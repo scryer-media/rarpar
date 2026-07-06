@@ -181,11 +181,14 @@ does not print an UnRAR banner and does not claim to be official UnRAR.
 ## Workspace Packages
 
 - `crates/weaver-reed-solomon`: Reed-Solomon finite-field kernels shared by
-  RAR recovery and PAR2 repair.
+  RAR recovery and PAR2 repair. Licensed GPL-3.0-or-later.
 - `crates/weaver-unrar`: RAR reading, probing, extraction, and recovery only.
+  Licensed GPL-3.0-or-later with the additional UnRAR source-code restriction.
 - `crates/weaver-par2`: PAR2 packet loading, verification, placement-aware
-  repair, and post-repair verification.
-- `tools/rarpar`: the standalone CLI.
+  repair, and post-repair verification. Licensed GPL-3.0-or-later.
+- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later; normal builds
+  link `weaver-unrar`, so binary distribution must also account for that
+  dependency's additional restriction.
 
 ## Development
 
@@ -203,9 +206,9 @@ usernames or home-directory paths.
 Common validation commands:
 
 ```bash
-rtk cargo fmt --check --all
-rtk cargo clippy --locked --workspace --all-targets -- -D warnings
-rtk cargo test --locked --workspace --no-fail-fast
+cargo fmt --check --all
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --no-fail-fast
 ```
 
 Release and crates.io publishing automation lives under `.github/workflows/`.
@@ -213,7 +216,12 @@ Publishing notes are in `docs/publishing.md`.
 
 ## License
 
-This project is licensed under GPL-3.0-or-later with the additional UnRAR
-source-code restriction documented in `LICENSE`. In short, RAR extraction and
-recovery code may not be used to develop a RAR-compatible archiver or recreate
-the proprietary RAR compression algorithm.
+The workspace is GPL-3.0-or-later, with one package-specific addition:
+
+- `weaver-reed-solomon`, `weaver-par2`, and the `rarpar` CLI source are
+  GPL-3.0-or-later.
+- `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
+  restriction documented in `LICENSE` and `crates/weaver-unrar/LICENSE`.
+
+In short, the additional restriction applies to the RAR extraction and recovery
+code in `weaver-unrar`; it does not apply to the PAR2 or Reed-Solomon crates.
