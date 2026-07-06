@@ -1,0 +1,12 @@
+# Fixture binaries should stay out of normal Git storage.
+crates/weaver-unrar/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable
+crates/weaver-unrar/tests/fixtures/**/*.rev filter=lfs diff=lfs merge=lfs -text
+crates/weaver-unrar/tests/fixtures/**/*.exe filter=lfs diff=lfs merge=lfs -text
+crates/weaver-unrar/tests/fixtures/**/*.bin filter=lfs diff=lfs merge=lfs -text
+crates/weaver-unrar/tests/fixtures/**/*.mkv filter=lfs diff=lfs merge=lfs -text
+crates/weaver-unrar/tests/fixtures/**/*.wav filter=lfs diff=lfs merge=lfs -text
+
+crates/weaver-par2/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text
+crates/weaver-par2/tests/fixtures/**/*.par2 filter=lfs diff=lfs merge=lfs -text
+crates/weaver-par2/tests/fixtures/par2cmdline-turbo/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+crates/weaver-par2/tests/fixtures/source/*.mkv filter=lfs diff=lfs merge=lfs -text

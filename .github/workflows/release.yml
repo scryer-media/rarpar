@@ -1,0 +1,454 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and deploy, for example rarpar-v0.7.0.
+        required: true
+        type: string
+  push:
+    tags:
+      - "rarpar-v*"
+
+concurrency:
+  group: rarpar-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-rarpar-release-preflight-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-release-preflight-
+            gha-sccache-v1-rarpar-release-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Validate release tag and workspace version
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(r"rarpar-v(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)", tag)
+          if not match:
+              print(f"unexpected release tag format: {tag}", file=sys.stderr)
+              sys.exit(1)
+          expected = match.group(1)
+          metadata = subprocess.check_output([
+              "cargo",
+              "metadata",
+              "--locked",
+              "--format-version",
+              "1",
+              "--no-deps",
+          ])
+          packages = json.loads(metadata)["packages"]
+          selected = {
+              package["name"]: package["version"]
+              for package in packages
+              if package["name"] in {
+                  "weaver-reed-solomon",
+                  "weaver-unrar",
+                  "weaver-par2",
+                  "rarpar",
+              }
+          }
+          bad = {name: version for name, version in selected.items() if version != expected}
+          if len(selected) != 4 or bad:
+              print(
+                  f"release version mismatch: expected {expected}, got {selected}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+      - name: Run release preflight checks
+        run: |
+          cargo fmt --check --all
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: always() && steps.sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  build:
+    name: build-${{ matrix.platform }}
+    needs: [preflight]
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-gnu
+            runs_on: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - platform: linux-arm64-gnu
+            runs_on: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - platform: linux-x86_64-musl
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+          - platform: linux-arm64-musl
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive_ext: tar.gz
+          - platform: darwin-arm64
+            runs_on: macos-26
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install native build dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(mold nasm)
+          case "${{ matrix.target }}" in
+            *-musl) packages+=(musl-tools) ;;
+          esac
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-rarpar-release-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-release-${{ matrix.platform }}-
+            gha-sccache-v1-rarpar-release-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: false
+          key: release-${{ matrix.platform }}
+      - name: Configure build environment (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+
+          case "${{ runner.os }}" in
+            Linux)
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+              case "${{ matrix.target }}" in
+                *-musl)
+                  target_env="${{ matrix.target }}"
+                  target_env="${target_env//-/_}"
+                  printf 'CC_%s=%s\n' "$target_env" "sccache musl-gcc" >> "$GITHUB_ENV"
+                  ;;
+                *)
+                  echo "CC=sccache cc" >> "$GITHUB_ENV"
+                  echo "CXX=sccache c++" >> "$GITHUB_ENV"
+                  ;;
+              esac
+              ;;
+            macOS)
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
+              echo "CC=sccache clang" >> "$GITHUB_ENV"
+              echo "CXX=sccache clang++" >> "$GITHUB_ENV"
+              ;;
+          esac
+      - name: Configure build environment (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=. -Clinker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CMAKE_C_COMPILER_LAUNCHER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CMAKE_CXX_COMPILER_LAUNCHER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Build rarpar (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          cargo build --locked --release -p rarpar --target "${{ matrix.target }}" 2>&1 \
+            | tee "logs/rarpar-${{ matrix.platform }}-build.log"
+      - name: Build rarpar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force logs | Out-Null
+          cargo build --locked --release -p rarpar --target ${{ matrix.target }} 2>&1 `
+            | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
+      - name: Smoke test release binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="target/${{ matrix.target }}/release/rarpar"
+          "$exe" --help > "logs/rarpar-${{ matrix.platform }}-help.log"
+          "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar \
+            > "logs/rarpar-${{ matrix.platform }}-lb.log"
+          grep -Fxq small.txt "logs/rarpar-${{ matrix.platform }}-lb.log"
+      - name: Smoke test release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\${{ matrix.target }}\release\rarpar.exe"
+          & $exe --help | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-help.log"
+          & $exe lb crates\weaver-unrar\tests\fixtures\rar5\rar5_store.rar `
+            | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-lb.log"
+          if (-not (Select-String -Path "logs\rarpar-${{ matrix.platform }}-lb.log" -Pattern '^small\.txt$' -Quiet)) {
+            throw "rarpar lb smoke test did not list small.txt"
+          }
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="rarpar-${RELEASE_TAG}-${{ matrix.platform }}.${{ matrix.archive_ext }}"
+          rm -rf package
+          mkdir -p package dist
+          cp "target/${{ matrix.target }}/release/rarpar" package/
+          cp README.md LICENSE package/
+          tar -czf "$archive" -C package .
+          mv "$archive" dist/
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = "rarpar-$env:RELEASE_TAG-${{ matrix.platform }}.${{ matrix.archive_ext }}"
+          Remove-Item -Recurse -Force package -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force package, dist | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\rarpar.exe package\
+          Copy-Item README.md package\
+          Copy-Item LICENSE package\
+          Compress-Archive -Path package\* -DestinationPath $archive
+          Move-Item $archive dist\
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats | tee "logs/rarpar-${{ matrix.platform }}-sccache-stats.txt"
+          else
+            echo "sccache not installed" | tee "logs/rarpar-${{ matrix.platform }}-sccache-stats.txt"
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rarpar-${{ matrix.platform }}
+          path: |
+            dist/*
+            logs/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save sccache directory
+        if: always() && steps.sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  build-freebsd:
+    name: build-freebsd-x86_64
+    needs: [preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Build rarpar on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          arch: x86_64
+          usesh: true
+          sync: rsync
+          envs: "RELEASE_TAG"
+          prepare: |
+            pkg install -y bash ca_root_nss cmake curl git nasm ninja perl5 pkgconf sccache
+          run: |
+            set -euo pipefail
+            toolchain="$(awk -F'"' '/channel/ { print $2 }' rust-toolchain.toml)"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain "$toolchain"
+            . "$HOME/.cargo/env"
+
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_DIR="$PWD/.sccache"
+            export CMAKE_C_COMPILER_LAUNCHER=sccache
+            export CMAKE_CXX_COMPILER_LAUNCHER=sccache
+            export RUSTFLAGS="--remap-path-prefix=$PWD=."
+
+            mkdir -p logs
+            rustc -vV | tee logs/rarpar-freebsd-x86_64-rustc.log
+            sccache --start-server || true
+            sccache --zero-stats || true
+
+            cargo build --locked --release -p rarpar 2>&1 \
+              | tee logs/rarpar-freebsd-x86_64-build.log
+            target/release/rarpar --help > logs/rarpar-freebsd-x86_64-help.log
+            target/release/rarpar lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar \
+              > logs/rarpar-freebsd-x86_64-lb.log
+            grep -Fxq small.txt logs/rarpar-freebsd-x86_64-lb.log
+            sccache --show-stats | tee logs/rarpar-freebsd-x86_64-sccache-stats.txt || true
+
+            archive="rarpar-${RELEASE_TAG}-freebsd-x86_64.tar.gz"
+            mkdir -p package dist
+            cp target/release/rarpar package/
+            cp README.md LICENSE package/
+            tar -czf "$archive" -C package .
+            mv "$archive" dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rarpar-freebsd-x86_64
+          path: |
+            dist/*
+            logs/*
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    name: deploy-github-release
+    needs: [build, build-freebsd]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          checksum_file="$(mktemp)"
+          find . -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > "$checksum_file"
+          mv "$checksum_file" SHA256SUMS
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_files=(dist/rarpar-*.tar.gz dist/rarpar-*.zip dist/SHA256SUMS)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${release_files[@]}" \
+              --title "$RELEASE_TAG" \
+              --notes "rarpar ${RELEASE_TAG}"
+          fi

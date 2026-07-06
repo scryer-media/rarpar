@@ -1,0 +1,26 @@
+[package]
+name = "rarpar"
+description = "Intelligent RAR/PAR2 repair and extraction CLI"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rarpar"
+path = "src/main.rs"
+
+[dependencies]
+weaver-par2 = { path = "../../crates/weaver-par2", version = "0.7.0", default-features = false, features = [
+    "native-crypto",
+] }
+weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.7.0", default-features = false, features = [
+    "native-crypto",
+] }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

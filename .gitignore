@@ -1,0 +1,27 @@
+/target/
+
+# Local CI/release artifacts
+/.ci/
+/dist/
+/package/
+/logs/
+/nasm.zip
+/rarpar-*.tar.gz
+/rarpar-*.zip
+/SHA256SUMS
+
+# Rust profiling/coverage
+/coverage/
+/tarpaulin-report.html
+*.profraw
+*.profdata
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+**/.DS_Store
+._*

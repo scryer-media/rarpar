@@ -1,0 +1,193 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: rarpar-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Check formatting
+        run: cargo fmt --check --all
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          components: clippy
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: gha-sccache-v1-rarpar-ci-clippy-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-ci-clippy-
+            gha-sccache-v1-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: gha-sccache-v1-rarpar-ci-test-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-ci-test-
+            gha-sccache-v1-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  package:
+    name: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [fmt, clippy, test]
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: gha-sccache-v1-rarpar-ci-package-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-ci-package-
+            gha-sccache-v1-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/package-lists
+          cargo package --locked -p weaver-reed-solomon
+          # Downstream crates depend on same-version workspace crates. Before the
+          # first crates.io publish those versions are not in the registry yet,
+          # so CI validates package contents while build/test jobs validate code.
+          cargo package --locked --list -p weaver-unrar > .ci/package-lists/weaver-unrar.txt
+          cargo package --locked --list -p weaver-par2 > .ci/package-lists/weaver-par2.txt
+          cargo package --locked --list -p rarpar > .ci/package-lists/rarpar.txt
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}

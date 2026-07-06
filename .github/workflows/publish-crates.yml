@@ -1,0 +1,233 @@
+name: publish-crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Workspace version to publish, for example 0.7.0.
+        required: true
+        type: string
+      dry_run:
+        description: Run preflight only without publishing to crates.io.
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: rarpar-publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-rarpar-publish-preflight-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-publish-preflight-
+            gha-sccache-v1-rarpar-publish-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Check workspace version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          expected = os.environ["EXPECTED_VERSION"]
+          metadata = subprocess.check_output([
+              "cargo",
+              "metadata",
+              "--locked",
+              "--format-version",
+              "1",
+              "--no-deps",
+          ])
+          packages = json.loads(metadata)["packages"]
+          selected = {
+              package["name"]: package["version"]
+              for package in packages
+              if package["name"] in {
+                  "weaver-reed-solomon",
+                  "weaver-unrar",
+                  "weaver-par2",
+                  "rarpar",
+              }
+          }
+          bad = {name: version for name, version in selected.items() if version != expected}
+          if len(selected) != 4 or bad:
+              print(
+                  f"version mismatch: expected {expected}, got {selected}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+      - name: Run publish preflight checks
+        run: |
+          cargo fmt --check --all
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace --no-fail-fast
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/package-lists
+          cargo package --locked -p weaver-reed-solomon
+          # The remaining packages depend on same-version workspace crates. The
+          # actual publish job below performs full cargo publish verification
+          # after each upstream crate has reached the crates.io index.
+          cargo package --locked --list -p weaver-unrar > .ci/package-lists/weaver-unrar.txt
+          cargo package --locked --list -p weaver-par2 > .ci/package-lists/weaver-par2.txt
+          cargo package --locked --list -p rarpar > .ci/package-lists/rarpar.txt
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: always() && steps.sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [preflight]
+    if: ${{ inputs.dry_run == false }}
+    environment: crates-io
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-rarpar-publish-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-rarpar-publish-
+            gha-sccache-v1-rarpar-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Check crates.io token secret
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN repository secret is required for crates.io publishing."
+            exit 1
+          fi
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PUBLISH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          publish_with_retry() {
+            crate="$1"
+            for attempt in 1 2 3 4 5 6; do
+              echo "Publishing ${crate} (attempt ${attempt})"
+              if cargo publish --locked -p "$crate"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 6 ]; then
+                return 1
+              fi
+              sleep 60
+            done
+          }
+
+          wait_for_crate_version() {
+            crate="$1"
+            version="$2"
+            for attempt in $(seq 1 20); do
+              echo "Waiting for ${crate} ${version} in crates.io index (attempt ${attempt})"
+              if cargo info "${crate}@${version}" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 30
+            done
+            echo "timed out waiting for ${crate} ${version} in crates.io index" >&2
+            return 1
+          }
+
+          publish_with_retry weaver-reed-solomon
+          wait_for_crate_version weaver-reed-solomon "$PUBLISH_VERSION"
+
+          publish_with_retry weaver-unrar
+          wait_for_crate_version weaver-unrar "$PUBLISH_VERSION"
+
+          publish_with_retry weaver-par2
+          wait_for_crate_version weaver-par2 "$PUBLISH_VERSION"
+
+          publish_with_retry rarpar
+          wait_for_crate_version rarpar "$PUBLISH_VERSION"
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: always() && steps.sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
