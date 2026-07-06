@@ -5,7 +5,6 @@ and PAR2 workflows.
 
 ## Commands
 
-- Use `rtk` for command execution.
 - Always pass `--locked` to Cargo commands after `Cargo.lock` exists.
 - For broad test sweeps, use Cargo's `--no-fail-fast`.
 
