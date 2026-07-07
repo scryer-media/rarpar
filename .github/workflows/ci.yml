@@ -21,6 +21,7 @@ env:
   SCCACHE_CACHE_VERSION: v1
   WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
   WEAVER_LFS_PAR2_FIXTURES: crates/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_UNIT_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_hp_large.rar
   WEAVER_LFS_UNRAR_FIXTURES: crates/weaver-unrar/tests/fixtures/**
 
 jobs:
@@ -179,6 +180,20 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Hydrate unit-test fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_UNIT_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_UNIT_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
