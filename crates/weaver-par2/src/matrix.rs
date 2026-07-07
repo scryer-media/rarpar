@@ -318,12 +318,19 @@ impl Matrix {
             let rhs_ptr = rhs.data.as_mut_ptr() as usize;
             let matrix_cols = self.cols;
             let rhs_cols = rhs.cols;
-            let row_group =
-                if n >= PARALLEL_ELIMINATION_THRESHOLD && rayon::current_num_threads() > 1 {
-                    PARALLEL_ELIMINATION_ROWS
-                } else {
-                    SIMD_ELIMINATION_ROWS
-                };
+            // `!cfg!(target_family = "wasm")` const-folds to `true` on native
+            // (the guard is the original expression, byte-identical codegen) and
+            // to `false` on wasm, so the row batches always take the serial
+            // `SIMD_ELIMINATION_ROWS` branch there and `rayon::current_num_threads`
+            // is never evaluated (wasip1 has no worker pool).
+            let row_group = if !cfg!(target_family = "wasm")
+                && n >= PARALLEL_ELIMINATION_THRESHOLD
+                && rayon::current_num_threads() > 1
+            {
+                PARALLEL_ELIMINATION_ROWS
+            } else {
+                SIMD_ELIMINATION_ROWS
+            };
             let eliminate_batch = |batch_start: usize, batch_end: usize| unsafe {
                 let mut matrix_pairs = Vec::with_capacity(batch_end - batch_start);
                 let mut rhs_pairs = Vec::with_capacity(batch_end - batch_start);

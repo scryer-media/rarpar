@@ -29,6 +29,7 @@
 //! - Path sanitization to prevent traversal attacks
 
 pub mod archive;
+pub(crate) mod crc;
 pub mod crypto;
 pub mod decompress;
 pub mod early;

@@ -19,13 +19,33 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 md-5 = { workspace = true }
-aws-lc-sys = { workspace = true, optional = true }
 rayon = { workspace = true, default-features = false }
-memmap2 = { workspace = true, default-features = false }
 libc = { workspace = true }
+
+# Native-only dependencies.
+#
+# `memmap2` backs the mmap scanner in `repairer.rs`; wasip1 has no `mmap`, so
+# the scanner takes a compile-time buffered `std::fs` fallback there (see
+# `MappedFile` in `repairer.rs`) and the crate must not even link memmap2 on
+# wasm. `aws-lc-sys` (the native-crypto MD5 backend) is unavailable on wasm and
+# is only reachable through the `native-crypto` feature, which is off for wasm
+# builds (`--no-default-features` selects the RustCrypto `md-5` fallback); the
+# target gate keeps it out even if the feature is force-enabled on a wasm build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2 = { workspace = true, default-features = false }
+aws-lc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
+
+# Native-only dev-dependencies.
+#
+# `criterion` hard-`compile_error!`s on wasm (wasi) targets, and building the
+# `wasm_par2_check` example for wasm compiles the crate's dev-dependencies, so
+# it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
+# `weaver-unrar` is native test-suite tooling (differential RAR extraction
+# checks) and is not needed by the wasm harness, so it stays off the wasm build.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 weaver-unrar = { path = "../weaver-unrar", version = "0.1.0", default-features = false, features = [
     "native-crypto",
 ] }

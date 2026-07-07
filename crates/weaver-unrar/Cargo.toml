@@ -27,6 +27,14 @@ crypto-rust = ["dep:sha2", "dep:hmac", "dep:aes", "dep:cbc"]
 # on a native target is harmless (the module is cfg'd out and AWS-LC or the
 # RustCrypto backend is selected instead).
 crypto-host = ["crypto-rust"]
+# WASM-only: delegate the bulk member-data CRC-32 to a host function
+# (`scryer_crc32`, over the same fixed `extism:host/user` import ABI as
+# `crypto-host`'s AES) instead of computing it in-wasm with `crc32fast`. Opt-in
+# and wasm-only in intent; on native targets it is a harmless no-op — the
+# `crate::crc::Crc32` seam keeps its portable `crc32fast` backend regardless.
+# Adds NO new dependency: `crc32fast` is already a normal dep that the
+# native/portable seam path (and the header/probe CRCs) use unchanged.
+crc-host = []
 # Back-compat alias for existing workspace dependency declarations (was a
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]

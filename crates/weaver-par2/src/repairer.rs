@@ -32,7 +32,6 @@ use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
 };
 use crate::verify::{self, FileStatus, FileVerification, Repairability, VerificationResult};
-use memmap2::MmapOptions;
 use rayon::prelude::*;
 use tracing::{debug, warn};
 
@@ -48,6 +47,61 @@ const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
 const ORDERED_SCAN_DEFAULT_SKIP_LEEWAY: u64 = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
 const SCANNER_SLOW_WARN_DURATION: Duration = Duration::from_secs(5);
+
+/// Read-only view over a whole file, used by the block scanner.
+///
+/// On native targets this is a real memory map (`memmap2`), preserving the
+/// existing zero-copy scan behaviour and performance byte-for-byte. On wasm
+/// targets — where `mmap` does not exist under wasip1 — it is a compile-time
+/// fallback that reads the file into an owned `Vec<u8>`. Both variants
+/// `Deref` to `&[u8]`, so every scan call site is identical across targets.
+///
+/// The selection is purely `#[cfg(target_family = "wasm")]`, so native
+/// codegen is unchanged: the `Vec` variant does not exist in the native build
+/// and the mmap variant does not exist in the wasm build.
+struct MappedFile {
+    #[cfg(not(target_family = "wasm"))]
+    inner: memmap2::Mmap,
+    #[cfg(target_family = "wasm")]
+    inner: Vec<u8>,
+}
+
+impl MappedFile {
+    /// Map (native) or fully read (wasm) an already-opened file.
+    ///
+    /// `#[inline]` so the native wrapper collapses into the call site, leaving
+    /// the exact `MmapOptions::new().map(&file)` codegen the scanner had before.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    fn map(file: &File) -> io::Result<Self> {
+        // SAFETY: identical to the prior inline `MmapOptions::new().map(&file)`
+        // call. The scanner only reads through the returned slice and drops the
+        // map before the file is truncated or rewritten.
+        let inner = unsafe { memmap2::MmapOptions::new().map(file)? };
+        Ok(Self { inner })
+    }
+
+    /// wasip1 has no `mmap`; buffer the whole file into memory instead. The
+    /// scanner treats the result as an immutable `&[u8]`, so behaviour matches
+    /// the native mmap path (only the backing storage differs).
+    #[cfg(target_family = "wasm")]
+    fn map(file: &File) -> io::Result<Self> {
+        let mut inner = Vec::new();
+        // Clone the handle so this read does not disturb any cursor the caller
+        // holds, mirroring mmap's independence from the file position.
+        (&mut &*file).read_to_end(&mut inner)?;
+        Ok(Self { inner })
+    }
+}
+
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.inner
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Par2RepairStatus {
@@ -1281,7 +1335,14 @@ impl RepairState {
         // inside a single candidate's scan — never both (nested fan-out
         // measured as an intermittent worker stack overflow via rayon's
         // steal-on-block recursion).
-        let results = if candidates.len() > 1 && rayon::current_num_threads() > 1 {
+        //
+        // `!cfg!(target_family = "wasm")` const-folds to `true` on native (the
+        // guard is unchanged) and to `false` on wasm, so the candidate scan is
+        // sequential there and `rayon::current_num_threads` is never called.
+        let results = if !cfg!(target_family = "wasm")
+            && candidates.len() > 1
+            && rayon::current_num_threads() > 1
+        {
             candidates
                 .par_iter()
                 .map(|candidate| {
@@ -2554,7 +2615,12 @@ impl<'a> RollingBlockScanner<'a> {
         // per-file fan-out inside the per-candidate fan-out lets a blocked
         // worker steal other files' whole scan frames onto one stack —
         // measured as an intermittent worker stack overflow on 16-file sets.
-        if scan_options.skip_data
+        // `cfg!(target_family = "wasm")` const-folds away on native (the OR
+        // chain is unchanged, byte-identical) and to `true` on wasm, forcing the
+        // serial scanner and short-circuiting before `rayon::current_num_threads`
+        // — the parallel segment scanner (and its worker pool) is never reached.
+        if cfg!(target_family = "wasm")
+            || scan_options.skip_data
             || ordered_scan_force_serial()
             || !ordered_scan_parallel_enabled()
             || !inner_parallel
@@ -3279,7 +3345,7 @@ impl<'a> RollingBlockScanner<'a> {
             return Ok(stats);
         }
 
-        let map = unsafe { MmapOptions::new().map(&file)? };
+        let map = MappedFile::map(&file)?;
         let slice_size = self.table.slice_size as usize;
         if slice_size > 0 && len >= slice_size {
             let mut crc = checksum::crc32(&map[..slice_size]);
@@ -3825,7 +3891,7 @@ fn scan_shifted_short_len_from_file(
 
     if short_len > SCANNER_IO_TARGET_BYTES {
         let file = File::open(path)?;
-        let map = unsafe { MmapOptions::new().map(&file)? };
+        let map = MappedFile::map(&file)?;
         scan_shifted_short_len_from_slice(table, path, kind, blocks, &map, short_len);
         drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
@@ -4282,7 +4348,14 @@ fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
     let file_len = file.metadata()?.len();
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut hasher = Md5State::new();
+    // Native keeps the 1 MiB read buffer on the stack (unchanged). On wasm the
+    // shadow stack is ~1 MiB total, so this frame-sized array would overflow it;
+    // move the identical-size buffer to the heap there. Both coerce to `&mut
+    // [u8]`, so the read loop is byte-for-byte the same.
+    #[cfg(not(target_family = "wasm"))]
     let mut buf = [0u8; 1024 * 1024];
+    #[cfg(target_family = "wasm")]
+    let mut buf = vec![0u8; 1024 * 1024];
     let mut total_read = 0u64;
     loop {
         let read = file.read(&mut buf)?;

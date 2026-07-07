@@ -381,7 +381,13 @@ fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
     let file_len = file.metadata()?.len();
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut hasher = checksum::FileHashState::new();
+    // Native keeps the 1 MiB read buffer on the stack (unchanged); on wasm the
+    // ~1 MiB shadow stack cannot hold a frame this large, so the identical-size
+    // buffer moves to the heap. Both deref to `&mut [u8]` — same read loop.
+    #[cfg(not(target_family = "wasm"))]
     let mut buf = [0u8; 1024 * 1024];
+    #[cfg(target_family = "wasm")]
+    let mut buf = vec![0u8; 1024 * 1024];
     let mut total_read = 0u64;
     loop {
         let read = file.read(&mut buf)?;
