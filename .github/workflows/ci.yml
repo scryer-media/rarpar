@@ -180,20 +180,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Hydrate unit-test fixtures
-        run: |
-          set -euo pipefail
-          git lfs install --local
-          git lfs pull --include="$WEAVER_LFS_UNIT_FIXTURES" --exclude=""
-          git lfs fsck --pointers
-          git lfs ls-files --name-only --include="$WEAVER_LFS_UNIT_FIXTURES" > .ci-lfs-hydrated.txt
-          test -s .ci-lfs-hydrated.txt
-          while IFS= read -r path; do
-            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
-              echo "::error::LFS file was not hydrated: $path"
-              exit 1
-            fi
-          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -217,6 +203,20 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
+      - name: Hydrate unit-test fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_UNIT_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_UNIT_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
