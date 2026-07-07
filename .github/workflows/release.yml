@@ -59,10 +59,6 @@ jobs:
             gha-sccache-v1-rarpar-release-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
-          cache-on-failure: false
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -224,11 +220,6 @@ jobs:
             gha-sccache-v1-rarpar-release-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: release-${{ matrix.platform }}
       - name: Configure build environment (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -354,12 +345,6 @@ jobs:
             logs/*
           if-no-files-found: error
           retention-days: 14
-      - name: Save sccache directory
-        if: always() && steps.sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   build-freebsd:
     name: build-freebsd-x86_64

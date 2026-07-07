@@ -30,9 +30,6 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
       - name: Check formatting
         run: cargo fmt --check --all
 
@@ -71,9 +68,6 @@ jobs:
             gha-sccache-v1-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -124,9 +118,6 @@ jobs:
             gha-sccache-v1-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -178,9 +169,6 @@ jobs:
             gha-sccache-v1-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-bin: false
       - name: Prime sccache server
         run: |
           sccache --start-server || true
