@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [features]
 default = []
@@ -14,7 +15,7 @@ native-crypto = []
 slow-tests = []
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon", default-features = false }
+weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.1.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }

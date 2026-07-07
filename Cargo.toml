@@ -8,9 +8,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.1.0"
 edition = "2024"
-license-file = "LICENSE"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/rarpar"
 
 [workspace.dependencies]

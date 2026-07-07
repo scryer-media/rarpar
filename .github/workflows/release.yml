@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and deploy, for example rarpar-v0.7.0.
+        description: Existing tag to build and deploy, for example rarpar-v0.1.0.
         required: true
         type: string
   push:
@@ -36,11 +36,12 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.96.0
           components: clippy, rustfmt
       - name: Install native build dependencies
         run: |
@@ -48,7 +49,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-v1-rarpar-release-preflight-${{ github.run_id }}
@@ -57,7 +58,7 @@ jobs:
             gha-sccache-v1-rarpar-release-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           cache-on-failure: false
@@ -119,7 +120,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: always() && steps.sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -165,11 +166,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive_ext: zip
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
@@ -211,7 +213,7 @@ jobs:
           }
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-v1-rarpar-release-${{ matrix.platform }}-${{ github.run_id }}
@@ -220,7 +222,7 @@ jobs:
             gha-sccache-v1-rarpar-release-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           cache-on-failure: false
@@ -315,6 +317,7 @@ jobs:
           mkdir -p package dist
           cp "target/${{ matrix.target }}/release/rarpar" package/
           cp README.md LICENSE package/
+          cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
           tar -czf "$archive" -C package .
           mv "$archive" dist/
       - name: Package artifact (Windows)
@@ -328,6 +331,7 @@ jobs:
           Copy-Item target\${{ matrix.target }}\release\rarpar.exe package\
           Copy-Item README.md package\
           Copy-Item LICENSE package\
+          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\
       - name: Show sccache stats
@@ -350,7 +354,7 @@ jobs:
           retention-days: 14
       - name: Save sccache directory
         if: always() && steps.sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -361,11 +365,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
       - name: Build rarpar on FreeBSD
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@v1.4.5
         with:
           release: "14.4"
           arch: x86_64
@@ -404,6 +408,7 @@ jobs:
             mkdir -p package dist
             cp target/release/rarpar package/
             cp README.md LICENSE package/
+            cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
             tar -czf "$archive" -C package .
             mv "$archive" dist/
       - name: Upload artifact
@@ -422,7 +427,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
       - name: Download release artifacts

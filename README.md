@@ -6,7 +6,8 @@ there, repair what can be repaired, restore recovery volumes when possible, and
 extract the archive with verification enabled.
 
 It is built on reusable archive and parity crates that live in this workspace
-and are intended to be publishable on crates.io alongside the CLI.
+and are intended to be publishable on crates.io. The CLI is distributed as a
+binary release and source build, not as a crates.io package.
 
 `rarpar` is not an official RAR or PAR2 utility. It does not ship binaries named
 `unrar`, `rar`, `par2`, or `par2repair`, and it does not provide RAR archive
@@ -43,12 +44,6 @@ Or build a local release binary:
 ```bash
 cargo build --locked --release -p rarpar
 ./target/release/rarpar --help
-```
-
-After the crates are published, the intended crates.io install command is:
-
-```bash
-cargo install rarpar
 ```
 
 ## Quick Start
@@ -221,7 +216,7 @@ The workspace is GPL-3.0-or-later, with one package-specific addition:
 - `weaver-reed-solomon`, `weaver-par2`, and the `rarpar` CLI source are
   GPL-3.0-or-later.
 - `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
-  restriction documented in `LICENSE` and `crates/weaver-unrar/LICENSE`.
+  restriction documented in `crates/weaver-unrar/LICENSE`.
 
 In short, the additional restriction applies to the RAR extraction and recovery
 code in `weaver-unrar`; it does not apply to the PAR2 or Reed-Solomon crates.

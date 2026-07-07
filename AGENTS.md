@@ -17,8 +17,10 @@ and PAR2 workflows.
 
 ## Licensing And Release
 
-- All crates and tools are GPL-3.0-or-later with the additional UnRAR
-  source-code restriction documented in `LICENSE`.
+- `weaver-reed-solomon`, `weaver-par2`, and `rarpar` source are
+  GPL-3.0-or-later.
+- `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
+  restriction documented in `crates/weaver-unrar/LICENSE`.
 - Never bypass signed commit or signed tag requirements.
 - Run the repo release script if one exists; do not hand-roll releases.
 

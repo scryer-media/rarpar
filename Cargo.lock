@@ -725,7 +725,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rarpar"
-version = "0.7.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.7.0"
+version = "0.1.0"
 dependencies = [
  "aws-lc-sys 0.41.0",
  "bytes",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-reed-solomon"
-version = "0.7.0"
+version = "0.1.0"
 dependencies = [
  "objc2",
  "objc2-foundation",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-unrar"
-version = "0.7.0"
+version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys 0.41.0",

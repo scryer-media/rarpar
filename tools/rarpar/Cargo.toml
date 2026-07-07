@@ -3,18 +3,19 @@ name = "rarpar"
 description = "Intelligent RAR/PAR2 repair and extraction CLI"
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
+publish = false
 
 [[bin]]
 name = "rarpar"
 path = "src/main.rs"
 
 [dependencies]
-weaver-par2 = { path = "../../crates/weaver-par2", version = "0.7.0", default-features = false, features = [
+weaver-par2 = { path = "../../crates/weaver-par2", version = "0.1.0", default-features = false, features = [
     "native-crypto",
 ] }
-weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.7.0", default-features = false, features = [
+weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.1.0", default-features = false, features = [
     "native-crypto",
 ] }
 clap = { workspace = true }

@@ -1,13 +1,14 @@
 # Publishing
 
-Initial external package version: `0.7.0`.
+Initial external package version: `0.1.0`.
 
 Publish order:
 
 1. `weaver-reed-solomon`
 2. `weaver-unrar`
 3. `weaver-par2`
-4. `rarpar`
+
+`rarpar` is a CLI binary and is not published to crates.io.
 
 Before publishing:
 
@@ -18,7 +19,6 @@ rtk cargo test --locked --workspace --no-fail-fast
 rtk cargo package --locked -p weaver-reed-solomon
 rtk cargo package --locked --list -p weaver-unrar
 rtk cargo package --locked --list -p weaver-par2
-rtk cargo package --locked --list -p rarpar
 ```
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
@@ -45,8 +45,8 @@ Verify repository metadata before the first publish.
 
 ## GitHub Actions
 
-- `rust-toolchain.toml` pins the repo to Rust `1.96.0`; workflows use that
-  file instead of repeating a separate toolchain version.
+- `rust-toolchain.toml` pins the repo to Rust `1.96.0`; workflows specify the
+  same toolchain explicitly for action compatibility.
 - `.github/workflows/ci.yml` runs formatting, clippy, workspace tests, and
   package-content checks on pull requests, pushes to `main`, and manual runs.
   Native build lanes use `sccache`, Linux `mold`, path-prefix remapping, and
@@ -71,8 +71,8 @@ and `--remap-path-prefix`, are allowed.
 
 Required repository configuration:
 
-- `CARGO_REGISTRY_TOKEN`: crates.io token with publish access to all four
-  packages. The publish workflow reads it from
+- `CARGO_REGISTRY_TOKEN`: crates.io token with publish access to the three
+  library packages. The publish workflow reads it from
   `secrets.CARGO_REGISTRY_TOKEN`.
 - `crates-io` environment: recommended for required reviewer protection around
   the real publish job.
