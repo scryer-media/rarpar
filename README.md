@@ -30,6 +30,12 @@ writing, compression, or modification APIs.
 
 ## Install
 
+With Homebrew:
+
+```bash
+brew install scryer-media/rarpar/rarpar
+```
+
 From a release archive, download the `rarpar` binary for your platform from
 GitHub Releases and place it on your `PATH`.
 

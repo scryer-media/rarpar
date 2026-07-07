@@ -57,7 +57,10 @@ Verify repository metadata before the first publish.
   supports manual dispatch against an existing tag. It validates that the tag
   version matches every workspace package, smoke-tests each native binary, and
   uploads build logs plus `sccache` stats as workflow artifacts. GitHub Releases
-  receive only `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`.
+  receive only `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`. When
+  `TAP_PUSH_TOKEN` is available, the release job updates
+  `scryer-media/homebrew-rarpar` with a single portable Homebrew formula that
+  selects the Linux musl or macOS archive for the current OS/architecture.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
   dependency order above. It is manual-only and defaults to dry-run/preflight
   mode. Set `dry_run` to `false` to publish. Real publishing retries failures
@@ -76,6 +79,9 @@ Required repository configuration:
   `secrets.CARGO_REGISTRY_TOKEN`.
 - `crates-io` environment: recommended for required reviewer protection around
   the real publish job.
+- `TAP_PUSH_TOKEN`: GitHub token that can push to
+  `scryer-media/homebrew-rarpar`. The release workflow skips the tap update
+  when this secret is absent.
 - Release workflow access to the standard GitHub-hosted runner labels in
   `.github/workflows/release.yml`, plus permission to run
   `vmactions/freebsd-vm@v1` for the FreeBSD x86_64 archive.
