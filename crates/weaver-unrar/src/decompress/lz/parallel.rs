@@ -103,7 +103,14 @@ struct TableSet {
 }
 
 pub(super) fn parallel_enabled() -> bool {
-    parallel_enabled_from_disable_env(std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").as_deref())
+    // `!cfg!(target_family = "wasm")` const-folds to `true` on native (the
+    // native branch below is preserved verbatim) and to `false` on wasm, so
+    // every LZ decode takes the single-thread path there and the rayon
+    // `rar_decode_pool` is never built (wasip1 has no thread spawn).
+    !cfg!(target_family = "wasm")
+        && parallel_enabled_from_disable_env(
+            std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").as_deref(),
+        )
 }
 
 fn parallel_enabled_from_disable_env(disable_env: Option<&std::ffi::OsStr>) -> bool {

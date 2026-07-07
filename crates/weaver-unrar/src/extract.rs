@@ -247,7 +247,14 @@ enum ExtractedMemberSinkStorage {
 impl ExtractedMemberSink {
     pub fn with_capacity_hint(capacity_hint: usize) -> RarResult<Self> {
         let threshold = spool_threshold_bytes().min(MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES);
-        let storage = if capacity_hint > threshold {
+        // `!cfg!(target_family = "wasm")` const-folds to `true` on native (the
+        // eager-spool decision is unchanged) and to `false` on wasm. WASI
+        // preview1 has no usable temp dir — `std::env::temp_dir()` is an
+        // unconditional `panic!` stub and does not consult `$TMPDIR` — so
+        // `NamedTempFile::new()` would abort. On wasm the sink therefore stays
+        // in memory (still bounded by the 512 MiB materialization limit checked
+        // elsewhere).
+        let storage = if !cfg!(target_family = "wasm") && capacity_hint > threshold {
             ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::Io)?)
         } else {
             ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint))
@@ -303,8 +310,14 @@ impl Write for ExtractedMemberSink {
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         match &mut self.storage {
+            // `cfg!(target_family = "wasm")` const-folds away on native (the
+            // guard is exactly `data.len()+buf.len() <= self.threshold`), but is
+            // a constant `true` on wasm so the in-memory arm always wins and the
+            // `promote_to_tempfile` arm below (which calls `NamedTempFile::new`,
+            // an abort on WASI preview1) is never reached there.
             ExtractedMemberSinkStorage::Memory(data)
-                if data.len().saturating_add(buf.len()) <= self.threshold =>
+                if cfg!(target_family = "wasm")
+                    || data.len().saturating_add(buf.len()) <= self.threshold =>
             {
                 data.extend_from_slice(buf);
             }

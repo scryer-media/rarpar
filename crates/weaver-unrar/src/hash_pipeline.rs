@@ -539,8 +539,14 @@ impl SharedHashStream {
         compute_blake: bool,
         expected_len: u64,
     ) -> std::sync::Arc<Self> {
-        let pipelined =
-            !compute_rar14 && (compute_crc || compute_blake) && expected_len >= PIPELINE_MIN_BYTES;
+        // `!cfg!(target_family = "wasm")` const-folds to `true` on native (LLVM
+        // drops it, leaving the native decision unchanged) and to `false` on
+        // wasm, forcing the `StreamState::Inline` path so `HashPipeline::new`
+        // (which spawns worker threads) is never constructed on wasm.
+        let pipelined = !cfg!(target_family = "wasm")
+            && !compute_rar14
+            && (compute_crc || compute_blake)
+            && expected_len >= PIPELINE_MIN_BYTES;
         let state = if pipelined {
             StreamState::Pipelined {
                 pipeline: HashPipeline::new(compute_crc, compute_blake),
