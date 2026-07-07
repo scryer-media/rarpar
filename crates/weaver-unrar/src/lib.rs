@@ -28,21 +28,6 @@
 //! - Post-decompression filters (Delta, E8, E8E9, ARM)
 //! - Path sanitization to prevent traversal attacks
 
-// Supported extraction targets are Darwin/macOS, Linux/Unix, and
-// Windows. Other RAR host OS values may be listed in metadata, but they do not
-// need AWS-LC target support here.
-#[cfg(not(all(
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    any(
-        target_os = "macos",
-        target_os = "linux",
-        all(target_os = "windows", target_env = "msvc")
-    )
-)))]
-compile_error!(
-    "weaver-unrar AWS-LC crypto only supports x86_64/aarch64 on macOS, Linux, and Windows MSVC"
-);
-
 pub mod archive;
 pub mod crypto;
 pub mod decompress;

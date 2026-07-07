@@ -3,8 +3,18 @@ name: publish-crates
 on:
   workflow_dispatch:
     inputs:
+      package:
+        description: Crate package to publish.
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - weaver-reed-solomon
+          - weaver-unrar
+          - weaver-par2
       version:
-        description: Workspace version to publish, for example 0.1.0.
+        description: Package version to publish, for example 0.1.1.
         required: true
         type: string
       dry_run:
@@ -14,7 +24,7 @@ on:
         type: boolean
 
 concurrency:
-  group: rarpar-publish-${{ inputs.version }}
+  group: rarpar-publish-${{ inputs.package }}-${{ inputs.version }}
   cancel-in-progress: false
 
 permissions:
@@ -22,6 +32,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  GIT_LFS_SKIP_SMUDGE: "1"
+  WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
 
 jobs:
   preflight:
@@ -38,8 +50,20 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
+      - name: Hydrate test fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_ALL_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+
+          while IFS= read -r path; do
+            [ -f "$path" ] || continue
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error file=${path}::fixture is still a Git LFS pointer"
+              exit 1
+            fi
+          done < <(git lfs ls-files --name-only --include="$WEAVER_LFS_ALL_FIXTURES")
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.96.0
@@ -66,6 +90,7 @@ jobs:
       - name: Check workspace version
         env:
           EXPECTED_VERSION: ${{ inputs.version }}
+          PUBLISH_PACKAGE: ${{ inputs.package }}
         run: |
           python3 - <<'PY'
           import json
@@ -74,6 +99,12 @@ jobs:
           import sys
 
           expected = os.environ["EXPECTED_VERSION"]
+          selected_package = os.environ["PUBLISH_PACKAGE"]
+          publishable = {
+              "weaver-reed-solomon",
+              "weaver-unrar",
+              "weaver-par2",
+          }
           metadata = subprocess.check_output([
               "cargo",
               "metadata",
@@ -86,28 +117,41 @@ jobs:
           selected = {
               package["name"]: package["version"]
               for package in packages
-              if package["name"] in {
-                  "weaver-reed-solomon",
-                  "weaver-unrar",
-                  "weaver-par2",
-              }
+              if package["name"] in publishable
           }
           rarpar = next(
               (package for package in packages if package["name"] == "rarpar"),
               None,
           )
-          bad = {name: version for name, version in selected.items() if version != expected}
-          if len(selected) != 3 or bad:
+          if set(selected) != publishable:
               print(
-                  f"version mismatch: expected {expected}, got {selected}",
+                  f"missing publishable package metadata: got {selected}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          if selected_package == "all":
+              bad = {name: version for name, version in selected.items() if version != expected}
+              if bad:
+                  print(
+                      f"version mismatch: expected all publishable crates at {expected}, got {selected}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          elif selected.get(selected_package) != expected:
+              print(
+                  f"version mismatch: expected {selected_package} {expected}, got {selected}",
                   file=sys.stderr,
               )
               sys.exit(1)
           if rarpar is None or rarpar["version"] != expected or rarpar.get("publish") != []:
-              print(
-                  f"rarpar must be version {expected} with publish=false, got {rarpar}",
-                  file=sys.stderr,
-              )
+              if selected_package == "all":
+                  print(
+                      f"rarpar must be version {expected} with publish=false, got {rarpar}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          if rarpar is None or rarpar.get("publish") != []:
+              print(f"rarpar must have publish=false, got {rarpar}", file=sys.stderr)
               sys.exit(1)
           PY
       - name: Run publish preflight checks
@@ -116,15 +160,87 @@ jobs:
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace --no-fail-fast
       - name: Verify package contents
+        env:
+          PUBLISH_PACKAGE: ${{ inputs.package }}
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
-          cargo package --locked -p weaver-reed-solomon
-          # The remaining packages depend on same-version workspace crates. The
-          # actual publish job below performs full cargo publish verification
-          # after each upstream crate has reached the crates.io index.
-          cargo package --locked --list -p weaver-unrar > .ci/package-lists/weaver-unrar.txt
-          cargo package --locked --list -p weaver-par2 > .ci/package-lists/weaver-par2.txt
+
+          if [ "$PUBLISH_PACKAGE" = all ]; then
+            crates="weaver-reed-solomon weaver-unrar weaver-par2"
+            cargo package --locked -p weaver-reed-solomon
+            for crate in weaver-unrar weaver-par2; do
+              # Downstream crates may depend on same-version workspace crates.
+              # Real publish verification happens below after each upstream
+              # crate has reached the crates.io index.
+              cargo package --locked --no-verify -p "$crate"
+            done
+          else
+            crates="$PUBLISH_PACKAGE"
+            cargo package --locked -p "$PUBLISH_PACKAGE"
+          fi
+
+          for crate in $crates; do
+            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::${crate} package includes fixture files"
+              exit 1
+            fi
+          done
+
+          if [ -f .ci/package-lists/weaver-unrar.txt ]; then
+            grep -Fxq LICENSE .ci/package-lists/weaver-unrar.txt
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          limits = {
+              "weaver-reed-solomon": 1_000_000,
+              "weaver-unrar": 2_500_000,
+              "weaver-par2": 2_500_000,
+          }
+          selected_package = os.environ["PUBLISH_PACKAGE"]
+          if selected_package != "all":
+              limits = {selected_package: limits[selected_package]}
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo",
+                  "metadata",
+                  "--locked",
+                  "--format-version",
+                  "1",
+                  "--no-deps",
+              ])
+          )
+          versions = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+              if package["name"] in limits
+          }
+          package_dir = pathlib.Path("target/package")
+          failed = False
+          for crate, limit in limits.items():
+              path = package_dir / f"{crate}-{versions.get(crate)}.crate"
+              if not path.exists():
+                  print(f"missing packaged crate for {crate} {versions.get(crate)}", file=sys.stderr)
+                  failed = True
+                  continue
+              size = path.stat().st_size
+              print(f"{path.name}: {size} bytes")
+              if size > limit:
+                  print(
+                      f"{crate} package is {size} bytes, over {limit} byte limit",
+                      file=sys.stderr,
+                  )
+                  failed = True
+          if failed:
+              sys.exit(1)
+          PY
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -152,8 +268,6 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.96.0
@@ -188,6 +302,7 @@ jobs:
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PUBLISH_PACKAGE: ${{ inputs.package }}
           PUBLISH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -220,14 +335,16 @@ jobs:
             return 1
           }
 
-          publish_with_retry weaver-reed-solomon
-          wait_for_crate_version weaver-reed-solomon "$PUBLISH_VERSION"
+          if [ "$PUBLISH_PACKAGE" = all ]; then
+            crates="weaver-reed-solomon weaver-unrar weaver-par2"
+          else
+            crates="$PUBLISH_PACKAGE"
+          fi
 
-          publish_with_retry weaver-unrar
-          wait_for_crate_version weaver-unrar "$PUBLISH_VERSION"
-
-          publish_with_retry weaver-par2
-          wait_for_crate_version weaver-par2 "$PUBLISH_VERSION"
+          for crate in $crates; do
+            publish_with_retry "$crate"
+            wait_for_crate_version "$crate" "$PUBLISH_VERSION"
+          done
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
