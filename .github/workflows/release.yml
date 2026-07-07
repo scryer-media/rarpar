@@ -457,14 +457,51 @@ jobs:
           fi
 
           VERSION="${RELEASE_TAG#rarpar-v}"
-          LINUX_X86_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-x86_64-musl.tar.gz" | cut -d ' ' -f1)
-          LINUX_ARM_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-arm64-musl.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_GNU_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-x86_64-gnu.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_MUSL_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-x86_64-musl.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_GNU_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-arm64-gnu.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_MUSL_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-arm64-musl.tar.gz" | cut -d ' ' -f1)
           DARWIN_ARM_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-darwin-arm64.tar.gz" | cut -d ' ' -f1)
           DARWIN_X86_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-darwin-x86_64.tar.gz" | cut -d ' ' -f1)
           REPO="${{ github.repository }}"
 
           mkdir -p tap/Formula
           cat > tap/Formula/rarpar.rb << FORMULA
+          require "open3"
+
+          module RarparReleaseSelection
+            MIN_GLIBC_VERSION = [2, 35].freeze
+
+            def self.glibc_supported?
+              version = glibc_version
+              return false unless version
+
+              (version <=> MIN_GLIBC_VERSION) >= 0
+            end
+
+            def self.glibc_version
+              output = capture_getconf || capture_ldd
+              match = output.to_s.match(/(?:glibc|GNU libc|GLIBC)[^0-9]*(\d+)\.(\d+)/i)
+              return unless match
+
+              [match[1].to_i, match[2].to_i]
+            end
+
+            def self.capture_getconf
+              output, status = Open3.capture2("getconf", "GNU_LIBC_VERSION")
+              status.success? ? output.strip : nil
+            rescue StandardError
+              nil
+            end
+
+            def self.capture_ldd
+              output, status = Open3.capture2e("ldd", "--version")
+              status.success? ? output.lines.first.to_s.strip : nil
+            rescue StandardError
+              nil
+            end
+          end
+
           class Rarpar < Formula
             desc "Smart RAR/PAR2 repair and extraction CLI"
             homepage "https://github.com/${REPO}"
@@ -485,13 +522,23 @@ jobs:
 
             on_linux do
               on_arm do
-                url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-musl.tar.gz"
-                sha256 "${LINUX_ARM_SHA}"
+                if RarparReleaseSelection.glibc_supported?
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-gnu.tar.gz"
+                  sha256 "${LINUX_ARM_GNU_SHA}"
+                else
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-musl.tar.gz"
+                  sha256 "${LINUX_ARM_MUSL_SHA}"
+                end
               end
 
               on_intel do
-                url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-musl.tar.gz"
-                sha256 "${LINUX_X86_SHA}"
+                if RarparReleaseSelection.glibc_supported?
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-gnu.tar.gz"
+                  sha256 "${LINUX_X86_GNU_SHA}"
+                else
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-musl.tar.gz"
+                  sha256 "${LINUX_X86_MUSL_SHA}"
+                end
               end
             end
 

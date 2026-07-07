@@ -60,7 +60,9 @@ Verify repository metadata before the first publish.
   receive only `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`. When
   `TAP_PUSH_TOKEN` is available, the release job updates
   `scryer-media/homebrew-rarpar` with a single portable Homebrew formula that
-  selects the Linux musl or macOS archive for the current OS/architecture.
+  selects the macOS archive for the current architecture and, on Linux,
+  prefers the GNU/glibc archive when glibc is new enough, falling back to the
+  musl archive otherwise.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
   dependency order above. It is manual-only and defaults to dry-run/preflight
   mode. Set `dry_run` to `false` to publish. Real publishing retries failures
