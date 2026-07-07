@@ -365,7 +365,7 @@ jobs:
           sync: rsync
           envs: "RELEASE_TAG"
           prepare: |
-            pkg install -y bash ca_root_nss cmake curl git nasm ninja perl5 pkgconf sccache
+            pkg install -y bash ca_root_nss cmake curl git nasm ninja perl5 pkgconf rust-bindgen-cli sccache
           run: |
             set -euo pipefail
             toolchain="$(awk -F'"' '/channel/ { print $2 }' rust-toolchain.toml)"
@@ -381,6 +381,7 @@ jobs:
 
             mkdir -p logs
             rustc -vV | tee logs/rarpar-freebsd-x86_64-rustc.log
+            bindgen --version | tee logs/rarpar-freebsd-x86_64-bindgen.log
             sccache --start-server || true
             sccache --zero-stats || true
 
