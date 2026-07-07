@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-unrar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys 0.41.0",

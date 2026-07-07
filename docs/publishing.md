@@ -10,6 +10,9 @@ Publish order:
 
 `rarpar` is a CLI binary and is not published to crates.io.
 
+Patch releases may publish a single library crate when only that crate changed.
+Use the dependency order above for coordinated multi-crate releases.
+
 Before publishing:
 
 ```text
@@ -17,14 +20,18 @@ rtk cargo fmt --check --all
 rtk cargo clippy --locked --workspace --all-targets -- -D warnings
 rtk cargo test --locked --workspace --no-fail-fast
 rtk cargo package --locked -p weaver-reed-solomon
+rtk cargo package --locked --no-verify -p weaver-unrar
+rtk cargo package --locked --no-verify -p weaver-par2
+rtk cargo package --locked --list -p weaver-reed-solomon
 rtk cargo package --locked --list -p weaver-unrar
 rtk cargo package --locked --list -p weaver-par2
 ```
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
-workflow publishes in the order above so each downstream package can be verified
-by `cargo publish` after its internal dependency is visible in the crates.io
-index.
+workflow accepts `package=all` for coordinated releases or one publishable crate
+name for a patch release. The `all` path publishes in the order above so each
+downstream package can be verified by `cargo publish` after its internal
+dependency is visible in the crates.io index.
 
 ## Fixture Policy
 
@@ -52,22 +59,23 @@ Verify repository metadata before the first publish.
   Native build lanes use `sccache`, Linux `mold`, path-prefix remapping, and
   `--no-install-recommends` native dependency installs.
 - `.github/workflows/release.yml` builds release archives for Linux GNU, Linux
-  musl, macOS Apple Silicon, macOS Intel, FreeBSD x86_64, and Windows, then
-  creates or updates a GitHub Release. It runs on tags matching `rarpar-v*` and
-  supports manual dispatch against an existing tag. It validates that the tag
-  version matches every workspace package, smoke-tests each native binary, and
-  uploads build logs plus `sccache` stats as workflow artifacts. GitHub Releases
-  receive only `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`. When
-  `TAP_PUSH_TOKEN` is available, the release job updates
+  musl, macOS Apple Silicon, macOS Intel, and Windows, then creates or updates
+  a GitHub Release. It runs on tags matching `rarpar-v*` and supports manual
+  dispatch against an existing tag. It validates that the tag version matches
+  every workspace package, smoke-tests each native binary, and uploads build
+  logs plus `sccache` stats as workflow artifacts. GitHub Releases receive only
+  `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`. When `TAP_PUSH_TOKEN` is
+  available, the release job updates
   `scryer-media/homebrew-rarpar` with a single portable Homebrew formula that
   selects the macOS archive for the current architecture and, on Linux,
   prefers the GNU/glibc archive when glibc is new enough, falling back to the
   musl archive otherwise.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
-  dependency order above. It is manual-only and defaults to dry-run/preflight
-  mode. Set `dry_run` to `false` to publish. Real publishing retries failures
-  and waits for each upstream crate version to appear in the crates.io index
-  before publishing dependents.
+  selected package mode. It is manual-only and defaults to dry-run/preflight
+  mode. Use `package=all` for coordinated releases or a specific package name
+  for patch releases. Set `dry_run` to `false` to publish. Real publishing
+  retries failures and waits for each published crate version to appear in the
+  crates.io index before continuing.
 
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
@@ -85,15 +93,13 @@ Required repository configuration:
   `scryer-media/homebrew-rarpar`. The release workflow skips the tap update
   when this secret is absent.
 - Release workflow access to the standard GitHub-hosted runner labels in
-  `.github/workflows/release.yml`, plus permission to run
-  `vmactions/freebsd-vm@v1` for the FreeBSD x86_64 archive.
+  `.github/workflows/release.yml`.
 - GitHub Actions cache access for `sccache` lanes. Cache saves are restricted
   to trusted repository events for pull-request CI and to release/publish jobs
   running in this repository.
 
-Initial publish note: before the first crates.io publish, downstream crates
-cannot be fully package-verified against the public registry because their
-same-version internal dependencies are not published yet. CI still runs the full
-workspace build/test suite and validates downstream package file lists; the
+Publish note: downstream crates can depend on same-version workspace crates that
+are not in the public registry yet. CI still runs the full workspace build/test
+suite and validates downstream package file lists and archive sizes; the
 protected publish workflow lets `cargo publish` perform the full verification as
 each upstream crate reaches the crates.io index.

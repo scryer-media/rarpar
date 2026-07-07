@@ -16,30 +16,185 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  GIT_LFS_SKIP_SMUDGE: "1"
+  RUST_TOOLCHAIN: 1.96.0
+  SCCACHE_CACHE_VERSION: v1
+  WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_PAR2_FIXTURES: crates/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_UNRAR_FIXTURES: crates/weaver-unrar/tests/fixtures/**
 
 jobs:
-  fmt:
-    name: fmt
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      crates: ${{ steps.detect.outputs.crates }}
+      rarpar: ${{ steps.detect.outputs.rarpar }}
+      rust: ${{ steps.detect.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: detect
+        name: Detect changed areas
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            {
+              echo "crates=true"
+              echo "rarpar=true"
+              echo "rust=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+              ;;
+            push)
+              base="$PUSH_BEFORE_SHA"
+              head="$GITHUB_SHA"
+              if [ -z "$base" ] || printf '%s' "$base" | grep -Eq '^0+$'; then
+                base="$(git rev-parse "${head}^" 2>/dev/null || true)"
+              fi
+              ;;
+            *)
+              base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+              head="HEAD"
+              ;;
+          esac
+
+          if [ -z "${base:-}" ]; then
+            git ls-files > changed-files.txt
+          else
+            git diff --name-only "$base" "$head" > changed-files.txt
+          fi
+
+          crates_direct=false
+          rarpar_direct=false
+          shared_rust=false
+
+          while IFS= read -r path; do
+            case "$path" in
+              crates/*|.github/workflows/publish-crates.yml|.gitattributes|.gitleaks.toml|.githooks/*)
+                crates_direct=true
+                ;;
+              tools/rarpar/*|.github/workflows/release.yml|README.md|docs/*)
+                rarpar_direct=true
+                ;;
+              .github/workflows/ci.yml)
+                crates_direct=true
+                rarpar_direct=true
+                ;;
+              Cargo.toml|Cargo.lock|rust-toolchain.toml)
+                shared_rust=true
+                ;;
+            esac
+          done < changed-files.txt
+
+          crates="$crates_direct"
+          rarpar="$rarpar_direct"
+
+          if [ "$shared_rust" = true ] && [ "$rarpar_direct" = false ]; then
+            crates=true
+          fi
+          if [ "$shared_rust" = true ] && [ "$crates_direct" = false ]; then
+            rarpar=true
+          fi
+
+          rust=false
+          if [ "$crates" = true ] || [ "$rarpar" = true ]; then
+            rust=true
+          fi
+
+          {
+            echo "crates=$crates"
+            echo "rarpar=$rarpar"
+            echo "rust=$rust"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Change classification"
+            echo
+            echo "- crates: \`$crates\`"
+            echo "- rarpar: \`$rarpar\`"
+            echo "- rust: \`$rust\`"
+            echo
+            echo "Changed files:"
+            sed 's/^/- `/' changed-files.txt | sed 's/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  hygiene:
+    name: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
+      - name: Check repository hygiene
+        run: |
+          set -euo pipefail
+
+          # Keep local workstation paths out of public-facing files.
+          mac_home_root="/Users"
+          linux_home_root="/home"
+          windows_home_root='C:\Users'
+          personal_path_regex="(${mac_home_root}/[^[:space:]/]+|${linux_home_root}/[^[:space:]/]+|${windows_home_root}\\[^\\[:space:]]+)"
+          if git grep -n -I -E "$personal_path_regex" -- . \
+            ':!.git/**' \
+            ':!target/**'; then
+            echo "::error::tracked files contain local personal paths"
+            exit 1
+          fi
+
+          # Cargo packages must never include fixture corpora.
+          if git grep -n 'tests/fixtures' -- crates/*/Cargo.toml | grep -v 'exclude = \["tests/fixtures/\*\*"\]'; then
+            echo "::error::fixture directories must remain excluded from publishable crates"
+            exit 1
+          fi
+
+          git lfs install --local
+          git lfs ls-files --name-only > .ci-lfs-files.txt
+          test -s .ci-lfs-files.txt
+          if grep -Ev '^crates/(weaver-unrar|weaver-par2)/tests/fixtures/' .ci-lfs-files.txt; then
+            echo "::error::unexpected Git LFS path outside fixture corpora"
+            exit 1
+          fi
+          git lfs fsck --pointers
+
+  fmt:
+    name: fmt
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --check --all
 
   clippy:
     name: clippy
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
       CC: sccache cc
       CXX: sccache c++
@@ -47,11 +202,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - name: Install native build dependencies
         run: |
@@ -61,11 +214,11 @@ jobs:
         id: sccache-restore
         uses: actions/cache/restore@v6
         with:
-          path: /home/runner/.cache/sccache
-          key: gha-sccache-v1-rarpar-ci-clippy-${{ github.run_id }}
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-${{ github.run_id }}
           restore-keys: |
-            gha-sccache-v1-rarpar-ci-clippy-
-            gha-sccache-v1-rarpar-ci-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Prime sccache server
@@ -81,16 +234,18 @@ jobs:
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: actions/cache/save@v6
         with:
-          path: /home/runner/.cache/sccache
+          path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  test:
-    name: test
+  unit-tests:
+    name: unit-tests
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
       CC: sccache cc
       CXX: sccache c++
@@ -98,11 +253,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -111,18 +264,82 @@ jobs:
         id: sccache-restore
         uses: actions/cache/restore@v6
         with:
-          path: /home/runner/.cache/sccache
-          key: gha-sccache-v1-rarpar-ci-test-${{ github.run_id }}
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-${{ github.run_id }}
           restore-keys: |
-            gha-sccache-v1-rarpar-ci-test-
-            gha-sccache-v1-rarpar-ci-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Run workspace tests
+      - name: Run no-fixture Rust tests
+        run: cargo test --locked --workspace --lib --bins --examples --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  fixture-tests:
+    name: fixture-tests
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - name: Hydrate regular fixture corpus
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_ALL_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_ALL_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run workspace fixture tests
         run: cargo test --locked --workspace --no-fail-fast
       - name: Show sccache stats
         if: always()
@@ -131,17 +348,18 @@ jobs:
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: actions/cache/save@v6
         with:
-          path: /home/runner/.cache/sccache
+          path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  package:
-    name: package
+  par2-slow-tests:
+    name: par2-slow-tests
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    needs: [fmt, clippy, test]
+    timeout-minutes: 90
     env:
       RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
       CC: sccache cc
       CXX: sccache c++
@@ -149,11 +367,23 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v7
-        with:
-          lfs: true
+      - name: Hydrate PAR2 fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_PAR2_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_PAR2_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -162,11 +392,382 @@ jobs:
         id: sccache-restore
         uses: actions/cache/restore@v6
         with:
-          path: /home/runner/.cache/sccache
-          key: gha-sccache-v1-rarpar-ci-package-${{ github.run_id }}
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-${{ github.run_id }}
           restore-keys: |
-            gha-sccache-v1-rarpar-ci-package-
-            gha-sccache-v1-rarpar-ci-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run PAR2 slow tests
+        run: cargo test --locked -p weaver-par2 --features slow-tests --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  unrar-slow-tests:
+    name: unrar-slow-tests
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - name: Hydrate UnRAR fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_UNRAR_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_UNRAR_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run UnRAR slow tests
+        run: cargo test --locked -p weaver-unrar --features slow-tests --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  platform-tests:
+    name: platform-tests-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-arm64
+            runs_on: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runs_on: macos-26
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows x86_64)
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Configure compiler flags (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          {
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold"
+              echo "CC=sccache cc"
+              echo "CXX=sccache c++"
+            else
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=."
+              echo "CC=sccache clang"
+              echo "CXX=sccache clang++"
+            fi
+          } >> "$GITHUB_ENV"
+      - name: Configure compiler flags (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=." | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Run platform unit tests
+        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  target-checks:
+    name: target-checks-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-gnu
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-x86_64-musl
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - platform: linux-arm64-gnu
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: linux-arm64-musl
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - platform: darwin-arm64
+            runs_on: macos-26
+            target: aarch64-apple-darwin
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+            target: x86_64-apple-darwin
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install native build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          packages=(mold nasm)
+          case "${{ matrix.target }}" in
+            *-musl) packages+=(musl-tools) ;;
+          esac
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows x86_64)
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Configure compiler flags (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          {
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold"
+              case "${{ matrix.target }}" in
+                *-musl)
+                  target_env="${{ matrix.target }}"
+                  target_env="${target_env//-/_}"
+                  printf 'CC_%s=%s\n' "$target_env" "sccache musl-gcc"
+                  ;;
+                *)
+                  echo "CC=sccache cc"
+                  echo "CXX=sccache c++"
+                  ;;
+              esac
+            else
+              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=."
+              echo "CC=sccache clang"
+              echo "CXX=sccache clang++"
+            fi
+          } >> "$GITHUB_ENV"
+      - name: Configure compiler flags (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=." | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Check workspace target
+        run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  freebsd-par2-check:
+    name: freebsd-par2-check
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check FreeBSD PAR2 support
+        uses: vmactions/freebsd-vm@v1.4.5
+        with:
+          release: "14.4"
+          arch: x86_64
+          usesh: true
+          sync: rsync
+          prepare: |
+            pkg install -y bash ca_root_nss cmake curl git nasm ninja perl5 pkgconf rust-bindgen-cli
+          run: |
+            set -euo pipefail
+            toolchain="$(awk -F'"' '/channel/ { print $2 }' rust-toolchain.toml)"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain "$toolchain"
+            . "$HOME/.cargo/env"
+            cargo check --locked -p weaver-reed-solomon -p weaver-par2
+
+  package:
+    name: package
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Prime sccache server
@@ -177,12 +778,66 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
+
           cargo package --locked -p weaver-reed-solomon
-          # Downstream crates depend on same-version workspace crates. Before the
-          # first crates.io publish those versions are not in the registry yet,
-          # so CI validates package contents while build/test jobs validate code.
-          cargo package --locked --list -p weaver-unrar > .ci/package-lists/weaver-unrar.txt
-          cargo package --locked --list -p weaver-par2 > .ci/package-lists/weaver-par2.txt
+          for crate in weaver-unrar weaver-par2; do
+            cargo package --locked --no-verify -p "$crate"
+          done
+
+          for crate in weaver-reed-solomon weaver-unrar weaver-par2; do
+            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::${crate} package includes fixture files"
+              exit 1
+            fi
+          done
+
+          grep -Fxq LICENSE .ci/package-lists/weaver-unrar.txt
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          limits = {
+              "weaver-reed-solomon": 1_000_000,
+              "weaver-unrar": 2_500_000,
+              "weaver-par2": 2_500_000,
+          }
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo",
+                  "metadata",
+                  "--locked",
+                  "--format-version",
+                  "1",
+                  "--no-deps",
+              ])
+          )
+          versions = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+              if package["name"] in limits
+          }
+          package_dir = pathlib.Path("target/package")
+          failed = False
+          for crate, limit in limits.items():
+              path = package_dir / f"{crate}-{versions.get(crate)}.crate"
+              if not path.exists():
+                  print(f"missing packaged crate for {crate} {versions.get(crate)}", file=sys.stderr)
+                  failed = True
+                  continue
+              size = path.stat().st_size
+              print(f"{path.name}: {size} bytes")
+              if size > limit:
+                  print(
+                      f"{crate} package is {size} bytes, over {limit} byte limit",
+                      file=sys.stderr,
+                  )
+                  failed = True
+          if failed:
+              sys.exit(1)
+          PY
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -190,5 +845,107 @@ jobs:
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: actions/cache/save@v6
         with:
-          path: /home/runner/.cache/sccache
+          path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  cli-smoke:
+    name: cli-smoke
+    needs: [changes, unit-tests]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v7
+      - name: Hydrate smoke fixtures
+        run: |
+          set -euo pipefail
+          include="crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**"
+          git lfs install --local
+          git lfs pull --include="$include" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$include" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Build rarpar
+        run: cargo build --locked -p rarpar
+      - name: Smoke CLI behavior
+        run: |
+          set -euo pipefail
+          exe=target/debug/rarpar
+          "$exe" --help > .ci-rarpar-help.txt
+          "$exe" inspect --json crates/weaver-par2/tests/fixtures/rar5_lz_plain > .ci-rarpar-inspect.json
+          "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar > .ci-rarpar-lb.txt
+          grep -Fxq small.txt .ci-rarpar-lb.txt
+          python3 -m json.tool .ci-rarpar-inspect.json >/dev/null
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  ci-complete:
+    name: ci-complete
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - changes
+      - hygiene
+      - fmt
+      - clippy
+      - unit-tests
+      - fixture-tests
+      - par2-slow-tests
+      - unrar-slow-tests
+      - platform-tests
+      - target-checks
+      - freebsd-par2-check
+      - package
+      - cli-smoke
+    steps:
+      - name: Check CI result
+        run: |
+          if [ '${{ contains(needs.*.result, 'failure') }}' = 'true' ] || [ '${{ contains(needs.*.result, 'cancelled') }}' = 'true' ]; then
+            echo "::error::one or more CI jobs failed"
+            exit 1
+          fi
+          echo "all CI jobs passed"
