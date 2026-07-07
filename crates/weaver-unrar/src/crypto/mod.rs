@@ -10,23 +10,35 @@
 //! Includes a [`KdfCache`] that avoids re-deriving keys when the same
 //! password+salt combination is used across multiple members (which is
 //! the common case).
+//!
+//! All cryptographic primitives that touch the underlying crypto library live
+//! behind the [`backend`] seam; the code in this module only ever calls that
+//! seam, so a second backend can be added without editing shared logic.
+
+mod backend;
+
+// Differential tests comparing the two backends bit-for-bit; only compiled
+// when both are built (native, both features enabled).
+#[cfg(all(
+    test,
+    feature = "crypto-aws-lc",
+    feature = "crypto-rust",
+    not(target_family = "wasm")
+))]
+mod differential_tests;
 
 use std::borrow::Cow;
 use std::io::Read;
-use std::ptr::null_mut;
 use std::sync::Mutex;
 
-use aws_lc_rs::{digest as aws_digest, hmac as aws_hmac};
-use aws_lc_sys::{
-    EVP_CIPHER, EVP_CIPHER_CTX, EVP_CIPHER_CTX_free, EVP_CIPHER_CTX_new,
-    EVP_CIPHER_CTX_set_padding, EVP_DecryptInit_ex, EVP_DecryptUpdate, EVP_aes_128_cbc,
-    EVP_aes_256_cbc,
-};
-#[cfg(test)]
-use aws_lc_sys::{EVP_EncryptInit_ex, EVP_EncryptUpdate};
 use blake2s_simd::blake2sp;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
+
+// Always-compiled so `crate::test_support` can expose them to integration
+// tests; the internal unit tests below also use these via `super::*`. They
+// delegate to whichever crypto backend is active.
+pub(crate) use backend::{encrypt_aes128_cbc_for_test, encrypt_aes256_cbc_for_test};
 
 use crate::error::{RarError, RarResult};
 use crate::rar4::types::Rar4EncryptionMethod;
@@ -52,17 +64,9 @@ impl Drop for Rar5KeyMaterial {
     }
 }
 
-fn hmac_sha256_aws_lc(password: &aws_hmac::Key, data: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(aws_hmac::sign(password, data).as_ref());
-    out
-}
-
+#[inline]
 pub(crate) fn sha256_digest(data: &[u8]) -> [u8; 32] {
-    let digest = aws_digest::digest(&aws_digest::SHA256, data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    out
+    backend::sha256(data)
 }
 
 fn fold_password_check(value: &[u8; 32]) -> [u8; 8] {
@@ -136,13 +140,13 @@ pub fn derive_rar5_material(
 
     let count = 1u32 << kdf_count;
     let password = rar_password_compat(password);
-    let password_mac = aws_hmac::Key::new(aws_hmac::HMAC_SHA256, password.as_bytes());
+    let password_mac = backend::hmac_sha256_key(password.as_bytes());
 
     let mut salt_block = [0u8; 20];
     salt_block[..salt.len()].copy_from_slice(salt);
     salt_block[19] = 1;
 
-    let mut u = hmac_sha256_aws_lc(&password_mac, &salt_block);
+    let mut u = backend::hmac_sha256(&password_mac, &salt_block);
     let mut fn_value = u;
 
     let mut key = [0u8; 32];
@@ -155,7 +159,7 @@ pub fn derive_rar5_material(
         (16, &mut psw_check_value),
     ] {
         for _ in 0..rounds {
-            u = hmac_sha256_aws_lc(&password_mac, &u);
+            u = backend::hmac_sha256(&password_mac, &u);
             for (acc, next) in fn_value.iter_mut().zip(u.iter()) {
                 *acc ^= *next;
             }
@@ -259,10 +263,7 @@ fn password_check_matches(psw_check: &[u8; 8], check_data: &[u8; 12]) -> bool {
 }
 
 pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
-    let digest = hmac_sha256_aws_lc(
-        &aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key),
-        &value.to_le_bytes(),
-    );
+    let digest = backend::hmac_sha256(&backend::hmac_sha256_key(key), &value.to_le_bytes());
     let mut mac = 0u32;
     for (index, byte) in digest.iter().copied().enumerate() {
         mac ^= (byte as u32) << ((index & 3) * 8);
@@ -271,7 +272,7 @@ pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
 }
 
 pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
-    hmac_sha256_aws_lc(&aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key), &value)
+    backend::hmac_sha256(&backend::hmac_sha256_key(key), &value)
 }
 
 #[derive(Clone, Debug)]
@@ -902,9 +903,11 @@ impl Rar29Sha1 {
     /// replicate WinRAR's buggy in-place RAR29 SHA-1.
     fn transform_block(&mut self, block: &[u8; 64]) -> [u32; 16] {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        if sha1_hw_enabled() {
-            // SAFETY: the required target features were verified at runtime.
-            return unsafe { sha1_hw::transform_block(&mut self.state, block) };
+        {
+            if sha1_hw_enabled() {
+                // SAFETY: the required target features were verified at runtime.
+                return unsafe { sha1_hw::transform_block(&mut self.state, block) };
+            }
         }
         self.transform_block_scalar(block)
     }
@@ -971,6 +974,17 @@ fn sha1_hw_enabled() -> bool {
             && std::arch::is_x86_feature_detected!("sse4.1")
             && std::arch::is_x86_feature_detected!("ssse3")
     })
+}
+
+/// Portable fallback: no hardware SHA-1 block transform exists off x86_64 /
+/// aarch64 (e.g. wasm32), so the scalar path is always taken there. On such
+/// targets the sole caller in `transform_block` is `cfg`-compiled out, so this
+/// is a deliberately-unused portability placeholder that keeps the symbol
+/// defined for every architecture.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[allow(dead_code)]
+fn sha1_hw_enabled() -> bool {
+    false
 }
 
 /// x86 SHA-extension (SHA-NI) SHA-1 block transform — the x86 twin of the
@@ -1404,147 +1418,20 @@ pub fn rar4_decrypt_data(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> RarResul
 // Streaming AES-CBC decryption
 // =============================================================================
 
-const AES_BLOCK: usize = 16;
-
-#[cfg(test)]
-fn encrypt_cbc_for_test(
-    cipher: *const EVP_CIPHER,
-    key: &[u8],
-    iv: &[u8; AES_BLOCK],
-    plaintext: &[u8],
-) -> Vec<u8> {
-    assert!(plaintext.len().is_multiple_of(AES_BLOCK));
-    assert!(plaintext.len() <= i32::MAX as usize);
-
-    let ctx = unsafe { EVP_CIPHER_CTX_new() };
-    assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
-
-    let init = unsafe { EVP_EncryptInit_ex(ctx, cipher, null_mut(), key.as_ptr(), iv.as_ptr()) };
-    assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
-
-    let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
-    assert_eq!(
-        no_padding, 1,
-        "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
-    );
-
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut out_len = 0_i32;
-    let result = unsafe {
-        EVP_EncryptUpdate(
-            ctx,
-            ciphertext.as_mut_ptr(),
-            &mut out_len,
-            plaintext.as_ptr(),
-            plaintext.len() as i32,
-        )
-    };
-    unsafe { EVP_CIPHER_CTX_free(ctx) };
-
-    assert_eq!(result, 1, "aws-lc EVP_EncryptUpdate must succeed");
-    assert_eq!(
-        out_len as usize,
-        plaintext.len(),
-        "aws-lc CBC encrypt must write the full block-aligned input"
-    );
-    ciphertext
-}
-
-#[cfg(test)]
-pub(crate) fn encrypt_aes128_cbc_for_test(
-    key: &[u8; 16],
-    iv: &[u8; AES_BLOCK],
-    plaintext: &[u8],
-) -> Vec<u8> {
-    encrypt_cbc_for_test(unsafe { EVP_aes_128_cbc() }, key, iv, plaintext)
-}
-
-#[cfg(test)]
-pub(crate) fn encrypt_aes256_cbc_for_test(
-    key: &[u8; 32],
-    iv: &[u8; AES_BLOCK],
-    plaintext: &[u8],
-) -> Vec<u8> {
-    encrypt_cbc_for_test(unsafe { EVP_aes_256_cbc() }, key, iv, plaintext)
-}
-
-struct AwsLcCbcDecryptor {
-    ctx: *mut EVP_CIPHER_CTX,
-}
-
-const AWS_LC_MAX_DECRYPT_UPDATE_LEN: usize = (i32::MAX as usize / AES_BLOCK) * AES_BLOCK;
-
-unsafe impl Send for AwsLcCbcDecryptor {}
-
-impl AwsLcCbcDecryptor {
-    fn new_aes256(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
-        Self::new(unsafe { EVP_aes_256_cbc() }, key, iv)
-    }
-
-    fn new_aes128(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
-        Self::new(unsafe { EVP_aes_128_cbc() }, key, iv)
-    }
-
-    fn new(cipher: *const EVP_CIPHER, key: &[u8], iv: &[u8; AES_BLOCK]) -> Self {
-        let ctx = unsafe { EVP_CIPHER_CTX_new() };
-        assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
-
-        let init =
-            unsafe { EVP_DecryptInit_ex(ctx, cipher, null_mut(), key.as_ptr(), iv.as_ptr()) };
-        assert_eq!(init, 1, "aws-lc EVP_DecryptInit_ex must succeed");
-
-        let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
-        assert_eq!(
-            no_padding, 1,
-            "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
-        );
-
-        Self { ctx }
-    }
-
-    fn decrypt_blocks(&mut self, data: &mut [u8]) {
-        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-        for chunk in data.chunks_mut(AWS_LC_MAX_DECRYPT_UPDATE_LEN) {
-            let mut out_len = 0_i32;
-            let input_len = chunk.len() as i32;
-            let result = unsafe {
-                EVP_DecryptUpdate(
-                    self.ctx,
-                    chunk.as_mut_ptr(),
-                    &mut out_len,
-                    chunk.as_ptr(),
-                    input_len,
-                )
-            };
-            assert_eq!(result, 1, "aws-lc EVP_DecryptUpdate must succeed");
-            assert!(out_len >= 0, "aws-lc output length must be non-negative");
-            assert_eq!(
-                out_len as usize,
-                chunk.len(),
-                "aws-lc CBC decrypt must write the full block-aligned input"
-            );
-        }
-    }
-}
-
-impl Drop for AwsLcCbcDecryptor {
-    fn drop(&mut self) {
-        unsafe { EVP_CIPHER_CTX_free(self.ctx) };
-    }
-}
+pub(crate) const AES_BLOCK: usize = 16;
 
 /// Stateful AES-256-CBC decryptor for incremental (streaming) decryption.
 ///
 /// Unlike `decrypt_data` which requires all data at once, this carries the
 /// CBC IV state across calls to `decrypt_blocks`.
 pub struct CbcDecryptor {
-    decryptor: AwsLcCbcDecryptor,
+    decryptor: backend::Aes256CbcDec,
 }
 
 impl CbcDecryptor {
     pub fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
         Self {
-            decryptor: AwsLcCbcDecryptor::new_aes256(key, iv),
+            decryptor: backend::Aes256CbcDec::new(key, iv),
         }
     }
 
@@ -1558,13 +1445,13 @@ impl CbcDecryptor {
 
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
-    decryptor: AwsLcCbcDecryptor,
+    decryptor: backend::Aes128CbcDec,
 }
 
 impl Rar4CbcDecryptor {
     pub fn new(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
         Self {
-            decryptor: AwsLcCbcDecryptor::new_aes128(key, iv),
+            decryptor: backend::Aes128CbcDec::new(key, iv),
         }
     }
 
@@ -2216,13 +2103,6 @@ mod tests {
 
         assert_eq!(hex(&key), "36b07b37fb4e20e63b54fd54aa00ede9");
         assert_eq!(hex(&iv), "57ea4f82b145f2aa06f7c23f546d9561");
-    }
-
-    #[test]
-    fn test_aws_lc_decrypt_update_chunk_limit_is_i32_aligned() {
-        assert_eq!(AWS_LC_MAX_DECRYPT_UPDATE_LEN % AES_BLOCK, 0);
-        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN <= i32::MAX as usize);
-        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN + AES_BLOCK > i32::MAX as usize);
     }
 
     struct ChunkedCursor {

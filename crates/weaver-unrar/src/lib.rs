@@ -47,6 +47,25 @@ pub mod types;
 pub mod vint;
 pub mod volume;
 
+/// Test-only helpers exposed for integration tests in this crate.
+///
+/// These build AES-CBC ciphertext by delegating to whichever crypto backend
+/// is active, so tests can construct encrypted fixtures without hand-rolling
+/// FFI or depending on a specific backend. Not part of the public API —
+/// hidden from docs and intended solely for `weaver-unrar`'s own tests.
+#[doc(hidden)]
+pub mod test_support {
+    /// CBC-encrypt block-aligned `plaintext` with AES-128 (no padding).
+    pub fn encrypt_aes128_cbc(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        crate::crypto::encrypt_aes128_cbc_for_test(key, iv, plaintext)
+    }
+
+    /// CBC-encrypt block-aligned `plaintext` with AES-256 (no padding).
+    pub fn encrypt_aes256_cbc(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        crate::crypto::encrypt_aes256_cbc_for_test(key, iv, plaintext)
+    }
+}
+
 // Re-export primary public API types
 pub use archive::{
     CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeHostOs,

@@ -7,11 +7,22 @@ license-file = "LICENSE"
 repository.workspace = true
 exclude = ["tests/fixtures/**"]
 
+# Crypto backend selection.
+#
+# Exactly one backend supplies the AES-CBC / HMAC-SHA256 / SHA-256 seam
+# consumed by `crate::crypto`. Precedence: on native (non-wasm) targets the
+# AWS-LC backend wins whenever `crypto-aws-lc` is enabled, even if
+# `crypto-rust` is also on (both modules still compile, which powers the
+# differential tests). On `wasm` targets the AWS-LC deps vanish via a target
+# gate, so `crypto-rust` is selected automatically. Enabling neither backend
+# (on a target where AWS-LC is unavailable) is a compile error.
 [features]
-default = []
-# Compatibility feature for existing workspace dependency declarations. RAR
-# standard crypto uses AWS-LC unconditionally on supported targets.
-native-crypto = []
+default = ["crypto-aws-lc"]
+crypto-aws-lc = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
+crypto-rust = ["dep:sha2", "dep:hmac", "dep:aes", "dep:cbc"]
+# Back-compat alias for existing workspace dependency declarations (was a
+# no-op); selects the native AWS-LC backend.
+native-crypto = ["crypto-aws-lc"]
 slow-tests = []
 
 [dependencies]
@@ -20,19 +31,24 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 blake2s_simd = { workspace = true }
-aws-lc-rs = { workspace = true }
-aws-lc-sys = { workspace = true }
+sha2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+aes = { workspace = true, optional = true }
+cbc = { workspace = true, optional = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 rayon = { workspace = true, default-features = false }
 tempfile = { workspace = true }
-memmap2 = { workspace = true, default-features = false }
 memchr = { workspace = true }
 unicode-normalization = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 filetime = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+aws-lc-rs = { workspace = true, optional = true }
+aws-lc-sys = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -48,6 +64,12 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+
+# Criterion pulls in Rayon by default and hard-`compile_error!`s on wasm
+# (wasi) targets. Building the `crypto_baseline` example for wasm compiles the
+# crate's dev-dependencies, so criterion is scoped to non-wasm targets; the
+# `archive_hotspots` bench only runs natively anyway.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.5"
 
 [[bench]]

@@ -1,4 +1,5 @@
 /target/
+/target-*/
 
 # Local CI/release artifacts
 /.ci/

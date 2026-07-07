@@ -4,54 +4,8 @@
 //! that the parser + decompressor produce correct output.
 
 use std::io::Cursor;
-use std::ptr::null_mut;
 
-use aws_lc_sys::{
-    EVP_CIPHER_CTX_free, EVP_CIPHER_CTX_new, EVP_CIPHER_CTX_set_padding, EVP_EncryptInit_ex,
-    EVP_EncryptUpdate, EVP_aes_128_cbc,
-};
-
-fn encrypt_aes128_cbc_for_test(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    assert!(plaintext.len().is_multiple_of(16));
-    assert!(plaintext.len() <= i32::MAX as usize);
-
-    let ctx = unsafe { EVP_CIPHER_CTX_new() };
-    assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
-
-    let init = unsafe {
-        EVP_EncryptInit_ex(
-            ctx,
-            EVP_aes_128_cbc(),
-            null_mut(),
-            key.as_ptr(),
-            iv.as_ptr(),
-        )
-    };
-    assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
-
-    let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
-    assert_eq!(
-        no_padding, 1,
-        "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
-    );
-
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let mut out_len = 0_i32;
-    let result = unsafe {
-        EVP_EncryptUpdate(
-            ctx,
-            ciphertext.as_mut_ptr(),
-            &mut out_len,
-            plaintext.as_ptr(),
-            plaintext.len() as i32,
-        )
-    };
-    unsafe { EVP_CIPHER_CTX_free(ctx) };
-
-    assert_eq!(result, 1, "aws-lc EVP_EncryptUpdate must succeed");
-    assert_eq!(out_len as usize, plaintext.len());
-    ciphertext
-}
+use weaver_unrar::test_support::encrypt_aes128_cbc;
 
 #[cfg(unix)]
 fn current_unix_owner_names() -> Option<(String, String)> {
@@ -2548,7 +2502,7 @@ fn encrypt_rar4_stored_payload(content: &[u8], key: &[u8; 16], iv: &[u8; 16]) ->
     let padded_len = (content.len() + 15) & !15;
     let mut padded = vec![0u8; padded_len];
     padded[..content.len()].copy_from_slice(content);
-    encrypt_aes128_cbc_for_test(key, iv, &padded)
+    encrypt_aes128_cbc(key, iv, &padded)
 }
 
 fn build_rar4_encrypted_stored_archive(
@@ -2847,7 +2801,7 @@ fn test_rar4_encrypted_no_password_fails() {
     let padded_len = (content.len() + 15) & !15;
     let mut padded = vec![0u8; padded_len];
     padded[..content.len()].copy_from_slice(content);
-    let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, &padded);
+    let ciphertext = encrypt_aes128_cbc(&key, &iv, &padded);
 
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(content);
