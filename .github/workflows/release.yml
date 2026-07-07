@@ -63,7 +63,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mold nasm
+          sudo apt-get install -y --no-install-recommends mold nasm mandoc
       - name: Restore sccache directory
         id: sccache-restore
         uses: actions/cache/restore@v6
@@ -126,6 +126,9 @@ jobs:
       - name: Run release preflight checks
         run: |
           cargo fmt --check --all
+          cargo run --locked -p xtask -- docs --check
+          cargo run --locked -p xtask -- docs --out target/dist/docs
+          mandoc -Tlint target/dist/docs/share/man/man1/rarpar.1
           cargo clippy --locked -p rarpar --all-targets -- -D warnings
           cargo test --locked -p rarpar --no-fail-fast
       - name: Show sccache stats
@@ -313,6 +316,9 @@ jobs:
           New-Item -ItemType Directory -Force logs | Out-Null
           cargo build --locked --release -p rarpar --target ${{ matrix.target }} 2>&1 `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
+      - name: Generate manpage and completions
+        shell: bash
+        run: cargo run --locked -p xtask -- docs --out target/dist/docs
       - name: Smoke test release binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -346,6 +352,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/rarpar" package/
           cp README.md LICENSE package/
           cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
+          cp -R target/dist/docs/share package/share
           tar -czf "$archive" -C package .
           mv "$archive" dist/
       - name: Package artifact (Windows)
@@ -360,8 +367,23 @@ jobs:
           Copy-Item README.md package\
           Copy-Item LICENSE package\
           Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
+          Copy-Item target\dist\docs\share package\share -Recurse
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\
+      - name: Stage package root inspection artifact (Linux GNU)
+        if: runner.os == 'Linux' && endsWith(matrix.platform, '-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package-root package-roots
+          mkdir -p package-roots
+          cargo run --locked -p xtask -- package-root \
+            --binary "target/${{ matrix.target }}/release/rarpar" \
+            --docs target/dist/docs \
+            --out package-root \
+            --target "${{ matrix.target }}"
+          tar -czf "package-roots/package-root-${RELEASE_TAG}-${{ matrix.platform }}.tar.gz" \
+            -C package-root .
       - name: Show sccache stats
         if: always()
         shell: bash
@@ -374,10 +396,18 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rarpar-${{ matrix.platform }}
+          name: rarpar-release-${{ matrix.platform }}
           path: |
             dist/*
             logs/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload package root inspection artifact
+        if: runner.os == 'Linux' && endsWith(matrix.platform, '-gnu')
+        uses: actions/upload-artifact@v7
+        with:
+          name: rarpar-package-root-${{ matrix.platform }}
+          path: package-roots/*
           if-no-files-found: error
           retention-days: 14
 
@@ -393,6 +423,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
+          pattern: rarpar-release-*
           path: dist
           merge-multiple: true
       - name: Generate checksums
@@ -400,7 +431,7 @@ jobs:
           set -euo pipefail
           cd dist
           checksum_file="$(mktemp)"
-          find . -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) -print0 \
+          find . -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) ! -name '*package-root*' -print0 \
             | sort -z \
             | xargs -0 sha256sum > "$checksum_file"
           mv "$checksum_file" SHA256SUMS
@@ -515,6 +546,10 @@ jobs:
 
             def install
               bin.install "rarpar"
+              man1.install "share/man/man1/rarpar.1" if File.exist?("share/man/man1/rarpar.1")
+              bash_completion.install "share/bash-completion/completions/rarpar" if File.exist?("share/bash-completion/completions/rarpar")
+              zsh_completion.install "share/zsh/site-functions/_rarpar" if File.exist?("share/zsh/site-functions/_rarpar")
+              fish_completion.install "share/fish/vendor_completions.d/rarpar.fish" if File.exist?("share/fish/vendor_completions.d/rarpar.fish")
               pkgshare.install "README.md" if File.exist?("README.md")
               pkgshare.install "LICENSE" if File.exist?("LICENSE")
               pkgshare.install "LICENSE.weaver-unrar" if File.exist?("LICENSE.weaver-unrar")
@@ -522,6 +557,7 @@ jobs:
 
             test do
               assert_match "rarpar", shell_output("#{bin}/rarpar --help")
+              assert_path_exists man1/"rarpar.1"
             end
           end
           FORMULA

@@ -1,10 +1,10 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use crate::cli::Cli;
 use crate::discovery::{ExecutedAction, RarSet};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use crate::password::PasswordResolver;
+use rarpar::cli::Cli;
 
 pub struct RarOutcome {
     pub set_id: String,

@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
-use crate::cli::Cli;
 use crate::error::RarparError;
+use rarpar::cli::Cli;
 
 #[derive(Debug, Clone)]
 pub struct PasswordResolver {

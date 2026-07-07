@@ -1,6 +1,6 @@
-use crate::cli::Cli;
 use crate::discovery::DiscoveryReport;
 use crate::error::RarparError;
+use rarpar::cli::Cli;
 
 pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparError> {
     if cli.json {

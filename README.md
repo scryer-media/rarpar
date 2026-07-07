@@ -39,6 +39,9 @@ brew install scryer-media/rarpar/rarpar
 From a release archive, download the `rarpar` binary for your platform from
 GitHub Releases and place it on your `PATH`.
 
+Release archives include a `rarpar(1)` manpage and shell completions under
+`share/`. Homebrew installs those automatically.
+
 From source:
 
 ```bash
@@ -214,6 +217,7 @@ cargo test --locked --workspace --no-fail-fast
 
 Release and crates.io publishing automation lives under `.github/workflows/`.
 Publishing notes are in `docs/publishing.md`.
+Linux packaging layout notes are in `docs/packaging.md`.
 
 ## License
 

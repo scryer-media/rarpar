@@ -11,17 +11,30 @@ publish = false
 name = "rarpar"
 path = "src/main.rs"
 
+[features]
+default = ["runtime"]
+runtime = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:weaver-par2",
+    "dep:weaver-unrar",
+]
+
 [dependencies]
 weaver-par2 = { path = "../../crates/weaver-par2", version = "0.1.0", default-features = false, features = [
     "native-crypto",
-] }
+], optional = true }
 weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.1.0", default-features = false, features = [
     "native-crypto",
-] }
+], optional = true }
 clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tempfile = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }

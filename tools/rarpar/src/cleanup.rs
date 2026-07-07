@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::cli::Cli;
 use crate::discovery::{Par2Set, RarSet, related_par2_sets};
 use crate::error::RarparError;
 use crate::password::PasswordResolver;
+use rarpar::cli::Cli;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanupManifest {

@@ -212,6 +212,25 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
 
     let tables = precompute_mul_tables(factor);
 
+    // wasm dispatch is purely compile-time: the SIMD artifact is built with a
+    // fixed `target_feature` set, so the flavor is selected here, not at
+    // runtime. relaxed-simd takes precedence over plain simd128 (it is the
+    // richer build); wasm without simd128 falls through to the scalar tail.
+    #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+    {
+        unsafe { mul_acc_region_wasm_simd128::<true>(&tables, src, dst) };
+        return;
+    }
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        not(target_feature = "relaxed-simd")
+    ))]
+    {
+        unsafe { mul_acc_region_wasm_simd128::<false>(&tables, src, dst) };
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
@@ -233,6 +252,12 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
         unsafe { mul_acc_region_neon(&tables, src, dst) };
         return;
     }
+
+    // On wasm without simd128 (and any other target with no SIMD kernel) the
+    // scalar tail below consumes only `factor`; acknowledge the precomputed
+    // tables so the unused fallback build stays warning-free.
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
+    let _ = &tables;
 
     #[allow(unreachable_code)]
     mul_acc_region_scalar(factor, src, dst);
@@ -1383,6 +1408,126 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             // XOR-accumulate.
             let result = veorq_u8(d, product);
             vst1q_u8(dst.as_mut_ptr().add(offset), result);
+
+            offset += 16;
+        }
+    }
+
+    // Scalar tail.
+    if offset < len {
+        mul_acc_region_scalar(tables.factor, &src[offset..], &mut dst[offset..]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wasm simd128 kernel: 16 bytes (8 GF elements) per iteration
+//
+// A near-mechanical port of the NEON split-nibble kernel above (see the
+// module-level "Split-nibble shuffle" note). The same 8 precomputed 16-byte
+// tables map each of the four input nibbles to its low/high product byte, and
+// the eight table lookups are byte swizzles (wasm's PSHUFB/VTBL equivalent).
+//
+// Two flavors share one body via the `$lookup` macro parameter:
+//   * `i8x16_swizzle` (simd128)            — out-of-range indices yield 0, but
+//     our nibble indices are pre-masked to 0..=15 so no lane is ever cleared.
+//   * `i8x16_relaxed_swizzle` (relaxed-simd) — identical here; it merely drops
+//     the x86 lane-clamp that the plain form must emit, since we already
+//     guarantee in-range indices. Same bytes out, fewer instructions in.
+//
+// Lane bookkeeping mirrors NEON exactly:
+//   * deinterleave lo/hi bytes: `vuzp1q_u8`/`vuzp2q_u8(s, s)` become
+//     `i8x16_shuffle` gathering the even/odd byte lanes into lanes 0..=7 (only
+//     those eight are consumed downstream, one per GF word).
+//   * reinterleave: `vzip1q_u8(lo, hi)` becomes an `i8x16_shuffle` weaving
+//     result_lo[k]/result_hi[k] into [rlo0, rhi0, rlo1, rhi1, ...].
+//   * `vshrq_n_u8(x, 4)` becomes `u8x16_shr(x, 4)` (logical, u8x16.shr_u).
+//
+// Dispatch is compile-time: the artifact is built with `+simd128` (and
+// optionally `+relaxed-simd`), so there is no runtime feature detection.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn mul_acc_region_wasm_simd128<const RELAXED: bool>(
+    tables: &MulTables,
+    src: &[u8],
+    dst: &mut [u8],
+) {
+    use core::arch::wasm32::*;
+
+    let len = src.len();
+    let mut offset = 0usize;
+
+    // `i8x16_relaxed_swizzle` is only defined when the relaxed-simd feature is
+    // enabled, so the `RELAXED` arm is compiled out entirely without it.
+    macro_rules! lookup {
+        ($table:expr, $idx:expr) => {{
+            #[cfg(target_feature = "relaxed-simd")]
+            {
+                if RELAXED {
+                    i8x16_relaxed_swizzle($table, $idx)
+                } else {
+                    i8x16_swizzle($table, $idx)
+                }
+            }
+            #[cfg(not(target_feature = "relaxed-simd"))]
+            {
+                let _ = RELAXED;
+                i8x16_swizzle($table, $idx)
+            }
+        }};
+    }
+
+    unsafe {
+        let mask_0f = u8x16_splat(0x0F);
+
+        let t0 = v128_load(tables.tables[0].as_ptr() as *const v128);
+        let t1 = v128_load(tables.tables[1].as_ptr() as *const v128);
+        let t2 = v128_load(tables.tables[2].as_ptr() as *const v128);
+        let t3 = v128_load(tables.tables[3].as_ptr() as *const v128);
+        let t4 = v128_load(tables.tables[4].as_ptr() as *const v128);
+        let t5 = v128_load(tables.tables[5].as_ptr() as *const v128);
+        let t6 = v128_load(tables.tables[6].as_ptr() as *const v128);
+        let t7 = v128_load(tables.tables[7].as_ptr() as *const v128);
+
+        while offset + 16 <= len {
+            let s = v128_load(src.as_ptr().add(offset) as *const v128);
+            let d = v128_load(dst.as_ptr().add(offset) as *const v128);
+
+            // Deinterleave: gather even (lo) / odd (hi) bytes into lanes 0..=7.
+            // Only the low eight lanes are consumed downstream, mirroring the
+            // NEON `vuzp1q_u8`/`vuzp2q_u8(s, s)` pair.
+            let lo_bytes =
+                i8x16_shuffle::<0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14>(s, s);
+            let hi_bytes =
+                i8x16_shuffle::<1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15>(s, s);
+
+            // Extract nibbles.
+            let lo_n0 = v128_and(lo_bytes, mask_0f);
+            let lo_n1 = v128_and(u8x16_shr(lo_bytes, 4), mask_0f);
+            let hi_n0 = v128_and(hi_bytes, mask_0f);
+            let hi_n1 = v128_and(u8x16_shr(hi_bytes, 4), mask_0f);
+
+            // 8 lookups.
+            let p0_lo = lookup!(t0, lo_n0);
+            let p0_hi = lookup!(t1, lo_n0);
+            let p1_lo = lookup!(t2, lo_n1);
+            let p1_hi = lookup!(t3, lo_n1);
+            let p2_lo = lookup!(t4, hi_n0);
+            let p2_hi = lookup!(t5, hi_n0);
+            let p3_lo = lookup!(t6, hi_n1);
+            let p3_hi = lookup!(t7, hi_n1);
+
+            // XOR contributions.
+            let result_lo = v128_xor(v128_xor(p0_lo, p1_lo), v128_xor(p2_lo, p3_lo));
+            let result_hi = v128_xor(v128_xor(p0_hi, p1_hi), v128_xor(p2_hi, p3_hi));
+
+            // Reinterleave: [rlo0, rhi0, rlo1, rhi1, ...] (lanes 16..=23 pick the
+            // low bytes of result_hi), mirroring NEON `vzip1q_u8`.
+            let product = i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(
+                result_lo, result_hi,
+            );
+
+            // XOR-accumulate.
+            let result = v128_xor(d, product);
+            v128_store(dst.as_mut_ptr().add(offset) as *mut v128, result);
 
             offset += 16;
         }

@@ -1,5 +1,4 @@
 mod cleanup;
-mod cli;
 mod compat_unrar;
 mod discovery;
 mod error;
@@ -13,10 +12,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command, RarCommand};
 use crate::discovery::{DiscoveryOptions, DiscoveryReport};
 use crate::error::{EXIT_SUCCESS, RarparError};
 use crate::password::PasswordResolver;
+use rarpar::cli::{Cli, Command, RarCommand};
 
 fn main() -> ExitCode {
     install_tracing();

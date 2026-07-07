@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::cli::{Cli, ParArgs, ParCommand};
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
+use rarpar::cli::{Cli, ParArgs, ParCommand};
 
 pub struct ParOutcome {
     pub set_id: String,

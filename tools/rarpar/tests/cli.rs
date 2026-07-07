@@ -55,6 +55,45 @@ fn run_with_input(args: &[&OsStr], input: &[u8]) -> Output {
 }
 
 #[test]
+fn root_help_leads_with_natural_workflow() {
+    let output = run(&[OsStr::new("--help")]);
+    assert!(
+        output.status.success(),
+        "--help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rarpar <path>"));
+    assert!(stdout.contains("rarpar inspect --json <path>"));
+    assert!(stdout.contains("rarpar cleanup --dry-run <path>"));
+    assert!(!stdout.contains("UNRAR"));
+}
+
+#[test]
+fn command_help_documents_mutation_safety() {
+    let auto = run(&[OsStr::new("auto"), OsStr::new("--help")]);
+    assert!(
+        auto.status.success(),
+        "auto --help failed: {}",
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    let auto_stdout = String::from_utf8_lossy(&auto.stdout);
+    assert!(auto_stdout.contains("verification enabled"));
+    assert!(auto_stdout.contains("verified successful extraction"));
+
+    let cleanup = run(&[OsStr::new("cleanup"), OsStr::new("--help")]);
+    assert!(
+        cleanup.status.success(),
+        "cleanup --help failed: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    let cleanup_stdout = String::from_utf8_lossy(&cleanup.stdout);
+    assert!(cleanup_stdout.contains("Validate expected extracted outputs"));
+    assert!(cleanup_stdout.contains("dry-run"));
+}
+
+#[test]
 fn inspect_detects_obfuscated_rar_by_magic_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[

@@ -17,6 +17,15 @@
 
 mod backend;
 
+// Multi-way SIMD BLAKE2sp kernel (NEON + wasm simd128). Only compiled on the
+// targets where `blake2s_simd` itself lacks a vector BLAKE2sp backend and this
+// module is actually selected below.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+mod blake2sp_simd;
+
 // Differential tests comparing the two backends bit-for-bit; only compiled
 // when both are built (native, both features enabled).
 #[cfg(all(
@@ -31,6 +40,13 @@ use std::borrow::Cow;
 use std::io::Read;
 use std::sync::Mutex;
 
+// The upstream BLAKE2sp is only used where the in-crate SIMD kernel is not
+// selected (see `Blake2spHasher` below); gate the import to that config so it
+// does not read as unused on aarch64 / wasm-simd128 builds.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 use blake2s_simd::blake2sp;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
@@ -275,6 +291,28 @@ pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
     backend::hmac_sha256(&backend::hmac_sha256_key(key), &value)
 }
 
+/// Incremental BLAKE2sp hasher.
+///
+/// The public API (`new` / `update` / `finalize`) and its byte output are the
+/// same on every target; only the backend differs. `blake2s_simd` ships only
+/// AVX2/SSE4.1/portable backends, so on `aarch64` and `wasm32 + simd128` its
+/// BLAKE2sp runs scalar; on exactly those targets we substitute the in-crate
+/// [`blake2sp_simd`](crate::crypto::blake2sp_simd) NEON / `simd128` kernel.
+/// Everywhere else (x86 AVX2, wasm without simd, other arches) it keeps calling
+/// `blake2s_simd` unchanged. The output is byte-identical either way.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+#[derive(Clone, Debug)]
+pub struct Blake2spHasher {
+    inner: blake2sp_simd::Blake2spState,
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 #[derive(Clone, Debug)]
 pub struct Blake2spHasher {
     inner: blake2sp::State,
@@ -286,6 +324,30 @@ impl Default for Blake2spHasher {
     }
 }
 
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+impl Blake2spHasher {
+    pub fn new() -> Self {
+        Self {
+            inner: blake2sp_simd::Blake2spState::new(),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub fn finalize(&self) -> [u8; 32] {
+        self.inner.finalize()
+    }
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 impl Blake2spHasher {
     pub fn new() -> Self {
         Self {
@@ -302,9 +364,31 @@ impl Blake2spHasher {
     }
 }
 
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+pub fn blake2sp_hash(data: &[u8]) -> [u8; 32] {
+    blake2sp_simd::hash(data)
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 pub fn blake2sp_hash(data: &[u8]) -> [u8; 32] {
     *blake2sp::blake2sp(data).as_array()
 }
+
+/// Re-export of the in-crate SIMD BLAKE2sp differential-corpus runner, used by
+/// the `wasm32` validation harness (an example) to exercise the `simd128`
+/// backend under `wasmtime`. `#[doc(hidden)]`: not part of the public API.
+#[doc(hidden)]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+pub use blake2sp_simd::{CorpusReport, differential_corpus};
 
 // =============================================================================
 // KDF cache — avoids re-deriving keys for repeated password+salt combinations

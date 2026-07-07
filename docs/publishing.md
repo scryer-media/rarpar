@@ -56,16 +56,21 @@ Verify repository metadata before the first publish.
   same toolchain explicitly for action compatibility.
 - `.github/workflows/ci.yml` runs formatting, clippy, workspace tests, and
   package-content checks on pull requests, pushes to `main`, and manual runs.
-  Native build lanes use `sccache`, Linux `mold`, path-prefix remapping, and
-  `--no-install-recommends` native dependency installs.
+  It also validates generated manpages, shell completions, and the future Linux
+  package-root layout. Native build lanes use `sccache`, Linux `mold`,
+  path-prefix remapping, and `--no-install-recommends` native dependency
+  installs.
 - `.github/workflows/release.yml` builds release archives for Linux GNU, Linux
   musl, macOS Apple Silicon, macOS Intel, and Windows, then creates or updates
   a GitHub Release. It runs on tags matching `rarpar-v*` and supports manual
   dispatch against an existing tag. It validates that the tag version matches
-  every workspace package, smoke-tests each native binary, and uploads build
-  logs plus `sccache` stats as workflow artifacts. GitHub Releases receive only
-  `rarpar-*.tar.gz`, `rarpar-*.zip`, and `SHA256SUMS`. When `TAP_PUSH_TOKEN` is
-  available, the release job updates
+  every workspace package, validates generated manpages/completions, smoke-tests
+  each native binary, and uploads build logs plus `sccache` stats as workflow
+  artifacts. Release archives include `share/` manpage and completion files.
+  Linux GNU builds also upload package-root inspection artifacts for future
+  distro packaging work, but GitHub Releases receive only `rarpar-*.tar.gz`,
+  `rarpar-*.zip`, and `SHA256SUMS`. When `TAP_PUSH_TOKEN` is available, the
+  release job updates
   `scryer-media/homebrew-rarpar` with a single portable Homebrew formula that
   selects the macOS archive for the current architecture and, on Linux,
   prefers the GNU/glibc archive when glibc is new enough, falling back to the

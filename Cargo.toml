@@ -4,6 +4,7 @@ members = [
     "crates/weaver-unrar",
     "crates/weaver-par2",
     "tools/rarpar",
+    "xtask",
 ]
 resolver = "2"
 

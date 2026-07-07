@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cleanup::{CleanupManifest, CleanupResult};
-use crate::cli::Cli;
 use crate::error::RarparError;
+use rarpar::cli::Cli;
 
 const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
 const RAR5_SIGNATURE: &[u8] = &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
