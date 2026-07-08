@@ -734,6 +734,48 @@ impl PreparedFactorMemo {
     }
 }
 
+/// XOR-JIT tier (x86_64, AVX2-without-GFNI): one JIT-compiled `dst ^= f*src`
+/// muladd body per distinct GF(2^16) factor in the decode matrix. Built once,
+/// before any parallel compute; `JitCode` is `Send + Sync`. `from_matrix`
+/// returns `None` when executable memory is unavailable, signalling the caller
+/// to fall back to the shuffle2x tier.
+#[cfg(target_arch = "x86_64")]
+struct JitMemo {
+    codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl JitMemo {
+    fn from_matrix(matrix: &matrix::Matrix) -> Option<Self> {
+        let mut codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>> =
+            (0..1usize << 16).map(|_| None).collect();
+        for output_idx in 0..matrix.rows {
+            for source_idx in 0..matrix.cols {
+                let factor = matrix.get(output_idx, source_idx);
+                // Factor 0 contributes nothing; already-built factors are reused.
+                if factor == 0 || codes[factor as usize].is_some() {
+                    continue;
+                }
+                match weaver_reed_solomon::xor_jit::build_muladd(factor) {
+                    Ok(Some(code)) => codes[factor as usize] = Some(code),
+                    // build_muladd only yields Ok(None) for factor 0 (skipped above).
+                    Ok(None) => {}
+                    // Executable memory unavailable: abandon the tier entirely.
+                    Err(_) => return None,
+                }
+            }
+        }
+        Some(Self { codes })
+    }
+
+    #[inline]
+    fn get(&self, factor: u16) -> &weaver_reed_solomon::xor_jit::memory::JitCode {
+        self.codes[factor as usize]
+            .as_ref()
+            .expect("jit code prepared during memo construction")
+    }
+}
+
 /// One double-buffered set of streamed source chunks. Which sources feed
 /// which outputs is read directly from the decode matrix inside the compute
 /// tasks — no gather lists are materialized.
@@ -748,15 +790,38 @@ struct StreamBatchSet {
     /// (kept in normal layout, applied scalar).
     scratch: Vec<u8>,
     tails: Vec<[u8; crate::gf_simd::SPLIT_BLOCK_BYTES]>,
+    /// XOR-JIT path (x86_64): each source's normal-layout sub-block tail bytes
+    /// (< 512), applied scalar. On this path `bufs` holds the bit-planar source
+    /// blocks and `scratch` is the pre-transpose read buffer.
+    #[cfg(target_arch = "x86_64")]
+    xorjit_tails: Vec<Vec<u8>>,
     tail_len: usize,
     start: usize,
     len: usize,
 }
 
 impl StreamBatchSet {
-    fn new(max_byte_len: usize, folded: bool) -> Self {
+    fn new(max_byte_len: usize, folded: bool, xorjit: bool) -> Self {
         let groups = STREAM_INPUT_BATCH / crate::gf_simd::FOLDED_GROUP;
-        if folded {
+        if xorjit {
+            // XOR-JIT path: `bufs` holds the per-source bit-planar blocks,
+            // `scratch` is the pre-transpose read buffer, and `xorjit_tails`
+            // keeps each source's < 512-byte normal-layout tail.
+            Self {
+                bufs: vec![vec![0u8; max_byte_len]; STREAM_INPUT_BATCH],
+                staging: Vec::new(),
+                scratch: vec![0u8; max_byte_len],
+                tails: Vec::new(),
+                #[cfg(target_arch = "x86_64")]
+                xorjit_tails: vec![
+                    vec![0u8; weaver_reed_solomon::xor_jit::transpose::BLOCK_BYTES];
+                    STREAM_INPUT_BATCH
+                ],
+                tail_len: 0,
+                start: 0,
+                len: 0,
+            }
+        } else if folded {
             Self {
                 bufs: Vec::new(),
                 staging: (0..groups)
@@ -764,6 +829,8 @@ impl StreamBatchSet {
                     .collect(),
                 scratch: vec![0u8; max_byte_len],
                 tails: vec![[0u8; crate::gf_simd::SPLIT_BLOCK_BYTES]; STREAM_INPUT_BATCH],
+                #[cfg(target_arch = "x86_64")]
+                xorjit_tails: Vec::new(),
                 tail_len: 0,
                 start: 0,
                 len: 0,
@@ -774,6 +841,8 @@ impl StreamBatchSet {
                 staging: Vec::new(),
                 scratch: Vec::new(),
                 tails: Vec::new(),
+                #[cfg(target_arch = "x86_64")]
+                xorjit_tails: Vec::new(),
                 tail_len: 0,
                 start: 0,
                 len: 0,
@@ -831,6 +900,7 @@ fn fill_stream_batch(
     byte_start: usize,
     byte_len: usize,
     use_folded: bool,
+    use_xorjit: bool,
     options: &RepairOptions,
 ) -> Result<()> {
     for b in 0..batch_len {
@@ -845,13 +915,40 @@ fn fill_stream_batch(
             available_inputs,
             batch_start + b,
             byte_start,
-            if use_folded {
+            if use_folded || use_xorjit {
                 &mut set.scratch[..byte_len]
             } else {
                 &mut set.bufs[b][..byte_len]
             },
         )?;
-        if use_folded {
+        if use_xorjit {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use weaver_reed_solomon::xor_jit::transpose;
+                // Bit-transpose each full 512-byte block into the planar `bufs`
+                // slot; the < 512-byte remainder stays normal for the scalar tail.
+                let vec_len = byte_len & !(transpose::BLOCK_BYTES - 1);
+                for k in 0..vec_len / transpose::BLOCK_BYTES {
+                    let s = k * transpose::BLOCK_BYTES;
+                    // SAFETY: use_xorjit implies AVX2 (xor_jit::supported()); the
+                    // read window (scratch) and write window (bufs) are distinct
+                    // fields of `set` and each exactly BLOCK_BYTES long.
+                    unsafe {
+                        transpose::prepare_block(
+                            (&set.scratch[s..s + transpose::BLOCK_BYTES])
+                                .try_into()
+                                .unwrap(),
+                            (&mut set.bufs[b][s..s + transpose::BLOCK_BYTES])
+                                .try_into()
+                                .unwrap(),
+                        );
+                    }
+                }
+                let tail_len = byte_len - vec_len;
+                set.xorjit_tails[b][..tail_len].copy_from_slice(&set.scratch[vec_len..byte_len]);
+                set.tail_len = tail_len;
+            }
+        } else if use_folded {
             let group = b / crate::gf_simd::FOLDED_GROUP;
             let lane = b % crate::gf_simd::FOLDED_GROUP;
             crate::gf_simd::split_encode_scatter(
@@ -927,15 +1024,105 @@ fn run_folded_tiles<F>(
 /// from the decode matrix inside each task. Strip-parallel when the chunk is
 /// large (keeps the batch's source strips cache-resident across all outputs);
 /// output-parallel when the chunk itself is small.
+#[allow(clippy::too_many_arguments)]
 fn run_stream_batch_compute(
     output_ptrs: &[usize],
     set: &StreamBatchSet,
     plan: &RepairPlan,
     memo: &PreparedFactorMemo,
+    #[cfg(target_arch = "x86_64")] jit_memo: Option<&JitMemo>,
     byte_len: usize,
     use_folded: bool,
+    use_xorjit: bool,
 ) {
     let matrix = &plan.input_factors;
+    if use_xorjit {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let jit_memo = jit_memo.expect("jit_memo present when use_xorjit is set");
+            // Prefix: whole 512-byte planar blocks via the JIT muladd
+            // (dst ^= factor*src, both operands planar). Tiled at
+            // COMPUTE_TILE_BYTES (a multiple of 512) so each destination tile
+            // stays L1-resident across all of this batch's sources — without
+            // tiling the output is reloaded from DRAM once per source, which
+            // dominates large-slice repairs. Mirrors `run_folded_tiles`.
+            let vec_len = byte_len & !(weaver_reed_solomon::xor_jit::transpose::BLOCK_BYTES - 1);
+            if vec_len > 0 {
+                let tiles = vec_len.div_ceil(COMPUTE_TILE_BYTES);
+                let threads = rayon::current_num_threads().max(1);
+                let outputs_n = output_ptrs.len();
+                let blocks_per_tile = if tiles >= threads * 2 {
+                    1
+                } else {
+                    (threads * 4)
+                        .div_ceil(tiles.max(1))
+                        .clamp(1, outputs_n.max(1))
+                };
+                let output_block = outputs_n.div_ceil(blocks_per_tile).max(1);
+                let task_count = tiles * blocks_per_tile;
+                (0..task_count).into_par_iter().for_each(|task| {
+                    let tile = task / blocks_per_tile;
+                    let block = task % blocks_per_tile;
+                    let s0 = tile * COMPUTE_TILE_BYTES;
+                    let s1 = (s0 + COMPUTE_TILE_BYTES).min(vec_len);
+                    let tile_len = s1 - s0;
+                    let j0 = block * output_block;
+                    let j1 = (j0 + output_block).min(outputs_n);
+                    for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0)
+                    {
+                        // SAFETY: use_xorjit implies AVX2; the tile [s0,s1) is a
+                        // multiple of 512 (COMPUTE_TILE_BYTES and vec_len both are)
+                        // and `bufs[b]`/output cover it; each (tile, output) range
+                        // has exactly one writer.
+                        let dst = unsafe { (output_ptr as *mut u8).add(s0) };
+                        for b in 0..set.len {
+                            let factor = matrix.get(j, set.start + b);
+                            if factor == 0 {
+                                continue;
+                            }
+                            unsafe {
+                                jit_memo.get(factor).run_muladd(
+                                    set.bufs[b].as_ptr().add(s0),
+                                    dst,
+                                    tile_len,
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            // Tail: the < 512-byte remainder stays normal layout, applied scalar
+            // into the disjoint [vec_len, byte_len) output region.
+            if set.tail_len > 0 {
+                output_ptrs
+                    .par_iter()
+                    .copied()
+                    .enumerate()
+                    .for_each(|(j, output_ptr)| {
+                        // SAFETY: one writer per output; this region is disjoint
+                        // from the planar prefix written above.
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (output_ptr as *mut u8).add(vec_len),
+                                set.tail_len,
+                            )
+                        };
+                        for b in 0..set.len {
+                            let factor = matrix.get(j, set.start + b);
+                            if factor == 0 {
+                                continue;
+                            }
+                            crate::gf_simd::mul_acc_region(
+                                factor,
+                                &set.xorjit_tails[b][..set.tail_len],
+                                dst,
+                            );
+                        }
+                    });
+            }
+        }
+        return;
+    }
     if use_folded {
         let vec_len = byte_len & !(crate::gf_simd::SPLIT_BLOCK_BYTES - 1);
         let groups = set.len.div_ceil(crate::gf_simd::FOLDED_GROUP);
@@ -1730,16 +1917,45 @@ fn execute_repair_streaming(
     // end: sources are encoded and group-interleaved as they are read,
     // accumulation runs plane-wise with register-resident folded matrices,
     // and outputs decode once per chunk before writing.
-    let use_folded = crate::gf_simd::altmap_supported();
+    // Tier selection: GFNI boxes take the affine folded path; AVX2-without-GFNI
+    // boxes take the XOR-JIT path (or shuffle2x if JIT alloc fails); every other
+    // target keeps the existing folded (x86 shuffle2x) or plain path.
+    // XOR-JIT is chosen only for the small-slice "B2 shape". The large-slice
+    // many-file "B1 shape" keeps shuffle2x, which amortizes the destination
+    // read-modify-write over a 6-source folded group; the per-source XOR-JIT
+    // muladd cannot, and loses on B1 even tiled (Zen2: B1 1 MiB slices
+    // shuffle2x ~20 s vs XOR-JIT ~32 s; B2 64 KiB slices XOR-JIT ahead).
+    #[cfg(target_arch = "x86_64")]
+    const XORJIT_MAX_SLICE_BYTES: u64 = 256 * 1024;
+    #[cfg(target_arch = "x86_64")]
+    let xorjit_candidate =
+        weaver_reed_solomon::xor_jit::supported() && plan.slice_size <= XORJIT_MAX_SLICE_BYTES;
+    #[cfg(not(target_arch = "x86_64"))]
+    let xorjit_candidate = false;
+    // Build the JIT memo up front so an executable-memory failure falls back to
+    // shuffle2x before any buffer is shaped for the planar layout.
+    #[cfg(target_arch = "x86_64")]
+    let jit_memo = if xorjit_candidate {
+        JitMemo::from_matrix(&plan.input_factors)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "x86_64")]
+    let use_xorjit = xorjit_candidate && jit_memo.is_some();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_xorjit = xorjit_candidate;
+    let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit;
     let memo = PreparedFactorMemo::from_matrix(&plan.input_factors, use_folded);
     let mut batch_sets = [
-        StreamBatchSet::new(max_byte_len, use_folded),
-        StreamBatchSet::new(max_byte_len, use_folded),
+        StreamBatchSet::new(max_byte_len, use_folded, use_xorjit),
+        StreamBatchSet::new(max_byte_len, use_folded, use_xorjit),
     ];
     let effective_bytes = (n as u64)
         .saturating_mul(total_sources as u64)
         .saturating_mul(plan.slice_size);
-    let mut gpu = GpuComputeArm::engage(use_folded, n, max_byte_len, effective_bytes);
+    // The GPU (Metal) arm is the non-x86 shape: engage only when neither x86
+    // fast path (folded or xorjit) owns the accumulation.
+    let mut gpu = GpuComputeArm::engage(use_folded || use_xorjit, n, max_byte_len, effective_bytes);
 
     info!(
         missing_slices = n,
@@ -1786,6 +2002,7 @@ fn execute_repair_streaming(
             byte_start,
             byte_len,
             use_folded,
+            use_xorjit,
             options,
         )?;
         let mut gpu_failed = false;
@@ -1819,6 +2036,7 @@ fn execute_repair_streaming(
                         byte_start,
                         byte_len,
                         use_folded,
+                        use_xorjit,
                         options,
                     );
                 }
@@ -1826,14 +2044,19 @@ fn execute_repair_streaming(
                 rayon::in_place_scope(|scope| {
                     let output_ptrs = &output_ptrs;
                     let memo = &memo;
+                    #[cfg(target_arch = "x86_64")]
+                    let jit_memo = jit_memo.as_ref();
                     scope.spawn(move |_| {
                         run_stream_batch_compute(
                             output_ptrs,
                             current,
                             plan,
                             memo,
+                            #[cfg(target_arch = "x86_64")]
+                            jit_memo,
                             byte_len,
                             use_folded,
+                            use_xorjit,
                         );
                     });
                     if batch_idx + 1 < batch_count {
@@ -1851,6 +2074,7 @@ fn execute_repair_streaming(
                             byte_start,
                             byte_len,
                             use_folded,
+                            use_xorjit,
                             options,
                         );
                     }
@@ -1867,7 +2091,29 @@ fn execute_repair_streaming(
             continue;
         }
 
-        if use_folded {
+        if use_xorjit {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use weaver_reed_solomon::xor_jit::transpose;
+                // Invert the planar transform on each 512-byte block; the scalar
+                // tail in [vec_len, byte_len) is already in normal layout.
+                let vec_len = byte_len & !(transpose::BLOCK_BYTES - 1);
+                chunk_output.par_iter_mut().for_each(|output| {
+                    for k in 0..vec_len / transpose::BLOCK_BYTES {
+                        let s = k * transpose::BLOCK_BYTES;
+                        // SAFETY: use_xorjit implies AVX2; each window is exactly
+                        // BLOCK_BYTES and the blocks are disjoint.
+                        unsafe {
+                            transpose::finish_block(
+                                (&mut output[s..s + transpose::BLOCK_BYTES])
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                });
+            }
+        } else if use_folded {
             chunk_output.par_iter_mut().for_each(|output| {
                 crate::gf_simd::altmap_decode(&mut output[..byte_len]);
             });

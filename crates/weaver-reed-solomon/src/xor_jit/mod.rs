@@ -16,3 +16,21 @@ pub mod deps;
 pub mod emit;
 pub mod memory;
 pub mod transpose;
+
+/// Whether the XOR-JIT tier should run: AVX2 present but GFNI absent. GFNI
+/// boxes use the faster affine folded kernel; this tier targets pre-GFNI x86
+/// (Zen1/2, pre-Ice-Lake Intel), where it beats the shuffle2x tier ~1.4×.
+pub fn supported() -> bool {
+    std::is_x86_feature_detected!("avx2") && !std::is_x86_feature_detected!("gfni")
+}
+
+/// Build the JIT'd muladd code for `factor` (returns `None` for factor 0, which
+/// contributes nothing). `Err` if executable memory could not be allocated —
+/// callers fall back to the shuffle2x tier.
+pub fn build_muladd(factor: u16) -> std::io::Result<Option<memory::JitCode>> {
+    if factor == 0 {
+        return Ok(None);
+    }
+    let code = codegen::generate_muladd(&deps::compute_deps(factor));
+    Ok(Some(memory::JitCode::new(&code)?))
+}
