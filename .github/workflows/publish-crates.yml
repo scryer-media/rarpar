@@ -168,7 +168,18 @@ jobs:
           mkdir -p .ci/package-lists
 
           registry_has_version() {
-            cargo info "$1@$2" >/dev/null 2>&1
+            local tmp rc
+            tmp="$(mktemp -d)"
+            if (
+              cd "$tmp"
+              cargo info "$1@$2" >/dev/null 2>&1
+            ); then
+              rc=0
+            else
+              rc=$?
+            fi
+            rm -rf "$tmp"
+            return "$rc"
           }
 
           manifest_for_crate() {
@@ -428,11 +439,18 @@ jobs:
           wait_for_crate_version() {
             crate="$1"
             version="$2"
+            local tmp
             for attempt in $(seq 1 20); do
+              tmp="$(mktemp -d)"
               echo "Waiting for ${crate} ${version} in crates.io index (attempt ${attempt})"
-              if cargo info "${crate}@${version}" >/dev/null 2>&1; then
+              if (
+                cd "$tmp"
+                cargo info "${crate}@${version}" >/dev/null 2>&1
+              ); then
+                rm -rf "$tmp"
                 return 0
               fi
+              rm -rf "$tmp"
               sleep 30
             done
             echo "timed out waiting for ${crate} ${version} in crates.io index" >&2

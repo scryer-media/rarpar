@@ -800,7 +800,18 @@ jobs:
           mkdir -p .ci/package-lists
 
           registry_has_version() {
-            cargo info "$1@$2" >/dev/null 2>&1
+            local tmp rc
+            tmp="$(mktemp -d)"
+            if (
+              cd "$tmp"
+              cargo info "$1@$2" >/dev/null 2>&1
+            ); then
+              rc=0
+            else
+              rc=$?
+            fi
+            rm -rf "$tmp"
+            return "$rc"
           }
 
           manifest_for_crate() {
