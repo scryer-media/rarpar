@@ -799,22 +799,105 @@ jobs:
           set -euo pipefail
           mkdir -p .ci/package-lists
 
-          cargo package --locked -p weaver-reed-solomon
-          for crate in weaver-unrar weaver-par2; do
-            cargo package --locked --no-verify -p "$crate"
-          done
+          registry_has_version() {
+            cargo info "$1@$2" >/dev/null 2>&1
+          }
 
-          for crate in weaver-reed-solomon weaver-unrar weaver-par2; do
+          manifest_for_crate() {
+            case "$1" in
+              weaver-reed-solomon) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
+              weaver-unrar) echo "crates/weaver-unrar/Cargo.toml" ;;
+              weaver-par2) echo "crates/weaver-par2/Cargo.toml" ;;
+              *) echo "unknown crate: $1" >&2; return 1 ;;
+            esac
+          }
+
+          verify_fixture_exclude() {
+            crate="$1"
+            case "$crate" in
+              weaver-unrar|weaver-par2)
+                python3 - "$(manifest_for_crate "$crate")" "$crate" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          manifest = pathlib.Path(sys.argv[1])
+          crate = sys.argv[2]
+          data = tomllib.loads(manifest.read_text())
+          excludes = data.get("package", {}).get("exclude", [])
+          if "tests/fixtures/**" not in excludes:
+              print(
+                  f"{crate} manifest must exclude tests/fixtures/**",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+                ;;
+            esac
+          }
+
+          exact_packaged_crates=""
+          package_and_list() {
+            crate="$1"
+            cargo package --locked -p "$crate"
             cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
             if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
-          done
+            if [ "$crate" = weaver-unrar ]; then
+              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+            fi
+            exact_packaged_crates="${exact_packaged_crates} ${crate}"
+          }
 
-          grep -Fxq LICENSE .ci/package-lists/weaver-unrar.txt
+          read -r reed_version unrar_version _ < <(python3 - <<'PY'
+          import json
+          import subprocess
+
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo",
+                  "metadata",
+                  "--locked",
+                  "--format-version",
+                  "1",
+                  "--no-deps",
+              ])
+          )
+          versions = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+          }
+          print(
+              versions["weaver-reed-solomon"],
+              versions["weaver-unrar"],
+              versions["weaver-par2"],
+          )
+          PY
+          )
+
+          package_and_list weaver-reed-solomon
+
+          if registry_has_version weaver-reed-solomon "$reed_version"; then
+            package_and_list weaver-unrar
+          else
+            echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$reed_version is published"
+            verify_fixture_exclude weaver-unrar
+          fi
+
+          if registry_has_version weaver-reed-solomon "$reed_version" \
+            && registry_has_version weaver-unrar "$unrar_version"; then
+            package_and_list weaver-par2
+          else
+            echo "weaver-par2 exact package check deferred until same-release dependencies are published"
+            verify_fixture_exclude weaver-par2
+          fi
+
+          export EXACT_PACKAGED_CRATES="$exact_packaged_crates"
           python3 - <<'PY'
           import json
+          import os
           import pathlib
           import subprocess
           import sys
@@ -824,6 +907,8 @@ jobs:
               "weaver-unrar": 2_500_000,
               "weaver-par2": 2_500_000,
           }
+          exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
+          limits = {crate: limits[crate] for crate in exact_packaged_crates}
           metadata = json.loads(
               subprocess.check_output([
                   "cargo",
@@ -839,6 +924,10 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in limits
           }
+          if not limits:
+              print("no exact .crate archives were produced", file=sys.stderr)
+              sys.exit(1)
+
           package_dir = pathlib.Path("target/package")
           failed = False
           for crate, limit in limits.items():
