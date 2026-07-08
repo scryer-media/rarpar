@@ -70,7 +70,8 @@ pub use rename::{
     scan_for_renames,
 };
 pub use repair::{
-    RepairOptions, RepairPlan, execute_repair, execute_repair_with_options, plan_repair,
+    NativeRepairSolver, RepairOptions, RepairPlan, RepairProblem, RepairSolver, SolverError,
+    execute_repair, execute_repair_with_options, execute_repair_with_solver, plan_repair,
     plan_repair_with_memory_limit, prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
 };
 pub use repairer::{

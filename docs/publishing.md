@@ -79,7 +79,8 @@ Verify repository metadata before the first publish.
   selected package mode. It is manual-only and defaults to dry-run/preflight
   mode. Use `package=all` for coordinated releases or a specific package name
   for patch releases. Set `dry_run` to `false` to publish. Real publishing
-  retries failures and waits for each published crate version to appear in the
+  runs exact package/list/size checks immediately before each crate, retries
+  failures, and waits for each published crate version to appear in the
   crates.io index before continuing.
 
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
@@ -105,6 +106,9 @@ Required repository configuration:
 
 Publish note: downstream crates can depend on same-version workspace crates that
 are not in the public registry yet. CI still runs the full workspace build/test
-suite and validates downstream package file lists and archive sizes; the
-protected publish workflow lets `cargo publish` perform the full verification as
-each upstream crate reaches the crates.io index.
+suite. For a first coordinated release of a new shared version, dry-run
+preflight cannot run exact `cargo package` checks for downstream crates until
+their same-version dependencies exist in the registry; it checks manifest
+fixture excludes instead. The protected real publish workflow performs the exact
+downstream package file-list and archive-size checks immediately before each
+publish, after the upstream crate has reached the crates.io index.

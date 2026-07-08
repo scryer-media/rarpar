@@ -49,28 +49,181 @@ const PW: Option<&'static str> = Some("testpass123");
 /// plus solid + PPMd rows for broader runtime coverage.
 const CASES: &[Case] = &[
     // ---------- rar5 ----------
-    Case { label: "rar5 store plain single", first: "rar5/rar5_store.rar", rest: &[], password: None },
-    Case { label: "rar5 lz    plain single", first: "rar5/rar5_lz.rar", rest: &[], password: None },
-    Case { label: "rar5 lz    enc   single", first: "rar5/rar5_enc_lz.rar", rest: &[], password: PW },
-    Case { label: "rar5 store enc   single", first: "rar5/rar5_enc_store.rar", rest: &[], password: PW },
-    Case { label: "rar5 lz    plain SOLID ", first: "rar5/rar5_solid.rar", rest: &[], password: None },
-    Case { label: "rar5 store plain mv    ", first: "rar5/rar5_mv_store.part1.rar", rest: &["rar5/rar5_mv_store.part2.rar", "rar5/rar5_mv_store.part3.rar", "rar5/rar5_mv_store.part4.rar", "rar5/rar5_mv_store.part5.rar"], password: None },
-    Case { label: "rar5 lz    plain mv    ", first: "rar5/generated_matrix_rar5_lz_plain.part1.rar", rest: &["rar5/generated_matrix_rar5_lz_plain.part2.rar", "rar5/generated_matrix_rar5_lz_plain.part3.rar", "rar5/generated_matrix_rar5_lz_plain.part4.rar", "rar5/generated_matrix_rar5_lz_plain.part5.rar", "rar5/generated_matrix_rar5_lz_plain.part6.rar", "rar5/generated_matrix_rar5_lz_plain.part7.rar"], password: None },
-    Case { label: "rar5 lz    enc   mv    ", first: "rar5/generated_matrix_rar5_lz_enc.part1.rar", rest: &["rar5/generated_matrix_rar5_lz_enc.part2.rar", "rar5/generated_matrix_rar5_lz_enc.part3.rar", "rar5/generated_matrix_rar5_lz_enc.part4.rar", "rar5/generated_matrix_rar5_lz_enc.part5.rar", "rar5/generated_matrix_rar5_lz_enc.part6.rar", "rar5/generated_matrix_rar5_lz_enc.part7.rar"], password: PW },
-    Case { label: "rar5 store enc   mv    ", first: "rar5/rar5_enc_mv_store.part1.rar", rest: &["rar5/rar5_enc_mv_store.part2.rar", "rar5/rar5_enc_mv_store.part3.rar", "rar5/rar5_enc_mv_store.part4.rar", "rar5/rar5_enc_mv_store.part5.rar"], password: PW },
+    Case {
+        label: "rar5 store plain single",
+        first: "rar5/rar5_store.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar5 lz    plain single",
+        first: "rar5/rar5_lz.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar5 lz    enc   single",
+        first: "rar5/rar5_enc_lz.rar",
+        rest: &[],
+        password: PW,
+    },
+    Case {
+        label: "rar5 store enc   single",
+        first: "rar5/rar5_enc_store.rar",
+        rest: &[],
+        password: PW,
+    },
+    Case {
+        label: "rar5 lz    plain SOLID ",
+        first: "rar5/rar5_solid.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar5 store plain mv    ",
+        first: "rar5/rar5_mv_store.part1.rar",
+        rest: &[
+            "rar5/rar5_mv_store.part2.rar",
+            "rar5/rar5_mv_store.part3.rar",
+            "rar5/rar5_mv_store.part4.rar",
+            "rar5/rar5_mv_store.part5.rar",
+        ],
+        password: None,
+    },
+    Case {
+        label: "rar5 lz    plain mv    ",
+        first: "rar5/generated_matrix_rar5_lz_plain.part1.rar",
+        rest: &[
+            "rar5/generated_matrix_rar5_lz_plain.part2.rar",
+            "rar5/generated_matrix_rar5_lz_plain.part3.rar",
+            "rar5/generated_matrix_rar5_lz_plain.part4.rar",
+            "rar5/generated_matrix_rar5_lz_plain.part5.rar",
+            "rar5/generated_matrix_rar5_lz_plain.part6.rar",
+            "rar5/generated_matrix_rar5_lz_plain.part7.rar",
+        ],
+        password: None,
+    },
+    Case {
+        label: "rar5 lz    enc   mv    ",
+        first: "rar5/generated_matrix_rar5_lz_enc.part1.rar",
+        rest: &[
+            "rar5/generated_matrix_rar5_lz_enc.part2.rar",
+            "rar5/generated_matrix_rar5_lz_enc.part3.rar",
+            "rar5/generated_matrix_rar5_lz_enc.part4.rar",
+            "rar5/generated_matrix_rar5_lz_enc.part5.rar",
+            "rar5/generated_matrix_rar5_lz_enc.part6.rar",
+            "rar5/generated_matrix_rar5_lz_enc.part7.rar",
+        ],
+        password: PW,
+    },
+    Case {
+        label: "rar5 store enc   mv    ",
+        first: "rar5/rar5_enc_mv_store.part1.rar",
+        rest: &[
+            "rar5/rar5_enc_mv_store.part2.rar",
+            "rar5/rar5_enc_mv_store.part3.rar",
+            "rar5/rar5_enc_mv_store.part4.rar",
+            "rar5/rar5_enc_mv_store.part5.rar",
+        ],
+        password: PW,
+    },
     // ---------- rar4 ----------
-    Case { label: "rar4 store plain single", first: "rar4/rar4_store.rar", rest: &[], password: None },
-    Case { label: "rar4 lz    plain single", first: "rar4/rar4_lz.rar", rest: &[], password: None },
-    Case { label: "rar4 lz    enc   single", first: "rar4/rar4_enc_lz.rar", rest: &[], password: PW },
-    Case { label: "rar4 store enc   single", first: "rar4/rar4_enc_store.rar", rest: &[], password: PW },
-    Case { label: "rar4 lz    plain SOLID ", first: "rar4/rar4_solid.rar", rest: &[], password: None },
-    Case { label: "rar4 ppmd  plain SOLID ", first: "rar4/rar4_ppm_solid_restart.rar", rest: &[], password: None },
-    Case { label: "rar4 store plain mv    ", first: "rar4/rar4_mv_store.part1.rar", rest: &["rar4/rar4_mv_store.part2.rar", "rar4/rar4_mv_store.part3.rar", "rar4/rar4_mv_store.part4.rar", "rar4/rar4_mv_store.part5.rar"], password: None },
-    Case { label: "rar4 lz    plain mv    ", first: "rar4/generated_matrix_rar4_lz_plain.part1.rar", rest: &["rar4/generated_matrix_rar4_lz_plain.part2.rar", "rar4/generated_matrix_rar4_lz_plain.part3.rar", "rar4/generated_matrix_rar4_lz_plain.part4.rar", "rar4/generated_matrix_rar4_lz_plain.part5.rar", "rar4/generated_matrix_rar4_lz_plain.part6.rar", "rar4/generated_matrix_rar4_lz_plain.part7.rar"], password: None },
-    Case { label: "rar4 lz    enc   mv    ", first: "rar4/generated_matrix_rar4_lz_enc.part1.rar", rest: &["rar4/generated_matrix_rar4_lz_enc.part2.rar", "rar4/generated_matrix_rar4_lz_enc.part3.rar", "rar4/generated_matrix_rar4_lz_enc.part4.rar", "rar4/generated_matrix_rar4_lz_enc.part5.rar", "rar4/generated_matrix_rar4_lz_enc.part6.rar", "rar4/generated_matrix_rar4_lz_enc.part7.rar"], password: PW },
-    Case { label: "rar4 store enc   mv    ", first: "rar4/rar4_enc_mv_store.part1.rar", rest: &["rar4/rar4_enc_mv_store.part2.rar", "rar4/rar4_enc_mv_store.part3.rar", "rar4/rar4_enc_mv_store.part4.rar", "rar4/rar4_enc_mv_store.part5.rar"], password: PW },
-    Case { label: "rar4 lz    plain SOLIDmv", first: "rar4/rar4_lz_solid_mv.rar", rest: &[], password: None },
-    Case { label: "rar4 ppmd  plain SOLIDmv", first: "rar4/rar4_ppm_solid_mv.rar", rest: &[], password: None },
+    Case {
+        label: "rar4 store plain single",
+        first: "rar4/rar4_store.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar4 lz    plain single",
+        first: "rar4/rar4_lz.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar4 lz    enc   single",
+        first: "rar4/rar4_enc_lz.rar",
+        rest: &[],
+        password: PW,
+    },
+    Case {
+        label: "rar4 store enc   single",
+        first: "rar4/rar4_enc_store.rar",
+        rest: &[],
+        password: PW,
+    },
+    Case {
+        label: "rar4 lz    plain SOLID ",
+        first: "rar4/rar4_solid.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar4 ppmd  plain SOLID ",
+        first: "rar4/rar4_ppm_solid_restart.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar4 store plain mv    ",
+        first: "rar4/rar4_mv_store.part1.rar",
+        rest: &[
+            "rar4/rar4_mv_store.part2.rar",
+            "rar4/rar4_mv_store.part3.rar",
+            "rar4/rar4_mv_store.part4.rar",
+            "rar4/rar4_mv_store.part5.rar",
+        ],
+        password: None,
+    },
+    Case {
+        label: "rar4 lz    plain mv    ",
+        first: "rar4/generated_matrix_rar4_lz_plain.part1.rar",
+        rest: &[
+            "rar4/generated_matrix_rar4_lz_plain.part2.rar",
+            "rar4/generated_matrix_rar4_lz_plain.part3.rar",
+            "rar4/generated_matrix_rar4_lz_plain.part4.rar",
+            "rar4/generated_matrix_rar4_lz_plain.part5.rar",
+            "rar4/generated_matrix_rar4_lz_plain.part6.rar",
+            "rar4/generated_matrix_rar4_lz_plain.part7.rar",
+        ],
+        password: None,
+    },
+    Case {
+        label: "rar4 lz    enc   mv    ",
+        first: "rar4/generated_matrix_rar4_lz_enc.part1.rar",
+        rest: &[
+            "rar4/generated_matrix_rar4_lz_enc.part2.rar",
+            "rar4/generated_matrix_rar4_lz_enc.part3.rar",
+            "rar4/generated_matrix_rar4_lz_enc.part4.rar",
+            "rar4/generated_matrix_rar4_lz_enc.part5.rar",
+            "rar4/generated_matrix_rar4_lz_enc.part6.rar",
+            "rar4/generated_matrix_rar4_lz_enc.part7.rar",
+        ],
+        password: PW,
+    },
+    Case {
+        label: "rar4 store enc   mv    ",
+        first: "rar4/rar4_enc_mv_store.part1.rar",
+        rest: &[
+            "rar4/rar4_enc_mv_store.part2.rar",
+            "rar4/rar4_enc_mv_store.part3.rar",
+            "rar4/rar4_enc_mv_store.part4.rar",
+            "rar4/rar4_enc_mv_store.part5.rar",
+        ],
+        password: PW,
+    },
+    Case {
+        label: "rar4 lz    plain SOLIDmv",
+        first: "rar4/rar4_lz_solid_mv.rar",
+        rest: &[],
+        password: None,
+    },
+    Case {
+        label: "rar4 ppmd  plain SOLIDmv",
+        first: "rar4/rar4_ppm_solid_mv.rar",
+        rest: &[],
+        password: None,
+    },
 ];
 
 /// Per-fixture extraction outcome.
@@ -103,8 +256,9 @@ fn open_archive(root: &Path, case: &Case) -> Result<RarArchive, String> {
     let mut archive = match case.password {
         Some(pw) => RarArchive::open_with_password(first, pw)
             .map_err(|e| format!("open_with_password {}: {e:?}", first_path.display()))?,
-        None => RarArchive::open(first)
-            .map_err(|e| format!("open {}: {e:?}", first_path.display()))?,
+        None => {
+            RarArchive::open(first).map_err(|e| format!("open {}: {e:?}", first_path.display()))?
+        }
     };
     if let Some(pw) = case.password {
         archive.set_password(pw);
@@ -137,10 +291,14 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
     let member_count = members.len();
     let solid = archive.is_solid();
 
-    let mut out = Outcome { members_extracted: 0, total_bytes: 0, spilled_members: 0 };
+    let mut out = Outcome {
+        members_extracted: 0,
+        total_bytes: 0,
+        spilled_members: 0,
+    };
 
-    for idx in 0..member_count {
-        if !is_data_member(&members[idx]) {
+    for (idx, member) in members.iter().enumerate().take(member_count) {
+        if !is_data_member(member) {
             continue;
         }
 
@@ -155,13 +313,19 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
                     Ok(Box::new(SharedVecWriter(Rc::clone(&writer_buf))) as Box<dyn Write>)
                 })
                 .map_err(|e| {
-                    format!("[{}] solid member {idx} ({}): {e:?}", case.label, members[idx].name)
+                    format!(
+                        "[{}] solid member {idx} ({}): {e:?}",
+                        case.label, member.name
+                    )
                 })?;
             out.members_extracted += 1;
             out.total_bytes += buf.borrow().len() as u64;
         } else {
             let extracted = archive.extract_member(idx, &options, None).map_err(|e| {
-                format!("[{}] extract_member {idx} ({}): {e:?}", case.label, members[idx].name)
+                format!(
+                    "[{}] extract_member {idx} ({}): {e:?}",
+                    case.label, member.name
+                )
             })?;
             out.members_extracted += 1;
             out.total_bytes += extracted.len() as u64;
@@ -172,7 +336,10 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
     }
 
     if out.members_extracted == 0 {
-        return Err(format!("[{}] no data members extracted (count={member_count})", case.label));
+        return Err(format!(
+            "[{}] no data members extracted (count={member_count})",
+            case.label
+        ));
     }
     Ok(out)
 }

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::io::{BufReader, BufWriter, Write};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(any(unix, windows))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

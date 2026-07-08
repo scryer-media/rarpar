@@ -1754,7 +1754,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rarpar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "serde",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-lc-sys 0.41.0",
  "bytes",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-reed-solomon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "objc2",
  "objc2-foundation",
@@ -3156,7 +3156,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "clap_complete",

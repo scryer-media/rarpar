@@ -100,6 +100,7 @@ fn make_windows_component_compatible(component: &str) -> String {
     converted
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn make_unix_windows_share_member_name_compatible(path: &str) -> String {
     let mut converted = String::with_capacity(path.len());
     let mut parts = path.split('/').peekable();
@@ -116,6 +117,7 @@ pub(crate) fn make_unix_windows_share_member_name_compatible(path: &str) -> Stri
     converted
 }
 
+#[cfg(any(unix, test))]
 fn make_unix_windows_share_component_compatible(
     component: &str,
     has_following_separator: bool,

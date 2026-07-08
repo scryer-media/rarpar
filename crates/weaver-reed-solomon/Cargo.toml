@@ -6,13 +6,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Opt-in Apple-GPU (Metal) GF(2^16) backend. Off by default so downstream
+# consumers (e.g. scryer's host reconstruct) that only use the CPU/SIMD
+# kernels never link objc2/Metal. The objc2* deps below are macOS-only and
+# optional; the `metal_gf16` module and its tests are additionally gated on
+# `target_os = "macos"` since objc2 cannot build on other platforms.
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
 [dependencies]
 rayon = { workspace = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSRange", "NSString"] }
-objc2-metal = { version = "0.3.2", default-features = false, features = [
+objc2 = { version = "0.6.2", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSRange", "NSString"], optional = true }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
     "MTLAllocation",
     "MTLBlitCommandEncoder",
     "MTLBuffer",

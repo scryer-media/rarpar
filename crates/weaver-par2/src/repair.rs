@@ -1534,12 +1534,12 @@ fn reconstruct_and_write_grouped_inputs(
 /// (see `weaver_reed_solomon::metal_gf16`). Any GPU error permanently
 /// disables the arm and the caller redoes the affected chunk on the CPU.
 struct GpuComputeArm {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     session: Option<weaver_reed_solomon::metal_gf16::MetalGf16Session>,
 }
 
 impl GpuComputeArm {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     fn engage(use_folded: bool, outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Self {
         // The folded path is x86-only, so `!use_folded` is the macOS shape;
         // the guard keeps the invariant explicit.
@@ -1562,7 +1562,7 @@ impl GpuComputeArm {
         Self { session }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     fn engage(
         _use_folded: bool,
         _outputs: usize,
@@ -1574,7 +1574,7 @@ impl GpuComputeArm {
 
     /// True when the GPU owns this chunk's accumulation.
     fn begin_chunk(&mut self, _byte_len: usize) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         {
             if let Some(session) = self.session.as_mut() {
                 match session.begin_chunk(_byte_len) {
@@ -1597,7 +1597,7 @@ impl GpuComputeArm {
         _plan: &RepairPlan,
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());
@@ -1625,7 +1625,7 @@ impl GpuComputeArm {
         _rows: &mut [Vec<u8>],
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());
@@ -1856,6 +1856,414 @@ fn execute_repair_streaming(
     Ok(())
 }
 
+// ── Host-agnostic repair-solver seam (RFC 123 WP2.5) ───────────────────────
+//
+// The Reed-Solomon reconstruct (`out[j] = XOR over sources s of
+// gf::mul(coeff[j][s], src[s])`) is the one step that cannot run under
+// single-threaded `wasm32-wasip1`: weaver parallelises it with rayon, which
+// cannot spawn a pool there, and the decode-matrix build wants a large native
+// stack. This seam lets a host inject a non-rayon solver (e.g. one that
+// marshals the solve to native host threads) WITHOUT weaver-par2 depending on
+// any host ABI. `RepairProblem` is a plain description of the solve — the same
+// fields the frozen "PAR2 v2" host descriptor carries — so a wasm consumer can
+// marshal it, while the native default keeps the current rayon behaviour.
+
+/// A host-agnostic description of a Reed-Solomon repair reconstruct.
+///
+/// Sources are ordered available inputs first (in `available_indices` order),
+/// then the selected recovery blocks (in `recovery_exponents` order) — the same
+/// column ordering as [`RepairPlan::input_factors`]. Each source and output
+/// region is `word_count * 2` bytes; output regions are pairwise disjoint. A
+/// solver reconstructs every `outputs[j]` in place, in `missing_indices` order.
+///
+/// This carries no pre-built matrix and no weaver-specific types: it is exactly
+/// the data a host needs to (re)build the repair coefficient matrix (via
+/// [`weaver_reed_solomon::matrix::build_repair_matrix`]) and run the GF matmul.
+pub struct RepairProblem<'a> {
+    /// Total input slices in the recovery set (indexes `constants`).
+    pub total_inputs: usize,
+    /// `u16` words per slice; each region is `word_count * 2` bytes.
+    pub word_count: usize,
+    /// Global indices of the missing slices (one per output row).
+    pub missing_indices: &'a [usize],
+    /// Global indices of the available input slices (source columns first).
+    pub available_indices: &'a [usize],
+    /// Recovery-block exponents used, one per missing slice (source columns last).
+    pub recovery_exponents: &'a [u32],
+    /// PAR2 input-slice constants for every input slice in the recovery set.
+    pub constants: &'a [u16],
+    /// Source byte-regions: available inputs then recovery blocks.
+    pub sources: &'a [&'a [u8]],
+    /// Output byte-regions for the reconstructed missing slices (disjoint).
+    pub outputs: &'a mut [&'a mut [u8]],
+}
+
+impl RepairProblem<'_> {
+    /// Bytes per source/output region (`word_count * 2`).
+    #[inline]
+    pub fn slice_bytes(&self) -> usize {
+        self.word_count * 2
+    }
+}
+
+/// Failure returned by a [`RepairSolver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SolverError {
+    /// The selected recovery exponents form a singular (non-invertible) matrix.
+    Singular {
+        /// Index into `recovery_exponents` of the unusable row, when known.
+        bad_row: Option<usize>,
+    },
+    /// The problem's dimensions were inconsistent with the solver.
+    Dimensions(String),
+    /// The solve was cancelled cooperatively.
+    Cancelled,
+    /// An opaque host-side failure (e.g. a wasm host-fn error code).
+    Host(String),
+}
+
+impl std::fmt::Display for SolverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SolverError::Singular { bad_row: Some(row) } => {
+                write!(f, "repair matrix is singular (recovery row {row})")
+            }
+            SolverError::Singular { bad_row: None } => write!(f, "repair matrix is singular"),
+            SolverError::Dimensions(reason) => write!(f, "repair problem dimensions: {reason}"),
+            SolverError::Cancelled => write!(f, "repair reconstruct cancelled"),
+            SolverError::Host(reason) => write!(f, "repair solver host failure: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SolverError {}
+
+impl From<SolverError> for Par2Error {
+    fn from(error: SolverError) -> Self {
+        match error {
+            SolverError::Cancelled => Par2Error::Cancelled,
+            other => Par2Error::ReedSolomonError {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
+/// The injectable reconstruct step of a PAR2 repair.
+///
+/// weaver-par2 calls this once per repair, at whole-reconstruct granularity;
+/// the hot per-element GF loop lives entirely inside an implementation, so the
+/// native default ([`NativeRepairSolver`]) is monomorphised with no dynamic
+/// dispatch on that loop. A host (e.g. a wasm plugin) implements this to run
+/// the solve off the rayon path — for example by marshaling `problem` to a
+/// native host-thread solver — without weaver-par2 knowing any host ABI.
+pub trait RepairSolver {
+    /// Reconstruct every `problem.outputs[j]` in place from `problem.sources`.
+    fn reconstruct(&self, problem: &mut RepairProblem<'_>) -> std::result::Result<(), SolverError>;
+}
+
+/// The native default solver: weaver's rayon GF(2^16) matmul over the plan's
+/// pre-built `input_factors`. Byte-identical to the pre-seam in-memory
+/// reconstruct, and the path exercised by the crate's own repair tests.
+pub struct NativeRepairSolver<'a> {
+    input_factors: &'a matrix::Matrix,
+    chunk_words: usize,
+    cancel: Option<CancellationToken>,
+}
+
+impl<'a> NativeRepairSolver<'a> {
+    /// Build a solver over the plan's repair coefficient matrix. `chunk_words`
+    /// is the per-output word tiling used by the rayon kernel (see
+    /// [`RepairExecutionMode::InMemory`]).
+    pub fn new(input_factors: &'a matrix::Matrix, chunk_words: usize) -> Self {
+        Self {
+            input_factors,
+            chunk_words,
+            cancel: None,
+        }
+    }
+
+    /// Attach a cancellation token, checked once per output row.
+    pub fn with_cancellation(mut self, cancel: Option<CancellationToken>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+}
+
+impl RepairSolver for NativeRepairSolver<'_> {
+    fn reconstruct(&self, problem: &mut RepairProblem<'_>) -> std::result::Result<(), SolverError> {
+        let n = problem.outputs.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if self.input_factors.rows != n {
+            return Err(SolverError::Dimensions(format!(
+                "input_factors has {} rows but {n} outputs",
+                self.input_factors.rows
+            )));
+        }
+        if self.input_factors.cols != problem.sources.len() {
+            return Err(SolverError::Dimensions(format!(
+                "input_factors has {} cols but {} sources",
+                self.input_factors.cols,
+                problem.sources.len()
+            )));
+        }
+
+        let word_count = problem.word_count;
+        let chunk_words = self.chunk_words.max(1);
+        let total_chunks_usize = word_count.div_ceil(chunk_words);
+
+        // Deduplicate prepared multiply tables per distinct factor value; a
+        // dense decode matrix repeats factors across (output, input) pairs, and
+        // preparing one table per pair would multiply memory by outputs*inputs.
+        let output_inputs = grouped_input_factors(self.input_factors);
+        let mut factor_slots: HashMap<u16, usize> = HashMap::new();
+        let mut prepared_factors: Vec<crate::gf_simd::PreparedInputFactor> = Vec::new();
+        let prepared_output_inputs: Vec<Vec<(u16, usize)>> = output_inputs
+            .iter()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|factor_input| {
+                        let slot = *factor_slots.entry(factor_input.factor).or_insert_with(|| {
+                            prepared_factors
+                                .push(crate::gf_simd::prepare_input_factor(factor_input.factor));
+                            prepared_factors.len() - 1
+                        });
+                        (factor_input.input_idx, slot)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let sources = problem.sources;
+        let prepared_factors = &prepared_factors;
+        let prepared_output_inputs = &prepared_output_inputs;
+        let cancel = self.cancel.as_ref();
+        let outputs = &mut *problem.outputs;
+
+        outputs.par_iter_mut().enumerate().try_for_each(
+            |(output_idx, out)| -> std::result::Result<(), SolverError> {
+                if let Some(cancel) = cancel
+                    && cancel.is_cancelled()
+                {
+                    return Err(SolverError::Cancelled);
+                }
+                let out: &mut [u8] = out;
+                let decode_inputs = &prepared_output_inputs[output_idx];
+                let mut chunk_inputs = Vec::with_capacity(decode_inputs.len());
+
+                for chunk_idx in 0..total_chunks_usize {
+                    let chunk_start = chunk_idx * chunk_words;
+                    let chunk_end = (chunk_start + chunk_words).min(word_count);
+                    let byte_start = chunk_start * 2;
+                    let byte_len = (chunk_end - chunk_start) * 2;
+
+                    chunk_inputs.clear();
+                    for (input_idx, factor_slot) in decode_inputs {
+                        chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
+                            prepared: &prepared_factors[*factor_slot],
+                            src: &sources[*input_idx as usize][byte_start..byte_start + byte_len],
+                        });
+                    }
+
+                    crate::gf_simd::mul_acc_input_batch_prepared(
+                        &mut out[byte_start..byte_start + byte_len],
+                        &chunk_inputs,
+                    );
+                }
+
+                Ok(())
+            },
+        )
+    }
+}
+
+/// Read the plan's sources into memory, reconstruct the missing slices through
+/// `solver`, and write them back. This is the in-memory repair shape shared by
+/// the native default and any injected [`RepairSolver`]; the streaming path
+/// (native-only, I/O-interleaved) does not use the seam.
+fn run_in_memory_repair<S: RepairSolver + ?Sized>(
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    options: &RepairOptions,
+    solver: &S,
+) -> Result<()> {
+    let n = plan.missing_slices.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let slice_size = plan.slice_size as usize;
+    assert!(
+        slice_size.is_multiple_of(2),
+        "PAR2 slice_size must be a multiple of 2"
+    );
+    let word_count = slice_size / 2;
+    let available_inputs = plan.available_input_global_indices.len();
+    let total_inputs = available_inputs + plan.recovery_exponents.len();
+    let total_inputs_u32 = total_inputs.min(u32::MAX as usize) as u32;
+    let read_total_bytes = (total_inputs as u64).saturating_mul(slice_size as u64);
+    let repair_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+    let write_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+    let operation_total_bytes = read_total_bytes
+        .saturating_add(repair_total_bytes)
+        .saturating_add(write_total_bytes);
+    let mut input_buffers: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; total_inputs];
+    let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
+
+    for (input_idx, &global_idx) in plan.available_input_global_indices.iter().enumerate() {
+        if input_idx % 64 == 0 {
+            check_cancel(options)?;
+        }
+
+        let (file_id, local_slice) = plan.global_to_file[global_idx];
+        let offset = local_slice as u64 * plan.slice_size;
+        let read_len = file_access
+            .read_file_range_into(&file_id, offset, &mut input_buffers[input_idx])
+            .map_err(Par2Error::Io)?;
+        input_buffers[input_idx][read_len..].fill(0);
+
+        if let Some(ref progress) = options.progress {
+            progress(ProgressUpdate {
+                stage: ProgressStage::Repairing,
+                current: input_idx as u32 + 1,
+                total: total_inputs_u32,
+                bytes_processed: (input_idx + 1) as u64 * slice_size as u64,
+                total_bytes: Some(operation_total_bytes),
+            });
+        }
+    }
+
+    for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
+        check_cancel(options)?;
+        let rs = par2_set
+            .recovery_slices
+            .get(&exp)
+            .ok_or_else(|| Par2Error::ReedSolomonError {
+                reason: format!("recovery block with exponent {exp} not found"),
+            })?;
+        let recovery_data = rs.data.to_vec().map_err(Par2Error::Io)?;
+        let copy_len = recovery_data.len().min(slice_size);
+        input_buffers[available_inputs + recovery_idx][..copy_len]
+            .copy_from_slice(&recovery_data[..copy_len]);
+        input_buffers[available_inputs + recovery_idx][copy_len..].fill(0);
+
+        if let Some(ref progress) = options.progress {
+            let current = available_inputs + recovery_idx + 1;
+            progress(ProgressUpdate {
+                stage: ProgressStage::Repairing,
+                current: current.min(u32::MAX as usize) as u32,
+                total: total_inputs_u32,
+                bytes_processed: current as u64 * slice_size as u64,
+                total_bytes: Some(operation_total_bytes),
+            });
+        }
+    }
+
+    check_cancel(options)?;
+
+    // Reconstruct through the solver seam. The borrows of `input_buffers` and
+    // `repaired_slices` are scoped so the slices are free to write afterwards.
+    {
+        let source_refs: Vec<&[u8]> = input_buffers.iter().map(|b| b.as_slice()).collect();
+        let mut output_refs: Vec<&mut [u8]> = repaired_slices
+            .iter_mut()
+            .map(|b| b.as_mut_slice())
+            .collect();
+        let mut problem = RepairProblem {
+            total_inputs: plan.total_input_slices,
+            word_count,
+            missing_indices: &plan.missing_global_indices,
+            available_indices: &plan.available_input_global_indices,
+            recovery_exponents: &plan.recovery_exponents,
+            constants: &plan.constants,
+            sources: &source_refs,
+            outputs: &mut output_refs,
+        };
+        solver.reconstruct(&mut problem)?;
+    }
+
+    if let Some(ref progress) = options.progress {
+        progress(ProgressUpdate {
+            stage: ProgressStage::Repairing,
+            current: n as u32,
+            total: n as u32,
+            bytes_processed: read_total_bytes.saturating_add(repair_total_bytes),
+            total_bytes: Some(operation_total_bytes),
+        });
+    }
+
+    check_cancel(options)?;
+    info!("writing repaired slices to files");
+    let write_targets = build_write_targets(plan, par2_set)?;
+    for (j, target) in write_targets.iter().enumerate() {
+        check_cancel(options)?;
+
+        let slice_end = target.offset + plan.slice_size;
+        let write_len = if slice_end > target.file_end {
+            (target.file_end - target.offset) as usize
+        } else {
+            slice_size
+        };
+
+        file_access
+            .write_file_range(
+                &target.file_id,
+                target.offset,
+                &repaired_slices[j][..write_len],
+            )
+            .map_err(|e| Par2Error::RepairWriteFailed {
+                filename: target.filename.clone(),
+                offset: target.offset,
+                source: e,
+            })?;
+
+        if let Some(ref progress) = options.progress {
+            progress(ProgressUpdate {
+                stage: ProgressStage::WritingRepaired,
+                current: j as u32 + 1,
+                total: n as u32,
+                bytes_processed: read_total_bytes
+                    .saturating_add(repair_total_bytes)
+                    .saturating_add((j + 1) as u64 * slice_size as u64),
+                total_bytes: Some(operation_total_bytes),
+            });
+        }
+    }
+
+    info!("repair complete: {} slices restored", n);
+    Ok(())
+}
+
+/// Execute a repair plan through a caller-provided [`RepairSolver`].
+///
+/// This always uses the in-memory reconstruct shape (all sources are read into
+/// memory and handed to the solver as byte regions), which is what an off-rayon
+/// host solver needs. The native rayon default is reached through
+/// [`execute_repair`] / [`execute_repair_with_options`]; use this entry to
+/// inject an alternative solver (e.g. a wasm host-thread dispatcher).
+pub fn execute_repair_with_solver<S: RepairSolver + ?Sized>(
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    options: &RepairOptions,
+    solver: &S,
+) -> Result<()> {
+    let n = plan.missing_slices.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let slice_size = plan.slice_size as usize;
+    assert!(
+        slice_size.is_multiple_of(2),
+        "PAR2 slice_size must be a multiple of 2"
+    );
+    run_in_memory_repair(plan, par2_set, file_access, options, solver)
+}
+
 /// Execute a repair plan with cancellation, progress, and memory budget support.
 pub fn execute_repair_with_options(
     plan: &RepairPlan,
@@ -1881,176 +2289,12 @@ pub fn execute_repair_with_options(
         } => execute_repair_streaming(plan, par2_set, file_access, options, chunk_words, budget),
         RepairExecutionMode::InMemory { chunk_words } => {
             info!("reconstructing {} missing slices", n);
-            let output_inputs = grouped_input_factors(&plan.input_factors);
-            let available_inputs = plan.available_input_global_indices.len();
-            let total_inputs = available_inputs + plan.recovery_exponents.len();
-            let total_inputs_u32 = total_inputs.min(u32::MAX as usize) as u32;
-            let read_total_bytes = (total_inputs as u64).saturating_mul(slice_size as u64);
-            let repair_total_bytes = (n as u64).saturating_mul(slice_size as u64);
-            let write_total_bytes = (n as u64).saturating_mul(slice_size as u64);
-            let operation_total_bytes = read_total_bytes
-                .saturating_add(repair_total_bytes)
-                .saturating_add(write_total_bytes);
-            let mut input_buffers: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; total_inputs];
-            let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
-
-            for (input_idx, &global_idx) in plan.available_input_global_indices.iter().enumerate() {
-                if input_idx % 64 == 0 {
-                    check_cancel(options)?;
-                }
-
-                let (file_id, local_slice) = plan.global_to_file[global_idx];
-                let offset = local_slice as u64 * plan.slice_size;
-                let read_len = file_access
-                    .read_file_range_into(&file_id, offset, &mut input_buffers[input_idx])
-                    .map_err(Par2Error::Io)?;
-                input_buffers[input_idx][read_len..].fill(0);
-
-                if let Some(ref progress) = options.progress {
-                    progress(ProgressUpdate {
-                        stage: ProgressStage::Repairing,
-                        current: input_idx as u32 + 1,
-                        total: total_inputs_u32,
-                        bytes_processed: (input_idx + 1) as u64 * slice_size as u64,
-                        total_bytes: Some(operation_total_bytes),
-                    });
-                }
-            }
-
-            for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
-                check_cancel(options)?;
-                let rs = par2_set.recovery_slices.get(&exp).ok_or_else(|| {
-                    Par2Error::ReedSolomonError {
-                        reason: format!("recovery block with exponent {exp} not found"),
-                    }
-                })?;
-                let recovery_data = rs.data.to_vec().map_err(Par2Error::Io)?;
-                let copy_len = recovery_data.len().min(slice_size);
-                input_buffers[available_inputs + recovery_idx][..copy_len]
-                    .copy_from_slice(&recovery_data[..copy_len]);
-                input_buffers[available_inputs + recovery_idx][copy_len..].fill(0);
-
-                if let Some(ref progress) = options.progress {
-                    let current = available_inputs + recovery_idx + 1;
-                    progress(ProgressUpdate {
-                        stage: ProgressStage::Repairing,
-                        current: current.min(u32::MAX as usize) as u32,
-                        total: total_inputs_u32,
-                        bytes_processed: current as u64 * slice_size as u64,
-                        total_bytes: Some(operation_total_bytes),
-                    });
-                }
-            }
-            // Prepared multiply tables are keyed by factor value: a dense
-            // decode matrix repeats factors across (output, input) pairs, and
-            // preparing one table per pair multiplies memory (and cache
-            // pressure) by outputs*inputs. At most 65535 distinct factors
-            // exist, so the deduplicated pool stays a few megabytes.
-            let mut factor_slots: HashMap<u16, usize> = HashMap::new();
-            let mut prepared_factors: Vec<crate::gf_simd::PreparedInputFactor> = Vec::new();
-            let prepared_output_inputs: Vec<Vec<(u16, usize)>> = output_inputs
-                .iter()
-                .map(|inputs| {
-                    inputs
-                        .iter()
-                        .map(|factor_input| {
-                            let slot =
-                                *factor_slots.entry(factor_input.factor).or_insert_with(|| {
-                                    prepared_factors.push(crate::gf_simd::prepare_input_factor(
-                                        factor_input.factor,
-                                    ));
-                                    prepared_factors.len() - 1
-                                });
-                            (factor_input.input_idx, slot)
-                        })
-                        .collect()
-                })
-                .collect();
-            let total_chunks_usize = (slice_size / 2).div_ceil(chunk_words);
-            let completed_outputs = AtomicU32::new(0);
-
-            repaired_slices.par_iter_mut().enumerate().try_for_each(
-                |(output_idx, repaired)| -> Result<()> {
-                    check_cancel(options)?;
-                    let decode_inputs = &prepared_output_inputs[output_idx];
-                    let mut chunk_inputs = Vec::with_capacity(decode_inputs.len());
-
-                    for chunk_idx in 0..total_chunks_usize {
-                        let chunk_start = chunk_idx * chunk_words;
-                        let chunk_end = (chunk_start + chunk_words).min(slice_size / 2);
-                        let byte_start = chunk_start * 2;
-                        let byte_len = (chunk_end - chunk_start) * 2;
-
-                        chunk_inputs.clear();
-                        for (input_idx, factor_slot) in decode_inputs {
-                            chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
-                                prepared: &prepared_factors[*factor_slot],
-                                src: &input_buffers[*input_idx as usize]
-                                    [byte_start..byte_start + byte_len],
-                            });
-                        }
-
-                        crate::gf_simd::mul_acc_input_batch_prepared(
-                            &mut repaired[byte_start..byte_start + byte_len],
-                            &chunk_inputs,
-                        );
-                    }
-
-                    if let Some(ref progress) = options.progress {
-                        let current = completed_outputs.fetch_add(1, Ordering::Relaxed) + 1;
-                        progress(ProgressUpdate {
-                            stage: ProgressStage::Repairing,
-                            current,
-                            total: n as u32,
-                            bytes_processed: read_total_bytes
-                                .saturating_add(current as u64 * slice_size as u64),
-                            total_bytes: Some(operation_total_bytes),
-                        });
-                    }
-
-                    Ok(())
-                },
-            )?;
-
-            info!("writing repaired slices to files");
-            let write_targets = build_write_targets(plan, par2_set)?;
-            for (j, target) in write_targets.iter().enumerate() {
-                check_cancel(options)?;
-
-                let slice_end = target.offset + plan.slice_size;
-                let write_len = if slice_end > target.file_end {
-                    (target.file_end - target.offset) as usize
-                } else {
-                    slice_size
-                };
-
-                file_access
-                    .write_file_range(
-                        &target.file_id,
-                        target.offset,
-                        &repaired_slices[j][..write_len],
-                    )
-                    .map_err(|e| Par2Error::RepairWriteFailed {
-                        filename: target.filename.clone(),
-                        offset: target.offset,
-                        source: e,
-                    })?;
-
-                if let Some(ref progress) = options.progress {
-                    progress(ProgressUpdate {
-                        stage: ProgressStage::WritingRepaired,
-                        current: j as u32 + 1,
-                        total: n as u32,
-                        bytes_processed: read_total_bytes
-                            .saturating_add(repair_total_bytes)
-                            .saturating_add((j + 1) as u64 * slice_size as u64),
-                        total_bytes: Some(operation_total_bytes),
-                    });
-                }
-            }
-
-            info!("repair complete: {} slices restored", n);
-            Ok(())
+            // The native default reconstruct runs through the RepairSolver seam
+            // (byte-identical to the pre-seam rayon path), so the crate's own
+            // repair tests exercise the default solver.
+            let solver = NativeRepairSolver::new(&plan.input_factors, chunk_words)
+                .with_cancellation(options.cancel.clone());
+            run_in_memory_repair(plan, par2_set, file_access, options, &solver)
         }
     }
 }
@@ -2708,5 +2952,213 @@ mod tests {
             },
         );
         assert!(matches!(mode, RepairExecutionMode::InMemory { .. }));
+    }
+
+    // ── Repair-solver seam (RFC 123 WP2.5) ─────────────────────────────────
+
+    /// Assemble the in-memory sources for a plan (available inputs then recovery
+    /// blocks) exactly as `run_in_memory_repair` does, drawing the available
+    /// slices from the known-good padded original.
+    fn seam_sources(
+        plan: &RepairPlan,
+        par2_set: &Par2FileSet,
+        padded_original: &[u8],
+        slice_size: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut sources = Vec::new();
+        for &global_idx in &plan.available_input_global_indices {
+            let (_file_id, local) = plan.global_to_file[global_idx];
+            let start = local as usize * slice_size;
+            sources.push(padded_original[start..start + slice_size].to_vec());
+        }
+        for &exp in &plan.recovery_exponents {
+            let mut data = par2_set.recovery_slices[&exp].data.to_vec().unwrap();
+            data.resize(slice_size, 0);
+            sources.push(data);
+        }
+        sources
+    }
+
+    /// Naive per-word serial GF(2^16) reconstruct: the independent oracle that
+    /// the pre-seam rayon kernel and the seam must both reproduce.
+    fn serial_reconstruct(
+        input_factors: &matrix::Matrix,
+        sources: &[Vec<u8>],
+        word_count: usize,
+    ) -> Vec<Vec<u8>> {
+        (0..input_factors.rows)
+            .map(|j| {
+                let mut out = vec![0u8; word_count * 2];
+                for (s, src) in sources.iter().enumerate() {
+                    let factor = input_factors.get(j, s);
+                    if factor == 0 {
+                        continue;
+                    }
+                    for w in 0..word_count {
+                        let sv = u16::from_le_bytes([src[w * 2], src[w * 2 + 1]]);
+                        let cur = u16::from_le_bytes([out[w * 2], out[w * 2 + 1]]);
+                        let nv = gf::add(cur, gf::mul(factor, sv));
+                        let b = nv.to_le_bytes();
+                        out[w * 2] = b[0];
+                        out[w * 2 + 1] = b[1];
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// The seam's native default reconstruct must equal both an independent
+    /// serial GF reference and the original bytes — the same property the PoC's
+    /// `host_side_reconstruct_recovers_original` checks, but through the real
+    /// `NativeRepairSolver` over a `RepairProblem`.
+    #[test]
+    fn seam_native_solver_matches_serial_reference_and_original() {
+        let slice_size = 128u64;
+        let ss = slice_size as usize;
+        let file_data: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 4);
+
+        // Damage slices 1 and 3 (of 4).
+        let mut damaged = file_data.clone();
+        damaged[128..256].fill(0);
+        damaged[384..512].fill(0);
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        let plan = plan_repair(&par2_set, &result).unwrap();
+        let n = plan.missing_slices.len();
+        assert_eq!(n, 2);
+
+        let word_count = ss / 2;
+        let num_slices = file_data.len() / ss;
+        let mut padded = file_data.clone();
+        padded.resize(num_slices * ss, 0);
+        let sources = seam_sources(&plan, &par2_set, &padded, ss);
+        let expected = serial_reconstruct(&plan.input_factors, &sources, word_count);
+
+        let source_refs: Vec<&[u8]> = sources.iter().map(|s| s.as_slice()).collect();
+        let mut outputs: Vec<Vec<u8>> = vec![vec![0u8; ss]; n];
+        {
+            let mut out_refs: Vec<&mut [u8]> =
+                outputs.iter_mut().map(|o| o.as_mut_slice()).collect();
+            let mut problem = RepairProblem {
+                total_inputs: plan.total_input_slices,
+                word_count,
+                missing_indices: &plan.missing_global_indices,
+                available_indices: &plan.available_input_global_indices,
+                recovery_exponents: &plan.recovery_exponents,
+                constants: &plan.constants,
+                sources: &source_refs,
+                outputs: &mut out_refs,
+            };
+            NativeRepairSolver::new(&plan.input_factors, word_count)
+                .reconstruct(&mut problem)
+                .unwrap();
+        }
+
+        assert_eq!(
+            outputs, expected,
+            "seam reconstruct must match the serial GF reference byte-for-byte"
+        );
+        for (j, &(_, local)) in plan.missing_slices.iter().enumerate() {
+            let start = local as usize * ss;
+            assert_eq!(
+                outputs[j],
+                &padded[start..start + ss],
+                "missing slice {local} not recovered"
+            );
+        }
+    }
+
+    /// A stand-in for Agent P's wasm solver: it ignores the plan's pre-built
+    /// matrix and instead rebuilds the coefficient matrix from the `RepairProblem`
+    /// raw spec using ONLY the `weaver-reed-solomon` host API, then reconstructs
+    /// via `mul_acc_region`. Proves the injection path recovers the original.
+    struct HostStyleSolver;
+
+    impl RepairSolver for HostStyleSolver {
+        fn reconstruct(
+            &self,
+            problem: &mut RepairProblem<'_>,
+        ) -> std::result::Result<(), SolverError> {
+            let coeffs = weaver_reed_solomon::matrix::build_repair_matrix(
+                problem.available_indices,
+                problem.missing_indices,
+                problem.recovery_exponents,
+                problem.constants,
+            )
+            .map_err(|e| SolverError::Singular { bad_row: e.bad_row })?;
+            let sources = problem.sources;
+            for (j, out) in problem.outputs.iter_mut().enumerate() {
+                let out: &mut [u8] = out;
+                out.fill(0);
+                for (s, src) in sources.iter().enumerate() {
+                    weaver_reed_solomon::gf_simd::mul_acc_region(coeffs.get(j, s), src, out);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// `execute_repair_with_solver` with an injected, non-native, host-style
+    /// solver recovers the original through weaver-par2's real repair API.
+    #[test]
+    fn execute_repair_with_solver_host_style_recovers_original() {
+        let slice_size = 128u64;
+        let file_data: Vec<u8> = (0..640u32).map(|i| ((i * 11 + 5) % 256) as u8).collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 3);
+
+        // Damage slices 0 and 2 (of 5).
+        let mut damaged = file_data.clone();
+        damaged[..128].fill(0);
+        damaged[256..384].fill(0);
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        assert_eq!(result.total_missing_blocks, 2);
+        let plan = plan_repair(&par2_set, &result).unwrap();
+
+        execute_repair_with_solver(
+            &plan,
+            &par2_set,
+            &mut access,
+            &RepairOptions::default(),
+            &HostStyleSolver,
+        )
+        .unwrap();
+
+        let repaired = access.read_file(&file_id).unwrap();
+        assert_eq!(
+            repaired, file_data,
+            "host-style solver through the seam must recover the original"
+        );
+    }
+
+    /// The host-side repair matrix (`weaver-reed-solomon`) must be byte-identical
+    /// to the coefficient matrix weaver-par2 builds natively, so a host solve
+    /// equals a native weaver repair.
+    #[test]
+    fn weaver_reed_solomon_repair_matrix_matches_weaver_par2() {
+        let total = 20usize;
+        let constants = gf::input_slice_constants(total);
+        let missing = vec![3usize, 7, 11, 15];
+        let exps: Vec<u32> = vec![0, 1, 2, 3];
+        let avail: Vec<usize> = (0..total).filter(|i| !missing.contains(i)).collect();
+
+        let (weaver_repair, _decode) =
+            matrix::build_repair_matrix_with_bad_row(&avail, &missing, &exps, &constants).unwrap();
+        let host =
+            weaver_reed_solomon::matrix::build_repair_matrix(&avail, &missing, &exps, &constants)
+                .unwrap();
+
+        assert_eq!(weaver_repair.rows, host.rows);
+        assert_eq!(weaver_repair.cols, host.cols);
+        assert_eq!(
+            weaver_repair.data, host.data,
+            "host repair matrix must be byte-identical to weaver-par2's"
+        );
     }
 }

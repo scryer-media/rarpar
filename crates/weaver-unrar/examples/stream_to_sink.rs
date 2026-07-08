@@ -18,7 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if arg == "--max-dict-mib" {
             let value = args.next().ok_or("missing value after --max-dict-mib")?;
-            max_dict_mib = Some(value.parse().map_err(|_| "--max-dict-mib must be an integer")?);
+            max_dict_mib = Some(
+                value
+                    .parse()
+                    .map_err(|_| "--max-dict-mib must be an integer")?,
+            );
             continue;
         }
 

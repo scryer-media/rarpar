@@ -72,7 +72,18 @@ fn main() -> ExitCode {
         options.memory_limit = Some(mib << 20);
     }
 
-    match Par2Repairer::new(options).verify_or_repair() {
+    // The production server drives repair from a worker thread it spawns, not
+    // the process main thread. On Windows the main thread's default stack is
+    // 1 MiB (vs 8 MiB on Linux), too small for the decode-matrix construction
+    // on the many-slice single-file shape. Run on an explicitly-sized worker
+    // so this driver measures the same code path the server does.
+    let worker = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || Par2Repairer::new(options).verify_or_repair())
+        .expect("spawn repair worker");
+    let result = worker.join().expect("repair worker panicked");
+
+    match result {
         Ok(outcome) => {
             println!(
                 "status={:?} complete={} damaged={} missing_files={} missing_blocks={} recovery_used={} reconstructed_bytes={}",

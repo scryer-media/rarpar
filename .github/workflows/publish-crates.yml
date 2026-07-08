@@ -162,36 +162,85 @@ jobs:
       - name: Verify package contents
         env:
           PUBLISH_PACKAGE: ${{ inputs.package }}
+          PUBLISH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
 
-          if [ "$PUBLISH_PACKAGE" = all ]; then
-            crates="weaver-reed-solomon weaver-unrar weaver-par2"
-            cargo package --locked -p weaver-reed-solomon
-            for crate in weaver-unrar weaver-par2; do
-              # Downstream crates may depend on same-version workspace crates.
-              # Real publish verification happens below after each upstream
-              # crate has reached the crates.io index.
-              cargo package --locked --no-verify -p "$crate"
-            done
-          else
-            crates="$PUBLISH_PACKAGE"
-            cargo package --locked -p "$PUBLISH_PACKAGE"
-          fi
+          registry_has_version() {
+            cargo info "$1@$2" >/dev/null 2>&1
+          }
 
-          for crate in $crates; do
+          manifest_for_crate() {
+            case "$1" in
+              weaver-reed-solomon) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
+              weaver-unrar) echo "crates/weaver-unrar/Cargo.toml" ;;
+              weaver-par2) echo "crates/weaver-par2/Cargo.toml" ;;
+              *) echo "unknown crate: $1" >&2; return 1 ;;
+            esac
+          }
+
+          verify_fixture_exclude() {
+            crate="$1"
+            case "$crate" in
+              weaver-unrar|weaver-par2)
+                python3 - "$(manifest_for_crate "$crate")" "$crate" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          manifest = pathlib.Path(sys.argv[1])
+          crate = sys.argv[2]
+          data = tomllib.loads(manifest.read_text())
+          excludes = data.get("package", {}).get("exclude", [])
+          if "tests/fixtures/**" not in excludes:
+              print(
+                  f"{crate} manifest must exclude tests/fixtures/**",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+                ;;
+            esac
+          }
+
+          exact_packaged_crates=""
+          package_and_list() {
+            crate="$1"
+            cargo package --locked -p "$crate"
             cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
             if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
-          done
+            if [ "$crate" = weaver-unrar ]; then
+              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+            fi
+            exact_packaged_crates="${exact_packaged_crates} ${crate}"
+          }
 
-          if [ -f .ci/package-lists/weaver-unrar.txt ]; then
-            grep -Fxq LICENSE .ci/package-lists/weaver-unrar.txt
+          if [ "$PUBLISH_PACKAGE" = all ]; then
+            package_and_list weaver-reed-solomon
+
+            if registry_has_version weaver-reed-solomon "$PUBLISH_VERSION"; then
+              package_and_list weaver-unrar
+            else
+              echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$PUBLISH_VERSION is published"
+              verify_fixture_exclude weaver-unrar
+            fi
+
+            if registry_has_version weaver-reed-solomon "$PUBLISH_VERSION" \
+              && registry_has_version weaver-unrar "$PUBLISH_VERSION"; then
+              package_and_list weaver-par2
+            else
+              echo "weaver-par2 exact package check deferred until same-release dependencies are published"
+              verify_fixture_exclude weaver-par2
+            fi
+          else
+            package_and_list "$PUBLISH_PACKAGE"
           fi
 
+          export EXACT_PACKAGED_CRATES="$exact_packaged_crates"
           python3 - <<'PY'
           import json
           import os
@@ -204,9 +253,8 @@ jobs:
               "weaver-unrar": 2_500_000,
               "weaver-par2": 2_500_000,
           }
-          selected_package = os.environ["PUBLISH_PACKAGE"]
-          if selected_package != "all":
-              limits = {selected_package: limits[selected_package]}
+          exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
+          limits = {crate: limits[crate] for crate in exact_packaged_crates}
           metadata = json.loads(
               subprocess.check_output([
                   "cargo",
@@ -222,6 +270,10 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in limits
           }
+          if not limits:
+              print("no exact .crate archives were produced in preflight", file=sys.stderr)
+              sys.exit(1)
+
           package_dir = pathlib.Path("target/package")
           failed = False
           for crate, limit in limits.items():
@@ -306,6 +358,58 @@ jobs:
           PUBLISH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          mkdir -p .ci/package-lists
+
+          verify_package_contents() {
+            crate="$1"
+            cargo package --locked -p "$crate"
+            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::${crate} package includes fixture files"
+              exit 1
+            fi
+            if [ "$crate" = weaver-unrar ]; then
+              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+            fi
+
+            python3 - "$crate" <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          crate = sys.argv[1]
+          limits = {
+              "weaver-reed-solomon": 1_000_000,
+              "weaver-unrar": 2_500_000,
+              "weaver-par2": 2_500_000,
+          }
+          metadata = json.loads(
+              subprocess.check_output([
+                  "cargo",
+                  "metadata",
+                  "--locked",
+                  "--format-version",
+                  "1",
+                  "--no-deps",
+              ])
+          )
+          versions = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+              if package["name"] == crate
+          }
+          path = pathlib.Path("target/package") / f"{crate}-{versions[crate]}.crate"
+          size = path.stat().st_size
+          print(f"{path.name}: {size} bytes")
+          if size > limits[crate]:
+              print(
+                  f"{crate} package is {size} bytes, over {limits[crate]} byte limit",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+          }
 
           publish_with_retry() {
             crate="$1"
@@ -342,6 +446,7 @@ jobs:
           fi
 
           for crate in $crates; do
+            verify_package_contents "$crate"
             publish_with_retry "$crate"
             wait_for_crate_version "$crate" "$PUBLISH_VERSION"
           done
