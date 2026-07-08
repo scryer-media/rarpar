@@ -131,10 +131,27 @@ pub struct ScanDiagnostics {
     pub files_skipped: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CarryDiagnostics {
+    pub carry_attempted: bool,
+    pub carry_applied: bool,
+    pub carry_retried_fresh: bool,
+    pub carry_retry_reason: Option<CarryRetryReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarryRetryReason {
+    TerminalStatus(Par2RepairStatus),
+    RepairRequested,
+    PostRepairVerificationFailed,
+}
+
 /// Scan state carried from an analyze pass to a later execute pass over the
-/// same set, letting the execute pass skip re-scanning every source file.
+/// same set, letting later scheduling avoid re-scanning every source file.
 /// Application re-stats every file the scan observed (including recording
-/// nonexistence) and refuses on any drift, falling back to a full scan.
+/// nonexistence) and refuses on visible drift. Accepted carry is still a
+/// speculative optimization: mutation and final statuses are retried from a
+/// fresh content scan before they are accepted.
 /// A carry never discovers source files that appeared after the analyze
 /// pass — callers that allow drop-ins between passes should not supply one.
 #[derive(Debug)]
@@ -328,6 +345,7 @@ pub struct Par2RepairOutcome {
     pub bytes_reconstructed: u64,
     pub packets: PacketDiagnostics,
     pub scan: ScanDiagnostics,
+    pub carry: CarryDiagnostics,
     pub verification: VerificationResult,
 }
 
@@ -348,9 +366,11 @@ pub struct Par2RepairerOptions {
     pub progress: Option<ProgressCallback>,
     /// Scan state from a prior pass over the same set (see
     /// [`Par2Repairer::verify_or_repair_carrying`]). Applied only when the
-    /// set matches and every observed file is unchanged on disk; otherwise
-    /// this pass scans normally. Must come from a pass with the same
-    /// `base_dir`/`extra_paths`/`scan_skip_*` configuration.
+    /// set matches and every observed file's stat snapshot still matches;
+    /// otherwise this pass scans normally. Accepted carry is speculative:
+    /// mutating repair requests and terminal results are retried from a fresh
+    /// content scan before reporting. Must come from a pass with the same `base_dir`/
+    /// `extra_paths`/`scan_skip_*` configuration.
     pub scan_carry: Option<Arc<ScanCarry>>,
 }
 
@@ -458,6 +478,19 @@ pub struct Par2Repairer {
     options: Par2RepairerOptions,
 }
 
+struct RepairPassSuccess {
+    outcome: Par2RepairOutcome,
+    carry: Option<Arc<ScanCarry>>,
+}
+
+enum RepairPassResult {
+    Success(RepairPassSuccess),
+    PostRepairVerificationFailed {
+        reason: String,
+        carry: CarryDiagnostics,
+    },
+}
+
 impl Par2Repairer {
     pub fn new(options: Par2RepairerOptions) -> Self {
         Self { options }
@@ -469,9 +502,10 @@ impl Par2Repairer {
 
     /// Like [`Self::verify_or_repair`], additionally returning this pass's
     /// scan state for reuse by a later pass over the same set
-    /// ([`Par2RepairerOptions::scan_carry`]). The carry reflects the disk
-    /// as scanned: after a `Repaired` outcome the repaired files have
-    /// changed, so a carry taken from that pass refuses to apply.
+    /// ([`Par2RepairerOptions::scan_carry`]). The carry is speculative:
+    /// it avoids a second scan when the observed file stats still match, but
+    /// mutating repair requests and terminal results are retried from a fresh
+    /// content scan before they are reported.
     pub fn verify_or_repair_carrying(&self) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
         self.verify_or_repair_inner(true)
     }
@@ -480,6 +514,87 @@ impl Par2Repairer {
         &self,
         want_carry: bool,
     ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
+        match self.verify_or_repair_pass(want_carry)? {
+            RepairPassResult::Success(success) => self.finish_or_retry(success, want_carry),
+            RepairPassResult::PostRepairVerificationFailed { reason, carry } => {
+                if carry.carry_applied {
+                    debug!(
+                        retry_reason = ?CarryRetryReason::PostRepairVerificationFailed,
+                        "carried PAR2 repair failed post-verification; retrying from a fresh scan"
+                    );
+                    return self
+                        .retry_fresh(want_carry, CarryRetryReason::PostRepairVerificationFailed);
+                }
+                Err(Par2Error::ReedSolomonError { reason })
+            }
+        }
+    }
+
+    fn finish_or_retry(
+        &self,
+        success: RepairPassSuccess,
+        want_carry: bool,
+    ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
+        let status = success.outcome.status;
+        if success.outcome.carry.carry_applied && self.options.repair {
+            debug!(
+                ?status,
+                "carried PAR2 pass reached a repair request; retrying from a fresh scan before mutation"
+            );
+            return self.retry_fresh(want_carry, CarryRetryReason::RepairRequested);
+        }
+        if success.outcome.carry.carry_applied && Self::is_terminal_non_repair_status(status) {
+            debug!(
+                ?status,
+                "carried PAR2 pass returned terminal non-repair status; retrying from a fresh scan"
+            );
+            return self.retry_fresh(want_carry, CarryRetryReason::TerminalStatus(status));
+        }
+        Ok((success.outcome, success.carry))
+    }
+
+    fn retry_fresh(
+        &self,
+        want_carry: bool,
+        retry_reason: CarryRetryReason,
+    ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
+        let mut options = self.options.clone();
+        options.scan_carry = None;
+        match Par2Repairer::new(options).verify_or_repair_pass(want_carry)? {
+            RepairPassResult::Success(mut success) => {
+                success.outcome.carry = CarryDiagnostics {
+                    carry_attempted: true,
+                    carry_applied: true,
+                    carry_retried_fresh: true,
+                    carry_retry_reason: Some(retry_reason),
+                };
+                Ok((success.outcome, success.carry))
+            }
+            RepairPassResult::PostRepairVerificationFailed { reason, .. } => {
+                Err(Par2Error::ReedSolomonError { reason })
+            }
+        }
+    }
+
+    fn is_terminal_non_repair_status(status: Par2RepairStatus) -> bool {
+        matches!(
+            status,
+            Par2RepairStatus::Verified
+                | Par2RepairStatus::RepairPossible
+                | Par2RepairStatus::Insufficient
+                | Par2RepairStatus::ResourceLimited
+        )
+    }
+
+    fn with_carry_diagnostics(
+        mut outcome: Par2RepairOutcome,
+        carry: &CarryDiagnostics,
+    ) -> Par2RepairOutcome {
+        outcome.carry = carry.clone();
+        outcome
+    }
+
+    fn verify_or_repair_pass(&self, want_carry: bool) -> Result<RepairPassResult> {
         let PacketInventory {
             set,
             diagnostics,
@@ -491,12 +606,17 @@ impl Par2Repairer {
         packet_diagnostics.discarded_recovery_blocks = state.discarded_recovery_blocks;
         packet_diagnostics.inconsistent_packets = state.inconsistent_packets;
 
-        let scan = match self
-            .options
-            .scan_carry
-            .as_deref()
-            .and_then(|carry| state.try_apply_carry(carry))
-        {
+        let mut carry_diagnostics = CarryDiagnostics {
+            carry_attempted: self.options.scan_carry.is_some(),
+            ..CarryDiagnostics::default()
+        };
+        let scan = match self.options.scan_carry.as_deref().and_then(|carry| {
+            let diagnostics = state.try_apply_carry(carry);
+            if diagnostics.is_some() {
+                carry_diagnostics.carry_applied = true;
+            }
+            diagnostics
+        }) {
             Some(diagnostics) => diagnostics,
             None => state.scan(&self.options)?,
         };
@@ -510,21 +630,45 @@ impl Par2Repairer {
         }
         let carry = want_carry.then(|| Arc::new(state.scan_carry(&scan)));
 
+        if carry_diagnostics.carry_applied {
+            let status =
+                if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
+                    Par2RepairStatus::Verified
+                } else {
+                    match &verification.repairable {
+                        Repairability::NotNeeded => Par2RepairStatus::Verified,
+                        Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
+                        Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
+                        Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
+                    }
+                };
+            return Ok(RepairPassResult::Success(RepairPassSuccess {
+                outcome: Self::with_carry_diagnostics(
+                    state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                    &carry_diagnostics,
+                ),
+                carry,
+            }));
+        }
+
         if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
             if self.options.purge {
                 purge_files_best_effort(&purge_paths);
             }
-            return Ok((
-                state.outcome(
-                    Par2RepairStatus::Verified,
-                    0,
-                    0,
-                    packet_diagnostics,
-                    scan,
-                    verification,
+            return Ok(RepairPassResult::Success(RepairPassSuccess {
+                outcome: Self::with_carry_diagnostics(
+                    state.outcome(
+                        Par2RepairStatus::Verified,
+                        0,
+                        0,
+                        packet_diagnostics,
+                        scan,
+                        verification,
+                    ),
+                    &carry_diagnostics,
                 ),
                 carry,
-            ));
+            }));
         }
 
         if !self.options.repair {
@@ -534,10 +678,13 @@ impl Par2Repairer {
                 Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
-            return Ok((
-                state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+            return Ok(RepairPassResult::Success(RepairPassSuccess {
+                outcome: Self::with_carry_diagnostics(
+                    state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                    &carry_diagnostics,
+                ),
                 carry,
-            ));
+            }));
         }
 
         if matches!(
@@ -548,10 +695,13 @@ impl Par2Repairer {
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
                 _ => Par2RepairStatus::Insufficient,
             };
-            return Ok((
-                state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+            return Ok(RepairPassResult::Success(RepairPassSuccess {
+                outcome: Self::with_carry_diagnostics(
+                    state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                    &carry_diagnostics,
+                ),
                 carry,
-            ));
+            }));
         }
 
         let repair = state.repair(&self.options, &verification)?;
@@ -560,13 +710,8 @@ impl Par2Repairer {
             &repair.install_dir,
             &repair.staged_file_ids,
         );
-        // Only staged files changed on disk; everything else keeps its
-        // analyze-phase verification. Staged files are fully read back and
-        // verified slice-by-slice against IFSC (spans in parallel — the
-        // serial whole-file MD5 chain was the last single-thread pass of a
-        // single-file repair). A damaged file that somehow escaped staging
-        // keeps its Damaged analyze entry and fails the gate below, so the
-        // merge fails closed.
+        // Fresh repair passes read staged files back and verify them
+        // slice-by-slice against IFSC before installation.
         let staged_ids: Vec<FileId> = state
             .set
             .recovery_file_ids
@@ -584,11 +729,12 @@ impl Par2Repairer {
                 .all(|file| matches!(file.status, FileStatus::Complete))
         {
             let _ = fs::remove_dir_all(&repair.install_dir);
-            return Err(Par2Error::ReedSolomonError {
+            return Ok(RepairPassResult::PostRepairVerificationFailed {
                 reason: format!(
                     "post-repair verification failed: {} blocks remain damaged",
                     post.total_missing_blocks
                 ),
+                carry: carry_diagnostics,
             });
         }
 
@@ -601,17 +747,20 @@ impl Par2Repairer {
             purge_files_best_effort(&purge_paths);
         }
 
-        Ok((
-            state.outcome(
-                Par2RepairStatus::Repaired,
-                repair.bytes_copied,
-                repair.bytes_reconstructed,
-                packet_diagnostics,
-                scan,
-                post,
+        Ok(RepairPassResult::Success(RepairPassSuccess {
+            outcome: Self::with_carry_diagnostics(
+                state.outcome(
+                    Par2RepairStatus::Repaired,
+                    repair.bytes_copied,
+                    repair.bytes_reconstructed,
+                    packet_diagnostics,
+                    scan,
+                    post,
+                ),
+                &carry_diagnostics,
             ),
             carry,
-        ))
+        }))
     }
 
     fn load_inventory(&self) -> Result<PacketInventory> {
@@ -2143,6 +2292,7 @@ impl RepairState {
             bytes_reconstructed,
             packets,
             scan,
+            carry: CarryDiagnostics::default(),
             verification,
         }
     }
@@ -4613,6 +4763,25 @@ mod tests {
     #[cfg(feature = "slow-tests")]
     use std::ffi::OsStr;
 
+    fn restore_carried_modified_time(carry: &ScanCarry, path: &Path) {
+        let expected = carry
+            .snapshot
+            .iter()
+            .find(|stat| stat.path == path)
+            .expect("path is in carried stat snapshot");
+        let Some((_, modified)) = expected.state else {
+            panic!("carried path exists as a regular file");
+        };
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            stat_for_carry(path),
+            *expected,
+            "test must force the stat gate to accept stale carry"
+        );
+    }
+
     fn synthetic_set(files: &[(&str, &[u8])], slice_size: u64) -> Par2FileSet {
         let mut recovery_file_ids = Vec::new();
         let mut descriptions = HashMap::new();
@@ -4659,6 +4828,71 @@ mod tests {
             recovery_slices: BTreeMap::new(),
             creator: None,
         }
+    }
+
+    fn write_synthetic_par2_file(
+        dir: &Path,
+        name: &str,
+        files: &[(&str, &[u8])],
+        slice_size: u64,
+    ) -> PathBuf {
+        let file_ids: Vec<FileId> = (0..files.len())
+            .map(|index| {
+                let mut raw_id = [0u8; 16];
+                raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+                FileId::from_bytes(raw_id)
+            })
+            .collect();
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for file_id in &file_ids {
+            main_body.extend_from_slice(file_id.as_bytes());
+        }
+        let recovery_set_id = checksum::md5(&main_body);
+
+        let mut stream = make_full_packet(
+            crate::packet::header::TYPE_MAIN,
+            &main_body,
+            recovery_set_id,
+        );
+        for ((filename, bytes), file_id) in files.iter().zip(file_ids.iter()) {
+            let mut fd_body = Vec::new();
+            fd_body.extend_from_slice(file_id.as_bytes());
+            fd_body.extend_from_slice(&checksum::md5(bytes));
+            fd_body.extend_from_slice(&checksum::md5(&bytes[..bytes.len().min(16 * 1024)]));
+            fd_body.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            fd_body.extend_from_slice(filename.as_bytes());
+            while fd_body.len() % 4 != 0 {
+                fd_body.push(0);
+            }
+            stream.extend_from_slice(&make_full_packet(
+                crate::packet::header::TYPE_FILE_DESC,
+                &fd_body,
+                recovery_set_id,
+            ));
+
+            let mut ifsc_body = Vec::new();
+            ifsc_body.extend_from_slice(file_id.as_bytes());
+            for chunk in bytes.chunks(slice_size as usize) {
+                let mut state = SliceChecksumState::new();
+                state.update(chunk);
+                let pad_to = ((chunk.len() as u64) < slice_size).then_some(slice_size);
+                let (crc32, md5) = state.finalize(pad_to);
+                ifsc_body.extend_from_slice(&md5);
+                ifsc_body.extend_from_slice(&crc32.to_le_bytes());
+            }
+            stream.extend_from_slice(&make_full_packet(
+                crate::packet::header::TYPE_IFSC,
+                &ifsc_body,
+                recovery_set_id,
+            ));
+        }
+
+        let path = dir.join(name);
+        fs::write(&path, stream).unwrap();
+        path
     }
 
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -7245,10 +7479,11 @@ mod tests {
         let slice_size = 64u64;
         let file_data: Vec<u8> = (0..1024u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
         let set = synthetic_set(&[("data.bin", &file_data)], slice_size);
+        let data_path = dir.path().join("data.bin");
 
         let mut damaged = file_data.clone();
         damaged[..64].fill(0);
-        fs::write(dir.path().join("data.bin"), &damaged).unwrap();
+        fs::write(&data_path, &damaged).unwrap();
 
         let mut analyze = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
         analyze.file_set = Some(set.clone());
@@ -7259,16 +7494,127 @@ mod tests {
         assert!(analyze_outcome.verification.total_missing_blocks > 0);
         let carry = carry.expect("carrying pass returns scan state");
 
-        // The damage is healed out-of-band, so the carry is stale: the
-        // execute pass must refuse it, rescan, and report Verified rather
-        // than acting on the carried damage.
-        fs::write(dir.path().join("data.bin"), &file_data).unwrap();
+        // The damage is healed out-of-band with the same file length. Some
+        // filesystems can leave the stat snapshot indistinguishable, so an
+        // execute pass may apply the carry first. It must still fresh-retry
+        // before returning stale terminal state.
+        fs::write(&data_path, &file_data).unwrap();
+        restore_carried_modified_time(&carry, &data_path);
         let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
         execute.file_set = Some(set);
         execute.repair = true;
         execute.scan_carry = Some(carry);
         let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
         assert_eq!(outcome.status, Par2RepairStatus::Verified, "{outcome:#?}");
+        assert!(outcome.carry.carry_attempted);
+        assert!(outcome.carry.carry_applied);
+        assert!(outcome.carry.carry_retried_fresh);
+        assert_eq!(
+            outcome.carry.carry_retry_reason,
+            Some(CarryRetryReason::RepairRequested)
+        );
+    }
+
+    #[test]
+    fn stale_verified_scan_carry_retries_before_reporting_success() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..1024u32).map(|i| ((i * 11 + 5) % 251) as u8).collect();
+        let par2_path = write_synthetic_par2_file(
+            dir.path(),
+            "data.par2",
+            &[("data.bin", &file_data)],
+            slice_size,
+        );
+        let data_path = dir.path().join("data.bin");
+        fs::write(&data_path, &file_data).unwrap();
+
+        let mut analyze =
+            Par2RepairerOptions::new(dir.path().to_path_buf(), vec![par2_path.clone()]);
+        analyze.repair = false;
+        let (analyze_outcome, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert_eq!(analyze_outcome.status, Par2RepairStatus::Verified);
+        let carry = carry.expect("carrying pass returns scan state");
+
+        let mut damaged = file_data;
+        damaged[..64].fill(0);
+        fs::write(&data_path, &damaged).unwrap();
+        restore_carried_modified_time(&carry, &data_path);
+
+        let mut execute =
+            Par2RepairerOptions::new(dir.path().to_path_buf(), vec![par2_path.clone()]);
+        execute.repair = true;
+        execute.purge = true;
+        execute.scan_carry = Some(carry);
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+        assert_eq!(
+            outcome.status,
+            Par2RepairStatus::Insufficient,
+            "{outcome:#?}"
+        );
+        assert_eq!(outcome.verification.total_missing_blocks, 1);
+        assert!(outcome.carry.carry_attempted);
+        assert!(outcome.carry.carry_applied);
+        assert!(outcome.carry.carry_retried_fresh);
+        assert_eq!(
+            outcome.carry.carry_retry_reason,
+            Some(CarryRetryReason::RepairRequested)
+        );
+        assert!(
+            par2_path.exists(),
+            "speculative carried Verified must not purge PAR2 files before fresh verification fails"
+        );
+    }
+
+    #[test]
+    fn carried_repair_request_fresh_scans_before_mutation() {
+        let dir = tempdir().unwrap();
+        let slice_size = 8u64;
+        let file_data = b"alpha---beta----".to_vec();
+        let set = synthetic_set(&[("target.bin", &file_data)], slice_size);
+        let extra_path = dir.path().join("renamed.bin");
+        fs::write(&extra_path, &file_data).unwrap();
+
+        let mut analyze = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        analyze.file_set = Some(set.clone());
+        analyze.repair = false;
+        analyze.extra_paths = vec![extra_path.clone()];
+        let (preview, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert_eq!(preview.status, Par2RepairStatus::RepairPossible);
+        assert_eq!(preview.verification.total_missing_blocks, 0);
+        let carry = carry.expect("analyze pass carries renamed source state");
+
+        let stale_source = b"wrong---blocks--".to_vec();
+        assert_eq!(stale_source.len(), file_data.len());
+        fs::write(&extra_path, stale_source).unwrap();
+        restore_carried_modified_time(&carry, &canonical_extra_path(&extra_path));
+
+        let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        execute.file_set = Some(set);
+        execute.extra_paths = vec![extra_path];
+        execute.scan_carry = Some(carry);
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+        assert_eq!(
+            outcome.status,
+            Par2RepairStatus::Insufficient,
+            "{outcome:#?}"
+        );
+        assert!(
+            !dir.path().join("target.bin").exists(),
+            "stale carried copy-only source must not be installed before a fresh scan"
+        );
+        assert!(outcome.carry.carry_attempted);
+        assert!(outcome.carry.carry_applied);
+        assert!(outcome.carry.carry_retried_fresh);
+        assert_eq!(
+            outcome.carry.carry_retry_reason,
+            Some(CarryRetryReason::RepairRequested)
+        );
     }
 
     #[cfg(feature = "slow-tests")]
@@ -7291,6 +7637,13 @@ mod tests {
         let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
         assert_eq!(outcome.status, Par2RepairStatus::Repaired);
         assert_eq!(outcome.verification.total_missing_blocks, 0);
+        assert!(outcome.carry.carry_attempted);
+        assert!(outcome.carry.carry_applied);
+        assert!(outcome.carry.carry_retried_fresh);
+        assert_eq!(
+            outcome.carry.carry_retry_reason,
+            Some(CarryRetryReason::RepairRequested)
+        );
 
         let mut reverify = Par2RepairerOptions::new(temp.path().to_path_buf(), par2_paths);
         reverify.repair = false;
