@@ -15,6 +15,10 @@
 //!       --target wasm32-wasip1
 //!   wasmtime run target/wasm32-wasip1/release/examples/blake2sp_wasm_check.wasm
 
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
 fn main() {
     let report = weaver_unrar::crypto::differential_corpus();
     match report.first_mismatch {
@@ -34,4 +38,12 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
+fn main() {
+    eprintln!("SKIP blake2sp SIMD differential corpus is not built for this target");
 }
