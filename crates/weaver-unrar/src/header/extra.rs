@@ -641,7 +641,11 @@ mod tests {
             ExtraRecord::FileTime { mtime, .. } => {
                 let duration = mtime.unwrap().duration_since(UNIX_EPOCH).unwrap();
                 assert_eq!(duration.as_secs(), 1_700_000_000);
-                assert_eq!(duration.subsec_nanos(), 123_456_789);
+                #[cfg(windows)]
+                let expected_nanos = 123_456_700;
+                #[cfg(not(windows))]
+                let expected_nanos = 123_456_789;
+                assert_eq!(duration.subsec_nanos(), expected_nanos);
             }
             other => panic!("expected FileTime, got {other:?}"),
         }

@@ -680,6 +680,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rar5_unix_member_backslash_remains_literal_like_rar_behavior_on_unix() {
         assert_eq!(

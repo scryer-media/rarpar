@@ -1104,6 +1104,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn member_info_uses_rar_behavior_rar5_unix_backslash_conversion() {
         let archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Unix, "dir\\file.txt");
