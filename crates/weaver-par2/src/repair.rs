@@ -664,9 +664,12 @@ fn staging_bytes_mut(cells: &mut [StagingCell]) -> &mut [u8] {
 /// memo is fully populated before any parallel compute runs.
 struct MemoEntry {
     prepared: crate::gf_simd::PreparedInputFactor,
-    /// Affine matrix forms for the folded split-layout kernel; only built
+    /// Affine matrix forms for the GFNI folded split-layout kernel; only built
     /// when that path is active.
     affine: Option<crate::gf_simd::AffineMulMatrices>,
+    /// Shuffle2x table forms for the non-GFNI AVX2 folded kernel; only built
+    /// when that path (AVX2 without GFNI) is active.
+    shuffle2x: Option<crate::gf_simd::Shuffle2xTables>,
 }
 
 struct PreparedFactorMemo {
@@ -674,15 +677,22 @@ struct PreparedFactorMemo {
 }
 
 impl PreparedFactorMemo {
-    fn from_matrix(matrix: &matrix::Matrix, with_affine: bool) -> Self {
+    fn from_matrix(matrix: &matrix::Matrix, with_folded: bool) -> Self {
         let mut slots: Vec<Option<Box<MemoEntry>>> = (0..1usize << 16).map(|_| None).collect();
+        // The folded split layout is shared; the GFNI affine kernel and the
+        // non-GFNI shuffle2x kernel consume it with different coefficient
+        // forms, so build whichever the active kernel needs.
+        let uses_gfni = with_folded && crate::gf_simd::folded_uses_gfni();
+        let uses_shuffle2x = with_folded && !uses_gfni;
         // Factor 0 backs the padding lanes of partially filled groups.
         let ensure = |factor: u16, slots: &mut Vec<Option<Box<MemoEntry>>>| {
             let slot = &mut slots[factor as usize];
             if slot.is_none() {
                 *slot = Some(Box::new(MemoEntry {
                     prepared: crate::gf_simd::prepare_input_factor(factor),
-                    affine: with_affine.then(|| crate::gf_simd::precompute_affine_matrices(factor)),
+                    affine: uses_gfni.then(|| crate::gf_simd::precompute_affine_matrices(factor)),
+                    shuffle2x: uses_shuffle2x
+                        .then(|| crate::gf_simd::precompute_shuffle2x_tables(factor)),
                 }));
             }
         };
@@ -711,6 +721,16 @@ impl PreparedFactorMemo {
             .affine
             .as_ref()
             .expect("affine matrices built for the folded path")
+    }
+
+    #[inline]
+    fn get_shuffle2x(&self, factor: u16) -> &crate::gf_simd::Shuffle2xTables {
+        self.slots[factor as usize]
+            .as_deref()
+            .expect("factor prepared during memo construction")
+            .shuffle2x
+            .as_ref()
+            .expect("shuffle2x tables built for the folded path")
     }
 }
 
@@ -850,6 +870,59 @@ fn fill_stream_batch(
     Ok(())
 }
 
+/// Run the folded split-layout tile nest — tile-outer -> output -> source-group
+/// — invoking `kernel(dst, &stagings, output_index)` per (tile, output). The
+/// 4 KiB destination tile stays L1-resident across every group pass (the kernel
+/// reloads dst once per group, an L1 hit at this size) and the tile's staging
+/// column stays in L2 across the output sweep; larger tiles turn the per-group
+/// dst reload into DRAM traffic that dominates the repair. The `kernel` closure
+/// selects the multiply (GFNI affine vs non-GFNI shuffle2x) — everything else,
+/// including the parallel decomposition, is identical for both.
+fn run_folded_tiles<F>(
+    vec_len: usize,
+    output_ptrs: &[usize],
+    groups: usize,
+    set: &StreamBatchSet,
+    kernel: F,
+) where
+    F: Fn(&mut [u8], &[&[u8]], usize) + Sync,
+{
+    let tiles = vec_len.div_ceil(COMPUTE_TILE_BYTES);
+    let threads = rayon::current_num_threads().max(1);
+    let outputs_n = output_ptrs.len();
+    // One task per tile when tiles alone give enough parallelism; otherwise
+    // split the output sweep so every thread has work.
+    let blocks_per_tile = if tiles >= threads * 2 {
+        1
+    } else {
+        (threads * 4)
+            .div_ceil(tiles.max(1))
+            .clamp(1, outputs_n.max(1))
+    };
+    let output_block = outputs_n.div_ceil(blocks_per_tile).max(1);
+    let task_count = tiles * blocks_per_tile;
+    (0..task_count).into_par_iter().for_each(|task| {
+        let tile = task / blocks_per_tile;
+        let block = task % blocks_per_tile;
+        let s0 = tile * COMPUTE_TILE_BYTES;
+        let s1 = (s0 + COMPUTE_TILE_BYTES).min(vec_len);
+        let j0 = block * output_block;
+        let j1 = (j0 + output_block).min(outputs_n);
+        let stride = crate::gf_simd::FOLDED_GROUP;
+        let stagings: Vec<&[u8]> = (0..groups)
+            .map(|g| &staging_bytes(&set.staging[g])[s0 * stride..s1 * stride])
+            .collect();
+        for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
+            // Safe: (tile, output) ranges have exactly one writer — tiles
+            // partition the region, output blocks partition the outputs, and
+            // batches are processed sequentially.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0) };
+            kernel(dst, &stagings, j);
+        }
+    });
+}
+
 /// Multiply one source batch into every output, with factors read straight
 /// from the decode matrix inside each task. Strip-parallel when the chunk is
 /// large (keeps the batch's source strips cache-resident across all outputs);
@@ -866,82 +939,62 @@ fn run_stream_batch_compute(
     if use_folded {
         let vec_len = byte_len & !(crate::gf_simd::SPLIT_BLOCK_BYTES - 1);
         let groups = set.len.div_ceil(crate::gf_simd::FOLDED_GROUP);
-        let group_matrices = |j: usize,
-                              g: usize|
-         -> [&crate::gf_simd::AffineMulMatrices;
-                                  crate::gf_simd::FOLDED_GROUP] {
-            std::array::from_fn(|lane| {
-                let b = g * crate::gf_simd::FOLDED_GROUP + lane;
-                // Padding lanes multiply through zero matrices and add nothing.
-                let factor = if b < set.len {
-                    matrix.get(j, set.start + b)
-                } else {
-                    0
-                };
-                memo.get_affine(factor)
-            })
-        };
-
         if vec_len > 0 {
-            // Coefficient matrices are resolved ONCE per batch into a flat
-            // table (outputs x groups); compute tasks index it instead of
-            // walking the decode matrix and memo per tile, which multiplied
-            // lookup work by the tile count.
-            let mut batch_matrices: Vec<
-                [&crate::gf_simd::AffineMulMatrices; crate::gf_simd::FOLDED_GROUP],
-            > = Vec::with_capacity(output_ptrs.len() * groups);
-            for j in 0..output_ptrs.len() {
-                for g in 0..groups {
-                    batch_matrices.push(group_matrices(j, g));
+            // Coefficients are resolved ONCE per batch into a flat (outputs x
+            // groups) table; compute tasks index it instead of walking the
+            // decode matrix and memo per tile. The split staging feeding the
+            // kernels is identical — only the coefficient form and the multiply
+            // kernel differ between GFNI (affine) and non-GFNI AVX2 (shuffle2x).
+            if crate::gf_simd::folded_uses_gfni() {
+                let mut batch_matrices: Vec<
+                    [&crate::gf_simd::AffineMulMatrices; crate::gf_simd::FOLDED_GROUP],
+                > = Vec::with_capacity(output_ptrs.len() * groups);
+                for j in 0..output_ptrs.len() {
+                    for g in 0..groups {
+                        batch_matrices.push(std::array::from_fn(|lane| {
+                            let b = g * crate::gf_simd::FOLDED_GROUP + lane;
+                            // Padding lanes multiply through zero and add nothing.
+                            let factor = if b < set.len {
+                                matrix.get(j, set.start + b)
+                            } else {
+                                0
+                            };
+                            memo.get_affine(factor)
+                        }));
+                    }
                 }
-            }
-            let batch_matrices = &batch_matrices;
-
-            // Reference-style tile nest: tile-outer -> output -> source-group.
-            // The 4 KiB destination tile stays L1-resident across every group
-            // pass (the kernel reloads dst once per group — an L1 hit at this
-            // size), and the tile's staging column (~batch x 4 KiB) stays in
-            // L2 across the output sweep. Larger tiles turn the per-group dst
-            // reload into DRAM traffic that dominates the whole repair.
-            let tiles = vec_len.div_ceil(COMPUTE_TILE_BYTES);
-            let threads = rayon::current_num_threads().max(1);
-            let outputs_n = output_ptrs.len();
-            // One task per tile when tiles alone give enough parallelism;
-            // otherwise split the output sweep so every thread has work.
-            let blocks_per_tile = if tiles >= threads * 2 {
-                1
-            } else {
-                (threads * 4)
-                    .div_ceil(tiles.max(1))
-                    .clamp(1, outputs_n.max(1))
-            };
-            let output_block = outputs_n.div_ceil(blocks_per_tile).max(1);
-            let task_count = tiles * blocks_per_tile;
-            (0..task_count).into_par_iter().for_each(|task| {
-                let tile = task / blocks_per_tile;
-                let block = task % blocks_per_tile;
-                let s0 = tile * COMPUTE_TILE_BYTES;
-                let s1 = (s0 + COMPUTE_TILE_BYTES).min(vec_len);
-                let j0 = block * output_block;
-                let j1 = (j0 + output_block).min(outputs_n);
-                let stride = crate::gf_simd::FOLDED_GROUP;
-                let stagings: Vec<&[u8]> = (0..groups)
-                    .map(|g| &staging_bytes(&set.staging[g])[s0 * stride..s1 * stride])
-                    .collect();
-                for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
-                    // Safe: (tile, output) ranges have exactly one writer —
-                    // tiles partition the region, output blocks partition the
-                    // outputs, and batches are processed sequentially.
-                    let dst = unsafe {
-                        std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0)
-                    };
+                run_folded_tiles(vec_len, output_ptrs, groups, set, |dst, stagings, j| {
                     crate::gf_simd::mul_acc_folded_batch(
                         dst,
-                        &stagings,
+                        stagings,
                         &batch_matrices[j * groups..(j + 1) * groups],
                     );
+                });
+            } else {
+                let mut batch_tables: Vec<
+                    [&crate::gf_simd::Shuffle2xTables; crate::gf_simd::FOLDED_GROUP],
+                > = Vec::with_capacity(output_ptrs.len() * groups);
+                for j in 0..output_ptrs.len() {
+                    for g in 0..groups {
+                        batch_tables.push(std::array::from_fn(|lane| {
+                            let b = g * crate::gf_simd::FOLDED_GROUP + lane;
+                            let factor = if b < set.len {
+                                matrix.get(j, set.start + b)
+                            } else {
+                                0
+                            };
+                            memo.get_shuffle2x(factor)
+                        }));
+                    }
                 }
-            });
+                run_folded_tiles(vec_len, output_ptrs, groups, set, |dst, stagings, j| {
+                    crate::gf_simd::mul_acc_shuffle2x_batch(
+                        dst,
+                        stagings,
+                        &batch_tables[j * groups..(j + 1) * groups],
+                    );
+                });
+            }
         }
 
         // Sub-block tails stay in normal layout on both sides; apply scalar.

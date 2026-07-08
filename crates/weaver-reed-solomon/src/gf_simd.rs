@@ -420,9 +420,26 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 }
 
 /// Whether the split byte-plane fast path is available: buffers can be
-/// converted to a per-register lo/hi plane layout so the GFNI kernels run
+/// converted to a per-register lo/hi plane layout so the folded kernels run
 /// without any per-iteration deinterleave/interleave shuffles.
+///
+/// This is the AVX2 split *layout* gate. Both the GFNI folded kernel
+/// ([`mul_acc_folded_group`]) and the non-GFNI shuffle2x kernel
+/// ([`mul_acc_shuffle2x_group`]) consume the identical layout; which kernel
+/// runs is chosen per group by [`folded_uses_gfni`].
 pub fn altmap_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return is_x86_feature_detected!("avx2");
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether the folded split-layout path should use the GFNI affine kernel
+/// (`gfni`+`avx2`) rather than the non-GFNI shuffle2x kernel. Only meaningful
+/// when [`altmap_supported`] is true.
+pub fn folded_uses_gfni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         return is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2");
@@ -495,7 +512,7 @@ pub fn split_encode_scatter(src: &[u8], staging: &mut [u8], lane: usize) {
         return;
     }
     let _ = (src, staging, lane, vec_len);
-    unreachable!("split staging requires x86_64 GFNI support");
+    unreachable!("split staging requires x86_64 AVX2 support");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -583,6 +600,57 @@ pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
     factor: 0,
 };
 
+/// Precomputed 256-bit shuffle tables for the non-GFNI AVX2 "shuffle2x"
+/// GF(2^16) multiply on the split byte-plane layout (a faithful port of
+/// ParPar's `gf16_shuffle2x`). Each table is a full 32-byte `__m256i`: the low
+/// 128-bit lane serves the low-byte plane, the high lane the high-byte plane,
+/// so one `vpshufb` per table covers both planes at once.
+///
+/// The four tables are rearrangements of the eight [`MulTables`] nibble
+/// byte-tables (`t[0..8]` = n0lo, n0hi, n1lo, n1hi, n2lo, n2hi, n3lo, n3hi):
+/// `norm_lo=[n0lo|n2hi]`, `swap_lo=[n0hi|n2lo]`, `norm_hi=[n1lo|n3hi]`,
+/// `swap_hi=[n1hi|n3lo]`. `norm` lookups land in the plane they belong to;
+/// `swap` lookups land in the opposite plane and are folded in with one
+/// `permute2x128` lane swap per destination block (see
+/// [`mul_acc_shuffle2x_group`]). This mirrors the affine `norm=[ll|hh]`,
+/// `swap=[hl|lh]` fold the GFNI kernel uses.
+#[derive(Clone)]
+pub struct Shuffle2xTables {
+    pub norm_lo: [u8; 32],
+    pub swap_lo: [u8; 32],
+    pub norm_hi: [u8; 32],
+    pub swap_hi: [u8; 32],
+}
+
+/// Zero shuffle2x tables: every lookup yields zero, so padding lanes of a
+/// partially filled group contribute nothing (mirrors [`ZERO_AFFINE`]).
+pub const ZERO_SHUFFLE2X: Shuffle2xTables = Shuffle2xTables {
+    norm_lo: [0u8; 32],
+    swap_lo: [0u8; 32],
+    norm_hi: [0u8; 32],
+    swap_hi: [0u8; 32],
+};
+
+/// Build the four shuffle2x tables for a GF(2^16) factor by rearranging the
+/// eight nibble byte-tables from [`precompute_mul_tables`]. Byte-exact by
+/// construction: the underlying products come from the shared scalar table
+/// builder, so no new GF arithmetic is introduced.
+pub fn precompute_shuffle2x_tables(factor: u16) -> Shuffle2xTables {
+    let t = precompute_mul_tables(factor).tables;
+    let cat = |lo: &[u8; 16], hi: &[u8; 16]| {
+        let mut o = [0u8; 32];
+        o[..16].copy_from_slice(lo);
+        o[16..].copy_from_slice(hi);
+        o
+    };
+    Shuffle2xTables {
+        norm_lo: cat(&t[0], &t[5]),
+        swap_lo: cat(&t[1], &t[4]),
+        norm_hi: cat(&t[2], &t[7]),
+        swap_hi: cat(&t[3], &t[6]),
+    }
+}
+
 /// Multiply every six-source group of a batch into one split-layout
 /// destination tile with a single call. `stagings[g]` is group `g`'s
 /// interleaved stream sliced to this tile (each `dst.len() * FOLDED_GROUP`
@@ -636,6 +704,43 @@ pub fn mul_acc_folded_batch(
     }
 }
 
+/// Multiply every six-source group of a batch into one split-layout
+/// destination tile with the non-GFNI AVX2 shuffle2x kernel. The counterpart
+/// of [`mul_acc_folded_batch`] for boxes with AVX2 but no GFNI; one call per
+/// (tile, output) amortizes call overhead across the batch. `tables[g]` are
+/// group `g`'s six coefficient table sets (padding lanes = [`ZERO_SHUFFLE2X`]).
+pub fn mul_acc_shuffle2x_batch(
+    dst: &mut [u8],
+    stagings: &[&[u8]],
+    tables: &[[&Shuffle2xTables; FOLDED_GROUP]],
+) {
+    assert_eq!(stagings.len(), tables.len(), "one table set per group");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let len = dst.len();
+        assert!(
+            len.is_multiple_of(SPLIT_BLOCK_BYTES),
+            "split dst length must be a multiple of {SPLIT_BLOCK_BYTES}"
+        );
+        for staging in stagings {
+            assert!(
+                staging.len() >= len * FOLDED_GROUP,
+                "staging must cover the full group"
+            );
+        }
+        debug_assert!(altmap_supported());
+        for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+            unsafe { mul_acc_shuffle2x_group_avx2(dst, staging, group_tables) };
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (dst, stagings, tables);
+        unreachable!("shuffle2x batch requires x86_64 AVX2 support");
+    }
+}
+
 /// Multiply one interleaved six-source group into a split-layout destination.
 ///
 /// `dst` is a split-layout region (length a multiple of 32); `staging` holds
@@ -666,7 +771,7 @@ pub fn mul_acc_folded_group(
 
     #[cfg(target_arch = "x86_64")]
     {
-        debug_assert!(altmap_supported());
+        debug_assert!(folded_uses_gfni());
         unsafe { mul_acc_folded_group_gfni_avx2(dst, staging, matrices) };
         return;
     }
@@ -745,6 +850,78 @@ unsafe fn mul_acc_folded_group_gfni_avx2(
             let crossed = _mm256_permute2x128_si256::<0x01>(acc2, acc2);
             acc1 = _mm256_xor_si256(acc1, crossed);
             _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc1);
+
+            offset += SPLIT_BLOCK_BYTES;
+            src += stride;
+        }
+    }
+}
+
+/// Multiply one interleaved six-source group into a split-layout destination
+/// with ParPar's non-GFNI "shuffle2x" formulation — the AVX2 analog of
+/// [`mul_acc_folded_group_gfni_avx2`], consuming the identical split staging.
+///
+/// Because the sources are already in split byte-plane layout, the hot loop
+/// carries no per-block deinterleave. Each source costs four `vpshufb` — norm
+/// and swap for the low nibble, norm and swap for the high nibble — half the
+/// eight lookups the interleaved `mul_acc_input_batch_avx2_prepared` path
+/// spends. `result` accumulates the plane-aligned (norm) products, `swapped`
+/// the cross-plane (swap) products; one `permute2x128` lane swap per
+/// destination block folds `swapped` into `result` for the whole group,
+/// exactly as the GFNI kernel folds its `acc2`.
+///
+/// `tables[l]` are lane `l`'s shuffle2x tables (see [`Shuffle2xTables`]);
+/// padding lanes use [`ZERO_SHUFFLE2X`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mul_acc_shuffle2x_group_avx2(
+    dst: &mut [u8],
+    staging: &[u8],
+    tables: &[&Shuffle2xTables; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mask = _mm256_set1_epi8(0x0f);
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
+
+            let mut result = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let mut swapped = _mm256_setzero_si256();
+
+            // norm lookups land in the same plane; swap lookups land in the
+            // opposite plane and are folded by the single lane swap below.
+            macro_rules! lane {
+                ($idx:literal, $t:expr) => {
+                    let data = _mm256_loadu_si256(
+                        staging.as_ptr().add(src + $idx * SPLIT_BLOCK_BYTES) as *const __m256i,
+                    );
+                    let lo = _mm256_and_si256(data, mask);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
+                    let nl = _mm256_loadu_si256($t.norm_lo.as_ptr() as *const __m256i);
+                    let sl = _mm256_loadu_si256($t.swap_lo.as_ptr() as *const __m256i);
+                    let nh = _mm256_loadu_si256($t.norm_hi.as_ptr() as *const __m256i);
+                    let sh = _mm256_loadu_si256($t.swap_hi.as_ptr() as *const __m256i);
+                    result = _mm256_xor_si256(result, _mm256_shuffle_epi8(nl, lo));
+                    swapped = _mm256_xor_si256(swapped, _mm256_shuffle_epi8(sl, lo));
+                    result = _mm256_xor_si256(result, _mm256_shuffle_epi8(nh, hi));
+                    swapped = _mm256_xor_si256(swapped, _mm256_shuffle_epi8(sh, hi));
+                };
+            }
+            lane!(0, tables[0]);
+            lane!(1, tables[1]);
+            lane!(2, tables[2]);
+            lane!(3, tables[3]);
+            lane!(4, tables[4]);
+            lane!(5, tables[5]);
+
+            let crossed = _mm256_permute2x128_si256::<0x01>(swapped, swapped);
+            result = _mm256_xor_si256(result, crossed);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
 
             offset += SPLIT_BLOCK_BYTES;
             src += stride;
@@ -3128,6 +3305,12 @@ mod tests {
             assert_eq!(buf, original, "roundtrip mismatch at len {len}");
         }
 
+        // The roundtrip above runs on any AVX2 box; the folded-group kernel
+        // below is GFNI-only.
+        if !folded_uses_gfni() {
+            return;
+        }
+
         // Folded-group kernel differential vs the scalar reference, including
         // zero-factor padding lanes and factor==1.
         let factor_sets: [[u16; FOLDED_GROUP]; 3] = [
@@ -3181,7 +3364,7 @@ mod tests {
 
     #[test]
     fn folded_batch_kernel_match() {
-        if !altmap_supported() {
+        if !folded_uses_gfni() {
             return;
         }
         // Odd and even group counts cover the fused-pair path, the odd
@@ -3267,6 +3450,93 @@ mod tests {
                 assert_eq!(
                     dst_seq, reference,
                     "sequential kernel mismatch groups={groups} len={len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shuffle2x_batch_kernel_match() {
+        // Non-GFNI AVX2 shuffle2x kernel differential vs the scalar reference,
+        // over the same split staging the GFNI folded path uses. Runs on any
+        // AVX2 box — including GFNI boxes, where it still exercises the
+        // shuffle2x fallback kernel end to end.
+        if !altmap_supported() {
+            return;
+        }
+        // Odd and even group counts, and factors mixing zero (padding lanes),
+        // one (XOR passthrough), and arbitrary values.
+        for groups in [1usize, 2, 3, 5] {
+            for len in [32usize, 4096, 21824] {
+                let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
+                    .map(|g| {
+                        let mut set = [0u16; FOLDED_GROUP];
+                        for (l, slot) in set.iter_mut().enumerate() {
+                            *slot = match (g + l) % 5 {
+                                0 => 0x0000,
+                                1 => 0x0001,
+                                _ => (0x2F1Du16)
+                                    .wrapping_mul((g * FOLDED_GROUP + l + 1) as u16)
+                                    .wrapping_add(0x0101),
+                            };
+                        }
+                        set
+                    })
+                    .collect();
+                let inputs: Vec<Vec<Vec<u8>>> = (0..groups)
+                    .map(|g| {
+                        (0..FOLDED_GROUP)
+                            .map(|l| {
+                                (0..len)
+                                    .map(|i| ((i * (g * 7 + l + 3) + 29) % 256) as u8)
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let mut reference = vec![0xA5u8; len];
+                for (set, group_inputs) in factor_sets.iter().zip(inputs.iter()) {
+                    for (&factor, input) in set.iter().zip(group_inputs.iter()) {
+                        mul_acc_region(factor, input, &mut reference);
+                    }
+                }
+
+                let stagings: Vec<Vec<u8>> = inputs
+                    .iter()
+                    .map(|group_inputs| {
+                        let mut staging = vec![0u8; len * FOLDED_GROUP];
+                        for (lane, input) in group_inputs.iter().enumerate() {
+                            split_encode_scatter(input, &mut staging, lane);
+                        }
+                        staging
+                    })
+                    .collect();
+                let tables: Vec<Vec<Shuffle2xTables>> = factor_sets
+                    .iter()
+                    .map(|set| {
+                        set.iter()
+                            .map(|&f| precompute_shuffle2x_tables(f))
+                            .collect()
+                    })
+                    .collect();
+                let table_sets: Vec<[&Shuffle2xTables; FOLDED_GROUP]> = tables
+                    .iter()
+                    .map(|group| {
+                        [
+                            &group[0], &group[1], &group[2], &group[3], &group[4], &group[5],
+                        ]
+                    })
+                    .collect();
+                let staging_refs: Vec<&[u8]> = stagings.iter().map(|s| s.as_slice()).collect();
+
+                let mut dst = vec![0xA5u8; len];
+                altmap_encode(&mut dst);
+                mul_acc_shuffle2x_batch(&mut dst, &staging_refs, &table_sets);
+                altmap_decode(&mut dst);
+                assert_eq!(
+                    dst, reference,
+                    "shuffle2x batch mismatch groups={groups} len={len}"
                 );
             }
         }
