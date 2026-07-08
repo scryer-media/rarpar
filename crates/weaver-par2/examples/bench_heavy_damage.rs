@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut info: libc::rusage = std::mem::zeroed();
@@ -41,6 +43,11 @@ fn peak_rss_bytes() -> u64 {
             info.ru_maxrss as u64 * 1024
         }
     }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
 }
 
 struct RunResult {

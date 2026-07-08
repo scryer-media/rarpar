@@ -7573,6 +7573,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_output_mode_preserves_supported_unix_and_darwin_modes() {
         let mut fh = test_rar3_symlink_header(None);
@@ -7591,6 +7592,7 @@ mod tests {
         assert_eq!(RarArchive::unix_output_mode(&fh), Some(0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_output_mode_converts_windows_attributes_like_rar_behavior() {
         let mask = current_umask();
@@ -7609,6 +7611,7 @@ mod tests {
         assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_output_mode_uses_rar_behavior_default_for_unsupported_hosts() {
         let mask = current_umask();
