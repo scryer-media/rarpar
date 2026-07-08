@@ -11,3 +11,6 @@ pub mod matrix;
 pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;
+/// JIT-generated bit-plane XOR GF(2^16) multiply for pre-GFNI x86.
+#[cfg(target_arch = "x86_64")]
+pub mod xor_jit;

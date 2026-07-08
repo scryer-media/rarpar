@@ -2835,6 +2835,7 @@ dependencies = [
 name = "weaver-reed-solomon"
 version = "0.2.0"
 dependencies = [
+ "memmap2",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
