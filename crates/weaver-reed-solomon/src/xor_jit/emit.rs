@@ -226,7 +226,7 @@ mod tests {
         // cmp rdx, rcx -> 48 39 CA  (matches ParPar back-edge)
         assert_eq!(emit(|b| cmp_rr(b, RDX, RCX)), [0x48, 0x39, 0xCA]);
         // ret -> C3
-        assert_eq!(emit(|b| ret(b)), [0xC3]);
+        assert_eq!(emit(ret), [0xC3]);
         // prefetcht1 [rsi] -> 0F 18 16  (/2, base rsi=6)
         assert_eq!(emit(|b| prefetcht1(b, RSI, 0)), [0x0F, 0x18, 0x16]);
     }
