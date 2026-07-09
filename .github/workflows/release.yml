@@ -350,10 +350,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rarpar-release-source"
           tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
           source_dir="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}"
-          if grep -Eq '^[[:space:]]*path[[:space:]]*=' "$source_dir/Cargo.toml"; then
-            echo "::error::packaged rarpar manifest still contains a path dependency"
-            exit 1
-          fi
+          python3 - "$source_dir/Cargo.toml" <<'PY'
+          import sys
+          import tomllib
+
+          manifest = sys.argv[1]
+          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
+          dependencies = data.get("dependencies", {})
+          for name in ("weaver-par2", "weaver-unrar"):
+              dep = dependencies.get(name)
+              if not isinstance(dep, dict) or "path" in dep or not dep.get("version"):
+                  print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
+                  sys.exit(1)
+          PY
           echo "RARPAR_RELEASE_SOURCE=$source_dir" >> "$GITHUB_ENV"
       - name: Stage rarpar release source (Windows)
         if: runner.os == 'Windows'
@@ -367,8 +376,23 @@ jobs:
           New-Item -ItemType Directory -Force $root | Out-Null
           tar -xzf "target/package/rarpar-$version.crate" -C $root
           $sourceDir = Join-Path $root "rarpar-$version"
-          if (Select-String -Path (Join-Path $sourceDir "Cargo.toml") -Pattern '^\s*path\s*=' -Quiet) {
-            throw "packaged rarpar manifest still contains a path dependency"
+          $manifest = Join-Path $sourceDir "Cargo.toml"
+          $check = @'
+          import sys
+          import tomllib
+
+          manifest = sys.argv[1]
+          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
+          dependencies = data.get("dependencies", {})
+          for name in ("weaver-par2", "weaver-unrar"):
+              dep = dependencies.get(name)
+              if not isinstance(dep, dict) or "path" in dep or not dep.get("version"):
+                  print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
+                  sys.exit(1)
+          '@
+          $check | python3 - $manifest
+          if ($LASTEXITCODE -ne 0) {
+            throw "packaged rarpar manifest dependency validation failed"
           }
           "RARPAR_RELEASE_SOURCE=$sourceDir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build rarpar (Unix)

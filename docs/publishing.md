@@ -8,7 +8,8 @@ Publish order:
 2. `weaver-unrar`
 3. `weaver-par2`
 
-`rarpar` is a CLI binary and is not published to crates.io.
+`rarpar` is a CLI binary and is not published to crates.io. It has its own
+binary release cycle, independent of the library crate publish cycle.
 
 Patch releases may publish a single library crate when only that crate changed.
 Use the dependency order above for coordinated multi-crate releases.
