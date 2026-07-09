@@ -28,9 +28,76 @@ writing, compression, or modification APIs.
 - Supports an UnRAR-compatible command shape, including `-vp` incremental
   extraction.
 
+## Performance
+
+`rarpar` uses the same RAR and PAR2 engines benchmarked in Weaver. These are
+selected warm-cache median results from shipped-style release builds with
+verified output, not benchmark-only binaries. They are shape-specific; archive
+content, storage, and CPU features matter. Release builds use AWS-LC-backed
+native crypto where available, plus Metal-accelerated PAR2 repair on macOS with
+automatic CPU fallback.
+
+RAR extraction, compared with the reference RAR extraction utility:
+
+| Platform | Workload | Reference | Weaver engine | Result |
+|---|---|---:|---:|---|
+| Apple M5 Max | RAR7 video, 4.9 GB, 4.6 GB dictionary | 8.6 s | **5.8 s** | ~1.5x faster |
+| Apple M5 Max | RAR5 encrypted, AES-256 | 0.41 s | **0.25 s** | ~1.6x faster |
+| Core Ultra 9 285H | RAR7 video, 4.9 GB, `-m3` | 17.7 s | **13.5 s** | ~1.3x faster |
+| Core Ultra 9 285H | RAR5 encrypted, AES-256 | 0.83 s | **0.52 s** | ~1.6x faster |
+| Ryzen 5 3600, Windows | RAR7 video, 4.94 GB, `-m3` | **13.5 s** | 13.6 s | parity |
+| Ryzen 5 3600, Windows | Store-mode BLAKE2sp verify, 4.94 GB | 3.48 s | **1.80 s** | ~1.9x faster |
+
+PAR2 verification and repair, compared with `par2cmdline-turbo 1.4.0`:
+
+| Platform | Workload | turbo | Weaver engine | Result |
+|---|---|---:|---:|---|
+| Apple M5 Max | 4 GB set, 1 MB slices, 407 missing | 112 s wall / 1622 s CPU | **28.5 s / 338 s** | ~3.9x faster |
+| Apple M5 Max | 2 GB set, 32,768 slices, 3,000 missing | 457 s wall / 6507 s CPU | **95 s / 1288 s** | ~4.8x faster |
+| Apple M5 Max | Verify clean 1 GB set | 2.43 s | **0.09 s** | ~27x faster |
+| Core Ultra 9 285H | 4 GB set, 1 MB slices, 407 missing | 12.1 s | **8.1 s** | ~1.5x faster |
+| Core Ultra 9 285H | Verify clean 1 GB set | 0.66 s | **0.37 s** | ~1.8x faster |
+| Ryzen 5 3600, Windows | Verify clean 1 GB set | 1.70 s | **0.30 s** | ~5.7x faster |
+
+### Metal On Apple Silicon
+
+On macOS, `rarpar` enables Weaver's Metal GF(2^16) repair tier for PAR2. The
+repair engine attempts a Metal session for non-x86 macOS repairs. In the default
+auto mode it engages Metal when `outputs * sources * region_bytes` is at least
+256 MiB; below that, the CPU path avoids GPU setup/upload overhead. Set
+`WEAVER_GF16_METAL=1` to force the Metal path or `WEAVER_GF16_METAL=0` to
+disable it. Once a Metal session engages, it runs the streaming repair chunks
+until completion or a GPU error, and any failed chunk is redone on the CPU.
+Repaired files are still read back and PAR2 verified before install.
+
+These numbers compare the same damaged PAR2 sets on an Apple M5 Max. `turbo` is
+`par2cmdline-turbo 1.4.0`; `Weaver CPU` is the all-core NEON path; `Weaver Metal`
+is the GPU path that `rarpar` now ships on macOS:
+
+| Platform | Workload | turbo | Weaver CPU | Weaver Metal | Result |
+|---|---|---:|---:|---:|---|
+| Apple M5 Max | 512 MB set, 64 KiB slices, 1,400 missing | 78.1 s | 8.96 s | **4.10 s** | ~19x faster than turbo |
+| Apple M5 Max | 76 MB set, 400 missing | 3.71 s | 0.62 s | **0.40 s** | ~9x faster than turbo |
+
+Raw Metal GF16 throughput in the Weaver benchmark was about **1.26 TB/s** versus
+about **62 GB/s** for the all-core NEON path; at this point the larger Apple
+Silicon repairs are mostly I/O-bound.
+
+Known weaker shapes remain: compressible-text RARs, RAR4 PPMd, Windows
+store-mode write-to-disk, and single-file/many-slice PAR2 repair on x86.
+`rarpar` verifies repaired and extracted output rather than trusting timing-only
+success.
+
 ## Install
 
 With Homebrew:
+
+```bash
+brew tap scryer-media/rarpar
+brew install rarpar
+```
+
+One-shot install:
 
 ```bash
 brew install scryer-media/rarpar/rarpar

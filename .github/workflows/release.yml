@@ -440,6 +440,8 @@ jobs:
           set -euo pipefail
           exe="$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar"
           "$exe" --help > "logs/rarpar-${{ matrix.platform }}-help.log"
+          "$exe" --version > "logs/rarpar-${{ matrix.platform }}-version.log"
+          grep -Fxq "rarpar ${RELEASE_TAG#rarpar-v}" "logs/rarpar-${{ matrix.platform }}-version.log"
           "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar \
             > "logs/rarpar-${{ matrix.platform }}-lb.log"
           grep -Fxq small.txt "logs/rarpar-${{ matrix.platform }}-lb.log"
@@ -450,6 +452,11 @@ jobs:
           $ErrorActionPreference = "Stop"
           $exe = Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe"
           & $exe --help | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-help.log"
+          & $exe --version | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-version.log"
+          $version = Get-Content "logs\rarpar-${{ matrix.platform }}-version.log" -Raw
+          if ($version.Trim() -ne "rarpar $($env:RELEASE_TAG -replace '^rarpar-v', '')") {
+            throw "rarpar --version output did not match release tag"
+          }
           & $exe lb crates\weaver-unrar\tests\fixtures\rar5\rar5_store.rar `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-lb.log"
           if (-not (Select-String -Path "logs\rarpar-${{ matrix.platform }}-lb.log" -Pattern '^small\.txt$' -Quiet)) {
@@ -621,14 +628,14 @@ jobs:
             def self.capture_getconf
               output, status = Open3.capture2("getconf", "GNU_LIBC_VERSION")
               status.success? ? output.strip : nil
-            rescue StandardError
+            rescue
               nil
             end
 
             def self.capture_ldd
               output, status = Open3.capture2e("ldd", "--version")
               status.success? ? output.lines.first.to_s.strip : nil
-            rescue StandardError
+            rescue
               nil
             end
           end
@@ -677,8 +684,12 @@ jobs:
               bin.install "rarpar"
               man1.install "share/man/man1/rarpar.1" if File.exist?("share/man/man1/rarpar.1")
               bash_completion.install "share/bash-completion/completions/rarpar" if File.exist?("share/bash-completion/completions/rarpar")
-              zsh_completion.install "share/zsh/site-functions/_rarpar" if File.exist?("share/zsh/site-functions/_rarpar")
-              fish_completion.install "share/fish/vendor_completions.d/rarpar.fish" if File.exist?("share/fish/vendor_completions.d/rarpar.fish")
+              if File.exist?("share/zsh/site-functions/_rarpar")
+                zsh_completion.install "share/zsh/site-functions/_rarpar"
+              end
+              if File.exist?("share/fish/vendor_completions.d/rarpar.fish")
+                fish_completion.install "share/fish/vendor_completions.d/rarpar.fish"
+              end
               pkgshare.install "README.md" if File.exist?("README.md")
               pkgshare.install "LICENSE" if File.exist?("LICENSE")
               pkgshare.install "LICENSE.weaver-unrar" if File.exist?("LICENSE.weaver-unrar")
@@ -686,6 +697,7 @@ jobs:
 
             test do
               assert_match "rarpar", shell_output("#{bin}/rarpar --help")
+              assert_match "rarpar #{version}", shell_output("#{bin}/rarpar --version")
               assert_path_exists man1/"rarpar.1"
             end
           end

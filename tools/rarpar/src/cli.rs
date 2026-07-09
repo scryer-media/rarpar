@@ -29,6 +29,7 @@ modify RAR archives.";
 #[derive(Debug, Parser)]
 #[command(
     name = "rarpar",
+    version,
     about = "Smart RAR/PAR2 repair and extraction CLI",
     long_about = ROOT_LONG_ABOUT,
     after_long_help = ROOT_AFTER_LONG_HELP

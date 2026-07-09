@@ -1118,6 +1118,12 @@ jobs:
           set -euo pipefail
           exe=target/debug/rarpar
           "$exe" --help > .ci-rarpar-help.txt
+          "$exe" --version > .ci-rarpar-version.txt
+          expected_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              python3 -c 'import json,sys; print(next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "rarpar")["version"])'
+          )"
+          grep -Fxq "rarpar ${expected_version}" .ci-rarpar-version.txt
           "$exe" inspect --json crates/weaver-par2/tests/fixtures/rar5_lz_plain > .ci-rarpar-inspect.json
           "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar > .ci-rarpar-lb.txt
           grep -Fxq small.txt .ci-rarpar-lb.txt

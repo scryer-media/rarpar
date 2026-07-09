@@ -55,6 +55,23 @@ fn run_with_input(args: &[&OsStr], input: &[u8]) -> Output {
 }
 
 #[test]
+fn root_version_reports_rarpar_version() {
+    let output = run(&[OsStr::new("--version")]);
+    assert!(
+        output.status.success(),
+        "--version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("rarpar {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!stdout.contains("UNRAR"));
+}
+
+#[test]
 fn root_help_leads_with_natural_workflow() {
     let output = run(&[OsStr::new("--help")]);
     assert!(

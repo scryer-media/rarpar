@@ -76,11 +76,11 @@ Verify repository metadata before the first publish.
   Linux GNU builds also upload package-root inspection artifacts for future
   distro packaging work, but GitHub Releases receive only `rarpar-*.tar.gz`,
   `rarpar-*.zip`, and `SHA256SUMS`. When `TAP_PUSH_TOKEN` is available, the
-  release job updates
-  `scryer-media/homebrew-rarpar` with a single portable Homebrew formula that
-  selects the macOS archive for the current architecture and, on Linux,
-  prefers the GNU/glibc archive when glibc is new enough, falling back to the
-  musl archive otherwise.
+  release job updates the `scryer-media/rarpar` Homebrew tap
+  (`scryer-media/homebrew-rarpar` on GitHub) with a single portable Homebrew
+  formula that selects the macOS archive for the current architecture and, on
+  Linux, prefers the GNU/glibc archive when glibc is new enough, falling back
+  to the musl archive otherwise.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
   selected package mode. It is manual-only and defaults to dry-run/preflight
   mode. Use `package=all` for coordinated releases or a specific package name
@@ -92,7 +92,9 @@ Verify repository metadata before the first publish.
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
-and `--remap-path-prefix`, are allowed.
+and `--remap-path-prefix`, are allowed. The `rarpar` binary enables the
+Weaver crates' native AWS-LC crypto path and macOS Metal PAR2 repair feature;
+Metal is target-gated and falls back to CPU repair when unavailable.
 
 Required repository configuration:
 
@@ -101,9 +103,10 @@ Required repository configuration:
   `secrets.CARGO_REGISTRY_TOKEN`.
 - `crates-io` environment: recommended for required reviewer protection around
   the real publish job.
-- `TAP_PUSH_TOKEN`: GitHub token that can push to
-  `scryer-media/homebrew-rarpar`. The release workflow skips the tap update
-  when this secret is absent.
+- `TAP_PUSH_TOKEN`: GitHub token that can push to the
+  `scryer-media/homebrew-rarpar` repository backing the `scryer-media/rarpar`
+  Homebrew tap. The release workflow skips the tap update when this secret is
+  absent.
 - Release workflow access to the standard GitHub-hosted runner labels in
   `.github/workflows/release.yml`.
 - GitHub Actions cache access for `sccache` lanes. Cache saves are restricted
