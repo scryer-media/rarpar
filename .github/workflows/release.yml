@@ -540,10 +540,25 @@ jobs:
           pattern: rarpar-release-*
           path: dist
           merge-multiple: true
+      - name: Normalize release assets
+        run: |
+          set -euo pipefail
+          rm -rf release-assets
+          mkdir -p release-assets
+          find dist -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) ! -name '*package-root*' -print0 \
+            | while IFS= read -r -d '' file; do
+                cp "$file" "release-assets/$(basename "$file")"
+              done
+          asset_count="$(find release-assets -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) | wc -l | tr -d ' ')"
+          if [ "$asset_count" != 7 ]; then
+            echo "::error::expected 7 release archives, found $asset_count"
+            find dist -maxdepth 4 -type f | sort
+            exit 1
+          fi
       - name: Generate checksums
         run: |
           set -euo pipefail
-          cd dist
+          cd release-assets
           checksum_file="$(mktemp)"
           find . -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) ! -name '*package-root*' -print0 \
             | sort -z \
@@ -554,7 +569,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_files=(dist/rarpar-*.tar.gz dist/rarpar-*.zip dist/SHA256SUMS)
+          release_files=(release-assets/rarpar-*.tar.gz release-assets/rarpar-*.zip release-assets/SHA256SUMS)
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
           else
@@ -573,12 +588,12 @@ jobs:
           fi
 
           VERSION="${RELEASE_TAG#rarpar-v}"
-          LINUX_X86_GNU_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-x86_64-gnu.tar.gz" | cut -d ' ' -f1)
-          LINUX_X86_MUSL_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-x86_64-musl.tar.gz" | cut -d ' ' -f1)
-          LINUX_ARM_GNU_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-arm64-gnu.tar.gz" | cut -d ' ' -f1)
-          LINUX_ARM_MUSL_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-linux-arm64-musl.tar.gz" | cut -d ' ' -f1)
-          DARWIN_ARM_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-darwin-arm64.tar.gz" | cut -d ' ' -f1)
-          DARWIN_X86_SHA=$(shasum -a 256 "dist/rarpar-${RELEASE_TAG}-darwin-x86_64.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_GNU_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-gnu.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_MUSL_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-musl.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_GNU_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-gnu.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_MUSL_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-musl.tar.gz" | cut -d ' ' -f1)
+          DARWIN_ARM_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-darwin-arm64.tar.gz" | cut -d ' ' -f1)
+          DARWIN_X86_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-darwin-x86_64.tar.gz" | cut -d ' ' -f1)
           REPO="${{ github.repository }}"
 
           mkdir -p tap/Formula
