@@ -1041,6 +1041,7 @@ jobs:
           test -x target/dist/package-root/usr/bin/rarpar
           test -f target/dist/package-root/usr/share/man/man1/rarpar.1
           test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE
+          test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
           test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.weaver-unrar
           top_levels="$(find target/dist/package-root -mindepth 1 -maxdepth 1 -printf '%f\n')"
           test "$top_levels" = "usr"

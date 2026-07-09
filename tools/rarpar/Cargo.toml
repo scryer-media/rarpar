@@ -3,7 +3,7 @@ name = "rarpar"
 description = "Intelligent RAR/PAR2 repair and extraction CLI"
 version = "0.2.4"
 edition.workspace = true
-license.workspace = true
+license-file = "LICENSE"
 repository.workspace = true
 publish = false
 

@@ -1,0 +1,30 @@
+# rarpar License
+
+rarpar source code is licensed under GPL-3.0-or-later.
+
+Normal rarpar binary distributions include and link `weaver-unrar`. Those
+binary distributions therefore carry the additional UnRAR source-code
+restriction for the RAR extraction and recovery code.
+
+Binary release archives include:
+
+- `LICENSE`: this rarpar license notice.
+- `LICENSE.GPL-3.0-or-later`: the full GNU GPL version 3 text.
+- `LICENSE.weaver-unrar`: the complete weaver-unrar license text, including
+  the UnRAR source-code restriction.
+
+Source checkouts include the full GNU GPL version 3 text in the workspace root
+`LICENSE` file and the complete weaver-unrar license in
+`crates/weaver-unrar/LICENSE`.
+
+## UnRAR Source-Code Restriction
+
+UnRAR source code may be used in any software to handle
+RAR archives without limitations free of charge, but cannot be
+used to develop RAR (WinRAR) compatible archiver and to
+re-create RAR compression algorithm, which is proprietary.
+Distribution of modified UnRAR source code in separate form
+or as a part of other software is permitted, provided that
+full text of this paragraph, starting from "UnRAR source code"
+words, is included in license, or in documentation if license
+is not available, and in source code comments of resulting package.

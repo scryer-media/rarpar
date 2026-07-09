@@ -471,7 +471,9 @@ jobs:
           rm -rf package
           mkdir -p package dist
           cp "$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar" package/
-          cp README.md LICENSE package/
+          cp README.md package/
+          cp tools/rarpar/LICENSE package/LICENSE
+          cp LICENSE package/LICENSE.GPL-3.0-or-later
           cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
           cp -R target/dist/docs/share package/share
           tar -czf "$archive" -C package .
@@ -486,7 +488,8 @@ jobs:
           New-Item -ItemType Directory -Force package, dist | Out-Null
           Copy-Item (Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe") package\
           Copy-Item README.md package\
-          Copy-Item LICENSE package\
+          Copy-Item tools\rarpar\LICENSE package\LICENSE
+          Copy-Item LICENSE package\LICENSE.GPL-3.0-or-later
           Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
           Copy-Item target\dist\docs\share package\share -Recurse
           Compress-Archive -Path package\* -DestinationPath $archive
@@ -644,7 +647,7 @@ jobs:
             desc "Smart RAR/PAR2 repair and extraction CLI"
             homepage "https://github.com/${REPO}"
             version "${VERSION}"
-            license "GPL-3.0-or-later"
+            license all_of: ["GPL-3.0-or-later", :cannot_represent]
 
             on_macos do
               on_arm do
@@ -692,6 +695,9 @@ jobs:
               end
               pkgshare.install "README.md" if File.exist?("README.md")
               pkgshare.install "LICENSE" if File.exist?("LICENSE")
+              if File.exist?("LICENSE.GPL-3.0-or-later")
+                pkgshare.install "LICENSE.GPL-3.0-or-later"
+              end
               pkgshare.install "LICENSE.weaver-unrar" if File.exist?("LICENSE.weaver-unrar")
             end
 

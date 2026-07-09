@@ -257,9 +257,9 @@ does not print an UnRAR banner and does not claim to be official UnRAR.
   Licensed GPL-3.0-or-later with the additional UnRAR source-code restriction.
 - `crates/weaver-par2`: PAR2 packet loading, verification, placement-aware
   repair, and post-repair verification. Licensed GPL-3.0-or-later.
-- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later; normal builds
-  link `weaver-unrar`, so binary distribution must also account for that
-  dependency's additional restriction.
+- `tools/rarpar`: the standalone CLI. Source is GPL-3.0-or-later. Normal
+  binary builds link `weaver-unrar`, so binary distribution also carries the
+  additional UnRAR source-code restriction.
 
 ## Development
 
@@ -288,12 +288,17 @@ Linux packaging layout notes are in `docs/packaging.md`.
 
 ## License
 
-The workspace is GPL-3.0-or-later, with one package-specific addition:
+The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
+`weaver-unrar` is used:
 
-- `weaver-reed-solomon`, `weaver-par2`, and the `rarpar` CLI source are
+- `weaver-reed-solomon`, `weaver-par2`, and `rarpar` source are
   GPL-3.0-or-later.
 - `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
   restriction documented in `crates/weaver-unrar/LICENSE`.
+- `rarpar` binary releases link `weaver-unrar` and therefore carry that
+  additional restriction too. Release archives include `LICENSE`,
+  `LICENSE.GPL-3.0-or-later`, and `LICENSE.weaver-unrar`.
 
-In short, the additional restriction applies to the RAR extraction and recovery
-code in `weaver-unrar`; it does not apply to the PAR2 or Reed-Solomon crates.
+The additional restriction applies to the RAR extraction and recovery code in
+`weaver-unrar` and to `rarpar` binaries that include it. It does not apply to
+the PAR2 or Reed-Solomon crates.

@@ -21,6 +21,8 @@ and PAR2 workflows.
   GPL-3.0-or-later.
 - `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
   restriction documented in `crates/weaver-unrar/LICENSE`.
+- `rarpar` binary distributions link `weaver-unrar` and must carry that
+  additional restriction too.
 - Never bypass signed commit or signed tag requirements.
 - Run the repo release script if one exists; do not hand-roll releases.
 

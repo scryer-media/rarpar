@@ -385,6 +385,12 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
     copy_into_root(
         out,
         Path::new("usr/share/licenses/rarpar/LICENSE"),
+        &root.join("tools/rarpar/LICENSE"),
+        0o644,
+    )?;
+    copy_into_root(
+        out,
+        Path::new("usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later"),
         &root.join("LICENSE"),
         0o644,
     )?;
@@ -484,6 +490,7 @@ fn validate_package_root(root: &Path) -> Result<()> {
         "usr/share/fish/vendor_completions.d/rarpar.fish",
         "usr/share/doc/rarpar/README.md",
         "usr/share/licenses/rarpar/LICENSE",
+        "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
         "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
     ] {
         let path = root.join(relative);
@@ -662,9 +669,10 @@ Zsh completion script.
 Fish completion script.
 .SH LICENSE
 \fBrarpar\fR source is GPL-3.0-or-later. Normal binary builds link
-\fBweaver-unrar\fR, whose source is GPL-3.0-or-later with the additional UnRAR
-source-code restriction documented in the distributed
-\fBLICENSE.weaver-unrar\fR file.
+\fBweaver-unrar\fR, so distributed \fBrarpar\fR binaries also carry the
+additional UnRAR source-code restriction for RAR extraction and recovery code.
+Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
+\fBLICENSE.weaver-unrar\fR.
 "#;
 
 #[cfg(test)]
@@ -735,6 +743,7 @@ mod tests {
             "usr/share/fish/vendor_completions.d/rarpar.fish",
             "usr/share/doc/rarpar/README.md",
             "usr/share/licenses/rarpar/LICENSE",
+            "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
             "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
         ] {
             assert!(out.join(relative).is_file(), "missing {relative}");

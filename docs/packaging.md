@@ -26,6 +26,8 @@ Homebrew Linux fallback when the host glibc is too old.
 - Summary: `Smart RAR/PAR2 repair and extraction CLI`
 - Homepage: `https://github.com/scryer-media/rarpar`
 - License: `GPL-3.0-or-later AND UnRAR-restriction`
+  - Homebrew represents this as `all_of: ["GPL-3.0-or-later", :cannot_represent]`
+    because the UnRAR restriction is not an SPDX license identifier.
 - Architecture: native per package, not universal
 
 The binary must remain named `rarpar`. Do not ship aliases or binaries named
@@ -44,6 +46,7 @@ future distro packages:
 /usr/share/fish/vendor_completions.d/rarpar.fish
 /usr/share/doc/rarpar/README.md
 /usr/share/licenses/rarpar/LICENSE
+/usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
 /usr/share/licenses/rarpar/LICENSE.weaver-unrar
 ```
 
