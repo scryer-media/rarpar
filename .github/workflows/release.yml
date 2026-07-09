@@ -79,7 +79,7 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Validate release tag and workspace version
+      - name: Validate release tag and package versions
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
@@ -128,6 +128,39 @@ jobs:
               sys.exit(1)
           print(f"release package versions: {selected}")
           PY
+      - name: Validate packaged CLI registry dependencies
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#rarpar-v}"
+          cargo package --locked --no-verify -p rarpar
+          rm -rf "$RUNNER_TEMP/rarpar-release-source"
+          mkdir -p "$RUNNER_TEMP/rarpar-release-source"
+          tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
+          manifest="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}/Cargo.toml"
+          python3 - "$manifest" <<'PY'
+          import sys
+          import tomllib
+
+          manifest = sys.argv[1]
+          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
+          dependencies = data.get("dependencies", {})
+          for name in ("weaver-par2", "weaver-unrar"):
+              dep = dependencies.get(name)
+              if dep is None:
+                  print(f"missing dependency: {name}", file=sys.stderr)
+                  sys.exit(1)
+              if isinstance(dep, str):
+                  print(f"{name} must be a dependency table", file=sys.stderr)
+                  sys.exit(1)
+              if "path" in dep:
+                  print(f"{name} still has a path dependency in packaged manifest", file=sys.stderr)
+                  sys.exit(1)
+              version = dep.get("version")
+              if not version:
+                  print(f"{name} is missing a registry version", file=sys.stderr)
+                  sys.exit(1)
+              print(f"packaged dependency: {name} {version}")
+          PY
       - name: Run release preflight checks
         run: |
           cargo fmt --check --all
@@ -154,6 +187,7 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
     strategy:
       fail-fast: false
       matrix:
@@ -305,13 +339,48 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
+      - name: Stage rarpar release source (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#rarpar-v}"
+          cargo package --locked --no-verify -p rarpar
+          rm -rf "$RUNNER_TEMP/rarpar-release-source"
+          mkdir -p "$RUNNER_TEMP/rarpar-release-source"
+          tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
+          source_dir="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}"
+          if grep -Eq '^[[:space:]]*path[[:space:]]*=' "$source_dir/Cargo.toml"; then
+            echo "::error::packaged rarpar manifest still contains a path dependency"
+            exit 1
+          fi
+          echo "RARPAR_RELEASE_SOURCE=$source_dir" >> "$GITHUB_ENV"
+      - name: Stage rarpar release source (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:RELEASE_TAG -replace '^rarpar-v', ''
+          cargo package --locked --no-verify -p rarpar
+          $root = Join-Path $env:RUNNER_TEMP "rarpar-release-source"
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $root | Out-Null
+          tar -xzf "target/package/rarpar-$version.crate" -C $root
+          $sourceDir = Join-Path $root "rarpar-$version"
+          if (Select-String -Path (Join-Path $sourceDir "Cargo.toml") -Pattern '^\s*path\s*=' -Quiet) {
+            throw "packaged rarpar manifest still contains a path dependency"
+          }
+          "RARPAR_RELEASE_SOURCE=$sourceDir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build rarpar (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p logs
-          cargo build --locked --release -p rarpar --target "${{ matrix.target }}" 2>&1 \
+          cargo build --locked --release \
+            --manifest-path "$RARPAR_RELEASE_SOURCE/Cargo.toml" \
+            --target "${{ matrix.target }}" \
+            --target-dir "$RARPAR_RELEASE_TARGET_DIR" 2>&1 \
             | tee "logs/rarpar-${{ matrix.platform }}-build.log"
       - name: Build rarpar (Windows)
         if: runner.os == 'Windows'
@@ -319,7 +388,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force logs | Out-Null
-          cargo build --locked --release -p rarpar --target ${{ matrix.target }} 2>&1 `
+          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
+          cargo build --locked --release `
+            --manifest-path $manifest `
+            --target ${{ matrix.target }} `
+            --target-dir $env:RARPAR_RELEASE_TARGET_DIR 2>&1 `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
       - name: Generate manpage and completions
         shell: bash
@@ -329,7 +402,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          exe="target/${{ matrix.target }}/release/rarpar"
+          exe="$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar"
           "$exe" --help > "logs/rarpar-${{ matrix.platform }}-help.log"
           "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar \
             > "logs/rarpar-${{ matrix.platform }}-lb.log"
@@ -339,7 +412,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\${{ matrix.target }}\release\rarpar.exe"
+          $exe = Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe"
           & $exe --help | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-help.log"
           & $exe lb crates\weaver-unrar\tests\fixtures\rar5\rar5_store.rar `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-lb.log"
@@ -354,7 +427,7 @@ jobs:
           archive="rarpar-${RELEASE_TAG}-${{ matrix.platform }}.${{ matrix.archive_ext }}"
           rm -rf package
           mkdir -p package dist
-          cp "target/${{ matrix.target }}/release/rarpar" package/
+          cp "$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar" package/
           cp README.md LICENSE package/
           cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
           cp -R target/dist/docs/share package/share
@@ -368,7 +441,7 @@ jobs:
           $archive = "rarpar-$env:RELEASE_TAG-${{ matrix.platform }}.${{ matrix.archive_ext }}"
           Remove-Item -Recurse -Force package -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force package, dist | Out-Null
-          Copy-Item target\${{ matrix.target }}\release\rarpar.exe package\
+          Copy-Item (Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe") package\
           Copy-Item README.md package\
           Copy-Item LICENSE package\
           Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
@@ -383,7 +456,7 @@ jobs:
           rm -rf package-root package-roots
           mkdir -p package-roots
           cargo run --locked -p xtask -- package-root \
-            --binary "target/${{ matrix.target }}/release/rarpar" \
+            --binary "$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar" \
             --docs target/dist/docs \
             --out package-root \
             --target "${{ matrix.target }}"
