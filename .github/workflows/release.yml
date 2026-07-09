@@ -137,25 +137,27 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rarpar-release-source"
           tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
           manifest="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}/Cargo.toml"
-          python3 - "$manifest" <<'PY'
+          cargo metadata --locked --format-version 1 --no-deps \
+            --manifest-path "$manifest" \
+            > "$RUNNER_TEMP/rarpar-release-source/metadata.json"
+          python3 - "$RUNNER_TEMP/rarpar-release-source/metadata.json" <<'PY'
+          import json
           import sys
-          import tomllib
 
-          manifest = sys.argv[1]
-          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
-          dependencies = data.get("dependencies", {})
+          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          package = next(
+              package for package in metadata["packages"] if package["name"] == "rarpar"
+          )
+          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           for name in ("weaver-par2", "weaver-unrar"):
               dep = dependencies.get(name)
               if dep is None:
                   print(f"missing dependency: {name}", file=sys.stderr)
                   sys.exit(1)
-              if isinstance(dep, str):
-                  print(f"{name} must be a dependency table", file=sys.stderr)
-                  sys.exit(1)
-              if "path" in dep:
+              if dep.get("source") is None or dep.get("path"):
                   print(f"{name} still has a path dependency in packaged manifest", file=sys.stderr)
                   sys.exit(1)
-              version = dep.get("version")
+              version = dep.get("req")
               if not version:
                   print(f"{name} is missing a registry version", file=sys.stderr)
                   sys.exit(1)
@@ -350,16 +352,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rarpar-release-source"
           tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
           source_dir="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}"
-          python3 - "$source_dir/Cargo.toml" <<'PY'
+          cargo metadata --locked --format-version 1 --no-deps \
+            --manifest-path "$source_dir/Cargo.toml" \
+            > "$RUNNER_TEMP/rarpar-release-source/metadata.json"
+          python3 - "$RUNNER_TEMP/rarpar-release-source/metadata.json" <<'PY'
+          import json
           import sys
-          import tomllib
 
-          manifest = sys.argv[1]
-          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
-          dependencies = data.get("dependencies", {})
+          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          package = next(
+              package for package in metadata["packages"] if package["name"] == "rarpar"
+          )
+          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           for name in ("weaver-par2", "weaver-unrar"):
               dep = dependencies.get(name)
-              if not isinstance(dep, dict) or "path" in dep or not dep.get("version"):
+              if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
                   sys.exit(1)
           PY
@@ -377,20 +384,25 @@ jobs:
           tar -xzf "target/package/rarpar-$version.crate" -C $root
           $sourceDir = Join-Path $root "rarpar-$version"
           $manifest = Join-Path $sourceDir "Cargo.toml"
+          $metadata = Join-Path $root "metadata.json"
+          cargo metadata --locked --format-version 1 --no-deps --manifest-path $manifest `
+            | Out-File -Encoding utf8 $metadata
           $check = @'
+          import json
           import sys
-          import tomllib
 
-          manifest = sys.argv[1]
-          data = tomllib.loads(open(manifest, "rb").read().decode("utf-8"))
-          dependencies = data.get("dependencies", {})
+          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          package = next(
+              package for package in metadata["packages"] if package["name"] == "rarpar"
+          )
+          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           for name in ("weaver-par2", "weaver-unrar"):
               dep = dependencies.get(name)
-              if not isinstance(dep, dict) or "path" in dep or not dep.get("version"):
+              if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
                   sys.exit(1)
           '@
-          $check | python3 - $manifest
+          $check | python3 - $metadata
           if ($LASTEXITCODE -ne 0) {
             throw "packaged rarpar manifest dependency validation failed"
           }
