@@ -64,8 +64,9 @@ Verify repository metadata before the first publish.
   musl, macOS Apple Silicon, macOS Intel, and Windows, then creates or updates
   a GitHub Release. It runs on tags matching `rarpar-v*` and supports manual
   dispatch against an existing tag. It validates that the tag version matches
-  every workspace package, validates generated manpages/completions, smoke-tests
-  each native binary, and uploads build logs plus `sccache` stats as workflow
+  the `rarpar` package, records the Weaver crate versions used for the build,
+  validates generated manpages/completions, smoke-tests each native binary, and
+  uploads build logs plus `sccache` stats as workflow
   artifacts. Release archives include `share/` manpage and completion files.
   Linux GNU builds also upload package-root inspection artifacts for future
   distro packaging work, but GitHub Releases receive only `rarpar-*.tar.gz`,

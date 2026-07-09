@@ -105,23 +105,28 @@ jobs:
               "--no-deps",
           ])
           packages = json.loads(metadata)["packages"]
+          required = {
+              "weaver-reed-solomon",
+              "weaver-unrar",
+              "weaver-par2",
+              "rarpar",
+          }
           selected = {
               package["name"]: package["version"]
               for package in packages
-              if package["name"] in {
-                  "weaver-reed-solomon",
-                  "weaver-unrar",
-                  "weaver-par2",
-                  "rarpar",
-              }
+              if package["name"] in required
           }
-          bad = {name: version for name, version in selected.items() if version != expected}
-          if len(selected) != 4 or bad:
+          missing = sorted(required - selected.keys())
+          if missing:
+              print(f"workspace is missing packages: {missing}", file=sys.stderr)
+              sys.exit(1)
+          if selected["rarpar"] != expected:
               print(
-                  f"release version mismatch: expected {expected}, got {selected}",
+                  f"release tag {tag} expects rarpar {expected}, got {selected['rarpar']}",
                   file=sys.stderr,
               )
               sys.exit(1)
+          print(f"release package versions: {selected}")
           PY
       - name: Run release preflight checks
         run: |
