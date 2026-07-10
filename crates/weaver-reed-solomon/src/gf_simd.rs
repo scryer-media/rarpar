@@ -2299,8 +2299,10 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
         .collect();
 
     // Prepared factors must be the GFNI flavor on this path (the dispatchers
-    // guarantee it on-machine); a foreign Avx2-flavored factor would be
-    // silently dropped here yet applied by the AVX2 tail delegate below.
+    // guarantee it on-machine). A foreign Avx2-flavored factor would be
+    // filtered out here AND by the AVX2 tail delegate below (whose vector
+    // loop and scalar tail both iterate a Gfni-filtered list), so its entire
+    // contribution would silently vanish from the result.
     debug_assert!(
         factors_and_srcs.iter().all(|fs| matches!(
             fs.prepared.x86.as_ref(),
@@ -2784,9 +2786,10 @@ unsafe fn mul_acc_input_batch_avx512_prepared(
         .collect();
 
     // Prepared factors must be the split-nibble (Avx2 table) flavor on this
-    // path (the dispatchers guarantee it on-machine); a foreign GFNI-flavored
-    // factor would be silently dropped here yet applied by the AVX2 tail
-    // delegate below.
+    // path (the dispatchers guarantee it on-machine). A foreign GFNI-flavored
+    // factor would be filtered out here AND by the AVX2 tail delegate below
+    // (whose vector loop and scalar tail both iterate an Avx2-filtered list),
+    // so its entire contribution would silently vanish from the result.
     debug_assert!(
         factors_and_srcs.iter().all(|fs| matches!(
             fs.prepared.x86.as_ref(),

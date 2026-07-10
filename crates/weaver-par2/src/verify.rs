@@ -926,6 +926,18 @@ fn sliced_verify_plan(
 /// MD5, tail slice zero-padded to `slice_size`). Returns one bool per slice in
 /// the span; a read error or short read fails the whole span. Shared verbatim
 /// by the serial and span-parallel drivers.
+///
+/// The span is read into the caller's `scratch` buffer (grown once, reused
+/// across spans) through the same short-read-looping [`read_file_slice_into`]
+/// the strict pipeline uses — a bare `read_file_range_into` is one `read(2)`
+/// and may come up short on a multi-megabyte span, which would report the
+/// whole span damaged. Its slices are then hashed in SIMD lanes
+/// ([`md5_simd::md5_multi`], up to [`VERIFY_SIMD_MAX_LANES`] at a time) rather
+/// than one scalar MD5 per slice, matching the strict path's
+/// [`verify_slices_batched_md5`]. Padding semantics are unchanged:
+/// `md5_multi(.., Some(slice_size))` and [`checksum::crc32_padded`] zero-pad a
+/// short tail slice exactly as `SliceChecksumState::finalize(Some(slice_size))`
+/// did.
 fn check_slice_span(
     access: &dyn FileAccess,
     file_id: &FileId,
@@ -933,27 +945,47 @@ fn check_slice_span(
     plan: &SlicedVerifyPlan,
     start: usize,
     count: usize,
+    scratch: &mut Vec<u8>,
 ) -> Vec<bool> {
     let slice_size = plan.slice_size;
     let offset = start as u64 * slice_size;
     let want = (plan.length - offset).min(count as u64 * slice_size);
-    let Ok(data) = access.read_file_range(file_id, offset, want) else {
+    let Ok(want_len) = usize::try_from(want) else {
         return vec![false; count];
     };
-    if data.len() as u64 != want {
+    if scratch.len() < want_len {
+        scratch.resize(want_len, 0);
+    }
+    let Ok(read) = read_file_slice_into(file_id, offset, want, access, &mut scratch[..want_len])
+    else {
+        return vec![false; count];
+    };
+    if read != want_len {
         return vec![false; count];
     }
-    (0..count)
-        .map(|index| {
-            let lo = (index as u64 * slice_size).min(want) as usize;
-            let hi = ((index as u64 + 1) * slice_size).min(want) as usize;
-            let mut state = checksum::SliceChecksumState::new();
-            state.update(&data[lo..hi]);
-            let (crc32, md5) = state.finalize(Some(slice_size));
-            let expected = &checksums[start + index];
-            crc32 == expected.crc32 && md5 == expected.md5
-        })
-        .collect()
+    let data = &scratch[..want_len];
+
+    let mut valid = Vec::with_capacity(count);
+    let mut index = 0usize;
+    while index < count {
+        let lanes = VERIFY_SIMD_MAX_LANES.min(count - index);
+        let mut inputs: [&[u8]; VERIFY_SIMD_MAX_LANES] = [&[]; VERIFY_SIMD_MAX_LANES];
+        for (lane, input) in inputs.iter_mut().take(lanes).enumerate() {
+            let slice_index = (index + lane) as u64;
+            let lo = (slice_index * slice_size).min(want) as usize;
+            let hi = ((slice_index + 1) * slice_size).min(want) as usize;
+            *input = &data[lo..hi];
+        }
+        let inputs = &inputs[..lanes];
+        let md5s = md5_simd::md5_multi(inputs, Some(slice_size));
+        for (lane, input) in inputs.iter().enumerate() {
+            let expected = &checksums[start + index + lane];
+            let crc32 = checksum::crc32_padded(input, slice_size);
+            valid.push(crc32 == expected.crc32 && md5s[lane] == expected.md5);
+        }
+        index += lanes;
+    }
+    valid
 }
 
 /// Assemble the per-file outcome from a completed slice-validity vector:
@@ -1030,17 +1062,28 @@ fn verify_file_sliced(
     let plan = sliced_verify_plan(par2, access, file_id)?;
     let checksums = par2.file_checksums(file_id)?;
     let per_span: Vec<Vec<bool>> = if span_parallel {
+        // `map_init` hands each rayon job its own read buffer, reused across
+        // the spans that job takes; `collect` preserves span order.
         plan.spans
             .par_iter()
-            .map(|&(start, count)| {
-                check_slice_span(access, file_id, checksums, &plan, start, count)
+            .map_init(Vec::new, |scratch, &(start, count)| {
+                check_slice_span(access, file_id, checksums, &plan, start, count, scratch)
             })
             .collect()
     } else {
+        let mut scratch = Vec::new();
         plan.spans
             .iter()
             .map(|&(start, count)| {
-                check_slice_span(access, file_id, checksums, &plan, start, count)
+                check_slice_span(
+                    access,
+                    file_id,
+                    checksums,
+                    &plan,
+                    start,
+                    count,
+                    &mut scratch,
+                )
             })
             .collect()
     };
@@ -1060,11 +1103,20 @@ fn verify_file_sliced_serial(
 ) -> Option<FileVerification> {
     let plan = sliced_verify_plan(par2, access, file_id)?;
     let checksums = par2.file_checksums(file_id)?;
+    let mut scratch = Vec::new();
     let valid_slices: Vec<bool> = plan
         .spans
         .iter()
         .flat_map(|&(start, count)| {
-            check_slice_span(access, file_id, checksums, &plan, start, count)
+            check_slice_span(
+                access,
+                file_id,
+                checksums,
+                &plan,
+                start,
+                count,
+                &mut scratch,
+            )
         })
         .collect();
     Some(finish_sliced_verification(file_id, &plan, valid_slices))
@@ -1177,13 +1229,28 @@ pub fn verify_selected_file_ids_with_options(
     file_ids: &[FileId],
     options: &VerifyOptions,
 ) -> VerificationResult {
+    // Resolved once per call: env override wins, otherwise the option flag.
+    let fast_verify = fast_verify_enabled(options.fast_verify);
+    verify_selected_file_ids_resolved(par2, access, file_ids, options, fast_verify)
+}
+
+/// [`verify_selected_file_ids_with_options`] with `fast_verify` already
+/// resolved. Split out (like [`resolve_fast_verify`]) so tests that assert
+/// a specific pipeline's I/O discipline can pin the mode instead of
+/// inheriting an ambient `WEAVER_PAR2_FAST_VERIFY` from the test
+/// environment.
+fn verify_selected_file_ids_resolved(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    file_ids: &[FileId],
+    options: &VerifyOptions,
+    fast_verify: bool,
+) -> VerificationResult {
     let mut files = Vec::new();
     let mut total_missing_blocks = 0u32;
     let mut resource_limit_reason = None;
     let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
-    // Resolved once per call: env override wins, otherwise the option flag.
-    let fast_verify = fast_verify_enabled(options.fast_verify);
 
     for (file_index, file_id) in file_ids.iter().enumerate() {
         // Check cancellation before each file.
@@ -2043,7 +2110,17 @@ mod tests {
             open_calls: open_calls.clone(),
         };
 
-        let verification = verify_selected_file_ids(&set, &access, &[file_id]);
+        // Pinned strict: the single-sequential-pass discipline is a property
+        // of the strict pipeline, and must not depend on an ambient
+        // WEAVER_PAR2_FAST_VERIFY in the test environment (fast verify reads
+        // spans via `read_file_range_into`, which this mock forbids).
+        let verification = verify_selected_file_ids_resolved(
+            &set,
+            &access,
+            &[file_id],
+            &VerifyOptions::default(),
+            false,
+        );
 
         assert_eq!(verification.total_missing_blocks, 0);
         assert!(matches!(verification.files[0].status, FileStatus::Complete));
@@ -2093,11 +2170,15 @@ mod tests {
             files: access.files,
         };
 
-        let verification = verify_selected_file_ids_with_options(
+        // Pinned strict: this asserts the strict pipeline's quick-check
+        // scratch reuse (see the sequential-pass test above for why pinning
+        // beats inheriting ambient WEAVER_PAR2_FAST_VERIFY).
+        let verification = verify_selected_file_ids_resolved(
             &set,
             &access,
             &file_ids,
             &VerifyOptions::default(),
+            false,
         );
 
         assert_eq!(verification.files.len(), 2);
@@ -2370,6 +2451,35 @@ mod tests {
             format!("{fast:?}"),
             "fast intact result must match strict byte for byte"
         );
+    }
+
+    #[test]
+    fn fast_verify_uses_only_non_allocating_reads() {
+        // The span reader must go through `read_file_slice_into` (looping
+        // `read_file_range_into` on a reused scratch buffer), never the
+        // allocating `read_file_range` this mock forbids. Pinned fast so an
+        // ambient WEAVER_PAR2_FAST_VERIFY=0 cannot skip the path under test.
+        // 17 full slices + a 460-byte tail exercises several SIMD MD5 lane
+        // batches within one span plus the padded-tail lane.
+        let file_data = (0..(QUICK_CHECK_16K_BYTES + 1500))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = ReadIntoOnlyAccess {
+            files: access.files,
+        };
+
+        let result = verify_selected_file_ids_resolved(
+            &set,
+            &access,
+            &[file_id],
+            &VerifyOptions::default(),
+            true,
+        );
+
+        assert!(matches!(result.files[0].status, FileStatus::Complete));
+        assert_eq!(result.total_missing_blocks, 0);
+        assert_eq!(result.files[0].valid_slices, vec![true; 18]);
     }
 
     #[test]
