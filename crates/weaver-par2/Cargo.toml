@@ -16,6 +16,12 @@ slow-tests = []
 # session (guarded in `repair.rs`) only engages when this feature is enabled on
 # macOS. Forwards to weaver-reed-solomon's `metal` backend.
 metal = ["weaver-reed-solomon/metal"]
+# Opt-in portable-GPU (wgpu: Vulkan/DX12/Metal) streaming-repair arm for the
+# platforms the native Metal backend does not cover. Off by default (wgpu is a
+# heavy dependency tree); the session engages under the same size gating as
+# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to weaver-reed-solomon's
+# `wgpu` backend.
+wgpu = ["weaver-reed-solomon/wgpu"]
 
 [dependencies]
 weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.1", default-features = false }

@@ -8,10 +8,16 @@
 //! `ymm3..15` (planes 0-2 stay in memory at `[rax-128/-96/-64]`), and for each
 //! output plane XORs in the source planes named by its deps row.
 //!
-//! Output planes are processed in pairs with ParPar's common-subexpression
-//! sharing: the source planes both rows of a pair need are XORed once into a
-//! shared accumulator (`ymm2`) and folded into each output, so a plane common
-//! to the pair costs one `vpxor` instead of two (~128 -> ~115 vpxor/block).
+//! Output planes are processed in pairs with common-subexpression sharing:
+//! the source planes both rows of a pair need are XORed once into a shared
+//! accumulator (`ymm2`) and folded into each output, so a plane common to the
+//! pair costs one `vpxor` instead of two. The pairing and register roles are
+//! ParPar's; the CSE EXTENT deliberately is not — ParPar shares only the
+//! lowest and highest common bits of a pair (`common_elim`,
+//! gf16_xor_avx2.c:213-228, a limit of its SIMD-generated writer) while this
+//! scheduler shares ALL common bits, and ParPar additionally fuses the dst
+//! load into its highest source-plane `vpxor`. Net: mean ~104 vpxor/block
+//! here vs ~121 modeled for upstream's schedule (mean deps set-bits 128).
 
 use super::deps::XorDeps;
 use super::emit::{self, RAX, RCX, RDX};

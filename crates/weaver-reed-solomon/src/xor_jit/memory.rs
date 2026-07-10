@@ -62,4 +62,38 @@ impl JitCode {
             out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
         );
     }
+
+    /// Execute an AVX512 muladd body ([`super::codegen512`]) over `len`-byte
+    /// planar regions (`len` a multiple of 1024). Convention: `rax=src-1024,
+    /// rdx=dst-1024, rcx=dst_end-1024` (no upstream `-384` bias — EVEX
+    /// compressed disp8 covers the plane offsets); the body advances one
+    /// 1024-byte block per iteration and `ret`s.
+    ///
+    /// # Safety
+    /// `self` must hold a body from [`super::codegen512::generate_muladd`],
+    /// AVX512BW+VL must be available, `src`/`dst` valid for `len` bytes,
+    /// `len % 1024 == 0`.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn run_muladd_512(&self, src: *const u8, dst: *mut u8, len: usize) {
+        let rax = src.wrapping_sub(1024);
+        let rdx = dst.wrapping_sub(1024);
+        let rcx = (dst as *const u8).wrapping_add(len).wrapping_sub(1024);
+        core::arch::asm!(
+            "call {entry}",
+            "vzeroupper",
+            entry = in(reg) self.entry,
+            inout("rax") rax => _,
+            inout("rdx") rdx => _,
+            inout("rsi") 0usize => _,
+            in("rcx") rcx,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _,
+            out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
+            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _,
+            out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+            out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _,
+            out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
+        );
+    }
 }

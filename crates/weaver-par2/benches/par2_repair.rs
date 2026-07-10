@@ -231,6 +231,30 @@ fn bench_gf_kernel(c: &mut Criterion) {
         });
     });
 
+    // Exercises the aarch64 >3-input CLMUL selection (WEAVER_GF16_CLMUL_BATCH=0
+    // pins the VTBL shuffle path for an A/B without a rebuild).
+    let batch_srcs: Vec<Vec<u8>> = (0..8)
+        .map(|salt: usize| {
+            (0..65_536)
+                .map(|i| ((i * 31 + salt * 97 + 5) % 253) as u8 | 1)
+                .collect()
+        })
+        .collect();
+    let batch_factors: Vec<u16> = (0..8).map(|i| 0x1021 + i * 0x0777).collect();
+    group.bench_function("mul_acc_input_batch_64kb_x8src", |b| {
+        b.iter(|| {
+            let srcs: Vec<weaver_par2::gf_simd::FactorSrc<'_>> = batch_factors
+                .iter()
+                .zip(batch_srcs.iter())
+                .map(|(&factor, src)| weaver_par2::gf_simd::FactorSrc {
+                    factor,
+                    src: src.as_slice(),
+                })
+                .collect();
+            weaver_par2::gf_simd::mul_acc_input_batch(&mut dst, &srcs);
+        });
+    });
+
     group.finish();
 }
 
@@ -261,12 +285,54 @@ fn bench_md5_hotloop(c: &mut Criterion) {
     group.finish();
 }
 
+/// A/B the rank-1 vs rank-k tiled repair-matrix solve at large sizes with a
+/// many-slice shape (avail = 2n), the shape that most stresses the elimination.
+/// Both paths run the identical Vandermonde construction, so the delta is the
+/// elimination strategy. Toggled via the explicit `use_tiled` A/B hook, not the
+/// `WEAVER_MATRIX_TILED` env gate, so the comparison is deterministic.
+fn bench_matrix_solve(c: &mut Criterion) {
+    use weaver_par2::matrix::build_repair_matrix_ab;
+
+    let mut group = c.benchmark_group("matrix_solve");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(10));
+
+    for &n in &[512usize, 1024, 2048] {
+        let avail = 2 * n;
+        let total = n + avail;
+        let constants = weaver_par2::gf::input_slice_constants(total);
+        let missing: Vec<usize> = (0..n).collect();
+        let available: Vec<usize> = (n..total).collect();
+        let exponents: Vec<u32> = (0..n as u32).collect();
+
+        for (label, use_tiled) in [("rank1", false), ("tiled", true)] {
+            group.bench_with_input(BenchmarkId::new(label, n), &use_tiled, |b, &use_tiled| {
+                b.iter(|| {
+                    let out = build_repair_matrix_ab(
+                        black_box(&available),
+                        black_box(&missing),
+                        black_box(&exponents),
+                        black_box(&constants),
+                        use_tiled,
+                    )
+                    .expect("solve");
+                    black_box(out);
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_verify_plan,
     bench_repair_workflow,
     bench_verify_slices_batched_io,
     bench_gf_kernel,
-    bench_md5_hotloop
+    bench_md5_hotloop,
+    bench_matrix_solve
 );
 criterion_main!(benches);

@@ -42,18 +42,32 @@ pub fn compute_deps(factor: u16) -> XorDeps {
 /// a region of whole 512-byte blocks. The JIT'd kernel reproduces exactly this
 /// XOR schedule; this is the byte-exact oracle it is validated against.
 pub fn muladd_planar(deps: &XorDeps, src: &[u8], dst: &mut [u8]) {
+    muladd_planar_sized(deps, src, dst, BLOCK_BYTES, PLANE_BYTES);
+}
+
+/// [`muladd_planar`] over an arbitrary plane geometry — the oracle for the
+/// AVX512 tier's 1024-byte blocks (64-byte planes). The XOR schedule is
+/// plane-size-independent; only the offsets scale.
+pub fn muladd_planar_sized(
+    deps: &XorDeps,
+    src: &[u8],
+    dst: &mut [u8],
+    block_bytes: usize,
+    plane_bytes: usize,
+) {
+    debug_assert_eq!(block_bytes, plane_bytes * 16);
     debug_assert_eq!(src.len(), dst.len());
-    debug_assert_eq!(src.len() % BLOCK_BYTES, 0);
-    for blk in 0..(src.len() / BLOCK_BYTES) {
-        let base = blk * BLOCK_BYTES;
+    debug_assert_eq!(src.len() % block_bytes, 0);
+    for blk in 0..(src.len() / block_bytes) {
+        let base = blk * block_bytes;
         for (o, &row) in deps.rows.iter().enumerate() {
             let mut mask = row;
             while mask != 0 {
                 let k = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
-                let src_plane = base + k * PLANE_BYTES;
-                let dst_plane = base + o * PLANE_BYTES;
-                for b in 0..PLANE_BYTES {
+                let src_plane = base + k * plane_bytes;
+                let dst_plane = base + o * plane_bytes;
+                for b in 0..plane_bytes {
                     dst[dst_plane + b] ^= src[src_plane + b];
                 }
             }

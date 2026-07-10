@@ -734,19 +734,24 @@ impl PreparedFactorMemo {
     }
 }
 
-/// XOR-JIT tier (x86_64, AVX2-without-GFNI): one JIT-compiled `dst ^= f*src`
-/// muladd body per distinct GF(2^16) factor in the decode matrix. Built once,
-/// before any parallel compute; `JitCode` is `Send + Sync`. `from_matrix`
-/// returns `None` when executable memory is unavailable, signalling the caller
-/// to fall back to the shuffle2x tier.
+/// XOR-JIT tier (x86_64, AVX2- or AVX512-without-GFNI): one JIT-compiled
+/// `dst ^= f*src` muladd body per distinct GF(2^16) factor in the decode
+/// matrix, at the detected [`JitWidth`] (512- or 1024-byte planar blocks).
+/// Built once, before any parallel compute; `JitCode` is `Send + Sync`.
+/// `from_matrix` returns `None` when executable memory is unavailable,
+/// signalling the caller to fall back to the shuffle2x tier.
 #[cfg(target_arch = "x86_64")]
 struct JitMemo {
     codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>>,
+    width: weaver_reed_solomon::xor_jit::JitWidth,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl JitMemo {
-    fn from_matrix(matrix: &matrix::Matrix) -> Option<Self> {
+    fn from_matrix(
+        width: weaver_reed_solomon::xor_jit::JitWidth,
+        matrix: &matrix::Matrix,
+    ) -> Option<Self> {
         let mut codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>> =
             (0..1usize << 16).map(|_| None).collect();
         for output_idx in 0..matrix.rows {
@@ -756,7 +761,7 @@ impl JitMemo {
                 if factor == 0 || codes[factor as usize].is_some() {
                     continue;
                 }
-                match weaver_reed_solomon::xor_jit::build_muladd(factor) {
+                match width.build_muladd(factor) {
                     Ok(Some(code)) => codes[factor as usize] = Some(code),
                     // build_muladd only yields Ok(None) for factor 0 (skipped above).
                     Ok(None) => {}
@@ -765,7 +770,7 @@ impl JitMemo {
                 }
             }
         }
-        Some(Self { codes })
+        Some(Self { codes, width })
     }
 
     #[inline]
@@ -812,9 +817,14 @@ impl StreamBatchSet {
                 staging: Vec::new(),
                 scratch: vec![0u8; max_byte_len],
                 tails: Vec::new(),
+                // Sized for the widest tier's block (1024): a tail is always
+                // strictly smaller than the active width's block size.
                 #[cfg(target_arch = "x86_64")]
                 xorjit_tails: vec![
-                    vec![0u8; weaver_reed_solomon::xor_jit::transpose::BLOCK_BYTES];
+                    vec![
+                        0u8;
+                        weaver_reed_solomon::xor_jit::transpose512::BLOCK_BYTES
+                    ];
                     STREAM_INPUT_BATCH
                 ],
                 tail_len: 0,
@@ -901,6 +911,7 @@ fn fill_stream_batch(
     byte_len: usize,
     use_folded: bool,
     use_xorjit: bool,
+    #[cfg(target_arch = "x86_64")] jit_memo: Option<&JitMemo>,
     options: &RepairOptions,
 ) -> Result<()> {
     for b in 0..batch_len {
@@ -924,23 +935,21 @@ fn fill_stream_batch(
         if use_xorjit {
             #[cfg(target_arch = "x86_64")]
             {
-                use weaver_reed_solomon::xor_jit::transpose;
-                // Bit-transpose each full 512-byte block into the planar `bufs`
-                // slot; the < 512-byte remainder stays normal for the scalar tail.
-                let vec_len = byte_len & !(transpose::BLOCK_BYTES - 1);
-                for k in 0..vec_len / transpose::BLOCK_BYTES {
-                    let s = k * transpose::BLOCK_BYTES;
-                    // SAFETY: use_xorjit implies AVX2 (xor_jit::supported()); the
+                // Bit-transpose each full block (512 or 1024 bytes per the
+                // tier width) into the planar `bufs` slot; the sub-block
+                // remainder stays normal for the scalar tail.
+                let width = jit_memo.expect("jit_memo present when use_xorjit").width;
+                let block = width.block_bytes();
+                let vec_len = byte_len & !(block - 1);
+                for k in 0..vec_len / block {
+                    let s = k * block;
+                    // SAFETY: use_xorjit implies AVX2 (JitWidth::detect()); the
                     // read window (scratch) and write window (bufs) are distinct
-                    // fields of `set` and each exactly BLOCK_BYTES long.
+                    // fields of `set` and each exactly one block long.
                     unsafe {
-                        transpose::prepare_block(
-                            (&set.scratch[s..s + transpose::BLOCK_BYTES])
-                                .try_into()
-                                .unwrap(),
-                            (&mut set.bufs[b][s..s + transpose::BLOCK_BYTES])
-                                .try_into()
-                                .unwrap(),
+                        width.prepare_block(
+                            &set.scratch[s..s + block],
+                            &mut set.bufs[b][s..s + block],
                         );
                     }
                 }
@@ -1040,13 +1049,15 @@ fn run_stream_batch_compute(
         #[cfg(target_arch = "x86_64")]
         {
             let jit_memo = jit_memo.expect("jit_memo present when use_xorjit is set");
-            // Prefix: whole 512-byte planar blocks via the JIT muladd
-            // (dst ^= factor*src, both operands planar). Tiled at
-            // COMPUTE_TILE_BYTES (a multiple of 512) so each destination tile
-            // stays L1-resident across all of this batch's sources — without
-            // tiling the output is reloaded from DRAM once per source, which
-            // dominates large-slice repairs. Mirrors `run_folded_tiles`.
-            let vec_len = byte_len & !(weaver_reed_solomon::xor_jit::transpose::BLOCK_BYTES - 1);
+            let width = jit_memo.width;
+            // Prefix: whole planar blocks (512/1024 bytes per tier width) via
+            // the JIT muladd (dst ^= factor*src, both operands planar). Tiled
+            // at COMPUTE_TILE_BYTES (a multiple of both block sizes) so each
+            // destination tile stays L1-resident across all of this batch's
+            // sources — without tiling the output is reloaded from DRAM once
+            // per source, which dominates large-slice repairs. Mirrors
+            // `run_folded_tiles`.
+            let vec_len = byte_len & !(width.block_bytes() - 1);
             if vec_len > 0 {
                 let tiles = vec_len.div_ceil(COMPUTE_TILE_BYTES);
                 let threads = rayon::current_num_threads().max(1);
@@ -1070,9 +1081,10 @@ fn run_stream_batch_compute(
                     let j1 = (j0 + output_block).min(outputs_n);
                     for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0)
                     {
-                        // SAFETY: use_xorjit implies AVX2; the tile [s0,s1) is a
-                        // multiple of 512 (COMPUTE_TILE_BYTES and vec_len both are)
-                        // and `bufs[b]`/output cover it; each (tile, output) range
+                        // SAFETY: use_xorjit implies the width's features; the
+                        // tile [s0,s1) is a multiple of the block size
+                        // (COMPUTE_TILE_BYTES and vec_len both are) and
+                        // `bufs[b]`/output cover it; each (tile, output) range
                         // has exactly one writer.
                         let dst = unsafe { (output_ptr as *mut u8).add(s0) };
                         for b in 0..set.len {
@@ -1081,7 +1093,8 @@ fn run_stream_batch_compute(
                                 continue;
                             }
                             unsafe {
-                                jit_memo.get(factor).run_muladd(
+                                width.run_muladd(
+                                    jit_memo.get(factor),
                                     set.bufs[b].as_ptr().add(s0),
                                     dst,
                                     tile_len,
@@ -1767,44 +1780,129 @@ fn reconstruct_and_write_grouped_inputs(
     Ok(())
 }
 
-/// Optional Apple-GPU arm of the streaming compute. All platform gating
-/// lives here: on non-macOS builds every method is a no-op and the CPU
-/// path runs unchanged; on macOS a session engages only when a Metal
-/// device is present and the repair is large enough to amortize dispatch
-/// (see `weaver_reed_solomon::metal_gf16`). Any GPU error permanently
-/// disables the arm and the caller redoes the affected chunk on the CPU.
-struct GpuComputeArm {
+/// One engaged GPU session. Metal (native, unified memory) has precedence on
+/// macOS; the wgpu backend (Vulkan/DX12/Metal) covers the remaining
+/// platforms. Both expose the identical begin/accumulate/finish protocol.
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+enum GpuSession {
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    session: Option<weaver_reed_solomon::metal_gf16::MetalGf16Session>,
+    Metal(weaver_reed_solomon::metal_gf16::MetalGf16Session),
+    #[cfg(feature = "wgpu")]
+    Wgpu(weaver_reed_solomon::wgpu_gf16::WgpuGf16Session),
+}
+
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+impl GpuSession {
+    fn try_new(outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Option<Self> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(session) = weaver_reed_solomon::metal_gf16::MetalGf16Session::try_new(
+            outputs,
+            max_byte_len,
+            effective_bytes,
+        ) {
+            return Some(GpuSession::Metal(session));
+        }
+        #[cfg(feature = "wgpu")]
+        if let Some(session) = weaver_reed_solomon::wgpu_gf16::WgpuGf16Session::try_new(
+            outputs,
+            max_byte_len,
+            effective_bytes,
+        ) {
+            return Some(GpuSession::Wgpu(session));
+        }
+        None
+    }
+
+    fn begin_chunk(&mut self, byte_len: usize) -> std::result::Result<(), &'static str> {
+        match self {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            GpuSession::Metal(s) => s.begin_chunk(byte_len),
+            #[cfg(feature = "wgpu")]
+            GpuSession::Wgpu(s) => s.begin_chunk(byte_len),
+        }
+    }
+
+    fn accumulate(
+        &mut self,
+        srcs: &[&[u8]],
+        factor: impl Fn(usize, usize) -> u16,
+    ) -> std::result::Result<(), &'static str> {
+        match self {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            GpuSession::Metal(s) => s.accumulate(srcs, factor),
+            #[cfg(feature = "wgpu")]
+            GpuSession::Wgpu(s) => s.accumulate(srcs, factor),
+        }
+    }
+
+    fn finish_chunk(&mut self, rows: &mut [Vec<u8>]) -> std::result::Result<(), &'static str> {
+        match self {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            GpuSession::Metal(s) => s.finish_chunk(rows),
+            #[cfg(feature = "wgpu")]
+            GpuSession::Wgpu(s) => s.finish_chunk(rows),
+        }
+    }
+
+    fn device_name(&self) -> String {
+        match self {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            GpuSession::Metal(s) => s.device_name(),
+            #[cfg(feature = "wgpu")]
+            GpuSession::Wgpu(s) => s.device_name(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            GpuSession::Metal(_) => "metal",
+            #[cfg(feature = "wgpu")]
+            GpuSession::Wgpu(_) => "wgpu",
+        }
+    }
+}
+
+/// Optional GPU arm of the streaming compute. All platform gating lives
+/// here: without a GPU feature every method is a no-op and the CPU path
+/// runs unchanged; otherwise a session engages only when a device is
+/// present and the repair is large enough to amortize dispatch (see
+/// `weaver_reed_solomon::{metal_gf16, wgpu_gf16}`). Any GPU error
+/// permanently disables the arm and the caller redoes the affected chunk
+/// on the CPU.
+struct GpuComputeArm {
+    #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+    session: Option<GpuSession>,
 }
 
 impl GpuComputeArm {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    fn engage(use_folded: bool, outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Self {
-        // The folded path is x86-only, so `!use_folded` is the macOS shape;
-        // the guard keeps the invariant explicit.
-        let session = (!use_folded)
-            .then(|| {
-                weaver_reed_solomon::metal_gf16::MetalGf16Session::try_new(
-                    outputs,
-                    max_byte_len,
-                    effective_bytes,
-                )
-            })
+    #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+    fn engage(
+        cpu_fast_path: bool,
+        outputs: usize,
+        max_byte_len: usize,
+        effective_bytes: u64,
+    ) -> Self {
+        // The folded/xorjit paths are x86-only, so `!cpu_fast_path` is the
+        // GPU-eligible shape; the guard keeps the invariant explicit (the
+        // GPU arm consumes `set.bufs`, which only the plain fill populates).
+        let session = (!cpu_fast_path)
+            .then(|| GpuSession::try_new(outputs, max_byte_len, effective_bytes))
             .flatten();
         if let Some(session) = &session {
             info!(
+                backend = session.backend_name(),
                 device = %session.device_name(),
                 outputs,
-                "metal gf16 tier engaged for streaming repair"
+                "gpu gf16 tier engaged for streaming repair"
             );
         }
         Self { session }
     }
 
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[cfg(not(any(all(feature = "metal", target_os = "macos"), feature = "wgpu")))]
     fn engage(
-        _use_folded: bool,
+        _cpu_fast_path: bool,
         _outputs: usize,
         _max_byte_len: usize,
         _effective_bytes: u64,
@@ -1814,13 +1912,13 @@ impl GpuComputeArm {
 
     /// True when the GPU owns this chunk's accumulation.
     fn begin_chunk(&mut self, _byte_len: usize) -> bool {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
         {
             if let Some(session) = self.session.as_mut() {
                 match session.begin_chunk(_byte_len) {
                     Ok(()) => return true,
                     Err(reason) => {
-                        warn!(reason, "metal gf16 begin_chunk failed; using CPU path");
+                        warn!(reason, "gpu gf16 begin_chunk failed; using CPU path");
                         self.session = None;
                     }
                 }
@@ -1837,7 +1935,7 @@ impl GpuComputeArm {
         _plan: &RepairPlan,
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());
@@ -1849,7 +1947,7 @@ impl GpuComputeArm {
             let matrix = &_plan.input_factors;
             let start = _set.start;
             if let Err(reason) = session.accumulate(&srcs, |j, s| matrix.get(j, start + s)) {
-                warn!(reason, "metal gf16 accumulate failed; redoing chunk on CPU");
+                warn!(reason, "gpu gf16 accumulate failed; redoing chunk on CPU");
                 self.session = None;
                 return Err(());
             }
@@ -1865,16 +1963,13 @@ impl GpuComputeArm {
         _rows: &mut [Vec<u8>],
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());
             };
             if let Err(reason) = session.finish_chunk(_rows) {
-                warn!(
-                    reason,
-                    "metal gf16 finish_chunk failed; redoing chunk on CPU"
-                );
+                warn!(reason, "gpu gf16 finish_chunk failed; redoing chunk on CPU");
                 self.session = None;
                 return Err(());
             }
@@ -1927,24 +2022,27 @@ fn execute_repair_streaming(
     // shuffle2x ~20 s vs XOR-JIT ~32 s; B2 64 KiB slices XOR-JIT ahead).
     #[cfg(target_arch = "x86_64")]
     const XORJIT_MAX_SLICE_BYTES: u64 = 256 * 1024;
+    // WEAVER_GF16_WGPU=1 forces the wgpu GPU arm: the x86 CPU fast tiers are
+    // disabled for the run so the batch sets take the plain shape the GPU arm
+    // consumes (`bufs`), with the universal CPU tier as the fallback.
+    #[cfg(feature = "wgpu")]
+    let gpu_forced = weaver_reed_solomon::wgpu_gf16::force_requested();
+    #[cfg(not(feature = "wgpu"))]
+    let gpu_forced = false;
+    // Widest supported JIT tier (AVX512 preferred over AVX2, both !GFNI);
+    // the same slice ceiling applies to both widths.
     #[cfg(target_arch = "x86_64")]
-    let xorjit_candidate =
-        weaver_reed_solomon::xor_jit::supported() && plan.slice_size <= XORJIT_MAX_SLICE_BYTES;
-    #[cfg(not(target_arch = "x86_64"))]
-    let xorjit_candidate = false;
+    let jit_width = weaver_reed_solomon::xor_jit::JitWidth::detect()
+        .filter(|_| plan.slice_size <= XORJIT_MAX_SLICE_BYTES && !gpu_forced);
     // Build the JIT memo up front so an executable-memory failure falls back to
     // shuffle2x before any buffer is shaped for the planar layout.
     #[cfg(target_arch = "x86_64")]
-    let jit_memo = if xorjit_candidate {
-        JitMemo::from_matrix(&plan.input_factors)
-    } else {
-        None
-    };
+    let jit_memo = jit_width.and_then(|width| JitMemo::from_matrix(width, &plan.input_factors));
     #[cfg(target_arch = "x86_64")]
-    let use_xorjit = xorjit_candidate && jit_memo.is_some();
+    let use_xorjit = jit_memo.is_some();
     #[cfg(not(target_arch = "x86_64"))]
-    let use_xorjit = xorjit_candidate;
-    let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit;
+    let use_xorjit = false;
+    let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit && !gpu_forced;
     let memo = PreparedFactorMemo::from_matrix(&plan.input_factors, use_folded);
     let mut batch_sets = [
         StreamBatchSet::new(max_byte_len, use_folded, use_xorjit),
@@ -2003,6 +2101,8 @@ fn execute_repair_streaming(
             byte_len,
             use_folded,
             use_xorjit,
+            #[cfg(target_arch = "x86_64")]
+            jit_memo.as_ref(),
             options,
         )?;
         let mut gpu_failed = false;
@@ -2037,6 +2137,8 @@ fn execute_repair_streaming(
                         byte_len,
                         use_folded,
                         use_xorjit,
+                        #[cfg(target_arch = "x86_64")]
+                        jit_memo.as_ref(),
                         options,
                     );
                 }
@@ -2075,6 +2177,8 @@ fn execute_repair_streaming(
                             byte_len,
                             use_folded,
                             use_xorjit,
+                            #[cfg(target_arch = "x86_64")]
+                            jit_memo,
                             options,
                         );
                     }
@@ -2094,21 +2198,18 @@ fn execute_repair_streaming(
         if use_xorjit {
             #[cfg(target_arch = "x86_64")]
             {
-                use weaver_reed_solomon::xor_jit::transpose;
-                // Invert the planar transform on each 512-byte block; the scalar
-                // tail in [vec_len, byte_len) is already in normal layout.
-                let vec_len = byte_len & !(transpose::BLOCK_BYTES - 1);
+                // Invert the planar transform on each block (width-sized); the
+                // scalar tail in [vec_len, byte_len) is already normal layout.
+                let width = jit_memo.as_ref().expect("jit_memo when use_xorjit").width;
+                let block = width.block_bytes();
+                let vec_len = byte_len & !(block - 1);
                 chunk_output.par_iter_mut().for_each(|output| {
-                    for k in 0..vec_len / transpose::BLOCK_BYTES {
-                        let s = k * transpose::BLOCK_BYTES;
+                    for k in 0..vec_len / block {
+                        let s = k * block;
                         // SAFETY: use_xorjit implies AVX2; each window is exactly
-                        // BLOCK_BYTES and the blocks are disjoint.
+                        // one block and the blocks are disjoint.
                         unsafe {
-                            transpose::finish_block(
-                                (&mut output[s..s + transpose::BLOCK_BYTES])
-                                    .try_into()
-                                    .unwrap(),
-                            );
+                            width.finish_block(&mut output[s..s + block]);
                         }
                     }
                 });

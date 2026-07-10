@@ -5,12 +5,16 @@
 //! modules so PAR2 matrix semantics stay unchanged.
 
 pub mod gf;
+pub mod gf_pmul;
 pub mod gf_simd;
 pub mod matrix;
+pub mod matrix_tiled;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_gf16;
 /// JIT-generated bit-plane XOR GF(2^16) multiply for pre-GFNI x86.
 #[cfg(target_arch = "x86_64")]
 pub mod xor_jit;

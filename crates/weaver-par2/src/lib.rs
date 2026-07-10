@@ -88,4 +88,4 @@ pub use verify::{
     verify_selected_file_ids, verify_selected_file_ids_with_options, verify_slices,
     verify_slices_from_crcs,
 };
-pub use weaver_reed_solomon::{gf, gf_simd};
+pub use weaver_reed_solomon::{gf, gf_pmul, gf_simd, matrix_tiled};

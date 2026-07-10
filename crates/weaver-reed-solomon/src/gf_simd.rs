@@ -34,6 +34,15 @@ use crate::gf;
 /// Concurrent source read streams per destination pass in the grouped-input
 /// kernels. Bounded by the line-fill buffers of the smallest supported cores;
 /// larger groups stall on L1 misses instead of computing.
+///
+/// Deliberate deviations from ParPar's muladd_multi machinery, for the record:
+/// this is a memory-stream bound over flat separate source slices, not
+/// upstream's per-method register-interleave over a packed input layout
+/// (`idealInputMultiple` = 3/2/1 per method, gf16mul.cpp:234-525), and
+/// upstream's per-cacheline software prefetch (`_mm_prefetch`/`PREFETCH_MEM`
+/// throughout its cores, plus the `_stridepf`/`_packpf` drivers) is not
+/// carried over — modern large-core hardware prefetchers cover the flat
+/// streaming pattern; revisit if small-core x86 profiles say otherwise.
 #[cfg(target_arch = "x86_64")]
 const SRC_STREAM_GROUP: usize = 8;
 
@@ -306,7 +315,11 @@ pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) 
             .filter(|fd| fd.factor != 0 && fd.factor != 1)
             .count();
         if nonzero_count > 2 {
-            unsafe { mul_acc_multi_region_clmul(factors_and_dsts, src) };
+            if clmul_sha3_available() {
+                unsafe { mul_acc_multi_region_clmul_sha3(factors_and_dsts, src) };
+            } else {
+                unsafe { mul_acc_multi_region_clmul(factors_and_dsts, src) };
+            }
         } else {
             unsafe { mul_acc_multi_region_neon(factors_and_dsts, src) };
         }
@@ -395,6 +408,13 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            unsafe { mul_acc_input_batch_gfni_avx512(dst, factors_and_srcs) };
+            return;
+        }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_input_batch_gfni_avx2(dst, factors_and_srcs) };
             return;
@@ -407,6 +427,17 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // Mirror upstream method selection: CLMul over VTBL shuffle when the
+        // input count exceeds 3 (ParPar gf16mul.cpp:1607-1626), SHA3 flavor
+        // when FEAT_SHA3 is present.
+        if factors_and_srcs.len() > 3 && clmul_batch_enabled() {
+            if clmul_sha3_available() {
+                unsafe { mul_acc_input_batch_clmul_sha3(dst, factors_and_srcs) };
+            } else {
+                unsafe { mul_acc_input_batch_clmul(dst, factors_and_srcs) };
+            }
+            return;
+        }
         unsafe { mul_acc_input_batch_neon(dst, factors_and_srcs) };
         return;
     }
@@ -754,6 +785,12 @@ pub fn mul_acc_shuffle2x_batch(
 /// whole group stay resident while the loop streams the staging area. The
 /// cross-plane terms accumulate separately and fold in with a single lane
 /// swap per block.
+///
+/// Packing note: this adopts shuffle2x's full-register split layout
+/// (all-lo | all-hi halves, `permute2x128` fold) rather than upstream
+/// affine2x's per-128-lane [8lo|8hi] packing with a `shuffle_epi32(1,0,3,2)`
+/// fold (gf16_affine2x_x86.h) — same norm/swap algebra, one staging layout
+/// shared with the non-GFNI shuffle2x kernel.
 pub fn mul_acc_folded_group(
     dst: &mut [u8],
     staging: &[u8],
@@ -1090,6 +1127,17 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
 
     #[cfg(target_arch = "aarch64")]
     {
+        // CLMUL preparation is six broadcasts — effectively free — so the
+        // prepared path routes through the same upstream >3-inputs selection
+        // using the raw factor carried by `PreparedInputFactor`.
+        if factors_and_srcs.len() > 3 && clmul_batch_enabled() {
+            if clmul_sha3_available() {
+                unsafe { mul_acc_input_batch_clmul_sha3_prepared(dst, factors_and_srcs) };
+            } else {
+                unsafe { mul_acc_input_batch_clmul_prepared(dst, factors_and_srcs) };
+            }
+            return;
+        }
         unsafe { mul_acc_input_batch_neon_prepared(dst, factors_and_srcs) };
         return;
     }
@@ -2087,6 +2135,16 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
         .map(|fs| fs.src)
         .collect();
 
+    // Prepared factors must be the GFNI flavor on this path (the dispatchers
+    // guarantee it on-machine); a foreign Avx2-flavored factor would be
+    // silently dropped here yet applied by the AVX2 tail delegate below.
+    debug_assert!(
+        factors_and_srcs.iter().all(|fs| matches!(
+            fs.prepared.x86.as_ref(),
+            None | Some(PreparedX86Factor::Gfni(_))
+        )),
+        "gfni avx512 batch requires GFNI-flavored prepared factors"
+    );
     let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
         .iter()
         .filter_map(|fs| match fs.prepared.x86.as_ref() {
@@ -2170,6 +2228,40 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
             .collect();
         unsafe { mul_acc_input_batch_gfni_avx2_prepared(&mut dst[vec_len..], &tail_srcs) };
     }
+}
+
+/// A GFNI-forced prepared factor for the unprepared 512-bit entry: inside a
+/// `gfni`-gated kernel the affine variant is always the right one, so skip
+/// `prepare_input_factor`'s runtime feature probe.
+#[cfg(target_arch = "x86_64")]
+fn prepare_input_factor_gfni(factor: u16) -> PreparedInputFactor {
+    PreparedInputFactor {
+        factor,
+        x86: (factor > 1).then(|| PreparedX86Factor::Gfni(precompute_affine_matrices(factor))),
+    }
+}
+
+/// Unprepared 512-bit GFNI grouped-input entry: computes the affine matrices
+/// inline (batch-setup cost, amortized over the whole region — the same
+/// trade the unprepared 256-bit kernel makes) and runs the prepared kernel.
+/// This is what the tiled matrix elimination's rank-k apply reaches on
+/// GFNI+AVX512 hardware; without it those solves ran the 256-bit kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn mul_acc_input_batch_gfni_avx512(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    let prepared: Vec<PreparedInputFactor> = factors_and_srcs
+        .iter()
+        .map(|fs| prepare_input_factor_gfni(fs.factor))
+        .collect();
+    let pairs: Vec<PreparedFactorSrc<'_>> = prepared
+        .iter()
+        .zip(factors_and_srcs.iter())
+        .map(|(prepared, fs)| PreparedFactorSrc {
+            prepared,
+            src: fs.src,
+        })
+        .collect();
+    unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, &pairs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2455,22 +2547,25 @@ unsafe fn mul_acc_input_batch_avx2_prepared(
 // ---------------------------------------------------------------------------
 // Multi-region CLMUL kernel (aarch64)
 //
-// Uses ARM polynomial multiply (PMULL/vmull_p8) with Karatsuba decomposition
-// to compute GF(2^16) multiply-accumulate. Each 16-bit GF element is split
-// into lo/hi bytes; three 8×8 polynomial multiplies produce a 30-bit product
-// that is then reduced modulo x^16 + x^12 + x^3 + x + 1.
-//
-// Advantage over VTBL shuffle: 3 PMULL + accumulate per factor vs 8 VTBL,
-// with a single shared reduction at the end. Wins when >2 factors.
+// One source region × many (factor, dst) pairs. Karatsuba PMULL products per
+// coefficient with the packed Barrett reduction shared with the input-batch
+// CLMUL kernels ([`clmul_barrett_reduce`], upstream `gf16_clmul_neon_reduction`,
+// poly 0x1100b) — the source's byte planes are deinterleaved once per 32-byte
+// block and reused across every destination. The one-src-many-dst shape itself
+// is rarpar-native (upstream's CLMUL kernels are grouped-input only).
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+#[inline(always)]
+unsafe fn mul_acc_multi_region_clmul_body<const SHA3: bool>(
+    factors_and_dsts: &mut [FactorDst<'_>],
+    src: &[u8],
+) {
     use std::arch::aarch64::*;
 
     let len = src.len();
 
-    // Separate factor=1 (XOR-only) destinations.
+    // factor==1 destinations are a plain XOR.
     for fd in factors_and_dsts.iter_mut() {
         if fd.factor == 1 {
             for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
@@ -2479,187 +2574,604 @@ unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src
         }
     }
 
-    // Collect non-trivial factors with precomputed coefficients.
-    // For Karatsuba: store (lo, hi, lo^hi) as poly8x8_t.
-    struct ClmulCoeff {
-        lo: poly8x8_t,
-        hi: poly8x8_t,
-        mid: poly8x8_t, // lo ^ hi
-        lo_full: poly8x16_t,
-        hi_full: poly8x16_t,
-        mid_full: poly8x16_t,
-        dst_idx: usize,
-    }
-
-    let coeffs: Vec<ClmulCoeff> = unsafe {
+    let coeffs: Vec<(ClmulBatchCoeff, usize)> = unsafe {
         factors_and_dsts
             .iter()
             .enumerate()
             .filter(|(_, fd)| fd.factor > 1)
-            .map(|(idx, fd)| {
-                let lo_byte = (fd.factor & 0xFF) as u8;
-                let hi_byte = (fd.factor >> 8) as u8;
-                let mid_byte = lo_byte ^ hi_byte;
-                ClmulCoeff {
-                    lo: vdup_n_p8(lo_byte),
-                    hi: vdup_n_p8(hi_byte),
-                    mid: vdup_n_p8(mid_byte),
-                    lo_full: vdupq_n_p8(lo_byte),
-                    hi_full: vdupq_n_p8(hi_byte),
-                    mid_full: vdupq_n_p8(mid_byte),
-                    dst_idx: idx,
-                }
-            })
+            .map(|(idx, fd)| (clmul_batch_coeff(fd.factor), idx))
             .collect()
     };
-
     if coeffs.is_empty() {
         return;
     }
 
+    let vec_len = len & !31;
     unsafe {
         let mut offset = 0usize;
-
-        while offset + 16 <= len {
-            let s = vld1q_u8(src.as_ptr().add(offset));
-
-            // Deinterleave: separate lo bytes (even) and hi bytes (odd) of each u16.
-            let data_lo = vreinterpretq_p8_u8(vuzp1q_u8(s, s));
-            let data_hi = vreinterpretq_p8_u8(vuzp2q_u8(s, s));
-            let data_mid = vreinterpretq_p8_u8(veorq_u8(
-                vreinterpretq_u8_p8(data_lo),
-                vreinterpretq_u8_p8(data_hi),
-            ));
-
-            let data_lo_half = vget_low_p8(data_lo);
-            let data_hi_half = vget_low_p8(data_hi);
-            let data_mid_half = vget_low_p8(data_mid);
-
-            // For each coefficient, compute Karatsuba products and accumulate,
-            // then reduce and write to that coefficient's destination.
-            for coeff in &coeffs {
-                // Three Karatsuba products (low half: 4 elements, high half: 4 elements).
-                // vmull_p8: poly8x8 × poly8x8 → poly16x8 (8 results from low halves)
-                // vmull_high_p8: poly8x16 × poly8x16 → poly16x8 (8 results from high halves)
-                let ll_lo = vmull_p8(data_lo_half, coeff.lo);
-                let ll_hi = vmull_high_p8(data_lo, coeff.lo_full);
-                let hh_lo = vmull_p8(data_hi_half, coeff.hi);
-                let hh_hi = vmull_high_p8(data_hi, coeff.hi_full);
-                let mm_lo = vmull_p8(data_mid_half, coeff.mid);
-                let mm_hi = vmull_high_p8(data_mid, coeff.mid_full);
-
-                // Karatsuba combination:
-                // Product = L + (M ^ L ^ H) << 8 + H << 16
-                //
-                // In byte terms (each poly16x8 has lo_byte and hi_byte per element):
-                //   product_byte0 = L.lo
-                //   product_byte1 = L.hi ^ K.lo  (K = M ^ L ^ H)
-                //   product_byte2 = H.lo ^ K.hi
-                //   product_byte3 = H.hi
-                //
-                // Bytes 0-1 form the low 16 bits, bytes 2-3 form the high 14 bits.
-
-                // Compute K = M ^ L ^ H for both halves.
-                let k_lo = veorq_u16(
-                    vreinterpretq_u16_p16(mm_lo),
-                    veorq_u16(vreinterpretq_u16_p16(ll_lo), vreinterpretq_u16_p16(hh_lo)),
-                );
-                let k_hi = veorq_u16(
-                    vreinterpretq_u16_p16(mm_hi),
-                    veorq_u16(vreinterpretq_u16_p16(ll_hi), vreinterpretq_u16_p16(hh_hi)),
-                );
-
-                // Deinterleave L, H, K into separate byte lanes.
-                let l_lo = vreinterpretq_u8_p16(ll_lo);
-                let l_hi = vreinterpretq_u8_p16(ll_hi);
-                let h_lo = vreinterpretq_u8_p16(hh_lo);
-                let h_hi = vreinterpretq_u8_p16(hh_hi);
-                let k_lo_u8 = vreinterpretq_u8_u16(k_lo);
-                let k_hi_u8 = vreinterpretq_u8_u16(k_hi);
-
-                // Separate even bytes (byte0 of each u16) and odd bytes (byte1).
-                let l_bytes = vuzpq_u8(l_lo, l_hi); // .0 = even bytes (L.lo), .1 = odd bytes (L.hi)
-                let h_bytes = vuzpq_u8(h_lo, h_hi); // .0 = H.lo, .1 = H.hi
-                let k_bytes = vuzpq_u8(k_lo_u8, k_hi_u8); // .0 = K.lo, .1 = K.hi
-
-                // Combine into product bytes:
-                let prod_byte0 = l_bytes.0; // L.lo
-                let prod_byte1 = veorq_u8(l_bytes.1, k_bytes.0); // L.hi ^ K.lo
-                let prod_byte2 = veorq_u8(h_bytes.0, k_bytes.1); // H.lo ^ K.hi
-                let prod_byte3 = h_bytes.1; // H.hi
-
-                // Assemble low 16 bits and high 14 bits as uint16x8_t.
-                // low = byte0 | (byte1 << 8) = reinterleave bytes 0,1
-                // high = byte2 | (byte3 << 8) = reinterleave bytes 2,3
-                let result_low = vreinterpretq_u16_u8(vzipq_u8(prod_byte0, prod_byte1).0);
-                let result_high = vreinterpretq_u16_u8(vzipq_u8(prod_byte2, prod_byte3).0);
-
-                // Reduce: high * (x^12 + x^3 + x + 1) folded into low.
-                // Iterative: each pass reduces bits above 15.
-                let reduced = reduce_gf16(result_low, result_high);
-
-                // Reinterleave from u16 back to bytes and XOR-accumulate into dst.
-                let product = vreinterpretq_u8_u16(reduced);
-                let d = vld1q_u8(factors_and_dsts[coeff.dst_idx].dst.as_ptr().add(offset));
-                let result = veorq_u8(d, product);
-                vst1q_u8(
-                    factors_and_dsts[coeff.dst_idx].dst.as_mut_ptr().add(offset),
-                    result,
-                );
+        while offset < vec_len {
+            let planes = clmul_load_planes(src.as_ptr().add(offset));
+            for (coeff, dst_idx) in &coeffs {
+                let r = clmul_barrett_reduce::<SHA3>(clmul_partials(planes, coeff));
+                let dst = factors_and_dsts[*dst_idx].dst.as_mut_ptr().add(offset);
+                let mut vb = vld2q_u8(dst as *const u8);
+                vb.0 = veorq_u8(veorq_u8(r[0], r[1]), vb.0);
+                vb.1 = veorq_u8(veorq_u8(r[2], r[3]), vb.1);
+                vst2q_u8(dst, vb);
             }
+            offset += 32;
+        }
+    }
 
-            offset += 16;
+    // Scalar tail (< one 32-byte block).
+    if vec_len < len {
+        for &(_, dst_idx) in &coeffs {
+            let factor = factors_and_dsts[dst_idx].factor;
+            mul_acc_region_scalar(
+                factor,
+                &src[vec_len..],
+                &mut factors_and_dsts[dst_idx].dst[vec_len..],
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    unsafe { mul_acc_multi_region_clmul_body::<false>(factors_and_dsts, src) }
+}
+
+/// EOR3-reduction flavor, selected when FEAT_SHA3 is detected.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_multi_region_clmul_sha3(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    unsafe { mul_acc_multi_region_clmul_body::<true>(factors_and_dsts, src) }
+}
+
+// ---------------------------------------------------------------------------
+// Input-batch CLMUL kernels (aarch64)
+//
+// Faithful port of ParPar's grouped-input CLMul kernel family:
+// `gf16_clmul_muladd_x` (gf16_clmul_neon_base.h), generated upstream as
+// `gf16_clmul_muladd_*_neon` / `*_sha3` (gf16_clmul_sha3.c). Many sources
+// accumulate into one destination; each 32-byte block runs one packed Barrett
+// reduction (`gf16_clmul_neon_reduction`, gf16_clmul_neon.h:52-101, poly
+// 0x1100b) shared by every source — the reason CLMul beats VTBL shuffle once
+// the input count exceeds 3 (ParPar gf16mul.cpp:1607-1626 selection).
+//
+// Three accumulation flavors, mirroring upstream exactly:
+//   - plain NEON (`_neon`): PMULL then EOR per partial (upstream `pmacl_*`).
+//   - SHA3 non-Apple (`_sha3`, Neoverse V1/N2, Graviton3+): per-source product
+//     sets merged with EOR3, two sources per merge (`gf16_clmul_sha3_merge2`).
+//   - SHA3 Apple: PMULL+EOR kept adjacent via inline asm so Apple cores fuse
+//     the pair; EOR3 is deliberately NOT used for accumulation
+//     (gf16_clmul_sha3.c:19-45), though the reduction still uses it.
+// Upstream processes at most 8 sources per pass (CLMUL_NUM_REGIONS, aarch64);
+// larger batches make additional passes over dst.
+// ---------------------------------------------------------------------------
+
+/// Upstream compiles the Apple flavor with `__APPLE__`; mirror that at build
+/// time. Only affects which SHA3 accumulation strategy is emitted.
+#[cfg(target_arch = "aarch64")]
+const CLMUL_APPLE_FUSION: bool = cfg!(target_vendor = "apple");
+
+/// Sources per pass, = upstream CLMUL_NUM_REGIONS on aarch64.
+#[cfg(target_arch = "aarch64")]
+const CLMUL_SRC_GROUP: usize = 8;
+
+/// Whether the input-batch dispatch may pick the CLMUL kernels. Setting
+/// `WEAVER_GF16_CLMUL_BATCH=0` pins the VTBL shuffle path so the two can be
+/// A/B'd without a rebuild (same escape-hatch pattern as
+/// `WEAVER_GF16_FOLDED_AVX512`).
+#[cfg(target_arch = "aarch64")]
+fn clmul_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_GF16_CLMUL_BATCH").is_none_or(|v| v != "0"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn clmul_sha3_available() -> bool {
+    std::arch::is_aarch64_feature_detected!("sha3")
+}
+
+/// Per-source broadcast coefficients: factor split into lo/hi bytes plus the
+/// Karatsuba middle term (upstream builds the same triple per region,
+/// gf16_clmul_neon_base.h:66-72).
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct ClmulBatchCoeff {
+    lo: std::arch::aarch64::poly8x16_t,
+    hi: std::arch::aarch64::poly8x16_t,
+    mid: std::arch::aarch64::poly8x16_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_batch_coeff(factor: u16) -> ClmulBatchCoeff {
+    use std::arch::aarch64::*;
+    let lo = (factor & 0xFF) as u8;
+    let hi = (factor >> 8) as u8;
+    unsafe {
+        ClmulBatchCoeff {
+            lo: vdupq_n_p8(lo),
+            hi: vdupq_n_p8(hi),
+            mid: vdupq_n_p8(lo ^ hi),
+        }
+    }
+}
+
+/// The six per-block partial products (upstream low1/low2/mid1/mid2/high1/high2).
+/// Shared with `gf_pmul`, whose upstream kernel reuses the same reduction.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub(crate) struct ClmulPartials {
+    pub(crate) low1: std::arch::aarch64::poly16x8_t,
+    pub(crate) low2: std::arch::aarch64::poly16x8_t,
+    pub(crate) mid1: std::arch::aarch64::poly16x8_t,
+    pub(crate) mid2: std::arch::aarch64::poly16x8_t,
+    pub(crate) high1: std::arch::aarch64::poly16x8_t,
+    pub(crate) high2: std::arch::aarch64::poly16x8_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn veorq_p16x(
+    a: std::arch::aarch64::poly16x8_t,
+    b: std::arch::aarch64::poly16x8_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        vreinterpretq_p16_u16(veorq_u16(
+            vreinterpretq_u16_p16(a),
+            vreinterpretq_u16_p16(b),
+        ))
+    }
+}
+
+/// 3-way XOR: EOR3 when the SHA3 flavor is active, EOR pair otherwise
+/// (upstream `eor3q_u8` and its non-SHA3 fallback, gf16_clmul_neon.h:46-50).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn eor3q<const SHA3: bool>(
+    a: std::arch::aarch64::uint8x16_t,
+    b: std::arch::aarch64::uint8x16_t,
+    c: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        if SHA3 {
+            veor3q_u8(a, b, c)
+        } else {
+            veorq_u8(a, veorq_u8(b, c))
+        }
+    }
+}
+
+/// A 32-byte block's deinterleaved byte planes (`vld2`): the even (lo) and
+/// odd (hi) bytes of the LE u16 words, plus their XOR (the Karatsuba middle
+/// operand). Shared by the input-batch and multi-region CLMUL kernels so a
+/// one-src-many-dst caller can deinterleave once per block.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct ClmulSrcPlanes {
+    lo: std::arch::aarch64::poly8x16_t,
+    hi: std::arch::aarch64::poly8x16_t,
+    mid: std::arch::aarch64::poly8x16_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_load_planes(src: *const u8) -> ClmulSrcPlanes {
+    use std::arch::aarch64::*;
+    unsafe {
+        let data = vld2q_u8(src);
+        ClmulSrcPlanes {
+            lo: vreinterpretq_p8_u8(data.0),
+            hi: vreinterpretq_p8_u8(data.1),
+            mid: vreinterpretq_p8_u8(veorq_u8(data.0, data.1)),
+        }
+    }
+}
+
+/// The six Karatsuba products of loaded planes × broadcast coefficient
+/// (the multiply half of upstream `gf16_clmul_neon_round1`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_partials(d: ClmulSrcPlanes, c: &ClmulBatchCoeff) -> ClmulPartials {
+    use std::arch::aarch64::*;
+    unsafe {
+        ClmulPartials {
+            low1: vmull_p8(vget_low_p8(d.lo), vget_low_p8(c.lo)),
+            low2: vmull_high_p8(d.lo, c.lo),
+            mid1: vmull_p8(vget_low_p8(d.mid), vget_low_p8(c.mid)),
+            mid2: vmull_high_p8(d.mid, c.mid),
+            high1: vmull_p8(vget_low_p8(d.hi), vget_low_p8(c.hi)),
+            high2: vmull_high_p8(d.hi, c.hi),
+        }
+    }
+}
+
+/// One source's six products for a 32-byte block (upstream
+/// `gf16_clmul_neon_round1`): load the byte planes, multiply by the
+/// broadcast coefficient.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_round1(src: *const u8, c: &ClmulBatchCoeff) -> ClmulPartials {
+    unsafe { clmul_partials(clmul_load_planes(src), c) }
+}
+
+/// Accumulating round, plain-NEON flavor: six PMULL + six EOR (upstream
+/// `gf16_clmul_neon_round` with intrinsic `pmacl_*`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_round_acc(acc: &mut ClmulPartials, src: *const u8, c: &ClmulBatchCoeff) {
+    unsafe {
+        let p = clmul_round1(src, c);
+        acc.low1 = veorq_p16x(acc.low1, p.low1);
+        acc.low2 = veorq_p16x(acc.low2, p.low2);
+        acc.mid1 = veorq_p16x(acc.mid1, p.mid1);
+        acc.mid2 = veorq_p16x(acc.mid2, p.mid2);
+        acc.high1 = veorq_p16x(acc.high1, p.high1);
+        acc.high2 = veorq_p16x(acc.high2, p.high2);
+    }
+}
+
+/// PMULL immediately followed by EOR, as one asm unit, so Apple cores fuse the
+/// pair (upstream gf16_clmul_sha3.c:27-44). `out` (not `lateout`) keeps the
+/// result register distinct from all inputs: it is written by the first
+/// instruction while `sum` is still live.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmacl_low_fused(
+    sum: std::arch::aarch64::poly16x8_t,
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull {r:v}.8h, {a:v}.8b, {b:v}.8b",
+            "eor {r:v}.16b, {r:v}.16b, {s:v}.16b",
+            r = out(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            s = in(vreg) vreinterpretq_u16_p16(sum),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmacl_high_fused(
+    sum: std::arch::aarch64::poly16x8_t,
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull2 {r:v}.8h, {a:v}.16b, {b:v}.16b",
+            "eor {r:v}.16b, {r:v}.16b, {s:v}.16b",
+            r = out(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            s = in(vreg) vreinterpretq_u16_p16(sum),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
+/// Accumulating round, Apple-fusion flavor.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_round_acc_fused(acc: &mut ClmulPartials, src: *const u8, c: &ClmulBatchCoeff) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let data = vld2q_u8(src);
+        let d_lo = vreinterpretq_p8_u8(data.0);
+        let d_hi = vreinterpretq_p8_u8(data.1);
+        let d_mid = vreinterpretq_p8_u8(veorq_u8(data.0, data.1));
+        acc.low1 = pmacl_low_fused(acc.low1, d_lo, c.lo);
+        acc.low2 = pmacl_high_fused(acc.low2, d_lo, c.lo);
+        acc.mid1 = pmacl_low_fused(acc.mid1, d_mid, c.mid);
+        acc.mid2 = pmacl_high_fused(acc.mid2, d_mid, c.mid);
+        acc.high1 = pmacl_low_fused(acc.high1, d_hi, c.hi);
+        acc.high2 = pmacl_high_fused(acc.high2, d_hi, c.hi);
+    }
+}
+
+/// Merge one source's product set into the accumulators with plain EOR
+/// (upstream `gf16_clmul_sha3_merge1`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_merge1(acc: &mut ClmulPartials, b: ClmulPartials) {
+    unsafe {
+        acc.low1 = veorq_p16x(acc.low1, b.low1);
+        acc.low2 = veorq_p16x(acc.low2, b.low2);
+        acc.mid1 = veorq_p16x(acc.mid1, b.mid1);
+        acc.mid2 = veorq_p16x(acc.mid2, b.mid2);
+        acc.high1 = veorq_p16x(acc.high1, b.high1);
+        acc.high2 = veorq_p16x(acc.high2, b.high2);
+    }
+}
+
+/// Merge two sources' product sets at once with EOR3 (upstream
+/// `gf16_clmul_sha3_merge2`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_merge2<const SHA3: bool>(
+    acc: &mut ClmulPartials,
+    b: ClmulPartials,
+    c: ClmulPartials,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        macro_rules! m {
+            ($f:ident) => {
+                acc.$f = vreinterpretq_p16_u8(eor3q::<SHA3>(
+                    vreinterpretq_u8_p16(acc.$f),
+                    vreinterpretq_u8_p16(b.$f),
+                    vreinterpretq_u8_p16(c.$f),
+                ));
+            };
+        }
+        m!(low1);
+        m!(low2);
+        m!(mid1);
+        m!(mid2);
+        m!(high1);
+        m!(high2);
+    }
+}
+
+/// Packed Barrett reduction, verbatim port of `gf16_clmul_neon_reduction`
+/// (gf16_clmul_neon.h:52-101), poly 0x1100b (first reduction coefficient
+/// 0x1111a). Returns four byte-plane vectors; the block result's even plane is
+/// `out[0]^out[1]`, the odd plane `out[2]^out[3]` — folded into dst by the
+/// caller. The `SHA3` flavor replaces the non-SHA3 `vqtbl1q` bit-fold trick
+/// with an extra term carried into the final EOR3 (upstream's
+/// `__ARM_FEATURE_SHA3` branches at :73-80 and :95-99).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn clmul_barrett_reduce<const SHA3: bool>(
+    p: ClmulPartials,
+) -> [std::arch::aarch64::uint8x16_t; 4] {
+    use std::arch::aarch64::*;
+    unsafe {
+        // put data in proper form
+        let hib = vuzpq_u8(vreinterpretq_u8_p16(p.high1), vreinterpretq_u8_p16(p.high2));
+        let lob = vuzpq_u8(vreinterpretq_u8_p16(p.low1), vreinterpretq_u8_p16(p.low2));
+        // merge mid into high/low
+        let midb = vuzpq_u8(vreinterpretq_u8_p16(p.mid1), vreinterpretq_u8_p16(p.mid2));
+        let libytes = veorq_u8(hib.0, lob.1);
+        let lob1 = eor3q::<SHA3>(libytes, lob.0, midb.0);
+        let hib0 = eor3q::<SHA3>(libytes, hib.1, midb.1);
+
+        // Barrett reduction: multiply the high half by 0x11110
+        let th0 = vsriq_n_u8::<4>(vshlq_n_u8::<4>(hib.1), hib0);
+        let th1 = veorq_u8(hib.1, vshrq_n_u8::<4>(hib.1));
+        let th0 = eor3q::<SHA3>(th0, th1, hib0);
+
+        // low bits of th0 are dead past this point; trim now for a shorter
+        // dependency chain
+        let th0_hi3 = vshrq_n_u8::<5>(th0);
+        // non-SHA3: `th0_hi3 ^= th0_hi3 >> 2` in one table op; SHA3 carries
+        // the `>> 2` term into the final EOR3 instead
+        let (th0_hi3, th0_hi1) = if SHA3 {
+            (th0_hi3, vshrq_n_u8::<2>(th0_hi3))
+        } else {
+            let tbl = vld1q_u8([0u8, 1, 2, 3, 5, 4, 7, 6, 0, 0, 0, 0, 0, 0, 0, 0].as_ptr());
+            (vqtbl1q_u8(tbl, th0_hi3), vdupq_n_u8(0))
+        };
+
+        // 0x1a's 0x10 part is handled above; shift in the 0x8 (hib.1 holds at
+        // most 7 bits, so 0x18 behaves like 0x1a here)
+        let th0 = veorq_u8(th0, vshrq_n_u8::<5>(hib.1));
+
+        // multiply by polynomial 0x100b
+        let red_l = vdupq_n_p8(0x0b);
+        let hib1_new = vsliq_n_u8::<4>(th0_hi3, th0);
+        let th1p = vreinterpretq_u8_p8(vmulq_p8(vreinterpretq_p8_u8(th1), red_l));
+        let hib0_new = vreinterpretq_u8_p8(vmulq_p8(vreinterpretq_p8_u8(th0), red_l));
+
+        let out_high1 = if SHA3 {
+            eor3q::<SHA3>(hib1_new, th0_hi1, th1p)
+        } else {
+            veorq_u8(hib1_new, th1p)
+        };
+        [lob.0, hib0_new, out_high1, lob1]
+    }
+}
+
+/// Shared body for the input-batch CLMUL kernels. `SHA3` selects the EOR3
+/// reduction/merge flavor; `FUSED` selects Apple's PMULL+EOR-paired
+/// accumulation (upstream: `FUSED` ≙ `__APPLE__`, where the merge rotation is
+/// NOT used and the final dst fold stays a plain EOR pair).
+///
+/// Takes `(factor, src)` pairs as a cloneable iterator so both the raw and
+/// prepared dispatch paths run allocation-free: sources are consumed in
+/// fixed groups of [`CLMUL_SRC_GROUP`] through a stack buffer, one full pass
+/// over `dst` per group (upstream makes one muladd_multi call per group).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool>(
+    dst: &mut [u8],
+    inputs: impl Iterator<Item = (u16, &'a [u8])> + Clone,
+) {
+    use std::arch::aarch64::*;
+    let len = dst.len();
+    // The public dispatchers assert this; guard direct (test/future) callers
+    // too — a short src would send vld2q/tail slicing out of bounds.
+    debug_assert!(len.is_multiple_of(2), "region length must be even");
+
+    // factor==1 is a plain XOR; fold those up front like the other kernels.
+    for (factor, src) in inputs.clone() {
+        debug_assert_eq!(src.len(), len, "src length must match dst");
+        if factor == 1 {
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    let vec_len = len & !31;
+    let mut it = inputs.filter(|&(factor, _)| factor > 1);
+    loop {
+        // Fill the next group of up to CLMUL_SRC_GROUP sources.
+        let mut group: [Option<(u16, ClmulBatchCoeff, &[u8])>; CLMUL_SRC_GROUP] =
+            [None; CLMUL_SRC_GROUP];
+        let mut n = 0usize;
+        for slot in group.iter_mut() {
+            let Some((factor, src)) = it.next() else {
+                break;
+            };
+            *slot = Some((factor, unsafe { clmul_batch_coeff(factor) }, src));
+            n += 1;
+        }
+        if n == 0 {
+            break;
+        }
+        let group = &group[..n];
+
+        unsafe {
+            let mut offset = 0usize;
+            while offset < vec_len {
+                let first = group[0].unwrap();
+                let mut acc = clmul_round1(first.2.as_ptr().add(offset), &first.1);
+                let rest = &group[1..];
+                if SHA3 && !FUSED {
+                    // EOR3 rotation: two fresh product sets per merge, odd
+                    // leftover via plain merge (gf16_clmul_sha3.c:86-112).
+                    let mut i = 0usize;
+                    while i + 2 <= rest.len() {
+                        let b = rest[i].unwrap();
+                        let c = rest[i + 1].unwrap();
+                        let pb = clmul_round1(b.2.as_ptr().add(offset), &b.1);
+                        let pc = clmul_round1(c.2.as_ptr().add(offset), &c.1);
+                        clmul_merge2::<SHA3>(&mut acc, pb, pc);
+                        i += 2;
+                    }
+                    if i < rest.len() {
+                        let b = rest[i].unwrap();
+                        let pb = clmul_round1(b.2.as_ptr().add(offset), &b.1);
+                        clmul_merge1(&mut acc, pb);
+                    }
+                } else {
+                    for e in rest {
+                        let e = e.unwrap();
+                        if FUSED {
+                            clmul_round_acc_fused(&mut acc, e.2.as_ptr().add(offset), &e.1);
+                        } else {
+                            clmul_round_acc(&mut acc, e.2.as_ptr().add(offset), &e.1);
+                        }
+                    }
+                }
+
+                let r = clmul_barrett_reduce::<SHA3>(acc);
+                let mut vb = vld2q_u8(dst.as_ptr().add(offset));
+                if SHA3 && !FUSED {
+                    vb.0 = veor3q_u8(r[0], r[1], vb.0);
+                    vb.1 = veor3q_u8(r[2], r[3], vb.1);
+                } else {
+                    vb.0 = veorq_u8(veorq_u8(r[0], r[1]), vb.0);
+                    vb.1 = veorq_u8(veorq_u8(r[2], r[3]), vb.1);
+                }
+                vst2q_u8(dst.as_mut_ptr().add(offset), vb);
+
+                offset += 32;
+            }
         }
 
-        // Scalar tail.
-        if offset < len {
-            for coeff in &coeffs {
-                mul_acc_region_scalar(
-                    factors_and_dsts[coeff.dst_idx].factor,
-                    &src[offset..],
-                    &mut factors_and_dsts[coeff.dst_idx].dst[offset..],
-                );
+        // Scalar tail (< one 32-byte block) for this group's sources.
+        if vec_len < len {
+            for e in group {
+                let (factor, _, src) = e.unwrap();
+                mul_acc_region_scalar(factor, &src[vec_len..], &mut dst[vec_len..]);
             }
         }
     }
 }
 
-/// Reduce a 30-bit GF(2)[x] product to GF(2^16).
-///
-/// Given low (bits 0-15) and high (bits 16-29), computes
-/// `low XOR reduce(high)` where the reduction polynomial is
-/// x^16 + x^12 + x^3 + x + 1.
+/// Input-batch CLMUL, plain-NEON flavor (upstream `gf16_clmul_muladd_*_neon`).
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn reduce_gf16(
-    low: std::arch::aarch64::uint16x8_t,
-    high: std::arch::aarch64::uint16x8_t,
-) -> std::arch::aarch64::uint16x8_t {
-    use std::arch::aarch64::*;
-
-    // Reduction: x^16 ≡ x^12 + x^3 + x + 1
-    // For high bits h: contribution = (h << 12) ^ (h << 3) ^ (h << 1) ^ h
-    // Bits that overflow u16 (from h << 12) become the next round's high bits.
-    let mut result = low;
-    let mut h = high;
-
-    // Each pass: max 14 bits → (h >> 4) = 10 bits → 6 bits → 2 bits → 0.
-    // Unroll 4 iterations (always sufficient for 14-bit input).
+unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
     unsafe {
-        for _ in 0..4 {
-            let contrib = veorq_u16(
-                veorq_u16(vshlq_n_u16::<12>(h), vshlq_n_u16::<3>(h)),
-                veorq_u16(vshlq_n_u16::<1>(h), h),
-            );
-            result = veorq_u16(result, contrib);
-            // Overflow from h << 12: bits that shifted past position 15.
-            // h >> 4 captures bits 4+ of h that land at position 16+ after << 12.
-            // h >> 13 captures the single bit from h << 3 that overflows.
-            h = veorq_u16(vshrq_n_u16::<4>(h), vshrq_n_u16::<13>(h));
-        }
+        mul_acc_input_batch_clmul_body::<false, false>(
+            dst,
+            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+        )
     }
+}
 
-    result
+/// Input-batch CLMUL, SHA3 flavor (upstream `gf16_clmul_muladd_*_sha3`):
+/// EOR3 merges on non-Apple cores, fused PMULL+EOR pairs on Apple.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_input_batch_clmul_sha3(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+            dst,
+            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+        )
+    }
+}
+
+/// Prepared-path entries: identical kernels fed straight from
+/// `PreparedFactorSrc` (CLMUL preparation is six broadcasts — the raw factor
+/// is all it needs), avoiding any conversion allocation in the dispatcher.
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_input_batch_clmul_prepared(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<false, false>(
+            dst,
+            factors_and_srcs
+                .iter()
+                .map(|fs| (fs.prepared.factor, fs.src)),
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_input_batch_clmul_sha3_prepared(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+            dst,
+            factors_and_srcs
+                .iter()
+                .map(|fs| (fs.prepared.factor, fs.src)),
+        )
+    }
+}
+
+/// Test-only instantiation of the non-Apple EOR3 merge flavor so the
+/// Neoverse/Graviton codepath is oracle-verified on Apple hardware too:
+/// M-series has FEAT_SHA3, and upstream's Apple carve-out is a scheduling
+/// preference, not a capability difference.
+#[cfg(all(target_arch = "aarch64", test))]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_input_batch_clmul_sha3_unfused(
+    dst: &mut [u8],
+    factors_and_srcs: &[FactorSrc<'_>],
+) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<true, false>(
+            dst,
+            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3288,6 +3800,155 @@ mod tests {
         assert_eq!(batched, reference);
     }
 
+    /// Dispatch-level oracle across a batch WIDER than the stream group (8),
+    /// so the group-boundary dst reload is exercised on every arch's grouped
+    /// kernel (x86 SRC_STREAM_GROUP paths on x86 CI, CLMUL groups here).
+    #[test]
+    fn input_batch_multi_group_matches_scalar() {
+        let count = 19usize; // 2 full groups + tail group on every path
+        let len = 4094usize;
+        let factors: Vec<u16> = (0..count)
+            .map(|i| match i {
+                0 => 0,
+                1 => 1,
+                _ => (i * 2749 + 3) as u16,
+            })
+            .collect();
+        let srcs: Vec<Vec<u8>> = (0..count)
+            .map(|i| (0..len).map(|b| ((b * (i + 5) + 31) % 249) as u8).collect())
+            .collect();
+
+        let mut reference = vec![0x33u8; len];
+        for (&factor, src) in factors.iter().zip(srcs.iter()) {
+            mul_acc_region_scalar(factor, src, &mut reference);
+        }
+
+        let pairs: Vec<FactorSrc<'_>> = factors
+            .iter()
+            .zip(srcs.iter())
+            .map(|(&factor, src)| FactorSrc {
+                factor,
+                src: src.as_slice(),
+            })
+            .collect();
+        let mut got = vec![0x33u8; len];
+        mul_acc_input_batch(&mut got, &pairs);
+        assert_eq!(got, reference);
+
+        // Prepared path over the same wide batch.
+        let prepared: Vec<PreparedInputFactor> =
+            factors.iter().map(|&f| prepare_input_factor(f)).collect();
+        let prepared_pairs: Vec<PreparedFactorSrc<'_>> = prepared
+            .iter()
+            .zip(srcs.iter())
+            .map(|(prepared, src)| PreparedFactorSrc {
+                prepared,
+                src: src.as_slice(),
+            })
+            .collect();
+        let mut got_prepared = vec![0x33u8; len];
+        mul_acc_input_batch_prepared(&mut got_prepared, &prepared_pairs);
+        assert_eq!(got_prepared, reference);
+    }
+
+    /// Direct oracle test for the unprepared 512-bit GFNI grouped-input entry
+    /// (runs only on GFNI+AVX512 hardware; no-ops elsewhere, including under
+    /// Rosetta 2).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn input_batch_gfni_avx512_matches_scalar() {
+        if !is_x86_feature_detected!("gfni")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vl")
+        {
+            return;
+        }
+        for &len in &[2usize, 62, 64, 66, 4096, 4094] {
+            let factors = [0u16, 1, 2, 0x8000, 0xFFFF, 0x1234, 0x2F1D];
+            let srcs: Vec<Vec<u8>> = factors
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (0..len).map(|b| ((b * (i + 3) + 17) % 251) as u8).collect())
+                .collect();
+
+            let mut reference = vec![0x6Bu8; len];
+            for (&factor, src) in factors.iter().zip(srcs.iter()) {
+                mul_acc_region_scalar(factor, src, &mut reference);
+            }
+
+            let pairs: Vec<FactorSrc<'_>> = factors
+                .iter()
+                .zip(srcs.iter())
+                .map(|(&factor, src)| FactorSrc {
+                    factor,
+                    src: src.as_slice(),
+                })
+                .collect();
+            let mut got = vec![0x6Bu8; len];
+            unsafe { mul_acc_input_batch_gfni_avx512(&mut got, &pairs) };
+            assert_eq!(got, reference, "gfni avx512 batch len={len}");
+        }
+    }
+
+    /// Direct oracle test for both input-batch CLMUL flavors: source counts
+    /// straddle the 8-source group (CLMUL_SRC_GROUP) and lengths straddle the
+    /// 32-byte block, with factor edge cases (0, 1, 0x8000, 0xFFFF) mixed in.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn input_batch_clmul_kernels_match_scalar() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &count in &[1usize, 2, 3, 4, 5, 7, 8, 9, 17] {
+            for &len in &[2usize, 30, 32, 34, 64, 96, 4094, 4096] {
+                let factors: Vec<u16> = (0..count)
+                    .map(|i| match i {
+                        0 => 1,
+                        1 => 0,
+                        2 => 0x8000,
+                        3 => 0xFFFF,
+                        _ => (next() >> 16) as u16,
+                    })
+                    .collect();
+                let inputs: Vec<Vec<u8>> = (0..count)
+                    .map(|_| (0..len).map(|_| next() as u8).collect())
+                    .collect();
+                let srcs: Vec<FactorSrc<'_>> = factors
+                    .iter()
+                    .zip(inputs.iter())
+                    .map(|(&factor, input)| FactorSrc { factor, src: input })
+                    .collect();
+
+                let mut reference = vec![0xA7u8; len];
+                for (&factor, input) in factors.iter().zip(inputs.iter()) {
+                    mul_acc_region_scalar(factor, input, &mut reference);
+                }
+
+                let mut plain = vec![0xA7u8; len];
+                unsafe { mul_acc_input_batch_clmul(&mut plain, &srcs) };
+                assert_eq!(plain, reference, "plain clmul count={count} len={len}");
+
+                if clmul_sha3_available() {
+                    let mut sha3 = vec![0xA7u8; len];
+                    unsafe { mul_acc_input_batch_clmul_sha3(&mut sha3, &srcs) };
+                    assert_eq!(sha3, reference, "sha3 clmul count={count} len={len}");
+
+                    let mut unfused = vec![0xA7u8; len];
+                    unsafe { mul_acc_input_batch_clmul_sha3_unfused(&mut unfused, &srcs) };
+                    assert_eq!(
+                        unfused, reference,
+                        "unfused sha3 clmul count={count} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn altmap_roundtrip_and_kernel_match() {
         if !altmap_supported() {
@@ -3607,6 +4268,50 @@ mod tests {
                 multi[i], reference[i],
                 "CLMUL edge mismatch for factor={factor:#06x}"
             );
+        }
+    }
+
+    /// Direct oracle test for both multi-region CLMUL flavors (plain and
+    /// EOR3-reduction), across block-tail straddles and 0/1 factor edges.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn multi_region_clmul_flavors_match_scalar() {
+        for &len in &[32usize, 94, 4096, 4094] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let factors = [0u16, 1, 2, 0x8000, 0xFFFF, 0x1234];
+
+            let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x5Au8; len]).collect();
+            for (i, &factor) in factors.iter().enumerate() {
+                mul_acc_region_scalar(factor, &src, &mut reference[i]);
+            }
+
+            for sha3 in [false, true] {
+                if sha3 && !clmul_sha3_available() {
+                    continue;
+                }
+                let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x5Au8; len]).collect();
+                {
+                    let mut pairs: Vec<FactorDst<'_>> = factors
+                        .iter()
+                        .zip(multi.iter_mut())
+                        .map(|(&factor, dst)| FactorDst {
+                            factor,
+                            dst: dst.as_mut_slice(),
+                        })
+                        .collect();
+                    if sha3 {
+                        unsafe { mul_acc_multi_region_clmul_sha3(&mut pairs, &src) };
+                    } else {
+                        unsafe { mul_acc_multi_region_clmul(&mut pairs, &src) };
+                    }
+                }
+                for (i, &factor) in factors.iter().enumerate() {
+                    assert_eq!(
+                        multi[i], reference[i],
+                        "flavor sha3={sha3} len={len} factor={factor:#06x}"
+                    );
+                }
+            }
         }
     }
 
