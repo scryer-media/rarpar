@@ -1897,6 +1897,13 @@ impl GpuComputeArm {
                 "gpu gf16 tier engaged for streaming repair"
             );
         }
+        // A headless box whose only Vulkan ICD is llvmpipe has an adapter and
+        // still gets the CPU tier; say so rather than leaving the operator to
+        // wonder. Cheap: this never probes an adapter that was not probed.
+        #[cfg(feature = "wgpu")]
+        if session.is_none() && weaver_reed_solomon::wgpu_gf16::auto_refused_cpu_adapter() {
+            debug!("wgpu adapter is a cpu rasterizer; keeping the cpu gf16 tier");
+        }
         Self { session }
     }
 

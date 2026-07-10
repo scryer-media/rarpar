@@ -22,15 +22,27 @@ const ORDER: u32 = 65535;
 struct GfTables {
     /// log_table[a] = discrete log base g of a, for a in 1..65535.
     /// log_table[0] is unused (log of 0 is undefined).
-    log_table: [u16; 65536],
+    log_table: Box<[u16; 65536]>,
     /// antilog_table[i] = g^i for i in 0..65534.
     /// antilog_table[65535] is a duplicate of antilog_table[0] for convenience.
-    antilog_table: [u16; 65536],
+    antilog_table: Box<[u16; 65536]>,
+}
+
+/// Allocates a zeroed table directly on the heap, never on the stack.
+fn zeroed_table() -> Box<[u16; 65536]> {
+    vec![0u16; 65536]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536-element vec is exactly one table")
 }
 
 static TABLES: LazyLock<GfTables> = LazyLock::new(|| {
-    let mut log_table = [0u16; 65536];
-    let mut antilog_table = [0u16; 65536];
+    // Each table is 128 KiB. Built as stack locals they cost ~256 KiB in release
+    // and ~1.25 MiB in debug (measured), and this initializer runs lazily on
+    // whichever thread first calls into the field — including a Windows main
+    // thread, whose stack MSVC reserves at only 1 MiB.
+    let mut log_table = zeroed_table();
+    let mut antilog_table = zeroed_table();
 
     // Generator g = 2 (x) with the primitive polynomial.
     // Build antilog table: antilog[i] = 2^i mod primitive_poly

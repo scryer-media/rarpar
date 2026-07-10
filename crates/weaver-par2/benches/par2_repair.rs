@@ -34,6 +34,40 @@ fn benchmark_scenarios() -> Vec<benchmark_support::Scenario> {
     select_scenarios(crate_bench_scenarios(), &bench_filter())
 }
 
+/// Surface the crate's own `tracing` output when `RUST_LOG` is set.
+///
+/// A GPU-vs-CPU workflow A/B is meaningless unless you can prove which tier ran:
+/// `repair.rs` logs "repairing with streamed chunk path" (the only mode that can
+/// reach the GPU arm) and "gpu gf16 tier engaged for streaming repair" with the
+/// backend and device. Without a subscriber those events go nowhere, and a run
+/// that silently fell back to the CPU is indistinguishable from one that never
+/// tried. Silent unless `RUST_LOG` is set, so ordinary bench runs stay clean.
+fn init_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RUST_LOG").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+    });
+}
+
+/// Repair memory budget override, in bytes, from `WEAVER_PAR2_BENCH_MEMORY_LIMIT`.
+///
+/// Exists to make GPU-vs-CPU workflow A/Bs honest. `select_repair_execution_mode`
+/// takes the in-memory path when the estimate fits the budget, and the GPU arm
+/// is only reachable from `execute_repair_streaming` — so an unpinned A/B can
+/// silently compare streaming+GPU against in-memory+CPU (confounding I/O shape
+/// with compute tier), or skip the GPU entirely and read as "no benefit".
+/// Pinning a small budget forces BOTH arms down the same streaming path.
+fn bench_memory_limit() -> Option<usize> {
+    std::env::var("WEAVER_PAR2_BENCH_MEMORY_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
+
 fn repairer_options(
     staged: &benchmark_support::StagedScenario,
     repair: bool,
@@ -44,6 +78,9 @@ fn repairer_options(
     );
     options.recovery_paths = staged.recovery_par2.clone();
     options.repair = repair;
+    if let Some(limit) = bench_memory_limit() {
+        options.memory_limit = Some(limit);
+    }
     options
 }
 
@@ -133,6 +170,7 @@ fn bench_verify_plan(c: &mut Criterion) {
 }
 
 fn bench_repair_workflow(c: &mut Criterion) {
+    init_tracing();
     let mut group = c.benchmark_group("repairer_repair_workflow");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(60));

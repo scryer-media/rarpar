@@ -61,6 +61,10 @@ weaver-unrar = { path = "../weaver-unrar", version = "0.2.0", default-features =
     "native-crypto",
 ] }
 criterion = "0.5"
+# Lets the bench surface the crate's own tier logs under `RUST_LOG` — the only
+# way to confirm which compute tier (streaming vs in-memory, CPU vs GPU) a
+# workflow A/B actually exercised.
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "par2_repair"

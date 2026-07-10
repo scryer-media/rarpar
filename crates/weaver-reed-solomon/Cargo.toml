@@ -27,6 +27,19 @@ wgpu = { version = "30.0.0", optional = true }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 memmap2 = { workspace = true, default-features = false }
 
+# `criterion` hard-`compile_error!`s on wasm targets, and this crate builds for
+# wasm, so the bench harness is scoped to native targets only.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+criterion = "0.5"
+
+# GPU-vs-CPU GF(2^16) throughput. `required-features` keeps it out of default
+# builds (and `--all-targets` lints) on machines without the wgpu stack.
+[[bench]]
+name = "gf16_gpu_vs_cpu"
+path = "benches/gf16_gpu_vs_cpu.rs"
+harness = false
+required-features = ["wgpu"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.2", default-features = false, features = ["std"], optional = true }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSRange", "NSString"], optional = true }

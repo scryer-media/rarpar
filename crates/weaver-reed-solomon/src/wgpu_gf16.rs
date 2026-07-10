@@ -21,8 +21,11 @@
 //! unified-memory shortcut is assumed.
 //!
 //! Gating mirrors the Metal arm: `WEAVER_GF16_WGPU=0` disables, `=1` forces
-//! (skips the size gate), otherwise a session engages when the repair is
-//! large enough to amortize dispatch + PCIe transfer.
+//! (skips every gate), otherwise a session engages when the repair is large
+//! enough to amortize dispatch + PCIe transfer. The automatic path also
+//! refuses `DeviceType::Cpu` adapters — see [`auto_engageable`] — because a
+//! Vulkan ICD list on a headless Linux box is often nothing but llvmpipe,
+//! and `request_adapter` returns it without complaint.
 
 use std::sync::OnceLock;
 
@@ -138,6 +141,7 @@ fn gf16_mulacc(
     )
 }
 
+#[derive(Clone, Copy)]
 enum WgpuGate {
     Auto,
     Force,
@@ -159,11 +163,19 @@ struct WgpuShared {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     adapter_name: String,
+    device_type: wgpu::DeviceType,
     max_binding: u64,
 }
 
+/// Module-scoped so [`auto_refused_cpu_adapter`] can observe an already-probed
+/// adapter without initializing one.
+static CONTEXT: OnceLock<Option<WgpuShared>> = OnceLock::new();
+
+/// The shared adapter/device/pipeline, probed once. Deliberately blind to the
+/// adapter's device type: the forced path must reach a CPU rasterizer, so the
+/// refusal belongs on the automatic arm of [`WgpuGf16Session::try_new_gated`],
+/// not here.
 fn shared_context() -> Option<&'static WgpuShared> {
-    static CONTEXT: OnceLock<Option<WgpuShared>> = OnceLock::new();
     CONTEXT
         .get_or_init(|| {
             if matches!(wgpu_gate(), WgpuGate::Off) {
@@ -207,20 +219,71 @@ fn shared_context() -> Option<&'static WgpuShared> {
                 cache: None,
             });
             let max_binding = device.limits().max_storage_buffer_binding_size;
+            let info = adapter.get_info();
             Some(WgpuShared {
                 device,
                 queue,
                 pipeline,
-                adapter_name: adapter.get_info().name,
+                adapter_name: info.name,
+                device_type: info.device_type,
                 max_binding,
             })
         })
         .as_ref()
 }
 
+/// Adapter classes the automatic gate accepts.
+///
+/// Only `DeviceType::Cpu` is refused, and the reason is structural rather than
+/// empirical: a software rasterizer (llvmpipe, lavapipe, SwiftShader) runs this
+/// shader on the very cores the CPU tier already owns, reached through a
+/// SPIR-V → LLVM JIT and a staging-buffer round trip that the CPU tier does not
+/// pay. There is no host on which it can win. Measured on an i5-1240P, work =
+/// outputs × sources × region: llvmpipe through this arm ~2.9 GiB/s against
+/// ~91 GiB/s for the 16-thread CPU path it would displace.
+///
+/// `IntegratedGpu` stays engaged, deliberately. The measurement that seems to
+/// argue otherwise — an Iris Xe at ~14.9 GiB/s losing to a single GFNI core at
+/// ~20.6 GiB/s — was taken on a box where this arm never engages: `engage` in
+/// `weaver-par2`'s repair path requires `!cpu_fast_path`, and `cpu_fast_path`
+/// is `altmap_supported() || xorjit`, both of which are x86-64-with-AVX2. So
+/// the automatic path only ever runs on non-x86 (where the CPU tier is the
+/// NEON kernel) and on pre-AVX2 x86, and on neither has an integrated GPU been
+/// shown to lose. Refusing the class would instead disable the arm on nearly
+/// every host it was written for, since Apple, Adreno and Mali all report
+/// `IntegratedGpu` — while `PowerPreference::HighPerformance` already prefers a
+/// discrete GPU when the host has both. A host whose integrated GPU really is
+/// slower than its CPU tier already has the `WEAVER_GF16_WGPU=0` kill switch;
+/// a second knob would be encoding a guess. If that case is ever measured on a
+/// host the automatic path can reach, the measurement should drive the policy.
+///
+/// `Other` and `VirtualGpu` stay engaged too: drivers under-report (virtio-gpu,
+/// some Mesa builds), and refusing them would reject real hardware.
+fn auto_engageable(device_type: wgpu::DeviceType) -> bool {
+    !matches!(device_type, wgpu::DeviceType::Cpu)
+}
+
 /// True when a wgpu adapter is present and the tier is not disabled.
+///
+/// Says nothing about whether the automatic gate would engage it — a CPU
+/// rasterizer is "available" and still refused. Use [`auto_engageable`] for
+/// that question.
 pub fn wgpu_gf16_available() -> bool {
     shared_context().is_some()
+}
+
+/// True when the automatic gate has probed an adapter and would refuse it as a
+/// CPU rasterizer, so a caller can log why the GPU arm stayed dark.
+///
+/// Reports only on an *already*-probed adapter and never initializes one, so
+/// asking the question on a repair that the size gate already declined costs
+/// nothing.
+pub fn auto_refused_cpu_adapter() -> bool {
+    matches!(wgpu_gate(), WgpuGate::Auto)
+        && CONTEXT
+            .get()
+            .and_then(|shared| shared.as_ref())
+            .is_some_and(|shared| !auto_engageable(shared.device_type))
 }
 
 /// True when `WEAVER_GF16_WGPU=1` demands the wgpu arm regardless of CPU
@@ -253,19 +316,43 @@ pub struct WgpuGf16Session {
 }
 
 impl WgpuGf16Session {
-    /// Engage a session when an adapter exists and the whole repair is big
-    /// enough to amortize dispatch + transfer (`effective_bytes` = outputs ×
-    /// sources × region bytes). `WEAVER_GF16_WGPU=1` skips the size gate.
+    /// Engage a session when a suitable adapter exists and the whole repair is
+    /// big enough to amortize dispatch + transfer (`effective_bytes` = outputs
+    /// × sources × region bytes). The automatic path additionally refuses CPU
+    /// rasterizers (see [`auto_engageable`]); `WEAVER_GF16_WGPU=1` skips both
+    /// gates, `=0` refuses everything.
     pub fn try_new(outputs: usize, max_region_bytes: usize, effective_bytes: u64) -> Option<Self> {
-        let shared = shared_context()?;
-        match wgpu_gate() {
+        Self::try_new_gated(wgpu_gate(), outputs, max_region_bytes, effective_bytes)
+    }
+
+    /// Engage on whatever adapter the host offers — CPU rasterizers included —
+    /// exactly as `WEAVER_GF16_WGPU=1` would, but without writing a
+    /// process-global env var.
+    ///
+    /// For benches and conformance tests that must exercise the shader on the
+    /// adapter `VK_DRIVER_FILES` selected. `WEAVER_GF16_WGPU=0` still wins: the
+    /// kill switch lives in [`shared_context`], which this cannot bypass.
+    pub fn try_new_forced(outputs: usize, max_region_bytes: usize) -> Option<Self> {
+        Self::try_new_gated(WgpuGate::Force, outputs, max_region_bytes, 0)
+    }
+
+    fn try_new_gated(
+        gate: WgpuGate,
+        outputs: usize,
+        max_region_bytes: usize,
+        effective_bytes: u64,
+    ) -> Option<Self> {
+        // Size gate before `shared_context()`: a repair too small for the GPU
+        // must not pay adapter probe, device creation and shader compilation
+        // only to be refused.
+        match gate {
             WgpuGate::Off => return None,
-            WgpuGate::Force => {}
-            WgpuGate::Auto => {
-                if effective_bytes < MIN_EFFECTIVE_BYTES {
-                    return None;
-                }
-            }
+            WgpuGate::Auto if effective_bytes < MIN_EFFECTIVE_BYTES => return None,
+            WgpuGate::Auto | WgpuGate::Force => {}
+        }
+        let shared = shared_context()?;
+        if matches!(gate, WgpuGate::Auto) && !auto_engageable(shared.device_type) {
+            return None;
         }
         if outputs == 0 || max_region_bytes == 0 || !max_region_bytes.is_multiple_of(2) {
             return None;
@@ -565,6 +652,11 @@ mod tests {
     /// tail), factor 0/1 edge cases, a MAX_SOURCES-wide batch, and a second
     /// chunk reusing the session. Skips when no adapter is present (headless
     /// CI without lavapipe).
+    ///
+    /// Forced, not automatic: this is a shader conformance test and lavapipe is
+    /// the only adapter CI has, but the automatic gate refuses CPU rasterizers.
+    /// Through `try_new` the whole test would quietly degrade to a skip on
+    /// exactly the host it is meant to run on.
     #[test]
     fn wgpu_session_matches_cpu_kernels() {
         for &(outputs, sources, byte_len) in &[
@@ -572,9 +664,7 @@ mod tests {
             (3, 5, 4098),
             (2, MAX_SOURCES, 2050),
         ] {
-            let Some(mut session) =
-                WgpuGf16Session::try_new(outputs, byte_len, MIN_EFFECTIVE_BYTES)
-            else {
+            let Some(mut session) = WgpuGf16Session::try_new_forced(outputs, byte_len) else {
                 eprintln!("wgpu adapter unavailable; skipping");
                 return;
             };
@@ -620,5 +710,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The automatic gate refuses a software rasterizer no matter how large the
+    /// repair, while the forced path still takes it. Meaningful on both kinds
+    /// of host: under `VK_DRIVER_FILES=.../lvp_icd.json` it pins the refusal,
+    /// on a real GPU it pins that the arm still engages.
+    #[test]
+    fn auto_gate_refuses_cpu_adapters() {
+        // `WEAVER_GF16_WGPU` would otherwise decide the answer for us.
+        if !matches!(wgpu_gate(), WgpuGate::Auto) {
+            eprintln!("WEAVER_GF16_WGPU overrides the auto gate; skipping");
+            return;
+        }
+        let Some(shared) = shared_context() else {
+            eprintln!("wgpu adapter unavailable; skipping");
+            return;
+        };
+        let (name, device_type) = (&shared.adapter_name, shared.device_type);
+        eprintln!("wgpu adapter: {name} ({device_type:?})");
+        let is_cpu = matches!(device_type, wgpu::DeviceType::Cpu);
+
+        assert!(
+            WgpuGf16Session::try_new_forced(2, 4096).is_some(),
+            "forced path must engage any adapter, including {name} ({device_type:?})"
+        );
+        assert_eq!(
+            WgpuGf16Session::try_new(2, 4096, u64::MAX).is_some(),
+            !is_cpu,
+            "auto gate on {name} ({device_type:?})"
+        );
+        assert_eq!(auto_refused_cpu_adapter(), is_cpu);
+        // The size gate is untouched by the device-type gate.
+        assert!(WgpuGf16Session::try_new(2, 4096, MIN_EFFECTIVE_BYTES - 1).is_none());
     }
 }
