@@ -28,6 +28,16 @@ use super::emit::{self, RAX, RCX, RDX};
 /// Bytes per bit-planar block.
 const BLOCK: i32 = 512;
 
+/// Emit `prefetcht1` hints for the NEXT block's src/dst first lines inside
+/// each loop iteration. Upstream's JIT bodies carry software prefetch
+/// (`gf16_xor_common.h` threads a dedicated `pf` stream); this port dropped
+/// it on the modern-HW-prefetcher rationale. UNMEASURED: off by default —
+/// flip and A/B per the bench playbook (same protocol as `NEON_SRC_PREFETCH`
+/// in gf_simd.rs). Note the scratchpad symbolic-verifier harness decodes only
+/// the default instruction subset; teach it `0F 18 /2` before verifying a
+/// `true` build.
+const JIT_NEXT_BLOCK_PREFETCH: bool = false;
+
 /// Signed byte offset of plane `p` from the mid-block pointer (after the
 /// `+512` advance, `rax`/`rdx` sit 128 bytes into the block).
 #[inline]
@@ -44,6 +54,12 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
     // Loop top: advance to this block, (re)load the resident source planes.
     emit::add_ri(&mut buf, RAX, BLOCK);
     emit::add_ri(&mut buf, RDX, BLOCK);
+    if JIT_NEXT_BLOCK_PREFETCH {
+        // First line of the next block on each stream (pointers sit at
+        // block_start+128, so the next block's first byte is at +384).
+        emit::prefetcht1(&mut buf, RAX, BLOCK - 128);
+        emit::prefetcht1(&mut buf, RDX, BLOCK - 128);
+    }
     for p in 3..16usize {
         emit::vmovdqu_load(&mut buf, p as u8, RAX, plane_off(p));
     }

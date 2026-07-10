@@ -1211,7 +1211,7 @@ fn mul_acc_region_scalar(factor: u16, src: &[u8], dst: &mut [u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// GFNI + AVX2 kernel: 32 bytes (16 GF elements) per iteration
+// GFNI + AVX2 kernel: 64 bytes (32 GF elements) per iteration
 //
 // Uses gf2p8affineqb to apply 8×8 binary matrix transforms instead of
 // PSHUFB nibble lookups. Each 16-bit GF multiply decomposes into:
@@ -1221,6 +1221,12 @@ fn mul_acc_region_scalar(factor: u16, src: &[u8], dst: &mut [u8]) {
 //
 // This is 4 affine + 2 XOR vs. 8 PSHUFB + 4 AND + 4 SRLI + 6 XOR in the
 // split-nibble approach — roughly half the instructions per element.
+//
+// Data marshalling is the same full-width pair deinterleave as
+// `mul_acc_region_avx2`: two vectors fold into one full vector of lo bytes
+// and one of hi bytes, so every gf2p8affineqb lane carries data (the old
+// single-vector deinterleave left the upper 8 lanes per 128-bit lane zero,
+// wasting half of each affine).
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -1238,48 +1244,55 @@ unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst
         let m_hl = _mm256_set1_epi64x(matrices.m_hl as i64);
         let m_hh = _mm256_set1_epi64x(matrices.m_hh as i64);
 
-        // Deinterleave masks (same as AVX2 shuffle kernel — per 128-bit lane).
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
-
-        macro_rules! process_chunk {
-            ($chunk_offset:expr) => {{
-                let s = _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
-                let d = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
-
-                let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-                let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
-
-                let result_lo = _mm256_xor_si256(
-                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
-                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
-                );
-                let result_hi = _mm256_xor_si256(
-                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
-                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
-                );
-
-                let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                let result = _mm256_xor_si256(d, product);
-                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, result);
-            }};
-        }
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
         while offset + 64 <= len {
-            process_chunk!(offset);
-            process_chunk!(offset + 32);
-            offset += 64;
-        }
+            let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let s1 = _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
 
-        while offset + 32 <= len {
-            process_chunk!(offset);
-            offset += 32;
+            // Deinterleave the pair into full lo/hi byte planes (per lane:
+            // [plane(s0) | plane(s1)] qword halves).
+            let a = _mm256_shuffle_epi8(s0, deint_pair);
+            let b = _mm256_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm256_unpacklo_epi64(a, b);
+            let hi_bytes = _mm256_unpackhi_epi64(a, b);
+
+            let result_lo = _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+            );
+            let result_hi = _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+            );
+
+            // Reinterleave within each lane: low qwords → s0's words, high
+            // qwords → s1's words.
+            let product0 = _mm256_unpacklo_epi8(result_lo, result_hi);
+            let product1 = _mm256_unpackhi_epi8(result_lo, result_hi);
+
+            // XOR-accumulate.
+            let d0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let d1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset) as *mut __m256i,
+                _mm256_xor_si256(d0, product0),
+            );
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
+                _mm256_xor_si256(d1, product1),
+            );
+
+            offset += 64;
         }
     }
 
-    // Tail: fall through to SSSE3 for remaining 16-byte chunk + scalar.
+    // Tail: fall through to SSSE3 for a remaining full-width 32-byte block +
+    // scalar (GFNI has no 128-bit kernel here; the shuffle tables are
+    // byte-exact, so results are identical).
     if offset < len {
         let tables = precompute_mul_tables(matrices.factor);
         unsafe { mul_acc_region_ssse3(&tables, &src[offset..], &mut dst[offset..]) };
@@ -1287,9 +1300,12 @@ unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst
 }
 
 // ---------------------------------------------------------------------------
-// GFNI + AVX-512 kernel: 64 bytes (32 GF elements) per iteration
+// GFNI + AVX-512 kernel: 128 bytes (64 GF elements) per iteration
 //
-// Same algorithm as GFNI+AVX2 but 2× wider (512-bit registers).
+// Same algorithm as GFNI+AVX2 but 2× wider (512-bit registers), with the
+// same full-width pair deinterleave as `mul_acc_region_avx512`: two 64-byte
+// vectors fold into one full vector of lo bytes and one of hi bytes, so all
+// gf2p8affineqb lanes carry data.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -1306,20 +1322,21 @@ unsafe fn mul_acc_region_gfni_avx512(matrices: &AffineMulMatrices, src: &[u8], d
         let m_hl = _mm512_set1_epi64(matrices.m_hl as i64);
         let m_hh = _mm512_set1_epi64(matrices.m_hh as i64);
 
-        // Deinterleave masks (per 128-bit lane — same pattern broadcast to all 4 lanes).
-        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
-        ));
-        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
         ));
 
-        while offset + 64 <= len {
-            let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
-            let d = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+        while offset + 128 <= len {
+            let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let s1 = _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
 
-            let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
-            let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+            // Deinterleave the pair into full lo/hi byte planes (per lane:
+            // [plane(s0) | plane(s1)] qword halves).
+            let a = _mm512_shuffle_epi8(s0, deint_pair);
+            let b = _mm512_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm512_unpacklo_epi64(a, b);
+            let hi_bytes = _mm512_unpackhi_epi64(a, b);
 
             let result_lo = _mm512_xor_si512(
                 _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
@@ -1330,15 +1347,28 @@ unsafe fn mul_acc_region_gfni_avx512(matrices: &AffineMulMatrices, src: &[u8], d
                 _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
             );
 
-            let product = _mm512_unpacklo_epi8(result_lo, result_hi);
-            let result = _mm512_xor_si512(d, product);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+            // Reinterleave within each lane: low qwords → s0's words, high
+            // qwords → s1's words.
+            let product0 = _mm512_unpacklo_epi8(result_lo, result_hi);
+            let product1 = _mm512_unpackhi_epi8(result_lo, result_hi);
 
-            offset += 64;
+            // XOR-accumulate.
+            let d0 = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+            let d1 = _mm512_loadu_si512(dst.as_ptr().add(offset + 64) as *const __m512i);
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(offset) as *mut __m512i,
+                _mm512_xor_si512(d0, product0),
+            );
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(offset + 64) as *mut __m512i,
+                _mm512_xor_si512(d1, product1),
+            );
+
+            offset += 128;
         }
     }
 
-    // Tail: fall through to GFNI+AVX2 for 32-byte chunk, then SSSE3/scalar.
+    // Tail: fall through to GFNI+AVX2 for 64-byte blocks, then SSSE3/scalar.
     if offset < len {
         unsafe { mul_acc_region_gfni_avx2(matrices, &src[offset..], &mut dst[offset..]) };
     }
@@ -1863,9 +1893,11 @@ unsafe fn mul_acc_region_wasm_simd128<const RELAXED: bool>(
 // ---------------------------------------------------------------------------
 // Multi-region GFNI + AVX2 kernel
 //
-// Reads src once per 32-byte chunk, applies all factors to all destinations.
-// Processes factors in batches of 4 (16 matrix registers fit in 16 YMM regs
-// alongside the deinterleave constants and source data).
+// Reads src once per 64-byte block, applies all factors to all destinations.
+// The full-width pair deinterleave (see `mul_acc_region_gfni_avx2`) is
+// hoisted once per block: every factor reuses the same full lo/hi byte
+// planes and costs only its four affines plus the per-destination
+// unpack/XOR/store.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -1916,21 +1948,27 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
     }
 
     unsafe {
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
         let mut offset = 0usize;
-        while offset + 32 <= len {
-            let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-            let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-            let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+        while offset + 64 <= len {
+            let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let s1 = _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+
+            // Full-width pair deinterleave, hoisted once per block (see
+            // `mul_acc_region_gfni_avx2` for the lane mapping).
+            let a = _mm256_shuffle_epi8(s0, deint_pair);
+            let b = _mm256_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm256_unpacklo_epi64(a, b);
+            let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
             for matrices in &all_matrices {
-                let d =
-                    _mm256_loadu_si256(factors_and_dsts[matrices.dst_idx].dst.as_ptr().add(offset)
-                        as *const __m256i);
+                let dst_ptr = factors_and_dsts[matrices.dst_idx].dst.as_ptr();
+                let d0 = _mm256_loadu_si256(dst_ptr.add(offset) as *const __m256i);
+                let d1 = _mm256_loadu_si256(dst_ptr.add(offset + 32) as *const __m256i);
 
                 let result_lo = _mm256_xor_si256(
                     _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_ll),
@@ -1941,18 +1979,23 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
                     _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, matrices.m_hh),
                 );
 
-                let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                let result = _mm256_xor_si256(d, product);
+                // Reinterleave within each lane: low qwords → s0's words,
+                // high qwords → s1's words.
+                let product0 = _mm256_unpacklo_epi8(result_lo, result_hi);
+                let product1 = _mm256_unpackhi_epi8(result_lo, result_hi);
+
+                let out = factors_and_dsts[matrices.dst_idx].dst.as_mut_ptr();
                 _mm256_storeu_si256(
-                    factors_and_dsts[matrices.dst_idx]
-                        .dst
-                        .as_mut_ptr()
-                        .add(offset) as *mut __m256i,
-                    result,
+                    out.add(offset) as *mut __m256i,
+                    _mm256_xor_si256(d0, product0),
+                );
+                _mm256_storeu_si256(
+                    out.add(offset + 32) as *mut __m256i,
+                    _mm256_xor_si256(d1, product1),
                 );
             }
 
-            offset += 32;
+            offset += 64;
         }
 
         // Tail: scalar for remaining bytes.
@@ -2016,16 +2059,16 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
         .collect();
 
     unsafe {
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
         // Sources are walked in small groups, one full destination pass per
         // group: bounding the concurrent read streams keeps them within the
         // core's line-fill buffers. A single pass over a large batch turns
         // into 60+ interleaved streams and stalls on L1 misses.
-        let vec_len = len & !31;
+        let vec_len = len & !63;
         let mut first_pass = true;
         let mut group_start = 0usize;
         loop {
@@ -2033,20 +2076,30 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
             let group = &prepared[group_start..group_end];
 
             let mut offset = 0usize;
-            while offset + 32 <= vec_len {
-                let mut acc = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            while offset + 64 <= vec_len {
+                let mut acc0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+                let mut acc1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
 
                 if first_pass {
                     for src in &xor_inputs {
-                        let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-                        acc = _mm256_xor_si256(acc, s);
+                        let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+                        let s1 =
+                            _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+                        acc0 = _mm256_xor_si256(acc0, s0);
+                        acc1 = _mm256_xor_si256(acc1, s1);
                     }
                 }
 
                 for input in group {
-                    let s = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
-                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+                    let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
+                    let s1 =
+                        _mm256_loadu_si256(input.src.as_ptr().add(offset + 32) as *const __m256i);
+
+                    // Full-width pair deinterleave (see `mul_acc_region_gfni_avx2`).
+                    let a = _mm256_shuffle_epi8(s0, deint_pair);
+                    let b = _mm256_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm256_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
                     let result_lo = _mm256_xor_si256(
                         _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_ll),
@@ -2057,12 +2110,13 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
                         _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
                     );
 
-                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                    acc = _mm256_xor_si256(acc, product);
+                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc);
-                offset += 32;
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                offset += 64;
             }
 
             first_pass = false;
@@ -2128,16 +2182,16 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
         .collect();
 
     unsafe {
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
         // Sources are walked in small groups, one full destination pass per
         // group: bounding the concurrent read streams keeps them within the
         // core's line-fill buffers. A single pass over a large batch turns
         // into 60+ interleaved streams and stalls on L1 misses.
-        let vec_len = len & !31;
+        let vec_len = len & !63;
         let mut first_pass = true;
         let mut group_start = 0usize;
         loop {
@@ -2145,20 +2199,30 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
             let group = &prepared[group_start..group_end];
 
             let mut offset = 0usize;
-            while offset + 32 <= vec_len {
-                let mut acc = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            while offset + 64 <= vec_len {
+                let mut acc0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+                let mut acc1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
 
                 if first_pass {
                     for src in &xor_inputs {
-                        let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-                        acc = _mm256_xor_si256(acc, s);
+                        let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+                        let s1 =
+                            _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+                        acc0 = _mm256_xor_si256(acc0, s0);
+                        acc1 = _mm256_xor_si256(acc1, s1);
                     }
                 }
 
                 for input in group {
-                    let s = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
-                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+                    let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
+                    let s1 =
+                        _mm256_loadu_si256(input.src.as_ptr().add(offset + 32) as *const __m256i);
+
+                    // Full-width pair deinterleave (see `mul_acc_region_gfni_avx2`).
+                    let a = _mm256_shuffle_epi8(s0, deint_pair);
+                    let b = _mm256_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm256_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
                     let result_lo = _mm256_xor_si256(
                         _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_ll),
@@ -2169,12 +2233,13 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
                         _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
                     );
 
-                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                    acc = _mm256_xor_si256(acc, product);
+                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc);
-                offset += 32;
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                offset += 64;
             }
 
             first_pass = false;
@@ -2202,9 +2267,11 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
 // ---------------------------------------------------------------------------
 // Grouped-input GFNI + AVX-512 kernel
 //
-// 512-bit counterpart to the GFNI+AVX2 grouped-input path: each 64-byte dst
+// 512-bit counterpart to the GFNI+AVX2 grouped-input path: each 128-byte dst
 // strip is loaded and stored once while every prepared source in the batch
-// is multiplied into it.
+// is multiplied into it, with the full-width pair deinterleave of
+// `mul_acc_input_batch_avx512_prepared` so all gf2p8affineqb lanes carry
+// data.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -2255,13 +2322,11 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
         })
         .collect();
 
-    let vec_len = len & !63;
+    let vec_len = len & !127;
     unsafe {
-        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
-        ));
-        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
         ));
 
         // Same source-group blocking as the 256-bit kernel: bound the
@@ -2273,20 +2338,50 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
             let group = &prepared[group_start..group_end];
 
             let mut offset = 0usize;
-            while offset + 64 <= vec_len {
-                let mut acc = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+            while offset + 128 <= vec_len {
+                let mut acc0 = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+                let mut acc1 = _mm512_loadu_si512(dst.as_ptr().add(offset + 64) as *const __m512i);
 
                 if first_pass {
                     for src in &xor_inputs {
-                        let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
-                        acc = _mm512_xor_si512(acc, s);
+                        let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+                        let s1 =
+                            _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
+                        acc0 = _mm512_xor_si512(acc0, s0);
+                        acc1 = _mm512_xor_si512(acc1, s1);
                     }
                 }
 
                 for input in group {
-                    let s = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
-                    let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
-                    let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+                    let s0 = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
+                    let s1 =
+                        _mm512_loadu_si512(input.src.as_ptr().add(offset + 64) as *const __m512i);
+
+                    // Full-width pair deinterleave — 4-lane word trace (zmm
+                    // 128-bit lanes L0..L3; word w[i] = le u16 at strip byte
+                    // 2i, so the 128-byte strip holds w[0..64)):
+                    //   s0 = strip[0..64):   lane Lk = words w[8k..8k+8)
+                    //   s1 = strip[64..128): lane Lk = words w[32+8k..32+8k+8)
+                    //   a = shuffle(s0, deint_pair):
+                    //     lane Lk = [lo(w[8k..8k+8)) | hi(w[8k..8k+8))]
+                    //   b = shuffle(s1, deint_pair):
+                    //     lane Lk = [lo(w[32+8k..)) | hi(w[32+8k..))]
+                    //   lo_bytes = unpacklo_epi64(a, b):
+                    //     lane Lk = [lo of s0's Lk words | lo of s1's Lk words]
+                    //   hi_bytes = unpackhi_epi64(a, b): same with hi bytes.
+                    //   gf2p8affineqb transforms bytes in place (the matrix is
+                    //   broadcast to every qword), so result_lo/result_hi keep
+                    //   that byte→word placement; then
+                    //   unpacklo_epi8(result_lo, result_hi):
+                    //     lane Lk = product words w[8k..8k+8) re-interleaved
+                    //     → acc0 (dst strip bytes [0..64))
+                    //   unpackhi_epi8(result_lo, result_hi):
+                    //     lane Lk = product words w[32+8k..32+8k+8)
+                    //     → acc1 (dst strip bytes [64..128)).
+                    let a = _mm512_shuffle_epi8(s0, deint_pair);
+                    let b = _mm512_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm512_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm512_unpackhi_epi64(a, b);
 
                     let result_lo = _mm512_xor_si512(
                         _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_ll),
@@ -2297,12 +2392,13 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
                         _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
                     );
 
-                    let product = _mm512_unpacklo_epi8(result_lo, result_hi);
-                    acc = _mm512_xor_si512(acc, product);
+                    acc0 = _mm512_xor_si512(acc0, _mm512_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm512_xor_si512(acc1, _mm512_unpackhi_epi8(result_lo, result_hi));
                 }
 
-                _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, acc);
-                offset += 64;
+                _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, acc0);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(offset + 64) as *mut __m512i, acc1);
+                offset += 128;
             }
 
             first_pass = false;
@@ -2365,7 +2461,9 @@ unsafe fn mul_acc_input_batch_gfni_avx512(dst: &mut [u8], factors_and_srcs: &[Fa
 //
 // Split-nibble counterpart to the GFNI grouped-input path. This keeps x86
 // machines without GFNI from falling all the way back to repeated dst
-// load/store cycles for every input region.
+// load/store cycles for every input region. Sources stream through the same
+// full-width pair deinterleave as `mul_acc_region_avx2`, so the eight lookups
+// per source serve all 32 words of a 64-byte destination strip.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -2416,29 +2514,45 @@ unsafe fn mul_acc_input_batch_avx2(dst: &mut [u8], factors_and_srcs: &[FactorSrc
 
     unsafe {
         let mask_0f = _mm256_set1_epi8(0x0F);
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
-        macro_rules! process_chunk {
-            ($chunk_offset:expr, $group:expr, $first:expr) => {{
-                let mut acc = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+        // Same source-group blocking as the GFNI kernels: bound the
+        // concurrent read streams per destination pass.
+        let vec_len = len & !63;
+        let mut first_pass = true;
+        let mut group_start = 0usize;
+        loop {
+            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
+            let group = &prepared[group_start..group_end];
 
-                if $first {
+            let mut offset = 0usize;
+            while offset + 64 <= vec_len {
+                let mut acc0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+                let mut acc1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
+
+                if first_pass {
                     for src in &xor_inputs {
-                        let s =
-                            _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
-                        acc = _mm256_xor_si256(acc, s);
+                        let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+                        let s1 =
+                            _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+                        acc0 = _mm256_xor_si256(acc0, s0);
+                        acc1 = _mm256_xor_si256(acc1, s1);
                     }
                 }
 
-                for input in $group {
-                    let s =
-                        _mm256_loadu_si256(input.src.as_ptr().add($chunk_offset) as *const __m256i);
+                for input in group {
+                    let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
+                    let s1 =
+                        _mm256_loadu_si256(input.src.as_ptr().add(offset + 32) as *const __m256i);
 
-                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+                    // Full-width pair deinterleave (see `mul_acc_region_avx2`).
+                    let a = _mm256_shuffle_epi8(s0, deint_pair);
+                    let b = _mm256_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm256_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
                     let lo_n0 = _mm256_and_si256(lo_bytes, mask_0f);
                     let lo_n1 = _mm256_and_si256(_mm256_srli_epi16(lo_bytes, 4), mask_0f);
@@ -2462,25 +2576,16 @@ unsafe fn mul_acc_input_batch_avx2(dst: &mut [u8], factors_and_srcs: &[FactorSrc
                         _mm256_xor_si256(p0_hi, p1_hi),
                         _mm256_xor_si256(p2_hi, p3_hi),
                     );
-                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                    acc = _mm256_xor_si256(acc, product);
+
+                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, acc);
-            }};
-        }
-
-        let vec_len = len & !31;
-        let mut first_pass = true;
-        let mut group_start = 0usize;
-        loop {
-            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
-            let group = &prepared[group_start..group_end];
-            let mut offset = 0usize;
-            while offset + 32 <= vec_len {
-                process_chunk!(offset, group, first_pass);
-                offset += 32;
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                offset += 64;
             }
+
             first_pass = false;
             group_start = group_end;
             if group_start >= prepared.len() {
@@ -2554,29 +2659,45 @@ unsafe fn mul_acc_input_batch_avx2_prepared(
 
     unsafe {
         let mask_0f = _mm256_set1_epi8(0x0F);
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
-        macro_rules! process_chunk {
-            ($chunk_offset:expr, $group:expr, $first:expr) => {{
-                let mut acc = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+        // Same source-group blocking as the GFNI kernels: bound the
+        // concurrent read streams per destination pass.
+        let vec_len = len & !63;
+        let mut first_pass = true;
+        let mut group_start = 0usize;
+        loop {
+            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
+            let group = &prepared[group_start..group_end];
 
-                if $first {
+            let mut offset = 0usize;
+            while offset + 64 <= vec_len {
+                let mut acc0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+                let mut acc1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
+
+                if first_pass {
                     for src in &xor_inputs {
-                        let s =
-                            _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
-                        acc = _mm256_xor_si256(acc, s);
+                        let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+                        let s1 =
+                            _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+                        acc0 = _mm256_xor_si256(acc0, s0);
+                        acc1 = _mm256_xor_si256(acc1, s1);
                     }
                 }
 
-                for input in $group {
-                    let s =
-                        _mm256_loadu_si256(input.src.as_ptr().add($chunk_offset) as *const __m256i);
+                for input in group {
+                    let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
+                    let s1 =
+                        _mm256_loadu_si256(input.src.as_ptr().add(offset + 32) as *const __m256i);
 
-                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+                    // Full-width pair deinterleave (see `mul_acc_region_avx2`).
+                    let a = _mm256_shuffle_epi8(s0, deint_pair);
+                    let b = _mm256_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm256_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
                     let lo_n0 = _mm256_and_si256(lo_bytes, mask_0f);
                     let lo_n1 = _mm256_and_si256(_mm256_srli_epi16(lo_bytes, 4), mask_0f);
@@ -2600,25 +2721,16 @@ unsafe fn mul_acc_input_batch_avx2_prepared(
                         _mm256_xor_si256(p0_hi, p1_hi),
                         _mm256_xor_si256(p2_hi, p3_hi),
                     );
-                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-                    acc = _mm256_xor_si256(acc, product);
+
+                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, acc);
-            }};
-        }
-
-        let vec_len = len & !31;
-        let mut first_pass = true;
-        let mut group_start = 0usize;
-        loop {
-            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
-            let group = &prepared[group_start..group_end];
-            let mut offset = 0usize;
-            while offset + 32 <= vec_len {
-                process_chunk!(offset, group, first_pass);
-                offset += 32;
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                offset += 64;
             }
+
             first_pass = false;
             group_start = group_end;
             if group_start >= prepared.len() {
@@ -3592,9 +3704,13 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
 // ---------------------------------------------------------------------------
 // Grouped-input NEON kernel (aarch64)
 //
-// Keeps the destination chunk in one register while accumulating multiple
-// source regions. This is the ARM counterpart to the GFNI grouped-input path
-// and avoids reloading/storing `dst` once per input region.
+// Keeps the destination strip's byte planes in registers while accumulating
+// multiple source regions. This is the ARM counterpart to the GFNI
+// grouped-input path and avoids reloading/storing `dst` once per input
+// region. Every source folds into the strip in a single destination pass —
+// no SRC_STREAM_GROUP-style blocking — which stays within the line-fill
+// buffers because dispatch hands batches of more than 3 sources to the CLMUL
+// kernels.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -3649,22 +3765,26 @@ unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc
         let mask_0f = vdupq_n_u8(0x0F);
         let mut offset = 0usize;
 
-        while offset + 16 <= len {
-            let mut acc = vld1q_u8(dst.as_ptr().add(offset));
+        // Full-width strips (see `mul_acc_region_neon`): `vld2q_u8` loads a
+        // 32-byte block directly as separated even/odd byte planes, so every
+        // lane of the eight lookups carries data, and the destination
+        // accumulates plane-wise with one interleaving `vst2q_u8` per strip.
+        while offset + 32 <= len {
+            let mut d = vld2q_u8(dst.as_ptr().add(offset));
 
             for src in &xor_inputs {
-                let s = vld1q_u8(src.as_ptr().add(offset));
-                acc = veorq_u8(acc, s);
+                let s = vld2q_u8(src.as_ptr().add(offset));
+                d.0 = veorq_u8(d.0, s.0);
+                d.1 = veorq_u8(d.1, s.1);
             }
 
             for ts in &table_sets {
-                let s = vld1q_u8(ts.src.as_ptr().add(offset));
-                let lo_bytes = vuzp1q_u8(s, s);
-                let hi_bytes = vuzp2q_u8(s, s);
-                let lo_n0 = vandq_u8(lo_bytes, mask_0f);
-                let lo_n1 = vandq_u8(vshrq_n_u8(lo_bytes, 4), mask_0f);
-                let hi_n0 = vandq_u8(hi_bytes, mask_0f);
-                let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
+                // Deinterleaving load: .0 = lo bytes of 16 words, .1 = hi.
+                let s = vld2q_u8(ts.src.as_ptr().add(offset));
+                let lo_n0 = vandq_u8(s.0, mask_0f);
+                let lo_n1 = vandq_u8(vshrq_n_u8(s.0, 4), mask_0f);
+                let hi_n0 = vandq_u8(s.1, mask_0f);
+                let hi_n1 = vandq_u8(vshrq_n_u8(s.1, 4), mask_0f);
 
                 let p0_lo = vqtbl1q_u8(ts.t[0], lo_n0);
                 let p0_hi = vqtbl1q_u8(ts.t[1], lo_n0);
@@ -3677,11 +3797,12 @@ unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc
 
                 let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
                 let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
-                acc = veorq_u8(acc, vzip1q_u8(result_lo, result_hi));
+                d.0 = veorq_u8(d.0, result_lo);
+                d.1 = veorq_u8(d.1, result_hi);
             }
 
-            vst1q_u8(dst.as_mut_ptr().add(offset), acc);
-            offset += 16;
+            vst2q_u8(dst.as_mut_ptr().add(offset), d);
+            offset += 32;
         }
 
         if offset < len {
@@ -3754,22 +3875,26 @@ unsafe fn mul_acc_input_batch_neon_prepared(
         let mask_0f = vdupq_n_u8(0x0F);
         let mut offset = 0usize;
 
-        while offset + 16 <= len {
-            let mut acc = vld1q_u8(dst.as_ptr().add(offset));
+        // Full-width strips (see `mul_acc_region_neon`): `vld2q_u8` loads a
+        // 32-byte block directly as separated even/odd byte planes, so every
+        // lane of the eight lookups carries data, and the destination
+        // accumulates plane-wise with one interleaving `vst2q_u8` per strip.
+        while offset + 32 <= len {
+            let mut d = vld2q_u8(dst.as_ptr().add(offset));
 
             for src in &xor_inputs {
-                let s = vld1q_u8(src.as_ptr().add(offset));
-                acc = veorq_u8(acc, s);
+                let s = vld2q_u8(src.as_ptr().add(offset));
+                d.0 = veorq_u8(d.0, s.0);
+                d.1 = veorq_u8(d.1, s.1);
             }
 
             for ts in &table_sets {
-                let s = vld1q_u8(ts.src.as_ptr().add(offset));
-                let lo_bytes = vuzp1q_u8(s, s);
-                let hi_bytes = vuzp2q_u8(s, s);
-                let lo_n0 = vandq_u8(lo_bytes, mask_0f);
-                let lo_n1 = vandq_u8(vshrq_n_u8(lo_bytes, 4), mask_0f);
-                let hi_n0 = vandq_u8(hi_bytes, mask_0f);
-                let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
+                // Deinterleaving load: .0 = lo bytes of 16 words, .1 = hi.
+                let s = vld2q_u8(ts.src.as_ptr().add(offset));
+                let lo_n0 = vandq_u8(s.0, mask_0f);
+                let lo_n1 = vandq_u8(vshrq_n_u8(s.0, 4), mask_0f);
+                let hi_n0 = vandq_u8(s.1, mask_0f);
+                let hi_n1 = vandq_u8(vshrq_n_u8(s.1, 4), mask_0f);
 
                 let p0_lo = vqtbl1q_u8(ts.t[0], lo_n0);
                 let p0_hi = vqtbl1q_u8(ts.t[1], lo_n0);
@@ -3782,11 +3907,12 @@ unsafe fn mul_acc_input_batch_neon_prepared(
 
                 let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
                 let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
-                acc = veorq_u8(acc, vzip1q_u8(result_lo, result_hi));
+                d.0 = veorq_u8(d.0, result_lo);
+                d.1 = veorq_u8(d.1, result_hi);
             }
 
-            vst1q_u8(dst.as_mut_ptr().add(offset), acc);
-            offset += 16;
+            vst2q_u8(dst.as_mut_ptr().add(offset), d);
+            offset += 32;
         }
 
         if offset < len {
@@ -3847,23 +3973,27 @@ mod tests {
 
     #[test]
     fn dispatched_matches_scalar_all_factors() {
-        // Test a sweep of factor values.
-        let src: Vec<u8> = (0..32).collect();
+        // Test a sweep of factor values, at sizes crossing the full-width
+        // 64-byte (AVX2/GFNI-AVX2) and 128-byte (AVX-512) blocks; 130 walks
+        // every tail width down to scalar.
+        for size in [32usize, 64, 130] {
+            let src: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
 
-        for factor in (0..=0xFFFFu16).step_by(257) {
-            let mut dst_dispatched = vec![0xCDu8; 32];
-            let mut dst_scalar = dst_dispatched.clone();
+            for factor in (0..=0xFFFFu16).step_by(257) {
+                let mut dst_dispatched = vec![0xCDu8; size];
+                let mut dst_scalar = dst_dispatched.clone();
 
-            mul_acc_region(factor, &src, &mut dst_dispatched);
-            if factor == 0 {
-                assert_eq!(dst_dispatched, dst_scalar);
-                continue;
+                mul_acc_region(factor, &src, &mut dst_dispatched);
+                if factor == 0 {
+                    assert_eq!(dst_dispatched, dst_scalar);
+                    continue;
+                }
+                mul_acc_region_scalar(factor, &src, &mut dst_scalar);
+                assert_eq!(
+                    dst_dispatched, dst_scalar,
+                    "mismatch for factor={factor:#06x} size={size}"
+                );
             }
-            mul_acc_region_scalar(factor, &src, &mut dst_scalar);
-            assert_eq!(
-                dst_dispatched, dst_scalar,
-                "mismatch for factor={factor:#06x}"
-            );
         }
     }
 
@@ -3882,9 +4012,10 @@ mod tests {
 
     #[test]
     fn dispatched_matches_scalar_odd_sizes() {
-        // Test sizes that aren't multiples of 16 or 32.
+        // Sizes that aren't multiples of 16 or 32, plus the 64- and 128-byte
+        // full-width block boundaries and their straddles.
         let factor = 0x4321u16;
-        for size in [2, 4, 6, 14, 18, 30, 34, 50, 62, 66] {
+        for size in [2, 4, 6, 14, 18, 30, 34, 50, 62, 64, 66, 126, 128, 130] {
             let src: Vec<u8> = (0..size).map(|i| (i * 7 % 256) as u8).collect();
             let mut dst_dispatched = vec![0xAAu8; size];
             let mut dst_scalar = dst_dispatched.clone();
@@ -3958,12 +4089,14 @@ mod tests {
     #[test]
     fn exhaustive_factor_sweep() {
         // Test every factor on a small buffer to ensure SIMD matches scalar.
-        // 32 bytes = exactly one full-width NEON/SSSE3 block.
-        let src: Vec<u8> = (0..32).collect();
+        // 64 bytes = exactly one full-width AVX2/GFNI-AVX2 block (two
+        // full-width NEON/SSSE3 blocks), so every factor exercises the
+        // pair-deinterleave main loop of the dispatched kernel.
+        let src: Vec<u8> = (0..64).collect();
 
         for factor in 2..=0xFFFFu16 {
-            let mut dst_dispatched = vec![0u8; 32];
-            let mut dst_scalar = vec![0u8; 32];
+            let mut dst_dispatched = vec![0u8; 64];
+            let mut dst_scalar = vec![0u8; 64];
 
             mul_acc_region(factor, &src, &mut dst_dispatched);
             mul_acc_region_scalar(factor, &src, &mut dst_scalar);
@@ -4088,67 +4221,78 @@ mod tests {
     #[test]
     fn input_batch_matches_repeated_single_region() {
         let factors = [0x0001u16, 0x1234, 0x0000, 0xABCD, 0x8000];
-        let inputs: Vec<Vec<u8>> = factors
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                (0..1026)
-                    .map(|i| ((i * (idx + 3) + 17) % 256) as u8)
-                    .collect()
-            })
-            .collect();
+        // Lengths cross the grouped kernels' full-width strips (64-byte
+        // GFNI/AVX2, 128-byte AVX-512); 1026 leaves a 2-byte scalar tail.
+        for &len in &[62usize, 64, 66, 126, 128, 130, 1026] {
+            let inputs: Vec<Vec<u8>> = factors
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    (0..len)
+                        .map(|i| ((i * (idx + 3) + 17) % 256) as u8)
+                        .collect()
+                })
+                .collect();
 
-        let mut reference = vec![0x5Au8; 1026];
-        for (factor, input) in factors.iter().zip(inputs.iter()) {
-            mul_acc_region(*factor, input, &mut reference);
+            let mut reference = vec![0x5Au8; len];
+            for (factor, input) in factors.iter().zip(inputs.iter()) {
+                mul_acc_region(*factor, input, &mut reference);
+            }
+
+            let mut batched = vec![0x5Au8; len];
+            let factor_srcs: Vec<FactorSrc<'_>> = factors
+                .iter()
+                .zip(inputs.iter())
+                .map(|(&factor, input)| FactorSrc { factor, src: input })
+                .collect();
+            mul_acc_input_batch(&mut batched, &factor_srcs);
+
+            assert_eq!(batched, reference, "input batch mismatch len={len}");
         }
-
-        let mut batched = vec![0x5Au8; 1026];
-        let factor_srcs: Vec<FactorSrc<'_>> = factors
-            .iter()
-            .zip(inputs.iter())
-            .map(|(&factor, input)| FactorSrc { factor, src: input })
-            .collect();
-        mul_acc_input_batch(&mut batched, &factor_srcs);
-
-        assert_eq!(batched, reference);
     }
 
     #[test]
     fn prepared_input_batch_matches_repeated_single_region() {
         let factors = [0x0001u16, 0x1234, 0x0000, 0xABCD, 0x8000];
-        let inputs: Vec<Vec<u8>> = factors
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                (0..1026)
-                    .map(|i| ((i * (idx + 5) + 29) % 256) as u8)
-                    .collect()
-            })
-            .collect();
-
-        let mut reference = vec![0x3Cu8; 1026];
-        for (factor, input) in factors.iter().zip(inputs.iter()) {
-            mul_acc_region(*factor, input, &mut reference);
-        }
-
         let prepared: Vec<PreparedInputFactor> = factors
             .iter()
             .map(|&factor| prepare_input_factor(factor))
             .collect();
-        let prepared_srcs: Vec<PreparedFactorSrc<'_>> = prepared
-            .iter()
-            .zip(inputs.iter())
-            .map(|(prepared, input)| PreparedFactorSrc {
-                prepared,
-                src: input,
-            })
-            .collect();
+        // Lengths cross the grouped kernels' full-width strips (64-byte
+        // GFNI/AVX2, 128-byte AVX-512); 1026 leaves a 2-byte scalar tail.
+        for &len in &[62usize, 64, 66, 126, 128, 130, 1026] {
+            let inputs: Vec<Vec<u8>> = factors
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    (0..len)
+                        .map(|i| ((i * (idx + 5) + 29) % 256) as u8)
+                        .collect()
+                })
+                .collect();
 
-        let mut batched = vec![0x3Cu8; 1026];
-        mul_acc_input_batch_prepared(&mut batched, &prepared_srcs);
+            let mut reference = vec![0x3Cu8; len];
+            for (factor, input) in factors.iter().zip(inputs.iter()) {
+                mul_acc_region(*factor, input, &mut reference);
+            }
 
-        assert_eq!(batched, reference);
+            let prepared_srcs: Vec<PreparedFactorSrc<'_>> = prepared
+                .iter()
+                .zip(inputs.iter())
+                .map(|(prepared, input)| PreparedFactorSrc {
+                    prepared,
+                    src: input,
+                })
+                .collect();
+
+            let mut batched = vec![0x3Cu8; len];
+            mul_acc_input_batch_prepared(&mut batched, &prepared_srcs);
+
+            assert_eq!(
+                batched, reference,
+                "prepared input batch mismatch len={len}"
+            );
+        }
     }
 
     /// Dispatch-level oracle across a batch WIDER than the stream group (8),
@@ -4157,7 +4301,6 @@ mod tests {
     #[test]
     fn input_batch_multi_group_matches_scalar() {
         let count = 19usize; // 2 full groups + tail group on every path
-        let len = 4094usize;
         let factors: Vec<u16> = (0..count)
             .map(|i| match i {
                 0 => 0,
@@ -4165,46 +4308,54 @@ mod tests {
                 _ => (i * 2749 + 3) as u16,
             })
             .collect();
-        let srcs: Vec<Vec<u8>> = (0..count)
-            .map(|i| (0..len).map(|b| ((b * (i + 5) + 31) % 249) as u8).collect())
-            .collect();
-
-        let mut reference = vec![0x33u8; len];
-        for (&factor, src) in factors.iter().zip(srcs.iter()) {
-            mul_acc_region_scalar(factor, src, &mut reference);
-        }
-
-        let pairs: Vec<FactorSrc<'_>> = factors
-            .iter()
-            .zip(srcs.iter())
-            .map(|(&factor, src)| FactorSrc {
-                factor,
-                src: src.as_slice(),
-            })
-            .collect();
-        let mut got = vec![0x33u8; len];
-        mul_acc_input_batch(&mut got, &pairs);
-        assert_eq!(got, reference);
-
-        // Prepared path over the same wide batch.
         let prepared: Vec<PreparedInputFactor> =
             factors.iter().map(|&f| prepare_input_factor(f)).collect();
-        let prepared_pairs: Vec<PreparedFactorSrc<'_>> = prepared
-            .iter()
-            .zip(srcs.iter())
-            .map(|(prepared, src)| PreparedFactorSrc {
-                prepared,
-                src: src.as_slice(),
-            })
-            .collect();
-        let mut got_prepared = vec![0x33u8; len];
-        mul_acc_input_batch_prepared(&mut got_prepared, &prepared_pairs);
-        assert_eq!(got_prepared, reference);
+        // Lengths straddle the 128-byte AVX-512 strip; 4094 leaves a
+        // 62-byte multi-width tail after the 64-byte strips.
+        for &len in &[126usize, 128, 130, 4094] {
+            let srcs: Vec<Vec<u8>> = (0..count)
+                .map(|i| (0..len).map(|b| ((b * (i + 5) + 31) % 249) as u8).collect())
+                .collect();
+
+            let mut reference = vec![0x33u8; len];
+            for (&factor, src) in factors.iter().zip(srcs.iter()) {
+                mul_acc_region_scalar(factor, src, &mut reference);
+            }
+
+            let pairs: Vec<FactorSrc<'_>> = factors
+                .iter()
+                .zip(srcs.iter())
+                .map(|(&factor, src)| FactorSrc {
+                    factor,
+                    src: src.as_slice(),
+                })
+                .collect();
+            let mut got = vec![0x33u8; len];
+            mul_acc_input_batch(&mut got, &pairs);
+            assert_eq!(got, reference, "multi-group batch mismatch len={len}");
+
+            // Prepared path over the same wide batch.
+            let prepared_pairs: Vec<PreparedFactorSrc<'_>> = prepared
+                .iter()
+                .zip(srcs.iter())
+                .map(|(prepared, src)| PreparedFactorSrc {
+                    prepared,
+                    src: src.as_slice(),
+                })
+                .collect();
+            let mut got_prepared = vec![0x33u8; len];
+            mul_acc_input_batch_prepared(&mut got_prepared, &prepared_pairs);
+            assert_eq!(
+                got_prepared, reference,
+                "multi-group prepared batch mismatch len={len}"
+            );
+        }
     }
 
     /// Direct oracle test for the unprepared 512-bit GFNI grouped-input entry
     /// (runs only on GFNI+AVX512 hardware; no-ops elsewhere, including under
-    /// Rosetta 2).
+    /// Rosetta 2). Lengths cross the full-width 128-byte strip and the
+    /// AVX2/scalar tail chain (126/128/130 and 254/256/258 straddles).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn input_batch_gfni_avx512_matches_scalar() {
@@ -4214,7 +4365,7 @@ mod tests {
         {
             return;
         }
-        for &len in &[2usize, 62, 64, 66, 4096, 4094] {
+        for &len in &[2usize, 62, 64, 66, 126, 128, 130, 254, 256, 258, 4096, 4094] {
             let factors = [0u16, 1, 2, 0x8000, 0xFFFF, 0x1234, 0x2F1D];
             let srcs: Vec<Vec<u8>> = factors
                 .iter()
@@ -4365,6 +4516,77 @@ mod tests {
                     assert_eq!(
                         unfused, reference,
                         "unfused sha3 clmul count={count} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Direct oracle test for the grouped-input VTBL NEON entries, raw and
+    /// prepared (dispatch only routes batches of at most 3 sources here, so
+    /// the wide dispatch-level tests never reach them). Lengths straddle the
+    /// 32-byte full-width strip and its scalar tail; the factor rotation
+    /// walks the edge cases (0, 1, 0x8000, 0xFFFF) through every source
+    /// position with random factors mixed in.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn input_batch_neon_kernels_match_scalar() {
+        let mut state = 0xB5AD_4ECE_DA1C_E2A9u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &count in &[1usize, 2, 3] {
+            for &len in &[2usize, 30, 32, 34, 62, 64, 66, 4094] {
+                for round in 0..6usize {
+                    let factors: Vec<u16> = (0..count)
+                        .map(|i| match (round + i) % 6 {
+                            0 => 0,
+                            1 => 1,
+                            2 => 0x8000,
+                            3 => 0xFFFF,
+                            _ => (next() >> 16) as u16,
+                        })
+                        .collect();
+                    let inputs: Vec<Vec<u8>> = (0..count)
+                        .map(|_| (0..len).map(|_| next() as u8).collect())
+                        .collect();
+
+                    let mut reference = vec![0x5Du8; len];
+                    for (&factor, input) in factors.iter().zip(inputs.iter()) {
+                        mul_acc_region_scalar(factor, input, &mut reference);
+                    }
+
+                    let srcs: Vec<FactorSrc<'_>> = factors
+                        .iter()
+                        .zip(inputs.iter())
+                        .map(|(&factor, input)| FactorSrc { factor, src: input })
+                        .collect();
+                    let mut raw = vec![0x5Du8; len];
+                    unsafe { mul_acc_input_batch_neon(&mut raw, &srcs) };
+                    assert_eq!(
+                        raw, reference,
+                        "raw neon batch count={count} len={len} round={round}"
+                    );
+
+                    let prepared: Vec<PreparedInputFactor> =
+                        factors.iter().map(|&f| prepare_input_factor(f)).collect();
+                    let prepared_srcs: Vec<PreparedFactorSrc<'_>> = prepared
+                        .iter()
+                        .zip(inputs.iter())
+                        .map(|(prepared, input)| PreparedFactorSrc {
+                            prepared,
+                            src: input,
+                        })
+                        .collect();
+                    let mut prep = vec![0x5Du8; len];
+                    unsafe { mul_acc_input_batch_neon_prepared(&mut prep, &prepared_srcs) };
+                    assert_eq!(
+                        prep, reference,
+                        "prepared neon batch count={count} len={len} round={round}"
                     );
                 }
             }

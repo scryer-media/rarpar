@@ -35,6 +35,11 @@ use super::emit::{self, RAX, RCX, RDX};
 /// Bytes per wide bit-planar block.
 const BLOCK: i32 = 1024;
 
+/// `prefetcht1` for the next block's src/dst first lines — the zmm twin of
+/// `super::codegen::JIT_NEXT_BLOCK_PREFETCH`; same UNMEASURED/off-by-default
+/// status and A/B protocol.
+const JIT_NEXT_BLOCK_PREFETCH: bool = false;
+
 /// Byte offset of plane `p` from the (advanced) block pointer.
 #[inline]
 fn plane_off(p: usize) -> i32 {
@@ -73,6 +78,12 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
     // Loop top: advance to this block, load all 16 source planes.
     emit::add_ri(&mut buf, RAX, BLOCK);
     emit::add_ri(&mut buf, RDX, BLOCK);
+    if JIT_NEXT_BLOCK_PREFETCH {
+        // First line of the next block on each stream (bias 0: next block
+        // starts exactly one BLOCK ahead).
+        emit::prefetcht1(&mut buf, RAX, BLOCK);
+        emit::prefetcht1(&mut buf, RDX, BLOCK);
+    }
     for k in 0..16usize {
         emit::vmovdqu32_load(&mut buf, src_reg(k), RAX, plane_off(k));
     }

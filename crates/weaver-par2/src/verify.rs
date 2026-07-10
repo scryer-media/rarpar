@@ -726,6 +726,38 @@ pub struct VerifyOptions {
     pub cancel: Option<CancellationToken>,
     /// If set, called with progress updates after each file is verified.
     pub progress: Option<ProgressCallback>,
+    /// Opt-in fast-verify mode (default `false`). When enabled, an intact
+    /// candidate file whose on-disk length already matches the description is
+    /// proven complete from its per-slice IFSC checksums (CRC32 + MD5, tail
+    /// slice zero-padded) scanned span-parallel at read speed, skipping the
+    /// inherently serial full-file MD5. Off by default, in which case
+    /// verification is byte-identical to the strict full-MD5 pipeline. The
+    /// `WEAVER_PAR2_FAST_VERIFY` environment variable overrides this per verify
+    /// call (see [`fast_verify_enabled`]).
+    pub fast_verify: bool,
+}
+
+/// Resolve whether the fast-verify path runs for this call. Precedence: the
+/// `WEAVER_PAR2_FAST_VERIFY` environment variable wins — `"1"` forces the fast
+/// path on, `"0"` forces it off — and any other or absent value falls back to
+/// the caller's `flag`. Read once per verify call so a single process can flip
+/// the behavior via the environment without recompiling.
+fn fast_verify_enabled(flag: bool) -> bool {
+    resolve_fast_verify(
+        std::env::var("WEAVER_PAR2_FAST_VERIFY").ok().as_deref(),
+        flag,
+    )
+}
+
+/// Pure precedence rule behind [`fast_verify_enabled`], split out so the
+/// override semantics can be unit-tested without mutating process environment
+/// state shared by concurrently running tests.
+fn resolve_fast_verify(env_value: Option<&str>, flag: bool) -> bool {
+    match env_value {
+        Some("1") => true,
+        Some("0") => false,
+        _ => flag,
+    }
 }
 
 /// Verify all files in a PAR2 set.
@@ -761,10 +793,45 @@ pub fn verify_selected_file_ids_parallel(
     access: &(dyn FileAccess + Sync),
     file_ids: &[FileId],
 ) -> VerificationResult {
+    verify_selected_file_ids_parallel_with_options(
+        par2,
+        access,
+        file_ids,
+        &VerifyOptions::default(),
+    )
+}
+
+/// Like [`verify_selected_file_ids_parallel`] but honoring [`VerifyOptions`].
+/// The only option consulted on this path is `fast_verify` (cancellation and
+/// progress are not surfaced here, as documented on the base function): when
+/// fast verify resolves on (via the flag or `WEAVER_PAR2_FAST_VERIFY`), each
+/// eligible file is proven complete from its IFSC slice checksums instead of a
+/// full-file MD5 — span-parallel for a lone file and file-parallel otherwise,
+/// the same single-axis rule as the post-repair readback. Ineligible files
+/// fall back to the serial pipeline. With fast verify off this is
+/// byte-identical to [`verify_selected_file_ids_parallel`].
+pub fn verify_selected_file_ids_parallel_with_options(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_ids: &[FileId],
+    options: &VerifyOptions,
+) -> VerificationResult {
     use rayon::prelude::*;
+    let fast_verify = fast_verify_enabled(options.fast_verify);
+    // Parallelism runs on exactly one axis: span-parallel for a lone file,
+    // else file-parallel with each file's spans serial (mirrors
+    // `verify_repaired_file_ids_parallel`).
+    let span_parallel = file_ids.len() == 1;
     let partials: Vec<VerificationResult> = file_ids
         .par_iter()
-        .map(|file_id| verify_selected_file_ids(par2, access, std::slice::from_ref(file_id)))
+        .map(|file_id| {
+            if fast_verify
+                && let Some(file) = verify_file_sliced(par2, access, file_id, span_parallel)
+            {
+                return single_file_result(par2, file);
+            }
+            verify_selected_file_ids(par2, access, std::slice::from_ref(file_id))
+        })
         .collect();
     combine_partial_results(par2, partials)
 }
@@ -804,17 +871,29 @@ pub fn verify_repaired_file_ids_parallel(
     combine_partial_results(par2, partials)
 }
 
-/// Slice-level readback verification of one staged file. Returns `None`
-/// when the file cannot take this path (no description, no or incomplete
-/// IFSC, zero length, or a length mismatch) — the caller falls back to the
-/// serial pipeline.
-fn verify_repaired_file_sliced(
+/// Precomputed layout for slice-span verification of one eligible file: its
+/// filename, on-disk length, slice size, and the `(start, count)` slice spans
+/// to check. Produced by [`sliced_verify_plan`] only for files that pass the
+/// shared fast-path / post-repair preconditions.
+struct SlicedVerifyPlan {
+    filename: String,
+    length: u64,
+    slice_size: u64,
+    spans: Vec<(usize, usize)>,
+}
+
+/// Build the [`SlicedVerifyPlan`] for `file_id`, or `None` when the file is
+/// ineligible for slice-proof verification: no file description, no or
+/// incomplete IFSC checksums (the count must equal the expected slice count),
+/// zero length or slice size, or an on-disk length that does not match the
+/// description. These are exactly the preconditions the opt-in fast-verify
+/// path and the post-repair readback share; an ineligible file falls back to
+/// the serial full-hash pipeline.
+fn sliced_verify_plan(
     par2: &Par2FileSet,
-    access: &(dyn FileAccess + Sync),
+    access: &dyn FileAccess,
     file_id: &FileId,
-    span_parallel: bool,
-) -> Option<VerificationResult> {
-    use rayon::prelude::*;
+) -> Option<SlicedVerifyPlan> {
     let desc = par2.file_description(file_id)?;
     let checksums = par2.file_checksums(file_id)?;
     let slice_size = par2.slice_size;
@@ -835,47 +914,78 @@ fn verify_repaired_file_sliced(
         .step_by(span_slices)
         .map(|start| (start, span_slices.min(expected_slices - start)))
         .collect();
-    let check_span = |&(start, count): &(usize, usize)| -> Vec<bool> {
-        let offset = start as u64 * slice_size;
-        let want = (desc.length - offset).min(count as u64 * slice_size);
-        let Ok(data) = access.read_file_range(file_id, offset, want) else {
-            return vec![false; count];
-        };
-        if data.len() as u64 != want {
-            return vec![false; count];
-        }
-        (0..count)
-            .map(|index| {
-                let lo = (index as u64 * slice_size).min(want) as usize;
-                let hi = ((index as u64 + 1) * slice_size).min(want) as usize;
-                let mut state = checksum::SliceChecksumState::new();
-                state.update(&data[lo..hi]);
-                let (crc32, md5) = state.finalize(Some(slice_size));
-                let expected = &checksums[start + index];
-                crc32 == expected.crc32 && md5 == expected.md5
-            })
-            .collect()
-    };
-    let per_span: Vec<Vec<bool>> = if span_parallel {
-        spans.par_iter().map(check_span).collect()
-    } else {
-        spans.iter().map(check_span).collect()
-    };
+    Some(SlicedVerifyPlan {
+        filename: desc.filename.clone(),
+        length: desc.length,
+        slice_size,
+        spans,
+    })
+}
 
-    let valid_slices: Vec<bool> = per_span.concat();
+/// Verify one `(start, count)` slice span against its IFSC checksums (CRC32 +
+/// MD5, tail slice zero-padded to `slice_size`). Returns one bool per slice in
+/// the span; a read error or short read fails the whole span. Shared verbatim
+/// by the serial and span-parallel drivers.
+fn check_slice_span(
+    access: &dyn FileAccess,
+    file_id: &FileId,
+    checksums: &[SliceChecksum],
+    plan: &SlicedVerifyPlan,
+    start: usize,
+    count: usize,
+) -> Vec<bool> {
+    let slice_size = plan.slice_size;
+    let offset = start as u64 * slice_size;
+    let want = (plan.length - offset).min(count as u64 * slice_size);
+    let Ok(data) = access.read_file_range(file_id, offset, want) else {
+        return vec![false; count];
+    };
+    if data.len() as u64 != want {
+        return vec![false; count];
+    }
+    (0..count)
+        .map(|index| {
+            let lo = (index as u64 * slice_size).min(want) as usize;
+            let hi = ((index as u64 + 1) * slice_size).min(want) as usize;
+            let mut state = checksum::SliceChecksumState::new();
+            state.update(&data[lo..hi]);
+            let (crc32, md5) = state.finalize(Some(slice_size));
+            let expected = &checksums[start + index];
+            crc32 == expected.crc32 && md5 == expected.md5
+        })
+        .collect()
+}
+
+/// Assemble the per-file outcome from a completed slice-validity vector:
+/// `Complete` when every slice matched, else `Damaged(n)` carrying the same
+/// per-slice validity vector the serial pipeline produces (repair planning
+/// consumes `valid_slices` identically, so the damaged shape must match).
+fn finish_sliced_verification(
+    file_id: &FileId,
+    plan: &SlicedVerifyPlan,
+    valid_slices: Vec<bool>,
+) -> FileVerification {
     let damaged = valid_slices.iter().filter(|valid| !**valid).count() as u32;
     let status = if damaged == 0 {
         FileStatus::Complete
     } else {
         FileStatus::Damaged(damaged)
     };
-    let files = vec![FileVerification {
+    FileVerification {
         file_id: *file_id,
-        filename: desc.filename.clone(),
+        filename: plan.filename.clone(),
         status,
         valid_slices,
         missing_slice_count: damaged,
-    }];
+    }
+}
+
+/// Wrap a single [`FileVerification`] into a set-level [`VerificationResult`],
+/// assessing repairability over just that file. Used by the per-file parallel
+/// drivers that fold their partials with [`combine_partial_results`].
+fn single_file_result(par2: &Par2FileSet, file: FileVerification) -> VerificationResult {
+    let damaged = file.missing_slice_count;
+    let files = vec![file];
     let recovery_blocks_available = par2.recovery_block_count();
     let repairable = repairability_for_result_with_resource_limit(
         &files,
@@ -883,12 +993,98 @@ fn verify_repaired_file_sliced(
         recovery_blocks_available,
         None,
     );
-    Some(VerificationResult {
+    VerificationResult {
         files,
         recovery_blocks_available,
         total_missing_blocks: damaged,
         repairable,
-    })
+    }
+}
+
+/// Slice-span verification of one file against its IFSC checksums, spans run
+/// concurrently when `span_parallel` is set. Returns `None` for ineligible
+/// files (see [`sliced_verify_plan`]); the caller falls back to the serial
+/// full-hash pipeline.
+///
+/// Why slice proof + length is sound (and why strict full-MD5 stays the
+/// default): the per-slice IFSC checksums are the very CRC32 + MD5 pairs that
+/// gate block reuse during scanning, and together they cover every byte of the
+/// file (the final slice is zero-padded to `slice_size`). With the on-disk
+/// length equal to the description length, a file whose every slice matches
+/// CRC32 **and** MD5 can only diverge from the whole-file MD5 if some slice
+/// suffered a simultaneous MD5 **and** CRC32 collision. The threat model here
+/// is random media damage / bit rot, against which per-slice MD5+CRC32 is as
+/// decisive as a whole-file MD5 — so fast verify trades the inherently serial
+/// full-file MD5 (~0.8 GB/s wall on fast disks) for the same slice checks run
+/// at read speed. It stays **opt-in**: identity establishment and the
+/// misplaced/renamed-file scanner keep the stricter whole-file rule, which
+/// exists to *establish* a found file's identity, not to re-check the content
+/// of a file already matched by length.
+fn verify_file_sliced(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_id: &FileId,
+    span_parallel: bool,
+) -> Option<FileVerification> {
+    use rayon::prelude::*;
+    let plan = sliced_verify_plan(par2, access, file_id)?;
+    let checksums = par2.file_checksums(file_id)?;
+    let per_span: Vec<Vec<bool>> = if span_parallel {
+        plan.spans
+            .par_iter()
+            .map(|&(start, count)| {
+                check_slice_span(access, file_id, checksums, &plan, start, count)
+            })
+            .collect()
+    } else {
+        plan.spans
+            .iter()
+            .map(|&(start, count)| {
+                check_slice_span(access, file_id, checksums, &plan, start, count)
+            })
+            .collect()
+    };
+    let valid_slices: Vec<bool> = per_span.concat();
+    Some(finish_sliced_verification(file_id, &plan, valid_slices))
+}
+
+/// Serial (span-sequential) sibling of [`verify_file_sliced`] for callers
+/// holding a non-`Sync` [`FileAccess`] — namely the serial per-file verify
+/// loop, which may itself run inside a file-parallel `par_iter` and so must
+/// not open a second rayon axis. Shares the same eligibility gate and per-span
+/// checks; only the span iteration differs.
+fn verify_file_sliced_serial(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    file_id: &FileId,
+) -> Option<FileVerification> {
+    let plan = sliced_verify_plan(par2, access, file_id)?;
+    let checksums = par2.file_checksums(file_id)?;
+    let valid_slices: Vec<bool> = plan
+        .spans
+        .iter()
+        .flat_map(|&(start, count)| {
+            check_slice_span(access, file_id, checksums, &plan, start, count)
+        })
+        .collect();
+    Some(finish_sliced_verification(file_id, &plan, valid_slices))
+}
+
+/// Slice-level readback verification of one staged file. Thin wrapper over
+/// [`verify_file_sliced`] (see there for the completeness argument) that lifts
+/// the per-file outcome into a set-level result. `Complete` from slice proof
+/// is additionally sound for a staged file because the repair just built it
+/// from the set's own layout, so its identity is definitional. Returns `None`
+/// for ineligible files (no description, no or incomplete IFSC, zero length,
+/// or a length mismatch) — the caller falls back to the serial pipeline.
+fn verify_repaired_file_sliced(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_id: &FileId,
+    span_parallel: bool,
+) -> Option<VerificationResult> {
+    verify_file_sliced(par2, access, file_id, span_parallel)
+        .map(|file| single_file_result(par2, file))
 }
 
 /// Fold per-file verification results into one set-level result, summing
@@ -986,6 +1182,8 @@ pub fn verify_selected_file_ids_with_options(
     let mut resource_limit_reason = None;
     let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
+    // Resolved once per call: env override wins, otherwise the option flag.
+    let fast_verify = fast_verify_enabled(options.fast_verify);
 
     for (file_index, file_id) in file_ids.iter().enumerate() {
         // Check cancellation before each file.
@@ -1115,6 +1313,34 @@ pub fn verify_selected_file_ids_with_options(
                 valid_slices: valid,
                 missing_slice_count: damaged,
             });
+            continue;
+        }
+
+        // Fast-verify (opt-in): the on-disk length already matches the
+        // description here, so prove completeness from the per-slice IFSC
+        // checksums scanned at read speed instead of the inherently serial
+        // full-file MD5. All slices valid -> Complete; any slice invalid ->
+        // Damaged with the same per-slice vector the strict path yields, so no
+        // full-MD5 fallback adds information (see `verify_file_sliced` for why
+        // slice proof + length is sound and why strict stays the default). The
+        // 16k quick check is intentionally skipped: the slice scan already
+        // covers the file's first bytes. Ineligible files (e.g. an IFSC count
+        // mismatch) return `None` and fall through to the strict pipeline
+        // below. This loop can run inside a file-parallel `par_iter`, so it
+        // uses the span-serial driver to avoid nesting a second rayon axis.
+        if fast_verify && let Some(fast) = verify_file_sliced_serial(par2, access, file_id) {
+            total_missing_blocks = total_missing_blocks.saturating_add(fast.missing_slice_count);
+            files.push(fast);
+            bytes_processed += desc.length;
+            if let Some(ref progress) = options.progress {
+                progress(ProgressUpdate {
+                    stage: ProgressStage::Verifying,
+                    current: file_index as u32 + 1,
+                    total: total_files,
+                    bytes_processed,
+                    total_bytes: None,
+                });
+            }
             continue;
         }
 
@@ -2055,6 +2281,252 @@ mod tests {
             "merged result must show all files complete: {merged:?}"
         );
         assert!(matches!(merged.repairable, Repairability::NotNeeded));
+    }
+
+    /// Like [`setup_test_set`] but omits the IFSC packet, so the resulting set
+    /// has no per-slice checksums (`file_checksums` returns `None`). Used to
+    /// prove fast verify falls back to the serial full-hash pipeline.
+    fn setup_test_set_no_ifsc(
+        file_data: &[u8],
+        slice_size: u64,
+    ) -> (Par2FileSet, MemoryFileAccess, FileId) {
+        let file_length = file_data.len() as u64;
+        let hash_full = checksum::md5(file_data);
+        let hash_16k = checksum::md5(&file_data[..file_data.len().min(16384)]);
+
+        let filename = b"testfile.dat";
+        let mut id_input = Vec::new();
+        id_input.extend_from_slice(&hash_16k);
+        id_input.extend_from_slice(&file_length.to_le_bytes());
+        id_input.extend_from_slice(filename);
+        let file_id_bytes: [u8; 16] = Md5::digest(&id_input).into();
+        let file_id = FileId::from_bytes(file_id_bytes);
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&1u32.to_le_bytes());
+        main_body.extend_from_slice(&file_id_bytes);
+        let rsid: [u8; 16] = Md5::digest(&main_body).into();
+
+        let mut fd_body = Vec::new();
+        fd_body.extend_from_slice(&file_id_bytes);
+        fd_body.extend_from_slice(&hash_full);
+        fd_body.extend_from_slice(&hash_16k);
+        fd_body.extend_from_slice(&file_length.to_le_bytes());
+        fd_body.extend_from_slice(filename);
+        while fd_body.len() % 4 != 0 {
+            fd_body.push(0);
+        }
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
+        stream.extend_from_slice(&make_full_packet(header::TYPE_FILE_DESC, &fd_body, rsid));
+
+        let set = Par2FileSet::from_files(&[&stream]).unwrap();
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, file_data.to_vec());
+        (set, access, file_id)
+    }
+
+    fn strict_opts() -> VerifyOptions {
+        VerifyOptions::default()
+    }
+
+    fn fast_opts() -> VerifyOptions {
+        VerifyOptions {
+            fast_verify: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_fast_verify_precedence() {
+        // Env override wins over the flag: "1" forces on, "0" forces off.
+        assert!(resolve_fast_verify(Some("1"), false));
+        assert!(!resolve_fast_verify(Some("0"), true));
+        // Absent or unrecognized env falls back to the flag.
+        assert!(resolve_fast_verify(None, true));
+        assert!(!resolve_fast_verify(None, false));
+        assert!(resolve_fast_verify(Some("yes"), true));
+        assert!(!resolve_fast_verify(Some(""), false));
+    }
+
+    #[test]
+    fn fast_verify_intact_matches_strict() {
+        // Partial last slice (1500 % 1024) exercises tail zero-padding.
+        let file_data = vec![0xA7u8; 1500];
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+
+        let strict =
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts());
+        let fast = verify_selected_file_ids_with_options(&set, &access, &[file_id], &fast_opts());
+
+        assert!(matches!(fast.files[0].status, FileStatus::Complete));
+        assert_eq!(fast.files[0].valid_slices, vec![true; 2]);
+        assert_eq!(fast.total_missing_blocks, 0);
+        assert!(matches!(fast.repairable, Repairability::NotNeeded));
+        assert_eq!(
+            format!("{strict:?}"),
+            format!("{fast:?}"),
+            "fast intact result must match strict byte for byte"
+        );
+    }
+
+    #[test]
+    fn fast_verify_damaged_matches_strict() {
+        // 20 full 1024-byte slices. The 16k quick check covers the first 16
+        // slices, so damage at offset 100 trips the gate (strict reaches its
+        // slice scan via the quick-hash-fail route) while damage at offset
+        // 18_000 does not (strict reaches it via the full-hash-fail route).
+        // Fast and strict must agree in both cases.
+        let base: Vec<u8> = (0..20480u32).map(|i| (i % 256) as u8).collect();
+
+        for corrupt_offset in [100usize, 18_000usize] {
+            let (set, mut access, file_id) = setup_test_set(&base, 1024);
+            let mut corrupted = base.clone();
+            corrupted[corrupt_offset] ^= 0xFF;
+            access.add_file(file_id, corrupted);
+
+            let strict =
+                verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts());
+            let fast =
+                verify_selected_file_ids_with_options(&set, &access, &[file_id], &fast_opts());
+
+            assert!(
+                matches!(fast.files[0].status, FileStatus::Damaged(1)),
+                "offset {corrupt_offset}: unexpected status {:?}",
+                fast.files[0].status
+            );
+            assert_eq!(fast.total_missing_blocks, 1, "offset {corrupt_offset}");
+            let damaged_slice = corrupt_offset / 1024;
+            assert!(
+                !fast.files[0].valid_slices[damaged_slice],
+                "offset {corrupt_offset}: slice {damaged_slice} should be damaged"
+            );
+            assert_eq!(
+                fast.files[0].valid_slices.iter().filter(|v| !**v).count(),
+                1,
+                "offset {corrupt_offset}: exactly one slice damaged"
+            );
+            assert_eq!(
+                format!("{strict:?}"),
+                format!("{fast:?}"),
+                "fast and strict must agree for corruption at offset {corrupt_offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_verify_falls_back_without_ifsc() {
+        let file_data = vec![0x33u8; 4096];
+        let (set, access, file_id) = setup_test_set_no_ifsc(&file_data, 1024);
+
+        let strict =
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts());
+        let fast = verify_selected_file_ids_with_options(&set, &access, &[file_id], &fast_opts());
+
+        assert!(matches!(fast.files[0].status, FileStatus::Complete));
+        assert_eq!(fast.total_missing_blocks, 0);
+        assert_eq!(
+            format!("{strict:?}"),
+            format!("{fast:?}"),
+            "without IFSC, fast verify must fall back to the serial pipeline"
+        );
+    }
+
+    #[test]
+    fn fast_verify_length_mismatch_falls_back() {
+        let file_data = vec![0x5Cu8; 4096];
+        let (set, mut access, file_id) = setup_test_set(&file_data, 1024);
+        // Truncate on disk so the on-disk length no longer matches the
+        // description: the fast path is ineligible and both modes take the
+        // serial pipeline.
+        access.add_file(file_id, file_data[..2500].to_vec());
+
+        let strict =
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts());
+        let fast = verify_selected_file_ids_with_options(&set, &access, &[file_id], &fast_opts());
+
+        assert!(matches!(fast.files[0].status, FileStatus::Damaged(_)));
+        assert_eq!(
+            format!("{strict:?}"),
+            format!("{fast:?}"),
+            "length mismatch must fall back identically to strict"
+        );
+    }
+
+    #[test]
+    fn fast_verify_flag_off_matches_strict_expectation() {
+        // One intact + one damaged file, flag off, must reproduce the
+        // pre-change strict pipeline outcome exactly.
+        let intact = vec![0x11u8; 4096];
+        let damaged = vec![0x22u8; 4096];
+        let (set, mut access, file_ids) =
+            setup_test_set_multi(&[(&intact, "intact.rar"), (&damaged, "damaged.rar")], 1024);
+        let mut corrupted = damaged.clone();
+        corrupted[0] ^= 0xFF;
+        access.add_file(file_ids[1], corrupted);
+
+        let off = verify_selected_file_ids_with_options(
+            &set,
+            &access,
+            &file_ids,
+            &VerifyOptions::default(),
+        );
+        assert!(matches!(off.files[0].status, FileStatus::Complete));
+        assert!(matches!(off.files[1].status, FileStatus::Damaged(1)));
+        assert_eq!(off.total_missing_blocks, 1);
+
+        // Flag-off must equal the dedicated strict entry point byte for byte.
+        let strict = verify_selected_file_ids(&set, &access, &file_ids);
+        assert_eq!(format!("{off:?}"), format!("{strict:?}"));
+    }
+
+    #[test]
+    fn fast_verify_parallel_matches_strict() {
+        let intact = vec![0x11u8; 4096];
+        let damaged = vec![0x22u8; 4096];
+        let truncated = vec![0x33u8; 4096];
+        let (set, mut access, file_ids) = setup_test_set_multi(
+            &[
+                (&intact, "intact.rar"),
+                (&damaged, "damaged.rar"),
+                (&truncated, "truncated.rar"),
+            ],
+            1024,
+        );
+        let mut corrupted = damaged.clone();
+        corrupted[1500] ^= 0xFF;
+        access.add_file(file_ids[1], corrupted);
+        access.add_file(file_ids[2], truncated[..2500].to_vec());
+
+        // Multi-file: file-parallel, each file's spans serial.
+        let strict = verify_selected_file_ids_parallel(&set, &access, &file_ids);
+        let fast =
+            verify_selected_file_ids_parallel_with_options(&set, &access, &file_ids, &fast_opts());
+        assert!(fast.total_missing_blocks > 0, "fixture must have damage");
+        assert_eq!(
+            format!("{strict:?}"),
+            format!("{fast:?}"),
+            "parallel fast verify must match parallel strict verify"
+        );
+
+        // Single file: exercises the span-parallel fast path.
+        for id in &file_ids {
+            let strict_one =
+                verify_selected_file_ids_parallel(&set, &access, std::slice::from_ref(id));
+            let fast_one = verify_selected_file_ids_parallel_with_options(
+                &set,
+                &access,
+                std::slice::from_ref(id),
+                &fast_opts(),
+            );
+            assert_eq!(
+                format!("{strict_one:?}"),
+                format!("{fast_one:?}"),
+                "single-file span-parallel fast verify must match strict"
+            );
+        }
     }
 
     #[test]
