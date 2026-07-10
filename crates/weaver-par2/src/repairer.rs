@@ -3063,6 +3063,11 @@ impl<'a> RollingBlockScanner<'a> {
         let len = file.metadata()?.len() as usize;
         let slice_size = self.table.slice_size as usize;
         if len == 0 || slice_size == 0 || len < slice_size {
+            // Close the handle before the serial scan reopens `path`. Only
+            // wasm targets lint here: their `std::fs::File` is an unsupported
+            // stub holding nothing droppable, whereas on unix/windows it owns
+            // a descriptor whose `Drop` does the close this relies on.
+            #[allow(clippy::drop_non_drop)]
             drop(file);
             return self.scan_file_ordered_canonical_serial(
                 path,
