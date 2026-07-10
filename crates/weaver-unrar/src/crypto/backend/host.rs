@@ -2,7 +2,7 @@
 //!
 //! Selected on `wasm32` when the `crypto-host` feature is on. It mirrors the
 //! other backends' 7-item seam, but the *bulk* AES-CBC decrypt crosses the wasm
-//! boundary to a host function (the scryer core AES), while the KDF primitives
+//! boundary to a host function (the embedding host's AES), while the KDF primitives
 //! (HMAC-SHA256 / SHA-256 / the test encrypt helpers) stay in-wasm and are
 //! re-exported verbatim from the portable RustCrypto backend. Delegating only
 //! the AES keeps the hot bulk path on the host's AES-NI without a copy, and
@@ -11,15 +11,20 @@
 //!
 //! ## The host ABI (fixed contract, shared with the host side)
 //!
-//! Import module (namespace): `extism:host/user`. One import is declared:
+//! Import module (namespace): `host` — embedder-neutral, satisfiable by any
+//! wasm runtime that can register imports (wasmtime, wasmer, …). The
+//! `host-abi-extism` feature switches only the namespace to
+//! `extism:host/user`, for Extism SDKs whose user host functions are pinned
+//! to that module; the function name and signature are identical in both.
+//! One import is declared:
 //!
 //! ```text
-//! scryer_aes_cbc_decrypt(key_ptr, key_len, iv_ptr, buf_ptr, buf_len) -> i64
+//! host_aes_cbc_decrypt(key_ptr, key_len, iv_ptr, buf_ptr, buf_len) -> i64
 //! ```
 //!
 //! All args/returns are raw `i64`; every `*_ptr` is a byte offset into the
 //! plugin's own linear memory, which the host slices in place (zero-copy — no
-//! extism-pdk `Vec<u8>` marshalling). AES-CBC, no padding, decrypt IN PLACE.
+//! SDK `Vec<u8>` marshalling). AES-CBC, no padding, decrypt IN PLACE.
 //! `key_len` is 16 (AES-128) or 32 (AES-256); `iv` is 16 bytes at `iv_ptr`;
 //! `buf_len` must be a multiple of 16 and may be 0. The host is STATELESS per
 //! call. Returns `0` ok, `-1` bad `key_len`, `-2` `buf_len % 16 != 0`, `-3`
@@ -61,14 +66,19 @@ use crate::crypto::AES_BLOCK;
 // the two definitions is compiled.
 // ---------------------------------------------------------------------------
 
-// Raw host import. A bare `#[link]` extern (no extism-pdk dependency) keeps
-// `weaver-unrar` extism-agnostic; the host merely has to expose a function of
-// this name in the `extism:host/user` namespace. (A `//` comment, not `///`:
-// doc comments are not allowed on the items inside a `#[link]` extern block.)
+// Raw host import: a bare `#[link]` extern (no embedder SDK dependency), so
+// any wasm runtime satisfies it by exposing a function of this name in the
+// import namespace. The namespace is `host` unless `host-abi-extism` retargets
+// it for Extism SDKs. (A `//` comment, not `///`: doc comments are not allowed
+// on the items inside a `#[link]` extern block.)
 #[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
-#[link(wasm_import_module = "extism:host/user")]
+#[cfg_attr(
+    feature = "host-abi-extism",
+    link(wasm_import_module = "extism:host/user")
+)]
+#[cfg_attr(not(feature = "host-abi-extism"), link(wasm_import_module = "host"))]
 unsafe extern "C" {
-    fn scryer_aes_cbc_decrypt(
+    fn host_aes_cbc_decrypt(
         key_ptr: u64,
         key_len: u64,
         iv_ptr: u64,
@@ -91,7 +101,7 @@ fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     // retains them past the call. `key`/`iv` are read-only to the host;
     // `data` is written in place.
     let rc = unsafe {
-        scryer_aes_cbc_decrypt(
+        host_aes_cbc_decrypt(
             key.as_ptr() as u64,
             key.len() as u64,
             iv.as_ptr() as u64,
@@ -101,7 +111,7 @@ fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     };
     assert_eq!(
         rc, 0,
-        "host scryer_aes_cbc_decrypt failed (contract violation): rc={rc}"
+        "host_aes_cbc_decrypt failed (contract violation): rc={rc}"
     );
 }
 

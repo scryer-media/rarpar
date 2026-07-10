@@ -1,5 +1,4 @@
-//! Factor -> `vpxor` schedule codegen for the XOR-JIT tier
-//! (see `scryer-docs/plans/125`).
+//! Factor -> `vpxor` schedule codegen for the XOR-JIT tier.
 //!
 //! Generates a straight-line, fully-unrolled block loop that computes
 //! `dst ^= factor · src` in bit-plane layout. The body follows ParPar's

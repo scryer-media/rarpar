@@ -171,6 +171,30 @@ struct WgpuShared {
 /// adapter without initializing one.
 static CONTEXT: OnceLock<Option<WgpuShared>> = OnceLock::new();
 
+/// First uncaptured device error, recorded by the handler installed at device
+/// creation. wgpu's DEFAULT handler panics on validation/internal errors — a
+/// driver rejecting an operation mid-repair would abort the process where the
+/// Metal arm surfaces an `Err` and the repair path redoes the chunk on the
+/// CPU. Recording instead poisons the arm permanently and non-fatally: every
+/// session method fails fast with the message (the repair path already
+/// `warn!`s it and permanently disables the arm), and `try_new` refuses new
+/// sessions so later repairs in the process go straight to the CPU tier.
+static DEVICE_ERROR: OnceLock<&'static str> = OnceLock::new();
+
+/// The poisoned-arm message, if any device error has been recorded.
+fn device_errored() -> Option<&'static str> {
+    DEVICE_ERROR.get().copied()
+}
+
+/// Record the first uncaptured device error. Leaks the formatted message once
+/// per process so the `&'static str` error seam the sessions already use can
+/// carry the real cause up to the repair path's warning.
+fn record_device_error(error: &wgpu::Error) {
+    let _ = DEVICE_ERROR.set(Box::leak(
+        format!("wgpu device error: {error}").into_boxed_str(),
+    ));
+}
+
 /// The shared adapter/device/pipeline, probed once. Deliberately blind to the
 /// adapter's device type: the forced path must reach a CPU rasterizer, so the
 /// refusal belongs on the automatic arm of [`WgpuGf16Session::try_new_gated`],
@@ -210,6 +234,11 @@ fn shared_context() -> Option<&'static WgpuShared> {
                     ..Default::default()
                 }))
                 .ok()?;
+            // Installed before any device call: replaces wgpu's default
+            // PANIC-on-error handler with the poison seam above, so shader,
+            // pipeline, buffer and submission errors all become session
+            // `Err`s + CPU fallback instead of a process abort.
+            device.on_uncaptured_error(std::sync::Arc::new(|error| record_device_error(&error)));
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("weaver.gf16.mulacc"),
                 source: wgpu::ShaderSource::Wgsl(shader_source().into()),
@@ -222,6 +251,11 @@ fn shared_context() -> Option<&'static WgpuShared> {
                 compilation_options: Default::default(),
                 cache: None,
             });
+            // Shader/pipeline errors arrive through the handler, not a
+            // `Result`: never cache a context whose pipeline is poisoned.
+            if device_errored().is_some() {
+                return None;
+            }
             let max_binding = device.limits().max_storage_buffer_binding_size;
             let info = adapter.get_info();
             Some(WgpuShared {
@@ -412,6 +446,12 @@ impl WgpuGf16Session {
             WgpuGate::Auto | WgpuGate::Force => {}
         }
         let shared = shared_context()?;
+        // A poisoned device (recorded uncaptured error) never takes new
+        // sessions — even forced ones: forcing past a broken device would
+        // just re-earn the same failure and warning every chunk.
+        if device_errored().is_some() {
+            return None;
+        }
         if matches!(gate, WgpuGate::Auto) && !auto_engageable(shared.device_type) {
             return None;
         }
@@ -532,6 +572,9 @@ impl WgpuGf16Session {
 
     /// Start a chunk: zero the resident destination rows on the GPU.
     pub fn begin_chunk(&mut self, byte_len: usize) -> Result<(), &'static str> {
+        if let Some(reason) = device_errored() {
+            return Err(reason);
+        }
         if byte_len == 0 || !byte_len.is_multiple_of(2) || byte_len > self.max_region_bytes {
             return Err("chunk length unsupported by the wgpu session");
         }
@@ -557,6 +600,9 @@ impl WgpuGf16Session {
         srcs: &[&[u8]],
         factor: impl Fn(usize, usize) -> u16,
     ) -> Result<(), &'static str> {
+        if let Some(reason) = device_errored() {
+            return Err(reason);
+        }
         let sources = srcs.len();
         if sources == 0 {
             return Ok(());
@@ -628,6 +674,9 @@ impl WgpuGf16Session {
     /// Wait for the chunk's dispatches and copy the accumulated destinations
     /// out. `dst_rows[j][..byte_len]` receives output `j`.
     pub fn finish_chunk(&mut self, dst_rows: &mut [Vec<u8>]) -> Result<(), &'static str> {
+        if let Some(reason) = device_errored() {
+            return Err(reason);
+        }
         if dst_rows.len() != self.outputs {
             return Err("output row count mismatch");
         }
@@ -684,6 +733,13 @@ impl WgpuGf16Session {
         self.staging_buf.unmap();
         self.chunk_words = 0;
         self.chunk_units = 0;
+        // Validation errors are asynchronous: an error raised by this chunk's
+        // own dispatch or copies may only be reported by the time the readback
+        // completes, and the mapped bytes are then untrustworthy. Re-check so
+        // a poisoned chunk is redone on the CPU instead of written to disk.
+        if let Some(reason) = device_errored() {
+            return Err(reason);
+        }
         Ok(())
     }
 

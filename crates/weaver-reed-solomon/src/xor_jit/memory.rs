@@ -1,5 +1,5 @@
 //! W^X executable memory + the non-standard-ABI call trampoline for the
-//! XOR-JIT tier (see `scryer-docs/plans/125`).
+//! XOR-JIT tier.
 //!
 //! Generated code is written to a fresh anonymous mapping, then flipped to
 //! read+execute before it is ever run — never simultaneously writable and

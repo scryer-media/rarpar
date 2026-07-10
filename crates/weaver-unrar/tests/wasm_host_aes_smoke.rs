@@ -1,9 +1,9 @@
 //! Native `wasmtime` harness for the wasm `crypto-host` AES smoke test.
 //!
 //! This is the end-to-end proof that the guest's raw `#[link]` import
-//! (`extism:host/user::scryer_aes_cbc_decrypt`) links and round-trips over the
+//! (`host::host_aes_cbc_decrypt`) links and round-trips over the
 //! real ABI — and it DOUBLES as the executable reference the host-side agent
-//! must satisfy: it implements `scryer_aes_cbc_decrypt` exactly to the fixed
+//! must satisfy: it implements `host_aes_cbc_decrypt` exactly to the fixed
 //! contract (raw offsets into the guest's linear memory, in-place AES-CBC, no
 //! padding, stateless per call) using a RustCrypto reference, then runs the
 //! `host_aes_smoke` wasm example under it and asserts the example prints PASS
@@ -121,7 +121,7 @@ fn build_smoke_wasm() -> PathBuf {
 /// `key`/`iv` and the block-aligned buffer from the guest's linear memory at the
 /// passed offsets, decrypts in place, and writes the plaintext back. Stateless
 /// per call. Returns the contract's status codes.
-fn host_scryer_aes_cbc_decrypt(
+fn reference_host_aes_cbc_decrypt(
     mut caller: Caller<'_, WasiP1Ctx>,
     key_ptr: i64,
     key_len: i64,
@@ -192,14 +192,14 @@ fn wasm_host_aes_smoke_round_trips_over_the_real_abi() {
         .expect("add wasi preview1 to linker");
 
     // The one custom import, in the fixed namespace, satisfying the guest's
-    // raw `#[link(wasm_import_module = "extism:host/user")]` extern.
+    // raw `#[link(wasm_import_module = "host")]` extern.
     linker
         .func_wrap(
-            "extism:host/user",
-            "scryer_aes_cbc_decrypt",
-            host_scryer_aes_cbc_decrypt,
+            "host",
+            "host_aes_cbc_decrypt",
+            reference_host_aes_cbc_decrypt,
         )
-        .expect("define host scryer_aes_cbc_decrypt");
+        .expect("define host host_aes_cbc_decrypt");
 
     let wasi = WasiCtxBuilder::new().inherit_stdio().build_p1();
     let mut store = Store::new(&engine, wasi);

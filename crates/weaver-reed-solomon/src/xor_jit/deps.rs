@@ -1,5 +1,5 @@
 //! GF(2^16) multiply-by-factor as a bit-plane dependency matrix, plus a scalar
-//! reference multiply, for the XOR-JIT tier (see `scryer-docs/plans/125`).
+//! reference multiply, for the XOR-JIT tier.
 //!
 //! `output_plane[o] = XOR of input_plane[k]` over the set bits of row `o` of a
 //! 16×16 GF(2) matrix — the same linear map the GFNI affine kernel and the

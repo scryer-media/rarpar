@@ -5,9 +5,9 @@
 //! crypto-host,crc-host`, it drives a FULL encrypted RAR extraction so that:
 //!
 //!   * every bulk AES-CBC decrypt crosses the wasm boundary to the host import
-//!     `extism:host/user::scryer_aes_cbc_decrypt` (the `crypto-host` backend),
+//!     `host::host_aes_cbc_decrypt` (the `crypto-host` backend),
 //!     and
-//!   * every bulk member-data CRC-32 crosses to `extism:host/user::scryer_crc32`
+//!   * every bulk member-data CRC-32 crosses to `host::host_crc32`
 //!     (the `crc-host` seam) — because `verify: true` makes the extractor check
 //!     each member's stored CRC, and on wasm that CRC runs through the host.
 //!
@@ -27,8 +27,8 @@
 //!     -p weaver-unrar --no-default-features --features crypto-host,crc-host \
 //!     --target wasm32-wasip1 --example wasm_extract_conformance
 //!
-//! It is not meaningful under a bare `wasmtime` CLI: the `scryer_aes_cbc_decrypt`
-//! and `scryer_crc32` imports are unsatisfied there and instantiation traps. Run
+//! It is not meaningful under a bare `wasmtime` CLI: the `host_aes_cbc_decrypt`
+//! and `host_crc32` imports are unsatisfied there and instantiation traps. Run
 //! it through the native driver, which provides both reference host functions:
 //!   cargo test -p weaver-unrar --test wasm_host_extract_conformance
 //!
@@ -164,7 +164,7 @@ fn is_data_member(m: &MemberInfo) -> bool {
 fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
     let mut archive = open_archive(root, case)?;
     // `verify: true` makes the extractor recompute and check each member's CRC
-    // — on wasm that CRC crosses to the host `scryer_crc32`, so a clean extract
+    // — on wasm that CRC crosses to the host `host_crc32`, so a clean extract
     // already proves the host CRC path; the explicit byte-compare below is the
     // stronger, independent check that the recovered plaintext is exactly right.
     let options = ExtractOptions {

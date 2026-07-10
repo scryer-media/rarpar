@@ -1,4 +1,4 @@
-//! XOR-JIT GF(2^16) multiply tier for pre-GFNI x86 (see `scryer-docs/plans/125`).
+//! XOR-JIT GF(2^16) multiply tier for pre-GFNI x86.
 //!
 //! Runtime-dispatched when AVX2 is present but GFNI is not. Reconstruction
 //! multiply is JIT-generated as bit-plane XOR sequences, which run on the four

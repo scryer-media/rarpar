@@ -20,21 +20,26 @@ exclude = ["tests/fixtures/**"]
 default = ["crypto-aws-lc"]
 crypto-aws-lc = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
 crypto-rust = ["dep:sha2", "dep:hmac", "dep:aes", "dep:cbc"]
-# WASM-only backend that delegates bulk AES-CBC to a host function (the scryer
-# core AES, reached over the fixed `extism:host/user` import ABI) while reusing
-# the RustCrypto KDF primitives in-wasm. It therefore pulls in `crypto-rust`.
-# The host backend module itself is target-gated to wasm; enabling this feature
-# on a native target is harmless (the module is cfg'd out and AWS-LC or the
-# RustCrypto backend is selected instead).
+# WASM-only backend that delegates bulk AES-CBC to a host function
+# (`host_aes_cbc_decrypt`, in the embedder-neutral `host` import namespace)
+# while reusing the RustCrypto KDF primitives in-wasm. It therefore pulls in
+# `crypto-rust`. The host backend module itself is target-gated to wasm;
+# enabling this feature on a native target is harmless (the module is cfg'd
+# out and AWS-LC or the RustCrypto backend is selected instead).
 crypto-host = ["crypto-rust"]
 # WASM-only: delegate the bulk member-data CRC-32 to a host function
-# (`scryer_crc32`, over the same fixed `extism:host/user` import ABI as
-# `crypto-host`'s AES) instead of computing it in-wasm with `crc32fast`. Opt-in
-# and wasm-only in intent; on native targets it is a harmless no-op — the
-# `crate::crc::Crc32` seam keeps its portable `crc32fast` backend regardless.
-# Adds NO new dependency: `crc32fast` is already a normal dep that the
-# native/portable seam path (and the header/probe CRCs) use unchanged.
+# (`host_crc32`, same neutral `host` namespace as `crypto-host`'s AES) instead
+# of computing it in-wasm with `crc32fast`. Opt-in and wasm-only in intent; on
+# native targets it is a harmless no-op — the `crate::crc::Crc32` seam keeps
+# its portable `crc32fast` backend regardless. Adds NO new dependency:
+# `crc32fast` is already a normal dep that the native/portable seam path (and
+# the header/probe CRCs) use unchanged.
 crc-host = []
+# Retarget the host imports' namespace from the embedder-neutral `host` to
+# `extism:host/user`, for Extism SDKs whose user host functions are pinned to
+# that module. Function names and signatures are identical either way; this
+# changes only the wasm import module string.
+host-abi-extism = []
 # Back-compat alias for existing workspace dependency declarations (was a
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]
@@ -87,7 +92,7 @@ tracing-subscriber.workspace = true
 #
 # The `wasm_host_aes_smoke` integration test drives the wasm `crypto-host`
 # example through a native `wasmtime` host that supplies a reference
-# `scryer_aes_cbc_decrypt`. Those deps (wasmtime + WASI preview1 + a RustCrypto
+# `host_aes_cbc_decrypt`. Those deps (wasmtime + WASI preview1 + a RustCrypto
 # reference AES) are native-only tooling for that harness and, like criterion,
 # MUST stay off the wasm example build — hence this same non-wasm target gate.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

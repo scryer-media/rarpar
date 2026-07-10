@@ -7,9 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Opt-in Apple-GPU (Metal) GF(2^16) backend. Off by default so downstream
-# consumers (e.g. scryer's host reconstruct) that only use the CPU/SIMD
-# kernels never link objc2/Metal. The objc2* deps below are macOS-only and
+# Opt-in Apple-GPU (Metal) GF(2^16) backend. Off by default so CPU-only
+# consumers never link objc2/Metal. The objc2* deps below are macOS-only and
 # optional; the `metal_gf16` module and its tests are additionally gated on
 # `target_os = "macos"` since objc2 cannot build on other platforms.
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]

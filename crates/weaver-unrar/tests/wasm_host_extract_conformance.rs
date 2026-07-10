@@ -2,9 +2,9 @@
 //!
 //! This is the executable proof that a FULL encrypted RAR extraction runs
 //! correctly through BOTH wasm host functions at once — the `crypto-host` bulk
-//! AES (`extism:host/user::scryer_aes_cbc_decrypt`) AND the `crc-host` bulk
-//! member CRC-32 (`extism:host/user::scryer_crc32`) — over their fixed raw-offset
-//! ABIs. It DOUBLES as the reference contract the scryer host side must satisfy:
+//! AES (`host::host_aes_cbc_decrypt`) AND the `crc-host` bulk
+//! member CRC-32 (`host::host_crc32`) — over their fixed raw-offset
+//! ABIs. It DOUBLES as the reference contract the embedding host must satisfy:
 //! it implements both host functions exactly to spec, then runs the
 //! `wasm_extract_conformance` example (built with `crypto-host,crc-host`) under
 //! `wasmtime`, which extracts every encrypted fixture (rar5 + rar4, store + lz,
@@ -130,11 +130,11 @@ fn build_conformance_wasm() -> PathBuf {
     wasm
 }
 
-/// Reference `scryer_aes_cbc_decrypt`, wired to the exact ABI the guest calls.
+/// Reference `host_aes_cbc_decrypt`, wired to the exact ABI the guest calls.
 /// Reads `key`/`iv` and the block-aligned buffer from the guest's linear memory
 /// at the passed offsets, decrypts in place, writes the plaintext back.
 /// Stateless per call. Returns the contract's status codes.
-fn host_scryer_aes_cbc_decrypt(
+fn reference_host_aes_cbc_decrypt(
     mut caller: Caller<'_, WasiP1Ctx>,
     key_ptr: i64,
     key_len: i64,
@@ -183,14 +183,14 @@ fn host_scryer_aes_cbc_decrypt(
     AES_RC_OK
 }
 
-/// Reference `scryer_crc32`, wired to the fixed ABI the guest CRC seam calls:
+/// Reference `host_crc32`, wired to the fixed ABI the guest CRC seam calls:
 /// resume an IEEE CRC-32 (reflected polynomial 0xEDB88320, RAR/ZIP/gzip) from
 /// `seed` over the READ-ONLY buffer at `buf_ptr`/`buf_len` in the guest's linear
 /// memory, returning the updated CRC in the low 32 bits. Chains so that
 /// `crc32(crc32(0, A), B) == crc32(0, A ++ B)`. A negative return signals an
 /// out-of-bounds slice (a contract violation the guest asserts on); the low-bits
 /// contract keeps success values non-negative for the 32-bit CRC range used.
-fn host_scryer_crc32(
+fn reference_host_crc32(
     mut caller: Caller<'_, WasiP1Ctx>,
     seed: i64,
     buf_ptr: i64,
@@ -251,17 +251,17 @@ fn wasm_host_extract_conformance_encrypted_fixtures() {
         .expect("add wasi preview1 to linker");
 
     // Both custom imports, in the fixed namespace, satisfying the guest's raw
-    // `#[link(wasm_import_module = "extism:host/user")]` externs.
+    // `#[link(wasm_import_module = "host")]` externs.
     linker
         .func_wrap(
-            "extism:host/user",
-            "scryer_aes_cbc_decrypt",
-            host_scryer_aes_cbc_decrypt,
+            "host",
+            "host_aes_cbc_decrypt",
+            reference_host_aes_cbc_decrypt,
         )
-        .expect("define host scryer_aes_cbc_decrypt");
+        .expect("define host host_aes_cbc_decrypt");
     linker
-        .func_wrap("extism:host/user", "scryer_crc32", host_scryer_crc32)
-        .expect("define host scryer_crc32");
+        .func_wrap("host", "host_crc32", reference_host_crc32)
+        .expect("define host host_crc32");
 
     // Preopen the fixtures tree read-only as /fixtures (the example reads both
     // /fixtures/<flavor>/*.rar and /fixtures/originals/*), and a writable /tmp
@@ -310,7 +310,7 @@ fn wasm_host_extract_conformance_encrypted_fixtures() {
     }
 }
 
-/// Unit-level check of the reference `scryer_crc32` contract (seeded resume +
+/// Unit-level check of the reference `host_crc32` contract (seeded resume +
 /// chaining), so a regression in the reference the host-side agent mirrors is
 /// caught even if the wasm round-trip is skipped.
 #[test]

@@ -12,7 +12,7 @@
 //!     and every plain-`crypto-rust` wasm build takes).
 //!   * **`wasm32` + `crc-host`** — holds a running `u32` (IEEE reflected CRC,
 //!     init 0) and delegates each [`update`](Crc32::update) to the host import
-//!     `scryer_crc32`, threading the returned CRC forward. `finalize` returns the
+//!     `host_crc32`, threading the returned CRC forward. `finalize` returns the
 //!     running value. This puts the bulk CRC on the host's (potentially
 //!     hardware-accelerated) implementation, mirroring how the `crypto-host`
 //!     backend delegates bulk AES.
@@ -24,10 +24,15 @@
 //!
 //! ## The host ABI (fixed contract, shared with the host side)
 //!
-//! Import module (namespace): `extism:host/user`. One import is declared:
+//! Import module (namespace): `host` — embedder-neutral, satisfiable by any
+//! wasm runtime that can register imports (wasmtime, wasmer, …). The
+//! `host-abi-extism` feature switches only the namespace to
+//! `extism:host/user`, for Extism SDKs whose user host functions are pinned
+//! to that module; the function name and signature are identical in both.
+//! One import is declared:
 //!
 //! ```text
-//! scryer_crc32(seed, buf_ptr, buf_len) -> i64
+//! host_crc32(seed, buf_ptr, buf_len) -> i64
 //! ```
 //!
 //! All args/returns are raw `i64`/`u64`; `buf_ptr` is a byte offset into the
@@ -38,14 +43,19 @@
 //! `crc32(crc32(0, A), B) == crc32(0, A ++ B)`. `buf_len` may be 0 (returns the
 //! seed unchanged).
 
-// Raw host import. A bare `#[link]` extern (no extism-pdk dependency) keeps
-// `weaver-unrar` extism-agnostic; the host merely has to expose a function of
-// this name in the `extism:host/user` namespace. (A `//` comment, not `///`:
-// doc comments are not allowed on the items inside a `#[link]` extern block.)
+// Raw host import: a bare `#[link]` extern (no embedder SDK dependency), so
+// any wasm runtime satisfies it by exposing a function of this name in the
+// import namespace. The namespace is `host` unless `host-abi-extism` retargets
+// it for Extism SDKs. (A `//` comment, not `///`: doc comments are not allowed
+// on the items inside a `#[link]` extern block.)
 #[cfg(all(target_arch = "wasm32", feature = "crc-host"))]
-#[link(wasm_import_module = "extism:host/user")]
+#[cfg_attr(
+    feature = "host-abi-extism",
+    link(wasm_import_module = "extism:host/user")
+)]
+#[cfg_attr(not(feature = "host-abi-extism"), link(wasm_import_module = "host"))]
 unsafe extern "C" {
-    fn scryer_crc32(seed: u64, buf_ptr: u64, buf_len: u64) -> i64;
+    fn host_crc32(seed: u64, buf_ptr: u64, buf_len: u64) -> i64;
 }
 
 /// Update the running CRC over `data` via the host, using the raw offset ABI
@@ -57,7 +67,7 @@ fn crc32_update_host(running: u32, data: &[u8]) -> u32 {
     // SAFETY: `data.as_ptr()`/`data.len()` are a valid read-only offset+length
     // into this module's own linear memory; the host slices them in place and
     // never retains them past the call.
-    let rc = unsafe { scryer_crc32(running as u64, data.as_ptr() as u64, data.len() as u64) };
+    let rc = unsafe { host_crc32(running as u64, data.as_ptr() as u64, data.len() as u64) };
     // The contract returns the updated CRC in the low 32 bits; the high bits are
     // reserved and ignored here.
     rc as u64 as u32

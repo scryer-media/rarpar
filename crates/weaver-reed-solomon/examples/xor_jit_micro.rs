@@ -2,7 +2,7 @@
 //! into 1 destination" folded-group unit (the reconstruct primitive), on real
 //! AVX2. Prepare/finish are done once (amortized as in streaming repair); only
 //! the multiply is timed. Decides whether the XOR-JIT streaming wiring pays off
-//! on pre-GFNI x86 before it is built (see scryer-docs/plans/125).
+//! on pre-GFNI x86 before it is built.
 //!
 //! Run on SYLIX: `cargo run --release --example xor_jit_micro`.
 

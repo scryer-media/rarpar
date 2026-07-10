@@ -4,13 +4,13 @@
 //! KNOWN AES-256-CBC (no-padding) vector through the public
 //! [`weaver_unrar::crypto::CbcDecryptor`], which on this build routes into the
 //! `backend::host` `Aes256CbcDec` and therefore calls the real host import
-//! `extism:host/user::scryer_aes_cbc_decrypt` over the fixed raw-offset ABI.
+//! `host::host_aes_cbc_decrypt` over the fixed raw-offset ABI.
 //!
 //! The ciphertext is decrypted in SEVERAL block-sized chunks so the guest CBC
 //! IV chaining is exercised end-to-end across host calls, not just a single
 //! shot. It prints a one-line `PASS`/`FAIL` and exits non-zero on any mismatch,
 //! so the native `wasmtime` harness (tests/wasm_host_aes_smoke.rs) can assert on
-//! it. That harness supplies a reference `scryer_aes_cbc_decrypt`, making this
+//! it. That harness supplies a reference `host_aes_cbc_decrypt`, making this
 //! example the executable reference the host-side agent must satisfy.
 //!
 //! Build & run (from the workspace root):
@@ -21,7 +21,7 @@
 //!   cargo test -p weaver-unrar --test wasm_host_aes_smoke
 //!
 //! Running the raw module under a plain `wasmtime` CLI will trap at
-//! instantiation because the `scryer_aes_cbc_decrypt` import is unsatisfied —
+//! instantiation because the `host_aes_cbc_decrypt` import is unsatisfied —
 //! that is expected; the module is only meaningful with a host that provides it.
 
 use weaver_unrar::crypto::CbcDecryptor;

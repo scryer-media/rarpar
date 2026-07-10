@@ -13,7 +13,7 @@
 //! order) followed by the selected `recovery blocks` (in `recovery_exponents`
 //! order) — exactly the column layout of `weaver-par2`'s repair matrix.
 //!
-//! It exists so a host (e.g. the Scryer wasmtime host in RFC 123 WP2.5) can run
+//! It exists so an embedding host (e.g. a wasmtime host application) can run
 //! the whole RS solve natively — Gaussian elimination on a large native stack
 //! plus the parallel GF matmul — on behalf of a single-threaded `wasm32-wasip1`
 //! guest that can neither spawn a rayon pool nor provision the large stack the

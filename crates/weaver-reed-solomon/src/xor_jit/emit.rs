@@ -1,7 +1,7 @@
 //! Minimal x86-64 machine-code emitter for the XOR-JIT GF(2^16) multiply tier.
 //!
-//! Emits only the instruction subset the XOR reconstruction codegen needs
-//! (see `scryer-docs/plans/125`): 256-bit `vpxor`/`vmovdqa`, and the scalar
+//! Emits only the instruction subset the XOR reconstruction codegen needs:
+//! 256-bit `vpxor`/`vmovdqa`, and the scalar
 //! `add`/`cmp`/`jl`/`ret`/`prefetcht1` for the block loop. The byte formulas
 //! follow ParPar's `x86_jit.h` where an upstream counterpart exists; the
 //! `vmovdqu` (F3-prefixed, unaligned) forms are rarpar additions — upstream

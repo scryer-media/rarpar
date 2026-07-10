@@ -1,4 +1,4 @@
-//! Bit-plane transpose for the XOR-JIT tier (see `scryer-docs/plans/125`).
+//! Bit-plane transpose for the XOR-JIT tier.
 //!
 //! A block is [`BLOCK_BYTES`] = 512 bytes = 256 GF(2^16) words, stored
 //! bit-planar as 16 planes of 256 bits (32 bytes each). Plane `p` lives at
