@@ -578,6 +578,10 @@ mod tests {
                 eprintln!("wgpu adapter unavailable; skipping");
                 return;
             };
+            // Name the adapter: a pass on a CPU rasterizer (llvmpipe/lavapipe)
+            // proves the shader, not the GPU arm. Without this the two are
+            // indistinguishable in the test log.
+            eprintln!("wgpu adapter: {}", session.device_name());
 
             let srcs: Vec<Vec<u8>> = (0..sources)
                 .map(|s| deterministic_bytes(byte_len, s))
