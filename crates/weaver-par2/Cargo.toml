@@ -24,7 +24,7 @@ metal = ["weaver-reed-solomon/metal"]
 wgpu = ["weaver-reed-solomon/wgpu"]
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.1", default-features = false }
+weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.2", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
@@ -57,7 +57,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # `weaver-unrar` is native test-suite tooling (differential RAR extraction
 # checks) and is not needed by the wasm harness, so it stays off the wasm build.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-weaver-unrar = { path = "../weaver-unrar", version = "0.2.0", default-features = false, features = [
+weaver-unrar = { path = "../weaver-unrar", version = "0.3.0", default-features = false, features = [
     "native-crypto",
 ] }
 criterion = "0.5"

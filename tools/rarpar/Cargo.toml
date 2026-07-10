@@ -25,11 +25,11 @@ runtime = [
 ]
 
 [dependencies]
-weaver-par2 = { path = "../../crates/weaver-par2", version = "0.2.1", default-features = false, features = [
+weaver-par2 = { path = "../../crates/weaver-par2", version = "0.2.2", default-features = false, features = [
     "metal",
     "native-crypto",
 ], optional = true }
-weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.2.0", default-features = false, features = [
+weaver-unrar = { path = "../../crates/weaver-unrar", version = "0.3.0", default-features = false, features = [
     "native-crypto",
 ], optional = true }
 clap = { workspace = true }
