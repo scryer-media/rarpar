@@ -43,8 +43,38 @@ use crate::gf;
 /// throughout its cores, plus the `_stridepf`/`_packpf` drivers) is not
 /// carried over — modern large-core hardware prefetchers cover the flat
 /// streaming pattern; revisit if small-core x86 profiles say otherwise.
+/// On aarch64 an explicit source-stream prefetch experiment exists behind
+/// [`NEON_SRC_PREFETCH`], currently off pending measurement.
 #[cfg(target_arch = "x86_64")]
 const SRC_STREAM_GROUP: usize = 8;
+
+/// Software-prefetch experiment for the aarch64 streaming kernels — PRFM
+/// PLDL1KEEP two 32-byte blocks ahead of each source stream in the NEON
+/// region kernel and the CLMUL input-batch body.
+///
+/// UNMEASURED: off by default so behavior is unchanged until a dedicated
+/// benchmark pass decides keep/revert. To A/B, flip to `true` and compare
+/// `gf_kernel/mul_acc_region_64kb` and
+/// `gf_kernel/mul_acc_input_batch_64kb_x8src`; keep only on a reproducible
+/// ≥2% win (the SRC_STREAM_GROUP note above records why software prefetch
+/// was originally dropped).
+#[cfg(target_arch = "aarch64")]
+const NEON_SRC_PREFETCH: bool = false;
+
+/// PRFM PLDL1KEEP hint: pull the line holding `ptr` toward L1 ahead of the
+/// streaming loads. A pure hint — never faults, any address is fine (callers
+/// pass `wrapping_add` pointers that may run past the buffer end).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn prefetch_src_l1(ptr: *const u8) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+}
 
 /// Precomputed shuffle tables for a single GF(2^16) multiplication factor.
 ///
@@ -417,6 +447,11 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
         }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_input_batch_gfni_avx2(dst, factors_and_srcs) };
+            return;
+        }
+        // Non-GFNI implied: execution fell past the GFNI arms above.
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            unsafe { mul_acc_input_batch_avx512(dst, factors_and_srcs) };
             return;
         }
         if is_x86_feature_detected!("avx2") {
@@ -1119,6 +1154,13 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
             unsafe { mul_acc_input_batch_gfni_avx2_prepared(dst, factors_and_srcs) };
             return;
         }
+        // Non-GFNI implied: execution fell past the GFNI arms above, so
+        // `prepare_input_factor` built Avx2-table-flavored factors on this
+        // machine — exactly what the 512-bit shuffle kernel consumes.
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            unsafe { mul_acc_input_batch_avx512_prepared(dst, factors_and_srcs) };
+            return;
+        }
         if is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_input_batch_avx2_prepared(dst, factors_and_srcs) };
             return;
@@ -1303,10 +1345,12 @@ unsafe fn mul_acc_region_gfni_avx512(matrices: &AffineMulMatrices, src: &[u8], d
 }
 
 // ---------------------------------------------------------------------------
-// AVX-512 shuffle kernel: 64 bytes (32 GF elements) per iteration
+// AVX-512 shuffle kernel: 128 bytes (64 GF elements) per iteration
 //
-// Same split-nibble algorithm as AVX2 but 2× wider (512-bit registers).
-// VPSHUFB in AVX-512 operates within each 128-bit lane independently.
+// Same split-nibble algorithm as AVX2 but 2× wider (512-bit registers), with
+// the same full-width pair deinterleave: VPSHUFB and the qword unpacks are
+// per-128-bit-lane, so two 64-byte vectors fold into one full vector of lo
+// bytes and one of hi bytes, and the eight lookups serve 64 words per round.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -1338,25 +1382,28 @@ unsafe fn mul_acc_region_avx512(tables: &MulTables, src: &[u8], dst: &mut [u8]) 
         let t7 =
             _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[7].as_ptr() as *const __m128i));
 
-        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
-        ));
-        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
         ));
 
-        while offset + 64 <= len {
-            let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
-            let d = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+        while offset + 128 <= len {
+            let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let s1 = _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
 
-            let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
-            let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+            // Deinterleave the pair into full lo/hi byte planes (per lane:
+            // [plane(s0) | plane(s1)] qword halves).
+            let a = _mm512_shuffle_epi8(s0, deint_pair);
+            let b = _mm512_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm512_unpacklo_epi64(a, b);
+            let hi_bytes = _mm512_unpackhi_epi64(a, b);
 
             let lo_n0 = _mm512_and_si512(lo_bytes, mask_0f);
             let lo_n1 = _mm512_and_si512(_mm512_srli_epi16(lo_bytes, 4), mask_0f);
             let hi_n0 = _mm512_and_si512(hi_bytes, mask_0f);
             let hi_n1 = _mm512_and_si512(_mm512_srli_epi16(hi_bytes, 4), mask_0f);
 
+            // 8 lookups serving all 64 words.
             let p0_lo = _mm512_shuffle_epi8(t0, lo_n0);
             let p0_hi = _mm512_shuffle_epi8(t1, lo_n0);
             let p1_lo = _mm512_shuffle_epi8(t2, lo_n1);
@@ -1375,29 +1422,47 @@ unsafe fn mul_acc_region_avx512(tables: &MulTables, src: &[u8], dst: &mut [u8]) 
                 _mm512_xor_si512(p2_hi, p3_hi),
             );
 
-            let product = _mm512_unpacklo_epi8(result_lo, result_hi);
-            let result = _mm512_xor_si512(d, product);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+            // Reinterleave within each lane: low qwords → s0's words, high
+            // qwords → s1's words.
+            let product0 = _mm512_unpacklo_epi8(result_lo, result_hi);
+            let product1 = _mm512_unpackhi_epi8(result_lo, result_hi);
 
-            offset += 64;
+            let d0 = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+            let d1 = _mm512_loadu_si512(dst.as_ptr().add(offset + 64) as *const __m512i);
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(offset) as *mut __m512i,
+                _mm512_xor_si512(d0, product0),
+            );
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(offset + 64) as *mut __m512i,
+                _mm512_xor_si512(d1, product1),
+            );
+
+            offset += 128;
         }
     }
 
-    // Tail: fall through to AVX2 for 32-byte chunk, then SSSE3/scalar.
+    // Tail: fall through to AVX2 for 64-byte blocks, then SSSE3/scalar.
     if offset < len {
         unsafe { mul_acc_region_avx2(tables, &src[offset..], &mut dst[offset..]) };
     }
 }
 
 // ---------------------------------------------------------------------------
-// SSSE3 kernel: 16 bytes (8 GF elements) per iteration
+// SSSE3 kernel: 32 bytes (16 GF elements) per iteration
 //
-// Algorithm:
-//   1. Deinterleave: separate lo bytes and hi bytes of each u16 word
-//   2. Extract 4 nibbles (2 per byte group)
+// Full-width lookups: two input vectors are deinterleaved into one FULL
+// vector of lo bytes and one FULL vector of hi bytes, so every lane of the
+// eight PSHUFB lookups carries data (a single-vector deinterleave would park
+// the planes in the low halves and waste the upper lanes).
+//
+// Algorithm per 32-byte block:
+//   1. Deinterleave pair: PSHUFB each vector to [8 lo | 8 hi], then
+//      punpcklqdq/punpckhqdq to gather [16 lo] and [16 hi]
+//   2. Extract 4 nibbles (2 per byte plane)
 //   3. 8× PSHUFB lookups (4 nibbles × {result_lo, result_hi})
 //   4. XOR contributions together
-//   5. Reinterleave result lo/hi bytes
+//   5. Reinterleave via unpacklo/unpackhi_epi8 (both halves carry data)
 //   6. XOR-accumulate into dst
 // ---------------------------------------------------------------------------
 
@@ -1422,20 +1487,19 @@ unsafe fn mul_acc_region_ssse3(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
         let t6 = _mm_loadu_si128(tables.tables[6].as_ptr() as *const __m128i);
         let t7 = _mm_loadu_si128(tables.tables[7].as_ptr() as *const __m128i);
 
-        // Deinterleave masks: extract even-position (lo) and odd-position (hi) bytes.
-        // Input: [lo0, hi0, lo1, hi1, ..., lo7, hi7]
-        // deint_lo → positions 0-7 = lo bytes, positions 8-15 = zeroed (high bit set → 0)
-        // deint_hi → positions 0-7 = hi bytes, positions 8-15 = zeroed
-        let deint_lo = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        // Pair deinterleave mask: even (lo) bytes to the low 8 positions, odd
+        // (hi) bytes to the high 8 — [lo0..lo7 | hi0..hi7] per vector.
+        let deint_pair = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
 
-        while offset + 16 <= len {
-            let s = _mm_loadu_si128(src.as_ptr().add(offset) as *const __m128i);
-            let d = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+        while offset + 32 <= len {
+            let s0 = _mm_loadu_si128(src.as_ptr().add(offset) as *const __m128i);
+            let s1 = _mm_loadu_si128(src.as_ptr().add(offset + 16) as *const __m128i);
 
-            // Deinterleave input bytes.
-            let lo_bytes = _mm_shuffle_epi8(s, deint_lo); // lo bytes at 0-7
-            let hi_bytes = _mm_shuffle_epi8(s, deint_hi); // hi bytes at 0-7
+            // Deinterleave the pair into full lo/hi byte planes.
+            let a = _mm_shuffle_epi8(s0, deint_pair); // [lo(s0) | hi(s0)]
+            let b = _mm_shuffle_epi8(s1, deint_pair); // [lo(s1) | hi(s1)]
+            let lo_bytes = _mm_unpacklo_epi64(a, b); // 16 lo bytes (words 0-15)
+            let hi_bytes = _mm_unpackhi_epi64(a, b); // 16 hi bytes (words 0-15)
 
             // Extract nibbles.
             let lo_n0 = _mm_and_si128(lo_bytes, mask_0f);
@@ -1443,7 +1507,8 @@ unsafe fn mul_acc_region_ssse3(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let hi_n0 = _mm_and_si128(hi_bytes, mask_0f);
             let hi_n1 = _mm_and_si128(_mm_srli_epi16(hi_bytes, 4), mask_0f);
 
-            // 8 lookups: each nibble contributes to both result lo and hi bytes.
+            // 8 lookups serving all 16 words: each nibble contributes to both
+            // result lo and hi bytes.
             let p0_lo = _mm_shuffle_epi8(t0, lo_n0);
             let p0_hi = _mm_shuffle_epi8(t1, lo_n0);
             let p1_lo = _mm_shuffle_epi8(t2, lo_n1);
@@ -1457,29 +1522,40 @@ unsafe fn mul_acc_region_ssse3(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let result_lo = _mm_xor_si128(_mm_xor_si128(p0_lo, p1_lo), _mm_xor_si128(p2_lo, p3_lo));
             let result_hi = _mm_xor_si128(_mm_xor_si128(p0_hi, p1_hi), _mm_xor_si128(p2_hi, p3_hi));
 
-            // Reinterleave: [rlo0, rhi0, rlo1, rhi1, ..., rlo7, rhi7]
-            let product = _mm_unpacklo_epi8(result_lo, result_hi);
+            // Reinterleave: low halves → words 0-7, high halves → words 8-15.
+            let product0 = _mm_unpacklo_epi8(result_lo, result_hi);
+            let product1 = _mm_unpackhi_epi8(result_lo, result_hi);
 
             // XOR-accumulate.
-            let result = _mm_xor_si128(d, product);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
+            let d0 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+            let d1 = _mm_loadu_si128(dst.as_ptr().add(offset + 16) as *const __m128i);
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset) as *mut __m128i,
+                _mm_xor_si128(d0, product0),
+            );
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset + 16) as *mut __m128i,
+                _mm_xor_si128(d1, product1),
+            );
 
-            offset += 16;
+            offset += 32;
         }
     }
 
-    // Scalar tail.
+    // Scalar tail (< one 32-byte block; lengths 16..=31 land here too).
     if offset < len {
         mul_acc_region_scalar(tables.factor, &src[offset..], &mut dst[offset..]);
     }
 }
 
 // ---------------------------------------------------------------------------
-// AVX2 kernel: 32 bytes (16 GF elements) per iteration
+// AVX2 kernel: 64 bytes (32 GF elements) per iteration
 //
-// Same deinterleave algorithm as SSSE3, but VPSHUFB operates within each
-// 128-bit lane independently — so the deinterleave and reinterleave work
-// per-lane, producing correct results for 8 words per lane × 2 lanes.
+// Same full-width pair-deinterleave as SSSE3, per 128-bit lane: VPSHUFB and
+// the qword unpacks operate within each lane independently, so lane k of
+// lo_bytes/hi_bytes holds [plane(v0 lane k) | plane(v1 lane k)] and the
+// epi8 unpacks re-emit v0's words from the low qwords and v1's words from
+// the high qwords — full lane utilization with no cross-lane permutes.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -1519,19 +1595,21 @@ unsafe fn mul_acc_region_avx2(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             tables.tables[7].as_ptr() as *const __m128i
         ));
 
-        // Deinterleave masks (same pattern in each 128-bit lane).
-        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
-        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
-        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
 
-        while offset + 32 <= len {
-            let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-            let d = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+        while offset + 64 <= len {
+            let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let s1 = _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
 
-            // Deinterleave within each 128-bit lane.
-            let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-            let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+            // Deinterleave the pair into full lo/hi byte planes (per lane:
+            // [plane(s0) | plane(s1)] qword halves).
+            let a = _mm256_shuffle_epi8(s0, deint_pair);
+            let b = _mm256_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm256_unpacklo_epi64(a, b);
+            let hi_bytes = _mm256_unpackhi_epi64(a, b);
 
             // Extract nibbles.
             let lo_n0 = _mm256_and_si256(lo_bytes, mask_0f);
@@ -1539,7 +1617,7 @@ unsafe fn mul_acc_region_avx2(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let hi_n0 = _mm256_and_si256(hi_bytes, mask_0f);
             let hi_n1 = _mm256_and_si256(_mm256_srli_epi16(hi_bytes, 4), mask_0f);
 
-            // 8 lookups.
+            // 8 lookups serving all 32 words.
             let p0_lo = _mm256_shuffle_epi8(t0, lo_n0);
             let p0_hi = _mm256_shuffle_epi8(t1, lo_n0);
             let p1_lo = _mm256_shuffle_epi8(t2, lo_n1);
@@ -1559,25 +1637,41 @@ unsafe fn mul_acc_region_avx2(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
                 _mm256_xor_si256(p2_hi, p3_hi),
             );
 
-            // Reinterleave within each lane.
-            let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+            // Reinterleave within each lane: low qwords → s0's words, high
+            // qwords → s1's words.
+            let product0 = _mm256_unpacklo_epi8(result_lo, result_hi);
+            let product1 = _mm256_unpackhi_epi8(result_lo, result_hi);
 
             // XOR-accumulate.
-            let result = _mm256_xor_si256(d, product);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
+            let d0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let d1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset) as *mut __m256i,
+                _mm256_xor_si256(d0, product0),
+            );
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
+                _mm256_xor_si256(d1, product1),
+            );
 
-            offset += 32;
+            offset += 64;
         }
     }
 
-    // Tail: fall through to SSSE3 for remaining 16-byte-aligned chunk + scalar.
+    // Tail: fall through to SSSE3 for a remaining 32-byte block + scalar.
     if offset < len {
         unsafe { mul_acc_region_ssse3(tables, &src[offset..], &mut dst[offset..]) };
     }
 }
 
 // ---------------------------------------------------------------------------
-// NEON kernel (aarch64): 16 bytes (8 GF elements) per iteration
+// NEON kernel (aarch64): 32 bytes (16 GF elements) per iteration
+//
+// Full-width lookups: `vld2q_u8` loads a 32-byte block directly as separated
+// even/odd byte planes (the same idiom as the CLMUL kernels), so every lane of
+// the eight `vqtbl1q` lookups carries data — 16 words per lookup round instead
+// of the 8 a single-vector `vuzp1q(s, s)` deinterleave would leave (upper
+// halves discarded).
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -1599,13 +1693,15 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
         let t6 = vld1q_u8(tables.tables[6].as_ptr());
         let t7 = vld1q_u8(tables.tables[7].as_ptr());
 
-        while offset + 16 <= len {
-            let s = vld1q_u8(src.as_ptr().add(offset));
-            let d = vld1q_u8(dst.as_ptr().add(offset));
+        while offset + 32 <= len {
+            if NEON_SRC_PREFETCH {
+                prefetch_src_l1(src.as_ptr().wrapping_add(offset + 64));
+            }
 
-            // Deinterleave: separate lo bytes (even positions) and hi bytes (odd).
-            let lo_bytes = vuzp1q_u8(s, s); // positions 0-7: lo bytes of 8 words
-            let hi_bytes = vuzp2q_u8(s, s); // positions 0-7: hi bytes of 8 words
+            // Deinterleaving load: .0 = lo bytes of 16 words, .1 = hi bytes.
+            let s = vld2q_u8(src.as_ptr().add(offset));
+            let lo_bytes = s.0;
+            let hi_bytes = s.1;
 
             // Extract nibbles.
             let lo_n0 = vandq_u8(lo_bytes, mask_0f);
@@ -1613,7 +1709,7 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let hi_n0 = vandq_u8(hi_bytes, mask_0f);
             let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
 
-            // 8 lookups.
+            // 8 lookups, all lanes live.
             let p0_lo = vqtbl1q_u8(t0, lo_n0);
             let p0_hi = vqtbl1q_u8(t1, lo_n0);
             let p1_lo = vqtbl1q_u8(t2, lo_n1);
@@ -1627,18 +1723,18 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
             let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
 
-            // Reinterleave: [rlo0, rhi0, rlo1, rhi1, ...]
-            let product = vzip1q_u8(result_lo, result_hi);
+            // XOR-accumulate on the destination's byte planes; the
+            // interleaving store puts the words back together.
+            let mut d = vld2q_u8(dst.as_ptr().add(offset));
+            d.0 = veorq_u8(d.0, result_lo);
+            d.1 = veorq_u8(d.1, result_hi);
+            vst2q_u8(dst.as_mut_ptr().add(offset), d);
 
-            // XOR-accumulate.
-            let result = veorq_u8(d, product);
-            vst1q_u8(dst.as_mut_ptr().add(offset), result);
-
-            offset += 16;
+            offset += 32;
         }
     }
 
-    // Scalar tail.
+    // Scalar tail (< one 32-byte block; lengths 16..=31 land here too).
     if offset < len {
         mul_acc_region_scalar(tables.factor, &src[offset..], &mut dst[offset..]);
     }
@@ -2545,6 +2641,204 @@ unsafe fn mul_acc_input_batch_avx2_prepared(
 }
 
 // ---------------------------------------------------------------------------
+// Grouped-input AVX-512 kernel (non-GFNI)
+//
+// 512-bit counterpart to the split-nibble AVX2 grouped-input path, for
+// AVX-512 boxes without GFNI: same SRC_STREAM_GROUP source blocking, tables
+// broadcast per 128-bit lane (as in `mul_acc_region_avx512`), and the
+// full-width pair deinterleave so the eight lookups per source serve all 64
+// words of a 128-byte destination strip.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn mul_acc_input_batch_avx512_prepared(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+
+    struct PreparedInput<'a> {
+        tables: [__m512i; 8],
+        src: &'a [u8],
+    }
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.prepared.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    // Prepared factors must be the split-nibble (Avx2 table) flavor on this
+    // path (the dispatchers guarantee it on-machine); a foreign GFNI-flavored
+    // factor would be silently dropped here yet applied by the AVX2 tail
+    // delegate below.
+    debug_assert!(
+        factors_and_srcs.iter().all(|fs| matches!(
+            fs.prepared.x86.as_ref(),
+            None | Some(PreparedX86Factor::Avx2(_))
+        )),
+        "avx512 shuffle batch requires Avx2-table-flavored prepared factors"
+    );
+    let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
+        .iter()
+        .filter_map(|fs| match fs.prepared.x86.as_ref() {
+            Some(PreparedX86Factor::Avx2(tables)) => {
+                let load_table = |idx: usize| unsafe {
+                    _mm512_broadcast_i32x4(_mm_loadu_si128(
+                        tables.tables[idx].as_ptr() as *const __m128i
+                    ))
+                };
+                Some(PreparedInput {
+                    tables: [
+                        load_table(0),
+                        load_table(1),
+                        load_table(2),
+                        load_table(3),
+                        load_table(4),
+                        load_table(5),
+                        load_table(6),
+                        load_table(7),
+                    ],
+                    src: fs.src,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    let vec_len = len & !127;
+    unsafe {
+        let mask_0f = _mm512_set1_epi8(0x0F);
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+
+        // Same source-group blocking as the 256-bit kernel: bound the
+        // concurrent read streams per destination pass.
+        let mut first_pass = true;
+        let mut group_start = 0usize;
+        loop {
+            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
+            let group = &prepared[group_start..group_end];
+
+            let mut offset = 0usize;
+            while offset + 128 <= vec_len {
+                let mut acc0 = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+                let mut acc1 = _mm512_loadu_si512(dst.as_ptr().add(offset + 64) as *const __m512i);
+
+                if first_pass {
+                    for src in &xor_inputs {
+                        let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+                        let s1 =
+                            _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
+                        acc0 = _mm512_xor_si512(acc0, s0);
+                        acc1 = _mm512_xor_si512(acc1, s1);
+                    }
+                }
+
+                for input in group {
+                    let s0 = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
+                    let s1 =
+                        _mm512_loadu_si512(input.src.as_ptr().add(offset + 64) as *const __m512i);
+
+                    // Full-width pair deinterleave (see `mul_acc_region_avx512`).
+                    let a = _mm512_shuffle_epi8(s0, deint_pair);
+                    let b = _mm512_shuffle_epi8(s1, deint_pair);
+                    let lo_bytes = _mm512_unpacklo_epi64(a, b);
+                    let hi_bytes = _mm512_unpackhi_epi64(a, b);
+
+                    let lo_n0 = _mm512_and_si512(lo_bytes, mask_0f);
+                    let lo_n1 = _mm512_and_si512(_mm512_srli_epi16(lo_bytes, 4), mask_0f);
+                    let hi_n0 = _mm512_and_si512(hi_bytes, mask_0f);
+                    let hi_n1 = _mm512_and_si512(_mm512_srli_epi16(hi_bytes, 4), mask_0f);
+
+                    let p0_lo = _mm512_shuffle_epi8(input.tables[0], lo_n0);
+                    let p0_hi = _mm512_shuffle_epi8(input.tables[1], lo_n0);
+                    let p1_lo = _mm512_shuffle_epi8(input.tables[2], lo_n1);
+                    let p1_hi = _mm512_shuffle_epi8(input.tables[3], lo_n1);
+                    let p2_lo = _mm512_shuffle_epi8(input.tables[4], hi_n0);
+                    let p2_hi = _mm512_shuffle_epi8(input.tables[5], hi_n0);
+                    let p3_lo = _mm512_shuffle_epi8(input.tables[6], hi_n1);
+                    let p3_hi = _mm512_shuffle_epi8(input.tables[7], hi_n1);
+
+                    let result_lo = _mm512_xor_si512(
+                        _mm512_xor_si512(p0_lo, p1_lo),
+                        _mm512_xor_si512(p2_lo, p3_lo),
+                    );
+                    let result_hi = _mm512_xor_si512(
+                        _mm512_xor_si512(p0_hi, p1_hi),
+                        _mm512_xor_si512(p2_hi, p3_hi),
+                    );
+
+                    acc0 = _mm512_xor_si512(acc0, _mm512_unpacklo_epi8(result_lo, result_hi));
+                    acc1 = _mm512_xor_si512(acc1, _mm512_unpackhi_epi8(result_lo, result_hi));
+                }
+
+                _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, acc0);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(offset + 64) as *mut __m512i, acc1);
+                offset += 128;
+            }
+
+            first_pass = false;
+            group_start = group_end;
+            if group_start >= prepared.len() {
+                break;
+            }
+        }
+    }
+
+    // Tail: reuse the 256-bit prepared kernel for the remainder.
+    if vec_len < len {
+        let tail_srcs: Vec<PreparedFactorSrc<'_>> = factors_and_srcs
+            .iter()
+            .map(|fs| PreparedFactorSrc {
+                prepared: fs.prepared,
+                src: &fs.src[vec_len..],
+            })
+            .collect();
+        unsafe { mul_acc_input_batch_avx2_prepared(&mut dst[vec_len..], &tail_srcs) };
+    }
+}
+
+/// An Avx2-table-forced prepared factor for the unprepared 512-bit shuffle
+/// entry: inside the non-GFNI `avx512bw` kernel the split-nibble tables are
+/// always the right flavor, so skip `prepare_input_factor`'s runtime feature
+/// probe (which would build GFNI matrices on GFNI hardware and starve this
+/// kernel — it consumes only the Avx2 table flavor).
+#[cfg(target_arch = "x86_64")]
+fn prepare_input_factor_shuffle(factor: u16) -> PreparedInputFactor {
+    PreparedInputFactor {
+        factor,
+        x86: (factor > 1).then(|| PreparedX86Factor::Avx2(precompute_mul_tables(factor))),
+    }
+}
+
+/// Unprepared 512-bit shuffle grouped-input entry: computes the nibble tables
+/// inline (batch-setup cost, amortized over the whole region — the same trade
+/// the unprepared 256-bit kernel makes) and runs the prepared kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn mul_acc_input_batch_avx512(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    let prepared: Vec<PreparedInputFactor> = factors_and_srcs
+        .iter()
+        .map(|fs| prepare_input_factor_shuffle(fs.factor))
+        .collect();
+    let pairs: Vec<PreparedFactorSrc<'_>> = prepared
+        .iter()
+        .zip(factors_and_srcs.iter())
+        .map(|(prepared, fs)| PreparedFactorSrc {
+            prepared,
+            src: fs.src,
+        })
+        .collect();
+    unsafe { mul_acc_input_batch_avx512_prepared(dst, &pairs) };
+}
+
+// ---------------------------------------------------------------------------
 // Multi-region CLMUL kernel (aarch64)
 //
 // One source region × many (factor, dst) pairs. Karatsuba PMULL products per
@@ -2595,8 +2889,8 @@ unsafe fn mul_acc_multi_region_clmul_body<const SHA3: bool>(
                 let r = clmul_barrett_reduce::<SHA3>(clmul_partials(planes, coeff));
                 let dst = factors_and_dsts[*dst_idx].dst.as_mut_ptr().add(offset);
                 let mut vb = vld2q_u8(dst as *const u8);
-                vb.0 = veorq_u8(veorq_u8(r[0], r[1]), vb.0);
-                vb.1 = veorq_u8(veorq_u8(r[2], r[3]), vb.1);
+                vb.0 = eor3q::<SHA3>(r[0], r[1], vb.0);
+                vb.1 = eor3q::<SHA3>(r[2], r[3], vb.1);
                 vst2q_u8(dst, vb);
             }
             offset += 32;
@@ -3042,6 +3336,13 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
         unsafe {
             let mut offset = 0usize;
             while offset < vec_len {
+                if NEON_SRC_PREFETCH {
+                    for e in group {
+                        let (_, _, src) = e.unwrap();
+                        prefetch_src_l1(src.as_ptr().wrapping_add(offset + 64));
+                    }
+                }
+
                 let first = group[0].unwrap();
                 let mut acc = clmul_round1(first.2.as_ptr().add(offset), &first.1);
                 let rest = &group[1..];
@@ -3177,7 +3478,14 @@ unsafe fn mul_acc_input_batch_clmul_sha3_unfused(
 // ---------------------------------------------------------------------------
 // Multi-region NEON kernel (aarch64)
 //
-// Reads src once per 16-byte chunk, applies all factors to all destinations.
+// Reads src once per 32-byte block, applies all factors to all destinations.
+// The block's byte planes are deinterleaved once (`vld2q_u8`, full-width like
+// the single-region kernel) and the nibble extraction is hoisted, so each
+// factor costs just its 8 lookups + XOR fold per 16 words.
+//
+// Only serves batches with ≤2 non-trivial factors (the dispatcher hands
+// larger fan-outs to the CLMUL kernels) — this is the matrix rank-1 update
+// path for tiny batches.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -3236,20 +3544,16 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
         let mask_0f = vdupq_n_u8(0x0F);
         let mut offset = 0usize;
 
-        while offset + 16 <= len {
-            let s = vld1q_u8(src.as_ptr().add(offset));
-
-            // Deinterleave once, reuse for all factors.
-            let lo_bytes = vuzp1q_u8(s, s);
-            let hi_bytes = vuzp2q_u8(s, s);
-            let lo_n0 = vandq_u8(lo_bytes, mask_0f);
-            let lo_n1 = vandq_u8(vshrq_n_u8(lo_bytes, 4), mask_0f);
-            let hi_n0 = vandq_u8(hi_bytes, mask_0f);
-            let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
+        while offset + 32 <= len {
+            // Deinterleave the block once (full-width byte planes), reuse the
+            // nibble vectors for all factors.
+            let s = vld2q_u8(src.as_ptr().add(offset));
+            let lo_n0 = vandq_u8(s.0, mask_0f);
+            let lo_n1 = vandq_u8(vshrq_n_u8(s.0, 4), mask_0f);
+            let hi_n0 = vandq_u8(s.1, mask_0f);
+            let hi_n1 = vandq_u8(vshrq_n_u8(s.1, 4), mask_0f);
 
             for ts in &table_sets {
-                let d = vld1q_u8(factors_and_dsts[ts.dst_idx].dst.as_ptr().add(offset));
-
                 let p0_lo = vqtbl1q_u8(ts.t[0], lo_n0);
                 let p0_hi = vqtbl1q_u8(ts.t[1], lo_n0);
                 let p1_lo = vqtbl1q_u8(ts.t[2], lo_n1);
@@ -3261,15 +3565,15 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
 
                 let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
                 let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
-                let product = vzip1q_u8(result_lo, result_hi);
-                let result = veorq_u8(d, product);
-                vst1q_u8(
-                    factors_and_dsts[ts.dst_idx].dst.as_mut_ptr().add(offset),
-                    result,
-                );
+
+                let dst_ptr = factors_and_dsts[ts.dst_idx].dst.as_mut_ptr().add(offset);
+                let mut d = vld2q_u8(dst_ptr as *const u8);
+                d.0 = veorq_u8(d.0, result_lo);
+                d.1 = veorq_u8(d.1, result_hi);
+                vst2q_u8(dst_ptr, d);
             }
 
-            offset += 16;
+            offset += 32;
         }
 
         // Scalar tail.
@@ -3654,11 +3958,12 @@ mod tests {
     #[test]
     fn exhaustive_factor_sweep() {
         // Test every factor on a small buffer to ensure SIMD matches scalar.
-        let src: Vec<u8> = (0..16).collect(); // exactly 1 SIMD iteration
+        // 32 bytes = exactly one full-width NEON/SSSE3 block.
+        let src: Vec<u8> = (0..32).collect();
 
         for factor in 2..=0xFFFFu16 {
-            let mut dst_dispatched = vec![0u8; 16];
-            let mut dst_scalar = vec![0u8; 16];
+            let mut dst_dispatched = vec![0u8; 32];
+            let mut dst_scalar = vec![0u8; 32];
 
             mul_acc_region(factor, &src, &mut dst_dispatched);
             mul_acc_region_scalar(factor, &src, &mut dst_scalar);
@@ -3731,6 +4036,52 @@ mod tests {
                 multi[i], reference[i],
                 "multi-region large mismatch for factor={factor:#06x}"
             );
+        }
+    }
+
+    /// Small-batch multi-region oracle: with ≤2 non-trivial factors the
+    /// aarch64 dispatcher stays on the VTBL shuffle kernel instead of CLMUL
+    /// (the matrix rank-1 path), so this pins that kernel across lengths
+    /// straddling its 32-byte block and the 0/1 factor edges.
+    #[test]
+    fn multi_region_small_batch_matches_scalar() {
+        for factors in [
+            vec![0x1234u16],
+            vec![0x0001, 0xBEEF],
+            vec![0x0000, 0x8000, 0x0001],
+            vec![0xFFFF, 0x0001, 0x0000, 0x0002],
+        ] {
+            for &len in &[
+                2usize, 16, 30, 32, 34, 62, 64, 66, 126, 128, 130, 4094, 4096,
+            ] {
+                let src: Vec<u8> = (0..len).map(|i| ((i * 29 + 7) % 253) as u8).collect();
+
+                let mut reference: Vec<Vec<u8>> =
+                    factors.iter().map(|_| vec![0x5Au8; len]).collect();
+                for (i, &factor) in factors.iter().enumerate() {
+                    mul_acc_region_scalar(factor, &src, &mut reference[i]);
+                }
+
+                let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x5Au8; len]).collect();
+                {
+                    let mut pairs: Vec<FactorDst<'_>> = factors
+                        .iter()
+                        .zip(multi.iter_mut())
+                        .map(|(&factor, dst)| FactorDst {
+                            factor,
+                            dst: dst.as_mut_slice(),
+                        })
+                        .collect();
+                    mul_acc_multi_region(&mut pairs, &src);
+                }
+
+                for (i, &factor) in factors.iter().enumerate() {
+                    assert_eq!(
+                        multi[i], reference[i],
+                        "small batch mismatch len={len} factor={factor:#06x}"
+                    );
+                }
+            }
         }
     }
 
@@ -3887,6 +4238,77 @@ mod tests {
             let mut got = vec![0x6Bu8; len];
             unsafe { mul_acc_input_batch_gfni_avx512(&mut got, &pairs) };
             assert_eq!(got, reference, "gfni avx512 batch len={len}");
+        }
+    }
+
+    /// Direct oracle test for the non-GFNI 512-bit shuffle grouped-input
+    /// entry and its prepared twin (runs on any AVX-512BW/VL hardware — GFNI
+    /// or not, since the entry forces the Avx2 table flavor; no-ops
+    /// elsewhere, including under Rosetta 2). Lengths straddle the 128-byte
+    /// block and the AVX2/scalar tail chain; the 19-source case crosses the
+    /// SRC_STREAM_GROUP boundary twice.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn input_batch_avx512_matches_scalar() {
+        if !is_x86_feature_detected!("avx512bw") || !is_x86_feature_detected!("avx512vl") {
+            return;
+        }
+        for &count in &[7usize, 19] {
+            for &len in &[2usize, 62, 64, 66, 126, 128, 130, 4096, 4094] {
+                let factors: Vec<u16> = (0..count)
+                    .map(|i| match i {
+                        0 => 0,
+                        1 => 1,
+                        2 => 0x8000,
+                        3 => 0xFFFF,
+                        _ => (i * 2749 + 3) as u16,
+                    })
+                    .collect();
+                let srcs: Vec<Vec<u8>> = (0..count)
+                    .map(|i| (0..len).map(|b| ((b * (i + 3) + 17) % 251) as u8).collect())
+                    .collect();
+
+                let mut reference = vec![0x6Bu8; len];
+                for (&factor, src) in factors.iter().zip(srcs.iter()) {
+                    mul_acc_region_scalar(factor, src, &mut reference);
+                }
+
+                let pairs: Vec<FactorSrc<'_>> = factors
+                    .iter()
+                    .zip(srcs.iter())
+                    .map(|(&factor, src)| FactorSrc {
+                        factor,
+                        src: src.as_slice(),
+                    })
+                    .collect();
+                let mut got = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_avx512(&mut got, &pairs) };
+                assert_eq!(
+                    got, reference,
+                    "avx512 shuffle batch count={count} len={len}"
+                );
+
+                // Prepared path: force the Avx2 table flavor so this also
+                // runs (and asserts) on GFNI machines.
+                let prepared: Vec<PreparedInputFactor> = factors
+                    .iter()
+                    .map(|&f| prepare_input_factor_shuffle(f))
+                    .collect();
+                let prepared_pairs: Vec<PreparedFactorSrc<'_>> = prepared
+                    .iter()
+                    .zip(srcs.iter())
+                    .map(|(prepared, src)| PreparedFactorSrc {
+                        prepared,
+                        src: src.as_slice(),
+                    })
+                    .collect();
+                let mut got_prepared = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_avx512_prepared(&mut got_prepared, &prepared_pairs) };
+                assert_eq!(
+                    got_prepared, reference,
+                    "avx512 shuffle batch prepared count={count} len={len}"
+                );
+            }
         }
     }
 
@@ -4377,13 +4799,16 @@ mod tests {
 
     /// Large-buffer factor sweep: ensures SIMD main loop + tail handling
     /// is correct across many factors with a buffer large enough to exercise
-    /// multiple SIMD iterations.
+    /// multiple SIMD iterations. 4094 bytes deliberately misses every block
+    /// size, so each factor walks the full delegation chain (e.g. on x86:
+    /// 128-byte AVX-512 blocks → one 64-byte AVX2 block → one 32-byte SSSE3
+    /// block → scalar words; on aarch64: 32-byte NEON blocks → scalar).
     #[test]
     fn large_buffer_factor_sweep() {
-        let src: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        let src: Vec<u8> = (0..4094).map(|i| (i % 256) as u8).collect();
 
         for factor in (2..=0xFFFFu16).step_by(127) {
-            let mut dst_dispatched = vec![0x33u8; 4096];
+            let mut dst_dispatched = vec![0x33u8; 4094];
             let mut dst_scalar = dst_dispatched.clone();
 
             mul_acc_region(factor, &src, &mut dst_dispatched);
@@ -4432,15 +4857,19 @@ mod tests {
     }
 
     /// Verify dispatch with non-power-of-2 buffer sizes that stress tail
-    /// handling across all SIMD widths (scalar remainder after 64/32/16-byte
-    /// SIMD iterations).
+    /// handling across all SIMD widths (scalar remainder after 128/64/32-byte
+    /// SIMD blocks).
     #[test]
     fn non_aligned_sizes_stress() {
         let factor = 0xCAFEu16;
-        // Sizes chosen to leave different tail lengths:
-        // 2 = scalar only, 18 = 16+2, 34 = 32+2, 50 = 32+16+2,
-        // 66 = 64+2, 98 = 64+32+2, 130 = 64*2+2
-        for size in [2, 6, 10, 14, 18, 22, 30, 34, 46, 50, 62, 66, 98, 130] {
+        // Sizes straddling every kernel's block size (NEON/SSSE3 32, AVX2 64,
+        // AVX-512 128) plus in-between remainders: 30/32/34 cross the 32-byte
+        // block, 62/64/66 the 64-byte block, 126/128/130 the 128-byte block,
+        // and 94/96/158/194/226/258 leave mixed multi-width tails.
+        for size in [
+            2, 6, 10, 14, 18, 22, 30, 32, 34, 46, 50, 62, 64, 66, 94, 96, 98, 126, 128, 130, 158,
+            194, 226, 258,
+        ] {
             let src: Vec<u8> = (0..size).map(|i| ((i * 31) % 256) as u8).collect();
             let mut dst_dispatched = vec![0xBBu8; size];
             let mut dst_scalar = dst_dispatched.clone();

@@ -231,6 +231,27 @@ fn bench_gf_kernel(c: &mut Criterion) {
         });
     });
 
+    // ≤2 non-trivial factors stays under the aarch64 CLMUL threshold (>2), so
+    // this pins the VTBL shuffle multi-region kernel — the matrix rank-1
+    // update shape for tiny batches.
+    let rank1_factors = [0x1234u16, 0xBEEF];
+    let mut rank1_dsts: Vec<Vec<u8>> = (0..rank1_factors.len())
+        .map(|_| vec![0u8; 65_536])
+        .collect();
+    group.bench_function("mul_acc_multi_region_64kb_x2", |b| {
+        b.iter(|| {
+            let mut pairs: Vec<FactorDst<'_>> = rank1_factors
+                .iter()
+                .zip(rank1_dsts.iter_mut())
+                .map(|(&factor, dst)| FactorDst {
+                    factor,
+                    dst: dst.as_mut_slice(),
+                })
+                .collect();
+            mul_acc_multi_region(&mut pairs, &src);
+        });
+    });
+
     // Exercises the aarch64 >3-input CLMUL selection (WEAVER_GF16_CLMUL_BATCH=0
     // pins the VTBL shuffle path for an A/B without a rebuild).
     let batch_srcs: Vec<Vec<u8>> = (0..8)

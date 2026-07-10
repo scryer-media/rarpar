@@ -8,9 +8,11 @@
 //! word order is free (XOR is bitwise-parallel). So the wide block is composed
 //! from two proven 512-byte AVX2 transposes with their half-planes
 //! interleaved: plane `p` = [block-A plane `p` | block-B plane `p`]. This
-//! keeps every piece testable on AVX2-only hosts (including Rosetta 2, which
-//! lacks AVX512), and prepare/finish cost is amortized noise next to the
-//! multiply.
+//! keeps every piece testable on any AVX2 x86 host (vs a native vpmovb2m
+//! port, which would need real AVX512 silicon), and prepare/finish cost is
+//! amortized noise next to the multiply. Note that Rosetta 2 executes AVX2
+//! but does not advertise it via CPUID, so the detection-gated tests here
+//! skip under translation — real coverage needs native x86 hardware.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::transpose;

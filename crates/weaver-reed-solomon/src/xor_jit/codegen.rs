@@ -11,13 +11,16 @@
 //! Output planes are processed in pairs with common-subexpression sharing:
 //! the source planes both rows of a pair need are XORed once into a shared
 //! accumulator (`ymm2`) and folded into each output, so a plane common to the
-//! pair costs one `vpxor` instead of two. The pairing and register roles are
-//! ParPar's; the CSE EXTENT deliberately is not — ParPar shares only the
-//! lowest and highest common bits of a pair (`common_elim`,
-//! gf16_xor_avx2.c:213-228, a limit of its SIMD-generated writer) while this
-//! scheduler shares ALL common bits, and ParPar additionally fuses the dst
-//! load into its highest source-plane `vpxor`. Net: mean ~104 vpxor/block
-//! here vs ~121 modeled for upstream's schedule (mean deps set-bits 128).
+//! pair costs one `vpxor` instead of two. The pairing, register roles, and
+//! dst-load fusion (each output's dst load rides as the memory operand of its
+//! first `vpxor` instead of a separate `vmovdqu`) are ParPar's; the CSE
+//! EXTENT deliberately is not — ParPar shares only the lowest and highest
+//! common bits of a pair (`common_elim`, gf16_xor_avx2.c:213-228, a limit of
+//! its SIMD-generated writer) while this scheduler shares ALL common bits.
+//! Net: mean ~104 vpxor/block here vs ~121 modeled for upstream's schedule
+//! (mean deps set-bits 128); dst-load fusion eliminates essentially all 16
+//! separate dst loads per block (mean total ~146 instructions vs ~162
+//! unfused — only an output whose planes all sit in memory keeps its load).
 
 use super::deps::XorDeps;
 use super::emit::{self, RAX, RCX, RDX};
@@ -79,18 +82,36 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
         }
 
         // Even output -> ymm0, odd output -> ymm1: dst ^ own planes ^ shared.
+        // The dst load is fused into the output's first XOR (ParPar's trick):
+        // `vpxor acc, reg, [rdx+off]` seeds acc with reg ^ dst in one
+        // instruction, where reg is a resident own plane (3-15) or, failing
+        // that, the shared accumulator ymm2. XOR commutes, so hoisting that
+        // operand first leaves the result unchanged.
         for (acc, out) in [(0u8, oe), (1u8, oo)] {
             if deps.rows[out] == 0 {
                 continue; // unchanged
             }
-            emit::vmovdqu_load(&mut buf, acc, RDX, plane_off(out));
             let mut m = only[acc as usize];
+            let mut fold_shared = common != 0;
+            let resident = m & !0b111;
+            if resident != 0 {
+                let k = resident.trailing_zeros() as usize;
+                m &= !(1 << k);
+                emit::vpxor_rrm(&mut buf, acc, k as u8, RDX, plane_off(out));
+            } else if fold_shared {
+                fold_shared = false;
+                emit::vpxor_rrm(&mut buf, acc, 2, RDX, plane_off(out));
+            } else {
+                // Own planes all live in memory (0-2) and nothing is shared:
+                // a vpxor cannot take two memory operands, so keep the load.
+                emit::vmovdqu_load(&mut buf, acc, RDX, plane_off(out));
+            }
             while m != 0 {
                 let k = m.trailing_zeros() as usize;
                 m &= m - 1;
                 xor_plane(&mut buf, acc, k);
             }
-            if common != 0 {
+            if fold_shared {
                 emit::vpxor_rrr(&mut buf, acc, acc, 2); // ^= shared
             }
             emit::vmovdqu_store(&mut buf, RDX, plane_off(out), acc);
@@ -120,6 +141,27 @@ mod tests {
             *byte = (s >> 24) as u8;
         }
         v
+    }
+
+    /// Structural invariants that need no AVX2 hardware, swept over the full
+    /// factor domain: single trailing `ret`, length within the JIT buffer
+    /// budget. Execution semantics are validated on real AVX2 hardware by
+    /// `jit_muladd_matches_planar` below.
+    #[test]
+    fn generated_code_shape_all_factors() {
+        for factor in 1..=u16::MAX {
+            let code = generate_muladd(&compute_deps(factor));
+            assert_eq!(
+                *code.last().unwrap(),
+                0xC3,
+                "factor {factor:#06x}: must end in ret"
+            );
+            assert!(
+                code.len() < 4096,
+                "factor {factor:#06x}: {} bytes",
+                code.len()
+            );
+        }
     }
 
     /// The JIT'd muladd must reproduce the scalar `muladd_planar` XOR schedule

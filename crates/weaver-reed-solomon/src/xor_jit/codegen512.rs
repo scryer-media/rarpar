@@ -47,20 +47,23 @@ fn src_reg(k: usize) -> u8 {
     16 + k as u8
 }
 
-/// Fold every plane in `mask` into `acc`: pairs via `vpternlogd 0x96`
-/// (acc ^= a ^ b), a trailing single via `vpxord`.
-fn fold_mask(buf: &mut Vec<u8>, acc: u8, mut mask: u16) {
+/// Fold the planes of `mask` into `acc` two at a time via `vpternlogd 0x96`
+/// (acc ^= a ^ b). An odd trailing plane is NOT emitted — it is returned so
+/// the caller can pair it with whatever else it still has to fold (the shared
+/// accumulator, when there is one) instead of spending a lone `vpxord`.
+#[must_use]
+fn fold_pairs(buf: &mut Vec<u8>, acc: u8, mut mask: u16) -> Option<usize> {
     while mask != 0 {
         let k1 = mask.trailing_zeros() as usize;
         mask &= mask - 1;
-        if mask != 0 {
-            let k2 = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            emit::vpternlogd_xor3(buf, acc, src_reg(k1), src_reg(k2));
-        } else {
-            emit::vpxord_rrr(buf, acc, acc, src_reg(k1));
+        if mask == 0 {
+            return Some(k1);
         }
+        let k2 = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        emit::vpternlogd_xor3(buf, acc, src_reg(k1), src_reg(k2));
     }
+    None
 }
 
 /// Generate the muladd loop body for `deps` (AVX512 flavor).
@@ -75,7 +78,9 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
     }
 
     // Output planes in pairs with the AVX2 codegen's CSE scheme: planes both
-    // rows need are folded once into zmm2 and XORed into each output.
+    // rows need are folded once into zmm2 and XORed into each output. When an
+    // output's own-plane count is odd, the leftover plane and zmm2 fold in a
+    // single `vpternlogd` instead of two `vpxord`s.
     for b in 0..8usize {
         let (oe, oo) = (2 * b, 2 * b + 1);
         let common = deps.rows[oe] & deps.rows[oo];
@@ -84,7 +89,9 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
         if common != 0 {
             let first = common.trailing_zeros() as usize;
             emit::vmovdqa32_rr(&mut buf, 2, src_reg(first));
-            fold_mask(&mut buf, 2, common & (common - 1));
+            if let Some(k) = fold_pairs(&mut buf, 2, common & (common - 1)) {
+                emit::vpxord_rrr(&mut buf, 2, 2, src_reg(k));
+            }
         }
 
         for (acc, out) in [(0u8, oe), (1u8, oo)] {
@@ -92,9 +99,14 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
                 continue; // unchanged
             }
             emit::vmovdqu32_load(&mut buf, acc, RDX, plane_off(out));
-            fold_mask(&mut buf, acc, only[acc as usize]);
-            if common != 0 {
-                emit::vpxord_rrr(&mut buf, acc, acc, 2); // ^= shared
+            let leftover = fold_pairs(&mut buf, acc, only[acc as usize]);
+            match (leftover, common != 0) {
+                // Odd own plane + shared accumulator: one ternlog folds both
+                // (acc ^= plane ^ shared), saving the separate `vpxord`s.
+                (Some(k), true) => emit::vpternlogd_xor3(&mut buf, acc, src_reg(k), 2),
+                (Some(k), false) => emit::vpxord_rrr(&mut buf, acc, acc, src_reg(k)),
+                (None, true) => emit::vpxord_rrr(&mut buf, acc, acc, 2), // ^= shared
+                (None, false) => {}
             }
             emit::vmovdqu32_store(&mut buf, RDX, plane_off(out), acc);
         }
@@ -134,6 +146,26 @@ mod tests {
         for factor in [1u16, 2, 0x8000, 0xABCD, 0xFFFF, 0x2F1D, 0x0101] {
             let code = generate_muladd(&compute_deps(factor));
             assert_eq!(*code.last().unwrap(), 0xC3, "must end in ret");
+            assert!(
+                code.len() < 4096,
+                "factor {factor:#06x}: {} bytes",
+                code.len()
+            );
+        }
+    }
+
+    /// [`generated_code_shape`] swept over the full factor domain — cheap and
+    /// hardware-free. Execution semantics are validated on real AVX512
+    /// hardware by `jit512_muladd_matches_planar`.
+    #[test]
+    fn generated_code_shape_all_factors() {
+        for factor in 1..=u16::MAX {
+            let code = generate_muladd(&compute_deps(factor));
+            assert_eq!(
+                *code.last().unwrap(),
+                0xC3,
+                "factor {factor:#06x}: must end in ret"
+            );
             assert!(
                 code.len() < 4096,
                 "factor {factor:#06x}: {} bytes",
