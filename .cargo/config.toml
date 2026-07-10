@@ -1,0 +1,10 @@
+# MSVC reserves 1 MiB for a binary's main thread (Linux/macOS give Rust's main
+# thread 8 MiB). rarpar survives 1 MiB today — the former offenders (1 MiB
+# stack read buffers in `hash_file`, GF16 table temporaries) are heap-allocated
+# now — but rayon steal-on-block still stacks whole work frames on one thread
+# (see the scars in weaver-par2's repairer.rs/verify.rs), so pin every binary
+# to the same 8 MiB headroom the other platforms already have. Preferred over
+# wrapping `verify_or_repair` in a sized worker thread: it covers the CLI,
+# tests, benches, and examples in one place, at link time.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]

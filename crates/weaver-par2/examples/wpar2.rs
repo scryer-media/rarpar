@@ -73,12 +73,18 @@ fn main() -> ExitCode {
     }
 
     // The production server drives repair from a worker thread it spawns, not
-    // the process main thread. On Windows the main thread's default stack is
-    // 1 MiB (vs 8 MiB on Linux), too small for the decode-matrix construction
-    // on the many-slice single-file shape. Run on an explicitly-sized worker
-    // so this driver measures the same code path the server does.
+    // the process main thread; run on an explicitly-sized worker so this
+    // driver measures the same code path the server does.
+    //
+    // History: this worker was 256 MiB, attributed to "decode-matrix
+    // construction on the many-slice single-file shape". That was a
+    // misdiagnosis — the decode matrix is Vec-backed (heap), and the real
+    // stack consumers were 1 MiB `hash_file` read buffers and the 256 KiB GF16
+    // log/antilog table temporaries, both since moved to the heap. 8 MiB (the
+    // Linux main-thread default) is plenty now; the production server's
+    // oversized worker can be shrunk on the same grounds.
     let worker = std::thread::Builder::new()
-        .stack_size(256 << 20)
+        .stack_size(8 << 20)
         .spawn(move || Par2Repairer::new(options).verify_or_repair())
         .expect("spawn repair worker");
     let result = worker.join().expect("repair worker panicked");

@@ -4507,6 +4507,12 @@ fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
     // stack is ~1 MiB total, and MSVC reserves 1 MiB for the main thread, so a
     // frame this large overflows both. `verify_or_repair` runs on the caller's
     // thread, and rayon steal-on-block can nest this frame deeper still.
+    //
+    // Do not regress this to a guarded stack buffer either: when this function
+    // inlines, LLVM hoists its static allocas into the caller's entry block,
+    // so the reservation lands in the caller's prologue no matter which branch
+    // runs — a caller-side guard like `should_skip_full_hash` skips the
+    // hashing work, never the stack cost.
     let mut buf = vec![0u8; 1024 * 1024];
     let mut total_read = 0u64;
     loop {

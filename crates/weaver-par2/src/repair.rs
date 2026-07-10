@@ -2029,6 +2029,9 @@ fn execute_repair_streaming(
     // shuffle2x ~20 s vs XOR-JIT ~32 s; B2 64 KiB slices XOR-JIT ahead).
     #[cfg(target_arch = "x86_64")]
     const XORJIT_MAX_SLICE_BYTES: u64 = 256 * 1024;
+    let effective_bytes = (n as u64)
+        .saturating_mul(total_sources as u64)
+        .saturating_mul(plan.slice_size);
     // WEAVER_GF16_WGPU=1 forces the wgpu GPU arm: the x86 CPU fast tiers are
     // disabled for the run so the batch sets take the plain shape the GPU arm
     // consumes (`bufs`), with the universal CPU tier as the fallback.
@@ -2036,11 +2039,31 @@ fn execute_repair_streaming(
     let gpu_forced = weaver_reed_solomon::wgpu_gf16::force_requested();
     #[cfg(not(feature = "wgpu"))]
     let gpu_forced = false;
+    // A discrete GPU claims accumulation from the x86 fast tiers on its own
+    // (see `discrete_auto_candidate` for the measurements and why integrated
+    // GPUs don't). The probe runs only where its answer can change the shape —
+    // a host that would otherwise take an AVX2 fast tier — so aarch64/macOS
+    // never initialize the wgpu stack here and keep their Metal precedence.
+    //
+    // Decision table (adapter class × gate, when an x86 fast tier exists):
+    //   WEAVER_GF16_WGPU=1                → GPU owns accumulation (any adapter)
+    //   auto + DiscreteGpu + ≥ size gate  → GPU owns accumulation
+    //   auto + Integrated/Virtual/Cpu/…   → fast tier keeps it
+    //   WEAVER_GF16_WGPU=0                → fast tier keeps it
+    // With no fast tier, `engage` below keeps its own (CPU-rasterizer-only)
+    // refusal, unchanged.
+    #[cfg(feature = "wgpu")]
+    let gpu_discrete_auto = !gpu_forced
+        && crate::gf_simd::altmap_supported()
+        && weaver_reed_solomon::wgpu_gf16::discrete_auto_candidate(effective_bytes);
+    #[cfg(not(feature = "wgpu"))]
+    let gpu_discrete_auto = false;
+    let gpu_preferred = gpu_forced || gpu_discrete_auto;
     // Widest supported JIT tier (AVX512 preferred over AVX2, both !GFNI);
     // the same slice ceiling applies to both widths.
     #[cfg(target_arch = "x86_64")]
     let jit_width = weaver_reed_solomon::xor_jit::JitWidth::detect()
-        .filter(|_| plan.slice_size <= XORJIT_MAX_SLICE_BYTES && !gpu_forced);
+        .filter(|_| plan.slice_size <= XORJIT_MAX_SLICE_BYTES && !gpu_preferred);
     // Build the JIT memo up front so an executable-memory failure falls back to
     // shuffle2x before any buffer is shaped for the planar layout.
     #[cfg(target_arch = "x86_64")]
@@ -2049,17 +2072,15 @@ fn execute_repair_streaming(
     let use_xorjit = jit_memo.is_some();
     #[cfg(not(target_arch = "x86_64"))]
     let use_xorjit = false;
-    let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit && !gpu_forced;
+    let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit && !gpu_preferred;
     let memo = PreparedFactorMemo::from_matrix(&plan.input_factors, use_folded);
     let mut batch_sets = [
         StreamBatchSet::new(max_byte_len, use_folded, use_xorjit),
         StreamBatchSet::new(max_byte_len, use_folded, use_xorjit),
     ];
-    let effective_bytes = (n as u64)
-        .saturating_mul(total_sources as u64)
-        .saturating_mul(plan.slice_size);
-    // The GPU (Metal) arm is the non-x86 shape: engage only when neither x86
-    // fast path (folded or xorjit) owns the accumulation.
+    // GPU arm: engages when nothing else owns accumulation — either no x86
+    // fast path exists (the original non-x86 shape), or `gpu_preferred` above
+    // pinned the fast tiers off in favor of a forced or discrete-auto GPU.
     let mut gpu = GpuComputeArm::engage(use_folded || use_xorjit, n, max_byte_len, effective_bytes);
 
     info!(

@@ -181,9 +181,13 @@ fn shared_context() -> Option<&'static WgpuShared> {
             if matches!(wgpu_gate(), WgpuGate::Off) {
                 return None;
             }
-            // Headless compute: no window/display handle needed.
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            // Headless compute: no window/display handle needed. `WGPU_BACKEND`
+            // (wgpu's own env convention: vulkan/dx12/metal/gl) narrows the
+            // backend set — without this the choice between e.g. Vulkan and
+            // DX12 on Windows is wgpu's alone and cannot be pinned for A/Bs.
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::from_env().unwrap_or(descriptor.backends);
+            let instance = wgpu::Instance::new(descriptor);
             let adapter =
                 pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -224,7 +228,10 @@ fn shared_context() -> Option<&'static WgpuShared> {
                 device,
                 queue,
                 pipeline,
-                adapter_name: info.name,
+                // Backend included: "3080 Ti" alone cannot distinguish a
+                // Vulkan run from a DX12 run in logs, and that ambiguity has
+                // already cost one wrong benchmark conclusion.
+                adapter_name: format!("{} [{:?}]", info.name, info.backend),
                 device_type: info.device_type,
                 max_binding,
             })
@@ -259,6 +266,11 @@ fn shared_context() -> Option<&'static WgpuShared> {
 ///
 /// `Other` and `VirtualGpu` stay engaged too: drivers under-report (virtio-gpu,
 /// some Mesa builds), and refusing them would reject real hardware.
+///
+/// This table governs hosts where nothing else owns accumulation. When an x86
+/// fast tier exists, weaver-par2's arbitration asks the stricter
+/// [`discrete_auto_candidate`] question instead, and a non-discrete adapter on
+/// such a host never reaches this gate at all.
 fn auto_engageable(device_type: wgpu::DeviceType) -> bool {
     !matches!(device_type, wgpu::DeviceType::Cpu)
 }
@@ -292,6 +304,55 @@ pub fn auto_refused_cpu_adapter() -> bool {
 /// universal CPU tier as the fallback.
 pub fn force_requested() -> bool {
     matches!(wgpu_gate(), WgpuGate::Force)
+}
+
+/// Pure decision behind [`discrete_auto_candidate`], split out so the table is
+/// unit-testable without an adapter or environment state.
+fn discrete_auto_candidate_resolved(
+    gate: WgpuGate,
+    device_type: Option<wgpu::DeviceType>,
+    effective_bytes: u64,
+) -> bool {
+    matches!(gate, WgpuGate::Auto)
+        && effective_bytes >= MIN_EFFECTIVE_BYTES
+        && matches!(device_type, Some(wgpu::DeviceType::DiscreteGpu))
+}
+
+/// True when the AUTOMATIC gate should claim accumulation from an x86 CPU fast
+/// tier because a DISCRETE GPU is present and the repair clears the size gate.
+///
+/// This is a stricter question than [`auto_engageable`], and deliberately so:
+/// that gate serves hosts with no fast tier, where anything better than a CPU
+/// rasterizer wins by default. Here the GPU must beat a running start —
+/// AVX2/GFNI folded or XOR-JIT accumulation across every core — so the burden
+/// of proof flips, and only `DiscreteGpu` carries it. Measured (RTX 3080 Ti vs
+/// Ryzen 5 3600, AVX2/no-GFNI, `rar5_heavy_damage_250` end-to-end workflow):
+/// 2.21 s CPU vs 1.07 s GPU, ~2×. Kernel-isolated the same pairing is only at
+/// PARITY — the end-to-end win comes from freeing the whole CPU for the MD5 +
+/// I/O the repair runs concurrently, which is also why the decision cannot be
+/// made from kernel throughput alone. `IntegratedGpu` is refused here on the
+/// same evidence class: an Iris Xe measured 6.4× BEHIND a 16-thread GFNI CPU
+/// kernel-isolated, and no end-to-end win has been shown on an AVX2 host.
+/// `Other`/`VirtualGpu` are refused as unmeasured against a fast tier (the
+/// under-reporting-driver argument in [`auto_engageable`] does not outweigh a
+/// measured-fast CPU). `WEAVER_GF16_WGPU=1` remains the override for all of
+/// them, and `=0` still kills the arm entirely.
+///
+/// Cost: on the first affirmative-looking call this initializes the shared
+/// adapter/device/pipeline (`OnceLock`, once per process) just to read the
+/// device type — the same setup any engagement would pay, wasted only on
+/// hosts whose adapter is then refused. The gate and size pre-checks run
+/// first so hosts with the tier off, or repairs under the size gate, never
+/// pay the probe.
+pub fn discrete_auto_candidate(effective_bytes: u64) -> bool {
+    if !matches!(wgpu_gate(), WgpuGate::Auto) || effective_bytes < MIN_EFFECTIVE_BYTES {
+        return false;
+    }
+    discrete_auto_candidate_resolved(
+        WgpuGate::Auto,
+        shared_context().map(|shared| shared.device_type),
+        effective_bytes,
+    )
 }
 
 /// One repair's GPU residency: source/factor upload buffers, one destination
@@ -646,6 +707,51 @@ mod tests {
         (0..len)
             .map(|i| ((i * (salt + 7) + 13) % 251) as u8)
             .collect()
+    }
+
+    /// The full discrete-auto decision table, adapter- and env-free.
+    #[test]
+    fn discrete_auto_decision_table() {
+        use wgpu::DeviceType;
+        let big = MIN_EFFECTIVE_BYTES;
+        let small = MIN_EFFECTIVE_BYTES - 1;
+
+        // Only Auto + DiscreteGpu + at-or-above the size gate says yes.
+        assert!(discrete_auto_candidate_resolved(
+            WgpuGate::Auto,
+            Some(DeviceType::DiscreteGpu),
+            big
+        ));
+
+        // Every other adapter class is refused against a fast tier.
+        for device in [
+            DeviceType::IntegratedGpu,
+            DeviceType::Cpu,
+            DeviceType::VirtualGpu,
+            DeviceType::Other,
+        ] {
+            assert!(!discrete_auto_candidate_resolved(
+                WgpuGate::Auto,
+                Some(device),
+                big
+            ));
+        }
+        // No adapter at all.
+        assert!(!discrete_auto_candidate_resolved(WgpuGate::Auto, None, big));
+        // Under the size gate.
+        assert!(!discrete_auto_candidate_resolved(
+            WgpuGate::Auto,
+            Some(DeviceType::DiscreteGpu),
+            small
+        ));
+        // Off never claims; Force is handled by `force_requested`, not here.
+        for gate in [WgpuGate::Off, WgpuGate::Force] {
+            assert!(!discrete_auto_candidate_resolved(
+                gate,
+                Some(DeviceType::DiscreteGpu),
+                big
+            ));
+        }
     }
 
     /// GPU session against the CPU kernels: odd word counts (packed-unit
