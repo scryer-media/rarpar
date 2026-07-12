@@ -615,37 +615,63 @@ jobs:
   target-checks:
     name: target-checks-${{ matrix.platform }}
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64-gnu
+          - platform: linux-x86_64-gnu-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - platform: linux-x86_64-musl
+            features: runtime,wgpu
+            gpu: wgpu
+          - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-          - platform: linux-arm64-gnu
+            features: runtime,wgpu
+            gpu: wgpu
+          - platform: linux-x86_64-docker
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            features: runtime
+            gpu: none
+          - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - platform: linux-arm64-musl
+            features: runtime,wgpu
+            gpu: wgpu
+          - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            features: runtime,wgpu
+            gpu: wgpu
+          - platform: linux-arm64-docker
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            features: runtime
+            gpu: none
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
+            features: runtime,metal
+            gpu: metal
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
+            features: runtime
+            gpu: none
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
+            features: runtime,wgpu
+            gpu: wgpu
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
+            features: runtime,wgpu
+            gpu: wgpu
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -735,6 +761,15 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
+      - name: Check release target features
+        run: >-
+          cargo check --locked -p rarpar --no-default-features
+          --features ${{ matrix.features }} --target ${{ matrix.target }}
+      - name: Audit release target features
+        run: >-
+          cargo run --locked -p xtask -- feature-audit
+          --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
+          --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
@@ -747,31 +782,6 @@ jobs:
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
-
-  freebsd-par2-check:
-    name: freebsd-par2-check
-    needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check FreeBSD PAR2 support
-        uses: vmactions/freebsd-vm@v1.4.5
-        with:
-          release: "14.4"
-          arch: x86_64
-          usesh: true
-          sync: rsync
-          prepare: |
-            pkg install -y bash ca_root_nss cmake curl git nasm ninja perl5 pkgconf rust-bindgen-cli
-          run: |
-            set -euo pipefail
-            toolchain="$(awk -F'"' '/channel/ { print $2 }' rust-toolchain.toml)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal --default-toolchain "$toolchain"
-            . "$HOME/.cargo/env"
-            cargo check --locked -p weaver-reed-solomon -p weaver-par2
 
   package:
     name: package
@@ -1155,7 +1165,6 @@ jobs:
       - unrar-slow-tests
       - platform-tests
       - target-checks
-      - freebsd-par2-check
       - package
       - docs-package
       - cli-smoke

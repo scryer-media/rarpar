@@ -1781,20 +1781,26 @@ fn reconstruct_and_write_grouped_inputs(
 }
 
 /// One engaged GPU session. Metal (native, unified memory) has precedence on
-/// macOS; the wgpu backend (Vulkan/DX12/Metal) covers the remaining
+/// Apple Silicon; the wgpu backend (Vulkan/DX12/Metal) covers the remaining
 /// platforms. Both expose the identical begin/accumulate/finish protocol.
-#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+#[cfg(any(
+    all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+    feature = "wgpu"
+))]
 enum GpuSession {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     Metal(weaver_reed_solomon::metal_gf16::MetalGf16Session),
     #[cfg(feature = "wgpu")]
     Wgpu(weaver_reed_solomon::wgpu_gf16::WgpuGf16Session),
 }
 
-#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+#[cfg(any(
+    all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+    feature = "wgpu"
+))]
 impl GpuSession {
     fn try_new(outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Option<Self> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(session) = weaver_reed_solomon::metal_gf16::MetalGf16Session::try_new(
             outputs,
             max_byte_len,
@@ -1815,7 +1821,7 @@ impl GpuSession {
 
     fn begin_chunk(&mut self, byte_len: usize) -> std::result::Result<(), &'static str> {
         match self {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             GpuSession::Metal(s) => s.begin_chunk(byte_len),
             #[cfg(feature = "wgpu")]
             GpuSession::Wgpu(s) => s.begin_chunk(byte_len),
@@ -1828,7 +1834,7 @@ impl GpuSession {
         factor: impl Fn(usize, usize) -> u16,
     ) -> std::result::Result<(), &'static str> {
         match self {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             GpuSession::Metal(s) => s.accumulate(srcs, factor),
             #[cfg(feature = "wgpu")]
             GpuSession::Wgpu(s) => s.accumulate(srcs, factor),
@@ -1837,7 +1843,7 @@ impl GpuSession {
 
     fn finish_chunk(&mut self, rows: &mut [Vec<u8>]) -> std::result::Result<(), &'static str> {
         match self {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             GpuSession::Metal(s) => s.finish_chunk(rows),
             #[cfg(feature = "wgpu")]
             GpuSession::Wgpu(s) => s.finish_chunk(rows),
@@ -1846,7 +1852,7 @@ impl GpuSession {
 
     fn device_name(&self) -> String {
         match self {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             GpuSession::Metal(s) => s.device_name(),
             #[cfg(feature = "wgpu")]
             GpuSession::Wgpu(s) => s.device_name(),
@@ -1855,7 +1861,7 @@ impl GpuSession {
 
     fn backend_name(&self) -> &'static str {
         match self {
-            #[cfg(all(feature = "metal", target_os = "macos"))]
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             GpuSession::Metal(_) => "metal",
             #[cfg(feature = "wgpu")]
             GpuSession::Wgpu(_) => "wgpu",
@@ -1871,12 +1877,18 @@ impl GpuSession {
 /// permanently disables the arm and the caller redoes the affected chunk
 /// on the CPU.
 struct GpuComputeArm {
-    #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+    #[cfg(any(
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+        feature = "wgpu"
+    ))]
     session: Option<GpuSession>,
 }
 
 impl GpuComputeArm {
-    #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+    #[cfg(any(
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+        feature = "wgpu"
+    ))]
     fn engage(
         cpu_fast_path: bool,
         outputs: usize,
@@ -1907,7 +1919,10 @@ impl GpuComputeArm {
         Self { session }
     }
 
-    #[cfg(not(any(all(feature = "metal", target_os = "macos"), feature = "wgpu")))]
+    #[cfg(not(any(
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+        feature = "wgpu"
+    )))]
     fn engage(
         _cpu_fast_path: bool,
         _outputs: usize,
@@ -1919,7 +1934,10 @@ impl GpuComputeArm {
 
     /// True when the GPU owns this chunk's accumulation.
     fn begin_chunk(&mut self, _byte_len: usize) -> bool {
-        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+        #[cfg(any(
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+            feature = "wgpu"
+        ))]
         {
             if let Some(session) = self.session.as_mut() {
                 match session.begin_chunk(_byte_len) {
@@ -1942,7 +1960,10 @@ impl GpuComputeArm {
         _plan: &RepairPlan,
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+        #[cfg(any(
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+            feature = "wgpu"
+        ))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());
@@ -1970,7 +1991,10 @@ impl GpuComputeArm {
         _rows: &mut [Vec<u8>],
         _byte_len: usize,
     ) -> std::result::Result<(), ()> {
-        #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
+        #[cfg(any(
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+            feature = "wgpu"
+        ))]
         {
             let Some(session) = self.session.as_mut() else {
                 return Err(());

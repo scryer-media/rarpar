@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/rarpar"
@@ -17,7 +17,7 @@ repository = "https://github.com/scryer-media/rarpar"
 [workspace.dependencies]
 aes = { version = "0.9", features = ["zeroize"] }
 aws-lc-rs = { version = "1.16", default-features = false, features = ["non-fips"] }
-aws-lc-sys = { version = "0.41", default-features = false, features = ["all-bindings"] }
+aws-lc-sys = { version = "0.42", default-features = false, features = ["all-bindings"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["zeroize"] }
 hmac = { version = "0.13", default-features = false }

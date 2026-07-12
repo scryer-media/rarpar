@@ -34,8 +34,9 @@ writing, compression, or modification APIs.
 selected warm-cache median results from shipped-style release builds with
 verified output, not benchmark-only binaries. They are shape-specific; archive
 content, storage, and CPU features matter. Release builds use AWS-LC-backed
-native crypto where available, plus Metal-accelerated PAR2 repair on macOS with
-automatic CPU fallback.
+native crypto, with Metal repair on Apple Silicon and `wgpu` repair in direct
+Linux and Windows builds. Every GPU-capable build falls back to CPU when a
+suitable device or driver is unavailable.
 
 RAR extraction, compared with the reference RAR extraction utility:
 
@@ -59,12 +60,18 @@ PAR2 verification and repair, compared with `par2cmdline-turbo 1.4.0`:
 | Core Ultra 9 285H | Verify clean 1 GB set | 0.66 s | **0.37 s** | ~1.8x faster |
 | Ryzen 5 3600, Windows | Verify clean 1 GB set | 1.70 s | **0.30 s** | ~5.7x faster |
 
-### Metal On Apple Silicon
+### GPU Backends
 
-On macOS, `rarpar` enables Weaver's Metal GF(2^16) repair tier for PAR2. The
-repair engine attempts a Metal session for non-x86 macOS repairs. In the default
-auto mode it engages Metal when `outputs * sources * region_bytes` is at least
-256 MiB; below that, the CPU path avoids GPU setup/upload overhead. Set
+Apple Silicon archives enable Weaver's Metal GF(2^16) repair tier for PAR2.
+Intel macOS archives are CPU-only. Direct Linux GNU, direct Linux musl, and
+Windows archives enable the portable `wgpu` tier; they need a compatible host
+graphics driver and fall back to CPU when no suitable device is available.
+Docker images are deliberately CPU-only and contain neither GPU backend nor
+graphics-driver requirements.
+
+The Apple Silicon repair engine attempts Metal when
+`outputs * sources * region_bytes` is at least 256 MiB; below that, the CPU path
+avoids GPU setup/upload overhead. Set
 `WEAVER_GF16_METAL=1` to force the Metal path or `WEAVER_GF16_METAL=0` to
 disable it. Once a Metal session engages, it runs the streaming repair chunks
 until completion or a GPU error, and any failed chunk is redone on the CPU.
@@ -72,7 +79,7 @@ Repaired files are still read back and PAR2 verified before install.
 
 These numbers compare the same damaged PAR2 sets on an Apple M5 Max. `turbo` is
 `par2cmdline-turbo 1.4.0`; `Weaver CPU` is the all-core NEON path; `Weaver Metal`
-is the GPU path that `rarpar` now ships on macOS:
+is the GPU path shipped in Apple Silicon archives:
 
 | Platform | Workload | turbo | Weaver CPU | Weaver Metal | Result |
 |---|---|---:|---:|---:|---|
@@ -108,6 +115,21 @@ GitHub Releases and place it on your `PATH`.
 
 Release archives include a `rarpar(1)` manpage and shell completions under
 `share/`. Homebrew installs those automatically.
+
+Linux direct archives are available in GNU and musl forms, both with `wgpu`
+acceleration and CPU fallback. The separate `linux-*-docker` archives are
+CPU-only musl binaries used to build the container image; they are not selected
+by Homebrew.
+
+With Docker or another OCI runtime:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work \
+  ghcr.io/scryer-media/rarpar:latest ./release
+```
+
+The container image is CPU-only by design and carries the same manpage,
+completions, README, and license notices as the Docker-focused release archive.
 
 From source:
 

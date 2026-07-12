@@ -30,7 +30,10 @@ rtk cargo package --locked --list -p weaver-par2
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
 workflow accepts `package=all` for coordinated releases or one publishable crate
-name for a patch release. The `all` path publishes in the order above so each
+name for a patch release. Coordinated publishes derive every crate's version
+from its manifest, so packages such as `weaver-unrar` may advance independently
+of `weaver-reed-solomon` and `weaver-par2`; the `version` input is required only
+for a single-crate publish. The `all` path publishes in the order above so each
 downstream package can be verified by `cargo publish` after its internal
 dependency is visible in the crates.io index.
 
@@ -61,26 +64,23 @@ Verify repository metadata before the first publish.
   package-root layout. Native build lanes use `sccache`, Linux `mold`,
   path-prefix remapping, and `--no-install-recommends` native dependency
   installs.
-- `.github/workflows/release.yml` builds release archives for Linux GNU, Linux
-  musl, macOS Apple Silicon, macOS Intel, and Windows, then creates or updates
-  a GitHub Release. It runs on tags matching `rarpar-v*` and supports manual
-  dispatch against an existing tag. It validates that the tag version matches
-  the `rarpar` package, verifies that the packaged CLI manifest has registry
-  dependencies for the Weaver crates, validates generated manpages/completions,
-  smoke-tests each native binary, and uploads build logs plus `sccache` stats as
-  workflow
-  artifacts. Release archives include `share/` manpage and completion files.
-  The platform binaries are built from `cargo package -p rarpar` output unpacked
-  outside the workspace, so release builds pull the published `weaver-*` crates
-  like any other downstream tool instead of building against local path crates.
-  Linux GNU builds also upload package-root inspection artifacts for future
-  distro packaging work, but GitHub Releases receive only `rarpar-*.tar.gz`,
-  `rarpar-*.zip`, and `SHA256SUMS`. When `TAP_PUSH_TOKEN` is available, the
-  release job updates the `scryer-media/rarpar` Homebrew tap
-  (`scryer-media/homebrew-rarpar` on GitHub) with a single portable Homebrew
-  formula that selects the macOS archive for the current architecture and, on
-  Linux, prefers the GNU/glibc archive when glibc is new enough, falling back
-  to the musl archive otherwise.
+- `.github/workflows/release.yml` builds ten release archives: GNU and musl
+  direct GPU builds plus CPU-only Docker builds for both Linux architectures,
+  Apple Silicon and Intel macOS, and x86_64 and ARM64 Windows. Apple Silicon
+  uses Metal; direct Linux and Windows use `wgpu`; Intel macOS and Docker are
+  CPU-only. It verifies this policy against the target-filtered dependency graph
+  and builds from `cargo package -p rarpar` output unpacked outside the
+  workspace, so the binary resolves published `weaver-*` crates just as a
+  downstream consumer would. GNU direct builds upload package-root inspection
+  artifacts for future distro packages; GitHub Releases receive ten archives
+  and `SHA256SUMS`.
+- The release workflow also publishes a CPU-only multi-architecture image to
+  `ghcr.io/scryer-media/rarpar` from the Docker-focused musl archives. It pushes
+  an exact tag for every release and minor plus `latest` tags for stable releases,
+  then validates both image architectures and their manifest before publishing
+  the GitHub Release and Homebrew update.
+  Homebrew selects the GNU direct archive on glibc 2.35+ and the musl direct
+  archive otherwise; it never selects a Docker-focused archive.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
   selected package mode. It is manual-only and defaults to dry-run/preflight
   mode. Use `package=all` for coordinated releases or a specific package name
@@ -92,9 +92,9 @@ Verify repository metadata before the first publish.
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
-and `--remap-path-prefix`, are allowed. The `rarpar` binary enables the
-Weaver crates' native AWS-LC crypto path and macOS Metal PAR2 repair feature;
-Metal is target-gated and falls back to CPU repair when unavailable.
+and `--remap-path-prefix`, are allowed. Every native artifact enables AWS-LC;
+the feature audit requires one resolved `aws-lc-sys` version and rejects GPU
+dependencies from Docker and CPU-only artifacts.
 
 Required repository configuration:
 
@@ -107,6 +107,8 @@ Required repository configuration:
   `scryer-media/homebrew-rarpar` repository backing the `scryer-media/rarpar`
   Homebrew tap. The release workflow skips the tap update when this secret is
   absent.
+- GitHub Packages write permission: the release workflow uses `github.token` to
+  publish the GHCR image under `ghcr.io/scryer-media/rarpar`.
 - Release workflow access to the standard GitHub-hosted runner labels in
   `.github/workflows/release.yml`.
 - GitHub Actions cache access for `sccache` lanes. Cache saves are restricted

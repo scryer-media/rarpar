@@ -9,7 +9,7 @@ pub mod gf_pmul;
 pub mod gf_simd;
 pub mod matrix;
 pub mod matrix_tiled;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;

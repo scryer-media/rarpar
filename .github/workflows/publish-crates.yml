@@ -14,8 +14,8 @@ on:
           - weaver-unrar
           - weaver-par2
       version:
-        description: Package version to publish, for example 0.1.1.
-        required: true
+        description: Version for a single-crate publish. Coordinated publishes derive each crate version from its manifest.
+        required: false
         type: string
       dry_run:
         description: Run preflight only without publishing to crates.io.
@@ -24,7 +24,7 @@ on:
         type: boolean
 
 concurrency:
-  group: rarpar-publish-${{ inputs.package }}-${{ inputs.version }}
+  group: rarpar-publish
   cancel-in-progress: false
 
 permissions:
@@ -99,7 +99,7 @@ jobs:
           import subprocess
           import sys
 
-          expected = os.environ["EXPECTED_VERSION"]
+          expected = os.environ["EXPECTED_VERSION"].strip()
           selected_package = os.environ["PUBLISH_PACKAGE"]
           publishable = {
               "weaver-reed-solomon",
@@ -131,26 +131,16 @@ jobs:
               )
               sys.exit(1)
           if selected_package == "all":
-              bad = {name: version for name, version in selected.items() if version != expected}
-              if bad:
-                  print(
-                      f"version mismatch: expected all publishable crates at {expected}, got {selected}",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
+              print(f"coordinated publish versions: {selected}")
+          elif not expected:
+              print("version is required when publishing a single crate", file=sys.stderr)
+              sys.exit(1)
           elif selected.get(selected_package) != expected:
               print(
                   f"version mismatch: expected {selected_package} {expected}, got {selected}",
                   file=sys.stderr,
               )
               sys.exit(1)
-          if rarpar is None or rarpar["version"] != expected or rarpar.get("publish") != []:
-              if selected_package == "all":
-                  print(
-                      f"rarpar must be version {expected} with publish=false, got {rarpar}",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
           if rarpar is None or rarpar.get("publish") != []:
               print(f"rarpar must have publish=false, got {rarpar}", file=sys.stderr)
               sys.exit(1)
@@ -163,7 +153,6 @@ jobs:
       - name: Verify package contents
         env:
           PUBLISH_PACKAGE: ${{ inputs.package }}
-          PUBLISH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
@@ -190,6 +179,11 @@ jobs:
               weaver-par2) echo "crates/weaver-par2/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
+          }
+
+          crate_version() {
+            cargo metadata --locked --format-version 1 --no-deps \
+              | python3 -c 'import json,sys; crate=sys.argv[1]; packages=json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == crate))' "$1"
           }
 
           verify_fixture_exclude() {
@@ -232,17 +226,19 @@ jobs:
           }
 
           if [ "$PUBLISH_PACKAGE" = all ]; then
+            reed_solomon_version="$(crate_version weaver-reed-solomon)"
+            unrar_version="$(crate_version weaver-unrar)"
             package_and_list weaver-reed-solomon
 
-            if registry_has_version weaver-reed-solomon "$PUBLISH_VERSION"; then
+            if registry_has_version weaver-reed-solomon "$reed_solomon_version"; then
               package_and_list weaver-unrar
             else
-              echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$PUBLISH_VERSION is published"
+              echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$reed_solomon_version is published"
               verify_fixture_exclude weaver-unrar
             fi
 
-            if registry_has_version weaver-reed-solomon "$PUBLISH_VERSION" \
-              && registry_has_version weaver-unrar "$PUBLISH_VERSION"; then
+            if registry_has_version weaver-reed-solomon "$reed_solomon_version" \
+              && registry_has_version weaver-unrar "$unrar_version"; then
               package_and_list weaver-par2
             else
               echo "weaver-par2 exact package check deferred until same-release dependencies are published"
@@ -368,7 +364,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           PUBLISH_PACKAGE: ${{ inputs.package }}
-          PUBLISH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
@@ -459,6 +454,11 @@ jobs:
             return 1
           }
 
+          crate_version() {
+            cargo metadata --locked --format-version 1 --no-deps \
+              | python3 -c 'import json,sys; crate=sys.argv[1]; packages=json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == crate))' "$1"
+          }
+
           if [ "$PUBLISH_PACKAGE" = all ]; then
             crates="weaver-reed-solomon weaver-unrar weaver-par2"
           else
@@ -468,7 +468,7 @@ jobs:
           for crate in $crates; do
             verify_package_contents "$crate"
             publish_with_retry "$crate"
-            wait_for_crate_version "$crate" "$PUBLISH_VERSION"
+            wait_for_crate_version "$crate" "$(crate_version "$crate")"
           done
       - name: Show sccache stats
         if: always()

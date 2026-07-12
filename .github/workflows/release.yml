@@ -17,6 +17,7 @@ concurrency:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -137,7 +138,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rarpar-release-source"
           tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
           manifest="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}/Cargo.toml"
-          cargo metadata --locked --format-version 1 --no-deps \
+          cargo metadata --locked --format-version 1 \
             --manifest-path "$manifest" \
             > "$RUNNER_TEMP/rarpar-release-source/metadata.json"
           python3 - "$RUNNER_TEMP/rarpar-release-source/metadata.json" <<'PY'
@@ -149,7 +150,11 @@ jobs:
               package for package in metadata["packages"] if package["name"] == "rarpar"
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("weaver-par2", "weaver-unrar"):
+          expected_requirements = {
+              "weaver-par2": "^0.2.3",
+              "weaver-unrar": "^0.3.1",
+          }
+          for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)
               if dep is None:
                   print(f"missing dependency: {name}", file=sys.stderr)
@@ -161,7 +166,25 @@ jobs:
               if not version:
                   print(f"{name} is missing a registry version", file=sys.stderr)
                   sys.exit(1)
+              if version != expected_requirement:
+                  print(
+                      f"{name} must require {expected_requirement}, got {version}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
               print(f"packaged dependency: {name} {version}")
+          resolved = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+              if package["name"] in expected_requirements
+          }
+          expected_versions = {"weaver-par2": "0.2.3", "weaver-unrar": "0.3.1"}
+          if resolved != expected_versions:
+              print(
+                  f"packaged rarpar resolved {resolved}, expected {expected_versions}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
           PY
       - name: Run release preflight checks
         run: |
@@ -194,34 +217,76 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64-gnu
+          - platform: linux-x86_64-gnu-direct
             runs_on: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
-          - platform: linux-arm64-gnu
-            runs_on: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - platform: linux-x86_64-musl
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: true
+          - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
-          - platform: linux-arm64-musl
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: false
+          - platform: linux-x86_64-docker
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            features: runtime
+            gpu: none
+            package_root: false
+          - platform: linux-arm64-gnu-direct
+            runs_on: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: true
+          - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: false
+          - platform: linux-arm64-docker
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive_ext: tar.gz
+            features: runtime
+            gpu: none
+            package_root: false
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
             archive_ext: tar.gz
+            features: runtime,metal
+            gpu: metal
+            package_root: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
+            features: runtime
+            gpu: none
+            package_root: false
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             archive_ext: zip
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: false
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_ext: zip
+            features: runtime,wgpu
+            gpu: wgpu
+            package_root: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -265,7 +330,7 @@ jobs:
         if: matrix.platform == 'darwin-x86_64'
         run: brew install nasm
       - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.platform == 'windows-x86_64'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -407,14 +472,30 @@ jobs:
             throw "packaged rarpar manifest dependency validation failed"
           }
           "RARPAR_RELEASE_SOURCE=$sourceDir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Audit release target features (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          cargo run --locked -p xtask -- feature-audit
+          --manifest "$RARPAR_RELEASE_SOURCE/Cargo.toml" --target ${{ matrix.target }}
+          --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+      - name: Audit release target features (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
+          cargo run --locked -p xtask -- feature-audit `
+            --manifest $manifest --target ${{ matrix.target }} `
+            --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
       - name: Build rarpar (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p logs
-          cargo build --locked --release \
+          cargo build --locked --release --no-default-features \
             --manifest-path "$RARPAR_RELEASE_SOURCE/Cargo.toml" \
+            --features "${{ matrix.features }}" \
             --target "${{ matrix.target }}" \
             --target-dir "$RARPAR_RELEASE_TARGET_DIR" 2>&1 \
             | tee "logs/rarpar-${{ matrix.platform }}-build.log"
@@ -425,8 +506,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force logs | Out-Null
           $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
-          cargo build --locked --release `
+          cargo build --locked --release --no-default-features `
             --manifest-path $manifest `
+            --features ${{ matrix.features }} `
             --target ${{ matrix.target }} `
             --target-dir $env:RARPAR_RELEASE_TARGET_DIR 2>&1 `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
@@ -495,7 +577,7 @@ jobs:
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\
       - name: Stage package root inspection artifact (Linux GNU)
-        if: runner.os == 'Linux' && endsWith(matrix.platform, '-gnu')
+        if: matrix.package_root
         shell: bash
         run: |
           set -euo pipefail
@@ -527,7 +609,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Upload package root inspection artifact
-        if: runner.os == 'Linux' && endsWith(matrix.platform, '-gnu')
+        if: matrix.package_root
         uses: actions/upload-artifact@v7
         with:
           name: rarpar-package-root-${{ matrix.platform }}
@@ -535,9 +617,94 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  container:
+    name: deploy-ghcr
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Download Docker artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: rarpar-release-linux-*-docker
+          path: dist
+          merge-multiple: true
+      - name: Stage container context
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf container-context
+          mkdir -p container-context/amd64 container-context/arm64
+          tar -xzf "dist/rarpar-${RELEASE_TAG}-linux-x86_64-docker.tar.gz" -C container-context/amd64
+          tar -xzf "dist/rarpar-${RELEASE_TAG}-linux-arm64-docker.tar.gz" -C container-context/arm64
+          test -x container-context/amd64/rarpar
+          test -x container-context/arm64/rarpar
+          if find container-context -path '*/tests/fixtures/*' -print -quit | grep -q .; then
+            echo "::error::container context must not contain fixture corpora"
+            exit 1
+          fi
+      - id: image
+        name: Set image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#rarpar-v}"
+          {
+            echo "name=ghcr.io/${{ github.repository }}"
+            echo "version=$version"
+            echo "revision=$(git rev-list -n 1 "$RELEASE_TAG")"
+            echo "tags<<EOF"
+            echo "ghcr.io/${{ github.repository }}:$version"
+            if [[ "$version" != *-* && "$version" != *+* ]]; then
+              echo "ghcr.io/${{ github.repository }}:${version%.*}"
+              echo "ghcr.io/${{ github.repository }}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build and push CPU-only image
+        uses: docker/build-push-action@v7
+        with:
+          context: container-context
+          file: .github/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.image.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later AND UnRAR-restriction
+      - name: Validate container images
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}"
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" "$image" --version \
+              | tee "rarpar-${platform//\//-}-version.txt"
+            grep -Fxq "rarpar ${{ steps.image.outputs.version }}" "rarpar-${platform//\//-}-version.txt"
+            docker run --rm --platform "$platform" "$image" --help >/dev/null
+          done
+          docker buildx imagetools inspect "$image" | tee ghcr-manifest.txt
+          grep -Fq "linux/amd64" ghcr-manifest.txt
+          grep -Fq "linux/arm64" ghcr-manifest.txt
+
   deploy:
     name: deploy-github-release
-    needs: [build]
+    needs: [build, container]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -560,8 +727,8 @@ jobs:
                 cp "$file" "release-assets/$(basename "$file")"
               done
           asset_count="$(find release-assets -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) | wc -l | tr -d ' ')"
-          if [ "$asset_count" != 7 ]; then
-            echo "::error::expected 7 release archives, found $asset_count"
+          if [ "$asset_count" != 10 ]; then
+            echo "::error::expected 10 release archives, found $asset_count"
             find dist -maxdepth 4 -type f | sort
             exit 1
           fi
@@ -598,10 +765,10 @@ jobs:
           fi
 
           VERSION="${RELEASE_TAG#rarpar-v}"
-          LINUX_X86_GNU_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-gnu.tar.gz" | cut -d ' ' -f1)
-          LINUX_X86_MUSL_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-musl.tar.gz" | cut -d ' ' -f1)
-          LINUX_ARM_GNU_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-gnu.tar.gz" | cut -d ' ' -f1)
-          LINUX_ARM_MUSL_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-musl.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_GNU_DIRECT_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-gnu-direct.tar.gz" | cut -d ' ' -f1)
+          LINUX_X86_MUSL_DIRECT_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-x86_64-musl-direct.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_GNU_DIRECT_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-gnu-direct.tar.gz" | cut -d ' ' -f1)
+          LINUX_ARM_MUSL_DIRECT_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-linux-arm64-musl-direct.tar.gz" | cut -d ' ' -f1)
           DARWIN_ARM_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-darwin-arm64.tar.gz" | cut -d ' ' -f1)
           DARWIN_X86_SHA=$(shasum -a 256 "release-assets/rarpar-${RELEASE_TAG}-darwin-x86_64.tar.gz" | cut -d ' ' -f1)
           REPO="${{ github.repository }}"
@@ -664,21 +831,21 @@ jobs:
             on_linux do
               on_arm do
                 if RarparReleaseSelection.glibc_supported?
-                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-gnu.tar.gz"
-                  sha256 "${LINUX_ARM_GNU_SHA}"
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-gnu-direct.tar.gz"
+                  sha256 "${LINUX_ARM_GNU_DIRECT_SHA}"
                 else
-                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-musl.tar.gz"
-                  sha256 "${LINUX_ARM_MUSL_SHA}"
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-arm64-musl-direct.tar.gz"
+                  sha256 "${LINUX_ARM_MUSL_DIRECT_SHA}"
                 end
               end
 
               on_intel do
                 if RarparReleaseSelection.glibc_supported?
-                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-gnu.tar.gz"
-                  sha256 "${LINUX_X86_GNU_SHA}"
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-gnu-direct.tar.gz"
+                  sha256 "${LINUX_X86_GNU_DIRECT_SHA}"
                 else
-                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-musl.tar.gz"
-                  sha256 "${LINUX_X86_MUSL_SHA}"
+                  url "https://github.com/${REPO}/releases/download/rarpar-v${VERSION}/rarpar-rarpar-v${VERSION}-linux-x86_64-musl-direct.tar.gz"
+                  sha256 "${LINUX_X86_MUSL_DIRECT_SHA}"
                 end
               end
             end

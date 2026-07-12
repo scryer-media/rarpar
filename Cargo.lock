@@ -165,20 +165,8 @@ version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
 dependencies = [
- "aws-lc-sys 0.42.0",
+ "aws-lc-sys",
  "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
 ]
 
 [[package]]
@@ -2143,7 +2131,7 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "rarpar"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "clap",
  "serde",
@@ -3294,9 +3282,9 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
- "aws-lc-sys 0.41.0",
+ "aws-lc-sys",
  "bytes",
  "crc32fast",
  "criterion",
@@ -3314,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-reed-solomon"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "criterion",
  "memmap2",
@@ -3328,11 +3316,11 @@ dependencies = [
 
 [[package]]
 name = "weaver-unrar"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes",
  "aws-lc-rs",
- "aws-lc-sys 0.41.0",
+ "aws-lc-sys",
  "blake2s_simd",
  "cbc",
  "crc32fast",
@@ -3871,12 +3859,14 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
  "rarpar",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

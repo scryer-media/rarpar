@@ -8,9 +8,10 @@ repository.workspace = true
 
 [features]
 # Opt-in Apple-GPU (Metal) GF(2^16) backend. Off by default so CPU-only
-# consumers never link objc2/Metal. The objc2* deps below are macOS-only and
-# optional; the `metal_gf16` module and its tests are additionally gated on
-# `target_os = "macos"` since objc2 cannot build on other platforms.
+# consumers never link objc2/Metal. The objc2* deps below are Apple-Silicon-only
+# and optional; the `metal_gf16` module and its tests are gated on
+# `target_os = "macos", target_arch = "aarch64"` because objc2 cannot build on
+# other platforms.
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 # Opt-in portable-GPU (wgpu: Vulkan/DX12/Metal) GF(2^16) backend for the
 # platforms the native Metal backend does not cover. Off by default — wgpu is
@@ -39,7 +40,7 @@ path = "benches/gf16_gpu_vs_cpu.rs"
 harness = false
 required-features = ["wgpu"]
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = { version = "0.6.2", default-features = false, features = ["std"], optional = true }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSRange", "NSString"], optional = true }
 objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [

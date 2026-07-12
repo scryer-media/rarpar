@@ -15,11 +15,12 @@ separate layout.
 
 Future distro packages should use GNU/glibc Linux builds:
 
-- `linux-x86_64-gnu` for amd64/x86_64 packages
-- `linux-arm64-gnu` for arm64/aarch64 packages
+- `linux-x86_64-gnu-direct` for amd64/x86_64 packages
+- `linux-arm64-gnu-direct` for arm64/aarch64 packages
 
-The musl archives remain useful as portable direct-download artifacts and as the
-Homebrew Linux fallback when the host glibc is too old.
+The GNU and musl direct archives are GPU-capable through `wgpu` with CPU
+fallback. The musl `linux-*-docker` archives are CPU-only inputs to the GHCR
+image and must not be used for distro packages or Homebrew selection.
 
 ## Package Metadata Defaults
 
@@ -61,7 +62,9 @@ Expected file modes:
 GNU/glibc packages are expected to need no runtime dependency on system
 `unrar`, `rar`, `par2`, or `par2repair`. Beyond libc/system libraries, runtime
 dependencies should be confirmed from the final release binary before adding
-package metadata.
+package metadata. GPU-capable direct packages also rely on the host graphics
+driver stack; `wgpu` falls back to CPU when no suitable GPU is available. The
+CPU-only Docker image has no GPU runtime dependency.
 
 ## Future Automation
 
