@@ -630,7 +630,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           pattern: rarpar-release-linux-*-docker
-          path: dist
+          path: container-artifacts
           merge-multiple: true
       - name: Stage container context
         shell: bash
@@ -638,8 +638,8 @@ jobs:
           set -euo pipefail
           rm -rf container-context
           mkdir -p container-context/amd64 container-context/arm64
-          tar -xzf "dist/rarpar-${RELEASE_TAG}-linux-x86_64-docker.tar.gz" -C container-context/amd64
-          tar -xzf "dist/rarpar-${RELEASE_TAG}-linux-arm64-docker.tar.gz" -C container-context/arm64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-x86_64-docker.tar.gz" -C container-context/amd64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-arm64-docker.tar.gz" -C container-context/arm64
           test -x container-context/amd64/rarpar
           test -x container-context/arm64/rarpar
           if find container-context -path '*/tests/fixtures/*' -print -quit | grep -q .; then
