@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aws-lc-sys",
  "bytes",
