@@ -6740,7 +6740,8 @@ struct SegmentPackedHashVerifier {
 
 impl SegmentPackedHashVerifier {
     fn new(member_name: &str, segment: &DataSegment, hash_key: Option<[u8; 32]>) -> Option<Self> {
-        let expected = segment.packed_hash?;
+        // A header may carry both packed checksums; extraction verifies one.
+        let expected = segment.packed_hashes.preferred()?;
         let state = match expected {
             PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crc32fast::Hasher::new()),
             PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Box::default()),
@@ -7159,11 +7160,11 @@ impl<'a> ChainedSegmentReader<'a> {
                     }
                     let file_header =
                         RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    self.segments.push(DataSegment::with_packed_hash(
+                    self.segments.push(DataSegment::with_packed_hashes(
                         vol_idx,
                         fh.data_offset,
                         fh.packed_size,
-                        RarArchive::packed_hash_for_split_segment(&file_header, None),
+                        RarArchive::packed_hashes_for_split_segment(&file_header, None),
                         false,
                     ));
                     self.split_after = fh.split_after;
@@ -7194,17 +7195,17 @@ impl<'a> ChainedSegmentReader<'a> {
                             pf.header.data_size, self.max_data_segment
                         )));
                     }
-                    let packed_hash =
-                        RarArchive::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+                    let packed_hashes =
+                        RarArchive::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
                     let packed_hash_uses_mac = pf
                         .file_encryption
                         .as_ref()
                         .is_some_and(|fe| fe.use_hash_mac);
-                    self.segments.push(DataSegment::with_packed_hash(
+                    self.segments.push(DataSegment::with_packed_hashes(
                         vol_idx,
                         pf.header.data_offset,
                         pf.header.data_size,
-                        packed_hash,
+                        packed_hashes,
                         packed_hash_uses_mac,
                     ));
                     self.split_after = pf.header.split_after;

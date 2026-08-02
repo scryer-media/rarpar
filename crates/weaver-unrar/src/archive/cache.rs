@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DataSegment, FileEncryptionInfo, MemberEntry, PackedDataHash, RarArchive, ServiceEntry,
+    DataSegment, FileEncryptionInfo, MemberEntry, PackedDataHashes, RarArchive, ServiceEntry,
 };
 use crate::header::file::FileHeader;
 use crate::header::{Redirection, RedirectionType};
@@ -171,6 +171,11 @@ pub struct CachedEncryption {
     pub use_hash_mac: bool,
 }
 
+/// One volume's slice of a member, as persisted in the header cache.
+///
+/// Both packed-hash fields are populated whenever the header carried both.
+/// Caches written by older binaries recorded at most one of them, so both stay
+/// `#[serde(default)]` and decode to `None` when absent.
 #[derive(Serialize, Deserialize)]
 pub struct CachedSegment {
     pub volume_index: usize,
@@ -360,20 +365,13 @@ fn decode_host_os(host_os: u64) -> HostOs {
 fn cached_segments(segments: &[DataSegment]) -> Vec<CachedSegment> {
     segments
         .iter()
-        .map(|s| {
-            let (packed_crc32, packed_blake2_hash) = match s.packed_hash {
-                Some(PackedDataHash::Crc32(value)) => (Some(value), None),
-                Some(PackedDataHash::Blake2sp(value)) => (None, Some(value)),
-                None => (None, None),
-            };
-            CachedSegment {
-                volume_index: s.volume_index,
-                data_offset: s.data_offset,
-                data_size: s.data_size,
-                packed_crc32,
-                packed_blake2_hash,
-                packed_hash_uses_mac: s.packed_hash_uses_mac,
-            }
+        .map(|s| CachedSegment {
+            volume_index: s.volume_index,
+            data_offset: s.data_offset,
+            data_size: s.data_size,
+            packed_crc32: s.packed_hashes.crc32,
+            packed_blake2_hash: s.packed_hashes.blake2sp,
+            packed_hash_uses_mac: s.packed_hash_uses_mac,
         })
         .collect()
 }
@@ -382,15 +380,14 @@ fn data_segments(segments: Vec<CachedSegment>) -> Vec<DataSegment> {
     segments
         .into_iter()
         .map(|s| {
-            let packed_hash = s
-                .packed_blake2_hash
-                .map(PackedDataHash::Blake2sp)
-                .or_else(|| s.packed_crc32.map(PackedDataHash::Crc32));
-            DataSegment::with_packed_hash(
+            DataSegment::with_packed_hashes(
                 s.volume_index,
                 s.data_offset,
                 s.data_size,
-                packed_hash,
+                PackedDataHashes {
+                    crc32: s.packed_crc32,
+                    blake2sp: s.packed_blake2_hash,
+                },
                 s.packed_hash_uses_mac,
             )
         })
@@ -757,6 +754,7 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
+    use crate::archive::PackedDataHash;
 
     #[derive(Serialize)]
     struct OldCachedArchiveHeaders {
@@ -1035,10 +1033,55 @@ mod tests {
         assert_eq!(service.segments.len(), 1);
         assert_eq!(service.segments[0].volume_index, 3);
         assert_eq!(
-            service.segments[0].packed_hash,
-            Some(PackedDataHash::Crc32(0x0102_0304))
+            service.segments[0].packed_hashes,
+            PackedDataHashes {
+                crc32: Some(0x0102_0304),
+                blake2sp: None,
+            }
         );
         assert!(service.segments[0].packed_hash_uses_mac);
+    }
+
+    #[test]
+    fn cached_segments_round_trip_both_packed_hashes_and_older_single_hash_caches() {
+        let blake2 = [0x3C; 32];
+        let both = DataSegment::with_packed_hashes(
+            0,
+            64,
+            256,
+            PackedDataHashes {
+                crc32: Some(0x0A0B_0C0D),
+                blake2sp: Some(blake2),
+            },
+            false,
+        );
+
+        let cached = cached_segments(&[both]);
+        assert_eq!(cached[0].packed_crc32, Some(0x0A0B_0C0D));
+        assert_eq!(cached[0].packed_blake2_hash, Some(blake2));
+        let restored = data_segments(cached);
+        assert_eq!(restored[0].packed_hashes.crc32, Some(0x0A0B_0C0D));
+        assert_eq!(restored[0].packed_hashes.blake2sp, Some(blake2));
+        // Extraction still verifies exactly one hash, BLAKE2sp first.
+        assert_eq!(
+            restored[0].packed_hashes.preferred(),
+            Some(PackedDataHash::Blake2sp(blake2))
+        );
+
+        // A cache written before the widening recorded only the preferred hash.
+        let legacy = data_segments(vec![CachedSegment {
+            volume_index: 0,
+            data_offset: 64,
+            data_size: 256,
+            packed_crc32: None,
+            packed_blake2_hash: Some(blake2),
+            packed_hash_uses_mac: false,
+        }]);
+        assert_eq!(legacy[0].packed_hashes.crc32, None);
+        assert_eq!(
+            legacy[0].packed_hashes.preferred(),
+            Some(PackedDataHash::Blake2sp(blake2))
+        );
     }
 
     #[test]

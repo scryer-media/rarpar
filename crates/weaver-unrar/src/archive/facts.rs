@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{PackedDataHash, RarArchive, ReadSeek};
+use super::{RarArchive, ReadSeek};
 use crate::error::RarResult;
 use crate::signature;
 use crate::types::{ArchiveFormat, CompressionMethod};
@@ -83,6 +83,10 @@ pub struct RarVolumeMemberFacts {
     pub data_blake2_hash: Option<[u8; 32]>,
     #[serde(default)]
     pub version: Option<u64>,
+    /// Checksums of the packed bytes this volume holds, from a split-after
+    /// header. A RAR5 header may state both, and both are kept: CRC32 composes
+    /// across out-of-order ranges where BLAKE2sp does not. Facts cached by
+    /// older binaries carry at most one of them.
     #[serde(default)]
     pub packed_crc32: Option<u32>,
     #[serde(default)]
@@ -237,9 +241,7 @@ fn unix_owner_facts(owner: Option<crate::types::UnixOwnerInfo>) -> Option<RarVol
 impl RarVolumeServiceFacts {
     fn from_rar4_service(order: usize, fh: &crate::rar4::types::Rar4FileHeader) -> Self {
         let file_header = RarArchive::rar4_to_file_header(fh, false);
-        let (packed_crc32, packed_blake2_hash) = split_packed_hash(
-            RarArchive::packed_hash_for_split_segment(&file_header, None),
-        );
+        let packed_hashes = RarArchive::packed_hashes_for_split_segment(&file_header, None);
         Self {
             order: order as u32,
             name: fh.name.clone(),
@@ -253,8 +255,8 @@ impl RarVolumeServiceFacts {
             data_blake2_hash: None,
             version: file_header.version,
             comment_crc16: None,
-            packed_crc32,
-            packed_blake2_hash,
+            packed_crc32: packed_hashes.crc32,
+            packed_blake2_hash: packed_hashes.blake2sp,
             packed_hash_uses_mac: false,
             split_before: fh.split_before,
             split_after: fh.split_after,
@@ -415,10 +417,11 @@ impl RarVolumeServiceFacts {
     }
 
     fn from_rar5_service(order: usize, service: crate::header::ParsedService) -> Self {
-        let packed_hash =
-            RarArchive::packed_hash_for_split_segment(&service.header.inner, service.hash.as_ref());
-        let (packed_crc32, packed_blake2_hash) = split_packed_hash(packed_hash);
-        let packed_hash_uses_mac = packed_hash.is_some()
+        let packed_hashes = RarArchive::packed_hashes_for_split_segment(
+            &service.header.inner,
+            service.hash.as_ref(),
+        );
+        let packed_hash_uses_mac = packed_hashes.is_present()
             && service
                 .file_encryption
                 .as_ref()
@@ -436,8 +439,8 @@ impl RarVolumeServiceFacts {
             data_blake2_hash: file_hash_blake2(service.hash.as_ref()),
             version: service.header.inner.version,
             comment_crc16: None,
-            packed_crc32,
-            packed_blake2_hash,
+            packed_crc32: packed_hashes.crc32,
+            packed_blake2_hash: packed_hashes.blake2sp,
             packed_hash_uses_mac,
             split_before: service.header.inner.split_before,
             split_after: service.header.inner.split_after,
@@ -460,14 +463,6 @@ impl RarVolumeServiceFacts {
             stream_name: None,
             stream_name_raw: None,
         }
-    }
-}
-
-fn split_packed_hash(packed_hash: Option<PackedDataHash>) -> (Option<u32>, Option<[u8; 32]>) {
-    match packed_hash {
-        Some(PackedDataHash::Crc32(value)) => (Some(value), None),
-        Some(PackedDataHash::Blake2sp(value)) => (None, Some(value)),
-        None => (None, None),
     }
 }
 
@@ -554,9 +549,8 @@ impl RarArchive {
                 .map(|(order, fh)| {
                     let file_header =
                         RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    let (packed_crc32, packed_blake2_hash) = split_packed_hash(
-                        RarArchive::packed_hash_for_split_segment(&file_header, None),
-                    );
+                    let packed_hashes =
+                        RarArchive::packed_hashes_for_split_segment(&file_header, None);
                     RarVolumeMemberFacts {
                         order: order as u32,
                         name: fh.name.clone(),
@@ -565,8 +559,8 @@ impl RarArchive {
                         data_crc32: (!fh.is_rar14).then_some(fh.crc32),
                         data_blake2_hash: None,
                         version: file_header.version,
-                        packed_crc32,
-                        packed_blake2_hash,
+                        packed_crc32: packed_hashes.crc32,
+                        packed_blake2_hash: packed_hashes.blake2sp,
                         packed_hash_uses_mac: false,
                         split_before: fh.split_before,
                         split_after: fh.split_after,
@@ -666,12 +660,11 @@ impl RarArchive {
             .into_iter()
             .enumerate()
             .map(|(order, parsed_file)| {
-                let packed_hash = RarArchive::packed_hash_for_split_segment(
+                let packed_hashes = RarArchive::packed_hashes_for_split_segment(
                     &parsed_file.header,
                     parsed_file.hash.as_ref(),
                 );
-                let (packed_crc32, packed_blake2_hash) = split_packed_hash(packed_hash);
-                let packed_hash_uses_mac = packed_hash.is_some()
+                let packed_hash_uses_mac = packed_hashes.is_present()
                     && parsed_file
                         .file_encryption
                         .as_ref()
@@ -684,8 +677,8 @@ impl RarArchive {
                     data_crc32: parsed_file.header.data_crc32,
                     data_blake2_hash: file_hash_blake2(parsed_file.hash.as_ref()),
                     version: parsed_file.header.version,
-                    packed_crc32,
-                    packed_blake2_hash,
+                    packed_crc32: packed_hashes.crc32,
+                    packed_blake2_hash: packed_hashes.blake2sp,
                     packed_hash_uses_mac,
                     split_before: parsed_file.header.split_before,
                     split_after: parsed_file.header.split_after,
@@ -818,6 +811,83 @@ mod tests {
         bytes
     }
 
+    /// Assemble one RAR5 block. `sizes` carries the optional extra-area and
+    /// data-area sizes, in the order their header flags select them.
+    fn build_rar5_block(
+        header_type: u64,
+        header_flags: u64,
+        sizes: &[u64],
+        type_body: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::vint::encode_vint(header_type));
+        body.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        for size in sizes {
+            body.extend_from_slice(&crate::vint::encode_vint(*size));
+        }
+        body.extend_from_slice(type_body);
+
+        let header_size = crate::vint::encode_vint(body.len() as u64);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header_size);
+        hasher.update(&body);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&hasher.finalize().to_le_bytes());
+        raw.extend_from_slice(&header_size);
+        raw.extend_from_slice(&body);
+        raw
+    }
+
+    /// A one-volume RAR5 archive whose only file header is a split-after
+    /// stored part carrying both a Pack-CRC32 field and a BLAKE2sp record.
+    fn rar5_split_after_archive_bytes(
+        name: &str,
+        payload: &[u8],
+        unpacked_size: u64,
+        packed_crc32: u32,
+        blake2: [u8; 32],
+    ) -> Vec<u8> {
+        let mut hash_body = crate::vint::encode_vint(0); // BLAKE2sp hash type.
+        hash_body.extend_from_slice(&blake2);
+        let hash_type = crate::vint::encode_vint(crate::header::extra::record_type::FILE_HASH);
+        let mut extra_area = crate::vint::encode_vint((hash_type.len() + hash_body.len()) as u64);
+        extra_area.extend_from_slice(&hash_type);
+        extra_area.extend_from_slice(&hash_body);
+
+        let mut file_body = Vec::new();
+        file_body.extend_from_slice(&crate::vint::encode_vint(
+            crate::header::file::flags::CRC32_PRESENT,
+        ));
+        file_body.extend_from_slice(&crate::vint::encode_vint(unpacked_size));
+        file_body.extend_from_slice(&crate::vint::encode_vint(0o644)); // attributes.
+        file_body.extend_from_slice(&packed_crc32.to_le_bytes());
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+        file_body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+        file_body.extend_from_slice(&crate::vint::encode_vint(name.len() as u64));
+        file_body.extend_from_slice(name.as_bytes());
+        file_body.extend_from_slice(&extra_area);
+
+        let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&build_rar5_block(
+            1,
+            0,
+            &[],
+            &crate::vint::encode_vint(crate::header::main_archive::flags::VOLUME),
+        ));
+        bytes.extend_from_slice(&build_rar5_block(
+            2,
+            crate::header::common::flags::EXTRA_AREA
+                | crate::header::common::flags::DATA_AREA
+                | crate::header::common::flags::SPLIT_AFTER,
+            &[extra_area.len() as u64, payload.len() as u64],
+            &file_body,
+        ));
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&build_rar5_block(5, 0, &[], &crate::vint::encode_vint(1)));
+        bytes
+    }
+
     #[test]
     fn named_messagepack_legacy_volume_facts_default_new_fields() {
         let legacy = LegacyVolumeFacts {
@@ -944,6 +1014,32 @@ mod tests {
         assert_eq!(decoded.services.len(), 1);
         assert!(!decoded.services[0].is_child);
         assert!(!decoded.services[0].is_inherited);
+    }
+
+    #[test]
+    fn rar5_split_after_facts_keep_packed_crc32_alongside_blake2() {
+        let payload = vec![0xA5u8; 64];
+        let packed_crc32 = crc32fast::hash(&payload);
+        let blake2 = [0x7Bu8; 32];
+        let bytes = rar5_split_after_archive_bytes(
+            "Silver.Horizon.S01E01.mkv",
+            &payload,
+            4096,
+            packed_crc32,
+            blake2,
+        );
+
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        let member = &facts.members[0];
+        assert!(member.split_after);
+        assert_eq!(member.data_size, payload.len() as u64);
+        // Both packed checksums survive: the CRC32 is no longer discarded just
+        // because the header also carried a BLAKE2sp record.
+        assert_eq!(member.packed_crc32, Some(packed_crc32));
+        assert_eq!(member.packed_blake2_hash, Some(blake2));
+        assert_eq!(member.data_crc32, Some(packed_crc32));
+        assert_eq!(member.data_blake2_hash, Some(blake2));
     }
 
     #[test]

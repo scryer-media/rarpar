@@ -44,6 +44,7 @@ pub mod progress;
 pub mod rar4;
 pub mod recovery;
 pub mod signature;
+pub mod stored_layout;
 pub mod types;
 pub mod vint;
 pub mod volume;
@@ -80,6 +81,10 @@ pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
 pub use recovery::{RecoveryOptions, RecoveryReport, restore_volumes_from_paths};
+pub use stored_layout::{
+    IneligibilityReason, MalformedReason, MappedSlice, MemberEligibility, StoredLayoutBuilder,
+    StoredLayoutError, StoredMember, StoredMemberPart, VolumeSplitEvidence,
+};
 pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
     MemberInfo, TopologyMemberInfo, UnixOwnerInfo, VolumeSpan,

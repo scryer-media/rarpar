@@ -92,16 +92,16 @@ impl RarArchive {
         let mut members = Vec::new();
 
         for pf in parsed.files {
-            let packed_hash = Self::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+            let packed_hashes = Self::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
             let packed_hash_uses_mac = pf
                 .file_encryption
                 .as_ref()
                 .is_some_and(|enc| enc.use_hash_mac);
-            let segment = DataSegment::with_packed_hash(
+            let segment = DataSegment::with_packed_hashes(
                 volume_number,
                 pf.header.data_offset,
                 pf.header.data_size,
-                packed_hash,
+                packed_hashes,
                 packed_hash_uses_mac,
             );
             let mut file_header = pf.header;
@@ -121,7 +121,7 @@ impl RarArchive {
         let mut services = Vec::new();
         for service in parsed.services {
             let entry = {
-                let packed_hash = Self::packed_hash_for_split_segment(
+                let packed_hashes = Self::packed_hashes_for_split_segment(
                     &service.header.inner,
                     service.hash.as_ref(),
                 );
@@ -129,11 +129,11 @@ impl RarArchive {
                     .file_encryption
                     .as_ref()
                     .is_some_and(|enc| enc.use_hash_mac);
-                let segment = DataSegment::with_packed_hash(
+                let segment = DataSegment::with_packed_hashes(
                     volume_number,
                     service.header.inner.data_offset,
                     service.header.inner.data_size,
-                    packed_hash,
+                    packed_hashes,
                     packed_hash_uses_mac,
                 );
                 let mut file_header = service.header.inner;
@@ -246,11 +246,11 @@ impl RarArchive {
         let mut members = Vec::new();
         for fh in &parsed.files {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-            let segment = DataSegment::with_packed_hash(
+            let segment = DataSegment::with_packed_hashes(
                 0,
                 fh.data_offset,
                 fh.packed_size,
-                Self::packed_hash_for_split_segment(&file_header, None),
+                Self::packed_hashes_for_split_segment(&file_header, None),
                 false,
             );
             members.push(MemberEntry {
@@ -272,11 +272,11 @@ impl RarArchive {
                 header_offset: fh.data_offset,
                 is_child: false,
                 is_inherited: false,
-                segments: vec![DataSegment::with_packed_hash(
+                segments: vec![DataSegment::with_packed_hashes(
                     0,
                     fh.data_offset,
                     fh.packed_size,
-                    Self::packed_hash_for_split_segment(&file_header, None),
+                    Self::packed_hashes_for_split_segment(&file_header, None),
                     false,
                 )],
                 file_header,
