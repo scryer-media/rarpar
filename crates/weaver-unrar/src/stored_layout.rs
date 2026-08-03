@@ -47,9 +47,23 @@ pub enum MalformedReason {
     /// The header declares the unpacked size unknown, so neither the chain sum
     /// nor a destination size can be established.
     MissingUnpackedSize,
+    /// Two parts declare different whole-member unpacked sizes. Reported in
+    /// volume order — the lowest volume's declaration first — so the reason is
+    /// the same whatever order the volumes arrive in.
+    InconsistentUnpackedSize { first: u64, second: u64 },
     /// A complete stored chain's packed bytes do not sum to the member's
     /// unpacked size. Checked over the whole chain, never per part.
     SizeMismatch {
+        packed_total: u64,
+        unpacked_size: u64,
+    },
+    /// The parts seen so far already carry more stored bytes than the declared
+    /// unpacked size, so the chain is wrong before it even closes. Stored bytes
+    /// are the member's bytes, so no such part can have a destination.
+    ///
+    /// `packed_total` is saturated to `u64::MAX` in the one case the true sum
+    /// cannot be represented: headers claiming more than `u64::MAX` bytes.
+    ExceedsDeclaredSize {
         packed_total: u64,
         unpacked_size: u64,
     },
@@ -58,13 +72,24 @@ pub enum MalformedReason {
 /// Why a member's bytes cannot be routed straight to a destination.
 ///
 /// The variants carry what a caller needs to apply its own policy — notably
-/// the byte counts a compressed member would cost if it were tolerated.
+/// the byte counts a compressed member would cost if it were tolerated. Those
+/// counts are the member's totals only when the variant says so: a chain that
+/// is still open has more parts to come, and a size no header states is not a
+/// zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IneligibilityReason {
     /// At least one part uses a compression method other than `Store`.
     Compressed {
-        packed_bytes: u64,
-        unpacked_bytes: u64,
+        /// Packed bytes summed over the parts seen so far — the member's total
+        /// only when `totals_final`, a lower bound otherwise. `None` when the
+        /// sum overflows `u64`, which only a hostile header can claim.
+        packed_bytes: Option<u64>,
+        /// The whole-member unpacked size the headers declare, or `None` when
+        /// no header states one. Never a substituted zero.
+        unpacked_bytes: Option<u64>,
+        /// Whether the chain is closed, so both counts are the member's totals
+        /// rather than a running lower bound over the parts seen so far.
+        totals_final: bool,
     },
     /// At least one part is encrypted.
     Encrypted,
@@ -123,6 +148,19 @@ pub struct StoredMemberPart {
     /// Offset of this part inside the member, or `None` while any earlier part
     /// of the chain is still unknown. No header states this value; it is the
     /// prefix sum of the earlier parts' `data_size`.
+    ///
+    /// Stable while the member is not [`MemberEligibility::Ineligible`]: for a
+    /// well-formed set a later volume only ever resolves a `None`, never moves
+    /// an offset it already reported. A malformation is the exception — an
+    /// earlier part arriving late can renumber the chain or unresolve it
+    /// ([`MalformedReason::UnexpectedChainStart`],
+    /// [`MalformedReason::ContinuationInFirstVolume`]) — but it does so in the
+    /// same [`StoredLayoutBuilder::add_volume`] call that turns the member
+    /// ineligible, so no offset ever moves while the member still routes.
+    ///
+    /// A caller that has already written bytes therefore holds the only record
+    /// of where they went; this field describes the current layout, not the
+    /// history of what was emitted.
     pub logical_offset: Option<u64>,
     /// CRC32 of this part's packed bytes, from a non-final split header.
     pub packed_crc32: Option<u32>,
@@ -287,6 +325,12 @@ pub struct StoredLayoutBuilder {
     volumes: BTreeMap<u32, VolumeRecord>,
     members: Vec<StoredMember>,
     traits: Vec<MemberTraits>,
+    /// Per member, the whole-member unpacked size each volume's header states,
+    /// keyed by volume. Kept apart from the member so the size and any
+    /// disagreement between parts are read in volume order rather than in the
+    /// order the volumes happened to arrive. Headers stating no size at all are
+    /// absent rather than recorded.
+    declarations: Vec<BTreeMap<u32, u64>>,
     index: HashMap<String, usize>,
     frontier: Option<u32>,
 }
@@ -299,6 +343,7 @@ impl StoredLayoutBuilder {
             volumes: BTreeMap::new(),
             members: Vec::new(),
             traits: Vec::new(),
+            declarations: Vec::new(),
             index: HashMap::new(),
             frontier: None,
         }
@@ -367,11 +412,12 @@ impl StoredLayoutBuilder {
                 continue;
             }
 
+            if let Some(unpacked_size) = snapshot.unpacked_size {
+                self.declarations[member_index].insert(volume, unpacked_size);
+            }
+
             let member = &mut self.members[member_index];
             member.first_volume = member.first_volume.min(volume);
-            if member.unpacked_size.is_none() {
-                member.unpacked_size = snapshot.unpacked_size;
-            }
             // Only a final part states the whole-member checksums; every
             // earlier part's fields describe that volume's packed bytes.
             if !snapshot.split_after {
@@ -402,17 +448,30 @@ impl StoredLayoutBuilder {
         }
 
         extents.sort_by_key(|extent| extent.data_offset);
-        for pair in extents.windows(2) {
-            let (left, right) = (pair[0], pair[1]);
-            if left.data_size > 0
-                && right.data_size > 0
-                && left.data_offset.saturating_add(left.data_size) > right.data_offset
-            {
-                for member_index in [left.member_index, right.member_index] {
-                    self.traits[member_index]
-                        .malformed
-                        .get_or_insert(MalformedReason::OverlappingParts { volume });
+        // A sweep, not a walk over adjacent pairs: a member whose range sits
+        // wholly inside an earlier member's range is not its neighbour once the
+        // extents are sorted, yet it still overlaps it. Carrying the furthest
+        // end seen so far catches every such extent, and marks both parties as
+        // the pairwise check did. Zero-length extents claim no bytes and so
+        // overlap nothing.
+        let mut covered: Option<(u64, usize)> = None;
+        for extent in &extents {
+            if extent.data_size == 0 {
+                continue;
+            }
+            let extent_end = extent.data_offset.saturating_add(extent.data_size);
+            match covered {
+                Some((end, owner)) if extent.data_offset < end => {
+                    for member_index in [owner, extent.member_index] {
+                        self.traits[member_index]
+                            .malformed
+                            .get_or_insert(MalformedReason::OverlappingParts { volume });
+                    }
+                    if extent_end > end {
+                        covered = Some((extent_end, extent.member_index));
+                    }
                 }
+                _ => covered = Some((extent_end, extent.member_index)),
             }
         }
 
@@ -446,9 +505,13 @@ impl StoredLayoutBuilder {
     /// The largest `N` for which volumes `0..=N` have all been added, or `None`
     /// while volume 0 is missing.
     ///
-    /// Payload arriving for a volume past the frontier cannot be fully placed:
-    /// a part's logical offset needs every earlier part's header, so the
-    /// frontier bounds how far ahead of the header chain a router can route.
+    /// A *split continuation* arriving for a volume past the frontier cannot be
+    /// placed: its logical offset is the prefix sum of the earlier parts, so it
+    /// needs every earlier part's header. The frontier bounds how far ahead of
+    /// the header chain such a part can be routed. It says nothing about a
+    /// member that begins and ends inside one volume: that part starts at
+    /// logical 0 and routes as soon as its own volume is added, however far
+    /// ahead of the frontier the volume is.
     pub fn header_frontier(&self) -> Option<u32> {
         self.frontier
     }
@@ -469,12 +532,18 @@ impl StoredLayoutBuilder {
     /// Slices come back in physical order and cover the requested range
     /// exactly; adjacent runs of the same non-member kind are coalesced. An
     /// empty range maps to no slices.
+    ///
+    /// A range running past `u64::MAX` is clamped to end there before anything
+    /// else — no volume byte can live at such an offset — and every branch
+    /// reports the same clamped length, so the returned slices always sum to
+    /// `min(len, u64::MAX - offset)`.
     pub fn map_physical_range(&self, volume: u32, offset: u64, len: u64) -> Vec<MappedSlice> {
         let mut slices = Vec::new();
+        let end = offset.saturating_add(len);
+        let len = end - offset;
         if len == 0 {
             return slices;
         }
-        let end = offset.saturating_add(len);
 
         let Some(record) = self.volumes.get(&volume) else {
             slices.push(MappedSlice::Unroutable { len });
@@ -510,27 +579,37 @@ impl StoredLayoutBuilder {
             let run_end = extent_end.min(end);
             let run_len = run_end - cursor;
             let member = &self.members[extent.member_index];
-            let part = member
-                .parts
-                .binary_search_by_key(&volume, |part| part.volume)
-                .ok()
-                .and_then(|position| member.parts[position].logical_offset);
-            let slice = match (member.eligibility.routes_direct(), part) {
-                (true, Some(logical_offset)) => MappedSlice::Member {
-                    member_index: extent.member_index,
-                    logical_offset: logical_offset + (cursor - extent.data_offset),
-                    len: run_len,
-                },
-                (true, None) => MappedSlice::Unroutable { len: run_len },
-                (false, _) => MappedSlice::Envelope { len: run_len },
-            };
-            push_slice(&mut slices, slice);
+            if member.eligibility.routes_direct() {
+                // `None` for a part whose prefix sum is still unknown, and for
+                // the offset a hostile chain pushes past `u64::MAX`; both mean
+                // the same thing here — these bytes have no known destination.
+                let logical_offset = member
+                    .parts
+                    .binary_search_by_key(&volume, |part| part.volume)
+                    .ok()
+                    .and_then(|position| member.parts[position].logical_offset)
+                    .and_then(|base| base.checked_add(cursor - extent.data_offset));
+                push_member_run(
+                    &mut slices,
+                    extent.member_index,
+                    member.unpacked_size,
+                    logical_offset,
+                    run_len,
+                );
+            } else {
+                push_slice(&mut slices, MappedSlice::Envelope { len: run_len });
+            }
             cursor = run_end;
         }
 
         if cursor < end {
             push_slice(&mut slices, MappedSlice::Envelope { len: end - cursor });
         }
+        debug_assert_eq!(
+            slices.iter().map(slice_len).sum::<u64>(),
+            len,
+            "mapped slices must cover the clamped request exactly"
+        );
         slices
     }
 
@@ -551,6 +630,7 @@ impl StoredLayoutBuilder {
             eligibility: MemberEligibility::ProvisionallyDirect,
         });
         self.traits.push(MemberTraits::default());
+        self.declarations.push(BTreeMap::new());
         self.index.insert(snapshot.name.clone(), index);
         index
     }
@@ -592,36 +672,56 @@ impl StoredLayoutBuilder {
         let mut parts = std::mem::take(&mut self.members[member_index].parts);
 
         // A logical offset is the prefix sum of the earlier parts, so it exists
-        // only from a known first part and only across an unbroken run.
+        // only from a known first part and only across an unbroken run. Sums
+        // are checked, never saturated: a saturated offset is a plausible-
+        // looking lie, and headers claiming petabyte-scale parts are free.
         let head_known = parts.first().is_some_and(|part| !part.split_before);
         let mut running = head_known.then_some(0u64);
         let mut expected_volume = parts.first().map_or(0, |part| part.volume);
-        let mut packed_total = 0u64;
+        let mut packed_total = Some(0u64);
         for part in &mut parts {
             if part.volume != expected_volume {
                 running = None;
             }
             part.logical_offset = running;
-            running = running.map(|value| value.saturating_add(part.data_size));
+            running = running.and_then(|value| value.checked_add(part.data_size));
             expected_volume = part.volume.saturating_add(1);
-            packed_total = packed_total.saturating_add(part.data_size);
+            packed_total = packed_total.and_then(|value| value.checked_add(part.data_size));
         }
 
         let chain_complete =
             running.is_some() && parts.last().is_some_and(|part| !part.split_after);
+
+        // Read in volume order rather than arrival order, so which size the
+        // member ends up with — and whether its parts disagree at all — does
+        // not depend on which volume happened to arrive first.
+        let mut declared = self.declarations[member_index].values().copied();
+        let unpacked_size = declared.next();
+        let inconsistent = unpacked_size.and_then(|first| {
+            declared
+                .find(|other| *other != first)
+                .map(|second| MalformedReason::InconsistentUnpackedSize { first, second })
+        });
+
         let traits = self.traits[member_index];
-        let malformed = traits.malformed.or_else(|| self.chain_malformation(&parts));
-        let eligibility = classify(
-            traits,
-            malformed,
-            chain_complete,
-            packed_total,
-            self.members[member_index].unpacked_size,
-            self.members[member_index].data_crc32,
-            self.members[member_index].data_blake2_hash,
-        );
+        let malformed = traits
+            .malformed
+            .or_else(|| self.chain_malformation(&parts))
+            .or(inconsistent);
 
         let member = &mut self.members[member_index];
+        member.unpacked_size = unpacked_size;
+        let eligibility = classify(
+            traits,
+            ChainFacts {
+                malformed,
+                complete: chain_complete,
+                packed_total,
+                unpacked_size,
+                data_crc32: member.data_crc32,
+                data_blake2_hash: member.data_blake2_hash,
+            },
+        );
         member.eligibility = eligibility;
         member.chain_complete = chain_complete;
         member.parts = parts;
@@ -678,24 +778,80 @@ fn push_slice(slices: &mut Vec<MappedSlice>, slice: MappedSlice) {
     }
 }
 
+/// How many bytes one slice accounts for.
+fn slice_len(slice: &MappedSlice) -> u64 {
+    match *slice {
+        MappedSlice::Member { len, .. }
+        | MappedSlice::Envelope { len }
+        | MappedSlice::Unroutable { len } => len,
+    }
+}
+
+/// Append one extent run belonging to a member the layout routes.
+///
+/// A run is the member's bytes only as far as the declared unpacked size
+/// reaches. An open chain is routed before anything has checked its totals, so
+/// a part can claim packed bytes that run past the member's declared end; those
+/// bytes have no destination — the chain closing is what will demote the member
+/// — and are reported unroutable rather than written past the file's length.
+/// An unknown offset (unresolved prefix sum, or one pushed past `u64::MAX`)
+/// makes the whole run unroutable the same way.
+fn push_member_run(
+    slices: &mut Vec<MappedSlice>,
+    member_index: usize,
+    unpacked_size: Option<u64>,
+    logical_offset: Option<u64>,
+    run_len: u64,
+) {
+    let routed = logical_offset
+        .map(|logical_offset| {
+            let limit = unpacked_size.unwrap_or(u64::MAX);
+            let room = limit.saturating_sub(logical_offset);
+            (logical_offset, run_len.min(room))
+        })
+        .filter(|(_, len)| *len > 0);
+
+    let Some((logical_offset, len)) = routed else {
+        push_slice(slices, MappedSlice::Unroutable { len: run_len });
+        return;
+    };
+    push_slice(
+        slices,
+        MappedSlice::Member {
+            member_index,
+            logical_offset,
+            len,
+        },
+    );
+    if len < run_len {
+        push_slice(slices, MappedSlice::Unroutable { len: run_len - len });
+    }
+}
+
+/// What one resolved chain states about itself, as [`classify`] reads it.
+#[derive(Debug, Clone, Copy)]
+struct ChainFacts {
+    malformed: Option<MalformedReason>,
+    /// The chain runs from a known first part to a known last part with no
+    /// unseen volume in between.
+    complete: bool,
+    /// The parts' packed sizes summed, or `None` when that sum runs past
+    /// `u64::MAX` — impossible for real bytes, free for a header to claim.
+    packed_total: Option<u64>,
+    unpacked_size: Option<u64>,
+    data_crc32: Option<u32>,
+    data_blake2_hash: Option<[u8; 32]>,
+}
+
 /// Classify a member from its accumulated facts.
 ///
 /// The order is deliberate: a fact that rules out any handling is reported
 /// ahead of one a caller might tolerate, so an encrypted or solid member never
 /// presents itself as merely compressed.
-#[allow(clippy::too_many_arguments)]
-fn classify(
-    traits: MemberTraits,
-    malformed: Option<MalformedReason>,
-    chain_complete: bool,
-    packed_total: u64,
-    unpacked_size: Option<u64>,
-    data_crc32: Option<u32>,
-    data_blake2_hash: Option<[u8; 32]>,
-) -> MemberEligibility {
+fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
     use IneligibilityReason as Reason;
 
-    if let Some(reason) = malformed {
+    if let Some(reason) = chain.malformed {
         return MemberEligibility::Ineligible(Reason::MalformedChain(reason));
     }
     if traits.directory {
@@ -712,21 +868,41 @@ fn classify(
     }
     if traits.compressed {
         return MemberEligibility::Ineligible(Reason::Compressed {
-            packed_bytes: packed_total,
-            unpacked_bytes: unpacked_size.unwrap_or(0),
+            packed_bytes: chain.packed_total,
+            unpacked_bytes: chain.unpacked_size,
+            totals_final: chain.complete,
         });
     }
-    if !chain_complete {
+
+    // A sum past `u64::MAX` exceeds every size a header can declare, so it is
+    // read at its saturated value from here down.
+    let packed_total = chain.packed_total.unwrap_or(u64::MAX);
+    // Stored bytes are the member's bytes, so the chain can never carry more of
+    // them than the member declares. Checked before the chain closes as well:
+    // an open chain routes, and a part reaching past the declared end would
+    // otherwise hand the caller a destination the file does not have.
+    if let Some(unpacked_size) = chain.unpacked_size
+        && packed_total > unpacked_size
+    {
+        return MemberEligibility::Ineligible(Reason::MalformedChain(
+            MalformedReason::ExceedsDeclaredSize {
+                packed_total,
+                unpacked_size,
+            },
+        ));
+    }
+    if !chain.complete {
         return MemberEligibility::ProvisionallyDirect;
     }
 
-    let Some(unpacked_size) = unpacked_size else {
+    let Some(unpacked_size) = chain.unpacked_size else {
         return MemberEligibility::Ineligible(Reason::MalformedChain(
             MalformedReason::MissingUnpackedSize,
         ));
     };
-    // Stored bytes are the member's bytes, so the whole chain must sum to the
-    // declared size. Never checked per part: only the sum is meaningful.
+    // A complete chain must sum to exactly the declared size — the check above
+    // has already ruled out overshooting. Never checked per part: only the sum
+    // is meaningful.
     if packed_total != unpacked_size {
         return MemberEligibility::Ineligible(Reason::MalformedChain(
             MalformedReason::SizeMismatch {
@@ -736,7 +912,7 @@ fn classify(
         ));
     }
 
-    match (data_crc32, data_blake2_hash) {
+    match (chain.data_crc32, chain.data_blake2_hash) {
         (Some(_), _) => MemberEligibility::DirectEligible,
         (None, Some(_)) => MemberEligibility::Ineligible(Reason::Blake2OnlyNoCrc32),
         (None, None) => MemberEligibility::Ineligible(Reason::NoChecksum),
@@ -750,6 +926,8 @@ mod tests {
 
     const EPISODE: &str = "Silver.Horizon.S01E01.mkv";
     const EXTRA: &str = "Silver.Horizon.S01E01.nfo";
+    const NEIGHBOUR: &str = "Silver.Horizon.S01E02.mkv";
+    const DISTANT: &str = "Silver.Horizon.S01E03.mkv";
 
     /// A stored, unsplit, unencrypted member with no checksum yet.
     fn member(name: &str, data_offset: u64, data_size: u64) -> RarVolumeMemberFacts {
@@ -803,9 +981,64 @@ mod tests {
         facts.split_before = split_before;
         facts.split_after = split_after;
         if split_after {
-            facts.packed_crc32 = Some(0xC0DE_0000 + data_size as u32);
+            facts.packed_crc32 = Some(0xC0DE_0000_u32.wrapping_add(data_size as u32));
         }
         facts
+    }
+
+    /// Deterministic, non-uniform part sizes. A prefix sum over these cannot be
+    /// mistaken for `index * size`, so a test asserting one is asserting the
+    /// real thing.
+    fn part_size(number: u32) -> u64 {
+        512 + u64::from((number * 37) % 89) * 8
+    }
+
+    /// Every part's currently reported offset, keyed by the part's identity
+    /// rather than its position, so a newly inserted part cannot look like a
+    /// moved one.
+    fn reported_offsets(builder: &StoredLayoutBuilder) -> BTreeMap<(String, u32), Option<u64>> {
+        builder
+            .members()
+            .iter()
+            .flat_map(|member| {
+                member
+                    .parts
+                    .iter()
+                    .map(|part| ((member.name.clone(), part.volume), part.logical_offset))
+            })
+            .collect()
+    }
+
+    /// Add a volume and hold the layout to its one stability promise: a part
+    /// that has already reported an offset never reports a different one, and
+    /// never withdraws it, unless that same call turns its member ineligible.
+    fn add_stably(builder: &mut StoredLayoutBuilder, number: u32, facts: &RarVolumeFacts) {
+        let before = reported_offsets(builder);
+        add(builder, number, facts);
+        let after = reported_offsets(builder);
+
+        for ((name, volume), old) in before {
+            // An unresolved part resolving is the whole point of the layout.
+            let Some(old) = old else { continue };
+            let new = after[&(name.clone(), volume)];
+            if new == Some(old) {
+                continue;
+            }
+            let member = builder
+                .members()
+                .iter()
+                .find(|member| member.name == name)
+                .expect("members are never dropped");
+            assert!(
+                matches!(
+                    member.eligibility,
+                    MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(_))
+                ),
+                "volume {volume} of {name} moved from {old} to {new:?} while the member was \
+                 still {:?}",
+                member.eligibility
+            );
+        }
     }
 
     fn with_crc32(mut facts: RarVolumeMemberFacts, crc32: u32) -> RarVolumeMemberFacts {
@@ -972,18 +1205,20 @@ mod tests {
     }
 
     #[test]
-    fn long_chain_routes_only_behind_the_header_frontier() {
+    fn a_long_chain_resolves_each_prefix_sum_as_its_volume_arrives() {
         const VOLUMES: u32 = 64;
-        const PART: u64 = 1024;
         const HEADER: u64 = 96;
 
+        let total: u64 = (0..VOLUMES).map(part_size).sum();
         let mut builder = layout();
+        let mut expected_offset = 0u64;
         for number in 0..VOLUMES {
+            let size = part_size(number);
             let part = split_part(
                 EPISODE,
                 HEADER,
-                PART,
-                PART * u64::from(VOLUMES),
+                size,
+                total,
                 number > 0,
                 number + 1 < VOLUMES,
             );
@@ -994,42 +1229,71 @@ mod tests {
             }]);
             // Payload for a volume not yet added is not placeable at all.
             assert_eq!(
-                builder.map_physical_range(number, HEADER, PART),
-                vec![MappedSlice::Unroutable { len: PART }]
+                builder.map_physical_range(number, HEADER, size),
+                vec![MappedSlice::Unroutable { len: size }]
             );
 
-            add(&mut builder, number, &facts);
+            add_stably(&mut builder, number, &facts);
 
             assert_eq!(builder.header_frontier(), Some(number));
             assert_eq!(
-                builder.map_physical_range(number, HEADER, PART),
+                builder.map_physical_range(number, HEADER, size),
                 vec![MappedSlice::Member {
                     member_index: 0,
-                    logical_offset: PART * u64::from(number),
-                    len: PART,
+                    logical_offset: expected_offset,
+                    len: size,
                 }]
             );
+            expected_offset += size;
         }
+        assert_eq!(expected_offset, total);
 
         let member = &builder.members()[0];
         assert_eq!(member.parts.len(), VOLUMES as usize);
+        let mut running = 0u64;
         for (position, part) in member.parts.iter().enumerate() {
-            assert_eq!(part.logical_offset, Some(PART * position as u64));
+            assert_eq!(part.data_size, part_size(position as u32));
+            assert_eq!(part.logical_offset, Some(running));
+            running += part.data_size;
         }
+        assert_eq!(member.eligibility, MemberEligibility::DirectEligible);
+    }
+
+    #[test]
+    fn an_unsplit_member_routes_ahead_of_the_header_frontier() {
+        // The frontier bounds split continuations, which need every earlier
+        // part's header. A member that starts and ends in one volume starts at
+        // logical 0 whatever the frontier says.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            7,
+            &volume(vec![with_crc32(member(EXTRA, 40, 10), 0x1111_1111)]),
+        );
+
+        assert_eq!(builder.header_frontier(), None);
+        assert_eq!(
+            builder.map_physical_range(7, 40, 10),
+            vec![MappedSlice::Member {
+                member_index: 0,
+                logical_offset: 0,
+                len: 10,
+            }]
+        );
     }
 
     #[test]
     fn long_chain_added_out_of_order_resolves_when_the_gap_closes() {
         const VOLUMES: u32 = 52;
-        const PART: u64 = 512;
         const HEADER: u64 = 64;
 
-        let total = PART * u64::from(VOLUMES);
+        let total: u64 = (0..VOLUMES).map(part_size).sum();
+        let offset_of = |number: u32| -> u64 { (0..number).map(part_size).sum() };
         let facts_for = |number: u32| {
             let part = split_part(
                 EPISODE,
                 HEADER,
-                PART,
+                part_size(number),
                 total,
                 number > 0,
                 number + 1 < VOLUMES,
@@ -1048,7 +1312,7 @@ mod tests {
             if number == 1 {
                 continue;
             }
-            add(&mut builder, number, &facts_for(number));
+            add_stably(&mut builder, number, &facts_for(number));
         }
 
         assert_eq!(builder.header_frontier(), Some(0));
@@ -1060,24 +1324,28 @@ mod tests {
             "no part past the hole can know where it starts"
         );
         assert_eq!(
-            builder.map_physical_range(2, HEADER, PART),
-            vec![MappedSlice::Unroutable { len: PART }]
+            builder.map_physical_range(2, HEADER, part_size(2)),
+            vec![MappedSlice::Unroutable { len: part_size(2) }]
         );
 
-        add(&mut builder, 1, &facts_for(1));
+        add_stably(&mut builder, 1, &facts_for(1));
 
         assert_eq!(builder.header_frontier(), Some(VOLUMES - 1));
         let member = &builder.members()[0];
+        let mut running = 0u64;
         for (position, part) in member.parts.iter().enumerate() {
-            assert_eq!(part.logical_offset, Some(PART * position as u64));
+            assert_eq!(part.data_size, part_size(position as u32));
+            assert_eq!(part.logical_offset, Some(running));
+            running += part.data_size;
         }
+        assert_eq!(running, total);
         assert_eq!(member.eligibility, MemberEligibility::DirectEligible);
         assert_eq!(
-            builder.map_physical_range(2, HEADER, PART),
+            builder.map_physical_range(2, HEADER, part_size(2)),
             vec![MappedSlice::Member {
                 member_index: 0,
-                logical_offset: PART * 2,
-                len: PART,
+                logical_offset: offset_of(2),
+                len: part_size(2),
             }]
         );
     }
@@ -1161,8 +1429,9 @@ mod tests {
         assert_eq!(
             ineligible(&builder, 1),
             IneligibilityReason::Compressed {
-                packed_bytes: 30,
-                unpacked_bytes: 90,
+                packed_bytes: Some(30),
+                unpacked_bytes: Some(90),
+                totals_final: true,
             }
         );
         // The gap, the compressed member's packed bytes and the trailing gap
@@ -1170,6 +1439,65 @@ mod tests {
         assert_eq!(
             builder.map_physical_range(0, 150, 60),
             vec![MappedSlice::Envelope { len: 60 }]
+        );
+    }
+
+    #[test]
+    fn a_compressed_members_byte_counts_say_whether_they_are_totals() {
+        // A caller budgeting the cost of tolerating a compressed member must be
+        // able to tell a total from a running lower bound, and an undeclared
+        // size from a zero-byte member.
+        let compressed = |facts: RarVolumeMemberFacts| {
+            let mut facts = facts;
+            facts.compression_method = CompressionMethod::Normal.code();
+            facts
+        };
+
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![compressed(split_part(EXTRA, 40, 30, 90, false, true))]),
+        );
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(30),
+                unpacked_bytes: Some(90),
+                totals_final: false,
+            },
+            "an open chain has more parts to come"
+        );
+
+        add(
+            &mut builder,
+            1,
+            &volume(vec![with_crc32(
+                compressed(split_part(EXTRA, 40, 25, 90, true, false)),
+                0x2222_2222,
+            )]),
+        );
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(55),
+                unpacked_bytes: Some(90),
+                totals_final: true,
+            }
+        );
+
+        // A member whose header states no unpacked size reports none, not zero.
+        let mut sizeless = compressed(member(EPISODE, 40, 10));
+        sizeless.unpacked_size = None;
+        let mut builder = layout();
+        add(&mut builder, 0, &volume(vec![sizeless]));
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(10),
+                unpacked_bytes: None,
+                totals_final: true,
+            }
         );
     }
 
@@ -1271,6 +1599,283 @@ mod tests {
                 unpacked_size: 60,
             })
         );
+    }
+
+    #[test]
+    fn a_member_swallowed_by_another_members_range_is_overlapping() {
+        // Sorted by offset, a contained member is not the neighbour of the
+        // member that swallows it, so a walk over adjacent pairs goes straight
+        // past the overlap. Both shapes here escaped that walk: a member ending
+        // inside the swallowing range, and one wholly inside it.
+        for inner in [(190u64, 50u64), (140u64, 10u64)] {
+            let mut builder = layout();
+            add(
+                &mut builder,
+                0,
+                &volume(vec![
+                    with_crc32(member(EPISODE, 100, 100), 0x1111_1111),
+                    with_crc32(member(EXTRA, 120, 10), 0x2222_2222),
+                    with_crc32(member(NEIGHBOUR, inner.0, inner.1), 0x3333_3333),
+                    with_crc32(member(DISTANT, 300, 10), 0x4444_4444),
+                ]),
+            );
+
+            let overlapping =
+                IneligibilityReason::MalformedChain(MalformedReason::OverlappingParts {
+                    volume: 0,
+                });
+            for index in 0..3 {
+                assert_eq!(
+                    ineligible(&builder, index),
+                    overlapping,
+                    "member {index} with inner extent {inner:?}"
+                );
+            }
+            // The member clear of every overlap keeps its own verdict, and the
+            // overlapping members' bytes take the envelope path.
+            assert_eq!(
+                builder.members()[3].eligibility,
+                MemberEligibility::DirectEligible
+            );
+            assert_eq!(
+                builder.map_physical_range(0, 100, 150),
+                vec![MappedSlice::Envelope { len: 150 }]
+            );
+        }
+    }
+
+    #[test]
+    fn parts_declaring_different_unpacked_sizes_are_malformed_in_either_order() {
+        // Which size a member ends up with cannot depend on which volume the
+        // router happened to see first.
+        let head = || split_part(EPISODE, 40, 10, 30, false, true);
+        let tail = || with_crc32(split_part(EPISODE, 40, 20, 999, true, false), 0xFEED_BEEF);
+        let expected =
+            IneligibilityReason::MalformedChain(MalformedReason::InconsistentUnpackedSize {
+                first: 30,
+                second: 999,
+            });
+
+        let mut forward = layout();
+        add(&mut forward, 0, &volume(vec![head()]));
+        add(&mut forward, 1, &volume(vec![tail()]));
+
+        let mut backward = layout();
+        add(&mut backward, 1, &volume(vec![tail()]));
+        add(&mut backward, 0, &volume(vec![head()]));
+
+        for builder in [&forward, &backward] {
+            assert_eq!(ineligible(builder, 0), expected);
+            // The lowest volume's declaration is the one that stands, whichever
+            // volume arrived first.
+            assert_eq!(builder.members()[0].unpacked_size, Some(30));
+        }
+    }
+
+    #[test]
+    fn an_open_chain_carrying_more_than_the_declared_size_is_malformed_before_it_closes() {
+        // A stored part is the member's own bytes, so a part already past the
+        // declared end has bytes with nowhere to go. Waiting for the chain to
+        // close would route them in the meantime.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![split_part(EPISODE, 40, 500, 100, false, true)]),
+        );
+
+        assert!(!builder.members()[0].chain_complete);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 500,
+                unpacked_size: 100,
+            })
+        );
+        assert_eq!(
+            builder.map_physical_range(0, 40, 500),
+            vec![MappedSlice::Envelope { len: 500 }]
+        );
+    }
+
+    #[test]
+    fn a_routed_run_is_clamped_to_the_members_declared_end() {
+        // The check above catches every representable overshoot before a member
+        // is routed, so the only way a routed part can still reach past the
+        // declared end is a chain whose sums run past `u64::MAX`.
+        const HUGE: u64 = u64::MAX - 100;
+
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![split_part(EPISODE, 40, HUGE, u64::MAX, false, true)]),
+        );
+        add(
+            &mut builder,
+            1,
+            &volume(vec![split_part(EPISODE, 40, 1000, u64::MAX, true, true)]),
+        );
+
+        assert_eq!(
+            builder.members()[0].eligibility,
+            MemberEligibility::ProvisionallyDirect
+        );
+        // Only 100 of that part's 1000 packed bytes are inside the member.
+        assert_eq!(
+            builder.map_physical_range(1, 40, 1000),
+            vec![
+                MappedSlice::Member {
+                    member_index: 0,
+                    logical_offset: HUGE,
+                    len: 100,
+                },
+                MappedSlice::Unroutable { len: 900 },
+            ]
+        );
+    }
+
+    #[test]
+    fn hostile_part_sizes_never_saturate_an_offset_or_panic() {
+        const HUGE: u64 = u64::MAX - 100;
+
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![split_part(EPISODE, 40, HUGE, u64::MAX, false, true)]),
+        );
+        add(
+            &mut builder,
+            1,
+            &volume(vec![split_part(EPISODE, 40, 1000, u64::MAX, true, true)]),
+        );
+        add(
+            &mut builder,
+            2,
+            &volume(vec![split_part(EPISODE, 40, 1000, u64::MAX, true, true)]),
+        );
+
+        let member = &builder.members()[0];
+        assert_eq!(member.parts[0].logical_offset, Some(0));
+        assert_eq!(member.parts[1].logical_offset, Some(HUGE));
+        // The prefix sum runs past `u64::MAX` here: unresolved, never saturated
+        // into an offset that looks like an answer.
+        assert_eq!(member.parts[2].logical_offset, None);
+        assert_eq!(
+            builder.map_physical_range(2, 40, 1000),
+            vec![MappedSlice::Unroutable { len: 1000 }]
+        );
+        // Nor does the mapping saturate one: an offset that only overflows
+        // part-way into a part is just as unplaceable.
+        assert_eq!(
+            builder.map_physical_range(1, 240, 100),
+            vec![MappedSlice::Unroutable { len: 100 }]
+        );
+
+        // Declaring a size those parts blow past demotes the member outright.
+        let mut demoted = layout();
+        add(
+            &mut demoted,
+            0,
+            &volume(vec![split_part(EPISODE, 40, 1 << 62, 1 << 20, false, true)]),
+        );
+        add(
+            &mut demoted,
+            1,
+            &volume(vec![split_part(EPISODE, 40, 1 << 62, 1 << 20, true, true)]),
+        );
+        assert_eq!(
+            ineligible(&demoted, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 1 << 63,
+                unpacked_size: 1 << 20,
+            })
+        );
+        assert_eq!(
+            demoted.map_physical_range(0, 40, 1 << 62),
+            vec![MappedSlice::Envelope { len: 1 << 62 }]
+        );
+    }
+
+    #[test]
+    fn a_range_running_past_the_addressable_end_is_clamped_in_every_branch() {
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![with_crc32(member(EPISODE, 100, 64), 0x1234_5678)]),
+        );
+
+        // Present volume and missing volume clamp the same way, so a caller
+        // cannot tell the two apart by how many bytes came back.
+        assert_eq!(
+            builder.map_physical_range(0, u64::MAX - 10, 100),
+            vec![MappedSlice::Envelope { len: 10 }]
+        );
+        assert_eq!(
+            builder.map_physical_range(1, u64::MAX - 10, 100),
+            vec![MappedSlice::Unroutable { len: 10 }]
+        );
+        // A range starting at the addressable end covers nothing at all.
+        assert!(builder.map_physical_range(0, u64::MAX, 100).is_empty());
+        assert!(builder.map_physical_range(1, u64::MAX, 100).is_empty());
+    }
+
+    #[test]
+    fn offsets_only_move_when_the_same_volume_makes_the_member_ineligible() {
+        // A chain whose first part sits in volume 1 — nothing yet says an
+        // earlier volume carries any of it.
+        let head = || split_part(EPISODE, 40, 10, 30, false, true);
+        let tail = || with_crc32(split_part(EPISODE, 40, 20, 30, true, false), 0xFEED_BEEF);
+        let offsets = |builder: &StoredLayoutBuilder| {
+            builder.members()[0]
+                .parts
+                .iter()
+                .map(|part| part.logical_offset)
+                .collect::<Vec<_>>()
+        };
+
+        let mut renumbered = layout();
+        add_stably(&mut renumbered, 1, &volume(vec![head()]));
+        add_stably(&mut renumbered, 2, &volume(vec![tail()]));
+        assert_eq!(offsets(&renumbered), vec![Some(0), Some(10)]);
+        assert_eq!(
+            renumbered.members()[0].eligibility,
+            MemberEligibility::DirectEligible
+        );
+
+        // An earlier part arriving late renumbers the chain. `add_stably` is
+        // the assertion that it can only do so in the call that demotes the
+        // member, which is what lets a caller trust an offset it acted on.
+        add_stably(
+            &mut renumbered,
+            0,
+            &volume(vec![split_part(EPISODE, 40, 5, 30, false, true)]),
+        );
+        assert_eq!(offsets(&renumbered), vec![Some(0), Some(5), Some(15)]);
+        assert_eq!(
+            ineligible(&renumbered, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::UnexpectedChainStart {
+                volume: 1,
+            })
+        );
+
+        // The same arrival flagged as a continuation withdraws the offsets
+        // instead of moving them — again only alongside the demotion.
+        let mut unresolved = layout();
+        add_stably(&mut unresolved, 1, &volume(vec![head()]));
+        add_stably(&mut unresolved, 2, &volume(vec![tail()]));
+        add_stably(
+            &mut unresolved,
+            0,
+            &volume(vec![split_part(EPISODE, 40, 5, 30, true, true)]),
+        );
+        assert_eq!(offsets(&unresolved), vec![None, None, None]);
+        assert!(matches!(
+            ineligible(&unresolved, 0),
+            IneligibilityReason::MalformedChain(_)
+        ));
     }
 
     #[test]
@@ -1459,6 +2064,54 @@ mod tests {
         }
 
         assert_eq!(builder.header_frontier(), Some(4));
+
+        // Every byte of every volume is accounted for: the mapping is a
+        // partition of the file, not a set of interesting fragments.
+        for (number, path) in volumes.iter().enumerate() {
+            let file_len = std::fs::metadata(path).unwrap().len();
+            let slices = builder.map_physical_range(number as u32, 0, file_len);
+            assert_eq!(
+                slices.iter().map(slice_len).sum::<u64>(),
+                file_len,
+                "volume {number} mapping must cover the whole file"
+            );
+            assert!(
+                slices
+                    .iter()
+                    .any(|slice| matches!(slice, MappedSlice::Member { .. })),
+                "volume {number} carries member bytes"
+            );
+        }
+
+        // The fixture's member spans all five volumes: the four non-final parts
+        // state the CRC32 of their own packed bytes, and only the final part's
+        // header states the whole-member CRC32.
+        const PACKED_CRC32: [u32; 4] = [2_728_221_531, 183_482_895, 1_141_563_331, 2_959_284_075];
+        let split = builder
+            .members()
+            .iter()
+            .find(|member| member.parts.len() > 1)
+            .expect("the fixture set splits a member across volumes");
+        assert_eq!(split.parts.len(), 5);
+        for (position, expected) in PACKED_CRC32.iter().enumerate() {
+            let part = &split.parts[position];
+            assert!(
+                part.split_after,
+                "part {position} continues into the next volume"
+            );
+            assert_eq!(
+                part.packed_crc32,
+                Some(*expected),
+                "part {position} states its own packed CRC32"
+            );
+        }
+        let final_part = &split.parts[4];
+        assert!(!final_part.split_after);
+        assert_eq!(
+            final_part.packed_crc32, None,
+            "a final part has no packed-only CRC32 to state"
+        );
+        assert_eq!(split.data_crc32, Some(3_348_152_310));
         let direct: Vec<&StoredMember> = builder
             .members()
             .iter()
