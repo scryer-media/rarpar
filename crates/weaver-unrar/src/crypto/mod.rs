@@ -1647,6 +1647,61 @@ pub fn decrypt_cipher_range(
     Ok(())
 }
 
+/// Encrypt one arbitrary range of a RAR5 member's cipher stream, in place.
+///
+/// The exact inverse of [`decrypt_cipher_range`], and its mirror in every
+/// respect: same argument order, same in-place semantics, same error type, same
+/// "the caller owns the predecessor" contract. AES-CBC encryption is
+/// deterministic given key, predecessor and plaintext, so a caller holding a
+/// member's plaintext can reproduce exactly the bytes that were posted — which
+/// is what a reader has to hand back when the archive's own bytes are gone and
+/// only the decrypted member is on disk.
+///
+/// - `key` is the member's AES-256 key, from
+///   [`KdfCache::derive_key_rar5`] over its `FHEXTRA_CRYPT` salt and KDF count.
+/// - `preceding_block` is the 16 **cipher** bytes immediately before `plain`'s
+///   first byte, or the member's header IV
+///   ([`crate::RarVolumeMemberEncryptionFacts::iv`]) when `plain` starts at
+///   member-logical offset 0. Passing the wrong 16 bytes is not a detectable
+///   error here, so the caller owns getting it right — and unlike the decrypt,
+///   the damage does **not** stop at the first block: CBC feeds each ciphertext
+///   block into the next, so every byte of the range comes out different from
+///   what was posted.
+/// - `plain` is a whole number of blocks, and holds the ciphertext on return.
+///
+/// Errors on a length that is not a multiple of 16, and on a backend that
+/// refuses the transform; an empty range is a no-op. Both are returned rather
+/// than asserted, because the caller is a reader that must be able to answer
+/// "these bytes are unavailable" instead of dying. On an error `plain`'s
+/// contents are unspecified.
+pub fn encrypt_cipher_range(
+    key: &[u8; 32],
+    preceding_block: &[u8; AES_BLOCK],
+    plain: &mut [u8],
+) -> RarResult<()> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    if !plain.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                plain.len()
+            ),
+        });
+    }
+
+    match backend::Aes256CbcEnc::new(key, preceding_block).encrypt_blocks(plain) {
+        true => Ok(()),
+        false => Err(RarError::CorruptArchive {
+            detail: format!(
+                "AES-256-CBC encryption of a {}-byte range was refused by the crypto backend",
+                plain.len()
+            ),
+        }),
+    }
+}
+
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
     decryptor: backend::Aes128CbcDec,
@@ -2428,6 +2483,87 @@ mod tests {
             Err(RarError::CorruptArchive { .. })
         ));
         assert!(decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn encrypt_cipher_range_is_the_exact_inverse_of_decrypt_cipher_range() {
+        // The property a reader that holds only the plaintext rests on: the
+        // posted bytes are reproducible from any block boundary, given that
+        // block's predecessor and nothing else. Every boundary of a stream is
+        // tried, in both directions, so this is the general statement.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 7 + 3) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..plaintext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=plaintext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = plaintext[start..end].to_vec();
+                encrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, ciphertext[start..end], "range {start}..{end}");
+
+                // And straight back, through the decrypt this is the inverse of.
+                decrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "round trip {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn encrypt_cipher_range_diverges_from_the_posted_stream_on_a_wrong_predecessor() {
+        // The mirror of the decrypt's wrong-predecessor test, and deliberately
+        // **not** the same statement. Decryption is self-healing: a wrong
+        // predecessor spoils one block and the rest come out right. Encryption
+        // is not — each ciphertext block is the next one's chaining input — so
+        // every block from the first onwards differs from what was posted.
+        // Nothing here can raise that as an error, which is why the caller owns
+        // the predecessor and why the docs say so.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 4).map(|i| (i * 5 + 1) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut range = plaintext[AES_BLOCK..].to_vec();
+        encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut range).unwrap();
+
+        for block in 0..range.len() / AES_BLOCK {
+            let at = block * AES_BLOCK;
+            assert_ne!(
+                range[at..at + AES_BLOCK],
+                ciphertext[AES_BLOCK + at..AES_BLOCK + at + AES_BLOCK],
+                "block {block} must not happen to match the posted stream"
+            );
+        }
+        // And the right predecessor reproduces it exactly, so the divergence is
+        // the predecessor's doing and nothing else's.
+        let mut range = plaintext[AES_BLOCK..].to_vec();
+        let preceding: [u8; AES_BLOCK] = ciphertext[..AES_BLOCK].try_into().unwrap();
+        encrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+        assert_eq!(range, ciphertext[AES_BLOCK..]);
+    }
+
+    #[test]
+    fn encrypt_cipher_range_refuses_a_partial_block_and_accepts_an_empty_one() {
+        // Returned, never asserted: the caller is a reader on a blocking pool,
+        // and a contract violation has to come back as a refusal it can report
+        // as unavailable bytes rather than as a panicked task.
+        let key = [0x21u8; 32];
+        for length in [1usize, AES_BLOCK - 1, AES_BLOCK + 1, AES_BLOCK * 2 + 3] {
+            let mut partial = vec![0u8; length];
+            assert!(
+                matches!(
+                    encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut partial),
+                    Err(RarError::CorruptArchive { .. })
+                ),
+                "a {length}-byte range must be refused rather than panic"
+            );
+        }
+        assert!(encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
     }
 
     #[test]

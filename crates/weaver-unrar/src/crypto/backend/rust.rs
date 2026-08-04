@@ -1,6 +1,6 @@
 //! Portable pure-Rust crypto backend (RustCrypto).
 //!
-//! Mirrors the AWS-LC backend's seam exactly — same 7 items, same semantics —
+//! Mirrors the AWS-LC backend's seam exactly — same 8 items, same semantics —
 //! using `sha2`, `hmac`, `aes`, and `cbc`. This backend has no C dependency,
 //! so it compiles for `wasm32` and any other target the RustCrypto crates
 //! support. On native targets it also compiles alongside the AWS-LC backend
@@ -73,6 +73,31 @@ pub(crate) fn encrypt_aes256_cbc_for_test(
     plaintext: &[u8],
 ) -> Vec<u8> {
     encrypt_cbc_for_test::<cbc::Encryptor<aes::Aes256>>(key, iv, plaintext)
+}
+
+/// AES-256-CBC block **encryptor**, in place, no padding.
+///
+/// Unlike [`encrypt_cbc_for_test`] this is a real seam item: it is what
+/// [`crate::crypto::encrypt_cipher_range`] runs on, so it allocates nothing and
+/// mirrors the AWS-LC encryptor's fallible signature — this backend has no way
+/// to fail once the length is block-aligned, and says so by always returning
+/// `true`.
+pub(crate) struct Aes256CbcEnc(cbc::Encryptor<aes::Aes256>);
+
+impl Aes256CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self(cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into()))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+        let (blocks, rest) = Array::<u8, _>::slice_as_chunks_mut(data);
+        debug_assert!(rest.is_empty());
+        self.0.encrypt_blocks(blocks);
+        true
+    }
 }
 
 /// AES-256-CBC block decryptor. Thin newtype over the RustCrypto CBC mode,

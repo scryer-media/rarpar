@@ -199,6 +199,52 @@ fn aes_cbc_decrypt_matches_across_backends() {
     }
 }
 
+/// (d) AES-256-CBC **encrypt**, in place: for random keys, predecessors and
+/// block-aligned plaintext, both backends' `Aes256CbcEnc` must produce the same
+/// ciphertext — and it must be the ciphertext the test helper produces, which is
+/// what the decrypt side is already pinned against.
+///
+/// This is what lets a caller re-encrypt a member's plaintext and claim the
+/// result is the bytes that were posted, whichever backend the target picked.
+#[test]
+fn aes_cbc_encrypt_in_place_matches_across_backends() {
+    let mut rng = XorShift64::new(0xE0C0_9988_7766_5544);
+
+    for case in 0..64u32 {
+        let max_blocks = (256 * 1024) / AES_BLOCK;
+        let len = (1 + rng.next_usize(max_blocks)) * AES_BLOCK;
+        let mut plaintext = vec![0u8; len];
+        rng.fill(&mut plaintext);
+        let mut preceding = [0u8; 16];
+        rng.fill(&mut preceding);
+        let mut key = [0u8; 32];
+        rng.fill(&mut key);
+
+        let mut aws_out = plaintext.clone();
+        assert!(
+            aws_lc::Aes256CbcEnc::new(&key, &preceding).encrypt_blocks(&mut aws_out),
+            "aws-lc encrypt must not refuse a block-aligned range, case {case}"
+        );
+        let mut rust_out = plaintext.clone();
+        assert!(rust::Aes256CbcEnc::new(&key, &preceding).encrypt_blocks(&mut rust_out));
+
+        assert_eq!(aws_out, rust_out, "aes256 encrypt mismatch, case {case}");
+        // The helper the decrypt differential already trusts, as the referee.
+        assert_eq!(
+            aws_out,
+            aws_lc::encrypt_aes256_cbc_for_test(&key, &preceding, &plaintext),
+            "aes256 in-place encrypt must equal the reference helper, case {case}"
+        );
+        // And the round trip, so a backend that agreed with itself and nothing
+        // else could not pass.
+        assert_eq!(
+            decrypt_chunked_rust256(&key, &preceding, &aws_out, &mut rng),
+            plaintext,
+            "aes256 encrypt/decrypt round trip, case {case}"
+        );
+    }
+}
+
 /// Yield a randomized sequence of block-multiple chunk sizes summing to `total`
 /// (a multiple of `AES_BLOCK`). Includes single-block (16) and odd multi-block
 /// chunks to stress IV-state carry across `decrypt_blocks` calls.

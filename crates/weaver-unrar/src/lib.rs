@@ -76,14 +76,17 @@ pub use archive::{
 };
 /// The encrypted-member surface a one-pass router needs: derive a member's key
 /// material from a password and its `FHEXTRA_CRYPT` facts, decide up front
-/// whether that password is right, decrypt an arbitrary cipher range, and fold
-/// a checksum the way a keyed header states it.
+/// whether that password is right, decrypt an arbitrary cipher range — or
+/// re-encrypt one, for a reader that holds the plaintext and owes its caller the
+/// bytes that were posted — and fold a checksum the way a keyed header states
+/// it.
 ///
 /// None of this needs an archive object; all of it is driven by
 /// [`RarVolumeMemberEncryptionFacts`] plus bytes.
 pub use crypto::{
     CRYPT5_KDF_LG2_COUNT_MAX, KdfCache, PasswordCheck, Rar5KeyMaterial, check_member_password,
     convert_blake2_to_mac, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
+    encrypt_cipher_range,
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
