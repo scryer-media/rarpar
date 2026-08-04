@@ -134,24 +134,100 @@ fn empty_parsed_headers() -> ParsedHeaders {
     }
 }
 
+/// Options controlling how the header walk reads an archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderParseOptions {
+    /// Whether the parser may answer from the archive's Quick Open cache.
+    ///
+    /// RAR can store a copy of every header in a `QO` service block near the
+    /// end of the archive, pointed at by a locator record in the main header.
+    /// When that block is present and parses cleanly through its cached
+    /// end-of-archive record, a reader can list the archive's contents from
+    /// that one block instead of seeking past every member's data area — which
+    /// is why it is consulted by default.
+    ///
+    /// The cache is not authoritative. Nothing in the format binds a `QO`
+    /// record to the physical header it claims to describe, so the two can
+    /// disagree — through staleness, or because the archive was crafted to
+    /// disagree. A forged cache can name a member that the physical walk never
+    /// sees, or point an honest-looking name at different data. A caller that
+    /// makes security or routing decisions from the parse result — which
+    /// members exist, where their data lives, what gets admitted downstream —
+    /// should set this to `false` and pay for the full physical walk.
+    pub allow_quick_open: bool,
+}
+
+impl Default for HeaderParseOptions {
+    /// Quick Open enabled — the long-standing behavior of
+    /// [`parse_all_headers`].
+    ///
+    /// Written by hand rather than derived: `#[derive(Default)]` yields `false`
+    /// for a `bool`, which would silently opt every existing caller out of
+    /// Quick Open and turn a performance choice into an accidental one.
+    fn default() -> Self {
+        Self {
+            allow_quick_open: true,
+        }
+    }
+}
+
 /// Parse all headers from a RAR5 archive stream.
 ///
 /// The reader should be positioned right after the RAR5 signature (8 bytes in).
 /// If a password is provided, archive-level encryption (encrypted headers) will
 /// be decrypted. Without a password, encountering an encryption header returns
 /// `Err(RarError::EncryptedArchive)`.
+///
+/// Parses under [`HeaderParseOptions::default()`], so the archive's Quick Open
+/// cache is used when present. Callers that must not trust that cache should
+/// use [`parse_all_headers_with_options`].
 pub fn parse_all_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
 ) -> RarResult<ParsedHeaders> {
-    let kdf_cache = crate::crypto::KdfCache::new();
-    parse_all_headers_with_kdf_cache(reader, password, &kdf_cache)
+    parse_all_headers_with_options(reader, password, HeaderParseOptions::default())
 }
 
+/// Parse all headers from a RAR5 archive stream under explicit `options`.
+///
+/// Same contract as [`parse_all_headers`], which is exactly this function with
+/// [`HeaderParseOptions::default()`]. Pass
+/// `HeaderParseOptions { allow_quick_open: false }` to require that every
+/// returned header came from the physical header walk, never from the
+/// archive's non-authoritative (and forgeable) Quick Open cache.
+pub fn parse_all_headers_with_options<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    options: HeaderParseOptions,
+) -> RarResult<ParsedHeaders> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    parse_all_headers_with_kdf_cache_and_options(reader, password, &kdf_cache, options)
+}
+
+/// Parse all headers reusing a caller-owned RAR5 KDF cache.
+///
+/// Uses [`HeaderParseOptions::default()`]; see
+/// [`parse_all_headers_with_kdf_cache_and_options`] to choose otherwise.
 pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
+) -> RarResult<ParsedHeaders> {
+    parse_all_headers_with_kdf_cache_and_options(
+        reader,
+        password,
+        kdf_cache,
+        HeaderParseOptions::default(),
+    )
+}
+
+/// Parse all headers reusing a caller-owned RAR5 KDF cache, under explicit
+/// `options`.
+pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
 ) -> RarResult<ParsedHeaders> {
     let mut result = empty_parsed_headers();
 
@@ -210,8 +286,11 @@ pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
             }
             HeaderType::MainArchive => {
                 dispatch_header(&raw, data_offset, &mut result)?;
-                if let Some(quick_open) =
-                    try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
+                // The QuickOpen cache can disagree with the physical headers,
+                // so a caller that opted out gets the physical walk only.
+                if options.allow_quick_open
+                    && let Some(quick_open) =
+                        try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
                 {
                     return Ok(quick_open);
                 }
@@ -1256,6 +1335,107 @@ mod tests {
             parsed.files[0].header.data_offset,
             physical_file_offset + physical_file.len() as u64
         );
+        assert!(parsed.end.is_some());
+    }
+
+    /// Build an archive whose QuickOpen cache disagrees with its physical
+    /// headers: the `QO` block faithfully echoes the one real member and then
+    /// appends `forged.bin`, which no physical header describes.
+    ///
+    /// Returns the archive bytes and the data offset the physical walk should
+    /// report for `physical.bin`.
+    fn build_test_archive_with_forged_quick_open_member() -> (Vec<u8>, u64) {
+        let qopen_offset = 256u64;
+        let forged_file_offset = 160u64;
+        let cached_end_offset = 200u64;
+
+        let main = build_test_main_with_qopen_locator(qopen_offset - 8);
+        let physical_file = build_test_file_header("physical.bin", 0, 0);
+        let physical_end = build_test_end_header();
+        let physical_file_offset = RAR5_SIGNATURE.len() as u64 + main.len() as u64;
+
+        let forged_file = build_test_file_header("forged.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            physical_file_offset,
+            &physical_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            forged_file_offset,
+            &forged_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_end_offset,
+            &cached_end,
+        ));
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&main);
+        archive.extend_from_slice(&physical_file);
+        archive.extend_from_slice(&physical_end);
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_qopen_service(&qopen_payload));
+        archive.extend_from_slice(&qopen_payload);
+
+        (archive, physical_file_offset + physical_file.len() as u64)
+    }
+
+    fn parsed_file_names(parsed: &ParsedHeaders) -> Vec<&str> {
+        parsed
+            .files
+            .iter()
+            .map(|file| file.header.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn header_parse_options_default_keeps_quick_open_enabled() {
+        assert!(
+            HeaderParseOptions::default().allow_quick_open,
+            "the hand-written Default must preserve QuickOpen, not fall back to bool's false"
+        );
+    }
+
+    #[test]
+    fn quick_open_records_that_disagree_with_physical_headers_are_adopted_by_default() {
+        let (archive, _) = build_test_archive_with_forged_quick_open_member();
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, None).unwrap();
+
+        // Pins today's default: a clean QuickOpen cache wins outright, so a
+        // member present only in the `QO` block is reported as if it were real.
+        assert_eq!(parsed_file_names(&parsed), ["physical.bin", "forged.bin"]);
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
+    fn quick_open_can_be_disabled_so_only_physical_headers_are_returned() {
+        let (archive, physical_data_offset) = build_test_archive_with_forged_quick_open_member();
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers_with_options(
+            &mut cursor,
+            None,
+            HeaderParseOptions {
+                allow_quick_open: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(parsed_file_names(&parsed), ["physical.bin"]);
+        assert_eq!(parsed.files[0].header.data_offset, physical_data_offset);
         assert!(parsed.end.is_some());
     }
 
