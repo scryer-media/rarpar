@@ -357,6 +357,9 @@ pub struct Par2RepairerOptions {
     pub recovery_paths: Vec<PathBuf>,
     pub extra_paths: Vec<PathBuf>,
     pub repair: bool,
+    /// Working-memory budget applied to scanning and repair. Parallel ordered
+    /// scans fall back to the bounded serial scanner when their fixed
+    /// bookkeeping cannot fit; `None` uses the crate default.
     pub memory_limit: Option<usize>,
     pub rename_only: bool,
     pub purge: bool,
@@ -1632,6 +1635,7 @@ impl RepairState {
                     skip_leeway: options.scan_skip_leeway,
                 },
                 inner_parallel,
+                options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT),
                 options.cancel.as_ref(),
             )?
         } else {
@@ -2440,6 +2444,10 @@ struct AlignedWindowFacts {
     matches: Vec<u32>,
 }
 
+fn ordered_scan_facts_allocation_bytes(window_count: usize) -> Option<usize> {
+    window_count.checked_mul(std::mem::size_of::<AlignedWindowFacts>())
+}
+
 /// How a gap resync hands control back to the aligned merge loop.
 enum ResyncOutcome {
     Realigned {
@@ -2740,6 +2748,7 @@ impl<'a> RollingBlockScanner<'a> {
             &mut state,
             scan_options,
             true,
+            DEFAULT_REPAIR_MEMORY_LIMIT,
             None,
         )?;
         state.apply_to_blocks(blocks);
@@ -2756,6 +2765,7 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
         inner_parallel: bool,
+        memory_limit: usize,
         cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
@@ -2794,6 +2804,7 @@ impl<'a> RollingBlockScanner<'a> {
             blocks,
             scan_options,
             segment_windows,
+            memory_limit,
             cancel,
         ) {
             Ok(stats) => Ok(stats),
@@ -3045,8 +3056,8 @@ impl<'a> RollingBlockScanner<'a> {
     /// serial cursor state machine over those facts, and Phase C byte-steps
     /// through gaps, splicing back into Phase B when a match realigns. All
     /// reads go through bounded buffers (positional reads in Phase A, the
-    /// serial cursor in Phase C), so resident memory tracks thread count,
-    /// not file size.
+    /// serial cursor in Phase C). The fixed facts table is admitted under the
+    /// configured working-memory budget; larger scans use the serial scanner.
     #[allow(clippy::too_many_arguments)]
     fn scan_file_ordered_canonical_parallel(
         &self,
@@ -3057,6 +3068,7 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
         segment_windows: usize,
+        memory_limit: usize,
         cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         let file = File::open(path)?;
@@ -3078,13 +3090,27 @@ impl<'a> RollingBlockScanner<'a> {
                 scan_options,
             );
         }
-        crate::file_cache::advise_sequential(&file, path, len as u64);
-        let mut stats = FileScanStats::new(FileScanMode::OrderedCanonicalParallel, len as u64);
-
         let last_full_offset = len - slice_size;
         let window_count = last_full_offset / slice_size + 1;
-        let segment_windows = segment_windows.max(1);
         let mut facts: Vec<AlignedWindowFacts> = Vec::new();
+        let facts_fit = ordered_scan_facts_allocation_bytes(window_count)
+            .is_some_and(|allocation_bytes| allocation_bytes <= memory_limit);
+        if !facts_fit || facts.try_reserve_exact(window_count).is_err() {
+            #[allow(clippy::drop_non_drop)]
+            drop(file);
+            return self.scan_file_ordered_canonical_serial(
+                path,
+                kind,
+                lookup,
+                target_file,
+                blocks,
+                scan_options,
+            );
+        }
+
+        crate::file_cache::advise_sequential(&file, path, len as u64);
+        let mut stats = FileScanStats::new(FileScanMode::OrderedCanonicalParallel, len as u64);
+        let segment_windows = segment_windows.max(1);
         facts.resize_with(window_count, AlignedWindowFacts::default);
         let baseline = blocks.baseline();
         let shared_file = &file;
@@ -5891,6 +5917,20 @@ mod tests {
         path: &Path,
         segment_windows: usize,
     ) -> (BlockLocationSummary, FileScanStats) {
+        scan_ordered_parallel_direct_with_memory_limit(
+            state,
+            path,
+            segment_windows,
+            DEFAULT_REPAIR_MEMORY_LIMIT,
+        )
+    }
+
+    fn scan_ordered_parallel_direct_with_memory_limit(
+        state: &RepairState,
+        path: &Path,
+        segment_windows: usize,
+        memory_limit: usize,
+    ) -> (BlockLocationSummary, FileScanStats) {
         let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
         let mut blocks = state.blocks.clone();
         let baseline = blocks.clone();
@@ -5912,6 +5952,7 @@ mod tests {
                 &mut scan_state,
                 ScanSkipOptions::disabled(),
                 segment_windows,
+                memory_limit,
                 None,
             )
             .unwrap();
@@ -6290,6 +6331,37 @@ mod tests {
         assert_eq!(locations[3], None);
         assert_eq!(locations[4], None);
         assert!(locations.iter().filter(|entry| entry.is_some()).count() == 8);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_facts_allocation_is_checked() {
+        let fact_size = std::mem::size_of::<AlignedWindowFacts>();
+        assert_eq!(ordered_scan_facts_allocation_bytes(0), Some(0));
+        assert_eq!(ordered_scan_facts_allocation_bytes(3), Some(fact_size * 3));
+        assert_eq!(ordered_scan_facts_allocation_bytes(usize::MAX), None);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_falls_back_when_facts_exceed_memory_limit() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let target = seeded_block(76, slice_size);
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        let mut oversized = target.clone();
+        oversized.resize(slice_size * 9, 0xEE);
+        fs::write(&candidate, oversized).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let facts_bytes = ordered_scan_facts_allocation_bytes(9).unwrap();
+
+        let (parallel_locations, parallel_stats) =
+            scan_ordered_parallel_direct_with_memory_limit(&state, &candidate, 2, facts_bytes);
+        assert_eq!(parallel_stats.mode, FileScanMode::OrderedCanonicalParallel);
+
+        let (fallback_locations, fallback_stats) =
+            scan_ordered_parallel_direct_with_memory_limit(&state, &candidate, 2, facts_bytes - 1);
+        assert_eq!(fallback_stats.mode, FileScanMode::OrderedCanonical);
+        assert_eq!(fallback_locations, parallel_locations);
     }
 
     #[test]
