@@ -2605,6 +2605,25 @@ fn test_rar4_long_password_unrar_vector_archive_extracts() {
     assert_eq!(result, RAR4_LONG_PASSWORD_CONTENT);
 }
 
+/// Builds an `unrar` invocation with a UTF-8 locale pinned on the child.
+///
+/// UnRAR renders member names through the process locale, and with `LANG`/
+/// `LC_ALL` unset it falls back to the C locale and drops every non-ASCII name.
+/// Pinning the locale on the spawned command keeps the oracle correct however
+/// the test runner itself was invoked. macOS ships `en_US.UTF-8` on every
+/// release but only gained `C.UTF-8` in macOS 15, while glibc has carried a
+/// built-in `C.UTF-8` since 2.35 that needs no locale generation.
+fn unrar_command(unrar_bin: &str) -> std::process::Command {
+    let locale = if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    };
+    let mut command = std::process::Command::new(unrar_bin);
+    command.env("LANG", locale).env("LC_ALL", locale);
+    command
+}
+
 #[test]
 fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() {
     let Ok(unrar_bin) = std::env::var("UNRAR_BIN") else {
@@ -2619,7 +2638,7 @@ fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() 
     let archive_path = dir.path().join("long-password.rar");
     std::fs::write(&archive_path, build_rar4_long_password_unrar_fixture()).unwrap();
 
-    let output = std::process::Command::new(unrar_bin)
+    let output = unrar_command(&unrar_bin)
         .arg("t")
         .arg("-idq")
         .arg(format!("-p{RAR4_LONG_PASSWORD}"))
@@ -2660,7 +2679,7 @@ fn extract_old_rar_fixture_with_unrar(unrar_bin: &str, archive_path: &std::path:
         output_dir.path().display(),
         std::path::MAIN_SEPARATOR
     );
-    let output = std::process::Command::new(unrar_bin)
+    let output = unrar_command(unrar_bin)
         .arg("x")
         .arg("-idq")
         .arg("-y")

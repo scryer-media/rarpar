@@ -296,6 +296,36 @@ fn snapshot_filesystem(
     entries
 }
 
+/// Builds an `unrar` invocation with a UTF-8 locale pinned on the child.
+///
+/// UnRAR renders member names through the process locale. With `LANG`/`LC_ALL`
+/// unset it falls back to the C locale and drops every non-ASCII name — the CJK
+/// corpus fixtures come back with an empty Name column, so the oracle would
+/// compare our (correct) entries against nothing at all. Pinning the locale on
+/// the spawned command keeps the harness correct regardless of how the test
+/// runner itself was invoked.
+fn unrar_command(unrar_bin: &str) -> Command {
+    // macOS has shipped `en_US.UTF-8` in its base locale set on every release
+    // but only gained `C.UTF-8` in macOS 15, while glibc has carried a built-in
+    // `C.UTF-8` since 2.35 that needs no locale generation and is therefore the
+    // portable choice on Linux runners and minimal containers. Windows `unrar`
+    // uses the wide-character APIs and ignores both variables.
+    let locale = if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    };
+    let mut command = Command::new(unrar_bin);
+    command.env("LANG", locale).env("LC_ALL", locale);
+    command
+}
+
+fn unrar_password_arg(password: Option<&str>) -> String {
+    password
+        .map(|pwd| format!("-p{pwd}"))
+        .unwrap_or_else(|| "-p-".to_string())
+}
+
 fn run_unrar_extract(
     unrar_bin: &str,
     paths: &[PathBuf],
@@ -303,17 +333,13 @@ fn run_unrar_extract(
     out_dir: &Path,
 ) -> std::process::ExitStatus {
     let destination = format!("{}{}", out_dir.display(), std::path::MAIN_SEPARATOR);
-    let mut command = Command::new(unrar_bin);
+    let mut command = unrar_command(unrar_bin);
     command
         .arg("x")
         .arg("-idq")
         .arg("-inul")
         .arg("-o+")
-        .arg(
-            password
-                .map(|pwd| format!("-p{pwd}"))
-                .unwrap_or_else(|| "-p-".to_string()),
-        )
+        .arg(unrar_password_arg(password))
         .arg(&paths[0])
         .arg(destination);
     command
@@ -323,18 +349,14 @@ fn run_unrar_extract(
 
 fn run_unrar_bare_list(
     unrar_bin: &str,
-    paths: &[PathBuf],
+    path: &Path,
     password: Option<&str>,
 ) -> std::process::Output {
-    let mut command = Command::new(unrar_bin);
+    let mut command = unrar_command(unrar_bin);
     command
         .arg("lb")
-        .arg(
-            password
-                .map(|pwd| format!("-p{pwd}"))
-                .unwrap_or_else(|| "-p-".to_string()),
-        )
-        .arg(&paths[0]);
+        .arg(unrar_password_arg(password))
+        .arg(path);
     command
         .output()
         .unwrap_or_else(|err| panic!("failed to run {unrar_bin}: {err}"))
@@ -342,21 +364,174 @@ fn run_unrar_bare_list(
 
 fn run_unrar_technical_list(
     unrar_bin: &str,
+    path: &Path,
+    password: Option<&str>,
+) -> std::process::Output {
+    let mut command = unrar_command(unrar_bin);
+    command
+        .arg("lt")
+        .arg(unrar_password_arg(password))
+        .arg(path);
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {unrar_bin}: {err}"))
+}
+
+/// Runs `unrar t` over a whole volume chain.
+///
+/// `lb`/`lt` only report the members whose headers *begin* in the volume they
+/// are pointed at, so for a volume set they systematically undercount against a
+/// whole-set parse. `t` follows the chain to its end, which makes it the
+/// like-for-like oracle for our whole-set listing, and it validates the member
+/// data on the way through.
+fn run_unrar_test(
+    unrar_bin: &str,
     paths: &[PathBuf],
     password: Option<&str>,
 ) -> std::process::Output {
-    let mut command = Command::new(unrar_bin);
+    let mut command = unrar_command(unrar_bin);
     command
-        .arg("lt")
-        .arg(
-            password
-                .map(|pwd| format!("-p{pwd}"))
-                .unwrap_or_else(|| "-p-".to_string()),
-        )
+        .arg("t")
+        // `-idp` drops the percentage indicator, which is what leaves each
+        // progress line as a plain command field + padded name (+ status) and
+        // makes `parse_unrar_test_member_names` structural rather than a guess.
+        // `-idc` keeps archive comments out of the stream.
+        .arg("-idp")
+        .arg("-idc")
+        .arg(unrar_password_arg(password))
         .arg(&paths[0]);
     command
         .output()
         .unwrap_or_else(|err| panic!("failed to run {unrar_bin}: {err}"))
+}
+
+/// Command fields UnRAR writes ahead of the padded member name on the progress
+/// lines of `t` (`MExtrTestFile` for the volume a member starts in,
+/// `MExtrPoints` for each volume it continues into).
+const UNRAR_TEST_START_FIELD: &str = "Testing     ";
+const UNRAR_TEST_CONTINUE_FIELD: &str = "...         ";
+/// Banner UnRAR prints when it opens each volume of the chain.
+const UNRAR_TEST_ARCHIVE_FIELD: &str = "Testing archive ";
+/// Line UnRAR prints once the whole chain tested clean.
+const UNRAR_TEST_ALL_OK: &str = "All OK";
+/// Status markers appended after the padded name field once `-idp` is in
+/// effect: `" " + " OK"/"  ?" + " "` for files, `" " + " OK"` for directories.
+/// Ordered most specific first so the file forms win over the directory form.
+const UNRAR_TEST_STATUS_MARKERS: [&str; 3] = ["  OK ", "   ? ", " OK"];
+
+/// Extracts the member names UnRAR reported while testing a volume chain.
+///
+/// A member that spans volumes is announced once per volume it touches, so the
+/// names are deduplicated by first appearance — which is archive order. The
+/// parse is anchored on UnRAR's fixed command fields and on its known status
+/// markers rather than on column arithmetic, and it reports an error instead of
+/// yielding a short or empty list, because an empty oracle result compares
+/// equal to an empty parse and would pass vacuously.
+fn parse_unrar_test_member_names(stdout: &[u8]) -> Result<Vec<String>, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut volumes = 0usize;
+    let mut all_ok = false;
+
+    for line in text.lines() {
+        if line.starts_with(UNRAR_TEST_ARCHIVE_FIELD) {
+            volumes += 1;
+            continue;
+        }
+        if line.trim_end() == UNRAR_TEST_ALL_OK {
+            all_ok = true;
+            continue;
+        }
+        let Some(rest) = line
+            .strip_prefix(UNRAR_TEST_START_FIELD)
+            .or_else(|| line.strip_prefix(UNRAR_TEST_CONTINUE_FIELD))
+        else {
+            continue;
+        };
+        // `RecVolumes::Test` reuses the same progress header for the `.rev`
+        // files sitting beside a volume set, and it is the only producer that
+        // still emits backspaces once `-idp` has disabled the percentage. Those
+        // lines name recovery volumes on disk, not archive members.
+        if rest.contains('\u{8}') {
+            continue;
+        }
+        let body = UNRAR_TEST_STATUS_MARKERS
+            .iter()
+            .find_map(|marker| rest.strip_suffix(marker))
+            .unwrap_or(rest);
+        let name = decode_unrar_bare_list_line(body.trim_end());
+        if name.is_empty() {
+            return Err(format!("unparsable `unrar t` progress line: {line:?}"));
+        }
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+
+    if volumes == 0 {
+        return Err(format!(
+            "`unrar t` printed no {UNRAR_TEST_ARCHIVE_FIELD:?} banner"
+        ));
+    }
+    if !all_ok {
+        return Err(format!(
+            "`unrar t` did not finish with {UNRAR_TEST_ALL_OK:?}"
+        ));
+    }
+    if names.is_empty() {
+        return Err("`unrar t` reported no members".to_string());
+    }
+    Ok(names)
+}
+
+/// Unions the per-volume `lt` results of a volume set.
+///
+/// `lt` reports only the members whose headers begin in the volume it is
+/// pointed at, so the whole set has to be assembled volume by volume to line up
+/// with our whole-set parse. Order follows first appearance, which is archive
+/// order. Fields are filled in from the first volume that carries them because
+/// UnRAR only prints the checksum on the volume where a split member *ends*.
+/// Returns `None` when any volume is rejected, matching how the single-volume
+/// path skips corrupt fixtures.
+fn union_unrar_technical_entries(
+    unrar_bin: &str,
+    paths: &[PathBuf],
+    password: Option<&str>,
+) -> Option<Vec<TechnicalEntry>> {
+    let mut merged: Vec<TechnicalEntry> = Vec::new();
+    let mut index_by_key = BTreeMap::<(String, Option<u64>), usize>::new();
+
+    for path in paths {
+        let output = run_unrar_technical_list(unrar_bin, path, password);
+        if !output.status.success() {
+            return None;
+        }
+        for entry in parse_unrar_technical_entries(&output.stdout) {
+            let key = (entry.name.clone(), entry.version);
+            match index_by_key.get(&key) {
+                Some(&index) => merge_technical_entry(&mut merged[index], entry),
+                None => {
+                    index_by_key.insert(key, merged.len());
+                    merged.push(entry);
+                }
+            }
+        }
+    }
+
+    Some(merged)
+}
+
+fn merge_technical_entry(target: &mut TechnicalEntry, other: TechnicalEntry) {
+    if target.kind.is_empty() {
+        target.kind = other.kind;
+    }
+    target.target = target.target.take().or(other.target);
+    target.size = target.size.or(other.size);
+    target.packed_size = target.packed_size.or(other.packed_size);
+    target.crc32 = target.crc32.or(other.crc32);
+    target.host_os = target.host_os.take().or(other.host_os);
+    target.version = target.version.or(other.version);
 }
 
 fn decode_unrar_bare_list_line(line: &str) -> String {
@@ -960,17 +1135,37 @@ fn imported_bare_listing_matches_unrar_when_available() {
     };
 
     let mut compared = 0usize;
+    let mut compared_volume_sets = 0usize;
     for (label, paths, password) in collect_oracle_fixture_groups() {
-        let output = run_unrar_bare_list(&unrar_bin, &paths, password);
-        if !output.status.success() {
-            continue;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let unrar_names: Vec<String> = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(decode_unrar_bare_list_line)
-            .collect();
+        let multivolume = paths.len() > 1;
+        // A volume set has to be compared against `t`: `lb` only lists the
+        // members whose headers begin in the volume it is handed, so it
+        // undercounts against our whole-set parse.
+        let unrar_names: Vec<String> = if multivolume {
+            let output = run_unrar_test(&unrar_bin, &paths, password);
+            if !output.status.success() {
+                continue;
+            }
+            match parse_unrar_test_member_names(&output.stdout) {
+                Ok(names) => names,
+                Err(err) => panic!(
+                    "could not read `unrar t` output for {label}: {err}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            }
+        } else {
+            let output = run_unrar_bare_list(&unrar_bin, &paths[0], password);
+            if !output.status.success() {
+                continue;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(decode_unrar_bare_list_line)
+                .collect()
+        };
         let weaver_names = match try_weaver_bare_list_names(&paths, password) {
             Ok(names) => names,
             Err(err) if unrar_names.is_empty() => {
@@ -984,11 +1179,18 @@ fn imported_bare_listing_matches_unrar_when_available() {
             "bare listing mismatch for {label}"
         );
         compared += 1;
+        if multivolume {
+            compared_volume_sets += 1;
+        }
     }
 
     assert!(
         compared > 0,
         "UNRAR_BIN={unrar_bin} did not accept any imported fixture groups"
+    );
+    assert!(
+        compared_volume_sets > 0,
+        "UNRAR_BIN={unrar_bin} did not accept any imported multi-volume fixture groups"
     );
 }
 
@@ -1007,12 +1209,25 @@ fn imported_technical_listing_types_match_unrar_when_available() {
     };
 
     let mut compared = 0usize;
+    let mut compared_volume_sets = 0usize;
     for (label, paths, password) in collect_oracle_fixture_groups() {
-        let output = run_unrar_technical_list(&unrar_bin, &paths, password);
-        if !output.status.success() {
-            continue;
-        }
-        let unrar_entries = parse_unrar_technical_entries(&output.stdout);
+        let multivolume = paths.len() > 1;
+        // `t` carries no type information, so the technical listing is instead
+        // unioned across the volumes of a set — each volume's `lt` reports the
+        // members whose headers begin in it, and the union is exactly the
+        // whole-set membership.
+        let unrar_entries = if multivolume {
+            match union_unrar_technical_entries(&unrar_bin, &paths, password) {
+                Some(entries) => entries,
+                None => continue,
+            }
+        } else {
+            let output = run_unrar_technical_list(&unrar_bin, &paths[0], password);
+            if !output.status.success() {
+                continue;
+            }
+            parse_unrar_technical_entries(&output.stdout)
+        };
         let weaver_entries = match try_weaver_technical_entries(&paths, password) {
             Ok(entries) => entries,
             Err(err) if unrar_entries.is_empty() => {
@@ -1071,11 +1286,18 @@ fn imported_technical_listing_types_match_unrar_when_available() {
             );
         }
         compared += 1;
+        if multivolume {
+            compared_volume_sets += 1;
+        }
     }
 
     assert!(
         compared > 0,
         "UNRAR_BIN={unrar_bin} did not accept any imported fixture groups"
+    );
+    assert!(
+        compared_volume_sets > 0,
+        "UNRAR_BIN={unrar_bin} did not accept any imported multi-volume fixture groups"
     );
 }
 
