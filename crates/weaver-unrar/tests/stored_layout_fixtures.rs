@@ -1350,12 +1350,11 @@ fn decrypting_any_cipher_range_from_its_preceding_block_matches_the_extractor() 
 /// Extract one member conventionally, with the password, as the reference
 /// every decrypt above is compared against.
 ///
-/// Deliberately the batch path: `extract_member_streaming` rebases a member's
-/// segment volume indices to the member's own first volume, so it reads the
-/// wrong volumes for any member that does not start in the set's first one
-/// (`rar5_enc_mv_store_pair`'s second member is exactly that shape, and its
-/// plaintext twin fails identically — the defect predates encryption and has
-/// nothing to do with it).
+/// The batch path, because this test is about the write transform and not about
+/// streaming. The streaming path reads the same bytes:
+/// `test_rar5_encrypted_multivolume_store_pair_second_member_streams_from_its_own_volumes`
+/// in `tests/integration.rs` holds it against this same fixture's second
+/// member, which is the one that starts past the set's first volume.
 fn extract_member(paths: &[PathBuf], name: &str) -> Vec<u8> {
     let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
         .iter()

@@ -4532,6 +4532,148 @@ fn test_rar5_fixture_multivolume_video_chunked_matches_prefix_deltas() {
     assert_eq!(actual_sizes, expected_sizes);
 }
 
+/// The volume numbering the streaming paths speak, held against the batch path
+/// for a member that does not start in the set's first volume.
+///
+/// `extract_member_streaming` and `extract_member_streaming_chunked` address
+/// volumes in the **set's own numbering** — the same one `member_segments`,
+/// `add_volume`, `attach_volume_reader` and `VolumeProvider::get_volume` use.
+/// So a plain [`StaticVolumeProvider`] over the whole set, with no re-keying at
+/// the call site, must produce exactly what the batch path produces.
+///
+/// Every other multi-volume fixture in this file holds a single member starting
+/// in volume 0, where a member-relative numbering and the set's own numbering
+/// coincide; only a second member reachable past a volume boundary tells them
+/// apart. When the streaming paths rebased each member's segments to that
+/// member's own first volume, this read the set from part 1 for a member that
+/// begins in part 6 and tripped the packed-data CRC.
+fn assert_streaming_matches_batch_for_member_past_volume_zero(
+    dir: &str,
+    vol_names: &[String],
+    member_name: &str,
+    password: Option<&str>,
+) {
+    let names: Vec<&str> = vol_names.iter().map(String::as_str).collect();
+    let paths: Vec<_> = names.iter().map(|name| fixture(dir, name)).collect();
+    let options = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: password.map(str::to_owned),
+        restore_owners: false,
+    };
+    let open = || {
+        let mut archive = open_multi(dir, &names);
+        if let Some(password) = password {
+            archive.set_password(password);
+        }
+        archive
+    };
+
+    let mut batch = open();
+    let index = batch.find_member(member_name).expect("member present");
+    let member = batch.member_info(index).expect("member info");
+    let (first_volume, last_volume) = (member.volumes.first_volume, member.volumes.last_volume);
+    assert!(
+        first_volume > 0,
+        "{member_name} starts in volume {first_volume}: this differential only \
+         proves anything for a member that starts past the set's first volume",
+    );
+    let expected = batch
+        .extract_member(index, &options, None)
+        .and_then(|member| member.into_bytes())
+        .expect("batch extraction");
+
+    // The provider is the set's, keyed by the set's own volume numbers, and is
+    // handed to the library exactly as built.
+    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+
+    let mut streamed = Vec::new();
+    open()
+        .extract_member_streaming(index, &options, &provider, &mut streamed)
+        .expect("streaming extraction");
+    assert_eq!(
+        streamed, expected,
+        "{member_name}: streamed bytes differ from the batch path"
+    );
+
+    let chunk_dir = tempfile::tempdir().unwrap();
+    let mut chunk_paths = std::collections::BTreeMap::new();
+    let records = open()
+        .extract_member_streaming_chunked(index, &options, &provider, |volume_index| {
+            let path = chunk_dir.path().join(format!("vol{volume_index:03}.chunk"));
+            chunk_paths.insert(volume_index, path.clone());
+            std::fs::File::create(path)
+                .map(|file| Box::new(file) as Box<dyn std::io::Write>)
+                .map_err(weaver_unrar::RarError::Io)
+        })
+        .expect("chunked streaming extraction");
+
+    assert_eq!(
+        records.first().map(|(volume_index, _)| *volume_index),
+        Some(first_volume),
+        "{member_name}: the first chunk must be reported against the set's \
+         volume {first_volume}, not an offset from it",
+    );
+    let mut assembled = Vec::new();
+    for (volume_index, bytes_written) in &records {
+        assert!(
+            (first_volume..=last_volume).contains(volume_index),
+            "{member_name}: chunk volume {volume_index} is outside the member's \
+             span {first_volume}..={last_volume}",
+        );
+        let data = std::fs::read(chunk_paths.get(volume_index).expect("chunk written")).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        assembled.extend_from_slice(&data);
+    }
+    assert_eq!(
+        assembled, expected,
+        "{member_name}: chunked bytes differ from the batch path"
+    );
+}
+
+fn store_pair_volumes(base: &str) -> Vec<String> {
+    (1..=9)
+        .map(|part| format!("{base}.part{part:02}.rar"))
+        .collect()
+}
+
+#[test]
+fn test_rar5_multivolume_store_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_mv_store_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        None,
+    );
+}
+
+/// The encrypted twin of the plaintext case above. The defect it guards is not
+/// encryption-specific — both sets have the same layout, and both failed the
+/// same way — but a wrong volume under AES-CBC surfaces as a decrypt-shaped
+/// error rather than a byte mismatch, so both are worth holding.
+#[test]
+fn test_rar5_encrypted_multivolume_store_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_enc_mv_store_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        Some(TEST_PASSWORD),
+    );
+}
+
+/// The solid variant, which reaches the streaming paths' third volume-indexing
+/// site: reading a member out of a solid set first decodes every member before
+/// it, and those skipped members' segments have to be addressed in the same
+/// numbering as the requested member's.
+#[test]
+fn test_rar5_multivolume_solid_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_mv_solid_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        None,
+    );
+}
+
 #[test]
 fn test_rar4_fixture_multivolume_video_batch() {
     let vols: Vec<&str> = (1..=5)

@@ -3399,16 +3399,21 @@ impl RarArchive {
         Ok(())
     }
 
-    fn normalized_provider_segments(segments: &[DataSegment]) -> (Vec<DataSegment>, usize) {
+    /// A member's segments in volume order, alongside the volume its data
+    /// starts in.
+    ///
+    /// Both stay in the volume set's own absolute numbering — the same
+    /// numbering [`RarArchive::member_segments`], [`RarArchive::add_volume`],
+    /// [`RarArchive::attach_volume_reader`] and [`VolumeProvider::get_volume`]
+    /// speak. The streaming paths hand these straight to a provider, so a
+    /// member that starts in volume 5 asks the provider for volume 5.
+    fn sorted_member_segments(segments: &[DataSegment]) -> (Vec<DataSegment>, usize) {
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by_key(|segment| segment.volume_index);
-        let volume_base = sorted_segments
+        let first_volume = sorted_segments
             .first()
             .map_or(0, |segment| segment.volume_index);
-        for segment in &mut sorted_segments {
-            segment.volume_index -= volume_base;
-        }
-        (sorted_segments, volume_base)
+        (sorted_segments, first_volume)
     }
 
     fn advance_solid_cursor_to_streaming(
@@ -3437,7 +3442,7 @@ impl RarArchive {
 
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_unpacked = self.target_unpacked_size(&skip_fh);
-                let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
+                let (segments, _) = Self::sorted_member_segments(&skip_entry.segments);
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
                     .with_member_name(&skip_fh.name)
                     .with_max_data_segment(self.limits.max_data_segment)
@@ -5443,6 +5448,12 @@ impl RarArchive {
     /// from the provider as needed — which may block until the volume finishes
     /// downloading.
     ///
+    /// Volumes are addressed in the **volume set's own numbering**, the same
+    /// one [`RarArchive::member_segments`] reports and
+    /// [`RarArchive::add_volume`] accepts: a member whose first segment lives
+    /// in volume 5 calls `provider.get_volume(5)`. The provider is the set's,
+    /// not the member's — do not re-key it to the member's first volume.
+    ///
     /// Currently supports:
     /// - **Store** (uncompressed): streams directly, minimal memory.
     /// - **LZ** (compressed, non-solid): reads compressed data through a
@@ -5508,15 +5519,7 @@ impl RarArchive {
         if fh.compression.method != CompressionMethod::Store {
             let entry = &self.members[index];
             let split_after = entry.file_header.split_after;
-            let mut sorted_segs = entry.segments.clone();
-            sorted_segs.sort_by_key(|s| s.volume_index);
-            // Normalize volume indices to 0-based for the provider.
-            // Archive segments use absolute volume numbers (from main header),
-            // but the streaming provider uses 0-based local indices.
-            let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-            for seg in &mut sorted_segs {
-                seg.volume_index -= vol_base;
-            }
+            let (sorted_segs, _) = Self::sorted_member_segments(&entry.segments);
 
             debug!(
                 member = %fh.name,
@@ -5546,13 +5549,7 @@ impl RarArchive {
         // One continuous reader → one DecryptingReader → maintains AES-CBC state across volumes.
         let entry = &self.members[index];
         let split_after = entry.file_header.split_after;
-        let mut sorted_segs = entry.segments.clone();
-        sorted_segs.sort_by_key(|s| s.volume_index);
-        // Normalize volume indices to 0-based (see LZ path comment above).
-        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-        for seg in &mut sorted_segs {
-            seg.volume_index -= vol_base;
-        }
+        let (sorted_segs, _) = Self::sorted_member_segments(&entry.segments);
 
         debug!(
             member = %fh.name,
@@ -5605,7 +5602,7 @@ impl RarArchive {
             None
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
-        let (segments, _) = Self::normalized_provider_segments(&self.members[index].segments);
+        let (segments, _) = Self::sorted_member_segments(&self.members[index].segments);
 
         if fh.compression.method == CompressionMethod::Store {
             return self.extract_member_streaming_store(
@@ -6022,6 +6019,11 @@ impl RarArchive {
     /// new writer. Each writer receives that volume's decompressed contribution.
     /// Returns `Vec<(volume_index, bytes_written)>` for each chunk.
     ///
+    /// Every `volume_index` here — the provider's, the factory's, and the
+    /// returned chunks' — is the volume set's own, as
+    /// [`RarArchive::extract_member_streaming`] describes. A member starting in
+    /// volume 5 reads volume 5 and reports its first chunk against 5.
+    ///
     /// For Store mode: detects volume transitions via the volume tracker and
     /// switches writers at each boundary.
     ///
@@ -6085,13 +6087,7 @@ impl RarArchive {
 
         let entry = &self.members[index];
         let split_after = entry.file_header.split_after;
-        let mut sorted_segs = entry.segments.clone();
-        sorted_segs.sort_by_key(|s| s.volume_index);
-        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-        for seg in &mut sorted_segs {
-            seg.volume_index -= vol_base;
-        }
-        let first_vol = sorted_segs.first().map_or(0, |s| s.volume_index);
+        let (sorted_segs, first_vol) = Self::sorted_member_segments(&entry.segments);
 
         if fh.compression.method != CompressionMethod::Store {
             debug!(
@@ -6324,8 +6320,7 @@ impl RarArchive {
             None
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
-        let (segments, first_vol) =
-            Self::normalized_provider_segments(&self.members[index].segments);
+        let (segments, first_vol) = Self::sorted_member_segments(&self.members[index].segments);
 
         if fh.compression.method == CompressionMethod::Store {
             return self.extract_member_streaming_store_chunked(

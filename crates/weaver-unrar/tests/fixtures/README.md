@@ -122,6 +122,19 @@ and `rar4_enc_*`, all written by RARLAB rar (7.20 for RAR5, 6.24 for RAR4).
    flag as a per-member constant, or folding it into "the parts agree about
    encryption", would misjudge every real encrypted split chain.
 
+## Multi-member multi-volume extraction
+
+Sets driven by `tests/integration.rs`, for the one thing every other
+multi-volume fixture here cannot show: a member that does not start in the
+set's first volume. With a single member starting in volume 0, addressing
+volumes by the set's numbering and by the member's own first volume look
+identical, and a streaming path that confuses the two still passes.
+
+| Set | Shape it exercises | Recipe |
+| --- | --- | --- |
+| `rar5/rar5_mv_store_pair.part01..09.rar` | Plain multi-volume store, two members over 9 volumes, the second starting in volume 5. The plaintext twin of `rar5_enc_mv_store_pair` — same members, same volume size, same member boundary — which is what shows the volume-addressing defect it was found through has nothing to do with encryption. | `rar a -m0 -v4k` on 20 001 B + 12 288 B blobs |
+| `rar5/rar5_mv_solid_pair.part01..09.rar` | The same pair as one solid (`-s -m5`) stream, second member again starting in volume 5. Reaching it decodes the first member first, so the skipped member's volumes are addressed too. | `rar a -m5 -s -v4k` on the same blobs |
+
 ### Known gap
 
 No fixture uses old-style RAR volume names (`archive.rar`, `archive.r00`,
