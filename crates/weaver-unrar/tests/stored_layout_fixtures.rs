@@ -17,9 +17,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use weaver_unrar::{
-    ArchiveFormat, IneligibilityReason, MappedSlice, MemberEligibility, RarArchive, RarVolumeFacts,
-    StoredLayoutBuilder, StoredMember,
+    ArchiveFormat, EncryptedStore, IneligibilityReason, KdfCache, MappedSlice, MemberEligibility,
+    PasswordCheck, RarArchive, RarVolumeFacts, StoredLayoutBuilder, StoredMember,
+    check_member_password, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
 };
+
+/// The corpus-wide fixture password, as `generate_encrypted.sh` and
+/// `generate_stored_layout.sh` both set it.
+const TEST_PASSWORD: &str = "testpass123";
 
 // ---------------------------------------------------------------------------
 // Fixture loading
@@ -31,6 +36,7 @@ struct Fixture {
     name: &'static str,
     facts: Vec<RarVolumeFacts>,
     lens: Vec<u64>,
+    paths: Vec<PathBuf>,
 }
 
 impl Fixture {
@@ -58,7 +64,12 @@ impl Fixture {
             );
             lens.push(std::fs::metadata(path).expect("fixture metadata").len());
         }
-        Some(Self { name, facts, lens })
+        Some(Self {
+            name,
+            facts,
+            lens,
+            paths,
+        })
     }
 
     fn count(&self) -> usize {
@@ -109,6 +120,7 @@ fn parts(prefix: &str, range: std::ops::RangeInclusive<u32>, width: usize) -> Ve
 fn slice_len(slice: &MappedSlice) -> u64 {
     match *slice {
         MappedSlice::Member { len, .. }
+        | MappedSlice::EncryptedMember { len, .. }
         | MappedSlice::Envelope { len }
         | MappedSlice::Unroutable { len } => len,
     }
@@ -129,9 +141,23 @@ fn envelope_len(slices: &[MappedSlice]) -> u64 {
 fn member_len(slices: &[MappedSlice]) -> u64 {
     slices
         .iter()
-        .filter(|slice| matches!(slice, MappedSlice::Member { .. }))
+        .filter(|slice| {
+            matches!(
+                slice,
+                MappedSlice::Member { .. } | MappedSlice::EncryptedMember { .. }
+            )
+        })
         .map(slice_len)
         .sum()
+}
+
+/// How far a member's packed bytes reach: its declared size, or the padded
+/// cipher length when the member is encrypted.
+fn packed_extent(member: &StoredMember) -> Option<u64> {
+    match member.eligibility.encrypted_store() {
+        Some(encrypted) => encrypted.cipher_size,
+        None => member.unpacked_size,
+    }
 }
 
 /// The mapping is a partition of each volume, not a set of interesting
@@ -171,8 +197,8 @@ fn assert_logical_offsets_are_prefix_sums(member: &StoredMember) {
     }
     assert_eq!(
         Some(running),
-        member.unpacked_size,
-        "{}: a stored chain's packed bytes sum to the member's size",
+        packed_extent(member),
+        "{}: a stored chain's packed bytes sum to the member's extent",
         member.name
     );
 }
@@ -733,12 +759,13 @@ fn header_volume_number_and_filename_part_number_disagree_by_a_constant() {
 // 8. RAR5 encrypted store
 // ---------------------------------------------------------------------------
 
-/// Encrypted members are ineligible whatever their compression: the packed
-/// bytes on the wire are ciphertext, so routing them to a destination would
-/// write ciphertext. The facts still describe the chain, which is what a future
-/// decrypt-then-route path would need.
+/// An encrypted `Store` member's cipher bytes sit at the member's own offsets,
+/// so the layout maps them to the member — as [`MappedSlice::EncryptedMember`],
+/// which is the same coordinates plus "decrypt these first". Its packed bytes
+/// are the plaintext CBC-encrypted, so the chain sums to `align16` of the
+/// declared size rather than to the size itself.
 #[test]
-fn rar5_encrypted_multi_volume_store_is_ineligible_but_still_mapped() {
+fn rar5_encrypted_multi_volume_store_classifies_as_encrypted_store() {
     let Some(fixture) = Fixture::load(
         "rar5_enc_mv_store",
         "rar5",
@@ -752,29 +779,601 @@ fn rar5_encrypted_multi_volume_store_is_ineligible_but_still_mapped() {
             facts.members.iter().all(|member| member.is_encrypted),
             "every member of the encrypted fixture is encrypted"
         );
+        assert!(
+            !facts.is_encrypted,
+            "`-p` encrypts file data only; the headers parse without a password"
+        );
     }
 
     let builder = fixture.build(ArchiveFormat::Rar5);
     let member = only_member(&builder);
     assert_eq!(member.name, "binary.bin");
     assert_eq!(member.parts.len(), 5);
-    assert_eq!(
-        member.eligibility,
-        MemberEligibility::Ineligible(IneligibilityReason::Encrypted)
+    assert!(member.chain_complete);
+
+    let store = member
+        .eligibility
+        .encrypted_store()
+        .expect("an encrypted stored member");
+    assert!(store.resolved);
+    // This member's plaintext is already a whole number of blocks, so the
+    // padded length and the declared one coincide — the case where an exact
+    // equality check would have passed by luck.
+    assert_eq!(member.unpacked_size, Some(262_144));
+    assert_eq!(store.cipher_size, Some(262_144));
+    assert_eq!(store.tail_padding, Some(0));
+    assert!(store.claims_password_check());
+    assert!(store.password_check().is_some());
+
+    assert_logical_offsets_are_prefix_sums(member);
+    assert_maps_every_volume_whole(&builder, &fixture);
+
+    // Split parts are not individually block-aligned: only the member's total
+    // is. That is what makes the preceding cipher block cross volumes.
+    let unaligned = member
+        .parts
+        .iter()
+        .filter(|part| !part.data_size.is_multiple_of(16))
+        .count();
+    assert!(
+        unaligned > 0,
+        "the writer splits mid-block, which is the whole boundary problem"
     );
 
-    // The chain is intact underneath the demotion, so the facts a later
-    // decrypting router would consume are all present.
-    assert!(member.chain_complete);
-    assert_logical_offsets_are_prefix_sums(member);
-
-    assert_maps_every_volume_whole(&builder, &fixture);
     for (number, &len) in fixture.lens.iter().enumerate() {
         let slices = builder.map_physical_range(number as u32, 0, len);
+        let part = &member.parts[number];
         assert_eq!(
-            envelope_len(&slices),
-            len,
-            "volume {number}: ciphertext never routes"
+            slices
+                .iter()
+                .filter(|slice| matches!(slice, MappedSlice::Member { .. }))
+                .count(),
+            0,
+            "volume {number}: cipher bytes never present as writable member bytes"
+        );
+        assert_eq!(
+            builder.map_physical_range(number as u32, part.data_offset, part.data_size),
+            vec![MappedSlice::EncryptedMember {
+                member_index: 0,
+                logical_offset: part.logical_offset.expect("resolved"),
+                len: part.data_size,
+            }],
+            "volume {number}: the part maps to its own cipher span"
+        );
+        assert_eq!(envelope_len(&slices), len - part.data_size);
+    }
+}
+
+/// Two encrypted members in one chain: RAR gives each its own CBC stream, so
+/// each has its own IV and its own padding, while the KDF tuple and password
+/// check are the archive's. The volume where one member ends and the next
+/// begins is the case a single-member fixture cannot reach.
+#[test]
+fn rar5_encrypted_multi_member_store_gives_each_member_its_own_cipher_stream() {
+    let Some(fixture) = Fixture::load(
+        "rar5_enc_mv_store_pair",
+        "rar5",
+        &parts("rar5_enc_mv_store_pair", 1..=9, 2),
+    ) else {
+        return;
+    };
+
+    let builder = fixture.build(ArchiveFormat::Rar5);
+    let members = builder.members();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].name, "Silver.Horizon.S02E01.mkv");
+    assert_eq!(members[1].name, "Silver.Horizon.S02E02.mkv");
+
+    let stores: Vec<EncryptedStore> = members
+        .iter()
+        .map(|member| {
+            member
+                .eligibility
+                .encrypted_store()
+                .unwrap_or_else(|| panic!("{}: encrypted store", member.name))
+        })
+        .collect();
+    assert!(stores.iter().all(|store| store.resolved));
+
+    // Opposite sides of the padding rule, in one archive: 20001 bytes need a
+    // 15-byte tail, 12288 need none.
+    assert_eq!(members[0].unpacked_size, Some(20_001));
+    assert_eq!(stores[0].cipher_size, Some(20_016));
+    assert_eq!(stores[0].tail_padding, Some(15));
+    assert_eq!(members[1].unpacked_size, Some(12_288));
+    assert_eq!(stores[1].cipher_size, Some(12_288));
+    assert_eq!(stores[1].tail_padding, Some(0));
+
+    let first = stores[0].crypt.expect("RAR5 crypt record");
+    let second = stores[1].crypt.expect("RAR5 crypt record");
+    assert_eq!(first.salt, second.salt, "one KDF tuple for the archive");
+    assert_eq!(first.kdf_count_lg2, second.kdf_count_lg2);
+    assert_eq!(first.psw_check, second.psw_check);
+    assert_ne!(first.iv, second.iv, "one CBC stream per member");
+
+    for member in members {
+        assert!(member.chain_complete);
+        assert_logical_offsets_are_prefix_sums(member);
+        // The keyed-checksum finding: `rar` sets the hash-MAC flag on the
+        // final part only, so the whole-member checksum is keyed while the
+        // non-final parts' packed checksums are not.
+        assert!(
+            member.data_hash_uses_mac,
+            "{}: the whole-member checksum is a keyed fold",
+            member.name
+        );
+        for (position, part) in member.parts.iter().enumerate() {
+            if part.split_after {
+                assert!(part.packed_crc32.is_some());
+                assert!(
+                    !part.packed_hash_uses_mac,
+                    "{}: part {position}'s packed CRC32 is a plain one",
+                    member.name
+                );
+            }
+        }
+    }
+
+    // The straddle volume: member 0's last part and member 1's first part.
+    let straddle = members[0].parts.last().expect("parts").volume;
+    assert_eq!(straddle, members[1].parts[0].volume);
+    assert_eq!(fixture.facts[straddle as usize].members.len(), 2);
+
+    assert_maps_every_volume_whole(&builder, &fixture);
+    let slices = builder.map_physical_range(straddle, 0, fixture.lens[straddle as usize]);
+    let indices: Vec<usize> = slices
+        .iter()
+        .filter_map(|slice| match slice {
+            MappedSlice::EncryptedMember { member_index, .. } => Some(*member_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        indices,
+        vec![0, 1],
+        "the straddle volume hands its bytes to both members in physical order"
+    );
+}
+
+/// The single-volume case, and the only place the tail padding is directly
+/// visible: a 20 001-byte member occupies 20 016 packed bytes, and all 20 016
+/// map to the member because the last block cannot be decrypted without them.
+#[test]
+fn rar5_single_volume_encrypted_store_maps_its_tail_padding_as_member_bytes() {
+    let Some(fixture) = Fixture::load(
+        "rar5_enc_store_pair",
+        "rar5",
+        &["rar5_enc_store_pair.rar".to_string()],
+    ) else {
+        return;
+    };
+
+    let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar5);
+    builder
+        .add_volume(0, &fixture.facts[0])
+        .expect("fixture volume accepted");
+
+    let members = builder.members();
+    assert_eq!(members.len(), 2);
+    let padded = &members[0];
+    let store = padded.eligibility.encrypted_store().expect("encrypted");
+    assert_eq!(padded.unpacked_size, Some(20_001));
+    assert_eq!(store.cipher_size, Some(20_016));
+    assert_eq!(store.tail_padding, Some(15));
+
+    let part = &padded.parts[0];
+    assert_eq!(part.data_size, 20_016);
+    assert_eq!(
+        builder.map_physical_range(0, part.data_offset, part.data_size),
+        vec![MappedSlice::EncryptedMember {
+            member_index: 0,
+            logical_offset: 0,
+            len: 20_016,
+        }],
+        "the padding bytes are member bytes on the wire, not envelope"
+    );
+
+    assert_maps_every_volume_whole(&builder, &fixture);
+}
+
+/// RAR4 states no per-file crypt record — key and IV come from the password
+/// and this 8-byte salt — so the salt is the whole of the facts, and the
+/// `align16` rule is the same one.
+#[test]
+fn rar4_encrypted_multi_volume_store_carries_its_file_salt() {
+    let Some(fixture) = Fixture::load(
+        "rar4_enc_mv_store",
+        "rar4",
+        &parts("rar4_enc_mv_store", 1..=5, 1),
+    ) else {
+        return;
+    };
+
+    for (number, facts) in fixture.facts.iter().enumerate() {
+        assert_eq!(facts.format, 4);
+        let member = &facts.members[0];
+        assert!(member.is_encrypted);
+        assert_eq!(member.encryption, None, "RAR4 has no FHEXTRA_CRYPT record");
+        assert!(
+            member.rar4_salt.is_some(),
+            "volume {number}: RAR4 `-p` writes a per-file salt"
         );
     }
+
+    let builder = fixture.build(ArchiveFormat::Rar4);
+    let member = only_member(&builder);
+    let store = member.eligibility.encrypted_store().expect("encrypted");
+    assert!(store.resolved);
+    assert_eq!(store.crypt, None);
+    assert_eq!(store.rar4_salt, fixture.facts[0].members[0].rar4_salt);
+    assert!(
+        !store.claims_password_check(),
+        "RAR4 carries no check value"
+    );
+    assert_eq!(store.cipher_size, Some(262_144));
+
+    assert_logical_offsets_are_prefix_sums(member);
+    assert_maps_every_volume_whole(&builder, &fixture);
+}
+
+// ---------------------------------------------------------------------------
+// 9. The encrypted-member surface a decrypting router calls
+// ---------------------------------------------------------------------------
+
+/// Admission (E-D1): the password is decided from the header's check value,
+/// before a byte is decrypted, and a wrong one is refuted rather than merely
+/// unconfirmed.
+#[test]
+fn deriving_a_members_key_reproduces_the_password_check_its_header_states() {
+    let sets: [(&'static str, &str, Vec<String>); 2] = [
+        (
+            "rar5_enc_mv_store_pair",
+            "rar5",
+            parts("rar5_enc_mv_store_pair", 1..=9, 2),
+        ),
+        (
+            "rar5_enc_mv_store",
+            "rar5",
+            parts("rar5_enc_mv_store", 1..=5, 1),
+        ),
+    ];
+
+    let cache = KdfCache::new();
+    let mut checked = 0usize;
+    for (name, dir, files) in sets {
+        let Some(fixture) = Fixture::load(name, dir, &files) else {
+            continue;
+        };
+        let builder = fixture.build(ArchiveFormat::Rar5);
+        for member in builder.members() {
+            let store = member.eligibility.encrypted_store().expect("encrypted");
+            let crypt = store.crypt.expect("RAR5 crypt record");
+            let check = store.password_check().expect("the writer states one");
+
+            assert_eq!(
+                check_member_password(
+                    &cache,
+                    TEST_PASSWORD,
+                    &crypt.salt,
+                    crypt.kdf_count_lg2,
+                    Some(&check)
+                ),
+                PasswordCheck::Verified,
+                "{name}/{}: the fixture password verifies",
+                member.name
+            );
+            assert_eq!(
+                check_member_password(
+                    &cache,
+                    "not-the-password",
+                    &crypt.salt,
+                    crypt.kdf_count_lg2,
+                    Some(&check)
+                ),
+                PasswordCheck::Wrong,
+                "{name}/{}: a wrong password is refuted, not merely unconfirmed",
+                member.name
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no encrypted fixture was reachable");
+}
+
+/// The hostile case that says what [`PasswordCheck::Verified`] is worth: the
+/// header's password check is unauthenticated data a writer chooses.
+///
+/// Forge those 8 bytes to the value a *wrong* password derives and
+/// `check_member_password` answers `Verified` for that password — correctly,
+/// since it is reporting what the header states, and the header lied. Every
+/// byte then decrypted is garbage.
+///
+/// What still catches it is the member's own checksum, folded with the same
+/// wrong password's hash key exactly as [`RarArchive`]'s conventional
+/// extractor folds it: the keyed whole-member gate is the real backstop, and
+/// it fires whether the check value was forged or simply absent. Any consumer
+/// that treats `Verified` as licence to keep decrypted bytes without running
+/// that gate is admitting this archive.
+#[test]
+fn forged_password_check_admits_a_wrong_password_and_the_keyed_member_gate_still_catches_it() {
+    /// A password that is not [`TEST_PASSWORD`], and never becomes one.
+    const WRONG_PASSWORD: &str = "testpass124";
+
+    let Some(fixture) = Fixture::load(
+        "rar5_enc_store_pair",
+        "rar5",
+        &["rar5_enc_store_pair.rar".to_string()],
+    ) else {
+        return;
+    };
+
+    let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar5);
+    builder
+        .add_volume(0, &fixture.facts[0])
+        .expect("fixture volume accepted");
+    let volume = std::fs::read(&fixture.paths[0]).expect("volume");
+    let cache = KdfCache::new();
+
+    let mut checked = 0usize;
+    for member in builder.members() {
+        let store = member.eligibility.encrypted_store().expect("encrypted");
+        let crypt = store.crypt.expect("RAR5 crypt record");
+        let stated = store.password_check().expect("the writer states one");
+        let unpacked_size = member.unpacked_size.expect("resolved") as usize;
+        let stored_checksum = member.data_crc32.expect("whole-member CRC32");
+        assert!(
+            member.data_hash_uses_mac,
+            "{}: this fixture's whole-member checksum is a keyed fold, which is \
+             the gate under test",
+            member.name
+        );
+
+        let wrong = derive_rar5_material(WRONG_PASSWORD, &crypt.salt, crypt.kdf_count_lg2)
+            .expect("the wrong password still derives material");
+
+        // Against the header as written, the wrong password is refuted. This
+        // is the control: the forgery below is what changes the answer, not
+        // some accident of the fixture.
+        assert_eq!(
+            check_member_password(
+                &cache,
+                WRONG_PASSWORD,
+                &crypt.salt,
+                crypt.kdf_count_lg2,
+                Some(&stated)
+            ),
+            PasswordCheck::Wrong,
+            "{}: control",
+            member.name
+        );
+
+        // Forge the check field to what the wrong password derives. Only the 8
+        // check bytes are forged here: the trailing 4-byte SHA-256 tag is the
+        // parser's business — it drops a field whose tag fails, and a writer
+        // forging the check would recompute the tag over its own bytes — and
+        // `check_member_password` compares the 8 alone.
+        let mut forged = stated;
+        forged[..8].copy_from_slice(&wrong.psw_check);
+        assert_ne!(
+            forged, stated,
+            "{}: the forgery must actually change the header's claim",
+            member.name
+        );
+        assert_eq!(
+            check_member_password(
+                &cache,
+                WRONG_PASSWORD,
+                &crypt.salt,
+                crypt.kdf_count_lg2,
+                Some(&forged)
+            ),
+            PasswordCheck::Verified,
+            "{}: admission believes the header, and the header lied",
+            member.name
+        );
+
+        // The cipher bytes exactly as the layout maps them: one part, whole
+        // member, so the preceding block of its first block is the header IV.
+        let part = &member.parts[0];
+        let start = part.data_offset as usize;
+        let cipher = volume[start..start + part.data_size as usize].to_vec();
+
+        // Decrypt with the admitted-but-wrong key and fold the result the way
+        // the header says its checksum was folded. Garbage in, and the keyed
+        // gate says so.
+        let mut garbage = cipher.clone();
+        decrypt_cipher_range(&wrong.key, &crypt.iv, &mut garbage).expect("block-aligned");
+        garbage.truncate(unpacked_size);
+        assert_ne!(
+            convert_crc32_to_mac(crc32(&garbage), &wrong.hash_key),
+            stored_checksum,
+            "{}: the keyed whole-member checksum must reject the forged \
+             admission — this assertion is the backstop the router may not skip",
+            member.name
+        );
+
+        // Non-vacuity: the same composition over the *right* password
+        // reproduces the header's stored value, so the mismatch above is the
+        // gate discriminating rather than the arithmetic simply never matching.
+        let right = derive_rar5_material(TEST_PASSWORD, &crypt.salt, crypt.kdf_count_lg2)
+            .expect("the fixture password derives");
+        let mut plaintext = cipher;
+        decrypt_cipher_range(&right.key, &crypt.iv, &mut plaintext).expect("block-aligned");
+        plaintext.truncate(unpacked_size);
+        assert_eq!(
+            convert_crc32_to_mac(crc32(&plaintext), &right.hash_key),
+            stored_checksum,
+            "{}: the gate accepts the real password",
+            member.name
+        );
+
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "both members of the pair fixture were checked");
+}
+
+/// CRC-32/ISO-HDLC, computed here rather than taken from the crate under test:
+/// a hostile test that borrows its checksum from the code it is checking
+/// proves less. Bitwise and slow, over ≤32 KiB.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// The standard check value, so a broken local helper cannot quietly make the
+/// forged-check test's inequality pass.
+#[test]
+fn crc32_helper_matches_the_standard_check_value() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(crc32(b""), 0);
+}
+
+/// The write transform (E-D2): any 16-aligned range of a member's cipher
+/// stream decrypts from its own bytes plus the 16 immediately before them, and
+/// the result is what the conventional extractor produces with the same
+/// password. Every part boundary is exercised, so the case where the preceding
+/// block lives in — or straddles — the previous volume is covered by
+/// construction.
+#[test]
+fn decrypting_any_cipher_range_from_its_preceding_block_matches_the_extractor() {
+    let files = parts("rar5_enc_mv_store_pair", 1..=9, 2);
+    let Some(fixture) = Fixture::load("rar5_enc_mv_store_pair", "rar5", &files) else {
+        return;
+    };
+
+    let builder = fixture.build(ArchiveFormat::Rar5);
+    let cache = KdfCache::new();
+    let mut boundary_cases = 0usize;
+
+    for (member_index, member) in builder.members().iter().enumerate() {
+        let store = member.eligibility.encrypted_store().expect("encrypted");
+        let crypt = store.crypt.expect("RAR5 crypt record");
+        let cipher_size = store.cipher_size.expect("resolved");
+        let unpacked_size = member.unpacked_size.expect("resolved");
+
+        // The member's cipher stream, read straight off the volumes at the
+        // offsets the layout maps — this is exactly the byte sequence a router
+        // sees on the wire.
+        let mut cipher = Vec::with_capacity(cipher_size as usize);
+        for part in &member.parts {
+            assert_eq!(
+                builder.map_physical_range(part.volume, part.data_offset, part.data_size),
+                vec![MappedSlice::EncryptedMember {
+                    member_index,
+                    logical_offset: part.logical_offset.expect("resolved"),
+                    len: part.data_size,
+                }]
+            );
+            let volume = std::fs::read(&fixture.paths[part.volume as usize]).expect("volume");
+            let start = part.data_offset as usize;
+            cipher.extend_from_slice(&volume[start..start + part.data_size as usize]);
+        }
+        assert_eq!(cipher.len() as u64, cipher_size);
+
+        let plaintext = extract_member(&fixture.paths, &member.name);
+        assert_eq!(plaintext.len() as u64, unpacked_size);
+
+        let key = cache
+            .derive_key_rar5(TEST_PASSWORD, &crypt.salt, crypt.kdf_count_lg2)
+            .expect("key derives");
+
+        // Offsets worth testing: the stream's start (the IV case), the first
+        // block boundary at or after every part boundary (where the preceding
+        // block comes from another volume), and the final block (whose tail is
+        // padding rather than member bytes).
+        let mut offsets = vec![0u64, cipher_size - 16];
+        let mut running = 0u64;
+        for part in &member.parts {
+            running += part.data_size;
+            let aligned = running.next_multiple_of(16);
+            if aligned > 0 && aligned < cipher_size {
+                offsets.push(aligned);
+            }
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        for offset in offsets {
+            let preceding: [u8; 16] = if offset == 0 {
+                crypt.iv
+            } else {
+                cipher[(offset - 16) as usize..offset as usize]
+                    .try_into()
+                    .expect("one block")
+            };
+            let len = (cipher_size - offset).min(32);
+            let mut range = cipher[offset as usize..(offset + len) as usize].to_vec();
+            decrypt_cipher_range(&key, &preceding, &mut range).expect("block-aligned range");
+
+            // Compare against the extractor's plaintext, stopping at the
+            // member's declared end: anything past it is the tail padding,
+            // which is not the member's data.
+            let compare = (unpacked_size.saturating_sub(offset)).min(len) as usize;
+            assert_eq!(
+                &range[..compare],
+                &plaintext[offset as usize..offset as usize + compare],
+                "{}: range {offset}+{len}",
+                member.name
+            );
+
+            if offset > 0 && offset < cipher_size {
+                let owner = |position: u64| {
+                    member
+                        .parts
+                        .iter()
+                        .position(|part| {
+                            let start = part.logical_offset.expect("resolved");
+                            position >= start && position < start + part.data_size
+                        })
+                        .expect("inside the member")
+                };
+                if owner(offset - 16) != owner(offset) {
+                    boundary_cases += 1;
+                }
+            }
+        }
+    }
+
+    assert!(
+        boundary_cases > 0,
+        "the preceding block must come from an earlier volume somewhere, or \
+         this test never exercises the boundary case it exists for"
+    );
+}
+
+/// Extract one member conventionally, with the password, as the reference
+/// every decrypt above is compared against.
+///
+/// Deliberately the batch path: `extract_member_streaming` rebases a member's
+/// segment volume indices to the member's own first volume, so it reads the
+/// wrong volumes for any member that does not start in the set's first one
+/// (`rar5_enc_mv_store_pair`'s second member is exactly that shape, and its
+/// plaintext twin fails identically — the defect predates encryption and has
+/// nothing to do with it).
+fn extract_member(paths: &[PathBuf], name: &str) -> Vec<u8> {
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+        .iter()
+        .map(|path| {
+            Box::new(std::io::Cursor::new(std::fs::read(path).expect("volume")))
+                as Box<dyn weaver_unrar::ReadSeek>
+        })
+        .collect();
+    let mut archive = RarArchive::open_volumes(readers).expect("volumes open");
+    archive.set_password(TEST_PASSWORD);
+    let index = archive.find_member(name).expect("member present");
+    let options = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+        restore_owners: false,
+    };
+    archive
+        .extract_member(index, &options, None)
+        .and_then(|member| member.into_bytes())
+        .expect("member extracts")
 }

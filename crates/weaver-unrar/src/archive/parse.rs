@@ -11,6 +11,7 @@ impl RarArchive {
             salt: params.salt,
             iv: params.iv,
             check_data: params.check_data,
+            psw_check_present: params.psw_check_present,
             use_hash_mac: params.use_hash_mac,
         }
     }

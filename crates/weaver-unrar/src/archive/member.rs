@@ -8689,6 +8689,7 @@ mod tests {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
+                psw_check_present: false,
                 use_hash_mac: false,
             }),
         );
@@ -8712,6 +8713,7 @@ mod tests {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
+                psw_check_present: false,
                 use_hash_mac: false,
             }),
         );

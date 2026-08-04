@@ -278,6 +278,81 @@ fn password_check_matches(psw_check: &[u8; 8], check_data: &[u8; 12]) -> bool {
     psw_check.as_slice().ct_eq(&check_data[..8]).into()
 }
 
+/// What a member's header lets a caller conclude about a candidate password,
+/// **before** any of that member's bytes are decrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordCheck {
+    /// The header carried a password-check value and this password reproduces
+    /// it.
+    ///
+    /// That is the whole of the claim: the password matches what *this header
+    /// states*. It is not a guarantee that decrypting yields the writer's
+    /// plaintext, because the check value is 8 unauthenticated bytes in a
+    /// header a hostile writer chooses. Forging them to the value a different
+    /// password derives makes this variant say `Verified` for that password
+    /// while every decrypted byte is garbage — see
+    /// `forged_password_check_admits_a_wrong_password_and_the_keyed_member_gate_still_catches_it`
+    /// in `tests/stored_layout_fixtures.rs`.
+    ///
+    /// The authority over the plaintext is the member's checksum, folded with
+    /// the same password's hash key when the header keys it
+    /// ([`convert_crc32_to_mac`] / [`convert_blake2_to_mac`]). A caller may use
+    /// this variant to admit a password cheaply and to reject one for free; it
+    /// must not use it to skip that gate before anything is kept.
+    Verified,
+    /// The header carried a password-check value and this password does not
+    /// reproduce it. Every byte decrypted with it would be garbage, so nothing
+    /// should be written on the strength of it.
+    Wrong,
+    /// The header carried no usable password-check value — the writer omitted
+    /// it, or the value failed its own SHA-256 tag — so nothing can be
+    /// concluded here. The password may still be right; the member's checksum
+    /// gates are then the earliest detector.
+    Unverifiable,
+}
+
+/// Check a candidate password against one member's RAR5 crypt facts.
+///
+/// The E-D1 admission surface: three outcomes, no key handed out, and a
+/// [`KdfCache`] so a set whose members share a KDF tuple pays for the
+/// derivation once. `psw_check` is
+/// [`crate::RarVolumeMemberEncryptionFacts::psw_check`] — already validated
+/// against its own tag by the parser, which is why the "claimed but corrupt"
+/// case arrives here as `None` and reads as [`PasswordCheck::Unverifiable`].
+///
+/// A KDF count the crate refuses (over [`CRYPT5_KDF_LG2_COUNT_MAX`]) also
+/// yields `Unverifiable`: the derivation never runs, so the password is
+/// neither confirmed nor refuted. Such a member cannot be decrypted at all —
+/// the caller learns that from the facts, not from here.
+pub fn check_member_password(
+    cache: &KdfCache,
+    password: &str,
+    salt: &[u8; 16],
+    kdf_count_lg2: u8,
+    psw_check: Option<&[u8; 12]>,
+) -> PasswordCheck {
+    let Some(psw_check) = psw_check else {
+        return PasswordCheck::Unverifiable;
+    };
+    if kdf_count_lg2 > CRYPT5_KDF_LG2_COUNT_MAX {
+        return PasswordCheck::Unverifiable;
+    }
+    match cache.derive_material_rar5(password, salt, kdf_count_lg2) {
+        Ok(mut material) => {
+            let matches = password_check_matches(&material.psw_check, psw_check);
+            material.key.zeroize();
+            material.hash_key.zeroize();
+            material.psw_check.zeroize();
+            if matches {
+                PasswordCheck::Verified
+            } else {
+                PasswordCheck::Wrong
+            }
+        }
+        Err(_) => PasswordCheck::Unverifiable,
+    }
+}
+
 pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
     let digest = backend::hmac_sha256(&backend::hmac_sha256_key(key), &value.to_le_bytes());
     let mut mac = 0u32;
@@ -1527,6 +1602,51 @@ impl CbcDecryptor {
     }
 }
 
+/// Decrypt one arbitrary range of a RAR5 member's cipher stream, in place.
+///
+/// The whole of E-D2 in one call: AES-CBC decrypts block *N* from block *N*
+/// and block *N−1* alone, so a range's plaintext depends only on its own
+/// cipher bytes plus the 16 immediately before them. No archive object, no
+/// chain state, no forward-only constraint — a router that has cipher bytes
+/// out of order can decrypt each span the moment its predecessor block has
+/// landed.
+///
+/// - `key` is the member's AES-256 key, from
+///   [`KdfCache::derive_key_rar5`] over its `FHEXTRA_CRYPT` salt and KDF count.
+/// - `preceding_block` is the 16 cipher bytes immediately before `cipher`'s
+///   first byte, or the member's header IV
+///   ([`crate::RarVolumeMemberEncryptionFacts::iv`]) when `cipher` starts at
+///   member-logical offset 0. Passing the wrong 16 bytes corrupts exactly the
+///   first block and leaves the rest correct — it is not a detectable error
+///   here, so the caller owns getting it right.
+/// - `cipher` is a whole number of blocks, so both its start offset and its
+///   length are multiples of 16. Cipher offset and member-logical offset are
+///   the same number for a stored member.
+///
+/// Errors only on a length that is not a multiple of 16; an empty range is a
+/// no-op. Decrypting past the member's declared size is legitimate — the final
+/// block's last bytes are its tail padding.
+pub fn decrypt_cipher_range(
+    key: &[u8; 32],
+    preceding_block: &[u8; AES_BLOCK],
+    cipher: &mut [u8],
+) -> RarResult<()> {
+    if cipher.is_empty() {
+        return Ok(());
+    }
+    if !cipher.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                cipher.len()
+            ),
+        });
+    }
+
+    CbcDecryptor::new(key, preceding_block).decrypt_blocks(cipher);
+    Ok(())
+}
+
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
     decryptor: backend::Aes128CbcDec,
@@ -2252,5 +2372,103 @@ mod tests {
         }
 
         assert_eq!(actual, plaintext);
+    }
+
+    // -----------------------------------------------------------------------
+    // E-D2 range decryption and E-D1 password admission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decrypt_cipher_range_matches_a_whole_stream_decrypt_from_any_block() {
+        // The property the whole write transform rests on: decrypting block N
+        // needs block N-1 and nothing else. Every block boundary of a stream is
+        // tried, so this is the general statement, not one lucky offset.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 7 + 3) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..ciphertext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=ciphertext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = ciphertext[start..end].to_vec();
+                decrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "range {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_cipher_range_corrupts_only_its_first_block_on_a_wrong_predecessor() {
+        // Stated because it is the failure mode a router has to reason about:
+        // the wrong preceding block is not an error anyone can raise here, it
+        // is one block of garbage and a correct remainder.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 4).map(|i| (i * 5 + 1) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut range = ciphertext[AES_BLOCK..].to_vec();
+        decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut range).unwrap();
+
+        assert_ne!(range[..AES_BLOCK], plaintext[AES_BLOCK..AES_BLOCK * 2]);
+        assert_eq!(range[AES_BLOCK..], plaintext[AES_BLOCK * 2..]);
+    }
+
+    #[test]
+    fn decrypt_cipher_range_refuses_a_partial_block_and_accepts_an_empty_one() {
+        let key = [0x21u8; 32];
+        let mut partial = vec![0u8; AES_BLOCK + 1];
+        assert!(matches!(
+            decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut partial),
+            Err(RarError::CorruptArchive { .. })
+        ));
+        assert!(decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn check_member_password_separates_wrong_from_unverifiable() {
+        let salt = [0x5Au8; 16];
+        let kdf_count = 4;
+        let cache = KdfCache::new();
+
+        let psw_check = derive_rar5_material("testpass123", &salt, kdf_count)
+            .unwrap()
+            .psw_check;
+        let mut check_data = [0u8; 12];
+        check_data[..8].copy_from_slice(&psw_check);
+        check_data[8..].copy_from_slice(&sha256_digest(&psw_check)[..4]);
+
+        assert_eq!(
+            check_member_password(&cache, "testpass123", &salt, kdf_count, Some(&check_data)),
+            PasswordCheck::Verified
+        );
+        assert_eq!(
+            check_member_password(&cache, "testpass124", &salt, kdf_count, Some(&check_data)),
+            PasswordCheck::Wrong
+        );
+        // No check value at all: the password may be right, but nothing here
+        // can say so — which is a different answer from `Wrong`, and the whole
+        // reason the two are distinct variants.
+        assert_eq!(
+            check_member_password(&cache, "testpass124", &salt, kdf_count, None),
+            PasswordCheck::Unverifiable
+        );
+        // A KDF count the crate refuses never runs a derivation, so it cannot
+        // refute the password either.
+        assert_eq!(
+            check_member_password(
+                &cache,
+                "testpass123",
+                &salt,
+                CRYPT5_KDF_LG2_COUNT_MAX + 1,
+                Some(&check_data)
+            ),
+            PasswordCheck::Unverifiable
+        );
     }
 }

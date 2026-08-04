@@ -41,6 +41,14 @@ pub struct FileEncryptionParams {
     pub salt: [u8; 16],
     pub iv: [u8; 16],
     pub check_data: Option<[u8; 12]>,
+    /// Whether the record's flags claim a password-check value at all.
+    ///
+    /// Distinct from `check_data.is_some()`: the parser drops a check value
+    /// whose trailing SHA-256 tag does not match, so a claimed-but-unusable
+    /// check reads as `psw_check_present` with `check_data: None`. A caller
+    /// deciding whether a wrong password can be detected before decrypting
+    /// needs `check_data`; one reporting *why* it cannot needs both.
+    pub psw_check_present: bool,
     /// When true, CRC32 and BLAKE2 hashes in the header are HMAC-transformed
     /// and cannot be verified without HashKey from the RAR5 KDF chain.
     pub use_hash_mac: bool,
@@ -821,6 +829,7 @@ fn apply_extra_records(
                     salt: *salt,
                     iv: *iv,
                     check_data: *check_data,
+                    psw_check_present: enc_flags & extra::FHEXTRA_CRYPT_PSWCHECK != 0,
                     use_hash_mac: enc_flags & 0x0002 != 0,
                 });
             }

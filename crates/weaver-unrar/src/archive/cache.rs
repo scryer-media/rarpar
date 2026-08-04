@@ -168,6 +168,11 @@ pub struct CachedEncryption {
     pub salt: [u8; 16],
     pub iv: [u8; 16],
     pub check_data: Option<[u8; 12]>,
+    /// Whether the header's flags claimed a password check. Caches written
+    /// before this field existed decode to `false`; `check_data` is the field
+    /// that decides whether a password can be verified, and it is unaffected.
+    #[serde(default)]
+    pub psw_check_present: bool,
     pub use_hash_mac: bool,
 }
 
@@ -189,6 +194,19 @@ pub struct CachedSegment {
     pub packed_hash_uses_mac: bool,
 }
 
+/// The pre-named cache shape, decoded positionally.
+///
+/// **Frozen.** MessagePack without field names is a bare array, so every one of
+/// these structs is a field *count* as much as a field list: a decode reads
+/// element *n* into field *n* and fails the moment the counts disagree. They
+/// therefore mirror the historical layout and must never track the current
+/// structs — widening `CachedArchiveHeaders`, `CachedMember` or
+/// `CachedEncryption` must leave this side alone, or every legacy blob stops
+/// decoding (a cache miss and a re-parse, so benign, but silent).
+///
+/// `deserialize_headers_accepts_legacy_compact_cache` pins that by building its
+/// input from its own frozen mirrors rather than from these or from the current
+/// structs.
 #[derive(Deserialize)]
 struct LegacyCachedArchiveHeaders {
     format: u8,
@@ -215,10 +233,43 @@ struct LegacyCachedMember {
     split_after: bool,
     is_directory: bool,
     is_encrypted: bool,
-    encryption: Option<CachedEncryption>,
+    encryption: Option<LegacyCachedEncryption>,
     rar4_salt: Option<[u8; 8]>,
     blake2_hash: Option<[u8; 32]>,
     segments: Vec<CachedSegment>,
+}
+
+/// The six-field encryption record a pre-named cache carries — everything the
+/// current [`CachedEncryption`] has except `psw_check_present`, which did not
+/// exist when anything wrote this shape.
+#[derive(Deserialize)]
+struct LegacyCachedEncryption {
+    version: u64,
+    kdf_count: u8,
+    salt: [u8; 16],
+    iv: [u8; 16],
+    check_data: Option<[u8; 12]>,
+    use_hash_mac: bool,
+}
+
+impl From<LegacyCachedEncryption> for CachedEncryption {
+    fn from(value: LegacyCachedEncryption) -> Self {
+        Self {
+            version: value.version,
+            kdf_count: value.kdf_count,
+            salt: value.salt,
+            iv: value.iv,
+            check_data: value.check_data,
+            // The parser only ever kept a check value whose flag was set and
+            // whose tag validated, so a stored value implies the claim. The
+            // reverse — a claim whose value failed its tag — is not recoverable
+            // from a cache that predates the field, and under-reports as
+            // `false`; `file_encryption` states the same rule for the named
+            // shape's defaulted field.
+            psw_check_present: value.check_data.is_some(),
+            use_hash_mac: value.use_hash_mac,
+        }
+    }
 }
 
 impl From<LegacyCachedArchiveHeaders> for CachedArchiveHeaders {
@@ -264,7 +315,7 @@ impl From<LegacyCachedMember> for CachedMember {
             split_after: value.split_after,
             is_directory: value.is_directory,
             is_encrypted: value.is_encrypted,
-            encryption: value.encryption,
+            encryption: value.encryption.map(CachedEncryption::from),
             rar4_salt: value.rar4_salt,
             version: None,
             blake2_hash: value.blake2_hash,
@@ -401,6 +452,7 @@ fn cached_encryption(encryption: &FileEncryptionInfo) -> CachedEncryption {
         salt: encryption.salt,
         iv: encryption.iv,
         check_data: encryption.check_data,
+        psw_check_present: encryption.psw_check_present,
         use_hash_mac: encryption.use_hash_mac,
     }
 }
@@ -412,6 +464,10 @@ fn file_encryption(encryption: CachedEncryption) -> FileEncryptionInfo {
         salt: encryption.salt,
         iv: encryption.iv,
         check_data: encryption.check_data,
+        // A cache written before this field existed states `false` here while
+        // still carrying a check value; keep the two consistent rather than
+        // reporting a member whose check is usable as having none claimed.
+        psw_check_present: encryption.psw_check_present || encryption.check_data.is_some(),
         use_hash_mac: encryption.use_hash_mac,
     }
 }
@@ -787,6 +843,13 @@ mod tests {
         members: Vec<CachedMember>,
     }
 
+    /// The historical member shape, frozen.
+    ///
+    /// Its nested records are frozen mirrors too, deliberately: building the
+    /// "old" input out of the *current* `CachedEncryption` / `CachedSegment`
+    /// made this test vacuous — it re-encoded today's field count and so could
+    /// never catch a widening, which is exactly the regression it exists to
+    /// catch. Nothing here may be replaced by a current struct.
     #[derive(Serialize)]
     struct OldCachedMember {
         name: String,
@@ -800,12 +863,39 @@ mod tests {
         split_after: bool,
         is_directory: bool,
         is_encrypted: bool,
-        encryption: Option<CachedEncryption>,
+        encryption: Option<OldCachedEncryption>,
         rar4_salt: Option<[u8; 8]>,
         blake2_hash: Option<[u8; 32]>,
-        segments: Vec<CachedSegment>,
+        segments: Vec<OldCachedSegment>,
     }
 
+    /// Six fields: the encryption record as it was before `psw_check_present`.
+    #[derive(Serialize)]
+    struct OldCachedEncryption {
+        version: u64,
+        kdf_count: u8,
+        salt: [u8; 16],
+        iv: [u8; 16],
+        check_data: Option<[u8; 12]>,
+        use_hash_mac: bool,
+    }
+
+    /// Three fields: the segment record as it was before the packed hashes.
+    #[derive(Serialize)]
+    struct OldCachedSegment {
+        volume_index: usize,
+        data_offset: u64,
+        data_size: u64,
+    }
+
+    /// A cache in the pre-named positional shape still decodes, *including* its
+    /// encryption record.
+    ///
+    /// The input is built from the frozen mirrors above, so the blob really
+    /// carries the historical field counts. Built from the current structs
+    /// instead — as this test once was — it re-encodes today's shape and proves
+    /// nothing: it would have passed unchanged while `psw_check_present`
+    /// silently broke every real legacy blob carrying an encryption record.
     #[test]
     fn deserialize_headers_accepts_legacy_compact_cache() {
         let blake2_hash = [0x42; 32];
@@ -828,7 +918,7 @@ mod tests {
                 split_after: true,
                 is_directory: false,
                 is_encrypted: true,
-                encryption: Some(CachedEncryption {
+                encryption: Some(OldCachedEncryption {
                     version: 0,
                     kdf_count: 15,
                     salt: [1; 16],
@@ -838,16 +928,30 @@ mod tests {
                 }),
                 rar4_salt: None,
                 blake2_hash: Some(blake2_hash),
-                segments: vec![CachedSegment {
+                segments: vec![OldCachedSegment {
                     volume_index: 0,
                     data_offset: 128,
                     data_size: 256,
-                    packed_crc32: None,
-                    packed_blake2_hash: None,
-                    packed_hash_uses_mac: false,
                 }],
             }],
         };
+
+        // Non-vacuity, stated in the encoding rather than in the type: a
+        // positional record is its element count, so pin the counts the
+        // historical shape had. `0x9N` is MessagePack's fixarray marker.
+        let encryption_bytes = rmp_serde::to_vec(&cached.members[0].encryption)
+            .expect("record should serialize positionally");
+        assert_eq!(
+            encryption_bytes[0], 0x96,
+            "the legacy encryption record is a six-element array, not today's seven"
+        );
+        let segment_bytes = rmp_serde::to_vec(&cached.members[0].segments[0])
+            .expect("record should serialize positionally");
+        assert_eq!(
+            segment_bytes[0], 0x93,
+            "the legacy segment record is a three-element array, not today's six"
+        );
+
         let bytes = rmp_serde::to_vec(&cached).expect("legacy compact cache should serialize");
 
         let archive = RarArchive::deserialize_headers(&bytes).expect("legacy cache should decode");
@@ -855,14 +959,145 @@ mod tests {
         let member = &archive.members[0];
         assert_eq!(member.file_header.compression.version, 1);
         assert_eq!(member.hash, Some(FileHash::Blake2sp(blake2_hash)));
+        let encryption = member.file_encryption.as_ref().expect("record decoded");
+        assert!(encryption.use_hash_mac);
+        assert_eq!(encryption.check_data, Some([3; 12]));
         assert!(
-            member
-                .file_encryption
-                .as_ref()
-                .is_some_and(|enc| enc.use_hash_mac)
+            encryption.psw_check_present,
+            "a stored check value implies the header claimed one, and the \
+             legacy shape has no field to say otherwise"
         );
+        // The fields the legacy segment shape omits arrive as their defaults,
+        // not as garbage read out of neighbouring fields.
+        let segment = &member.segments[0];
+        assert_eq!((segment.data_offset, segment.data_size), (128, 256));
+        assert_eq!(segment.packed_hashes.crc32, None);
+        assert_eq!(segment.packed_hashes.blake2sp, None);
+        assert!(!segment.packed_hash_uses_mac);
         assert!(member.file_header.mtime.is_none());
         assert!(member.redirection.is_none());
+    }
+
+    /// The `psw_check_present || check_data.is_some()` rule in
+    /// [`file_encryption`], over the shape that actually triggers it: a named
+    /// cache written before the field existed, so the field defaults to `false`
+    /// while a usable check value is right there beside it.
+    ///
+    /// Without the rule the pair contradicts itself downstream —
+    /// [`EncryptedStore::claims_password_check`] would say the header claims no
+    /// check while [`EncryptedStore::password_check`] hands one out. Both cache
+    /// tests above set the flag explicitly, so neither reaches this path.
+    #[test]
+    fn named_cache_without_the_psw_check_flag_infers_it_from_the_check_value() {
+        /// The encryption record as the named encoding wrote it before
+        /// `psw_check_present`. Frozen, for the same reason as the mirrors above.
+        #[derive(Serialize)]
+        struct NamedCachedEncryptionWithoutFlag {
+            version: u64,
+            kdf_count: u8,
+            salt: [u8; 16],
+            iv: [u8; 16],
+            check_data: Option<[u8; 12]>,
+            use_hash_mac: bool,
+        }
+
+        #[derive(Serialize)]
+        struct MemberWithOldEncryption {
+            name: String,
+            unpacked_size: Option<u64>,
+            data_crc32: Option<u32>,
+            compression_method: u8,
+            compression_solid: bool,
+            dict_size: u64,
+            split_before: bool,
+            split_after: bool,
+            is_directory: bool,
+            is_encrypted: bool,
+            encryption: Option<NamedCachedEncryptionWithoutFlag>,
+            segments: Vec<CachedSegment>,
+        }
+
+        #[derive(Serialize)]
+        struct HeadersWithOldEncryption {
+            format: u8,
+            is_solid: bool,
+            is_encrypted: bool,
+            more_volumes: bool,
+            members: Vec<MemberWithOldEncryption>,
+        }
+
+        let check_data = [0x7C; 12];
+        let cached = HeadersWithOldEncryption {
+            format: 5,
+            is_solid: false,
+            is_encrypted: false,
+            more_volumes: false,
+            members: vec![MemberWithOldEncryption {
+                name: "Silver.Horizon.S02E01.mkv".to_string(),
+                unpacked_size: Some(20_001),
+                data_crc32: Some(0x1234_5678),
+                compression_method: CompressionMethod::Store.code(),
+                compression_solid: false,
+                dict_size: 0,
+                split_before: false,
+                split_after: false,
+                is_directory: false,
+                is_encrypted: true,
+                encryption: Some(NamedCachedEncryptionWithoutFlag {
+                    version: 0,
+                    kdf_count: 15,
+                    salt: [0x5A; 16],
+                    iv: [0x1F; 16],
+                    check_data: Some(check_data),
+                    use_hash_mac: true,
+                }),
+                segments: vec![CachedSegment {
+                    volume_index: 0,
+                    data_offset: 128,
+                    data_size: 20_016,
+                    packed_crc32: None,
+                    packed_blake2_hash: None,
+                    packed_hash_uses_mac: false,
+                }],
+            }],
+        };
+        let bytes = rmp_serde::to_vec_named(&cached).expect("old named cache should serialize");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("psw_check_present"),
+            "non-vacuity: the encoded cache must not carry the field at all"
+        );
+
+        let archive = RarArchive::deserialize_headers(&bytes).expect("old named cache decodes");
+        let encryption = archive.members[0]
+            .file_encryption
+            .as_ref()
+            .expect("record decoded");
+
+        assert_eq!(encryption.check_data, Some(check_data));
+        assert!(encryption.psw_check_present);
+
+        // Stated as the consumer sees it: the two accessors must never
+        // disagree about whether this member has a password check.
+        let store = crate::stored_layout::EncryptedStore {
+            crypt: Some(crate::RarVolumeMemberEncryptionFacts {
+                version: encryption.version,
+                kdf_count_lg2: encryption.kdf_count,
+                salt: encryption.salt,
+                iv: encryption.iv,
+                psw_check_present: encryption.psw_check_present,
+                psw_check: encryption.check_data,
+            }),
+            rar4_salt: None,
+            cipher_size: Some(20_016),
+            tail_padding: Some(15),
+            resolved: true,
+        };
+        assert_eq!(
+            store.claims_password_check(),
+            store.password_check().is_some(),
+            "a decoded cache must not claim no check while handing one out"
+        );
+        assert!(store.claims_password_check());
     }
 
     #[test]
@@ -979,6 +1214,7 @@ mod tests {
                     salt: [0x11; 16],
                     iv: [0x22; 16],
                     check_data: Some([0x33; 12]),
+                    psw_check_present: true,
                     use_hash_mac: true,
                 }),
                 rar4_salt: None,

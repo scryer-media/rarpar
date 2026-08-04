@@ -14,14 +14,42 @@
 //! [`StoredMemberPart::logical_offset`] is `None` until the part's own chain
 //! prefix is complete.
 //!
+//! **Encrypted store members** ride the same machinery with one difference.
+//! Their packed bytes are the member's plaintext as a single AES-CBC stream,
+//! so cipher offset and member-logical offset coincide and every range answer
+//! above is unchanged — but a chain's packed sizes sum to
+//! `align16(unpacked_size)` rather than to the size itself, and the bytes must
+//! be decrypted before they are anyone's data. The layout says so in the type
+//! system: [`MemberEligibility::EncryptedStore`] carries the key material the
+//! headers state, and the bytes map as [`MappedSlice::EncryptedMember`], never
+//! as [`MappedSlice::Member`].
+//!
 //! This module classifies facts and nothing else. Budgets, tolerances, group
-//! merging and the decision to route or demote belong to the caller; the layout
-//! only reports what the headers say.
+//! merging, password handling and the decision to route or demote belong to the
+//! caller; the layout only reports what the headers say. In particular it holds
+//! no password, derives no key and decrypts nothing — see
+//! [`crate::crypto::check_member_password`] and
+//! [`crate::crypto::decrypt_cipher_range`] for the surfaces that do.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::archive::{RarVolumeFacts, RarVolumeMemberFacts};
+use crate::archive::{RarVolumeFacts, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts};
 use crate::types::{ArchiveFormat, CompressionMethod};
+
+/// AES block size. An encrypted member's packed bytes are its plaintext
+/// CBC-encrypted, so they run to a whole number of these — see
+/// [`EncryptedStore`].
+const AES_BLOCK: u64 = 16;
+
+/// The cipher length of a member whose plaintext is `unpacked_size` bytes:
+/// `unpacked_size` rounded up to a whole AES block.
+///
+/// `None` only when that value is past `u64::MAX`, which no chain's packed
+/// sizes can reach — so a `None` limit fails every comparison below, which is
+/// the fail-closed answer such a header deserves.
+fn align16(unpacked_size: u64) -> Option<u64> {
+    unpacked_size.checked_next_multiple_of(AES_BLOCK)
+}
 
 /// Why a member's split chain cannot be trusted.
 ///
@@ -51,15 +79,35 @@ pub enum MalformedReason {
     /// volume order — the lowest volume's declaration first — so the reason is
     /// the same whatever order the volumes arrive in.
     InconsistentUnpackedSize { first: u64, second: u64 },
+    /// The member's parts do not agree about encryption: some are encrypted
+    /// and some are not, or their `FHEXTRA_CRYPT` records state different key
+    /// material. Either way no single key decrypts the chain, and a chain that
+    /// is ciphertext in places and plaintext in others has no coherent length
+    /// rule.
+    ///
+    /// `volume` is the lowest volume disagreeing with the member's first part,
+    /// read in volume order rather than arrival order.
+    ///
+    /// The hash-MAC flag is deliberately not part of "agree": RARLAB `rar`
+    /// 7.20 sets it on a split member's final part only, so requiring it to
+    /// match would malform every real encrypted split chain.
+    MixedEncryption { volume: u32 },
     /// A complete stored chain's packed bytes do not sum to the member's
     /// unpacked size. Checked over the whole chain, never per part.
+    ///
+    /// For an **encrypted** member the sum is compared against
+    /// `align16(unpacked_size)` instead, because its packed bytes are the
+    /// plaintext CBC-encrypted; the fields still report the declared unpacked
+    /// size, not the derived cipher length. A chain carrying one whole block
+    /// too many is a mismatch even though its slack is "only" 16 bytes.
     SizeMismatch {
         packed_total: u64,
         unpacked_size: u64,
     },
     /// The parts seen so far already carry more stored bytes than the declared
-    /// unpacked size, so the chain is wrong before it even closes. Stored bytes
-    /// are the member's bytes, so no such part can have a destination.
+    /// unpacked size — `align16` of it for an encrypted member — so the chain
+    /// is wrong before it even closes. Stored bytes are the member's bytes, so
+    /// no such part can have a destination.
     ///
     /// `packed_total` is saturated to `u64::MAX` in the one case the true sum
     /// cannot be represented: headers claiming more than `u64::MAX` bytes.
@@ -91,7 +139,11 @@ pub enum IneligibilityReason {
         /// rather than a running lower bound over the parts seen so far.
         totals_final: bool,
     },
-    /// At least one part is encrypted.
+    /// At least one part is encrypted, and the member is not a plain encrypted
+    /// `Store` chain — it is also compressed or solid, or a RAR5 part claimed
+    /// encryption while stating no `FHEXTRA_CRYPT` record, so no key can be
+    /// derived for it. An encrypted `Store` member whose parts agree
+    /// classifies as [`MemberEligibility::EncryptedStore`] instead.
     Encrypted,
     /// At least one part sets the per-member solid flag. This is the member's
     /// own flag, not the archive-level solid flag.
@@ -109,6 +161,69 @@ pub enum IneligibilityReason {
     MalformedChain(MalformedReason),
 }
 
+/// An encrypted `Store` member's key material and cipher extent.
+///
+/// Every part of the member is encrypted, uses method `Store`, and states the
+/// same key material. The library states these facts and derives nothing: no
+/// password is involved, no key exists here, and whether such a member routes
+/// is the caller's decision.
+///
+/// **What the cipher bytes are.** RAR5 encrypts a member's whole plaintext as
+/// one AES-256-CBC stream — one IV per member, carried on every part's header,
+/// with the chain running unbroken across volume boundaries — so cipher offset
+/// and member-logical offset are the same number. Split parts are *not*
+/// individually block-aligned; only the member's total is. Decrypting cipher
+/// block *N* therefore needs only cipher block *N−1*, which for the first
+/// block of a part is the tail of the previous volume's part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedStore {
+    /// The RAR5 `FHEXTRA_CRYPT` record every part states. `None` for a RAR4
+    /// member, which carries only `rar4_salt`; a RAR5 member that stated no
+    /// record never reaches this state (it is
+    /// [`IneligibilityReason::Encrypted`], since nothing could key it).
+    pub crypt: Option<RarVolumeMemberEncryptionFacts>,
+    /// RAR4's per-file KDF salt, where the headers state one. RAR4 derives
+    /// both key and IV from password plus this salt, and a header with no salt
+    /// is valid — the key then comes from the password alone.
+    pub rar4_salt: Option<[u8; 8]>,
+    /// The member's cipher length, `align16(unpacked_size)`: what a complete
+    /// chain's packed sizes must sum to. `None` while no header declares a
+    /// size, never a substituted zero.
+    pub cipher_size: Option<u64>,
+    /// `cipher_size - unpacked_size`, always `0..16`: the plaintext bytes of
+    /// the final cipher block that lie past the member's end.
+    ///
+    /// They are never destination bytes, but they are real cipher bytes that
+    /// arrive on the wire, and byte-exact re-encryption of the last block
+    /// needs the plaintext they decrypt to. `None` together with
+    /// `cipher_size`.
+    pub tail_padding: Option<u8>,
+    /// Whether the chain has closed with every requirement
+    /// [`MemberEligibility::DirectEligible`] states also met — the align16 sum
+    /// exact and a whole-member CRC32 seen. `false` is the encrypted twin of
+    /// [`MemberEligibility::ProvisionallyDirect`]: the member's bytes map, and
+    /// the chain closing is what decides whether it stays eligible.
+    pub resolved: bool,
+}
+
+impl EncryptedStore {
+    /// Whether the header claims a password-check value, whether or not that
+    /// value survived its own checksum.
+    pub fn claims_password_check(&self) -> bool {
+        self.crypt.is_some_and(|crypt| crypt.psw_check_present)
+    }
+
+    /// The usable 12-byte password-check field, when the header carries one
+    /// that validated.
+    ///
+    /// `Some` means a wrong password is detectable before a single byte is
+    /// decrypted — see [`crate::crypto::check_member_password`]. `None` means
+    /// it is not, and the member's checksum gates are the earliest detector.
+    pub fn password_check(&self) -> Option<[u8; 12]> {
+        self.crypt.and_then(|crypt| crypt.psw_check)
+    }
+}
+
 /// Whether a member's packed bytes can be routed to their final destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberEligibility {
@@ -120,6 +235,15 @@ pub enum MemberEligibility {
     /// part's header — has not been seen yet. Resolves to [`Self::DirectEligible`]
     /// or [`Self::Ineligible`] once the chain closes.
     ProvisionallyDirect,
+    /// An encrypted `Store` member: the same classification work as the two
+    /// states above, over cipher bytes instead of plaintext.
+    ///
+    /// The member's bytes map to the member, but they map as
+    /// [`MappedSlice::EncryptedMember`] — they are ciphertext, and writing
+    /// them to a destination unchanged would write ciphertext. The payload
+    /// carries what a decrypting caller needs; deciding whether to route it at
+    /// all (has a password arrived? does its check pass?) is the caller's.
+    EncryptedStore(EncryptedStore),
     /// A fact disqualifies the member.
     Ineligible(IneligibilityReason),
 }
@@ -128,11 +252,27 @@ impl MemberEligibility {
     /// Whether the layout maps this member's packed bytes to the member rather
     /// than to the envelope.
     ///
-    /// True for both direct states: a set is routed while its chains are still
-    /// open, and a member that later fails to close cleanly is the caller's
-    /// demotion decision, not a mapping error.
+    /// True for every non-ineligible state: a set is routed while its chains
+    /// are still open, and a member that later fails to close cleanly is the
+    /// caller's demotion decision, not a mapping error.
+    ///
+    /// True does **not** mean the mapped bytes may be written unchanged: for
+    /// [`Self::EncryptedStore`] they are ciphertext, which is why they map to
+    /// their own [`MappedSlice`] variant rather than to
+    /// [`MappedSlice::Member`].
     pub fn routes_direct(self) -> bool {
-        matches!(self, Self::DirectEligible | Self::ProvisionallyDirect)
+        matches!(
+            self,
+            Self::DirectEligible | Self::ProvisionallyDirect | Self::EncryptedStore(_)
+        )
+    }
+
+    /// The encrypted-store facts, for the one state that has them.
+    pub fn encrypted_store(self) -> Option<EncryptedStore> {
+        match self {
+            Self::EncryptedStore(facts) => Some(facts),
+            _ => None,
+        }
     }
 }
 
@@ -166,6 +306,15 @@ pub struct StoredMemberPart {
     pub packed_crc32: Option<u32>,
     /// BLAKE2sp of this part's packed bytes, from a non-final split header.
     pub packed_blake2_hash: Option<[u8; 32]>,
+    /// Whether this part's packed checksums are keyed folds rather than plain
+    /// checksums (RAR5 `FHEXTRA_CRYPT` hash-MAC), so comparing against them
+    /// needs the KDF's hash key.
+    ///
+    /// Per part, not per member: RARLAB `rar` 7.20 keys a split member's
+    /// whole-member checksum but leaves the non-final parts' packed checksums
+    /// plain, so a caller checking part completions and a caller checking the
+    /// member both need their own answer.
+    pub packed_hash_uses_mac: bool,
     /// The part continues a member started in an earlier volume.
     pub split_before: bool,
     /// The member continues into a later volume.
@@ -188,6 +337,10 @@ pub struct StoredMember {
     pub data_crc32: Option<u32>,
     /// Whole-member BLAKE2sp, from the same header as `data_crc32`.
     pub data_blake2_hash: Option<[u8; 32]>,
+    /// Whether `data_crc32` and `data_blake2_hash` are keyed folds rather than
+    /// plain checksums (RAR5 `FHEXTRA_CRYPT` hash-MAC). Read from the same
+    /// header as those values, so `false` until that header arrives.
+    pub data_hash_uses_mac: bool,
     /// Parts in volume order.
     pub parts: Vec<StoredMemberPart>,
     /// Whether the chain runs from a known first part to a known last part with
@@ -195,6 +348,22 @@ pub struct StoredMember {
     pub chain_complete: bool,
     /// Classification of this member from the facts seen so far.
     pub eligibility: MemberEligibility,
+}
+
+impl StoredMember {
+    /// How far the member's packed bytes may reach: the declared unpacked size
+    /// for a plaintext member, its `align16` for an encrypted one — whose
+    /// packed bytes are the plaintext CBC-encrypted and so run one part-block
+    /// further.
+    ///
+    /// `None` when no header declares a size, and when an encrypted member's
+    /// declared size rounds past `u64::MAX`.
+    fn packed_extent(&self) -> Option<u64> {
+        match self.eligibility.encrypted_store() {
+            Some(encrypted) => encrypted.cipher_size,
+            None => self.unpacked_size,
+        }
+    }
 }
 
 /// The member names one volume's headers link to its neighbours.
@@ -214,6 +383,24 @@ pub struct VolumeSplitEvidence {
 pub enum MappedSlice {
     /// Bytes of a direct-routed member, at `logical_offset` inside it.
     Member {
+        member_index: usize,
+        logical_offset: u64,
+        len: u64,
+    },
+    /// Cipher bytes of a [`MemberEligibility::EncryptedStore`] member, at
+    /// `logical_offset` inside its cipher stream.
+    ///
+    /// The coordinates are exactly [`Self::Member`]'s — cipher offset and
+    /// member-logical offset coincide for a stored member — and the variant
+    /// differs solely so that no caller can write these bytes to a destination
+    /// by mistake. Decrypting them needs the member's key and the 16 cipher
+    /// bytes immediately before `logical_offset` (the member's IV when
+    /// `logical_offset` is 0).
+    ///
+    /// A run may reach up to `align16(unpacked_size)`, so its last ≤15
+    /// plaintext bytes can lie past the member's declared end; those are the
+    /// [`EncryptedStore::tail_padding`] bytes and are not destination bytes.
+    EncryptedMember {
         member_index: usize,
         logical_offset: u64,
         len: u64,
@@ -253,8 +440,10 @@ struct MemberSnapshot {
     unpacked_size: Option<u64>,
     data_crc32: Option<u32>,
     data_blake2_hash: Option<[u8; 32]>,
+    data_hash_uses_mac: bool,
     packed_crc32: Option<u32>,
     packed_blake2_hash: Option<[u8; 32]>,
+    packed_hash_uses_mac: bool,
     split_before: bool,
     split_after: bool,
     is_directory: bool,
@@ -262,6 +451,7 @@ struct MemberSnapshot {
     is_redirection: bool,
     is_store: bool,
     is_solid: bool,
+    encryption: PartEncryption,
 }
 
 impl MemberSnapshot {
@@ -273,8 +463,10 @@ impl MemberSnapshot {
             unpacked_size: facts.unpacked_size,
             data_crc32: facts.data_crc32,
             data_blake2_hash: facts.data_blake2_hash,
+            data_hash_uses_mac: facts.use_hash_mac,
             packed_crc32: facts.packed_crc32,
             packed_blake2_hash: facts.packed_blake2_hash,
+            packed_hash_uses_mac: facts.packed_hash_uses_mac,
             split_before: facts.split_before,
             split_after: facts.split_after,
             is_directory: facts.is_directory,
@@ -282,8 +474,43 @@ impl MemberSnapshot {
             is_redirection: facts.redirection_type.is_some(),
             is_store: facts.compression_method == CompressionMethod::Store.code(),
             is_solid: facts.compression_solid,
+            encryption: PartEncryption {
+                encrypted: facts.is_encrypted,
+                crypt: facts.encryption,
+                rar4_salt: facts.rar4_salt,
+            },
         }
     }
+}
+
+/// What one header states about its part's encryption.
+///
+/// Compared for equality across a member's parts: two parts that disagree
+/// cannot be one cipher stream. The hash-MAC flag is deliberately outside this
+/// struct — it lives on the snapshot, because it legitimately differs per part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartEncryption {
+    encrypted: bool,
+    crypt: Option<RarVolumeMemberEncryptionFacts>,
+    rar4_salt: Option<[u8; 8]>,
+}
+
+/// What a member's parts agree on about encryption, read in volume order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberEncryption {
+    /// No part is encrypted.
+    Plain,
+    /// Every part is encrypted and they state the same key material.
+    Uniform {
+        crypt: Option<RarVolumeMemberEncryptionFacts>,
+        rar4_salt: Option<[u8; 8]>,
+    },
+    /// Parts disagree: some encrypted and some not, or different key material.
+    Mixed { volume: u32 },
+    /// Every part is encrypted and they agree, but a RAR5 header claimed
+    /// encryption while stating no `FHEXTRA_CRYPT` record, so no key can be
+    /// derived for the member at all.
+    Unkeyable,
 }
 
 /// A member's packed range inside one volume, used by the physical mapping.
@@ -331,6 +558,11 @@ pub struct StoredLayoutBuilder {
     /// order the volumes happened to arrive. Headers stating no size at all are
     /// absent rather than recorded.
     declarations: Vec<BTreeMap<u32, u64>>,
+    /// Per member, what each volume's header stated about encryption, keyed by
+    /// volume. Kept apart from the member for the same reason as
+    /// `declarations`: which record the member ends up with, and which volume
+    /// is named when the parts disagree, must not depend on arrival order.
+    encryptions: Vec<BTreeMap<u32, PartEncryption>>,
     index: HashMap<String, usize>,
     frontier: Option<u32>,
 }
@@ -344,6 +576,7 @@ impl StoredLayoutBuilder {
             members: Vec::new(),
             traits: Vec::new(),
             declarations: Vec::new(),
+            encryptions: Vec::new(),
             index: HashMap::new(),
             frontier: None,
         }
@@ -415,14 +648,18 @@ impl StoredLayoutBuilder {
             if let Some(unpacked_size) = snapshot.unpacked_size {
                 self.declarations[member_index].insert(volume, unpacked_size);
             }
+            self.encryptions[member_index].insert(volume, snapshot.encryption);
 
             let member = &mut self.members[member_index];
             member.first_volume = member.first_volume.min(volume);
             // Only a final part states the whole-member checksums; every
-            // earlier part's fields describe that volume's packed bytes.
+            // earlier part's fields describe that volume's packed bytes. The
+            // hash-MAC flag qualifies those checksums, so it comes from the
+            // same header rather than from whichever part arrived last.
             if !snapshot.split_after {
                 member.data_crc32 = snapshot.data_crc32;
                 member.data_blake2_hash = snapshot.data_blake2_hash;
+                member.data_hash_uses_mac = snapshot.data_hash_uses_mac;
             }
 
             let part = StoredMemberPart {
@@ -432,6 +669,7 @@ impl StoredLayoutBuilder {
                 logical_offset: None,
                 packed_crc32: snapshot.packed_crc32,
                 packed_blake2_hash: snapshot.packed_blake2_hash,
+                packed_hash_uses_mac: snapshot.packed_hash_uses_mac,
                 split_before: snapshot.split_before,
                 split_after: snapshot.split_after,
             };
@@ -592,7 +830,8 @@ impl StoredLayoutBuilder {
                 push_member_run(
                     &mut slices,
                     extent.member_index,
-                    member.unpacked_size,
+                    member.packed_extent(),
+                    member.eligibility.encrypted_store().is_some(),
                     logical_offset,
                     run_len,
                 );
@@ -625,12 +864,14 @@ impl StoredLayoutBuilder {
             unpacked_size: None,
             data_crc32: None,
             data_blake2_hash: None,
+            data_hash_uses_mac: false,
             parts: Vec::new(),
             chain_complete: false,
             eligibility: MemberEligibility::ProvisionallyDirect,
         });
         self.traits.push(MemberTraits::default());
         self.declarations.push(BTreeMap::new());
+        self.encryptions.push(BTreeMap::new());
         self.index.insert(snapshot.name.clone(), index);
         index
     }
@@ -704,10 +945,19 @@ impl StoredLayoutBuilder {
         });
 
         let traits = self.traits[member_index];
+        let encryption = self.member_encryption(member_index);
+        // Appended last so a chain that is both size-inconsistent and
+        // encryption-inconsistent keeps reporting the size disagreement, as it
+        // did before encrypted members were classified at all.
+        let mixed_encryption = match encryption {
+            MemberEncryption::Mixed { volume } => Some(MalformedReason::MixedEncryption { volume }),
+            _ => None,
+        };
         let malformed = traits
             .malformed
             .or_else(|| self.chain_malformation(&parts))
-            .or(inconsistent);
+            .or(inconsistent)
+            .or(mixed_encryption);
 
         let member = &mut self.members[member_index];
         member.unpacked_size = unpacked_size;
@@ -721,10 +971,36 @@ impl StoredLayoutBuilder {
                 data_crc32: member.data_crc32,
                 data_blake2_hash: member.data_blake2_hash,
             },
+            encryption,
         );
         member.eligibility = eligibility;
         member.chain_complete = chain_complete;
         member.parts = parts;
+    }
+
+    /// Fold one member's per-volume encryption records into what its parts
+    /// agree on, read in volume order.
+    fn member_encryption(&self, member_index: usize) -> MemberEncryption {
+        let mut records = self.encryptions[member_index].iter();
+        let Some((_, first)) = records.next() else {
+            return MemberEncryption::Plain;
+        };
+        if let Some((volume, _)) = records.find(|(_, record)| *record != first) {
+            return MemberEncryption::Mixed { volume: *volume };
+        }
+        if !first.encrypted {
+            return MemberEncryption::Plain;
+        }
+        // RAR4 states no per-file record at all — its key comes from the
+        // password and the optional salt — so only a RAR5 member is missing
+        // something when `crypt` is absent.
+        if first.crypt.is_none() && self.format == ArchiveFormat::Rar5 {
+            return MemberEncryption::Unkeyable;
+        }
+        MemberEncryption::Uniform {
+            crypt: first.crypt,
+            rar4_salt: first.rar4_salt,
+        }
     }
 
     /// Structural violations a chain proves once enough volumes are present.
@@ -782,6 +1058,7 @@ fn push_slice(slices: &mut Vec<MappedSlice>, slice: MappedSlice) {
 fn slice_len(slice: &MappedSlice) -> u64 {
     match *slice {
         MappedSlice::Member { len, .. }
+        | MappedSlice::EncryptedMember { len, .. }
         | MappedSlice::Envelope { len }
         | MappedSlice::Unroutable { len } => len,
     }
@@ -789,23 +1066,25 @@ fn slice_len(slice: &MappedSlice) -> u64 {
 
 /// Append one extent run belonging to a member the layout routes.
 ///
-/// A run is the member's bytes only as far as the declared unpacked size
-/// reaches. An open chain is routed before anything has checked its totals, so
-/// a part can claim packed bytes that run past the member's declared end; those
-/// bytes have no destination — the chain closing is what will demote the member
-/// — and are reported unroutable rather than written past the file's length.
-/// An unknown offset (unresolved prefix sum, or one pushed past `u64::MAX`)
-/// makes the whole run unroutable the same way.
+/// A run is the member's bytes only as far as `packed_extent` reaches — the
+/// declared unpacked size, or its `align16` for an encrypted member. An open
+/// chain is routed before anything has checked its totals, so a part can claim
+/// packed bytes that run past that end; those bytes have no destination — the
+/// chain closing is what will demote the member — and are reported unroutable
+/// rather than written past the file's length. An unknown offset (unresolved
+/// prefix sum, or one pushed past `u64::MAX`) makes the whole run unroutable
+/// the same way.
 fn push_member_run(
     slices: &mut Vec<MappedSlice>,
     member_index: usize,
-    unpacked_size: Option<u64>,
+    packed_extent: Option<u64>,
+    encrypted: bool,
     logical_offset: Option<u64>,
     run_len: u64,
 ) {
     let routed = logical_offset
         .map(|logical_offset| {
-            let limit = unpacked_size.unwrap_or(u64::MAX);
+            let limit = packed_extent.unwrap_or(u64::MAX);
             let room = limit.saturating_sub(logical_offset);
             (logical_offset, run_len.min(room))
         })
@@ -817,10 +1096,18 @@ fn push_member_run(
     };
     push_slice(
         slices,
-        MappedSlice::Member {
-            member_index,
-            logical_offset,
-            len,
+        if encrypted {
+            MappedSlice::EncryptedMember {
+                member_index,
+                logical_offset,
+                len,
+            }
+        } else {
+            MappedSlice::Member {
+                member_index,
+                logical_offset,
+                len,
+            }
         },
     );
     if len < run_len {
@@ -848,7 +1135,11 @@ struct ChainFacts {
 /// The order is deliberate: a fact that rules out any handling is reported
 /// ahead of one a caller might tolerate, so an encrypted or solid member never
 /// presents itself as merely compressed.
-fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
+fn classify(
+    traits: MemberTraits,
+    chain: ChainFacts,
+    encryption: MemberEncryption,
+) -> MemberEligibility {
     use IneligibilityReason as Reason;
 
     if let Some(reason) = chain.malformed {
@@ -861,7 +1152,20 @@ fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
         return MemberEligibility::Ineligible(Reason::Redirection);
     }
     if traits.encrypted {
-        return MemberEligibility::Ineligible(Reason::Encrypted);
+        // Only a stored member's cipher bytes are the member's own bytes at
+        // the member's own offsets. Compressed or solid, the cipher stream
+        // decrypts to packed data that still has to go through a codec, so the
+        // member stays exactly as ineligible as it was before encrypted store
+        // was classified at all — including staying `Encrypted` rather than
+        // `Solid` or `Compressed`, which is the answer this order has always
+        // given for an encrypted member.
+        let MemberEncryption::Uniform { crypt, rar4_salt } = encryption else {
+            return MemberEligibility::Ineligible(Reason::Encrypted);
+        };
+        if traits.solid || traits.compressed {
+            return MemberEligibility::Ineligible(Reason::Encrypted);
+        }
+        return classify_stored_chain(chain, Some((crypt, rar4_salt)));
     }
     if traits.solid {
         return MemberEligibility::Ineligible(Reason::Solid);
@@ -874,15 +1178,56 @@ fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
         });
     }
 
+    classify_stored_chain(chain, None)
+}
+
+/// Classify a `Store` chain that nothing else has disqualified.
+///
+/// `encrypted` carries the member's key material when its parts are encrypted,
+/// and is the only difference between the two paths: an encrypted chain's
+/// packed bytes are its plaintext CBC-encrypted, so they sum to
+/// `align16(unpacked_size)` rather than to `unpacked_size` itself. Everything
+/// else — when the totals may be checked, which checksums are required — is
+/// the same question over the same facts.
+fn classify_stored_chain(
+    chain: ChainFacts,
+    encrypted: Option<(Option<RarVolumeMemberEncryptionFacts>, Option<[u8; 8]>)>,
+) -> MemberEligibility {
+    use IneligibilityReason as Reason;
+
     // A sum past `u64::MAX` exceeds every size a header can declare, so it is
     // read at its saturated value from here down.
     let packed_total = chain.packed_total.unwrap_or(u64::MAX);
+    // How far the chain's packed bytes may legitimately reach. `None` means
+    // either that no header declared a size, or — for an encrypted member
+    // whose declared size rounds past `u64::MAX` — that the true limit is not
+    // representable; the two are told apart by `chain.unpacked_size` below.
+    let extent = match encrypted {
+        Some(_) => chain.unpacked_size.and_then(align16),
+        None => chain.unpacked_size,
+    };
+    let encrypted_state = |resolved: bool| {
+        let (crypt, rar4_salt) = encrypted.expect("only called on the encrypted path");
+        MemberEligibility::EncryptedStore(EncryptedStore {
+            crypt,
+            rar4_salt,
+            cipher_size: extent,
+            // Both `Some` or both `None`: the padding is `extent - declared`,
+            // so it exists exactly when the extent does.
+            tail_padding: extent.zip(chain.unpacked_size).map(|(cipher, unpacked)| {
+                debug_assert!(cipher - unpacked < AES_BLOCK);
+                (cipher - unpacked) as u8
+            }),
+            resolved,
+        })
+    };
+
     // Stored bytes are the member's bytes, so the chain can never carry more of
     // them than the member declares. Checked before the chain closes as well:
     // an open chain routes, and a part reaching past the declared end would
     // otherwise hand the caller a destination the file does not have.
     if let Some(unpacked_size) = chain.unpacked_size
-        && packed_total > unpacked_size
+        && packed_total > extent.unwrap_or(u64::MAX)
     {
         return MemberEligibility::Ineligible(Reason::MalformedChain(
             MalformedReason::ExceedsDeclaredSize {
@@ -892,7 +1237,10 @@ fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
         ));
     }
     if !chain.complete {
-        return MemberEligibility::ProvisionallyDirect;
+        return match encrypted {
+            Some(_) => encrypted_state(false),
+            None => MemberEligibility::ProvisionallyDirect,
+        };
     }
 
     let Some(unpacked_size) = chain.unpacked_size else {
@@ -900,10 +1248,12 @@ fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
             MalformedReason::MissingUnpackedSize,
         ));
     };
-    // A complete chain must sum to exactly the declared size — the check above
-    // has already ruled out overshooting. Never checked per part: only the sum
-    // is meaningful.
-    if packed_total != unpacked_size {
+    // A complete chain must sum to exactly the extent — the check above has
+    // already ruled out overshooting. Never checked per part: only the sum is
+    // meaningful, and an encrypted member's parts are not individually
+    // block-aligned. An unrepresentable extent can equal no sum, so it lands
+    // here as a mismatch rather than passing by default.
+    if extent != Some(packed_total) {
         return MemberEligibility::Ineligible(Reason::MalformedChain(
             MalformedReason::SizeMismatch {
                 packed_total,
@@ -913,7 +1263,10 @@ fn classify(traits: MemberTraits, chain: ChainFacts) -> MemberEligibility {
     }
 
     match (chain.data_crc32, chain.data_blake2_hash) {
-        (Some(_), _) => MemberEligibility::DirectEligible,
+        (Some(_), _) => match encrypted {
+            Some(_) => encrypted_state(true),
+            None => MemberEligibility::DirectEligible,
+        },
         (None, Some(_)) => MemberEligibility::Ineligible(Reason::Blake2OnlyNoCrc32),
         (None, None) => MemberEligibility::Ineligible(Reason::NoChecksum),
     }
@@ -946,6 +1299,8 @@ mod tests {
             split_after: false,
             is_directory: false,
             is_encrypted: false,
+            encryption: None,
+            rar4_salt: None,
             host_os: None,
             attributes: None,
             owner: None,
@@ -991,6 +1346,47 @@ mod tests {
     /// real thing.
     fn part_size(number: u32) -> u64 {
         512 + u64::from((number * 37) % 89) * 8
+    }
+
+    /// The RAR5 crypt record every part of an encrypted fixture member states.
+    /// Distinct byte fills so a test cannot pass by confusing salt with IV.
+    fn crypt_record() -> RarVolumeMemberEncryptionFacts {
+        RarVolumeMemberEncryptionFacts {
+            version: 0,
+            kdf_count_lg2: 15,
+            salt: [0x5A; 16],
+            iv: [0x1F; 16],
+            psw_check_present: true,
+            psw_check: Some([0xC4; 12]),
+        }
+    }
+
+    /// Mark a header encrypted, carrying `crypt`.
+    fn encrypted(
+        mut facts: RarVolumeMemberFacts,
+        crypt: RarVolumeMemberEncryptionFacts,
+    ) -> RarVolumeMemberFacts {
+        facts.is_encrypted = true;
+        facts.encryption = Some(crypt);
+        facts
+    }
+
+    /// One encrypted, unsplit `Store` member whose packed bytes are the
+    /// `align16` of `unpacked_size`, as RAR writes them.
+    fn encrypted_member(name: &str, data_offset: u64, unpacked_size: u64) -> RarVolumeMemberFacts {
+        let cipher_size = align16(unpacked_size).expect("test sizes are small");
+        let mut facts = encrypted(member(name, data_offset, cipher_size), crypt_record());
+        facts.unpacked_size = Some(unpacked_size);
+        facts.data_crc32 = Some(0x1234_5678);
+        facts
+    }
+
+    /// The encrypted-store facts of a member the layout classified that way.
+    fn encrypted_store(builder: &StoredLayoutBuilder, index: usize) -> EncryptedStore {
+        match builder.members()[index].eligibility {
+            MemberEligibility::EncryptedStore(facts) => facts,
+            other => panic!("expected an encrypted-store member, got {other:?}"),
+        }
     }
 
     /// Every part's currently reported offset, keyed by the part's identity
@@ -2159,5 +2555,591 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Encrypted `Store` members
+    // -----------------------------------------------------------------------
+
+    /// Re-label an encrypted run as a plaintext one, so two mappings can be
+    /// compared on the only thing that is supposed to match: the coordinates.
+    fn as_plain(slice: MappedSlice) -> MappedSlice {
+        match slice {
+            MappedSlice::EncryptedMember {
+                member_index,
+                logical_offset,
+                len,
+            } => MappedSlice::Member {
+                member_index,
+                logical_offset,
+                len,
+            },
+            other => other,
+        }
+    }
+
+    fn rar4_volume(members: Vec<RarVolumeMemberFacts>) -> RarVolumeFacts {
+        let mut facts = volume(members);
+        facts.format = 4;
+        facts
+    }
+
+    #[test]
+    fn an_encrypted_store_member_carries_its_crypt_record_and_cipher_extent() {
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![encrypted_member(EPISODE, 100, 290)]),
+        );
+
+        let member = &builder.members()[0];
+        assert!(member.chain_complete);
+        assert_eq!(member.unpacked_size, Some(290));
+        assert!(
+            member.eligibility.routes_direct(),
+            "an encrypted store member's bytes map to the member"
+        );
+
+        let facts = encrypted_store(&builder, 0);
+        assert_eq!(facts.crypt, Some(crypt_record()));
+        assert_eq!(facts.rar4_salt, None);
+        // 290 -> 304: the cipher stream is the plaintext rounded up one block.
+        assert_eq!(facts.cipher_size, Some(304));
+        assert_eq!(facts.tail_padding, Some(14));
+        assert!(facts.resolved);
+        assert!(facts.claims_password_check());
+        assert_eq!(facts.password_check(), Some([0xC4; 12]));
+
+        // The mapped run is the whole cipher stream — including the 14 padding
+        // bytes past the member's declared end, which are real wire bytes.
+        assert_eq!(
+            builder.map_physical_range(0, 100, 304),
+            vec![MappedSlice::EncryptedMember {
+                member_index: 0,
+                logical_offset: 0,
+                len: 304,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_encrypted_member_without_a_password_check_still_classifies() {
+        let mut crypt = crypt_record();
+        crypt.psw_check_present = false;
+        crypt.psw_check = None;
+
+        let mut builder = layout();
+        let mut facts = encrypted_member(EPISODE, 100, 290);
+        facts.encryption = Some(crypt);
+        add(&mut builder, 0, &volume(vec![facts]));
+
+        let facts = encrypted_store(&builder, 0);
+        assert!(facts.resolved, "an absent check disqualifies nothing here");
+        assert!(!facts.claims_password_check());
+        assert_eq!(facts.password_check(), None);
+    }
+
+    #[test]
+    fn an_encrypted_member_reports_a_claimed_check_it_cannot_use() {
+        // The parser drops a check value whose SHA-256 tag failed, leaving the
+        // claim and no value. A caller must not read that as "the writer
+        // omitted it": it is a corrupt header, and the two deserve different
+        // words even though both mean the password cannot be pre-verified.
+        let mut crypt = crypt_record();
+        crypt.psw_check = None;
+
+        let mut builder = layout();
+        let mut facts = encrypted_member(EPISODE, 100, 290);
+        facts.encryption = Some(crypt);
+        add(&mut builder, 0, &volume(vec![facts]));
+
+        let facts = encrypted_store(&builder, 0);
+        assert!(facts.claims_password_check());
+        assert_eq!(facts.password_check(), None);
+    }
+
+    /// Build a three-part encrypted chain summing to exactly `packed_total`.
+    fn encrypted_chain(unpacked_size: u64, packed_total: u64) -> StoredLayoutBuilder {
+        let head = packed_total / 3;
+        let middle = packed_total / 3;
+        let tail = packed_total - head - middle;
+
+        let mut builder = layout();
+        for (number, size, split_before, split_after) in [
+            (0u32, head, false, true),
+            (1, middle, true, true),
+            (2, tail, true, false),
+        ] {
+            let mut facts = split_part(EPISODE, 64, size, unpacked_size, split_before, split_after);
+            facts = encrypted(facts, crypt_record());
+            if !split_after {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+        builder
+    }
+
+    #[test]
+    fn an_encrypted_chain_sums_to_align16_at_every_slack() {
+        // Slack 0, 1 and 15: the whole range the final block can absorb.
+        for (unpacked_size, slack) in [(4096u64, 0u64), (4095, 1), (4081, 15)] {
+            let cipher_size = unpacked_size + slack;
+            assert_eq!(align16(unpacked_size), Some(cipher_size), "test arithmetic");
+
+            let builder = encrypted_chain(unpacked_size, cipher_size);
+            let facts = encrypted_store(&builder, 0);
+            assert!(
+                facts.resolved,
+                "unpacked {unpacked_size} padded to {cipher_size} is a complete chain"
+            );
+            assert_eq!(facts.cipher_size, Some(cipher_size));
+            assert_eq!(facts.tail_padding, Some(slack as u8));
+        }
+    }
+
+    #[test]
+    fn an_encrypted_chain_carrying_a_whole_extra_block_is_rejected() {
+        // The case a naive "within 16 bytes" tolerance gets wrong: the member
+        // is already block-aligned, so `align16` adds nothing and a chain one
+        // block longer is one block of bytes that belong to nobody.
+        let builder = encrypted_chain(4096, 4096 + 16);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 4112,
+                unpacked_size: 4096,
+            })
+        );
+
+        // And one byte past that, for good measure.
+        let builder = encrypted_chain(4096, 4096 + 17);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 4113,
+                unpacked_size: 4096,
+            })
+        );
+    }
+
+    #[test]
+    fn an_encrypted_chain_short_of_align16_is_a_size_mismatch() {
+        // One block short.
+        let builder = encrypted_chain(4095, 4080);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::SizeMismatch {
+                packed_total: 4080,
+                unpacked_size: 4095,
+            })
+        );
+
+        // And the plaintext rule applied to ciphertext: an unpadded sum. This
+        // is what the unencrypted equality check would have accepted, and it
+        // is a length no AES-CBC stream can have.
+        let builder = encrypted_chain(4095, 4095);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::SizeMismatch {
+                packed_total: 4095,
+                unpacked_size: 4095,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unencrypted_chain_still_needs_an_exact_sum() {
+        // The regression floor for the change above: padding is an encrypted
+        // member's rule and nobody else's.
+        let mut builder = layout();
+        for (number, size, split_before, split_after) in
+            [(0u32, 2048u64, false, true), (1, 2048, true, false)]
+        {
+            let mut facts = split_part(EPISODE, 64, size, 4090, split_before, split_after);
+            if !split_after {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 4096,
+                unpacked_size: 4090,
+            }),
+            "a plaintext chain gets no block-padding tolerance"
+        );
+    }
+
+    #[test]
+    fn an_open_encrypted_chain_is_unresolved_and_its_bytes_still_map() {
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![encrypted(
+                split_part(EPISODE, 40, 1024, 4095, false, true),
+                crypt_record(),
+            )]),
+        );
+
+        let facts = encrypted_store(&builder, 0);
+        assert!(!facts.resolved, "the whole-member CRC32 is still to come");
+        assert_eq!(facts.cipher_size, Some(4096));
+        assert_eq!(facts.tail_padding, Some(1));
+        assert!(!builder.members()[0].chain_complete);
+        assert_eq!(
+            builder.map_physical_range(0, 40, 1024),
+            vec![MappedSlice::EncryptedMember {
+                member_index: 0,
+                logical_offset: 0,
+                len: 1024,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_encrypted_part_reaching_past_align16_demotes_before_the_chain_closes() {
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![encrypted(
+                split_part(EPISODE, 40, 4097, 4095, false, true),
+                crypt_record(),
+            )]),
+        );
+
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                packed_total: 4097,
+                unpacked_size: 4095,
+            }),
+            "4095 pads to 4096, so 4097 packed bytes are already too many"
+        );
+        assert_eq!(
+            builder.map_physical_range(0, 40, 4097),
+            vec![MappedSlice::Envelope { len: 4097 }],
+            "a demoted member's bytes take the envelope path"
+        );
+    }
+
+    #[test]
+    fn mixed_encrypted_and_plain_parts_demote_the_chain() {
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![encrypted(
+                split_part(EPISODE, 40, 2048, 4096, false, true),
+                crypt_record(),
+            )]),
+        );
+        add(
+            &mut builder,
+            1,
+            &volume(vec![with_crc32(
+                split_part(EPISODE, 40, 2048, 4096, true, false),
+                0xFEED_BEEF,
+            )]),
+        );
+
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::MixedEncryption { volume: 1 })
+        );
+    }
+
+    #[test]
+    fn parts_disagreeing_on_key_material_demote_the_chain_in_volume_order() {
+        let mut rotated = crypt_record();
+        rotated.iv = [0x2E; 16];
+
+        // Added newest first: the reason must still name volume 2, which is
+        // the lowest volume that disagrees with the member's first part.
+        let mut builder = layout();
+        for number in (0..4u32).rev() {
+            let crypt = if number >= 2 { rotated } else { crypt_record() };
+            let mut facts = split_part(EPISODE, 40, 1024, 4096, number > 0, number + 1 < 4);
+            facts = encrypted(facts, crypt);
+            if number + 1 == 4 {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::MixedEncryption { volume: 2 })
+        );
+    }
+
+    #[test]
+    fn the_hash_mac_flag_differing_across_parts_does_not_demote_the_chain() {
+        // The shape RARLAB `rar` 7.20 actually writes: one crypt record on
+        // every part, and the keyed-checksum flag set on the final part alone,
+        // because only that part's checksum is the whole member's. Folding the
+        // flag into "the parts agree" would malform every real encrypted split
+        // chain.
+        let mut builder = layout();
+        for (number, split_before, split_after) in [(0u32, false, true), (1, true, false)] {
+            let mut facts = split_part(EPISODE, 40, 2048, 4096, split_before, split_after);
+            facts = encrypted(facts, crypt_record());
+            facts.packed_hash_uses_mac = false;
+            if !split_after {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+                facts.use_hash_mac = true;
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+
+        let facts = encrypted_store(&builder, 0);
+        assert!(facts.resolved);
+        let member = &builder.members()[0];
+        assert!(
+            member.data_hash_uses_mac,
+            "the whole-member checksum is keyed, from the final part's header"
+        );
+        assert!(
+            !member.parts[0].packed_hash_uses_mac,
+            "the non-final part's packed checksum is not"
+        );
+    }
+
+    #[test]
+    fn encrypted_members_that_are_not_plain_stores_keep_reporting_encrypted() {
+        // Compressed, solid, and a RAR5 header claiming encryption while
+        // stating no crypt record — nothing can key that last one, so it is as
+        // unroutable as it was before encrypted store existed.
+        let compressed = {
+            let mut facts = encrypted_member(EPISODE, 100, 4096);
+            facts.compression_method = CompressionMethod::Normal.code();
+            facts
+        };
+        let solid = {
+            let mut facts = encrypted_member(EPISODE, 100, 4096);
+            facts.compression_solid = true;
+            facts
+        };
+        let recordless = {
+            let mut facts = encrypted_member(EPISODE, 100, 4096);
+            facts.encryption = None;
+            facts
+        };
+
+        for facts in [compressed, solid, recordless] {
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(vec![facts]));
+            assert_eq!(ineligible(&builder, 0), IneligibilityReason::Encrypted);
+        }
+    }
+
+    #[test]
+    fn an_encrypted_member_still_needs_a_whole_member_crc32() {
+        let mut blake2_only = encrypted_member(EPISODE, 100, 4096);
+        blake2_only.data_crc32 = None;
+        blake2_only.data_blake2_hash = Some([0x11; 32]);
+        let mut none = encrypted_member(EPISODE, 100, 4096);
+        none.data_crc32 = None;
+
+        for (facts, expected) in [
+            (blake2_only, IneligibilityReason::Blake2OnlyNoCrc32),
+            (none, IneligibilityReason::NoChecksum),
+        ] {
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(vec![facts]));
+            assert_eq!(ineligible(&builder, 0), expected);
+        }
+    }
+
+    #[test]
+    fn an_encrypted_directory_or_redirection_keeps_its_own_reason() {
+        let mut directory = encrypted_member(EPISODE, 100, 4096);
+        directory.is_directory = true;
+        let mut redirection = encrypted_member(EPISODE, 100, 4096);
+        redirection.redirection_type = Some(1);
+
+        for (facts, expected) in [
+            (directory, IneligibilityReason::Directory),
+            (redirection, IneligibilityReason::Redirection),
+        ] {
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(vec![facts]));
+            assert_eq!(ineligible(&builder, 0), expected);
+        }
+    }
+
+    #[test]
+    fn an_encrypted_member_maps_exactly_where_its_unencrypted_twin_does() {
+        // Cipher offset and member-logical offset are the same number for a
+        // stored member, so with an already-aligned size the two layouts must
+        // produce identical runs — same indices, offsets and lengths, differing
+        // only in the variant that says "decrypt these first".
+        const SIZE: u64 = 4096;
+        let plain = with_crc32(member(EPISODE, 100, SIZE), 0x1234_5678);
+        let cipher = encrypted_member(EPISODE, 100, SIZE);
+        assert_eq!(plain.data_size, cipher.data_size, "aligned twin");
+
+        let mut plain_builder = layout();
+        add(&mut plain_builder, 0, &volume(vec![plain]));
+        let mut cipher_builder = layout();
+        add(&mut cipher_builder, 0, &volume(vec![cipher]));
+
+        for (offset, len) in [(0, 5000), (100, SIZE), (150, 64), (4000, 500)] {
+            let expected = plain_builder.map_physical_range(0, offset, len);
+            let actual: Vec<MappedSlice> = cipher_builder
+                .map_physical_range(0, offset, len)
+                .into_iter()
+                .map(as_plain)
+                .collect();
+            assert_eq!(actual, expected, "range {offset}+{len}");
+            assert!(
+                expected
+                    .iter()
+                    .any(|slice| matches!(slice, MappedSlice::Member { .. })),
+                "range {offset}+{len} must cover member bytes, or it proves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_encrypted_split_chain_maps_each_part_to_its_cipher_offset() {
+        // Real writers do not align split parts individually — only the
+        // member's total — so the second part starts mid-block, and its
+        // logical offset must be the plain prefix sum all the same.
+        let sizes = [1001u64, 1001, 2094];
+        let unpacked_size = 4090;
+        assert_eq!(sizes.iter().sum::<u64>(), 4096);
+        assert_eq!(align16(unpacked_size), Some(4096), "test arithmetic");
+
+        let mut builder = layout();
+        for (number, size) in sizes.iter().copied().enumerate() {
+            let number = number as u32;
+            let mut facts = split_part(
+                EPISODE,
+                64,
+                size,
+                unpacked_size,
+                number > 0,
+                number + 1 < sizes.len() as u32,
+            );
+            facts = encrypted(facts, crypt_record());
+            if number + 1 == sizes.len() as u32 {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+
+        let facts = encrypted_store(&builder, 0);
+        assert!(facts.resolved);
+        assert_eq!(facts.tail_padding, Some(6));
+
+        let mut running = 0u64;
+        for (position, size) in sizes.iter().copied().enumerate() {
+            assert_eq!(
+                builder.map_physical_range(position as u32, 64, size),
+                vec![MappedSlice::EncryptedMember {
+                    member_index: 0,
+                    logical_offset: running,
+                    len: size,
+                }],
+                "part {position}"
+            );
+            if position == 1 {
+                assert_ne!(
+                    running % AES_BLOCK,
+                    0,
+                    "a part starting mid-block is what this test is about"
+                );
+            }
+            running += size;
+        }
+    }
+
+    #[test]
+    fn a_rar4_encrypted_store_member_carries_its_file_salt() {
+        // RAR4 states no per-file crypt record: its key and IV come from the
+        // password plus this salt, so the salt is the whole of the facts.
+        let mut facts = member(EPISODE, 100, 304);
+        facts.unpacked_size = Some(290);
+        facts.is_encrypted = true;
+        facts.rar4_salt = Some([0x9B; 8]);
+        facts.data_crc32 = Some(0x1234_5678);
+        facts.compression_version = 29;
+
+        let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+        builder
+            .add_volume(0, &rar4_volume(vec![facts]))
+            .expect("volume accepted");
+
+        let store = encrypted_store(&builder, 0);
+        assert_eq!(store.crypt, None);
+        assert_eq!(store.rar4_salt, Some([0x9B; 8]));
+        assert_eq!(store.cipher_size, Some(304));
+        assert_eq!(store.tail_padding, Some(14));
+        assert!(store.resolved);
+        assert!(!store.claims_password_check());
+    }
+
+    #[test]
+    fn a_rar4_encrypted_member_without_a_salt_is_still_keyable() {
+        // RAR3 archives written without a salt derive the key from the password
+        // alone. That is a complete description, not a missing record.
+        let mut facts = member(EPISODE, 100, 304);
+        facts.unpacked_size = Some(290);
+        facts.is_encrypted = true;
+        facts.data_crc32 = Some(0x1234_5678);
+
+        let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+        builder
+            .add_volume(0, &rar4_volume(vec![facts]))
+            .expect("volume accepted");
+
+        let store = encrypted_store(&builder, 0);
+        assert_eq!(store.crypt, None);
+        assert_eq!(store.rar4_salt, None);
+        assert!(store.resolved);
+    }
+
+    #[test]
+    fn unencrypted_members_keep_every_classification_they_had() {
+        // The regression floor, stated once as a table rather than trusted to
+        // the tests above: nothing on the plaintext path changed.
+        let store = with_crc32(member(EPISODE, 100, 64), 0x1234_5678);
+        let mut compressed = with_crc32(member(EXTRA, 200, 44), 0x2222_2222);
+        compressed.compression_method = CompressionMethod::Normal.code();
+        compressed.unpacked_size = Some(65_536);
+        let mut solid = with_crc32(member(NEIGHBOUR, 300, 64), 0x3333_3333);
+        solid.compression_solid = true;
+        let mut blake2 = member(DISTANT, 400, 64);
+        blake2.data_blake2_hash = Some([0x11; 32]);
+
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![store, compressed, solid, blake2]),
+        );
+
+        assert_eq!(
+            builder.members()[0].eligibility,
+            MemberEligibility::DirectEligible
+        );
+        assert_eq!(
+            ineligible(&builder, 1),
+            IneligibilityReason::Compressed {
+                packed_bytes: Some(44),
+                unpacked_bytes: Some(65_536),
+                totals_final: true,
+            }
+        );
+        assert_eq!(ineligible(&builder, 2), IneligibilityReason::Solid);
+        assert_eq!(
+            ineligible(&builder, 3),
+            IneligibilityReason::Blake2OnlyNoCrc32
+        );
     }
 }

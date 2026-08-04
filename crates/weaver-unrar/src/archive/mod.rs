@@ -11,8 +11,8 @@ mod volume;
 
 pub use cache::CachedArchiveHeaders;
 pub use facts::{
-    RarVolumeFacts, RarVolumeHostOs, RarVolumeMemberFacts, RarVolumeServiceFacts,
-    RarVolumeUnixOwnerFacts,
+    RarVolumeFacts, RarVolumeHostOs, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts,
+    RarVolumeServiceFacts, RarVolumeUnixOwnerFacts,
 };
 
 use std::io::{Read, Seek, SeekFrom};
@@ -42,6 +42,9 @@ pub(super) struct FileEncryptionInfo {
     pub(super) salt: [u8; 16],
     pub(super) iv: [u8; 16],
     pub(super) check_data: Option<[u8; 12]>,
+    /// Whether the record's flags claimed a password check, whether or not its
+    /// checksum validated (enc_flags & 0x0001).
+    pub(super) psw_check_present: bool,
     /// When true, CRC32/BLAKE2 hashes are HMAC-transformed (enc_flags & 0x0002).
     pub(super) use_hash_mac: bool,
 }

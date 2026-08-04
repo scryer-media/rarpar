@@ -75,7 +75,10 @@ scripts for the surrounding setup.
 | `rar5/rar5_multifile_lz.rar` | Mixed archive: `-m3` stores what it cannot shrink, so two stored members stay direct-eligible while one compressed member is demoted with exact packed/unpacked counts. | `rar a -m3 -ep1` (`generate_edge_cases.sh`) |
 | `rar5/rar5_store_blake2.rar` + `rar5/rar5_store_crc32_control.rar` | The `-htb` pair: identical members, differing only in the hash switch. Establishes that BLAKE2 **replaces** the CRC32. | `rar a -m0 -htb` / `rar a -m0` |
 | `rar5/rar5_mv_store_blake2.part1..6.rar` | `-htb` across a split chain: non-final parts state a packed BLAKE2sp and no packed CRC32. | `rar a -m0 -htb -v1k` on a 4 KiB blob |
-| `rar5/rar5_enc_mv_store.part1..5.rar` | Encrypted multi-volume store: demoted to `Encrypted`, chain facts still intact. | `rar a -m0 -v55k -ep1 -ptestpass123` (`generate_encrypted.sh`) |
+| `rar5/rar5_enc_mv_store.part1..5.rar` | Encrypted multi-volume store, one member over 5 volumes, with a plaintext size that is already block-aligned — the case an exact chain-sum equality passes by luck. | `rar a -m0 -v55k -ep1 -ptestpass123` (`generate_encrypted.sh`) |
+| `rar5/rar5_enc_mv_store_pair.part01..09.rar` | Encrypted (`-p`) multi-volume store with **two** members over 9 volumes: two CBC streams with different IVs, one volume carrying the tail of one member and the head of the next, and both sides of the padding rule (20 001 B needs a 15-byte tail, 12 288 B needs none). Parts are not individually block-aligned, so a range's preceding cipher block routinely lives in the previous volume. | `rar a -m0 -ptestpass123 -v4k` on 20 001 B + 12 288 B blobs |
+| `rar5/rar5_enc_store_pair.rar` | The same two members in one volume: the only place the 15-byte tail padding is directly visible as packed bytes past the member's declared end. | `rar a -m0 -ptestpass123` on the same blobs |
+| `rar4/rar4_enc_mv_store.part1..5.rar` | RAR4 encrypted multi-volume store: no `FHEXTRA_CRYPT` record, an 8-byte per-file salt instead, and the same `align16` chain rule. | `rar a -ma4 -m0 -v55k -ep1 -ptestpass123` (`generate_encrypted.sh`) |
 | `rar5/rar5_recovery_volumes.part01..10.rar` | Header volume numbers (0-based) against filename part numbers (1-based). | no checked-in generator; shape reconstructed from the headers as `rar a -m0 -v1k -rv2 … payload.bin` (8192 B), which also emits the two `.rev` recovery volumes |
 
 ### Empirical finding: `-htb` writes BLAKE2 only
@@ -94,6 +97,30 @@ whole-member BLAKE2sp and no CRC32.
 So `IneligibilityReason::Blake2OnlyNoCrc32` is a state real archives reach, not
 a defensive branch — BLAKE2sp only accepts bytes in order, so nothing in a
 `-htb` archive can verify an out-of-order direct-store write.
+
+### Empirical findings: what `-p` does to a stored chain
+
+Measured across `rar5_enc_store*`, `rar5_enc_mv_*`, `generated_matrix_rar5_store_enc`
+and `rar4_enc_*`, all written by RARLAB rar (7.20 for RAR5, 6.24 for RAR4).
+
+1. **One CBC stream per member, padded once.** A member's packed sizes sum to
+   `align16(unpacked_size)`, never to `unpacked_size` — 1 172 084 B of payload
+   occupies 1 172 096 packed bytes, 290 B occupies 304. This holds for RAR4 as
+   well as RAR5.
+2. **Split parts are not individually block-aligned.** A 262 144 B member over
+   five volumes splits 56 058 / 56 057 / 56 057 / 56 057 / 37 915 — none of
+   which is a multiple of 16. The CBC chain therefore runs unbroken across
+   volume boundaries, and the cipher block preceding an interior offset is
+   often in the previous volume (sometimes straddling the boundary itself).
+3. **Every part of a member states the same crypt record**, byte for byte:
+   same version, KDF count, salt, IV and password-check value. Different
+   *members* of one archive share the salt and check value but get their own
+   IV.
+4. **The hash-MAC flag is per part, and `rar` sets it on the final part only.**
+   `enc_flags & 0x0002` is clear on every non-final part and set on the last —
+   because only the last part's checksum is the whole member's. Treating that
+   flag as a per-member constant, or folding it into "the parts agree about
+   encryption", would misjudge every real encrypted split chain.
 
 ### Known gap
 
