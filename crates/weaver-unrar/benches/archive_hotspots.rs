@@ -7,16 +7,16 @@ fn fixture(dir: &str, name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-fn extract_options() -> weaver_unrar::ExtractOptions {
-    weaver_unrar::ExtractOptions {
+fn extract_options() -> unrar_rs::ExtractOptions {
+    unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     }
 }
 
-fn encrypted_extract_options() -> weaver_unrar::ExtractOptions {
-    weaver_unrar::ExtractOptions {
+fn encrypted_extract_options() -> unrar_rs::ExtractOptions {
+    unrar_rs::ExtractOptions {
         verify: true,
         password: Some("testpass123".to_string()),
         restore_owners: false,
@@ -29,7 +29,7 @@ fn bench_solid_extract_all_members(c: &mut Criterion, dir: &str, name: &str, ben
     c.bench_function(bench_name, |b| {
         b.iter(|| {
             let mut archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+                unrar_rs::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
             let member_count = archive.metadata().members.len();
             for member_index in 0..member_count {
                 let data = archive
@@ -47,7 +47,7 @@ fn bench_solid_reopen_later_member(c: &mut Criterion, dir: &str, name: &str, ben
     c.bench_function(bench_name, |b| {
         b.iter(|| {
             let mut archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+                unrar_rs::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
             let data = archive.extract_member(1, &options, None).unwrap();
             black_box(data);
         });
@@ -60,8 +60,8 @@ fn bench_non_solid_lz_chunked(c: &mut Criterion) {
     c.bench_function("rar_non_solid_lz_chunked_extract", |b| {
         b.iter(|| {
             let mut archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
-            let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![path.clone()]);
+                unrar_rs::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+            let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![path.clone()]);
             let chunks = archive
                 .extract_member_streaming_chunked(0, &options, &provider, |_| {
                     Ok(Box::new(std::io::sink()))
@@ -78,7 +78,7 @@ fn bench_solid_lz_chunked(c: &mut Criterion) {
     c.bench_function("rar_solid_lz_chunked_extract", |b| {
         b.iter(|| {
             let mut archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+                unrar_rs::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
             let member_count = archive.metadata().members.len();
             for member_index in 0..member_count {
                 let chunks = archive
@@ -106,10 +106,8 @@ fn bench_rar5_encrypted_store_chunked_multivolume(c: &mut Criterion) {
     c.bench_function("rar5_encrypted_store_chunked_multivolume", |b| {
         b.iter(|| {
             let mut archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&first_volume).unwrap())
-                    .unwrap();
-            let provider =
-                weaver_unrar::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
+                unrar_rs::RarArchive::open(std::fs::File::open(&first_volume).unwrap()).unwrap();
+            let provider = unrar_rs::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
             let chunks = archive
                 .extract_member_streaming_chunked(0, &options, &provider, |_| {
                     Ok(Box::new(std::io::sink()))
@@ -131,15 +129,15 @@ fn bench_rar5_reopen_kdf_multivolume(c: &mut Criterion) {
         .collect::<Vec<_>>();
     let first_volume = ordered_volumes[0].clone();
     let options = encrypted_extract_options();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
-    let shared_cache = std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new());
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
+    let shared_cache = std::sync::Arc::new(unrar_rs::crypto::KdfCache::new());
 
     c.bench_function("rar5_reopen_kdf_multivolume_fresh_cache", |b| {
         b.iter(|| {
-            let mut archive = weaver_unrar::RarArchive::open_with_password_and_shared_kdf_cache(
+            let mut archive = unrar_rs::RarArchive::open_with_password_and_shared_kdf_cache(
                 std::fs::File::open(&first_volume).unwrap(),
                 "testpass123",
-                std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             )
             .unwrap();
             let chunks = archive
@@ -153,7 +151,7 @@ fn bench_rar5_reopen_kdf_multivolume(c: &mut Criterion) {
 
     c.bench_function("rar5_reopen_kdf_multivolume_shared_cache", |b| {
         b.iter(|| {
-            let mut archive = weaver_unrar::RarArchive::open_with_password_and_shared_kdf_cache(
+            let mut archive = unrar_rs::RarArchive::open_with_password_and_shared_kdf_cache(
                 std::fs::File::open(&first_volume).unwrap(),
                 "testpass123",
                 shared_cache.clone(),
@@ -209,8 +207,7 @@ fn bench_archive_planner_view(c: &mut Criterion) {
     let path = fixture("rar5", "rar5_multifile_lz.rar");
     c.bench_function("rar_archive_planner_view", |b| {
         b.iter(|| {
-            let archive =
-                weaver_unrar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+            let archive = unrar_rs::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
             black_box(archive.metadata());
             black_box(archive.topology_members());
             black_box(archive.planner_member_states());
@@ -229,7 +226,7 @@ fn bench_filter_e8e9(c: &mut Criterion) {
     c.bench_function("rar_filter_e8e9", |b| {
         b.iter(|| {
             let mut data = seed.clone();
-            weaver_unrar::decompress::lz::filter::apply_e8e9(&mut data, 0);
+            unrar_rs::decompress::lz::filter::apply_e8e9(&mut data, 0);
             black_box(data);
         });
     });

@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use weaver_unrar::ArchiveFormat;
+use unrar_rs::ArchiveFormat;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args()
@@ -35,11 +35,11 @@ fn print_volume(
     password: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     file.seek(SeekFrom::Start(0))?;
-    let format = weaver_unrar::signature::read_signature(file)?;
+    let format = unrar_rs::signature::read_signature(file)?;
 
     match format {
         ArchiveFormat::Rar5 => {
-            let parsed = weaver_unrar::header::parse_all_headers(file, password)?;
+            let parsed = unrar_rs::header::parse_all_headers(file, password)?;
             println!(
                 "{} format=rar5 vol={:?} files={}",
                 path.file_name()
@@ -64,7 +64,7 @@ fn print_volume(
             }
         }
         ArchiveFormat::Rar14 => {
-            let parsed = weaver_unrar::rar4::parse_rar14_headers(file)?;
+            let parsed = unrar_rs::rar4::parse_rar14_headers(file)?;
             println!(
                 "{} format=rar14 vol=0 files={}",
                 path.file_name()
@@ -80,7 +80,7 @@ fn print_volume(
             }
         }
         ArchiveFormat::Rar4 => {
-            let parsed = weaver_unrar::rar4::parse_rar4_headers(file, password)?;
+            let parsed = unrar_rs::rar4::parse_rar4_headers(file, password)?;
             println!(
                 "{} format=rar4 vol={:?} files={}",
                 path.file_name()

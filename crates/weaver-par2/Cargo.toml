@@ -1,5 +1,5 @@
 [package]
-name = "weaver-par2"
+name = "par2-rs"
 description = "PAR2 parity verification and repair"
 version = "0.2.4"
 edition.workspace = true
@@ -14,17 +14,17 @@ slow-tests = []
 # Opt-in Apple-GPU (Metal) acceleration for the streaming repair path. Off by
 # default: the CPU/rayon path is the always-present fallback, and the Metal
 # session (guarded in `repair.rs`) only engages when this feature is enabled on
-# Apple Silicon. Forwards to weaver-reed-solomon's `metal` backend.
-metal = ["weaver-reed-solomon/metal"]
+# Apple Silicon. Forwards to reedsolomon-rs's `metal` backend.
+metal = ["reedsolomon-rs/metal"]
 # Opt-in portable-GPU (wgpu: Vulkan/DX12/Metal) streaming-repair arm for the
 # platforms the native Metal backend does not cover. Off by default (wgpu is a
 # heavy dependency tree); the session engages under the same size gating as
-# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to weaver-reed-solomon's
+# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to reedsolomon-rs's
 # `wgpu` backend.
-wgpu = ["weaver-reed-solomon/wgpu"]
+wgpu = ["reedsolomon-rs/wgpu"]
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
+reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
@@ -54,10 +54,10 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # `criterion` hard-`compile_error!`s on wasm (wasi) targets, and building the
 # `wasm_par2_check` example for wasm compiles the crate's dev-dependencies, so
 # it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
-# `weaver-unrar` is native test-suite tooling (differential RAR extraction
+# `unrar-rs` is native test-suite tooling (differential RAR extraction
 # checks) and is not needed by the wasm harness, so it stays off the wasm build.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-weaver-unrar = { path = "../weaver-unrar", version = "0.3.1", default-features = false, features = [
+unrar-rs = { path = "../weaver-unrar", version = "0.3.1", default-features = false, features = [
     "native-crypto",
 ] }
 criterion = "0.5"

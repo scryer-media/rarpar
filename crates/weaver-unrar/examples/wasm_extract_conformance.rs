@@ -24,22 +24,22 @@
 //!
 //! Build (wasm):
 //!   RUSTFLAGS="-C target-feature=+simd128" cargo build --release \
-//!     -p weaver-unrar --no-default-features --features crypto-host,crc-host \
+//!     -p unrar-rs --no-default-features --features crypto-host,crc-host \
 //!     --target wasm32-wasip1 --example wasm_extract_conformance
 //!
 //! It is not meaningful under a bare `wasmtime` CLI: the `host_aes_cbc_decrypt`
 //! and `host_crc32` imports are unsatisfied there and instantiation traps. Run
 //! it through the native driver, which provides both reference host functions:
-//!   cargo test -p weaver-unrar --test wasm_host_extract_conformance
+//!   cargo test -p unrar-rs --test wasm_host_extract_conformance
 //!
 //! Also runnable natively for parity debugging (uses the portable backends):
-//!   cargo run --release -p weaver-unrar --example wasm_extract_conformance -- <tests/fixtures>
+//!   cargo run --release -p unrar-rs --example wasm_extract_conformance -- <tests/fixtures>
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use weaver_unrar::{ExtractOptions, MemberInfo, RarArchive};
+use unrar_rs::{ExtractOptions, MemberInfo, RarArchive};
 
 /// The encrypted fixture password (see tests/fixtures/generate_encrypted.sh and
 /// generate_generated_matrix.sh — all encrypted fixtures share it).

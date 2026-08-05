@@ -17,18 +17,18 @@ and PAR2 workflows.
 
 ## Licensing And Release
 
-- `weaver-reed-solomon`, `weaver-par2`, and `rarpar` source are
+- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
   GPL-3.0-or-later.
-- `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
+- `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
   restriction documented in `crates/weaver-unrar/LICENSE`.
-- `rarpar` binary distributions link `weaver-unrar` and must carry that
+- `rarpar` binary distributions link `unrar-rs` and must carry that
   additional restriction too.
 - Never bypass signed commit or signed tag requirements.
 - Run the repo release script if one exists; do not hand-roll releases.
 
 ## RAR/PAR2 Rules
 
-- `weaver-unrar` is read/extract/recovery-only.
+- `unrar-rs` is read/extract/recovery-only.
 - Do not add archive writer, archive builder, compressor, or modify-RAR APIs.
 - Standard crypto must use `aws-lc-rs` or `aws-lc-sys` directly.
 - Local crypto ports are allowed only for UnRAR-specific legacy algorithms that

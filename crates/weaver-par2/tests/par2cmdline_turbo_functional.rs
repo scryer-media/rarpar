@@ -7,17 +7,17 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use par2_rs::{Par2Error, Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
 use support::{
     Rng, SyntheticPar2, assert_file_matches, assert_repaired_or_verified, assert_verified,
     build_synthetic_par2, extract_fixture, run_repair, run_verify, temp_case_dir,
 };
-use weaver_par2::{Par2Error, Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
 
 fn run_synthetic_repair_with_skip_leeway(
     base_dir: &Path,
     synthetic: &SyntheticPar2,
     skip_leeway: u64,
-) -> weaver_par2::Par2RepairOutcome {
+) -> par2_rs::Par2RepairOutcome {
     let mut options = Par2RepairerOptions::new(base_dir.to_path_buf(), Vec::new());
     options.file_set = Some(synthetic.par2_set.clone());
     options.repair = true;
@@ -732,7 +732,7 @@ fn upstream_test33_renamed_files_repair_cleanly() {
         .verification
         .files
         .iter()
-        .filter(|file| matches!(file.status, weaver_par2::FileStatus::Renamed(_)))
+        .filter(|file| matches!(file.status, par2_rs::FileStatus::Renamed(_)))
         .count();
     assert!(
         pre.verification.total_missing_blocks > 0 || renamed > 0,

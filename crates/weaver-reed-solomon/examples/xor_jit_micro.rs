@@ -8,11 +8,11 @@
 
 #[cfg(target_arch = "x86_64")]
 fn main() {
-    use std::time::Instant;
-    use weaver_reed_solomon::gf_simd::{
+    use reedsolomon_rs::gf_simd::{
         self, FOLDED_GROUP, Shuffle2xTables, precompute_shuffle2x_tables, split_encode_scatter,
     };
-    use weaver_reed_solomon::xor_jit::{codegen, deps, memory::JitCode, transpose};
+    use reedsolomon_rs::xor_jit::{codegen, deps, memory::JitCode, transpose};
+    use std::time::Instant;
 
     if !std::is_x86_feature_detected!("avx2") {
         println!("AVX2 not available");

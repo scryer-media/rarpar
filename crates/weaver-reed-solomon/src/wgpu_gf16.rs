@@ -286,7 +286,7 @@ fn shared_context() -> Option<&'static WgpuShared> {
 /// `IntegratedGpu` stays engaged, deliberately. The measurement that seems to
 /// argue otherwise — an Iris Xe at ~14.9 GiB/s losing to a single GFNI core at
 /// ~20.6 GiB/s — was taken on a box where this arm never engages: `engage` in
-/// `weaver-par2`'s repair path requires `!cpu_fast_path`, and `cpu_fast_path`
+/// `par2-rs`'s repair path requires `!cpu_fast_path`, and `cpu_fast_path`
 /// is `altmap_supported() || xorjit`, both of which are x86-64-with-AVX2. So
 /// the automatic path only ever runs on non-x86 (where the CPU tier is the
 /// NEON kernel) and on pre-AVX2 x86, and on neither has an integrated GPU been
@@ -302,7 +302,7 @@ fn shared_context() -> Option<&'static WgpuShared> {
 /// some Mesa builds), and refusing them would reject real hardware.
 ///
 /// This table governs hosts where nothing else owns accumulation. When an x86
-/// fast tier exists, weaver-par2's arbitration asks the stricter
+/// fast tier exists, par2-rs's arbitration asks the stricter
 /// [`discrete_auto_candidate`] question instead, and a non-discrete adapter on
 /// such a host never reaches this gate at all.
 fn auto_engageable(device_type: wgpu::DeviceType) -> bool {

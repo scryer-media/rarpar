@@ -1,4 +1,4 @@
-//! PAR2 verification and repair engine for the Weaver Usenet downloader.
+//! General-purpose PAR2 verification and repair engine.
 //!
 //! This crate implements parsing and verification of PAR2 (Parity Archive Volume Set
 //! v2.0) files. It supports:
@@ -26,12 +26,13 @@
     ))
 ))]
 compile_error!(
-    "weaver-par2 native-crypto only supports x86_64/aarch64 on macOS, Linux GNU/musl, and Windows MSVC"
+    "par2-rs native-crypto only supports x86_64/aarch64 on macOS, Linux GNU/musl, and Windows MSVC"
 );
 
 pub mod checksum;
 pub mod disk;
 pub mod error;
+pub mod evidence;
 mod file_cache;
 pub mod matrix;
 pub mod md5_simd;
@@ -41,6 +42,7 @@ pub mod path;
 pub mod placement;
 pub mod rename;
 pub mod repair;
+pub mod repair_session;
 pub mod repairer;
 pub mod session;
 pub mod types;
@@ -50,6 +52,7 @@ pub mod verify;
 pub use checksum::{FileHashState, SliceChecksumState};
 pub use disk::{DiskFileAccess, MultiDirectoryFileAccess, PlacementFileAccess};
 pub use error::{Par2Error, Result};
+pub use evidence::{CommittedFileEvidence, ContiguousAssemblyProof, FileStatFingerprint};
 pub use gf::{add as gf_add, input_slice_constants, inv as gf_inv, mul as gf_mul, pow as gf_pow};
 pub use gf_simd::{FactorDst, mul_acc_multi_region, mul_acc_region};
 pub use matrix::{Matrix, build_decode_matrix};
@@ -63,6 +66,7 @@ pub use par2_set::{
 };
 pub use path::{translate_par2_name_to_local_path, translate_par2_name_to_relative};
 pub use placement::{PlacementEntry, PlacementPlan, apply_placement_plan, scan_placement};
+pub use reedsolomon_rs::{gf, gf_pmul, gf_simd, matrix_tiled};
 pub use rename::{
     MatchType, RenameSuggestion, SplitFileGroup, detect_split_files, identify_par2_files,
     scan_for_renames,
@@ -72,12 +76,19 @@ pub use repair::{
     execute_repair, execute_repair_with_options, execute_repair_with_solver, plan_repair,
     plan_repair_with_memory_limit, prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
 };
+pub use repair_session::{
+    DEFAULT_RETAINED_STATE_LIMIT, Par2RepairSession, Par2RepairSessionDiagnostics,
+    Par2RepairSessionOptions, Par2SessionError,
+};
 pub use repairer::{
     BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
     Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock,
     SourceFileEntry,
 };
-pub use session::VerificationSession;
+pub use session::{
+    FeedDisposition, FeedOutcome, SettleRead, SliceEvidence, SliceEvidenceStrength,
+    VerificationMemoryBudget, VerificationSession, VerificationSessionOptions,
+};
 pub use types::{CancellationToken, ProgressCallback, ProgressStage, ProgressUpdate};
 pub use types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum, SliceIndex};
 pub use verify::{
@@ -86,4 +97,3 @@ pub use verify::{
     verify_selected_file_ids, verify_selected_file_ids_with_options, verify_slices,
     verify_slices_from_crcs,
 };
-pub use weaver_reed_solomon::{gf, gf_pmul, gf_simd, matrix_tiled};

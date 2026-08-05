@@ -3,8 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use par2_rs::Par2FileSet;
 use tempfile::TempDir;
-use weaver_par2::Par2FileSet;
 
 pub const DEFAULT_TURBO_BINARY: &str = "par2";
 

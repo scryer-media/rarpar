@@ -50,7 +50,7 @@ use rayon::prelude::*;
 /// bench (Apple Silicon); a divergence from upstream's <=6 is deliberate.
 pub const TILE_GROUP: usize = 8;
 
-// Row-batching / parallelism thresholds mirror `weaver-par2`'s rank-1 path
+// Row-batching / parallelism thresholds mirror `par2-rs`'s rank-1 path
 // (`crates/weaver-par2/src/matrix.rs`) so both elimination strategies schedule
 // identically.
 const SIMD_ELIMINATION_ROWS: usize = 16;
@@ -188,7 +188,7 @@ fn in_group_reduce(
 
 /// Eliminate the group columns `[g, g+k)` from every row outside the group in a
 /// single [`gf_simd::mul_acc_input_batch`] pass per row, batched serially or
-/// across rayon workers exactly like `weaver-par2`'s rank-1 path. Disjoint rows
+/// across rayon workers exactly like `par2-rs`'s rank-1 path. Disjoint rows
 /// are mutated through raw pointers reconstructed per row (`from_raw_parts_mut`),
 /// the same idiom the rank-1 path uses for parallel row mutation.
 #[allow(clippy::too_many_arguments)]
@@ -302,7 +302,7 @@ mod tests {
     }
 
     /// Textbook no-pivot Gauss-Jordan, identical in structure and diagonal-read
-    /// order to `weaver-par2`'s rank-1 path. The tiled inverter must produce
+    /// order to `par2-rs`'s rank-1 path. The tiled inverter must produce
     /// byte-identical results and the same `Err(col)`.
     fn naive_solve(
         sub: &mut [u16],

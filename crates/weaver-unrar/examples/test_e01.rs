@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
-use weaver_unrar::{ExtractOptions, RarArchive, StaticVolumeProvider};
+use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args().nth(1).ok_or("usage: test-e01 <dir>")?;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let start = std::time::Instant::now();
-    let result: Result<(), weaver_unrar::RarError> = match mode.as_str() {
+    let result: Result<(), unrar_rs::RarError> = match mode.as_str() {
         "streaming" => {
             let mut sink = io::sink();
             archive

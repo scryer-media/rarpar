@@ -28,13 +28,13 @@ fn fixture_bytes(dir: &str, name: &str) -> Vec<u8> {
 /// Open + fully extract every member; the only acceptable outcomes are a
 /// clean error anywhere along the way or verified-correct output.
 fn extract_all_clean(bytes: Vec<u8>, password: Option<&str>) {
-    let Ok(mut archive) = weaver_unrar::RarArchive::open(Cursor::new(bytes)) else {
+    let Ok(mut archive) = unrar_rs::RarArchive::open(Cursor::new(bytes)) else {
         return;
     };
     if let Some(password) = password {
         archive.set_password(password);
     }
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: password.map(str::to_owned),
         restore_owners: false,
@@ -128,17 +128,17 @@ fn multivolume_truncated_last_volume_fails_cleanly() {
         let last = volumes.last_mut().unwrap();
         last.truncate(last.len() / 2);
 
-        let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = volumes
+        let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = volumes
             .into_iter()
-            .map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn weaver_unrar::ReadSeek>)
+            .map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn unrar_rs::ReadSeek>)
             .collect();
-        let Ok(mut archive) = weaver_unrar::RarArchive::open_volumes(readers) else {
+        let Ok(mut archive) = unrar_rs::RarArchive::open_volumes(readers) else {
             continue;
         };
         if let Some(password) = password {
             archive.set_password(password);
         }
-        let opts = weaver_unrar::ExtractOptions {
+        let opts = unrar_rs::ExtractOptions {
             verify: true,
             password: password.map(str::to_owned),
             restore_owners: false,
@@ -158,11 +158,11 @@ fn multivolume_extraction_without_later_volumes_errors() {
         ("rar5", "rar5_enc_mv_video.part1.rar", Some(PASSWORD)),
     ] {
         let bytes = fixture_bytes(dir, first);
-        let mut archive = weaver_unrar::RarArchive::open(Cursor::new(bytes)).unwrap();
+        let mut archive = unrar_rs::RarArchive::open(Cursor::new(bytes)).unwrap();
         if let Some(password) = password {
             archive.set_password(password);
         }
-        let opts = weaver_unrar::ExtractOptions {
+        let opts = unrar_rs::ExtractOptions {
             verify: true,
             password: password.map(str::to_owned),
             restore_owners: false,
@@ -175,7 +175,7 @@ fn multivolume_extraction_without_later_volumes_errors() {
         );
 
         // Streaming with a provider that only knows the first volume.
-        let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![
+        let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![
             fixture_root().join(dir).join(first),
         ]);
         let mut sink = Vec::new();
@@ -191,9 +191,9 @@ fn multivolume_extraction_without_later_volumes_errors() {
 fn wrong_password_fails_across_encryption_modes() {
     // Data-encrypted RAR4: headers list fine, extraction must fail.
     let bytes = fixture_bytes("rar4", "rar4_enc_lz.rar");
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(bytes)).unwrap();
     archive.set_password("not-the-password");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("not-the-password".into()),
         restore_owners: false,
@@ -205,8 +205,8 @@ fn wrong_password_fails_across_encryption_modes() {
 
     // Missing password on encrypted data must also fail, not return garbage.
     let bytes = fixture_bytes("rar4", "rar4_enc_lz.rar");
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(bytes)).unwrap();
-    let no_pw = weaver_unrar::ExtractOptions {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(bytes)).unwrap();
+    let no_pw = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -221,15 +221,15 @@ fn wrong_password_fails_across_encryption_modes() {
     for (dir, name) in [("rar4", "rar4_hp_lz.rar"), ("rar5", "rar5_hp_lz.rar")] {
         let path = fixture_root().join(dir).join(name);
         let file = File::open(&path).unwrap();
-        match weaver_unrar::RarArchive::open_with_password(file, "not-the-password") {
+        match unrar_rs::RarArchive::open_with_password(file, "not-the-password") {
             Err(err) => {
                 assert!(
-                    !matches!(err, weaver_unrar::RarError::Io(_)),
+                    !matches!(err, unrar_rs::RarError::Io(_)),
                     "{dir}/{name}: wrong password must not surface as a bare IO error: {err}"
                 );
             }
             Ok(mut archive) => {
-                let opts = weaver_unrar::ExtractOptions {
+                let opts = unrar_rs::ExtractOptions {
                     verify: true,
                     password: Some("not-the-password".into()),
                     restore_owners: false,
@@ -267,13 +267,13 @@ fn writer_errors_propagate_from_streaming_extraction() {
     }
 
     let path = fixture_root().join("rar5").join("rar5_lz.rar");
-    let mut archive = weaver_unrar::RarArchive::open(File::open(&path).unwrap()).unwrap();
-    let opts = weaver_unrar::ExtractOptions {
+    let mut archive = unrar_rs::RarArchive::open(File::open(&path).unwrap()).unwrap();
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![path]);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![path]);
     let result = archive.extract_member_streaming(0, &opts, &provider, &mut FailingWriter);
     assert!(
         result.is_err(),

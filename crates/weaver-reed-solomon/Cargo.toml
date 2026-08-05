@@ -1,6 +1,6 @@
 [package]
-name = "weaver-reed-solomon"
-description = "Shared Reed-Solomon finite-field kernels for Weaver repair engines"
+name = "reedsolomon-rs"
+description = "High-performance Reed-Solomon finite-field kernels for parity and archive repair"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

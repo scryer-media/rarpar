@@ -8,6 +8,6 @@ COPY ${TARGETARCH}/share/ /usr/share/
 COPY ${TARGETARCH}/README.md /usr/share/doc/rarpar/README.md
 COPY ${TARGETARCH}/LICENSE /usr/share/licenses/rarpar/LICENSE
 COPY ${TARGETARCH}/LICENSE.GPL-3.0-or-later /usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
-COPY ${TARGETARCH}/LICENSE.weaver-unrar /usr/share/licenses/rarpar/LICENSE.weaver-unrar
+COPY ${TARGETARCH}/LICENSE.unrar-rs /usr/share/licenses/rarpar/LICENSE.unrar-rs
 
 ENTRYPOINT ["/usr/local/bin/rarpar"]

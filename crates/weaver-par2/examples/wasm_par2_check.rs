@@ -20,7 +20,7 @@
 //! writable `/scratch` preopen first, because repair rewrites files in place.
 //!
 //! Build (wasm):
-//!   cargo build --release -p weaver-par2 --no-default-features \
+//!   cargo build --release -p par2-rs --no-default-features \
 //!     --target wasm32-wasip1 --example wasm_par2_check
 //!
 //! Run (wasmtime 46; host::guest preopens):
@@ -30,14 +30,14 @@
 //!     target/wasm32-wasip1/release/examples/wasm_par2_check.wasm /fixtures /scratch
 //!
 //! Also runs natively for parity debugging:
-//!   cargo run --release -p weaver-par2 --example wasm_par2_check -- \
+//!   cargo run --release -p par2-rs --example wasm_par2_check -- \
 //!     crates/weaver-par2/tests/fixtures <scratch>
 
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use weaver_par2::{Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
+use par2_rs::{Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
 
 /// One corruption site inside a protected file.
 #[derive(Clone, Copy)]
@@ -166,11 +166,7 @@ fn corrupt(path: &Path, offset: u64, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn run_repairer(
-    base: &Path,
-    par2_paths: &[PathBuf],
-    repair: bool,
-) -> weaver_par2::Par2RepairOutcome {
+fn run_repairer(base: &Path, par2_paths: &[PathBuf], repair: bool) -> par2_rs::Par2RepairOutcome {
     let mut options = Par2RepairerOptions::new(base.to_path_buf(), par2_paths.to_vec());
     options.repair = repair;
     options.memory_limit = Some(256 * 1024 * 1024);

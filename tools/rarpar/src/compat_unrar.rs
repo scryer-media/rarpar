@@ -324,10 +324,7 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
             )
         })?;
         archive
-            .add_volume(
-                next_index,
-                Box::new(reader) as Box<dyn weaver_unrar::ReadSeek>,
-            )
+            .add_volume(next_index, Box::new(reader) as Box<dyn unrar_rs::ReadSeek>)
             .map_err(map_rar_error)?;
         if !archive.has_volume(next_index) {
             return Err(CompatFailure::stdout(
@@ -387,7 +384,7 @@ fn run_list(invocation: &Invocation) -> Result<(), CompatFailure> {
 
 fn extract_all_ready(
     invocation: &Invocation,
-    archive: &mut weaver_unrar::RarArchive,
+    archive: &mut unrar_rs::RarArchive,
     extracted: &mut BTreeSet<usize>,
 ) -> Result<(), CompatFailure> {
     let members = archive.indexed_member_infos();
@@ -396,7 +393,7 @@ fn extract_all_ready(
     }
 
     let password = password_candidate(&invocation.password);
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password,
         restore_owners: false,
@@ -424,7 +421,7 @@ fn extract_all_ready(
 
 fn prepare_output_path(
     out_path: &Path,
-    member: &weaver_unrar::MemberInfo,
+    member: &unrar_rs::MemberInfo,
     overwrite: OverwriteMode,
 ) -> Result<Option<PathBuf>, CompatFailure> {
     if member.is_directory {
@@ -451,7 +448,7 @@ fn prepare_output_path(
     }
 }
 
-fn print_member_ok(member: &weaver_unrar::MemberInfo, out_path: &Path) {
+fn print_member_ok(member: &unrar_rs::MemberInfo, out_path: &Path) {
     let verb = if member.is_directory {
         "Creating"
     } else {
@@ -461,7 +458,7 @@ fn print_member_ok(member: &weaver_unrar::MemberInfo, out_path: &Path) {
 }
 
 fn ensure_all_members_done(
-    archive: &weaver_unrar::RarArchive,
+    archive: &unrar_rs::RarArchive,
     extracted: &BTreeSet<usize>,
 ) -> Result<(), CompatFailure> {
     if all_members_done(archive, extracted) {
@@ -471,14 +468,14 @@ fn ensure_all_members_done(
     }
 }
 
-fn all_members_done(archive: &weaver_unrar::RarArchive, extracted: &BTreeSet<usize>) -> bool {
+fn all_members_done(archive: &unrar_rs::RarArchive, extracted: &BTreeSet<usize>) -> bool {
     archive
         .indexed_member_infos()
         .into_iter()
         .all(|member| extracted.contains(&member.index))
 }
 
-fn missing_volume_failure(archive: &weaver_unrar::RarArchive) -> CompatFailure {
+fn missing_volume_failure(archive: &unrar_rs::RarArchive) -> CompatFailure {
     let missing = archive
         .indexed_member_infos()
         .into_iter()
@@ -598,10 +595,7 @@ fn ordered_volume_paths(set: &RarSet) -> Vec<PathBuf> {
     volumes.into_iter().map(|volume| volume.path).collect()
 }
 
-fn open_set(
-    set: &RarSet,
-    password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, CompatFailure> {
+fn open_set(set: &RarSet, password: Option<&str>) -> Result<unrar_rs::RarArchive, CompatFailure> {
     let paths = ordered_volume_paths(set);
     let Some(first) = paths.first() else {
         return Err(CompatFailure::stdout(EXIT_NO_FILES, "No files to extract"));
@@ -615,7 +609,7 @@ fn open_set(
             )
         })?;
         archive
-            .add_volume(index, Box::new(file) as Box<dyn weaver_unrar::ReadSeek>)
+            .add_volume(index, Box::new(file) as Box<dyn unrar_rs::ReadSeek>)
             .map_err(map_rar_error)?;
     }
     Ok(archive)
@@ -624,7 +618,7 @@ fn open_set(
 fn open_first_volume(
     path: &Path,
     password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, CompatFailure> {
+) -> Result<unrar_rs::RarArchive, CompatFailure> {
     let file = File::open(path).map_err(|error| {
         CompatFailure::stdout(
             EXIT_OPEN,
@@ -632,9 +626,9 @@ fn open_first_volume(
         )
     })?;
     let mut archive = if let Some(password) = password {
-        weaver_unrar::RarArchive::open_with_password(file, password).map_err(map_rar_error)?
+        unrar_rs::RarArchive::open_with_password(file, password).map_err(map_rar_error)?
     } else {
-        weaver_unrar::RarArchive::open(file).map_err(map_rar_error)?
+        unrar_rs::RarArchive::open(file).map_err(map_rar_error)?
     };
     if let Some(password) = password {
         archive.set_password(password.to_string());
@@ -649,7 +643,7 @@ fn password_candidate(password: &PasswordMode) -> Option<String> {
     }
 }
 
-fn member_output_path(invocation: &Invocation, member: &weaver_unrar::MemberInfo) -> PathBuf {
+fn member_output_path(invocation: &Invocation, member: &unrar_rs::MemberInfo) -> PathBuf {
     if matches!(invocation.action, Action::ExtractFlat) {
         let name = Path::new(&member.name)
             .file_name()
@@ -719,41 +713,39 @@ fn old_style_next_name(name: &str, next_index: usize) -> String {
     format!("{base}.r{number:02}")
 }
 
-fn map_rar_error(error: weaver_unrar::RarError) -> CompatFailure {
+fn map_rar_error(error: unrar_rs::RarError) -> CompatFailure {
     match error {
-        weaver_unrar::RarError::Io(error) => {
+        unrar_rs::RarError::Io(error) => {
             if error.kind() == io::ErrorKind::AlreadyExists {
                 CompatFailure::stdout(EXIT_CREATE, format!("Cannot create: {error}"))
             } else {
                 CompatFailure::stdout(EXIT_WRITE, format!("Write error: {error}"))
             }
         }
-        weaver_unrar::RarError::InvalidSignature => {
+        unrar_rs::RarError::InvalidSignature => {
             CompatFailure::stdout(EXIT_CHECKSUM, "is not RAR archive")
         }
-        weaver_unrar::RarError::EncryptedArchive
-        | weaver_unrar::RarError::EncryptedMember { .. }
-        | weaver_unrar::RarError::InvalidPassword
-        | weaver_unrar::RarError::WrongPassword { .. } => {
+        unrar_rs::RarError::EncryptedArchive
+        | unrar_rs::RarError::EncryptedMember { .. }
+        | unrar_rs::RarError::InvalidPassword
+        | unrar_rs::RarError::WrongPassword { .. } => {
             CompatFailure::stdout(EXIT_WRONG_PASSWORD, "The specified password is incorrect.")
         }
-        weaver_unrar::RarError::DataCrcMismatch { member, .. } => {
+        unrar_rs::RarError::DataCrcMismatch { member, .. } => {
             CompatFailure::stdout(EXIT_CHECKSUM, format!("{member} - CRC failed"))
         }
-        weaver_unrar::RarError::PackedDataCrcMismatch { member, volume, .. } => {
-            CompatFailure::stdout(
-                EXIT_CHECKSUM,
-                format!("{member} : packed data CRC failed in volume {volume}"),
-            )
-        }
-        weaver_unrar::RarError::Blake2Mismatch { member }
-        | weaver_unrar::RarError::PackedDataBlake2Mismatch { member, .. } => {
+        unrar_rs::RarError::PackedDataCrcMismatch { member, volume, .. } => CompatFailure::stdout(
+            EXIT_CHECKSUM,
+            format!("{member} : packed data CRC failed in volume {volume}"),
+        ),
+        unrar_rs::RarError::Blake2Mismatch { member }
+        | unrar_rs::RarError::PackedDataBlake2Mismatch { member, .. } => {
             CompatFailure::stdout(EXIT_CHECKSUM, format!("{member} - checksum failed"))
         }
-        weaver_unrar::RarError::MissingVolume { volume, .. } => {
+        unrar_rs::RarError::MissingVolume { volume, .. } => {
             CompatFailure::stdout(EXIT_FATAL, format!("Cannot find volume {volume}"))
         }
-        weaver_unrar::RarError::ResourceLimit { detail } => {
+        unrar_rs::RarError::ResourceLimit { detail } => {
             CompatFailure::stdout(EXIT_FATAL, format!("ERROR: {detail}"))
         }
         error => CompatFailure::stdout(EXIT_FATAL, format!("ERROR: {error}")),

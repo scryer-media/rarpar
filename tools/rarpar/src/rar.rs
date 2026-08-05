@@ -141,7 +141,7 @@ pub fn restore_volume_paths(cli: &Cli, paths: &[PathBuf]) -> Result<u8, RarparEr
 pub fn open_set_with_password(
     set: &RarSet,
     password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, weaver_unrar::RarError> {
+) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
     let mut paths = set
         .volumes
         .iter()
@@ -160,26 +160,26 @@ pub fn open_set_with_password(
 fn open_paths_with_password(
     paths: &[PathBuf],
     password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, weaver_unrar::RarError> {
+) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
     if paths.is_empty() {
-        return Err(weaver_unrar::RarError::CorruptArchive {
+        return Err(unrar_rs::RarError::CorruptArchive {
             detail: "no RAR volumes provided".to_string(),
         });
     }
 
-    let first = File::open(&paths[0]).map_err(weaver_unrar::RarError::Io)?;
+    let first = File::open(&paths[0]).map_err(unrar_rs::RarError::Io)?;
     let mut archive = if let Some(password) = password {
-        weaver_unrar::RarArchive::open_with_password(first, password)?
+        unrar_rs::RarArchive::open_with_password(first, password)?
     } else {
-        weaver_unrar::RarArchive::open(first)?
+        unrar_rs::RarArchive::open(first)?
     };
     if let Some(password) = password {
         archive.set_password(password.to_string());
     }
 
     for (index, path) in paths.iter().enumerate().skip(1) {
-        let file = File::open(path).map_err(weaver_unrar::RarError::Io)?;
-        archive.add_volume(index, Box::new(file) as Box<dyn weaver_unrar::ReadSeek>)?;
+        let file = File::open(path).map_err(unrar_rs::RarError::Io)?;
+        archive.add_volume(index, Box::new(file) as Box<dyn unrar_rs::ReadSeek>)?;
     }
     Ok(archive)
 }
@@ -210,7 +210,7 @@ pub fn with_password_retry<T, F>(
     mut operation: F,
 ) -> Result<T, RarparError>
 where
-    F: FnMut(weaver_unrar::RarArchive) -> Result<T, RarparError>,
+    F: FnMut(unrar_rs::RarArchive) -> Result<T, RarparError>,
 {
     let prompt_reason = match open_set_with_password(set, None) {
         Ok(archive) => match operation(archive) {
@@ -269,12 +269,12 @@ fn restore_volume_paths_inner(
             restored_paths: Vec::new(),
         });
     }
-    let options = weaver_unrar::RecoveryOptions {
+    let options = unrar_rs::RecoveryOptions {
         output_dir: cli.output.clone(),
         overwrite_existing: cli.overwrite,
         verify_restored: true,
     };
-    let report = weaver_unrar::restore_volumes_from_paths(paths, &options)?;
+    let report = unrar_rs::restore_volumes_from_paths(paths, &options)?;
     Ok(RarRestoreOutcome {
         set_id: set_id.to_string(),
         success: true,
@@ -288,7 +288,7 @@ fn restore_volume_paths_inner(
 }
 
 fn preflight_outputs(
-    archive: &weaver_unrar::RarArchive,
+    archive: &unrar_rs::RarArchive,
     output_dir: &Path,
     overwrite: bool,
 ) -> Result<(), RarparError> {
@@ -341,15 +341,15 @@ fn single_archive_set(archive: &Path) -> Result<RarSet, RarparError> {
     })
 }
 
-fn extract_options(password: Option<String>) -> weaver_unrar::ExtractOptions {
-    weaver_unrar::ExtractOptions {
+fn extract_options(password: Option<String>) -> unrar_rs::ExtractOptions {
+    unrar_rs::ExtractOptions {
         verify: true,
         password,
         restore_owners: false,
     }
 }
 
-fn archive_password(_archive: &weaver_unrar::RarArchive) -> Option<String> {
+fn archive_password(_archive: &unrar_rs::RarArchive) -> Option<String> {
     None
 }
 
@@ -360,12 +360,12 @@ fn is_password_error(error: &RarparError) -> bool {
     }
 }
 
-fn is_rar_password_error(error: &weaver_unrar::RarError) -> bool {
+fn is_rar_password_error(error: &unrar_rs::RarError) -> bool {
     matches!(
         error,
-        weaver_unrar::RarError::EncryptedArchive
-            | weaver_unrar::RarError::EncryptedMember { .. }
-            | weaver_unrar::RarError::InvalidPassword
-            | weaver_unrar::RarError::WrongPassword { .. }
+        unrar_rs::RarError::EncryptedArchive
+            | unrar_rs::RarError::EncryptedMember { .. }
+            | unrar_rs::RarError::InvalidPassword
+            | unrar_rs::RarError::WrongPassword { .. }
     )
 }

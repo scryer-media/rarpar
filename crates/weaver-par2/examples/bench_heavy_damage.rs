@@ -3,9 +3,9 @@
 //! Runs multiple iterations with warmup to produce stable timing and peak RSS.
 //!
 //! Usage:
-//!   DAMAGE=450 cargo run -p weaver-par2 --release --example bench_heavy_damage
-//!   DAMAGE=450 WARMUP=2 ITERS=5 cargo run -p weaver-par2 --release --example bench_heavy_damage
-//!   FIXTURE_DIR=/path/to/fixture DAMAGE=450 cargo run -p weaver-par2 --release --example bench_heavy_damage
+//!   DAMAGE=450 cargo run -p par2-rs --release --example bench_heavy_damage
+//!   DAMAGE=450 WARMUP=2 ITERS=5 cargo run -p par2-rs --release --example bench_heavy_damage
+//!   FIXTURE_DIR=/path/to/fixture DAMAGE=450 cargo run -p par2-rs --release --example bench_heavy_damage
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
-use weaver_par2::{
+use par2_rs::{
     DiskFileAccess, Par2FileSet, RepairOptions, Repairability, execute_repair_with_options,
     plan_repair, verify_all,
 };
+use tempfile::TempDir;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -227,7 +227,7 @@ fn main() {
 
     let fixture = load_fixture_info(env_fixture_dir());
 
-    eprintln!("weaver-par2 benchmark");
+    eprintln!("par2-rs benchmark");
     eprintln!(
         "  archive:  {}MB ({} slices × {}KB)",
         fixture.rar_size / 1024 / 1024,

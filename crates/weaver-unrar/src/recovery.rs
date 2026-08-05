@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{RarError, RarResult};
 use crate::probe::probe_volume;
 use crate::types::ArchiveFormat;
-use weaver_reed_solomon::rar3::Rar3RsCoder;
-use weaver_reed_solomon::rar5::Rar5RsCoder;
+use reedsolomon_rs::rar3::Rar3RsCoder;
+use reedsolomon_rs::rar5::Rar5RsCoder;
 
 const REV5_SIGN: &[u8; 8] = b"Rar!\x1aRev";
 const REV5_PREFIX_LEN: usize = 16;

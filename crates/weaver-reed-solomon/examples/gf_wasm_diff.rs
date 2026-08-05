@@ -8,12 +8,12 @@
 //! ```sh
 //! # plain simd128 (i8x16_swizzle path)
 //! RUSTFLAGS="-C target-feature=+simd128" \
-//!   cargo build -p weaver-reed-solomon --example gf_wasm_diff --target wasm32-wasip1
+//!   cargo build -p reedsolomon-rs --example gf_wasm_diff --target wasm32-wasip1
 //! wasmtime target/wasm32-wasip1/debug/examples/gf_wasm_diff.wasm
 //!
 //! # relaxed-simd (i8x16_relaxed_swizzle path)
 //! RUSTFLAGS="-C target-feature=+simd128,+relaxed-simd" \
-//!   cargo build -p weaver-reed-solomon --example gf_wasm_diff --target wasm32-wasip1
+//!   cargo build -p reedsolomon-rs --example gf_wasm_diff --target wasm32-wasip1
 //! wasmtime target/wasm32-wasip1/debug/examples/gf_wasm_diff.wasm
 //! ```
 //!
@@ -29,7 +29,7 @@
 //! wasm kernel is only meaningfully covered under wasmtime.
 //!
 //! Benchmarking note (not part of this correctness harness): the crate's GF
-//! throughput benches live in `weaver-par2` (criterion, native-only). A wasm GF
+//! throughput benches live in `par2-rs` (criterion, native-only). A wasm GF
 //! timing harness does not fit criterion — the wasm kernel only runs under
 //! wasmtime — so it would slot in as a sibling `examples/gf_wasm_bench.rs` here
 //! that loops `mul_acc_region` over a large fixed buffer and reports bytes/sec,
@@ -38,8 +38,8 @@
 
 use std::process::ExitCode;
 
-use weaver_reed_solomon::gf;
-use weaver_reed_solomon::gf_simd::mul_acc_region;
+use reedsolomon_rs::gf;
+use reedsolomon_rs::gf_simd::mul_acc_region;
 
 /// Independent scalar oracle: `dst[w] ^= gf_mul(src[w], factor)` per LE u16
 /// word, using only the public field API. Mirrors the crate-private

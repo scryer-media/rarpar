@@ -27,9 +27,9 @@ pub enum RarparError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("RAR error: {0}")]
-    Rar(#[from] weaver_unrar::RarError),
+    Rar(#[from] unrar_rs::RarError),
     #[error("PAR2 error: {0}")]
-    Par2(#[from] weaver_par2::Par2Error),
+    Par2(#[from] par2_rs::Par2Error),
 }
 
 impl RarparError {
@@ -40,16 +40,14 @@ impl RarparError {
             Self::Resource(_) => EXIT_RESOURCE,
             Self::Io(_) | Self::Json(_) | Self::Data(_) => EXIT_DATA_FAILURE,
             Self::Rar(error) => match error {
-                weaver_unrar::RarError::ResourceLimit { .. } => EXIT_RESOURCE,
-                weaver_unrar::RarError::Io(io)
-                    if io.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
+                unrar_rs::RarError::ResourceLimit { .. } => EXIT_RESOURCE,
+                unrar_rs::RarError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
                     EXIT_UNSAFE
                 }
                 _ => EXIT_DATA_FAILURE,
             },
             Self::Par2(error) => match error {
-                weaver_par2::Par2Error::ResourceLimitExceeded { .. } => EXIT_RESOURCE,
+                par2_rs::Par2Error::ResourceLimitExceeded { .. } => EXIT_RESOURCE,
                 _ => EXIT_DATA_FAILURE,
             },
         }

@@ -11,13 +11,13 @@
 //!
 //! where the `sources` are ordered `available inputs` (in `available_indices`
 //! order) followed by the selected `recovery blocks` (in `recovery_exponents`
-//! order) — exactly the column layout of `weaver-par2`'s repair matrix.
+//! order) — exactly the column layout of `par2-rs`'s repair matrix.
 //!
 //! It exists so an embedding host (e.g. a wasmtime host application) can run
 //! the whole RS solve natively — Gaussian elimination on a large native stack
 //! plus the parallel GF matmul — on behalf of a single-threaded `wasm32-wasip1`
 //! guest that can neither spawn a rayon pool nor provision the large stack the
-//! elimination needs. `weaver-par2` keeps its own performance-tuned matrix path
+//! elimination needs. `par2-rs` keeps its own performance-tuned matrix path
 //! for native, in-process repair; the two are byte-identical because the RS
 //! decode matrix (`inv(submatrix) * pre`) is unique for a given selection.
 //!
@@ -60,7 +60,7 @@ impl RepairCoefficients {
 /// The selected recovery exponents produced a singular submatrix, so the missing
 /// slices cannot be recovered from them. `bad_row` (when known) is the index into
 /// `recovery_exponents` of the exponent whose row could not be pivoted, matching
-/// the semantics `weaver-par2` uses to skip a bad recovery block and retry.
+/// the semantics `par2-rs` uses to skip a bad recovery block and retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SingularMatrix {
     /// Row (index into `recovery_exponents`) that had no usable pivot.
@@ -81,7 +81,7 @@ pub struct SingularMatrix {
 ///
 /// Returns the coefficient matrix, or [`SingularMatrix`] if the chosen exponents
 /// do not form an invertible submatrix. The result is byte-identical to the
-/// coefficients `weaver-par2` computes for the same inputs.
+/// coefficients `par2-rs` computes for the same inputs.
 pub fn build_repair_matrix(
     available_indices: &[usize],
     missing_indices: &[usize],

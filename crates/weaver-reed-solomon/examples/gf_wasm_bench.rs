@@ -7,12 +7,12 @@
 //!
 //! Build + run (wasm, both flavors) — the GF log tables need a larger stack:
 //!   RUSTFLAGS="-C target-feature=+simd128 -C link-arg=-zstack-size=8388608" \
-//!     cargo build --release --example gf_wasm_bench --target wasm32-wasip1 -p weaver-reed-solomon
+//!     cargo build --release --example gf_wasm_bench --target wasm32-wasip1 -p reedsolomon-rs
 //!   wasmtime run target/wasm32-wasip1/release/examples/gf_wasm_bench.wasm
 //! Scalar flavor: drop `+simd128` from RUSTFLAGS (keep the stack-size arg).
 
+use reedsolomon_rs::gf_simd::mul_acc_region;
 use std::time::Instant;
-use weaver_reed_solomon::gf_simd::mul_acc_region;
 
 /// Region size per call (heap-allocated; large enough to amortize per-call table
 /// precompute to negligible).

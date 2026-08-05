@@ -34,7 +34,7 @@
 - Validate all required outputs before deleting sources. Permanent deletion
   requires explicit user intent.
 - Keep discovery bounded and do not follow directory symlinks by default.
-- `weaver-unrar` is read, extract, and recovery only. Do not add RAR writing,
+- `unrar-rs` is read, extract, and recovery only. Do not add RAR writing,
   compression, construction, or modification.
 - Use AWS-LC for standard cryptography. Local implementations are limited to
   RAR-specific legacy algorithms unavailable in AWS-LC.
@@ -87,11 +87,11 @@ affected Cargo tests.
 
 ## Licensing
 
-- `weaver-reed-solomon`, `weaver-par2`, and `rarpar` source are
+- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
   GPL-3.0-or-later.
-- `weaver-unrar` is GPL-3.0-or-later plus the UnRAR source-code restriction in
+- `unrar-rs` is GPL-3.0-or-later plus the UnRAR source-code restriction in
   `crates/weaver-unrar/LICENSE`.
-- Distributed `rarpar` binaries link `weaver-unrar` and carry its restriction.
+- Distributed `rarpar` binaries link `unrar-rs` and carry its restriction.
 - Do not move restricted RAR implementation code into PAR2 or Reed-Solomon
   code.
 - Contributions must be original or license-compatible with the destination;

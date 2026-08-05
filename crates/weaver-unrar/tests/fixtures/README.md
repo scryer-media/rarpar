@@ -1,4 +1,4 @@
-# weaver-unrar test fixtures
+# unrar-rs test fixtures
 
 Binary fixtures live in Git LFS. `.gitattributes` at the repo root routes
 `crates/weaver-unrar/tests/fixtures/**/*.{rar,rev,exe,bin,mkv,wav}` through the

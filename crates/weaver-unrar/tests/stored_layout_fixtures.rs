@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use weaver_unrar::{
+use unrar_rs::{
     ArchiveFormat, EncryptedStore, IneligibilityReason, KdfCache, MappedSlice, MemberEligibility,
     PasswordCheck, RarArchive, RarVolumeFacts, StoredLayoutBuilder, StoredMember,
     check_member_password, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
@@ -1356,17 +1356,17 @@ fn decrypting_any_cipher_range_from_its_preceding_block_matches_the_extractor() 
 /// in `tests/integration.rs` holds it against this same fixture's second
 /// member, which is the one that starts past the set's first volume.
 fn extract_member(paths: &[PathBuf], name: &str) -> Vec<u8> {
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
         .iter()
         .map(|path| {
             Box::new(std::io::Cursor::new(std::fs::read(path).expect("volume")))
-                as Box<dyn weaver_unrar::ReadSeek>
+                as Box<dyn unrar_rs::ReadSeek>
         })
         .collect();
     let mut archive = RarArchive::open_volumes(readers).expect("volumes open");
     archive.set_password(TEST_PASSWORD);
     let index = archive.find_member(name).expect("member present");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,

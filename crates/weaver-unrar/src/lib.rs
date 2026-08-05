@@ -1,4 +1,4 @@
-//! `weaver-unrar` -- RAR archive reader and extractor.
+//! `unrar-rs` -- RAR archive reader and extractor.
 //!
 //! UnRAR source code may be used in any software to handle
 //! RAR archives without limitations free of charge, but cannot be
@@ -54,7 +54,7 @@ pub mod volume;
 /// These build AES-CBC ciphertext by delegating to whichever crypto backend
 /// is active, so tests can construct encrypted fixtures without hand-rolling
 /// FFI or depending on a specific backend. Not part of the public API —
-/// hidden from docs and intended solely for `weaver-unrar`'s own tests.
+/// hidden from docs and intended solely for `unrar-rs`'s own tests.
 #[doc(hidden)]
 pub mod test_support {
     /// CBC-encrypt block-aligned `plaintext` with AES-128 (no padding).

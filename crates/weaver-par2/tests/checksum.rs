@@ -1,4 +1,4 @@
-use weaver_par2::checksum::{FileHashState, SliceChecksumState, crc32, crc32_combine, md5};
+use par2_rs::checksum::{FileHashState, SliceChecksumState, crc32, crc32_combine, md5};
 
 #[test]
 fn crc32_known_value() {

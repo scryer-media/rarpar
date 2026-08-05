@@ -166,7 +166,7 @@ jobs:
           git lfs install --local
           git lfs ls-files --name-only > .ci-lfs-files.txt
           test -s .ci-lfs-files.txt
-          if grep -Ev '^crates/(weaver-unrar|weaver-par2)/tests/fixtures/' .ci-lfs-files.txt; then
+          if grep -Ev '^crates/(unrar-rs|par2-rs)/tests/fixtures/' .ci-lfs-files.txt; then
             echo "::error::unexpected Git LFS path outside fixture corpora"
             exit 1
           fi
@@ -420,7 +420,7 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run PAR2 slow tests
-        run: cargo test --locked -p weaver-par2 --features slow-tests --no-fail-fast
+        run: cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -485,7 +485,7 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run UnRAR slow tests
-        run: cargo test --locked -p weaver-unrar --features slow-tests --no-fail-fast
+        run: cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -843,9 +843,9 @@ jobs:
 
           manifest_for_crate() {
             case "$1" in
-              weaver-reed-solomon) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
-              weaver-unrar) echo "crates/weaver-unrar/Cargo.toml" ;;
-              weaver-par2) echo "crates/weaver-par2/Cargo.toml" ;;
+              reedsolomon-rs) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
+              unrar-rs) echo "crates/weaver-unrar/Cargo.toml" ;;
+              par2-rs) echo "crates/weaver-par2/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
           }
@@ -853,7 +853,7 @@ jobs:
           verify_fixture_exclude() {
             crate="$1"
             case "$crate" in
-              weaver-unrar|weaver-par2)
+              unrar-rs|par2-rs)
                 python3 - "$(manifest_for_crate "$crate")" "$crate" <<'PY'
           import pathlib
           import sys
@@ -883,7 +883,7 @@ jobs:
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
-            if [ "$crate" = weaver-unrar ]; then
+            if [ "$crate" = unrar-rs ]; then
               grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
             fi
             exact_packaged_crates="${exact_packaged_crates} ${crate}"
@@ -908,28 +908,28 @@ jobs:
               for package in metadata["packages"]
           }
           print(
-              versions["weaver-reed-solomon"],
-              versions["weaver-unrar"],
-              versions["weaver-par2"],
+              versions["reedsolomon-rs"],
+              versions["unrar-rs"],
+              versions["par2-rs"],
           )
           PY
           )
 
-          package_and_list weaver-reed-solomon
+          package_and_list reedsolomon-rs
 
-          if registry_has_version weaver-reed-solomon "$reed_version"; then
-            package_and_list weaver-unrar
+          if registry_has_version reedsolomon-rs "$reed_version"; then
+            package_and_list unrar-rs
           else
-            echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$reed_version is published"
-            verify_fixture_exclude weaver-unrar
+            echo "unrar-rs exact package check deferred until reedsolomon-rs@$reed_version is published"
+            verify_fixture_exclude unrar-rs
           fi
 
-          if registry_has_version weaver-reed-solomon "$reed_version" \
-            && registry_has_version weaver-unrar "$unrar_version"; then
-            package_and_list weaver-par2
+          if registry_has_version reedsolomon-rs "$reed_version" \
+            && registry_has_version unrar-rs "$unrar_version"; then
+            package_and_list par2-rs
           else
-            echo "weaver-par2 exact package check deferred until same-release dependencies are published"
-            verify_fixture_exclude weaver-par2
+            echo "par2-rs exact package check deferred until same-release dependencies are published"
+            verify_fixture_exclude par2-rs
           fi
 
           export EXACT_PACKAGED_CRATES="$exact_packaged_crates"
@@ -941,9 +941,9 @@ jobs:
           import sys
 
           limits = {
-              "weaver-reed-solomon": 1_000_000,
-              "weaver-unrar": 2_500_000,
-              "weaver-par2": 2_500_000,
+              "reedsolomon-rs": 1_000_000,
+              "unrar-rs": 2_500_000,
+              "par2-rs": 2_500_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}
@@ -1052,7 +1052,7 @@ jobs:
           test -f target/dist/package-root/usr/share/man/man1/rarpar.1
           test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE
           test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
-          test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.weaver-unrar
+          test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.unrar-rs
           top_levels="$(find target/dist/package-root -mindepth 1 -maxdepth 1 -printf '%f\n')"
           test "$top_levels" = "usr"
           if grep -R -n 'tests/fixtures' target/dist/docs target/dist/package-root; then

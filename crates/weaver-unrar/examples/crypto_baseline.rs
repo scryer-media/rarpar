@@ -9,11 +9,11 @@
 //! portable path). The numbers are a rough single-thread baseline, not a
 //! statistical benchmark: 1 warmup + 3 timed reps, best rep reported.
 //!
-//! Run:  cargo run --release --example crypto_baseline -p weaver-unrar
+//! Run:  cargo run --release --example crypto_baseline -p unrar-rs
 
 use std::time::Instant;
 
-use weaver_unrar::crypto::{Blake2spHasher, CbcDecryptor, derive_rar5_material};
+use unrar_rs::crypto::{Blake2spHasher, CbcDecryptor, derive_rar5_material};
 
 // Buffer sizes — kept as consts so they are easy to tweak.
 const KDF_LG2_COUNT: u8 = 15; // 2^15 PBKDF2 iterations.

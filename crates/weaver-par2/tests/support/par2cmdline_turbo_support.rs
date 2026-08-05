@@ -8,14 +8,14 @@ use std::process::Command;
 
 use bytes::Bytes;
 use md5::{Digest, Md5};
-use tempfile::{Builder, TempDir};
-use weaver_par2::checksum::{self, SliceChecksumState};
-use weaver_par2::packet::header;
-use weaver_par2::{
+use par2_rs::checksum::{self, SliceChecksumState};
+use par2_rs::packet::header;
+use par2_rs::{
     FileAccess, FileId, Par2FileSet, Par2RepairOutcome, Par2RepairStatus, Par2Repairer,
     Par2RepairerOptions, RecoverySlice, Repairability, SliceChecksum, execute_repair, gf_pow,
     input_slice_constants, mul_acc_region, plan_repair, verify_all,
 };
+use tempfile::{Builder, TempDir};
 
 pub const UPSTREAM_FUNCTIONAL_CASE_COUNT: usize = 46;
 pub const UPSTREAM_UNIT_CASE_COUNT: usize = 11;

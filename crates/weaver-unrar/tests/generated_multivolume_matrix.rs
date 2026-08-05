@@ -42,12 +42,12 @@ fn collect_volume_paths(dir: &str, prefix: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn open_archive(paths: &[PathBuf]) -> weaver_unrar::RarArchive {
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+fn open_archive(paths: &[PathBuf]) -> unrar_rs::RarArchive {
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
         .iter()
-        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
+        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
         .collect();
-    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
+    unrar_rs::RarArchive::open_volumes(readers).unwrap()
 }
 
 fn extract_chunked(paths: &[PathBuf], password: Option<&str>, chunk_dir: &Path) -> Vec<u8> {
@@ -57,8 +57,8 @@ fn extract_chunked(paths: &[PathBuf], password: Option<&str>, chunk_dir: &Path) 
     }
 
     fs::create_dir_all(chunk_dir).unwrap();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths.to_vec());
-    let opts = weaver_unrar::ExtractOptions {
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths.to_vec());
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: password.map(str::to_owned),
         restore_owners: false,
@@ -70,7 +70,7 @@ fn extract_chunked(paths: &[PathBuf], password: Option<&str>, chunk_dir: &Path) 
             chunk_paths.insert(volume_index, path.clone());
             File::create(path)
                 .map(|file| Box::new(file) as Box<dyn Write>)
-                .map_err(weaver_unrar::RarError::Io)
+                .map_err(unrar_rs::RarError::Io)
         })
         .unwrap();
 
@@ -158,7 +158,7 @@ fn generated_multivolume_single_member_matrix_extracts() {
         if let Some(password) = password {
             batch_archive.set_password(password);
         }
-        let opts = weaver_unrar::ExtractOptions {
+        let opts = unrar_rs::ExtractOptions {
             verify: true,
             password: password.map(str::to_owned),
             restore_owners: false,
@@ -170,7 +170,7 @@ fn generated_multivolume_single_member_matrix_extracts() {
         if let Some(password) = password {
             streaming_archive.set_password(password);
         }
-        let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths.clone());
+        let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths.clone());
         let mut streaming = Vec::new();
         streaming_archive
             .extract_member_streaming(0, &opts, &provider, &mut streaming)

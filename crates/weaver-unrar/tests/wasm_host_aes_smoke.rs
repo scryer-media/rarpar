@@ -88,7 +88,7 @@ fn build_smoke_wasm() -> PathBuf {
             "build",
             "--release",
             "-p",
-            "weaver-unrar",
+            "unrar-rs",
             "--example",
             "host_aes_smoke",
             "--no-default-features",

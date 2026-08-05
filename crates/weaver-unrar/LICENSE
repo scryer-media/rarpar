@@ -1,6 +1,6 @@
-# weaver-unrar License
+# unrar-rs License
 
-weaver-unrar is licensed under GPL-3.0-or-later, with the additional UnRAR
+unrar-rs is licensed under GPL-3.0-or-later, with the additional UnRAR
 source-code restriction below for RAR extraction and recovery code.
 
 ## UnRAR Source-Code Restriction

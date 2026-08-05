@@ -101,7 +101,7 @@ fn build_conformance_wasm() -> PathBuf {
             "build",
             "--release",
             "-p",
-            "weaver-unrar",
+            "unrar-rs",
             "--example",
             "wasm_extract_conformance",
             "--no-default-features",

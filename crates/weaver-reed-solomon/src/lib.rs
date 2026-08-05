@@ -1,4 +1,4 @@
-//! Shared Reed-Solomon finite-field kernels for Weaver repair engines.
+//! High-performance Reed-Solomon finite-field kernels for parity and archive repair.
 //!
 //! `gf` and `gf_simd` expose the existing GF(2^16) PAR2/RAR5 arithmetic and
 //! SIMD multiply-accumulate kernels. RAR-specific coders live in separate

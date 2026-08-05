@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use weaver_par2::{Par2Repairer, Par2RepairerOptions};
+use par2_rs::{Par2Repairer, Par2RepairerOptions};
 
 fn main() -> ExitCode {
     let mut verify_only = false;

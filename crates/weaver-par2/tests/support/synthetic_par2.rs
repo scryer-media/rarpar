@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use md5::{Digest, Md5};
-use weaver_par2::checksum::SliceChecksumState;
-use weaver_par2::packet::header;
-use weaver_par2::{
+use par2_rs::checksum::SliceChecksumState;
+use par2_rs::packet::header;
+use par2_rs::{
     FileId, RecoverySlice, gf_pow, input_slice_constants, mul_acc_region, par2_set::Par2FileSet,
 };
 
@@ -81,7 +81,7 @@ pub fn build_synthetic_par2(
         rng.fill_bytes(&mut data);
         let filename = format!("testfile_{idx:03}.dat");
 
-        let hash_16k = weaver_par2::checksum::md5(&data[..data.len().min(16384)]);
+        let hash_16k = par2_rs::checksum::md5(&data[..data.len().min(16384)]);
 
         let mut id_input = Vec::new();
         id_input.extend_from_slice(&hash_16k);
@@ -140,8 +140,8 @@ pub fn build_synthetic_par2(
 
     // File description + IFSC packets for each file.
     for f in &files {
-        let hash_full = weaver_par2::checksum::md5(&f.data);
-        let hash_16k = weaver_par2::checksum::md5(&f.data[..f.data.len().min(16384)]);
+        let hash_full = par2_rs::checksum::md5(&f.data);
+        let hash_16k = par2_rs::checksum::md5(&f.data[..f.data.len().min(16384)]);
         let file_length = f.data.len() as u64;
         let num_slices = f.data.len().div_ceil(ss);
 

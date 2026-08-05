@@ -283,7 +283,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
     let prefix = read_prefix(path, 16).unwrap_or_default();
 
     if looks_like_par2(path, &prefix) {
-        match weaver_par2::scan_packets_from_path_with_set_ids(path) {
+        match par2_rs::scan_packets_from_path_with_set_ids(path) {
             Ok(packets) if !packets.is_empty() => {
                 let set_id = packets
                     .first()
@@ -337,9 +337,9 @@ fn classify_path(path: &Path) -> DiscoveredFile {
     }
 
     if looks_like_rar(path, &prefix) {
-        match File::open(path).and_then(|mut file| {
-            weaver_unrar::probe_volume(&mut file).map_err(std::io::Error::other)
-        }) {
+        match File::open(path)
+            .and_then(|mut file| unrar_rs::probe_volume(&mut file).map_err(std::io::Error::other))
+        {
             Ok(probe) => {
                 let files = probe
                     .files
@@ -398,7 +398,7 @@ fn build_par2_sets(files: &[DiscoveredFile]) -> Vec<Par2Set> {
             paths.sort();
             paths.dedup();
             let base_dir = common_base_dir(&paths);
-            let protected_files = weaver_par2::Par2FileSet::from_paths(&paths)
+            let protected_files = par2_rs::Par2FileSet::from_paths(&paths)
                 .ok()
                 .map(|set| {
                     set.files

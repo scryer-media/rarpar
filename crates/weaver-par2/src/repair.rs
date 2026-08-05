@@ -742,17 +742,17 @@ impl PreparedFactorMemo {
 /// signalling the caller to fall back to the shuffle2x tier.
 #[cfg(target_arch = "x86_64")]
 struct JitMemo {
-    codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>>,
-    width: weaver_reed_solomon::xor_jit::JitWidth,
+    codes: Vec<Option<reedsolomon_rs::xor_jit::memory::JitCode>>,
+    width: reedsolomon_rs::xor_jit::JitWidth,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl JitMemo {
     fn from_matrix(
-        width: weaver_reed_solomon::xor_jit::JitWidth,
+        width: reedsolomon_rs::xor_jit::JitWidth,
         matrix: &matrix::Matrix,
     ) -> Option<Self> {
-        let mut codes: Vec<Option<weaver_reed_solomon::xor_jit::memory::JitCode>> =
+        let mut codes: Vec<Option<reedsolomon_rs::xor_jit::memory::JitCode>> =
             (0..1usize << 16).map(|_| None).collect();
         for output_idx in 0..matrix.rows {
             for source_idx in 0..matrix.cols {
@@ -774,7 +774,7 @@ impl JitMemo {
     }
 
     #[inline]
-    fn get(&self, factor: u16) -> &weaver_reed_solomon::xor_jit::memory::JitCode {
+    fn get(&self, factor: u16) -> &reedsolomon_rs::xor_jit::memory::JitCode {
         self.codes[factor as usize]
             .as_ref()
             .expect("jit code prepared during memo construction")
@@ -821,10 +821,7 @@ impl StreamBatchSet {
                 // strictly smaller than the active width's block size.
                 #[cfg(target_arch = "x86_64")]
                 xorjit_tails: vec![
-                    vec![
-                        0u8;
-                        weaver_reed_solomon::xor_jit::transpose512::BLOCK_BYTES
-                    ];
+                    vec![0u8; reedsolomon_rs::xor_jit::transpose512::BLOCK_BYTES];
                     STREAM_INPUT_BATCH
                 ],
                 tail_len: 0,
@@ -1789,9 +1786,9 @@ fn reconstruct_and_write_grouped_inputs(
 ))]
 enum GpuSession {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    Metal(weaver_reed_solomon::metal_gf16::MetalGf16Session),
+    Metal(reedsolomon_rs::metal_gf16::MetalGf16Session),
     #[cfg(feature = "wgpu")]
-    Wgpu(weaver_reed_solomon::wgpu_gf16::WgpuGf16Session),
+    Wgpu(reedsolomon_rs::wgpu_gf16::WgpuGf16Session),
 }
 
 #[cfg(any(
@@ -1801,7 +1798,7 @@ enum GpuSession {
 impl GpuSession {
     fn try_new(outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Option<Self> {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(session) = weaver_reed_solomon::metal_gf16::MetalGf16Session::try_new(
+        if let Some(session) = reedsolomon_rs::metal_gf16::MetalGf16Session::try_new(
             outputs,
             max_byte_len,
             effective_bytes,
@@ -1809,7 +1806,7 @@ impl GpuSession {
             return Some(GpuSession::Metal(session));
         }
         #[cfg(feature = "wgpu")]
-        if let Some(session) = weaver_reed_solomon::wgpu_gf16::WgpuGf16Session::try_new(
+        if let Some(session) = reedsolomon_rs::wgpu_gf16::WgpuGf16Session::try_new(
             outputs,
             max_byte_len,
             effective_bytes,
@@ -1873,7 +1870,7 @@ impl GpuSession {
 /// here: without a GPU feature every method is a no-op and the CPU path
 /// runs unchanged; otherwise a session engages only when a device is
 /// present and the repair is large enough to amortize dispatch (see
-/// `weaver_reed_solomon::{metal_gf16, wgpu_gf16}`). Any GPU error
+/// `reedsolomon_rs::{metal_gf16, wgpu_gf16}`). Any GPU error
 /// permanently disables the arm and the caller redoes the affected chunk
 /// on the CPU.
 struct GpuComputeArm {
@@ -1913,7 +1910,7 @@ impl GpuComputeArm {
         // still gets the CPU tier; say so rather than leaving the operator to
         // wonder. Cheap: this never probes an adapter that was not probed.
         #[cfg(feature = "wgpu")]
-        if session.is_none() && weaver_reed_solomon::wgpu_gf16::auto_refused_cpu_adapter() {
+        if session.is_none() && reedsolomon_rs::wgpu_gf16::auto_refused_cpu_adapter() {
             debug!("wgpu adapter is a cpu rasterizer; keeping the cpu gf16 tier");
         }
         Self { session }
@@ -2060,7 +2057,7 @@ fn execute_repair_streaming(
     // disabled for the run so the batch sets take the plain shape the GPU arm
     // consumes (`bufs`), with the universal CPU tier as the fallback.
     #[cfg(feature = "wgpu")]
-    let gpu_forced = weaver_reed_solomon::wgpu_gf16::force_requested();
+    let gpu_forced = reedsolomon_rs::wgpu_gf16::force_requested();
     #[cfg(not(feature = "wgpu"))]
     let gpu_forced = false;
     // A discrete GPU claims accumulation from the x86 fast tiers on its own
@@ -2079,14 +2076,14 @@ fn execute_repair_streaming(
     #[cfg(feature = "wgpu")]
     let gpu_discrete_auto = !gpu_forced
         && crate::gf_simd::altmap_supported()
-        && weaver_reed_solomon::wgpu_gf16::discrete_auto_candidate(effective_bytes);
+        && reedsolomon_rs::wgpu_gf16::discrete_auto_candidate(effective_bytes);
     #[cfg(not(feature = "wgpu"))]
     let gpu_discrete_auto = false;
     let gpu_preferred = gpu_forced || gpu_discrete_auto;
     // Widest supported JIT tier (AVX512 preferred over AVX2, both !GFNI);
     // the same slice ceiling applies to both widths.
     #[cfg(target_arch = "x86_64")]
-    let jit_width = weaver_reed_solomon::xor_jit::JitWidth::detect()
+    let jit_width = reedsolomon_rs::xor_jit::JitWidth::detect()
         .filter(|_| plan.slice_size <= XORJIT_MAX_SLICE_BYTES && !gpu_preferred);
     // Build the JIT memo up front so an executable-memory failure falls back to
     // shuffle2x before any buffer is shaped for the planar layout.
@@ -2315,7 +2312,7 @@ fn execute_repair_streaming(
 // single-threaded `wasm32-wasip1`: weaver parallelises it with rayon, which
 // cannot spawn a pool there, and the decode-matrix build wants a large native
 // stack. This seam lets a host inject a non-rayon solver (e.g. one that
-// marshals the solve to native host threads) WITHOUT weaver-par2 depending on
+// marshals the solve to native host threads) WITHOUT par2-rs depending on
 // any host ABI. `RepairProblem` is a plain description of the solve — the same
 // fields the frozen "PAR2 v2" host descriptor carries — so a wasm consumer can
 // marshal it, while the native default keeps the current rayon behaviour.
@@ -2330,7 +2327,7 @@ fn execute_repair_streaming(
 ///
 /// This carries no pre-built matrix and no weaver-specific types: it is exactly
 /// the data a host needs to (re)build the repair coefficient matrix (via
-/// [`weaver_reed_solomon::matrix::build_repair_matrix`]) and run the GF matmul.
+/// [`reedsolomon_rs::matrix::build_repair_matrix`]) and run the GF matmul.
 pub struct RepairProblem<'a> {
     /// Total input slices in the recovery set (indexes `constants`).
     pub total_inputs: usize,
@@ -2403,12 +2400,12 @@ impl From<SolverError> for Par2Error {
 
 /// The injectable reconstruct step of a PAR2 repair.
 ///
-/// weaver-par2 calls this once per repair, at whole-reconstruct granularity;
+/// par2-rs calls this once per repair, at whole-reconstruct granularity;
 /// the hot per-element GF loop lives entirely inside an implementation, so the
 /// native default ([`NativeRepairSolver`]) is monomorphised with no dynamic
 /// dispatch on that loop. A host (e.g. a wasm plugin) implements this to run
 /// the solve off the rayon path — for example by marshaling `problem` to a
-/// native host-thread solver — without weaver-par2 knowing any host ABI.
+/// native host-thread solver — without par2-rs knowing any host ABI.
 pub trait RepairSolver {
     /// Reconstruct every `problem.outputs[j]` in place from `problem.sources`.
     fn reconstruct(&self, problem: &mut RepairProblem<'_>) -> std::result::Result<(), SolverError>;
@@ -3526,7 +3523,7 @@ mod tests {
 
     /// A stand-in for Agent P's wasm solver: it ignores the plan's pre-built
     /// matrix and instead rebuilds the coefficient matrix from the `RepairProblem`
-    /// raw spec using ONLY the `weaver-reed-solomon` host API, then reconstructs
+    /// raw spec using ONLY the `reedsolomon-rs` host API, then reconstructs
     /// via `mul_acc_region`. Proves the injection path recovers the original.
     struct HostStyleSolver;
 
@@ -3535,7 +3532,7 @@ mod tests {
             &self,
             problem: &mut RepairProblem<'_>,
         ) -> std::result::Result<(), SolverError> {
-            let coeffs = weaver_reed_solomon::matrix::build_repair_matrix(
+            let coeffs = reedsolomon_rs::matrix::build_repair_matrix(
                 problem.available_indices,
                 problem.missing_indices,
                 problem.recovery_exponents,
@@ -3547,7 +3544,7 @@ mod tests {
                 let out: &mut [u8] = out;
                 out.fill(0);
                 for (s, src) in sources.iter().enumerate() {
-                    weaver_reed_solomon::gf_simd::mul_acc_region(coeffs.get(j, s), src, out);
+                    reedsolomon_rs::gf_simd::mul_acc_region(coeffs.get(j, s), src, out);
                 }
             }
             Ok(())
@@ -3555,7 +3552,7 @@ mod tests {
     }
 
     /// `execute_repair_with_solver` with an injected, non-native, host-style
-    /// solver recovers the original through weaver-par2's real repair API.
+    /// solver recovers the original through par2-rs's real repair API.
     #[test]
     fn execute_repair_with_solver_host_style_recovers_original() {
         let slice_size = 128u64;
@@ -3589,11 +3586,11 @@ mod tests {
         );
     }
 
-    /// The host-side repair matrix (`weaver-reed-solomon`) must be byte-identical
-    /// to the coefficient matrix weaver-par2 builds natively, so a host solve
+    /// The host-side repair matrix (`reedsolomon-rs`) must be byte-identical
+    /// to the coefficient matrix par2-rs builds natively, so a host solve
     /// equals a native weaver repair.
     #[test]
-    fn weaver_reed_solomon_repair_matrix_matches_weaver_par2() {
+    fn reedsolomon_rs_repair_matrix_matches_par2_rs() {
         let total = 20usize;
         let constants = gf::input_slice_constants(total);
         let missing = vec![3usize, 7, 11, 15];
@@ -3602,15 +3599,14 @@ mod tests {
 
         let (weaver_repair, _decode) =
             matrix::build_repair_matrix_with_bad_row(&avail, &missing, &exps, &constants).unwrap();
-        let host =
-            weaver_reed_solomon::matrix::build_repair_matrix(&avail, &missing, &exps, &constants)
-                .unwrap();
+        let host = reedsolomon_rs::matrix::build_repair_matrix(&avail, &missing, &exps, &constants)
+            .unwrap();
 
         assert_eq!(weaver_repair.rows, host.rows);
         assert_eq!(weaver_repair.cols, host.cols);
         assert_eq!(
             weaver_repair.data, host.data,
-            "host repair matrix must be byte-identical to weaver-par2's"
+            "host repair matrix must be byte-identical to par2-rs's"
         );
     }
 }

@@ -4,30 +4,458 @@
 //! the scheduler to query file status and repairability at any time without
 //! waiting for the full download to complete.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::checksum::{FileHashState, SliceChecksumState};
+use crate::checksum::SliceChecksumState;
 use crate::packet::Packet;
 use crate::par2_set::Par2FileSet;
-use crate::types::{FileId, SliceChecksum};
+use crate::types::{FileId, RecoverySetId, SliceChecksum};
 use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult};
+
+const DEFAULT_BUFFERED_BOUNDARY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARTIAL_RANGES_PER_SLICE: usize = 4096;
+const PARTIAL_RANGE_ACCOUNTING_BYTES: usize = std::mem::size_of::<(u64, Vec<u8>)>() + 64;
+
+/// A caller-shareable cap for buffered, incomplete slice data.
+///
+/// Whole, aligned slices are checksummed immediately and do not consume this
+/// budget. Cloning the budget makes its limit apply across all of the sessions
+/// using that clone.
+#[derive(Clone, Debug)]
+pub struct VerificationMemoryBudget {
+    inner: Arc<VerificationMemoryBudgetInner>,
+}
+
+#[derive(Debug)]
+struct VerificationMemoryBudgetInner {
+    max_buffered_bytes: usize,
+    buffered_bytes: AtomicUsize,
+}
+
+impl VerificationMemoryBudget {
+    /// Create a budget shared by any sessions given a clone of this value.
+    pub fn new(max_buffered_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(VerificationMemoryBudgetInner {
+                max_buffered_bytes,
+                buffered_bytes: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Maximum number of buffered boundary bytes allowed across all users.
+    pub fn max_buffered_bytes(&self) -> usize {
+        self.inner.max_buffered_bytes
+    }
+
+    /// Number of bytes currently reserved by incomplete slices.
+    pub fn buffered_bytes(&self) -> usize {
+        self.inner.buffered_bytes.load(Ordering::Acquire)
+    }
+
+    /// Number of additional boundary bytes that can currently be buffered.
+    pub fn available_bytes(&self) -> usize {
+        self.max_buffered_bytes()
+            .saturating_sub(self.buffered_bytes())
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+
+        let limit = self.inner.max_buffered_bytes;
+        let mut current = self.inner.buffered_bytes.load(Ordering::Acquire);
+        loop {
+            if bytes > limit.saturating_sub(current) {
+                return false;
+            }
+
+            match self.inner.buffered_bytes.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes != 0 {
+            self.inner.buffered_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Default for VerificationMemoryBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_BUFFERED_BOUNDARY_BYTES)
+    }
+}
+
+/// Configuration for a [`VerificationSession`].
+#[derive(Clone, Debug, Default)]
+pub struct VerificationSessionOptions {
+    memory_budget: VerificationMemoryBudget,
+}
+
+impl VerificationSessionOptions {
+    /// Create options with the default 64 MiB boundary-buffer budget.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the caller-shareable budget used for incomplete slice data.
+    pub fn with_memory_budget(mut self, memory_budget: VerificationMemoryBudget) -> Self {
+        self.memory_budget = memory_budget;
+        self
+    }
+
+    /// The budget this session will use for incomplete slice data.
+    pub fn memory_budget(&self) -> &VerificationMemoryBudget {
+        &self.memory_budget
+    }
+}
+
+/// A completed PAR2 slice verdict, suitable for passing to a repair session.
+///
+/// Evidence deliberately identifies PAR2 coordinates only. It never exposes a
+/// filesystem path or assumes where the downloaded bytes were stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceEvidenceStrength {
+    /// The slice was compared using the PAR2 IFSC CRC32 only.
+    Crc32Only,
+    /// The slice was compared using both the PAR2 IFSC CRC32 and MD5.
+    Crc32AndMd5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceEvidence {
+    recovery_set_id: RecoverySetId,
+    file_id: FileId,
+    slice_index: u32,
+    valid: bool,
+    strength: SliceEvidenceStrength,
+}
+
+impl SliceEvidence {
+    /// Recovery set whose metadata produced this verdict.
+    pub fn recovery_set_id(&self) -> RecoverySetId {
+        self.recovery_set_id
+    }
+
+    /// File to which this PAR2 slice belongs.
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    /// Zero-based PAR2 slice index within [`Self::file_id`].
+    pub fn slice_index(&self) -> u32 {
+        self.slice_index
+    }
+
+    /// Whether this slice's CRC32 and MD5 matched the PAR2 IFSC entry.
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Hash strength used to produce this verdict.
+    pub fn strength(&self) -> SliceEvidenceStrength {
+        self.strength
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        recovery_set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: u32,
+        valid: bool,
+        strength: SliceEvidenceStrength,
+    ) -> Self {
+        Self {
+            recovery_set_id,
+            file_id,
+            slice_index,
+            valid,
+            strength,
+        }
+    }
+}
+
+/// A byte range the caller should read to settle an incomplete or ambiguous
+/// slice. The range is expressed in the logical file, not a filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleRead {
+    file_id: FileId,
+    slice_index: u32,
+    offset: u64,
+    length: u64,
+}
+
+impl SettleRead {
+    fn new(file_id: FileId, slice_index: usize, offset: u64, length: u64) -> Self {
+        Self {
+            file_id,
+            slice_index: u32::try_from(slice_index).unwrap_or(u32::MAX),
+            offset,
+            length,
+        }
+    }
+
+    /// File containing the range to be read.
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    /// Zero-based PAR2 slice index containing this read.
+    pub fn slice_index(&self) -> u32 {
+        self.slice_index
+    }
+
+    /// Logical file offset to read.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Number of bytes to read.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+/// High-level disposition for a call to [`VerificationSession::feed_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedDisposition {
+    /// One or more slices were verified immediately or after completing a buffer.
+    Verified,
+    /// Boundary data was retained while waiting for the requested settle reads.
+    Buffered,
+    /// The range only repeated bytes already retained or verified.
+    Duplicate,
+    /// PAR2 metadata or slice checksums have not arrived yet.
+    MetadataPending,
+    /// The supplied file ID is not part of the currently known PAR2 set.
+    UnknownFile,
+    /// The supplied byte range is outside the declared file length.
+    OutOfRange,
+    /// Retaining a boundary range would exceed the shared memory budget.
+    BudgetExhausted,
+    /// A previously buffered byte and this feed disagree.
+    ConflictingOverlap,
+    /// A settled slice was supplied only partially, so its identity cannot be
+    /// checked without reading the complete slice again.
+    NeedsSettleRead,
+}
+
+/// Detailed result of an arbitrary-range feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedOutcome {
+    disposition: FeedDisposition,
+    evidence: Vec<SliceEvidence>,
+    settle_reads: Vec<SettleRead>,
+}
+
+impl FeedOutcome {
+    fn new(disposition: FeedDisposition) -> Self {
+        Self {
+            disposition,
+            evidence: Vec::new(),
+            settle_reads: Vec::new(),
+        }
+    }
+
+    /// Summary disposition for this feed.
+    pub fn disposition(&self) -> FeedDisposition {
+        self.disposition
+    }
+
+    /// Slices whose verdict became known during this feed.
+    pub fn evidence(&self) -> &[SliceEvidence] {
+        &self.evidence
+    }
+
+    /// Missing or full-slice reads needed to settle the affected slices.
+    pub fn settle_reads(&self) -> &[SettleRead] {
+        &self.settle_reads
+    }
+}
+
+/// Stable spelling for callers that prefer to name the operation explicitly.
+pub type FeedRangeOutcome = FeedOutcome;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SliceFingerprint {
+    crc32: u32,
+    md5: [u8; 16],
+}
+
+impl SliceFingerprint {
+    fn from_data(data: &[u8], slice_size: u64) -> Self {
+        let mut state = SliceChecksumState::new();
+        state.update(data);
+        let pad_to = ((data.len() as u64) < slice_size).then_some(slice_size);
+        let (crc32, md5) = state.finalize(pad_to);
+        Self { crc32, md5 }
+    }
+
+    fn is_valid_for(self, expected: &SliceChecksum) -> bool {
+        self.crc32 == expected.crc32 && self.md5 == expected.md5
+    }
+}
+
+/// Sparse byte storage for a slice which arrived in more than one range.
+struct PartialSlice {
+    expected_len: u64,
+    ranges: BTreeMap<u64, Vec<u8>>,
+    buffered_bytes: usize,
+    reserved_bytes: usize,
+}
+
+impl PartialSlice {
+    fn new(expected_len: u64) -> Self {
+        Self {
+            expected_len,
+            ranges: BTreeMap::new(),
+            buffered_bytes: 0,
+            reserved_bytes: 0,
+        }
+    }
+
+    fn matches(&self, start: u64, data: &[u8]) -> bool {
+        let end = start + data.len() as u64;
+        self.ranges.range(..end).all(|(&range_start, existing)| {
+            let range_end = range_start + existing.len() as u64;
+            let overlap_start = range_start.max(start);
+            let overlap_end = range_end.min(end);
+            overlap_start >= overlap_end
+                || existing
+                    [(overlap_start - range_start) as usize..(overlap_end - range_start) as usize]
+                    == data[(overlap_start - start) as usize..(overlap_end - start) as usize]
+        })
+    }
+
+    fn uncovered_ranges(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut cursor = start;
+        let mut uncovered = Vec::new();
+
+        for (&range_start, existing) in self.ranges.range(..end) {
+            let range_end = range_start + existing.len() as u64;
+            if range_end <= cursor {
+                continue;
+            }
+            if range_start > cursor {
+                let gap_end = range_start.min(end);
+                uncovered.push((cursor, gap_end));
+                cursor = gap_end;
+            }
+            cursor = cursor.max(range_end.min(end));
+            if cursor == end {
+                break;
+            }
+        }
+
+        if cursor < end {
+            uncovered.push((cursor, end));
+        }
+        uncovered
+    }
+
+    /// Insert only previously unseen bytes. Returns the new byte count, or
+    /// `None` when the shared budget cannot reserve the requested storage.
+    fn insert(
+        &mut self,
+        start: u64,
+        data: &[u8],
+        budget: &VerificationMemoryBudget,
+    ) -> Option<usize> {
+        let end = start + data.len() as u64;
+        let uncovered = self.uncovered_ranges(start, end);
+        if self.ranges.len().saturating_add(uncovered.len()) > MAX_PARTIAL_RANGES_PER_SLICE {
+            return None;
+        }
+        let added = uncovered
+            .iter()
+            .map(|(from, to)| usize::try_from(to - from).unwrap_or(usize::MAX))
+            .sum::<usize>();
+        let reservation = added.saturating_add(
+            uncovered
+                .len()
+                .saturating_mul(PARTIAL_RANGE_ACCOUNTING_BYTES),
+        );
+
+        if !budget.try_reserve(reservation) {
+            return None;
+        }
+
+        for (from, to) in uncovered {
+            self.ranges.insert(
+                from,
+                data[(from - start) as usize..(to - start) as usize].to_vec(),
+            );
+        }
+        self.buffered_bytes += added;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(reservation);
+        Some(added)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.buffered_bytes as u64 == self.expected_len
+    }
+
+    fn fingerprint(&self, slice_size: u64) -> Option<SliceFingerprint> {
+        if !self.is_complete() {
+            return None;
+        }
+
+        let mut state = SliceChecksumState::new();
+        let mut offset = 0;
+        for (&range_start, data) in &self.ranges {
+            if range_start != offset {
+                return None;
+            }
+            state.update(data);
+            offset += data.len() as u64;
+        }
+        if offset != self.expected_len {
+            return None;
+        }
+
+        let pad_to = (self.expected_len < slice_size).then_some(slice_size);
+        let (crc32, md5) = state.finalize(pad_to);
+        Some(SliceFingerprint { crc32, md5 })
+    }
+
+    fn settle_reads(
+        &self,
+        file_id: FileId,
+        slice_index: usize,
+        slice_offset: u64,
+    ) -> Vec<SettleRead> {
+        self.uncovered_ranges(0, self.expected_len)
+            .into_iter()
+            .map(|(start, end)| {
+                SettleRead::new(file_id, slice_index, slice_offset + start, end - start)
+            })
+            .collect()
+    }
+}
 
 /// Per-file verification state tracking.
 struct FileVerificationState {
-    /// Per-slice streaming checksum accumulators. `None` means the slice
-    /// has not received any data yet.
-    slice_states: Vec<Option<SliceChecksumState>>,
+    /// Boundary slices kept only until their sparse ranges cover the slice.
+    partial_slices: HashMap<usize, PartialSlice>,
     /// Per-slice verification result. `None` means not yet finalized,
     /// `Some(true)` = valid, `Some(false)` = damaged.
     verified_slices: Vec<Option<bool>>,
-    /// Streaming full-file MD5 hash (only valid if data arrives in order;
-    /// tracked for completeness but not relied on for out-of-order feeds).
-    #[allow(dead_code)]
-    full_hash: FileHashState,
-    /// Streaming hash for the first 16KB of the file.
-    hash_16k: SliceChecksumState,
-    /// Total bytes received for this file.
+    /// Checksum fingerprints retained after immediate hashing so an identical
+    /// full-slice retry is cheap and a conflicting full-slice retry is explicit.
+    fingerprints: Vec<Option<SliceFingerprint>>,
+    /// Total unique bytes accepted into still-pending or finalized slices.
     bytes_received: u64,
     /// Expected file length from the PAR2 file description.
     file_length: u64,
@@ -37,84 +465,72 @@ struct FileVerificationState {
 
 impl FileVerificationState {
     fn new(file_length: u64, slice_size: u64) -> Self {
-        let num_slices = if file_length == 0 {
+        let num_slices = if file_length == 0 || slice_size == 0 {
             0
         } else {
             file_length.div_ceil(slice_size) as usize
         };
 
         Self {
-            slice_states: vec![None; num_slices],
+            partial_slices: HashMap::new(),
             verified_slices: vec![None; num_slices],
-            full_hash: FileHashState::new(),
-            hash_16k: SliceChecksumState::new(),
+            fingerprints: vec![None; num_slices],
             bytes_received: 0,
             file_length,
             slice_size,
         }
     }
 
-    /// Feed data for a single slice. The offset must be slice-aligned and the
-    /// data must cover exactly one slice (possibly shorter for the last slice).
-    fn feed_slice_data(&mut self, offset: u64, data: &[u8]) {
-        if self.slice_size == 0 {
-            return;
-        }
+    fn slice_offset(&self, slice_index: usize) -> Option<u64> {
+        (slice_index as u64).checked_mul(self.slice_size)
+    }
 
-        let slice_index = (offset / self.slice_size) as usize;
-        if slice_index >= self.slice_states.len() {
-            return;
-        }
+    fn slice_len(&self, slice_index: usize) -> Option<u64> {
+        let offset = self.slice_offset(slice_index)?;
+        (offset < self.file_length).then(|| (self.file_length - offset).min(self.slice_size))
+    }
 
-        // Initialize accumulator if this is the first data for this slice.
-        let state = self.slice_states[slice_index].get_or_insert_with(SliceChecksumState::new);
-        state.update(data);
-        self.bytes_received += data.len() as u64;
-
-        // Feed into the 16k hash if this data falls within the first 16KB.
-        if offset < 16384 {
-            let end = (offset + data.len() as u64).min(16384);
-            let useful = &data[..(end - offset) as usize];
-            self.hash_16k.update(useful);
+    fn evidence(
+        &self,
+        recovery_set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: usize,
+        valid: bool,
+    ) -> SliceEvidence {
+        SliceEvidence {
+            recovery_set_id,
+            file_id,
+            slice_index: u32::try_from(slice_index).unwrap_or(u32::MAX),
+            valid,
+            strength: if self
+                .fingerprints
+                .get(slice_index)
+                .is_some_and(Option::is_some)
+            {
+                SliceEvidenceStrength::Crc32AndMd5
+            } else {
+                SliceEvidenceStrength::Crc32Only
+            },
         }
     }
 
-    /// Try to finalize a slice if all its data has been received.
-    fn try_finalize_slice(&mut self, slice_index: usize, expected: &SliceChecksum) -> Option<bool> {
-        // Already verified?
-        if let Some(result) = self.verified_slices[slice_index] {
-            return Some(result);
-        }
+    fn full_slice_read(&self, file_id: FileId, slice_index: usize) -> SettleRead {
+        SettleRead::new(
+            file_id,
+            slice_index,
+            self.slice_offset(slice_index).unwrap_or(self.file_length),
+            self.slice_len(slice_index).unwrap_or(0),
+        )
+    }
 
-        let state = self.slice_states[slice_index].take()?;
-        let expected_slice_len = if slice_index == self.slice_states.len() - 1 {
-            // Last slice may be shorter.
-            let remainder = self.file_length % self.slice_size;
-            if remainder == 0 {
-                self.slice_size
-            } else {
-                remainder
-            }
-        } else {
-            self.slice_size
-        };
-
-        // Only finalize if we've received all data for this slice.
-        if state.bytes_fed() < expected_slice_len {
-            // Put the state back -- not complete yet.
-            self.slice_states[slice_index] = Some(state);
-            return None;
-        }
-
-        let pad_to = if state.bytes_fed() < self.slice_size {
-            Some(self.slice_size)
-        } else {
-            None
-        };
-        let (crc, md5) = state.finalize(pad_to);
-        let valid = crc == expected.crc32 && md5 == expected.md5;
-        self.verified_slices[slice_index] = Some(valid);
-        Some(valid)
+    fn discard_partial(&mut self, slice_index: usize, budget: &VerificationMemoryBudget) -> usize {
+        self.partial_slices
+            .remove(&slice_index)
+            .map(|partial| {
+                budget.release(partial.reserved_bytes);
+                partial.buffered_bytes
+            })
+            .unwrap_or(0)
     }
 
     /// Count how many slices have been verified as valid.
@@ -144,6 +560,15 @@ impl FileVerificationState {
     }
 }
 
+enum SliceFeed {
+    Verified(SliceEvidence),
+    Buffered(Vec<SettleRead>),
+    Duplicate(Vec<SettleRead>),
+    BudgetExhausted(SettleRead),
+    Conflict(SettleRead),
+    NeedsSettleRead(SettleRead),
+}
+
 /// Streaming verification session that tracks PAR2 verification state as data
 /// arrives during download.
 ///
@@ -158,15 +583,49 @@ pub struct VerificationSession {
     /// Packets received before the PAR2 set was complete. These are buffered
     /// so that `add_par2_data` can be called incrementally.
     buffered_packets: Vec<Packet>,
+    memory_budget: VerificationMemoryBudget,
 }
 
 impl VerificationSession {
     /// Create a new empty verification session.
     pub fn new() -> Self {
+        Self::with_options(VerificationSessionOptions::default())
+    }
+
+    /// Create a session using the supplied buffering policy.
+    pub fn with_options(options: VerificationSessionOptions) -> Self {
         Self {
             par2_set: None,
             file_states: HashMap::new(),
             buffered_packets: Vec::new(),
+            memory_budget: options.memory_budget,
+        }
+    }
+
+    /// Create a session using a caller-shareable boundary-buffer budget.
+    pub fn with_memory_budget(memory_budget: VerificationMemoryBudget) -> Self {
+        Self::with_options(VerificationSessionOptions::new().with_memory_budget(memory_budget))
+    }
+
+    /// The budget used for incomplete slice data in this session.
+    pub fn memory_budget(&self) -> &VerificationMemoryBudget {
+        &self.memory_budget
+    }
+
+    fn initialize_file_states(&mut self) {
+        let Some(par2_set) = self.par2_set.as_ref() else {
+            return;
+        };
+
+        for file_id in &par2_set.recovery_file_ids {
+            if !self.file_states.contains_key(file_id)
+                && let Some(desc) = par2_set.file_description(file_id)
+            {
+                self.file_states.insert(
+                    *file_id,
+                    FileVerificationState::new(desc.length, par2_set.slice_size),
+                );
+            }
         }
     }
 
@@ -176,24 +635,25 @@ impl VerificationSession {
     /// Once a valid `Par2FileSet` can be built from the accumulated packets,
     /// per-file verification state is initialized.
     pub fn add_par2_data(&mut self, packets: &[Packet]) {
+        if let Some(par2_set) = self.par2_set.as_mut() {
+            // Once a set exists, merge only the new packets. Rebuilding from
+            // `buffered_packets` would clone every earlier recovery payload on
+            // every PAR2 volume arrival.
+            let _ = Arc::make_mut(par2_set).merge_packets(packets.to_vec());
+            self.initialize_file_states();
+            return;
+        }
+
         self.buffered_packets.extend(packets.iter().cloned());
 
         // Try to build a Par2FileSet from all accumulated packets.
         match Par2FileSet::from_packets(self.buffered_packets.clone()) {
             Ok(set) => {
-                let set = Arc::new(set);
-                // Initialize file states for any files we haven't seen yet.
-                for file_id in &set.recovery_file_ids {
-                    if !self.file_states.contains_key(file_id)
-                        && let Some(desc) = set.file_description(file_id)
-                    {
-                        self.file_states.insert(
-                            *file_id,
-                            FileVerificationState::new(desc.length, set.slice_size),
-                        );
-                    }
-                }
-                self.par2_set = Some(set);
+                self.par2_set = Some(Arc::new(set));
+                // The packets are now represented by the set. Keep no second
+                // copy, especially because recovery payloads can be large.
+                self.buffered_packets.clear();
+                self.initialize_file_states();
             }
             Err(_) => {
                 // Not enough packets yet (e.g., no main packet). Keep buffering.
@@ -203,41 +663,282 @@ impl VerificationSession {
 
     /// Feed decoded file data for a specific file.
     ///
-    /// The data must be slice-aligned: `offset` must be a multiple of the PAR2
-    /// slice size, and `data` should contain exactly one slice worth of data
-    /// (or less for the last slice of a file). The assembly layer is responsible
-    /// for aligning segments to slices before calling this.
+    /// This compatibility wrapper accepts the historical aligned input and
+    /// intentionally discards the detailed outcome. New callers should use
+    /// [`feed_range`](Self::feed_range) to receive evidence and settle reads.
     ///
     /// If PAR2 metadata has not yet arrived, the data is silently ignored.
     /// (The assembly layer should re-feed data after PAR2 metadata arrives
     /// if needed, or the caller can handle this at a higher level.)
     pub fn feed_data(&mut self, file_id: &FileId, offset: u64, data: &[u8]) {
+        let _ = self.feed_range(file_id, offset, data);
+    }
+
+    /// Feed an arbitrary logical byte range for a PAR2 file.
+    ///
+    /// Aligned complete slices are checksummed immediately without retaining
+    /// the slice payload. Only incomplete boundary slices are buffered. The
+    /// returned [`FeedOutcome`] reports newly settled [`SliceEvidence`] and
+    /// precise [`SettleRead`] ranges needed to complete or disambiguate a slice.
+    pub fn feed_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> FeedOutcome {
         let par2_set = match &self.par2_set {
             Some(set) => Arc::clone(set),
-            None => return, // No PAR2 metadata yet; ignore data.
+            None => return FeedOutcome::new(FeedDisposition::MetadataPending),
         };
 
-        // Ensure file state exists.
+        let Some(desc) = par2_set.file_description(file_id) else {
+            return FeedOutcome::new(FeedDisposition::UnknownFile);
+        };
+        let Some(checksums) = par2_set.file_checksums(file_id) else {
+            return FeedOutcome::new(FeedDisposition::MetadataPending);
+        };
+        if par2_set.slice_size == 0 {
+            return FeedOutcome::new(FeedDisposition::OutOfRange);
+        }
+
+        let range_end = match offset.checked_add(data.len() as u64) {
+            Some(end) if offset <= desc.length && end <= desc.length => end,
+            _ => return FeedOutcome::new(FeedDisposition::OutOfRange),
+        };
+        if data.is_empty() {
+            return FeedOutcome::new(FeedDisposition::Duplicate);
+        }
+
+        // Ensure file state exists. This also supports non-recovery files for
+        // callers that choose to verify their available IFSC metadata.
         if !self.file_states.contains_key(file_id) {
-            if let Some(desc) = par2_set.file_description(file_id) {
-                self.file_states.insert(
-                    *file_id,
-                    FileVerificationState::new(desc.length, par2_set.slice_size),
-                );
-            } else {
-                return; // Unknown file ID.
+            self.file_states.insert(
+                *file_id,
+                FileVerificationState::new(desc.length, par2_set.slice_size),
+            );
+        }
+
+        let first_slice = usize::try_from(offset / par2_set.slice_size)
+            .map_err(|_| ())
+            .ok();
+        let last_slice = usize::try_from((range_end - 1) / par2_set.slice_size)
+            .map_err(|_| ())
+            .ok();
+        let (Some(first_slice), Some(last_slice)) = (first_slice, last_slice) else {
+            return FeedOutcome::new(FeedDisposition::OutOfRange);
+        };
+
+        let state = self
+            .file_states
+            .get_mut(file_id)
+            .expect("state inserted above");
+        let mut outcome = FeedOutcome::new(FeedDisposition::Duplicate);
+        let mut saw_verified = false;
+        let mut saw_buffered = false;
+        let mut saw_budget_exhausted = false;
+        let mut saw_conflict = false;
+        let mut saw_needs_settle_read = false;
+
+        for slice_index in first_slice..=last_slice {
+            let Some(slice_offset) = state.slice_offset(slice_index) else {
+                saw_needs_settle_read = true;
+                continue;
+            };
+            let Some(slice_len) = state.slice_len(slice_index) else {
+                saw_needs_settle_read = true;
+                continue;
+            };
+            let Some(expected) = checksums.get(slice_index) else {
+                return FeedOutcome::new(FeedDisposition::MetadataPending);
+            };
+
+            let piece_start = offset.max(slice_offset);
+            let piece_end = range_end.min(slice_offset + slice_len);
+            let piece = &data[(piece_start - offset) as usize..(piece_end - offset) as usize];
+            let whole_slice = piece_start == slice_offset && piece.len() as u64 == slice_len;
+
+            match Self::feed_slice_range(
+                state,
+                &self.memory_budget,
+                par2_set.recovery_set_id,
+                *file_id,
+                slice_index,
+                piece_start - slice_offset,
+                piece,
+                whole_slice,
+                expected,
+            ) {
+                SliceFeed::Verified(evidence) => {
+                    saw_verified = true;
+                    outcome.evidence.push(evidence);
+                }
+                SliceFeed::Buffered(reads) => {
+                    saw_buffered = true;
+                    Self::append_settle_reads(&mut outcome.settle_reads, reads);
+                }
+                SliceFeed::Duplicate(reads) => {
+                    Self::append_settle_reads(&mut outcome.settle_reads, reads);
+                }
+                SliceFeed::BudgetExhausted(read) => {
+                    saw_budget_exhausted = true;
+                    Self::append_settle_reads(&mut outcome.settle_reads, [read]);
+                }
+                SliceFeed::Conflict(read) => {
+                    saw_conflict = true;
+                    Self::append_settle_reads(&mut outcome.settle_reads, [read]);
+                }
+                SliceFeed::NeedsSettleRead(read) => {
+                    saw_needs_settle_read = true;
+                    Self::append_settle_reads(&mut outcome.settle_reads, [read]);
+                }
             }
         }
 
-        let state = self.file_states.get_mut(file_id).unwrap();
-        state.feed_slice_data(offset, data);
+        outcome.disposition = if saw_conflict {
+            FeedDisposition::ConflictingOverlap
+        } else if saw_budget_exhausted {
+            FeedDisposition::BudgetExhausted
+        } else if saw_needs_settle_read {
+            FeedDisposition::NeedsSettleRead
+        } else if saw_verified {
+            FeedDisposition::Verified
+        } else if saw_buffered {
+            FeedDisposition::Buffered
+        } else {
+            FeedDisposition::Duplicate
+        };
+        outcome
+    }
 
-        // Try to finalize the slice that was just fed.
-        if let Some(slice_index) = offset.checked_div(par2_set.slice_size).map(|v| v as usize)
-            && let Some(checksums) = par2_set.file_checksums(file_id)
-            && slice_index < checksums.len()
+    /// Alias for callers that use `feed_data` terminology for arbitrary ranges.
+    pub fn feed_data_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> FeedOutcome {
+        self.feed_range(file_id, offset, data)
+    }
+
+    fn append_settle_reads(
+        target: &mut Vec<SettleRead>,
+        reads: impl IntoIterator<Item = SettleRead>,
+    ) {
+        for read in reads {
+            if !target.contains(&read) {
+                target.push(read);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn feed_slice_range(
+        state: &mut FileVerificationState,
+        memory_budget: &VerificationMemoryBudget,
+        recovery_set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: usize,
+        slice_data_offset: u64,
+        data: &[u8],
+        whole_slice: bool,
+        expected: &SliceChecksum,
+    ) -> SliceFeed {
+        let full_read = state.full_slice_read(file_id, slice_index);
+
+        if let Some(fingerprint) = state.fingerprints[slice_index] {
+            if whole_slice {
+                return if fingerprint == SliceFingerprint::from_data(data, state.slice_size) {
+                    SliceFeed::Duplicate(Vec::new())
+                } else {
+                    SliceFeed::Conflict(full_read.clone())
+                };
+            }
+            return SliceFeed::NeedsSettleRead(full_read.clone());
+        }
+        if state.verified_slices[slice_index].is_some() {
+            // `verify_from_slice_crcs` can settle a CRC-only slice. A partial
+            // byte retry cannot prove it is the same data because MD5 was not
+            // retained, so request one trusted full-slice read.
+            return SliceFeed::NeedsSettleRead(full_read.clone());
+        }
+
+        let slice_len = state.slice_len(slice_index).unwrap_or(0);
+        if whole_slice {
+            let partial_bytes = match state.partial_slices.get(&slice_index) {
+                Some(partial) if !partial.matches(0, data) => {
+                    state.discard_partial(slice_index, memory_budget);
+                    return SliceFeed::Conflict(full_read.clone());
+                }
+                Some(partial) => partial.buffered_bytes as u64,
+                None => 0,
+            };
+            if partial_bytes != 0 {
+                state.discard_partial(slice_index, memory_budget);
+            }
+
+            let fingerprint = SliceFingerprint::from_data(data, state.slice_size);
+            let valid = fingerprint.is_valid_for(expected);
+            state.verified_slices[slice_index] = Some(valid);
+            state.fingerprints[slice_index] = Some(fingerprint);
+            state.bytes_received += slice_len.saturating_sub(partial_bytes);
+            return SliceFeed::Verified(state.evidence(
+                recovery_set_id,
+                file_id,
+                slice_index,
+                valid,
+            ));
+        }
+
+        if state
+            .partial_slices
+            .get(&slice_index)
+            .is_some_and(|partial| !partial.matches(slice_data_offset, data))
         {
-            state.try_finalize_slice(slice_index, &checksums[slice_index]);
+            state.discard_partial(slice_index, memory_budget);
+            return SliceFeed::Conflict(full_read.clone());
+        }
+
+        let had_partial = state.partial_slices.contains_key(&slice_index);
+        let inserted = state
+            .partial_slices
+            .entry(slice_index)
+            .or_insert_with(|| PartialSlice::new(slice_len))
+            .insert(slice_data_offset, data, memory_budget);
+        let Some(inserted) = inserted else {
+            if !had_partial {
+                state.partial_slices.remove(&slice_index);
+            }
+            return SliceFeed::BudgetExhausted(full_read.clone());
+        };
+        state.bytes_received += inserted as u64;
+
+        let complete = state
+            .partial_slices
+            .get(&slice_index)
+            .is_some_and(PartialSlice::is_complete);
+        if complete {
+            let partial = state
+                .partial_slices
+                .remove(&slice_index)
+                .expect("complete partial slice exists");
+            let fingerprint = partial
+                .fingerprint(state.slice_size)
+                .expect("complete partial slice covers every byte");
+            memory_budget.release(partial.reserved_bytes);
+            let valid = fingerprint.is_valid_for(expected);
+            state.verified_slices[slice_index] = Some(valid);
+            state.fingerprints[slice_index] = Some(fingerprint);
+            return SliceFeed::Verified(state.evidence(
+                recovery_set_id,
+                file_id,
+                slice_index,
+                valid,
+            ));
+        }
+
+        let reads = state
+            .partial_slices
+            .get(&slice_index)
+            .expect("partial slice remains when incomplete")
+            .settle_reads(
+                file_id,
+                slice_index,
+                state.slice_offset(slice_index).unwrap_or(state.file_length),
+            );
+        if inserted == 0 {
+            SliceFeed::Duplicate(reads)
+        } else {
+            SliceFeed::Buffered(reads)
         }
     }
 
@@ -455,28 +1156,58 @@ impl VerificationSession {
         }
 
         let state = self.file_states.get_mut(file_id)?;
-
-        let results: Vec<bool> = checksums
-            .iter()
-            .enumerate()
-            .map(|(i, expected)| {
-                let valid = slice_crcs
-                    .get(i)
-                    .map(|&crc| crc == expected.crc32)
-                    .unwrap_or(false);
-                // Update the verified_slices state (only if not already verified).
-                if state.verified_slices[i].is_none() {
-                    state.verified_slices[i] = Some(valid);
-                    if valid {
-                        // Mark bytes as received so file isn't treated as "missing".
-                        state.bytes_received = state.bytes_received.max(1);
-                    }
+        let mut results = Vec::with_capacity(checksums.len());
+        for (i, expected) in checksums.iter().enumerate() {
+            let valid = slice_crcs
+                .get(i)
+                .map(|&crc| crc == expected.crc32)
+                .unwrap_or(false);
+            // Update the verified_slices state (only if not already verified).
+            if state.verified_slices[i].is_none() {
+                state.discard_partial(i, &self.memory_budget);
+                state.verified_slices[i] = Some(valid);
+                if valid {
+                    // Mark bytes as received so file isn't treated as "missing".
+                    state.bytes_received = state.bytes_received.max(1);
                 }
-                valid
-            })
-            .collect();
+            }
+            results.push(valid);
+        }
 
         Some(results)
+    }
+
+    /// Return every settled slice verdict held by this session.
+    ///
+    /// The result is deterministic by file ID and slice index, and contains
+    /// only PAR2 coordinates plus validity so it can be handed to a later
+    /// repair stage without coupling it to filesystem paths.
+    pub fn slice_evidence(&self) -> Vec<SliceEvidence> {
+        let Some(recovery_set_id) = self.par2_set.as_ref().map(|set| set.recovery_set_id) else {
+            return Vec::new();
+        };
+        let mut evidence = self
+            .file_states
+            .iter()
+            .flat_map(|(file_id, state)| {
+                state
+                    .verified_slices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slice_index, valid)| {
+                        valid.map(|valid| {
+                            state.evidence(recovery_set_id, *file_id, slice_index, valid)
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        evidence.sort_unstable_by(|left, right| {
+            left.file_id()
+                .as_bytes()
+                .cmp(right.file_id().as_bytes())
+                .then_with(|| left.slice_index().cmp(&right.slice_index()))
+        });
+        evidence
     }
 
     /// Get a reference to the underlying PAR2 file set, if loaded.
@@ -488,6 +1219,16 @@ impl VerificationSession {
 impl Default for VerificationSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for VerificationSession {
+    fn drop(&mut self) {
+        for state in self.file_states.values() {
+            for partial in state.partial_slices.values() {
+                self.memory_budget.release(partial.reserved_bytes);
+            }
+        }
     }
 }
 
@@ -846,6 +1587,12 @@ mod tests {
             session.file_status(&file_id),
             Some(FileStatus::Complete)
         ));
+        assert!(
+            session
+                .slice_evidence()
+                .iter()
+                .all(|evidence| evidence.strength() == SliceEvidenceStrength::Crc32Only)
+        );
     }
 
     #[test]
@@ -879,5 +1626,221 @@ mod tests {
         assert!(!session.is_complete());
         assert!(session.verification_result().is_none());
         assert!(matches!(session.repairability(), Repairability::NotNeeded));
+    }
+
+    #[test]
+    fn feed_range_settles_out_of_order_boundaries_without_buffering_full_slices() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..24u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let mut session = VerificationSession::new();
+        session.add_par2_data(&parse_packets(&par2_bytes));
+
+        // Feed the tail of slice 1 before its prefix, then settle it. The
+        // buffered range reports the exact three-byte prefix still needed.
+        let pending = session.feed_range(&file_id, 11, &file_data[11..16]);
+        assert_eq!(pending.disposition(), FeedDisposition::Buffered);
+        assert_eq!(pending.settle_reads().len(), 1);
+        assert_eq!(pending.settle_reads()[0].offset(), 8);
+        assert_eq!(pending.settle_reads()[0].length(), 3);
+
+        let settled = session.feed_range(&file_id, 8, &file_data[8..11]);
+        assert_eq!(settled.disposition(), FeedDisposition::Verified);
+        assert_eq!(settled.evidence().len(), 1);
+        assert_eq!(settled.evidence()[0].slice_index(), 1);
+        assert!(settled.evidence()[0].is_valid());
+
+        // The two boundary pieces of slice 0 arrive in the opposite order.
+        assert_eq!(
+            session
+                .feed_range(&file_id, 3, &file_data[3..8])
+                .disposition(),
+            FeedDisposition::Buffered
+        );
+        let settled = session.feed_range(&file_id, 0, &file_data[..3]);
+        assert_eq!(settled.disposition(), FeedDisposition::Verified);
+        assert_eq!(settled.evidence()[0].slice_index(), 0);
+
+        // Slice 2 is aligned and complete, so it is immediately hashed rather
+        // than retained in the boundary buffer.
+        let direct = session.feed_range(&file_id, 16, &file_data[16..24]);
+        assert_eq!(direct.disposition(), FeedDisposition::Verified);
+        assert_eq!(direct.evidence()[0].slice_index(), 2);
+        assert!(session.is_complete());
+    }
+
+    #[test]
+    fn feed_range_distinguishes_identical_and_conflicting_overlaps() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..8u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let reserved = 4 + PARTIAL_RANGE_ACCOUNTING_BYTES;
+        let budget = VerificationMemoryBudget::new(reserved);
+        let mut session = VerificationSession::with_memory_budget(budget.clone());
+        session.add_par2_data(&parse_packets(&par2_bytes));
+
+        assert_eq!(
+            session
+                .feed_range(&file_id, 0, &file_data[..4])
+                .disposition(),
+            FeedDisposition::Buffered
+        );
+        assert_eq!(budget.buffered_bytes(), reserved);
+
+        // Repeating data already in the sparse buffer neither consumes budget
+        // again nor creates a competing slice result.
+        let duplicate = session.feed_range(&file_id, 2, &file_data[2..4]);
+        assert_eq!(duplicate.disposition(), FeedDisposition::Duplicate);
+        assert_eq!(budget.buffered_bytes(), reserved);
+
+        let mut conflicting = file_data[3..5].to_vec();
+        conflicting[0] ^= 0xFF;
+        let conflict = session.feed_range(&file_id, 3, &conflicting);
+        assert_eq!(conflict.disposition(), FeedDisposition::ConflictingOverlap);
+        assert_eq!(budget.buffered_bytes(), 0);
+        assert_eq!(conflict.settle_reads().len(), 1);
+        assert_eq!(conflict.settle_reads()[0].offset(), 0);
+        assert_eq!(conflict.settle_reads()[0].length(), slice_size);
+
+        let settled = session.feed_range(&file_id, 0, &file_data);
+        assert_eq!(settled.disposition(), FeedDisposition::Verified);
+        assert!(settled.evidence()[0].is_valid());
+    }
+
+    #[test]
+    fn feed_range_reports_metadata_and_out_of_range_input() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..8u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let mut session = VerificationSession::new();
+
+        assert_eq!(
+            session.feed_range(&file_id, 0, &file_data).disposition(),
+            FeedDisposition::MetadataPending
+        );
+
+        session.add_par2_data(&parse_packets(&par2_bytes));
+        assert_eq!(
+            session
+                .feed_range(&file_id, file_data.len() as u64, &[1])
+                .disposition(),
+            FeedDisposition::OutOfRange
+        );
+        assert_eq!(
+            session.feed_range(&file_id, u64::MAX, &[1]).disposition(),
+            FeedDisposition::OutOfRange
+        );
+    }
+
+    #[test]
+    fn feed_range_pads_a_partial_last_slice_after_arbitrary_ranges() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..13u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let mut session = VerificationSession::new();
+        session.add_par2_data(&parse_packets(&par2_bytes));
+
+        assert_eq!(
+            session
+                .feed_range(&file_id, 0, &file_data[..8])
+                .disposition(),
+            FeedDisposition::Verified
+        );
+        assert_eq!(
+            session
+                .feed_range(&file_id, 10, &file_data[10..])
+                .disposition(),
+            FeedDisposition::Buffered
+        );
+        let last = session.feed_range(&file_id, 8, &file_data[8..10]);
+        assert_eq!(last.disposition(), FeedDisposition::Verified);
+        assert_eq!(last.evidence()[0].slice_index(), 1);
+        assert!(last.evidence()[0].is_valid());
+        assert!(session.is_complete());
+    }
+
+    #[test]
+    fn shared_boundary_budget_is_released_on_settlement_and_drop() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..8u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let packets = parse_packets(&par2_bytes);
+        let reserved = 4 + PARTIAL_RANGE_ACCOUNTING_BYTES;
+        let budget = VerificationMemoryBudget::new(reserved);
+        let options = VerificationSessionOptions::new().with_memory_budget(budget.clone());
+        let mut first = VerificationSession::with_options(options.clone());
+        let mut second = VerificationSession::with_options(options);
+        first.add_par2_data(&packets);
+        second.add_par2_data(&packets);
+
+        assert_eq!(
+            first.feed_range(&file_id, 0, &file_data[..4]).disposition(),
+            FeedDisposition::Buffered
+        );
+        assert_eq!(budget.buffered_bytes(), reserved);
+        assert_eq!(
+            second
+                .feed_range(&file_id, 0, &file_data[..4])
+                .disposition(),
+            FeedDisposition::BudgetExhausted
+        );
+
+        // An aligned full retry settles first's partial slice directly and
+        // releases its reservation before hashing.
+        assert_eq!(
+            first.feed_range(&file_id, 0, &file_data).disposition(),
+            FeedDisposition::Verified
+        );
+        assert_eq!(budget.buffered_bytes(), 0);
+        assert_eq!(
+            second
+                .feed_range(&file_id, 0, &file_data[..4])
+                .disposition(),
+            FeedDisposition::Buffered
+        );
+        assert_eq!(budget.buffered_bytes(), reserved);
+
+        drop(second);
+        assert_eq!(budget.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn fragmented_range_metadata_counts_toward_shared_budget() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..8u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let budget = VerificationMemoryBudget::new(2 + PARTIAL_RANGE_ACCOUNTING_BYTES * 2 - 1);
+        let mut session = VerificationSession::with_memory_budget(budget.clone());
+        session.add_par2_data(&parse_packets(&par2_bytes));
+
+        assert_eq!(
+            session
+                .feed_range(&file_id, 0, &file_data[..1])
+                .disposition(),
+            FeedDisposition::Buffered
+        );
+        assert_eq!(
+            session
+                .feed_range(&file_id, 2, &file_data[2..3])
+                .disposition(),
+            FeedDisposition::BudgetExhausted
+        );
+        assert_eq!(budget.buffered_bytes(), 1 + PARTIAL_RANGE_ACCOUNTING_BYTES);
+    }
+
+    #[test]
+    fn add_par2_data_merges_new_packets_without_rebuilding_an_existing_set() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..8u8).collect();
+        let (par2_bytes, _file_id, _) = build_par2_packets(&file_data, slice_size);
+        let packets = parse_packets(&par2_bytes);
+        let mut session = VerificationSession::new();
+        session.add_par2_data(&packets);
+
+        let before = Arc::as_ptr(session.par2_set.as_ref().unwrap());
+        // Re-merging an already represented main packet must keep the existing
+        // set allocation instead of rebuilding every accumulated packet.
+        session.add_par2_data(&packets[..1]);
+        assert_eq!(before, Arc::as_ptr(session.par2_set.as_ref().unwrap()));
     }
 }

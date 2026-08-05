@@ -13,7 +13,8 @@ use std::os::unix::fs::FileExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -22,7 +23,7 @@ use crate::checksum::{self, Md5State};
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
-use crate::par2_set::Par2FileSet;
+use crate::par2_set::{FileDescription, Par2FileSet};
 use crate::path::is_generated_par2_artifact_name;
 use crate::repair::{
     DEFAULT_REPAIR_MEMORY_LIMIT, RepairOptions, execute_repair_with_options,
@@ -163,7 +164,7 @@ pub struct ScanCarry {
     diagnostics: ScanDiagnostics,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CarriedFileStat {
     path: PathBuf,
     /// `(length, modified)` when the path existed as a regular file.
@@ -766,7 +767,18 @@ impl Par2Repairer {
         }))
     }
 
-    fn load_inventory(&self) -> Result<PacketInventory> {
+    pub(crate) fn load_inventory(&self) -> Result<PacketInventory> {
+        self.load_inventory_with_adjacent_recovery(true)
+    }
+
+    pub(crate) fn load_inventory_without_adjacent_recovery(&self) -> Result<PacketInventory> {
+        self.load_inventory_with_adjacent_recovery(false)
+    }
+
+    fn load_inventory_with_adjacent_recovery(
+        &self,
+        discover_adjacent_recovery: bool,
+    ) -> Result<PacketInventory> {
         if let Some(set) = self.options.file_set.clone() {
             return Ok(PacketInventory {
                 set,
@@ -845,13 +857,15 @@ impl Par2Repairer {
             }
         }
 
-        for adjacent in discover_adjacent_par2_files(&primary_par2_paths)? {
-            if seen.insert(adjacent.clone()) {
-                paths.push(PacketInputPath {
-                    path: adjacent,
-                    optional: true,
-                    purgeable: true,
-                });
+        if discover_adjacent_recovery {
+            for adjacent in discover_adjacent_par2_files(&primary_par2_paths)? {
+                if seen.insert(adjacent.clone()) {
+                    paths.push(PacketInputPath {
+                        path: adjacent,
+                        optional: true,
+                        purgeable: true,
+                    });
+                }
             }
         }
 
@@ -971,10 +985,10 @@ impl Par2Repairer {
     }
 }
 
-struct RepairState {
-    set: Par2FileSet,
-    files: Vec<SourceFileEntry>,
-    blocks: Vec<SourceBlock>,
+pub(crate) struct RepairState {
+    pub(crate) set: Par2FileSet,
+    pub(crate) files: Vec<SourceFileEntry>,
+    pub(crate) blocks: Vec<SourceBlock>,
     file_index_by_id: HashMap<FileId, usize>,
     block_index_by_file_slice: HashMap<(FileId, u32), usize>,
     hash_table: VerificationHashTable,
@@ -983,18 +997,53 @@ struct RepairState {
     discarded_recoverable_files: u32,
 }
 
-struct RepairInstall {
-    install_dir: PathBuf,
-    staged_file_ids: HashSet<FileId>,
-    bytes_copied: u64,
-    bytes_reconstructed: u64,
+pub(crate) struct RepairInstall {
+    pub(crate) install_dir: PathBuf,
+    pub(crate) staged_file_ids: HashSet<FileId>,
+    pub(crate) bytes_copied: u64,
+    pub(crate) bytes_reconstructed: u64,
+    pub(crate) validation_bytes: u64,
+}
+
+struct RepairStagingGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RepairStagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RepairStagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 struct RepairExecutionAccess {
     slice_size: u64,
     repair_paths: HashMap<FileId, PathBuf>,
     source_locations: HashMap<(FileId, u32), BlockLocation>,
+    source_blocks: HashMap<(FileId, u32), SourceBlock>,
     source_files: HashMap<PathBuf, File>,
+    source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
+    stream_validation: Mutex<HashMap<(FileId, u32), StreamSourceValidation>>,
+    validation_bytes: AtomicU64,
+}
+
+struct StreamSourceValidation {
+    next_offset: u64,
+    crc32: Option<crc32fast::Hasher>,
+    last_stripe: Option<(u64, usize, u32)>,
+    finalized: bool,
 }
 
 impl RepairExecutionAccess {
@@ -1004,6 +1053,7 @@ impl RepairExecutionAccess {
         blocks: &[SourceBlock],
         staged_file_ids: &HashSet<FileId>,
         slice_size: u64,
+        source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
     ) -> io::Result<Self> {
         let repair_paths = files
             .iter()
@@ -1019,20 +1069,133 @@ impl RepairExecutionAccess {
                     .map(|location| ((block.file_id, block.local_index), location))
             })
             .collect();
+        let source_blocks = blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .map(|block| ((block.file_id, block.local_index), block.clone()))
+            .collect();
         let source_files = source_locations
             .values()
             .map(|location| location.path.clone())
             .collect::<HashSet<_>>()
             .into_iter()
-            .map(|path| File::open(&path).map(|file| (path, file)))
+            .map(|path| {
+                File::open(&path)
+                    .map(|file| (path.clone(), file))
+                    .map_err(|_| source_changed_io(&path))
+            })
             .collect::<io::Result<HashMap<_, _>>>()?;
 
         Ok(Self {
             slice_size,
             repair_paths,
             source_locations,
+            source_blocks,
             source_files,
+            source_snapshots,
+            stream_validation: Mutex::new(HashMap::new()),
+            validation_bytes: AtomicU64::new(0),
         })
+    }
+
+    fn validation_bytes(&self) -> u64 {
+        self.validation_bytes.load(Ordering::Relaxed)
+    }
+
+    fn ensure_source_unchanged(&self, path: &Path) -> io::Result<()> {
+        let Some(snapshots) = self.source_snapshots.as_ref() else {
+            return Ok(());
+        };
+        let Some(expected) = snapshots.get(path) else {
+            return Ok(());
+        };
+        if stat_for_carry(path) == *expected {
+            Ok(())
+        } else {
+            Err(source_changed_io(path))
+        }
+    }
+
+    fn validate_source_chunk(
+        &self,
+        file_id: FileId,
+        local_slice: u32,
+        slice_offset: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let Some(expected) = self.source_blocks.get(&(file_id, local_slice)) else {
+            return Ok(());
+        };
+        let stripe_crc = checksum::crc32(data);
+        let mut states = self
+            .stream_validation
+            .lock()
+            .map_err(|_| io::Error::other("source validation state lock poisoned"))?;
+        let state =
+            states
+                .entry((file_id, local_slice))
+                .or_insert_with(|| StreamSourceValidation {
+                    next_offset: 0,
+                    crc32: Some(crc32fast::Hasher::new()),
+                    last_stripe: None,
+                    finalized: false,
+                });
+
+        if state.finalized {
+            return match state.last_stripe {
+                Some((start, len, crc))
+                    if start == slice_offset && len == data.len() && crc == stripe_crc =>
+                {
+                    Ok(())
+                }
+                _ => Err(source_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].path,
+                )),
+            };
+        }
+        if slice_offset != state.next_offset {
+            return match state.last_stripe {
+                Some((start, len, crc))
+                    if start == slice_offset && len == data.len() && crc == stripe_crc =>
+                {
+                    // A retry of the most recent streaming stripe must not be
+                    // counted twice. This occurs when a compute backend
+                    // replays a chunk after falling back to the CPU path.
+                    Ok(())
+                }
+                _ => Err(source_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].path,
+                )),
+            };
+        }
+        if state.next_offset.saturating_add(data.len() as u64) > expected.expected_len {
+            return Err(source_changed_io(
+                &self.source_locations[&(file_id, local_slice)].path,
+            ));
+        }
+        state
+            .crc32
+            .as_mut()
+            .expect("unfinalized source checksum")
+            .update(data);
+        self.validation_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        state.last_stripe = Some((slice_offset, data.len(), stripe_crc));
+        state.next_offset += data.len() as u64;
+        if state.next_offset == expected.expected_len {
+            let mut crc32 = state.crc32.take().expect("unfinalized source checksum");
+            update_crc_zeros(
+                &mut crc32,
+                self.slice_size.saturating_sub(expected.expected_len),
+            );
+            if crc32.finalize() != expected.checksum.crc32 {
+                return Err(source_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].path,
+                ));
+            }
+            state.finalized = true;
+        }
+        Ok(())
     }
 
     fn repair_path_for(&self, file_id: &FileId) -> io::Result<&Path> {
@@ -1045,6 +1208,44 @@ impl RepairExecutionAccess {
 
 impl crate::verify::FileAccess for RepairExecutionAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        if offset.is_multiple_of(self.slice_size) {
+            let local_slice = u32::try_from(offset / self.slice_size).ok();
+            if let Some((location, expected)) = local_slice.and_then(|local_slice| {
+                self.source_locations
+                    .get(&(*file_id, local_slice))
+                    .zip(self.source_blocks.get(&(*file_id, local_slice)))
+            }) && len >= expected.expected_len
+                && location.len == expected.expected_len
+            {
+                self.ensure_source_unchanged(&location.path)?;
+                let file = self.source_files.get(&location.path).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
+                })?;
+                let mut buf = vec![0u8; expected.expected_len as usize];
+                read_exact_file_at(file, &mut buf, location.offset)
+                    .map_err(|_| source_changed_io(&location.path))?;
+                let mut checksum = checksum::SliceChecksumState::new();
+                checksum.update(&buf);
+                let (crc32, md5) = checksum.finalize(Some(self.slice_size));
+                if crc32 != expected.checksum.crc32 || md5 != expected.checksum.md5 {
+                    return Err(source_changed_io(&location.path));
+                }
+                self.validation_bytes
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                let file_len = file
+                    .metadata()
+                    .ok()
+                    .map_or(location.len, |metadata| metadata.len());
+                crate::file_cache::drop_touched_file_cache(
+                    file,
+                    &location.path,
+                    file_len,
+                    location.offset,
+                    buf.len() as u64,
+                );
+                return Ok(buf);
+            }
+        }
         let mut buf = vec![0u8; len as usize];
         let read_len = self.read_file_range_into(file_id, offset, &mut buf)?;
         buf.truncate(read_len);
@@ -1061,6 +1262,7 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
             let local_slice = slice_index as u32;
             let slice_offset = offset % self.slice_size;
             if let Some(location) = self.source_locations.get(&(*file_id, local_slice)) {
+                self.ensure_source_unchanged(&location.path)?;
                 if slice_offset >= location.len {
                     return Ok(0);
                 }
@@ -1069,7 +1271,12 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                     io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
                 })?;
                 let read_offset = location.offset + slice_offset;
-                let read = read_file_at(file, &mut dst[..len], read_offset)?;
+                let read = read_file_at(file, &mut dst[..len], read_offset)
+                    .map_err(|_| source_changed_io(&location.path))?;
+                if read != len {
+                    return Err(source_changed_io(&location.path));
+                }
+                self.validate_source_chunk(*file_id, local_slice, slice_offset, &dst[..read])?;
                 let file_len = file
                     .metadata()
                     .ok()
@@ -1182,12 +1389,12 @@ fn read_exact_file_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> io::R
     Ok(())
 }
 
-struct RepairVerificationAccess {
+pub(crate) struct RepairVerificationAccess {
     paths: HashMap<FileId, PathBuf>,
 }
 
 impl RepairVerificationAccess {
-    fn new(
+    pub(crate) fn new(
         files: &[SourceFileEntry],
         install_dir: &Path,
         staged_file_ids: &HashSet<FileId>,
@@ -1281,7 +1488,87 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
 }
 
 impl RepairState {
-    fn from_set(base_dir: &Path, mut set: Par2FileSet) -> Result<Self> {
+    /// Conservative preflight estimate used before allocating the retained
+    /// block map and verification hash table.
+    pub(crate) fn estimated_retained_bytes_from_set(base_dir: &Path, set: &Par2FileSet) -> usize {
+        let recoverable_blocks = set
+            .recovery_file_ids
+            .iter()
+            .filter_map(|file_id| set.slice_checksums.get(file_id))
+            .fold(0usize, |total, checksums| {
+                total.saturating_add(checksums.len())
+            });
+        let recoverable_files = set.recovery_file_ids.len();
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of::<Par2FileSet>())
+            .saturating_add(
+                recoverable_files.saturating_mul(
+                    std::mem::size_of::<SourceFileEntry>()
+                        .saturating_add(std::mem::size_of::<(FileId, usize)>() * 2),
+                ),
+            )
+            .saturating_add(
+                recoverable_blocks.saturating_mul(
+                    std::mem::size_of::<SourceBlock>()
+                        .saturating_add(std::mem::size_of::<((FileId, u32), usize)>() * 2)
+                        .saturating_add(std::mem::size_of::<(u32, Vec<usize>)>() * 2)
+                        .saturating_add(std::mem::size_of::<usize>()),
+                ),
+            )
+            .saturating_add(
+                set.recovery_file_ids
+                    .len()
+                    .saturating_mul(std::mem::size_of::<FileId>()),
+            )
+            .saturating_add(
+                set.non_recovery_file_ids
+                    .len()
+                    .saturating_mul(std::mem::size_of::<FileId>()),
+            )
+            .saturating_add(
+                set.files
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(FileId, FileDescription)>() * 2),
+            )
+            .saturating_add(
+                set.slice_checksums
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(FileId, Vec<SliceChecksum>)>() * 2),
+            );
+
+        for description in set.files.values() {
+            bytes = bytes
+                .saturating_add(description.par2_name.len())
+                .saturating_add(description.filename.len())
+                .saturating_add(description.filename.len())
+                .saturating_add(base_dir.as_os_str().len())
+                .saturating_add(1);
+        }
+        for checksums in set.slice_checksums.values() {
+            bytes = bytes.saturating_add(
+                checksums
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SliceChecksum>()),
+            );
+        }
+        for recovery in set.recovery_slices.values() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of_val(recovery).saturating_mul(2))
+                .saturating_add(match recovery.data.as_bytes() {
+                    Some(data) => data.len(),
+                    None => recovery
+                        .data
+                        .file_span()
+                        .map_or(0, |(path, _, _)| path.as_os_str().len()),
+                });
+        }
+        if let Some(creator) = &set.creator {
+            bytes = bytes.saturating_add(creator.len());
+        }
+        bytes
+    }
+
+    pub(crate) fn from_set(base_dir: &Path, mut set: Par2FileSet) -> Result<Self> {
         let mut discarded_recovery_blocks = 0;
         let slice_size = set.slice_size;
         set.recovery_slices.retain(|_, recovery| {
@@ -1406,6 +1693,330 @@ impl RepairState {
             inconsistent_packets,
             discarded_recoverable_files,
         })
+    }
+
+    /// Conservative heap bytes that may be added when a complete source path
+    /// is cloned into the file entry and each of its block locations.
+    pub(crate) fn complete_location_path_budget(
+        &self,
+        file_id: FileId,
+        path: &Path,
+    ) -> Option<usize> {
+        let file = &self.files[*self.file_index_by_id.get(&file_id)?];
+        file.recoverable.then(|| {
+            path.as_os_str()
+                .len()
+                .saturating_mul(file.block_count.saturating_add(1))
+        })
+    }
+
+    /// Conservative heap bytes that may be added for one slice location.
+    pub(crate) fn block_location_path_budget(
+        &self,
+        file_id: FileId,
+        local_index: u32,
+        path: &Path,
+    ) -> Option<usize> {
+        self.block_index_by_file_slice
+            .contains_key(&(file_id, local_index))
+            .then_some(path.as_os_str().len())
+    }
+
+    /// Seed a complete, independently committed source. The retained-session
+    /// caller is responsible for checking its evidence before calling this;
+    /// repair-time validation still checks every byte that is later consumed.
+    pub(crate) fn seed_complete_location(&mut self, file_id: FileId, path: PathBuf) -> bool {
+        let Some(file_index) = self.file_index_by_id.get(&file_id).copied() else {
+            return false;
+        };
+        let (recoverable, safe_path, length, first_block, block_count) = {
+            let file = &self.files[file_index];
+            (
+                file.recoverable,
+                file.safe_path.clone(),
+                file.length,
+                file.first_block,
+                file.block_count,
+            )
+        };
+        if !recoverable {
+            return false;
+        }
+        let kind = if path == safe_path {
+            BlockLocationKind::Canonical
+        } else {
+            BlockLocationKind::Extra
+        };
+        self.files[file_index].complete_location = Some(BlockLocation {
+            path: path.clone(),
+            offset: 0,
+            len: length,
+            kind,
+        });
+        for block_index in first_block..first_block + block_count {
+            let block = &self.blocks[block_index];
+            self.record_block_location(
+                block_index,
+                BlockLocation {
+                    path: path.clone(),
+                    offset: block.local_index as u64 * self.set.slice_size,
+                    len: block.expected_len,
+                    kind,
+                },
+            );
+        }
+        true
+    }
+
+    /// Seed one IFSC-verified source slice. This never promotes a file to a
+    /// whole-file match: only a full committed hash may do that.
+    pub(crate) fn seed_block_location(
+        &mut self,
+        file_id: FileId,
+        local_index: u32,
+        path: PathBuf,
+    ) -> bool {
+        let Some(block_index) = self
+            .block_index_by_file_slice
+            .get(&(file_id, local_index))
+            .copied()
+        else {
+            return false;
+        };
+        let file = &self.files[*self
+            .file_index_by_id
+            .get(&file_id)
+            .expect("block file exists")];
+        let block = &self.blocks[block_index];
+        let kind = if path == file.safe_path {
+            BlockLocationKind::Canonical
+        } else {
+            BlockLocationKind::Extra
+        };
+        self.record_block_location(
+            block_index,
+            BlockLocation {
+                path,
+                offset: local_index as u64 * self.set.slice_size,
+                len: block.expected_len,
+                kind,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn invalidate_path(&mut self, path: &Path) -> bool {
+        let mut changed = false;
+        for file in &mut self.files {
+            if file
+                .complete_location
+                .as_ref()
+                .is_some_and(|location| location.path == path)
+            {
+                file.complete_location = None;
+                changed = true;
+            }
+            if file.safe_path == path {
+                file.target_exists = false;
+            }
+        }
+        for block in &mut self.blocks {
+            if block
+                .location
+                .as_ref()
+                .is_some_and(|location| location.path == path)
+            {
+                block.location = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn invalidate_all_sources(&mut self) {
+        for file in &mut self.files {
+            file.complete_location = None;
+            file.target_exists = false;
+            file.non_canonical_complete_source_count = 0;
+        }
+        for block in &mut self.blocks {
+            block.location = None;
+        }
+    }
+
+    /// Conservative accounting for memory retained by a stateful session.
+    /// File-backed recovery packets count only their owned path metadata, not
+    /// their on-disk payload; in-memory recovery packets count their bytes.
+    pub(crate) fn estimated_retained_bytes(&self) -> usize {
+        self.estimated_retained_bytes_with_set(&self.set)
+    }
+
+    pub(crate) fn estimated_retained_bytes_with_set(&self, set: &Par2FileSet) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.files
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SourceFileEntry>()),
+            )
+            .saturating_add(
+                self.blocks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SourceBlock>()),
+            )
+            .saturating_add(
+                self.file_index_by_id
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(FileId, usize)>()),
+            )
+            .saturating_add(
+                self.block_index_by_file_slice
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<((FileId, u32), usize)>()),
+            )
+            .saturating_add(
+                set.recovery_file_ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FileId>()),
+            )
+            .saturating_add(
+                set.non_recovery_file_ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FileId>()),
+            )
+            .saturating_add(
+                set.files
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(FileId, FileDescription)>()),
+            )
+            .saturating_add(
+                set.slice_checksums
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(FileId, Vec<SliceChecksum>)>()),
+            )
+            .saturating_add(self.hash_table.estimated_retained_bytes());
+        for file in &self.files {
+            bytes = bytes
+                .saturating_add(file.par2_name.capacity())
+                .saturating_add(file.safe_name.capacity())
+                .saturating_add(file.safe_path.as_os_str().len())
+                .saturating_add(
+                    file.complete_location
+                        .as_ref()
+                        .map_or(0, |location| location.path.as_os_str().len()),
+                );
+        }
+        for block in &self.blocks {
+            bytes = bytes.saturating_add(
+                block
+                    .location
+                    .as_ref()
+                    .map_or(0, |location| location.path.as_os_str().len()),
+            );
+        }
+        for recovery in set.recovery_slices.values() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of_val(recovery).saturating_mul(2))
+                .saturating_add(match recovery.data.as_bytes() {
+                    Some(data) => data.len(),
+                    None => recovery
+                        .data
+                        .file_span()
+                        .map_or(0, |(path, _, _)| path.as_os_str().len()),
+                });
+        }
+        for description in set.files.values() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of_val(description).saturating_mul(2))
+                .saturating_add(description.par2_name.capacity())
+                .saturating_add(description.filename.capacity());
+        }
+        for checksums in set.slice_checksums.values() {
+            bytes = bytes.saturating_add(
+                checksums
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SliceChecksum>()),
+            );
+        }
+        if let Some(creator) = &set.creator {
+            bytes = bytes.saturating_add(creator.capacity());
+        }
+        bytes
+    }
+
+    fn sources_resolved(&self) -> bool {
+        self.files
+            .iter()
+            .filter(|file| file.recoverable)
+            .all(|file| {
+                file.complete_location.is_some()
+                    || (file.block_count == file.expected_block_count
+                        && (0..file.block_count)
+                            .all(|local| self.blocks[file.first_block + local].location.is_some()))
+            })
+    }
+
+    /// Scan only files that do not already have committed whole-file or
+    /// per-slice evidence. This is deliberately separate from `scan`, which
+    /// remains the one-shot scanner and preserves its existing behaviour.
+    pub(crate) fn scan_unresolved(
+        &mut self,
+        options: &Par2RepairerOptions,
+    ) -> Result<ScanDiagnostics> {
+        let mut diagnostics = ScanDiagnostics::default();
+        let mut canonical_candidates = self
+            .files
+            .iter()
+            .filter(|file| file.recoverable && file.complete_location.is_none())
+            .filter(|file| {
+                file.block_count == 0
+                    || (0..file.block_count)
+                        .any(|local| self.blocks[file.first_block + local].location.is_none())
+            })
+            .map(|file| ScanCandidate {
+                path: file.safe_path.clone(),
+                kind: BlockLocationKind::Canonical,
+            })
+            .collect::<Vec<_>>();
+        canonical_candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        canonical_candidates.dedup_by(|left, right| left.path == right.path);
+        self.scan_candidates(options, &canonical_candidates, &mut diagnostics)?;
+
+        self.refresh_file_states();
+        if self.sources_resolved() {
+            return Ok(diagnostics);
+        }
+
+        let source_file_keys: HashSet<PathBuf> = self
+            .files
+            .iter()
+            .map(|file| canonical_extra_path(&file.safe_path))
+            .collect();
+        let mut extra_candidates = BTreeMap::new();
+        for path in discover_candidate_files(&options.base_dir)? {
+            extra_candidates
+                .entry(canonical_extra_path(&path))
+                .or_insert(path);
+        }
+        for path in &options.extra_paths {
+            if !has_par2_marker(path)
+                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                let canonical = canonical_extra_path(path);
+                extra_candidates.insert(canonical.clone(), canonical);
+            }
+        }
+        let extra_candidates = extra_candidates
+            .into_iter()
+            .filter_map(|(key, path)| {
+                (!source_file_keys.contains(&key)).then_some(ScanCandidate {
+                    path,
+                    kind: BlockLocationKind::Extra,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.scan_candidates(options, &extra_candidates, &mut diagnostics)?;
+        self.refresh_file_states();
+        Ok(diagnostics)
     }
 
     fn scan(&mut self, options: &Par2RepairerOptions) -> Result<ScanDiagnostics> {
@@ -1904,7 +2515,7 @@ impl RepairState {
         Some(carry.diagnostics.clone())
     }
 
-    fn verification_result(&self) -> VerificationResult {
+    pub(crate) fn verification_result(&self) -> VerificationResult {
         let mut files = Vec::new();
         let mut total_missing_blocks = 0u32;
         // Only files whose FileDesc packet is missing are truly unrepairable:
@@ -1982,7 +2593,7 @@ impl RepairState {
         }
     }
 
-    fn files_are_canonical_complete(&self) -> bool {
+    pub(crate) fn files_are_canonical_complete(&self) -> bool {
         if self.discarded_recoverable_files > 0 {
             return false;
         }
@@ -1998,13 +2609,48 @@ impl RepairState {
         })
     }
 
-    fn repair(
+    fn snapshot_repair_input_sources(&self) -> HashMap<PathBuf, CarriedFileStat> {
+        let mut snapshots = HashMap::new();
+        for file in self.files.iter().filter(|file| file.recoverable) {
+            if let Some(location) = file.complete_location.as_ref() {
+                snapshots.insert(location.path.clone(), stat_for_carry(&location.path));
+            }
+        }
+        for block in self.blocks.iter().filter(|block| block.location.is_some()) {
+            let location = block.location.as_ref().expect("location filtered above");
+            snapshots.insert(location.path.clone(), stat_for_carry(&location.path));
+        }
+        snapshots
+    }
+
+    pub(crate) fn repair(
         &self,
         options: &Par2RepairerOptions,
         verification: &VerificationResult,
     ) -> Result<RepairInstall> {
+        self.repair_inner(options, verification, false)
+    }
+
+    /// Retained sessions call this path after analysis. Every source slice is
+    /// checked against its IFSC checksum before it can enter staging or the
+    /// Reed-Solomon input stream.
+    pub(crate) fn repair_validated(
+        &self,
+        options: &Par2RepairerOptions,
+        verification: &VerificationResult,
+    ) -> Result<RepairInstall> {
+        self.repair_inner(options, verification, true)
+    }
+
+    fn repair_inner(
+        &self,
+        options: &Par2RepairerOptions,
+        verification: &VerificationResult,
+        validate_sources: bool,
+    ) -> Result<RepairInstall> {
         let install_dir = unique_repair_dir(&options.base_dir);
         fs::create_dir_all(&install_dir)?;
+        let mut staging_guard = RepairStagingGuard::new(install_dir.clone());
         let mut bytes_copied = 0u64;
         let staged_file_ids: HashSet<FileId> = self
             .files
@@ -2012,6 +2658,7 @@ impl RepairState {
             .filter(|file| file.recoverable && !self.is_canonical_complete(file))
             .map(|file| file.file_id)
             .collect();
+        let source_snapshots = validate_sources.then(|| self.snapshot_repair_input_sources());
 
         for file in self
             .files
@@ -2040,12 +2687,23 @@ impl RepairState {
                 continue;
             };
             let target = install_dir.join(&file.safe_name);
-            copy_range(&location.path, 0, &target, 0, file.length)?;
+            if validate_sources {
+                copy_complete_file_validated(
+                    file,
+                    &self.blocks[file.first_block..file.first_block + file.block_count],
+                    self.set.slice_size,
+                    &location.path,
+                    &target,
+                )?;
+            } else {
+                copy_range(&location.path, 0, &target, 0, file.length)?;
+            }
             bytes_copied += file.length;
             whole_file_copied_ids.insert(file.file_id);
         }
 
         let mut block_copy_ranges = Vec::new();
+        let mut validated_block_copies = Vec::new();
         for block in &self.blocks {
             check_cancel(options)?;
             if !staged_file_ids.contains(&block.file_id)
@@ -2060,16 +2718,18 @@ impl RepairState {
                 continue;
             };
             let target = install_dir.join(&self.files[file_idx].safe_name);
-            push_block_copy_range(
-                &mut block_copy_ranges,
-                BlockCopyRange {
-                    src: location.path.clone(),
-                    src_offset: location.offset,
-                    dst: target,
-                    dst_offset: block.local_index as u64 * self.set.slice_size,
-                    len: block.expected_len,
-                },
-            );
+            let range = BlockCopyRange {
+                src: location.path.clone(),
+                src_offset: location.offset,
+                dst: target,
+                dst_offset: block.local_index as u64 * self.set.slice_size,
+                len: block.expected_len,
+            };
+            if validate_sources {
+                validated_block_copies.push((block.clone(), range));
+            } else {
+                push_block_copy_range(&mut block_copy_ranges, range);
+            }
             bytes_copied += block.expected_len;
         }
         let copy_block_ranges = |ranges: &[BlockCopyRange]| -> Result<()> {
@@ -2085,9 +2745,17 @@ impl RepairState {
             }
             Ok(())
         };
+        let copy_validated_blocks = || -> Result<()> {
+            for (block, range) in &validated_block_copies {
+                check_cancel(options)?;
+                copy_block_range_validated(block, self.set.slice_size, range)?;
+            }
+            Ok(())
+        };
 
-        let reconstruct = || -> Result<u64> {
+        let reconstruct = || -> Result<(u64, u64)> {
             let mut bytes_reconstructed = 0u64;
+            let mut validation_bytes = 0u64;
             if verification.total_missing_blocks > 0 {
                 let mut access = RepairExecutionAccess::new(
                     install_dir.clone(),
@@ -2095,6 +2763,7 @@ impl RepairState {
                     &self.blocks,
                     &staged_file_ids,
                     self.set.slice_size,
+                    source_snapshots.clone(),
                 )?;
                 let plan =
                     plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
@@ -2117,8 +2786,9 @@ impl RepairState {
                     memory_limit: options.memory_limit,
                 };
                 execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
+                validation_bytes = access.validation_bytes();
             }
-            Ok(bytes_reconstructed)
+            Ok((bytes_reconstructed, validation_bytes))
         };
 
         // The intact block copies run serially AHEAD of reconstruction:
@@ -2129,17 +2799,23 @@ impl RepairState {
         // contention profile. The copy is not the bottleneck; keep it
         // simple and ordered.
         copy_block_ranges(&block_copy_ranges)?;
-        let bytes_reconstructed = reconstruct()?;
+        copy_validated_blocks()?;
+        let (bytes_reconstructed, reconstruction_validation_bytes) = reconstruct()?;
+        let validation_bytes = if validate_sources { bytes_copied } else { 0 }
+            .saturating_add(reconstruction_validation_bytes);
 
-        Ok(RepairInstall {
+        let repair = RepairInstall {
             install_dir,
             staged_file_ids,
             bytes_copied,
             bytes_reconstructed,
-        })
+            validation_bytes,
+        };
+        staging_guard.disarm();
+        Ok(repair)
     }
 
-    fn install_repaired_files(
+    pub(crate) fn install_repaired_files(
         &self,
         repair: &RepairInstall,
         options: &Par2RepairerOptions,
@@ -2241,7 +2917,7 @@ impl RepairState {
         install_result
     }
 
-    fn outcome(
+    pub(crate) fn outcome(
         &self,
         status: Par2RepairStatus,
         bytes_copied: u64,
@@ -2326,6 +3002,28 @@ impl VerificationHashTable {
             short_blocks,
             slice_size,
         }
+    }
+
+    fn estimated_retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.by_crc
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, Vec<usize>)>()),
+            )
+            .saturating_add(
+                self.short_blocks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            );
+        for indexes in self.by_crc.values() {
+            bytes = bytes.saturating_add(
+                indexes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            );
+        }
+        bytes
     }
 }
 
@@ -4553,6 +5251,114 @@ fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
     Ok(hasher.finalize())
 }
 
+const SOURCE_CHANGED_PREFIX: &str = "PAR2 source changed: ";
+
+fn source_changed_io(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{SOURCE_CHANGED_PREFIX}{}", path.display()),
+    )
+}
+
+fn copy_block_range_validated(
+    block: &SourceBlock,
+    slice_size: u64,
+    range: &BlockCopyRange,
+) -> io::Result<()> {
+    let mut input = File::open(&range.src).map_err(|_| source_changed_io(&range.src))?;
+    let source_len = input
+        .metadata()
+        .map_err(|_| source_changed_io(&range.src))?
+        .len();
+    if range.len != block.expected_len
+        || range
+            .src_offset
+            .checked_add(range.len)
+            .is_none_or(|end| end > source_len)
+    {
+        return Err(source_changed_io(&range.src));
+    }
+    input
+        .seek(SeekFrom::Start(range.src_offset))
+        .map_err(|_| source_changed_io(&range.src))?;
+    if let Some(parent) = range.dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new().write(true).open(&range.dst)?;
+    output.seek(SeekFrom::Start(range.dst_offset))?;
+    let mut checksum = checksum::SliceChecksumState::new();
+    let mut remaining = range.len;
+    let mut buf = vec![0u8; remaining.clamp(1, 256 * 1024) as usize];
+    while remaining > 0 {
+        let take = remaining.min(buf.len() as u64) as usize;
+        input
+            .read_exact(&mut buf[..take])
+            .map_err(|_| source_changed_io(&range.src))?;
+        output.write_all(&buf[..take])?;
+        checksum.update(&buf[..take]);
+        remaining -= take as u64;
+    }
+    output.flush()?;
+    let (crc32, md5) = checksum.finalize(Some(slice_size));
+    if crc32 != block.checksum.crc32 || md5 != block.checksum.md5 {
+        return Err(source_changed_io(&range.src));
+    }
+    Ok(())
+}
+
+fn copy_complete_file_validated(
+    file: &SourceFileEntry,
+    blocks: &[SourceBlock],
+    slice_size: u64,
+    src: &Path,
+    dst: &Path,
+) -> io::Result<()> {
+    let mut input = File::open(src).map_err(|_| source_changed_io(src))?;
+    let source_len = input.metadata().map_err(|_| source_changed_io(src))?.len();
+    if source_len != file.length {
+        return Err(source_changed_io(src));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new().write(true).open(dst)?;
+    let mut full_hash = Md5State::new();
+    let mut copied = 0u64;
+    let mut buf = vec![0u8; 256 * 1024];
+    let block_iter: Box<dyn Iterator<Item = Option<&SourceBlock>>> = if blocks.is_empty() {
+        Box::new(std::iter::once(None))
+    } else {
+        Box::new(blocks.iter().map(Some))
+    };
+    for block in block_iter {
+        let expected_len = block.map_or(file.length, |block| block.expected_len);
+        let mut remaining = expected_len;
+        let mut slice_checksum = checksum::SliceChecksumState::new();
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            input
+                .read_exact(&mut buf[..take])
+                .map_err(|_| source_changed_io(src))?;
+            output.write_all(&buf[..take])?;
+            full_hash.update(&buf[..take]);
+            slice_checksum.update(&buf[..take]);
+            remaining -= take as u64;
+            copied += take as u64;
+        }
+        if let Some(block) = block {
+            let (crc32, md5) = slice_checksum.finalize(Some(slice_size));
+            if crc32 != block.checksum.crc32 || md5 != block.checksum.md5 {
+                return Err(source_changed_io(src));
+            }
+        }
+    }
+    output.flush()?;
+    if copied != file.length || full_hash.finalize() != file.hash_full {
+        return Err(source_changed_io(src));
+    }
+    Ok(())
+}
+
 fn copy_range(
     src: &Path,
     src_offset: u64,
@@ -4796,6 +5602,194 @@ mod tests {
 
     #[cfg(feature = "slow-tests")]
     use std::ffi::OsStr;
+
+    #[test]
+    fn armed_repair_staging_guard_removes_failed_output() {
+        let dir = tempdir().unwrap();
+        let staging = dir.path().join(".weaver-par2-repair-test");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial.bin"), b"partial").unwrap();
+
+        drop(RepairStagingGuard::new(staging.clone()));
+
+        assert!(!staging.exists());
+    }
+
+    fn rewrite_same_size_and_restore_mtime(path: &Path, replacement: &[u8]) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), replacement.len() as u64);
+        fs::write(path, replacement).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    }
+
+    fn validated_source_block(file_id: FileId, path: &Path, expected: &[u8]) -> SourceBlock {
+        let mut state = SliceChecksumState::new();
+        state.update(expected);
+        let (crc32, md5) = state.finalize(Some(expected.len() as u64));
+        SourceBlock {
+            global_index: 0,
+            file_id,
+            local_index: 0,
+            expected_len: expected.len() as u64,
+            checksum: SliceChecksum { crc32, md5 },
+            location: Some(BlockLocation {
+                path: path.to_path_buf(),
+                offset: 0,
+                len: expected.len() as u64,
+                kind: BlockLocationKind::Canonical,
+            }),
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_same_size_source_change_with_restored_mtime() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let expected = b"good";
+        fs::write(&source, expected).unwrap();
+        let snapshot = HashMap::from([(source.clone(), stat_for_carry(&source))]);
+        let file_id = FileId::from_bytes([0x41; 16]);
+        let block = validated_source_block(file_id, &source, expected);
+        rewrite_same_size_and_restore_mtime(&source, b"evil");
+        assert_eq!(stat_for_carry(&source), snapshot[&source]);
+        let access = RepairExecutionAccess::new(
+            dir.path().join("staging"),
+            &[],
+            &[block],
+            &HashSet::new(),
+            expected.len() as u64,
+            Some(snapshot),
+        )
+        .unwrap();
+
+        let error =
+            crate::verify::FileAccess::read_file_range(&access, &file_id, 0, expected.len() as u64)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!dir.path().join("installed.bin").exists());
+    }
+
+    #[test]
+    fn streaming_short_slice_pads_crc_and_accepts_one_stripe_replay() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("short.bin");
+        let payload = b"tail";
+        fs::write(&source, payload).unwrap();
+        let file_id = FileId::from_bytes([0x44; 16]);
+        let mut checksum = SliceChecksumState::new();
+        checksum.update(payload);
+        let (crc32, md5) = checksum.finalize(Some(8));
+        let block = SourceBlock {
+            global_index: 0,
+            file_id,
+            local_index: 0,
+            expected_len: payload.len() as u64,
+            checksum: SliceChecksum { crc32, md5 },
+            location: Some(BlockLocation {
+                path: source,
+                offset: 0,
+                len: payload.len() as u64,
+                kind: BlockLocationKind::Canonical,
+            }),
+        };
+        let access = RepairExecutionAccess::new(
+            dir.path().join("staging"),
+            &[],
+            &[block],
+            &HashSet::new(),
+            8,
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let mut read = vec![0u8; payload.len()];
+            assert_eq!(
+                crate::verify::FileAccess::read_file_range_into(&access, &file_id, 0, &mut read,)
+                    .unwrap(),
+                payload.len()
+            );
+            assert_eq!(read, payload);
+        }
+        assert_eq!(access.validation_bytes(), payload.len() as u64);
+    }
+
+    #[test]
+    fn whole_file_copy_rejects_same_size_source_change_and_cleans_staging() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let expected = b"whole-file";
+        fs::write(&source, expected).unwrap();
+        let file_id = FileId::from_bytes([0x42; 16]);
+        let block = validated_source_block(file_id, &source, expected);
+        let file = SourceFileEntry {
+            file_id,
+            par2_name: "installed.bin".to_owned(),
+            safe_path: dir.path().join("installed.bin"),
+            safe_name: "installed.bin".to_owned(),
+            length: expected.len() as u64,
+            hash_full: checksum::md5(expected),
+            hash_16k: checksum::md5(expected),
+            recoverable: true,
+            first_block: 0,
+            expected_block_count: 1,
+            block_count: 1,
+            target_exists: false,
+            complete_location: None,
+            non_canonical_complete_source_count: 0,
+        };
+        rewrite_same_size_and_restore_mtime(&source, b"changed!!!");
+        let staging = dir.path().join(".weaver-par2-repair-whole");
+        fs::create_dir_all(&staging).unwrap();
+        let destination = staging.join("installed.bin");
+        File::create(&destination).unwrap();
+        let guard = RepairStagingGuard::new(staging.clone());
+
+        let error = copy_complete_file_validated(
+            &file,
+            &[block],
+            expected.len() as u64,
+            &source,
+            &destination,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(guard);
+        assert!(!staging.exists());
+        assert!(!file.safe_path.exists());
+    }
+
+    #[test]
+    fn intact_block_copy_rejects_same_size_source_change_and_cleans_staging() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let expected = b"block";
+        fs::write(&source, expected).unwrap();
+        let file_id = FileId::from_bytes([0x43; 16]);
+        let block = validated_source_block(file_id, &source, expected);
+        rewrite_same_size_and_restore_mtime(&source, b"wrong");
+        let staging = dir.path().join(".weaver-par2-repair-block");
+        fs::create_dir_all(&staging).unwrap();
+        let destination = staging.join("installed.bin");
+        File::create(&destination).unwrap();
+        let range = BlockCopyRange {
+            src: source,
+            src_offset: 0,
+            dst: destination,
+            dst_offset: 0,
+            len: expected.len() as u64,
+        };
+        let guard = RepairStagingGuard::new(staging.clone());
+
+        let error = copy_block_range_validated(&block, expected.len() as u64, &range).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(guard);
+        assert!(!staging.exists());
+        assert!(!dir.path().join("installed.bin").exists());
+    }
 
     fn restore_carried_modified_time(carry: &ScanCarry, path: &Path) {
         let expected = carry

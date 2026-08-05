@@ -20,7 +20,7 @@ pub mod transpose;
 pub mod transpose512;
 
 /// JIT tier width: the AVX2 512-byte-block tier or the AVX512 1024-byte-block
-/// tier ([`codegen512`]). Consumers (weaver-par2's streaming tier) hold one of
+/// tier ([`codegen512`]). Consumers (par2-rs's streaming tier) hold one of
 /// these and use its methods so the tier plumbing stays width-generic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JitWidth {

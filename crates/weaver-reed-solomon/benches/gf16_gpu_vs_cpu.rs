@@ -1,13 +1,13 @@
 //! GPU (wgpu) vs CPU GF(2^16) mul-acc throughput over identical work.
 //!
-//! The `gf_kernel` group in weaver-par2's `par2_repair.rs` calls the CPU kernels
+//! The `gf_kernel` group in par2-rs's `par2_repair.rs` calls the CPU kernels
 //! directly and can never engage the GPU arm; `repairer_repair_workflow` engages
 //! it but is dominated by staging I/O and MD5, so a GPU delta drowns there. This
 //! bench isolates the one computation both arms actually perform:
 //! `dst[j] ^= factor(j, s) * src[s]` for every output `j` and source `s`.
 //!
-//! It lives in this crate rather than weaver-par2 because it only exercises
-//! `gf_simd` + `wgpu_gf16`, while weaver-par2's dev-dependencies drag in
+//! It lives in this crate rather than par2-rs because it only exercises
+//! `gf_simd` + `wgpu_gf16`, while par2-rs's dev-dependencies drag in
 //! `aws-lc-sys` (cmake + NASM), absent on some GPU test hosts.
 //!
 //! Whether the arm is worth engaging is a property of the HOST, so read the
@@ -27,7 +27,7 @@
 //! - Factors are all >= 2, so every lane exercises a real GF multiply rather
 //!   than the `factor == 1` plain-XOR shortcut.
 //!
-//! Run: `cargo bench -p weaver-reed-solomon --features wgpu --bench gf16_gpu_vs_cpu`
+//! Run: `cargo bench -p reedsolomon-rs --features wgpu --bench gf16_gpu_vs_cpu`
 //! Pick a backend with `WGPU_BACKEND=vulkan|dx12|metal`; on Linux pin a specific
 //! Vulkan device with `VK_DRIVER_FILES=<icd.json>` (e.g. to keep wgpu off the
 //! llvmpipe software rasterizer, whose numbers mean nothing).
@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rayon::prelude::*;
-use weaver_reed_solomon::gf_simd::{FactorSrc, mul_acc_input_batch};
-use weaver_reed_solomon::wgpu_gf16::WgpuGf16Session;
+use reedsolomon_rs::gf_simd::{FactorSrc, mul_acc_input_batch};
+use reedsolomon_rs::wgpu_gf16::WgpuGf16Session;
 
 /// Recovery rows computed per pass (a typical repair fan-out).
 const OUTPUTS: usize = 16;

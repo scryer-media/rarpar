@@ -1927,6 +1927,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "par2-rs"
+version = "0.2.4"
+dependencies = [
+ "aws-lc-sys",
+ "bytes",
+ "crc32fast",
+ "criterion",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "unrar-rs",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2134,14 +2154,14 @@ name = "rarpar"
 version = "0.2.5"
 dependencies = [
  "clap",
+ "par2-rs",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "weaver-par2",
- "weaver-unrar",
+ "unrar-rs",
 ]
 
 [[package]]
@@ -2200,6 +2220,20 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.2.3"
+dependencies = [
+ "criterion",
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "pollster",
+ "rayon",
+ "wgpu",
 ]
 
 [[package]]
@@ -2773,6 +2807,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
+name = "unrar-rs"
+version = "0.3.1"
+dependencies = [
+ "aes",
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "blake2s_simd",
+ "cbc",
+ "crc32fast",
+ "criterion",
+ "filetime",
+ "hmac",
+ "libc",
+ "memchr",
+ "rayon",
+ "reedsolomon-rs",
+ "rmp-serde",
+ "serde",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "wasmtime",
+ "wasmtime-wasi",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3278,72 +3344,6 @@ dependencies = [
  "log",
  "once_cell",
  "pkg-config",
-]
-
-[[package]]
-name = "weaver-par2"
-version = "0.2.4"
-dependencies = [
- "aws-lc-sys",
- "bytes",
- "crc32fast",
- "criterion",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "weaver-reed-solomon",
- "weaver-unrar",
-]
-
-[[package]]
-name = "weaver-reed-solomon"
-version = "0.2.3"
-dependencies = [
- "criterion",
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "pollster",
- "rayon",
- "wgpu",
-]
-
-[[package]]
-name = "weaver-unrar"
-version = "0.3.1"
-dependencies = [
- "aes",
- "aws-lc-rs",
- "aws-lc-sys",
- "blake2s_simd",
- "cbc",
- "crc32fast",
- "criterion",
- "filetime",
- "hmac",
- "libc",
- "memchr",
- "rayon",
- "rmp-serde",
- "serde",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "wasmtime",
- "wasmtime-wasi",
- "weaver-reed-solomon",
- "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]

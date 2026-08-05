@@ -288,8 +288,8 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
 
 fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
-    require_feature(metadata, "weaver-par2", "native-crypto")?;
-    require_feature(metadata, "weaver-unrar", "crypto-aws-lc")?;
+    require_feature(metadata, "par2-rs", "native-crypto")?;
+    require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
 
     let aws_lc_versions = resolved_package_versions(metadata, "aws-lc-sys");
     if aws_lc_versions.len() != 1 {
@@ -332,7 +332,7 @@ fn assert_metal(metadata: &CargoMetadata, target: &str) -> Result<()> {
             "Metal policy is only valid for aarch64-apple-darwin, got {target}"
         ));
     }
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
         require_feature(metadata, package, "metal")?;
         reject_feature(metadata, package, "wgpu")?;
     }
@@ -352,7 +352,7 @@ fn assert_wgpu(metadata: &CargoMetadata, target: &str) -> Result<()> {
     if !WGPU_TARGETS.contains(&target) {
         return fail(format!("wgpu policy is not supported for target {target}"));
     }
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
         require_feature(metadata, package, "wgpu")?;
         reject_feature(metadata, package, "metal")?;
     }
@@ -361,7 +361,7 @@ fn assert_wgpu(metadata: &CargoMetadata, target: &str) -> Result<()> {
 }
 
 fn reject_gpu_features(metadata: &CargoMetadata) -> Result<()> {
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
         reject_feature(metadata, package, "metal")?;
         reject_feature(metadata, package, "wgpu")?;
     }
@@ -680,7 +680,7 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
     )?;
     copy_into_root(
         out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.weaver-unrar"),
+        Path::new("usr/share/licenses/rarpar/LICENSE.unrar-rs"),
         &root.join("crates/weaver-unrar/LICENSE"),
         0o644,
     )?;
@@ -775,7 +775,7 @@ fn validate_package_root(root: &Path) -> Result<()> {
         "usr/share/doc/rarpar/README.md",
         "usr/share/licenses/rarpar/LICENSE",
         "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-        "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
+        "usr/share/licenses/rarpar/LICENSE.unrar-rs",
     ] {
         let path = root.join(relative);
         if !path.is_file() {
@@ -953,10 +953,10 @@ Zsh completion script.
 Fish completion script.
 .SH LICENSE
 \fBrarpar\fR source is GPL-3.0-or-later. Normal binary builds link
-\fBweaver-unrar\fR, so distributed \fBrarpar\fR binaries also carry the
+\fBunrar-rs\fR, so distributed \fBrarpar\fR binaries also carry the
 additional UnRAR source-code restriction for RAR extraction and recovery code.
 Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
-\fBLICENSE.weaver-unrar\fR.
+\fBLICENSE.unrar-rs\fR.
 "#;
 
 #[cfg(test)]
@@ -1066,7 +1066,7 @@ mod tests {
             "usr/share/doc/rarpar/README.md",
             "usr/share/licenses/rarpar/LICENSE",
             "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-            "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
+            "usr/share/licenses/rarpar/LICENSE.unrar-rs",
         ] {
             assert!(out.join(relative).is_file(), "missing {relative}");
         }
@@ -1102,18 +1102,18 @@ mod tests {
                 version: "0.2.5".to_owned(),
             },
             CargoPackage {
-                id: "weaver-par2".to_owned(),
-                name: "weaver-par2".to_owned(),
+                id: "par2-rs".to_owned(),
+                name: "par2-rs".to_owned(),
                 version: "0.2.3".to_owned(),
             },
             CargoPackage {
-                id: "weaver-unrar".to_owned(),
-                name: "weaver-unrar".to_owned(),
+                id: "unrar-rs".to_owned(),
+                name: "unrar-rs".to_owned(),
                 version: "0.3.1".to_owned(),
             },
             CargoPackage {
-                id: "weaver-reed-solomon".to_owned(),
-                name: "weaver-reed-solomon".to_owned(),
+                id: "reedsolomon-rs".to_owned(),
+                name: "reedsolomon-rs".to_owned(),
                 version: "0.2.3".to_owned(),
             },
         ];
@@ -1123,15 +1123,15 @@ mod tests {
                 features: vec!["runtime".to_owned()],
             },
             CargoNode {
-                id: "weaver-par2".to_owned(),
+                id: "par2-rs".to_owned(),
                 features: vec!["native-crypto".to_owned()],
             },
             CargoNode {
-                id: "weaver-unrar".to_owned(),
+                id: "unrar-rs".to_owned(),
                 features: vec!["crypto-aws-lc".to_owned()],
             },
             CargoNode {
-                id: "weaver-reed-solomon".to_owned(),
+                id: "reedsolomon-rs".to_owned(),
                 features: Vec::new(),
             },
         ];
@@ -1153,10 +1153,7 @@ mod tests {
             GpuPolicy::None => {}
             GpuPolicy::Metal => {
                 for node in &mut nodes {
-                    if matches!(
-                        node.id.as_str(),
-                        "rarpar" | "weaver-par2" | "weaver-reed-solomon"
-                    ) {
+                    if matches!(node.id.as_str(), "rarpar" | "par2-rs" | "reedsolomon-rs") {
                         node.features.push("metal".to_owned());
                     }
                 }
@@ -1172,10 +1169,7 @@ mod tests {
             }
             GpuPolicy::Wgpu => {
                 for node in &mut nodes {
-                    if matches!(
-                        node.id.as_str(),
-                        "rarpar" | "weaver-par2" | "weaver-reed-solomon"
-                    ) {
+                    if matches!(node.id.as_str(), "rarpar" | "par2-rs" | "reedsolomon-rs") {
                         node.features.push("wgpu".to_owned());
                     }
                 }

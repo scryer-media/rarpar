@@ -1,5 +1,5 @@
 [package]
-name = "weaver-unrar"
+name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 version = "0.3.1"
 edition.workspace = true
@@ -46,7 +46,7 @@ native-crypto = ["crypto-aws-lc"]
 slow-tests = []
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
+reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }

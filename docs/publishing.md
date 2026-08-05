@@ -4,9 +4,9 @@ Initial external package version: `0.1.0`.
 
 Publish order:
 
-1. `weaver-reed-solomon`
-2. `weaver-unrar`
-3. `weaver-par2`
+1. `reedsolomon-rs`
+2. `unrar-rs`
+3. `par2-rs`
 
 `rarpar` is a CLI binary and is not published to crates.io. It has its own
 binary release cycle, independent of the library crate publish cycle.
@@ -20,19 +20,19 @@ Before publishing:
 rtk cargo fmt --check --all
 rtk cargo clippy --locked --workspace --all-targets -- -D warnings
 rtk cargo test --locked --workspace --no-fail-fast
-rtk cargo package --locked -p weaver-reed-solomon
-rtk cargo package --locked --no-verify -p weaver-unrar
-rtk cargo package --locked --no-verify -p weaver-par2
-rtk cargo package --locked --list -p weaver-reed-solomon
-rtk cargo package --locked --list -p weaver-unrar
-rtk cargo package --locked --list -p weaver-par2
+rtk cargo package --locked -p reedsolomon-rs
+rtk cargo package --locked --no-verify -p unrar-rs
+rtk cargo package --locked --no-verify -p par2-rs
+rtk cargo package --locked --list -p reedsolomon-rs
+rtk cargo package --locked --list -p unrar-rs
+rtk cargo package --locked --list -p par2-rs
 ```
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
 workflow accepts `package=all` for coordinated releases or one publishable crate
 name for a patch release. Coordinated publishes derive every crate's version
-from its manifest, so packages such as `weaver-unrar` may advance independently
-of `weaver-reed-solomon` and `weaver-par2`; the `version` input is required only
+from its manifest, so packages such as `unrar-rs` may advance independently
+of `reedsolomon-rs` and `par2-rs`; the `version` input is required only
 for a single-crate publish. The `all` path publishes in the order above so each
 downstream package can be verified by `cargo publish` after its internal
 dependency is visible in the crates.io index.

@@ -10,9 +10,9 @@ on:
         type: choice
         options:
           - all
-          - weaver-reed-solomon
-          - weaver-unrar
-          - weaver-par2
+          - reedsolomon-rs
+          - unrar-rs
+          - par2-rs
       version:
         description: Version for a single-crate publish. Coordinated publishes derive each crate version from its manifest.
         required: false
@@ -102,9 +102,9 @@ jobs:
           expected = os.environ["EXPECTED_VERSION"].strip()
           selected_package = os.environ["PUBLISH_PACKAGE"]
           publishable = {
-              "weaver-reed-solomon",
-              "weaver-unrar",
-              "weaver-par2",
+              "reedsolomon-rs",
+              "unrar-rs",
+              "par2-rs",
           }
           metadata = subprocess.check_output([
               "cargo",
@@ -174,9 +174,9 @@ jobs:
 
           manifest_for_crate() {
             case "$1" in
-              weaver-reed-solomon) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
-              weaver-unrar) echo "crates/weaver-unrar/Cargo.toml" ;;
-              weaver-par2) echo "crates/weaver-par2/Cargo.toml" ;;
+              reedsolomon-rs) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
+              unrar-rs) echo "crates/weaver-unrar/Cargo.toml" ;;
+              par2-rs) echo "crates/weaver-par2/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
           }
@@ -189,7 +189,7 @@ jobs:
           verify_fixture_exclude() {
             crate="$1"
             case "$crate" in
-              weaver-unrar|weaver-par2)
+              unrar-rs|par2-rs)
                 python3 - "$(manifest_for_crate "$crate")" "$crate" <<'PY'
           import pathlib
           import sys
@@ -219,30 +219,30 @@ jobs:
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
-            if [ "$crate" = weaver-unrar ]; then
+            if [ "$crate" = unrar-rs ]; then
               grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
             fi
             exact_packaged_crates="${exact_packaged_crates} ${crate}"
           }
 
           if [ "$PUBLISH_PACKAGE" = all ]; then
-            reed_solomon_version="$(crate_version weaver-reed-solomon)"
-            unrar_version="$(crate_version weaver-unrar)"
-            package_and_list weaver-reed-solomon
+            reed_solomon_version="$(crate_version reedsolomon-rs)"
+            unrar_version="$(crate_version unrar-rs)"
+            package_and_list reedsolomon-rs
 
-            if registry_has_version weaver-reed-solomon "$reed_solomon_version"; then
-              package_and_list weaver-unrar
+            if registry_has_version reedsolomon-rs "$reed_solomon_version"; then
+              package_and_list unrar-rs
             else
-              echo "weaver-unrar exact package check deferred until weaver-reed-solomon@$reed_solomon_version is published"
-              verify_fixture_exclude weaver-unrar
+              echo "unrar-rs exact package check deferred until reedsolomon-rs@$reed_solomon_version is published"
+              verify_fixture_exclude unrar-rs
             fi
 
-            if registry_has_version weaver-reed-solomon "$reed_solomon_version" \
-              && registry_has_version weaver-unrar "$unrar_version"; then
-              package_and_list weaver-par2
+            if registry_has_version reedsolomon-rs "$reed_solomon_version" \
+              && registry_has_version unrar-rs "$unrar_version"; then
+              package_and_list par2-rs
             else
-              echo "weaver-par2 exact package check deferred until same-release dependencies are published"
-              verify_fixture_exclude weaver-par2
+              echo "par2-rs exact package check deferred until same-release dependencies are published"
+              verify_fixture_exclude par2-rs
             fi
           else
             package_and_list "$PUBLISH_PACKAGE"
@@ -257,9 +257,9 @@ jobs:
           import sys
 
           limits = {
-              "weaver-reed-solomon": 1_000_000,
-              "weaver-unrar": 2_500_000,
-              "weaver-par2": 2_500_000,
+              "reedsolomon-rs": 1_000_000,
+              "unrar-rs": 2_500_000,
+              "par2-rs": 2_500_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}
@@ -376,7 +376,7 @@ jobs:
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
-            if [ "$crate" = weaver-unrar ]; then
+            if [ "$crate" = unrar-rs ]; then
               grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
             fi
 
@@ -388,9 +388,9 @@ jobs:
 
           crate = sys.argv[1]
           limits = {
-              "weaver-reed-solomon": 1_000_000,
-              "weaver-unrar": 2_500_000,
-              "weaver-par2": 2_500_000,
+              "reedsolomon-rs": 1_000_000,
+              "unrar-rs": 2_500_000,
+              "par2-rs": 2_500_000,
           }
           metadata = json.loads(
               subprocess.check_output([
@@ -460,7 +460,7 @@ jobs:
           }
 
           if [ "$PUBLISH_PACKAGE" = all ]; then
-            crates="weaver-reed-solomon weaver-unrar weaver-par2"
+            crates="reedsolomon-rs unrar-rs par2-rs"
           else
             crates="$PUBLISH_PACKAGE"
           fi

@@ -107,9 +107,9 @@ jobs:
           ])
           packages = json.loads(metadata)["packages"]
           required = {
-              "weaver-reed-solomon",
-              "weaver-unrar",
-              "weaver-par2",
+              "reedsolomon-rs",
+              "unrar-rs",
+              "par2-rs",
               "rarpar",
           }
           selected = {
@@ -151,8 +151,8 @@ jobs:
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           expected_requirements = {
-              "weaver-par2": "^0.2.3",
-              "weaver-unrar": "^0.3.1",
+              "par2-rs": "^0.2.3",
+              "unrar-rs": "^0.3.1",
           }
           for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)
@@ -178,7 +178,7 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in expected_requirements
           }
-          expected_versions = {"weaver-par2": "0.2.3", "weaver-unrar": "0.3.1"}
+          expected_versions = {"par2-rs": "0.2.3", "unrar-rs": "0.3.1"}
           if resolved != expected_versions:
               print(
                   f"packaged rarpar resolved {resolved}, expected {expected_versions}",
@@ -429,7 +429,7 @@ jobs:
               package for package in metadata["packages"] if package["name"] == "rarpar"
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("weaver-par2", "weaver-unrar"):
+          for name in ("par2-rs", "unrar-rs"):
               dep = dependencies.get(name)
               if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
@@ -461,7 +461,7 @@ jobs:
               package for package in metadata["packages"] if package["name"] == "rarpar"
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("weaver-par2", "weaver-unrar"):
+          for name in ("par2-rs", "unrar-rs"):
               dep = dependencies.get(name)
               if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
@@ -556,7 +556,7 @@ jobs:
           cp README.md package/
           cp tools/rarpar/LICENSE package/LICENSE
           cp LICENSE package/LICENSE.GPL-3.0-or-later
-          cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
+          cp crates/weaver-unrar/LICENSE package/LICENSE.unrar-rs
           cp -R target/dist/docs/share package/share
           tar -czf "$archive" -C package .
           mv "$archive" dist/
@@ -572,7 +572,7 @@ jobs:
           Copy-Item README.md package\
           Copy-Item tools\rarpar\LICENSE package\LICENSE
           Copy-Item LICENSE package\LICENSE.GPL-3.0-or-later
-          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
+          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.unrar-rs
           Copy-Item target\dist\docs\share package\share -Recurse
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\
@@ -865,7 +865,7 @@ jobs:
               if File.exist?("LICENSE.GPL-3.0-or-later")
                 pkgshare.install "LICENSE.GPL-3.0-or-later"
               end
-              pkgshare.install "LICENSE.weaver-unrar" if File.exist?("LICENSE.weaver-unrar")
+              pkgshare.install "LICENSE.unrar-rs" if File.exist?("LICENSE.unrar-rs")
             end
 
             test do

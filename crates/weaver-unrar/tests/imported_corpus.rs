@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crc32fast::hash as crc32;
 use tempfile::TempDir;
-use weaver_unrar::{ArchiveFormat, ExtractOptions, FileHash, RarArchive, ReadSeek, UnixOwnerInfo};
+use unrar_rs::{ArchiveFormat, ExtractOptions, FileHash, RarArchive, ReadSeek, UnixOwnerInfo};
 
 const LIBARCHIVE_PASSWORD: &str = "password";
 const GENERATED_FIXTURE_PASSWORD: &str = "testpass123";
@@ -482,7 +482,7 @@ struct TechnicalEntry {
     version: Option<u64>,
 }
 
-fn member_listing_name(member: &weaver_unrar::MemberInfo) -> String {
+fn member_listing_name(member: &unrar_rs::MemberInfo) -> String {
     if let Some(version) = member.version {
         let suffix = format!(";{version}");
         if member.name.ends_with(&suffix) {
@@ -495,14 +495,14 @@ fn member_listing_name(member: &weaver_unrar::MemberInfo) -> String {
     }
 }
 
-fn member_listing_kind(member: &weaver_unrar::MemberInfo) -> &'static str {
+fn member_listing_kind(member: &unrar_rs::MemberInfo) -> &'static str {
     if member.is_hardlink {
         "Hard link"
     } else if member.is_file_copy {
         "File reference"
     } else if member.is_symlink {
         match member.host_os {
-            weaver_unrar::HostOs::Windows => "Windows symbolic link",
+            unrar_rs::HostOs::Windows => "Windows symbolic link",
             _ => "Unix symbolic link",
         }
     } else if member.is_directory {
@@ -512,31 +512,31 @@ fn member_listing_kind(member: &weaver_unrar::MemberInfo) -> &'static str {
     }
 }
 
-fn member_listing_host_os(member: &weaver_unrar::MemberInfo) -> Option<String> {
+fn member_listing_host_os(member: &unrar_rs::MemberInfo) -> Option<String> {
     match member.host_os {
-        weaver_unrar::HostOs::Windows => Some("Windows".to_string()),
-        weaver_unrar::HostOs::Unix => Some("Unix".to_string()),
-        weaver_unrar::HostOs::Darwin => match member.compression.format {
+        unrar_rs::HostOs::Windows => Some("Windows".to_string()),
+        unrar_rs::HostOs::Unix => Some("Unix".to_string()),
+        unrar_rs::HostOs::Darwin => match member.compression.format {
             ArchiveFormat::Rar4 | ArchiveFormat::Rar14 => Some("Mac OS".to_string()),
             ArchiveFormat::Rar5 => Some("Unix".to_string()),
         },
-        weaver_unrar::HostOs::Unknown(_) => None,
+        unrar_rs::HostOs::Unknown(_) => None,
     }
 }
 
 fn try_weaver_bare_list_names(
     paths: &[PathBuf],
     password: Option<&str>,
-) -> weaver_unrar::RarResult<Vec<String>> {
+) -> unrar_rs::RarResult<Vec<String>> {
     let readers: Vec<Box<dyn ReadSeek>> = paths
         .iter()
         .map(|path| {
             Ok(
-                Box::new(std::fs::File::open(path).map_err(weaver_unrar::RarError::Io)?)
+                Box::new(std::fs::File::open(path).map_err(unrar_rs::RarError::Io)?)
                     as Box<dyn ReadSeek>,
             )
         })
-        .collect::<weaver_unrar::RarResult<_>>()?;
+        .collect::<unrar_rs::RarResult<_>>()?;
     let mut archive = RarArchive::open_volumes(readers)?;
     if let Some(password) = password {
         archive.set_password(password);
@@ -552,16 +552,16 @@ fn try_weaver_bare_list_names(
 fn try_weaver_technical_entries(
     paths: &[PathBuf],
     password: Option<&str>,
-) -> weaver_unrar::RarResult<Vec<TechnicalEntry>> {
+) -> unrar_rs::RarResult<Vec<TechnicalEntry>> {
     let readers: Vec<Box<dyn ReadSeek>> = paths
         .iter()
         .map(|path| {
             Ok(
-                Box::new(std::fs::File::open(path).map_err(weaver_unrar::RarError::Io)?)
+                Box::new(std::fs::File::open(path).map_err(unrar_rs::RarError::Io)?)
                     as Box<dyn ReadSeek>,
             )
         })
-        .collect::<weaver_unrar::RarResult<_>>()?;
+        .collect::<unrar_rs::RarResult<_>>()?;
     let mut archive = RarArchive::open_volumes(readers)?;
     if let Some(password) = password {
         archive.set_password(password);

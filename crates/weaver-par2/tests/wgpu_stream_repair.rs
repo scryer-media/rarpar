@@ -9,7 +9,7 @@
 
 #![cfg(feature = "wgpu")]
 
-use weaver_par2::{
+use par2_rs::{
     FileAccess, MemoryFileAccess, RepairOptions, Repairability, execute_repair_with_options,
     plan_repair, verify_all,
 };
