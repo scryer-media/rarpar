@@ -22,7 +22,10 @@
 //! be decrypted before they are anyone's data. The layout says so in the type
 //! system: [`MemberEligibility::EncryptedStore`] carries the key material the
 //! headers state, and the bytes map as [`MappedSlice::EncryptedMember`], never
-//! as [`MappedSlice::Member`].
+//! as [`MappedSlice::Member`]. RAR5 (AES-256, IV in the header) and RAR4
+//! (AES-128, IV out of the KDF) are both classified, and [`MemberKeying`] is
+//! which — the pre-AES RAR4 ciphers are not, because their streams obey neither
+//! the CBC random-access rule nor the `align16` one.
 //!
 //! This module classifies facts and nothing else. Budgets, tolerances, group
 //! merging, password handling and the decision to route or demote belong to the
@@ -49,6 +52,26 @@ const AES_BLOCK: u64 = 16;
 /// the fail-closed answer such a header deserves.
 fn align16(unpacked_size: u64) -> Option<u64> {
     unpacked_size.checked_next_multiple_of(AES_BLOCK)
+}
+
+/// Whether a RAR4-family part encrypts with AES-128-CBC ("RAR 3.0"
+/// encryption) rather than with one of the three legacy ciphers.
+///
+/// The selection rule is the format's, and this **delegates** to the same call
+/// the extraction path makes — [`crate::rar4::types::Rar4EncryptionMethod::for_unpack_version`],
+/// which [`crate::archive`]'s RAR4 decryptor selection also uses — rather than
+/// restating the table. That is deliberate and load-bearing: a second copy of
+/// the version table could drift, and a classification that said AES where the
+/// extractor reached for a legacy cipher (or the reverse) is precisely the
+/// wrong-bytes hazard this predicate exists to close. The only thing stated
+/// here is the RAR 1.4 exception, which is not a version question at all: RAR
+/// 1.4 encryption is always the RAR 1.3 cipher whatever its version byte says.
+fn rar4_uses_aes(format: ArchiveFormat, unpack_version: u8) -> bool {
+    format != ArchiveFormat::Rar14
+        && matches!(
+            crate::rar4::types::Rar4EncryptionMethod::for_unpack_version(unpack_version),
+            crate::rar4::types::Rar4EncryptionMethod::Rar30
+        )
 }
 
 /// Why a member's split chain cannot be trusted.
@@ -140,10 +163,12 @@ pub enum IneligibilityReason {
         totals_final: bool,
     },
     /// At least one part is encrypted, and the member is not a plain encrypted
-    /// `Store` chain — it is also compressed or solid, or a RAR5 part claimed
-    /// encryption while stating no `FHEXTRA_CRYPT` record, so no key can be
-    /// derived for it. An encrypted `Store` member whose parts agree
-    /// classifies as [`MemberEligibility::EncryptedStore`] instead.
+    /// `Store` chain — it is also compressed or solid, or nothing can key it:
+    /// a RAR5 part claimed encryption while stating no `FHEXTRA_CRYPT` record,
+    /// or a RAR4 part selected one of the pre-AES ciphers (RAR 1.3, 1.5, 2.0),
+    /// whose streams are neither AES-CBC nor block-padded. An encrypted `Store`
+    /// member whose parts agree and whose cipher is AES classifies as
+    /// [`MemberEligibility::EncryptedStore`] instead.
     Encrypted,
     /// At least one part sets the per-member solid flag. This is the member's
     /// own flag, not the archive-level solid flag.
@@ -168,19 +193,33 @@ pub enum IneligibilityReason {
 /// password is involved, no key exists here, and whether such a member routes
 /// is the caller's decision.
 ///
-/// **What the cipher bytes are.** RAR5 encrypts a member's whole plaintext as
-/// one AES-256-CBC stream — one IV per member, carried on every part's header,
-/// with the chain running unbroken across volume boundaries — so cipher offset
-/// and member-logical offset are the same number. Split parts are *not*
-/// individually block-aligned; only the member's total is. Decrypting cipher
-/// block *N* therefore needs only cipher block *N−1*, which for the first
-/// block of a part is the tail of the previous volume's part.
+/// **What the cipher bytes are.** RAR encrypts a member's whole plaintext as
+/// one CBC stream — one IV per member, with the chain running unbroken across
+/// volume boundaries — so cipher offset and member-logical offset are the same
+/// number. Split parts are *not* individually block-aligned; only the member's
+/// total is. Decrypting cipher block *N* therefore needs only cipher block
+/// *N−1*, which for the first block of a part is the tail of the previous
+/// volume's part.
+///
+/// Both formats work this way and the `align16` rule is the same for both. What
+/// differs is the key: RAR5 is AES-256 with the IV in the header, RAR4 is
+/// AES-128 with the IV coming out of the KDF beside the key. [`Self::keying`]
+/// is the discriminant, and it is total — a member that cannot be keyed at all
+/// never reaches this state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncryptedStore {
+    /// The set's archive format, and the discriminant [`Self::keying`] reads:
+    /// it is what says whether this member's cipher stream is RAR5's AES-256 or
+    /// RAR4's AES-128, which are keyed by different derivations from different
+    /// header material.
+    pub format: ArchiveFormat,
     /// The RAR5 `FHEXTRA_CRYPT` record every part states. `None` for a RAR4
     /// member, which carries only `rar4_salt`; a RAR5 member that stated no
     /// record never reaches this state (it is
     /// [`IneligibilityReason::Encrypted`], since nothing could key it).
+    ///
+    /// Prefer [`Self::keying`] over testing this field: it says the same thing
+    /// exhaustively and names what each answer means.
     pub crypt: Option<RarVolumeMemberEncryptionFacts>,
     /// RAR4's per-file KDF salt, where the headers state one. RAR4 derives
     /// both key and IV from password plus this salt, and a header with no salt
@@ -206,9 +245,66 @@ pub struct EncryptedStore {
     pub resolved: bool,
 }
 
+/// How a member's cipher stream is keyed, as its headers state it.
+///
+/// The two formats state key material in completely different shapes, and a
+/// caller that has to derive a key needs to know which one it is holding —
+/// exhaustively, so that a third never slips past as a default. This is that
+/// discriminant, and [`EncryptedStore::keying`] is the only way to obtain one:
+/// a member reaches [`MemberEligibility::EncryptedStore`] **only** when it is
+/// keyable, so there is no "neither" variant to handle.
+///
+/// It carries no password, derives nothing and holds no secret — every field is
+/// what the archive says in the clear. The derivations it names are
+/// [`crate::KdfCache::derive_key_rar5`] and [`crate::KdfCache::derive_key_rar4`],
+/// and the cipher it selects is [`crate::crypto::MemberCipherKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKeying {
+    /// RAR5 file encryption: AES-256-CBC. The record carries the KDF salt and
+    /// iteration count, the member's IV, and an optional password-check value —
+    /// so a wrong password is refutable before a byte is decrypted.
+    Rar5(RarVolumeMemberEncryptionFacts),
+    /// RAR4/RAR3 "RAR 3.0" file encryption: AES-128-CBC. The header carries at
+    /// most this 8-byte per-file salt; **key and IV are both KDF outputs**, and
+    /// there is no password-check value at all, so a wrong password is only ever
+    /// caught by the member's checksum. A header with no salt is valid — the key
+    /// then comes from the password alone.
+    Rar4 { salt: Option<[u8; 8]> },
+}
+
 impl EncryptedStore {
+    /// How this member is keyed, and therefore which derivation and which
+    /// cipher width a caller must use for it.
+    ///
+    /// The discriminant is the **format**, not the presence of a
+    /// `FHEXTRA_CRYPT` record. A record reaches this type only from a RAR5
+    /// header, so the two agree today — but they are not the same statement,
+    /// and only one of them is safe to be wrong about: a RAR4 part that somehow
+    /// carried a record would key as `Rar5` under a record test, and a caller
+    /// would then run AES-256 with a header IV over an AES-128 stream. That is
+    /// wrong bytes, caught only by the member's CRC32 after the whole member has
+    /// been written. Reading the format instead makes a RAR4 member key as RAR4
+    /// whatever else a header carried, which is the format's own answer.
+    ///
+    /// Total by construction: a RAR5 member with no `FHEXTRA_CRYPT` record and a
+    /// RAR4 member using one of the pre-AES ciphers are both
+    /// [`IneligibilityReason::Encrypted`], so neither can reach this type — the
+    /// RAR5 half of that is stated in [`StoredLayoutBuilder::member_encryption`]
+    /// and is itself format-discriminated.
+    pub fn keying(&self) -> MemberKeying {
+        match self.crypt {
+            Some(crypt) if self.format == ArchiveFormat::Rar5 => MemberKeying::Rar5(crypt),
+            _ => MemberKeying::Rar4 {
+                salt: self.rar4_salt,
+            },
+        }
+    }
+
     /// Whether the header claims a password-check value, whether or not that
     /// value survived its own checksum.
+    ///
+    /// Always `false` for a RAR4 member: the format has no such field, so the
+    /// member's checksum gate is the only wrong-password detector there is.
     pub fn claims_password_check(&self) -> bool {
         self.crypt.is_some_and(|crypt| crypt.psw_check_present)
     }
@@ -455,7 +551,11 @@ struct MemberSnapshot {
 }
 
 impl MemberSnapshot {
-    fn from_facts(facts: &RarVolumeMemberFacts) -> Self {
+    /// `format` is the volume's, checked equal to the layout's before any
+    /// snapshot is taken. It is here for one field: the RAR4 unpack version,
+    /// which is only a cipher selector in the RAR4 family and is not one at all
+    /// under RAR5.
+    fn from_facts(facts: &RarVolumeMemberFacts, format: ArchiveFormat) -> Self {
         Self {
             name: facts.name.clone(),
             data_offset: facts.data_offset,
@@ -478,6 +578,21 @@ impl MemberSnapshot {
                 encrypted: facts.is_encrypted,
                 crypt: facts.encryption,
                 rar4_salt: facts.rar4_salt,
+                // The field means what it is named: the RAR4 unpack version,
+                // recorded only where it selects a cipher — an encrypted part
+                // of a RAR4-family volume.
+                //
+                // Both halves of that condition are load-bearing, because this
+                // struct is compared for equality across a member's parts.
+                // Recording it for *plaintext* parts would make two parts
+                // stating different unpack versions `Mixed`, where before RAR4
+                // was keyable they simply agreed. Recording it under **RAR5**,
+                // where `compression_version` is not a cipher selector at all,
+                // would do the same to two encrypted RAR5 parts — demoting a
+                // member that RAR5 keys perfectly well off its `FHEXTRA_CRYPT`
+                // record.
+                rar4_version: (facts.is_encrypted && format.is_rar4_family())
+                    .then_some(facts.compression_version),
             },
         }
     }
@@ -493,6 +608,14 @@ struct PartEncryption {
     encrypted: bool,
     crypt: Option<RarVolumeMemberEncryptionFacts>,
     rar4_salt: Option<[u8; 8]>,
+    /// The RAR4 unpack version, which is what selects the cipher — `Some` only
+    /// on an encrypted part **of a RAR4-family volume**. RAR4 has carried four
+    /// different encryptions over its life and only the newest is AES-128-CBC;
+    /// see [`StoredLayoutBuilder::member_encryption`]. RAR5 keys off its
+    /// `FHEXTRA_CRYPT` record instead, and its version byte says nothing about
+    /// a cipher, so recording one there would only be a way for two parts of
+    /// one member to disagree.
+    rar4_version: Option<u8>,
 }
 
 /// What a member's parts agree on about encryption, read in volume order.
@@ -507,9 +630,11 @@ enum MemberEncryption {
     },
     /// Parts disagree: some encrypted and some not, or different key material.
     Mixed { volume: u32 },
-    /// Every part is encrypted and they agree, but a RAR5 header claimed
-    /// encryption while stating no `FHEXTRA_CRYPT` record, so no key can be
-    /// derived for the member at all.
+    /// Every part is encrypted and they agree, but nothing here can key them:
+    /// a RAR5 header claimed encryption while stating no `FHEXTRA_CRYPT`
+    /// record, or a RAR4 header selected one of the three pre-AES ciphers
+    /// (RAR 1.3, 1.5 and 2.0 each had their own), which are not AES-CBC, have
+    /// no `align16` rule, and cannot be handed to a router as a key plus an IV.
     Unkeyable,
 }
 
@@ -611,7 +736,7 @@ impl StoredLayoutBuilder {
         let snapshots: Vec<MemberSnapshot> = facts
             .members
             .iter()
-            .map(MemberSnapshot::from_facts)
+            .map(|member| MemberSnapshot::from_facts(member, found))
             .collect();
         if let Some(existing) = self.volumes.get(&volume) {
             return if existing.snapshots == snapshots {
@@ -959,11 +1084,13 @@ impl StoredLayoutBuilder {
             .or(inconsistent)
             .or(mixed_encryption);
 
+        let format = self.format;
         let member = &mut self.members[member_index];
         member.unpacked_size = unpacked_size;
         let eligibility = classify(
             traits,
             ChainFacts {
+                format,
                 malformed,
                 complete: chain_complete,
                 packed_total,
@@ -991,11 +1118,38 @@ impl StoredLayoutBuilder {
         if !first.encrypted {
             return MemberEncryption::Plain;
         }
-        // RAR4 states no per-file record at all — its key comes from the
-        // password and the optional salt — so only a RAR5 member is missing
-        // something when `crypt` is absent.
-        if first.crypt.is_none() && self.format == ArchiveFormat::Rar5 {
-            return MemberEncryption::Unkeyable;
+        // Keyability is a per-format question, so the format asks it — the same
+        // discriminant [`EncryptedStore::keying`] answers with. Deciding it from
+        // the presence of a `FHEXTRA_CRYPT` record instead would let one
+        // format's evidence settle the other format's question.
+        match self.format {
+            // RAR5 states its key material in the record, so a header claiming
+            // encryption without one leaves nothing to key.
+            ArchiveFormat::Rar5 => {
+                if first.crypt.is_none() {
+                    return MemberEncryption::Unkeyable;
+                }
+            }
+            // RAR4 states no per-file record at all — its key comes from the
+            // password and the optional salt — and its *cipher* is chosen by
+            // the unpack version. Only the newest one, "RAR 3.0" encryption
+            // (AES-128-CBC), is the shape this whole classification assumes:
+            // one CBC stream over the member's plaintext, padded once to a
+            // whole block. RAR 1.3 and 1.5 are stream ciphers with no padding
+            // at all and RAR 2.0 is its own block cipher, so an `align16` sum
+            // would be meaningless for them and decrypting them as AES would
+            // silently produce garbage that only the member checksum could
+            // catch. They stay ineligible — and so does a RAR4 header that
+            // somehow carried a RAR5 record, because the version is still what
+            // says which cipher wrote the bytes.
+            ArchiveFormat::Rar4 | ArchiveFormat::Rar14 => {
+                if !first
+                    .rar4_version
+                    .is_some_and(|version| rar4_uses_aes(self.format, version))
+                {
+                    return MemberEncryption::Unkeyable;
+                }
+            }
         }
         MemberEncryption::Uniform {
             crypt: first.crypt,
@@ -1118,6 +1272,10 @@ fn push_member_run(
 /// What one resolved chain states about itself, as [`classify`] reads it.
 #[derive(Debug, Clone, Copy)]
 struct ChainFacts {
+    /// The set's format, checked equal to every volume's before a fact from it
+    /// was recorded. It is what an encrypted member is keyed *as*, so it
+    /// travels with the facts rather than being re-inferred from them.
+    format: ArchiveFormat,
     malformed: Option<MalformedReason>,
     /// The chain runs from a known first part to a known last part with no
     /// unseen volume in between.
@@ -1209,6 +1367,7 @@ fn classify_stored_chain(
     let encrypted_state = |resolved: bool| {
         let (crypt, rar4_salt) = encrypted.expect("only called on the encrypted path");
         MemberEligibility::EncryptedStore(EncryptedStore {
+            format: chain.format,
             crypt,
             rar4_salt,
             cipher_size: extent,
@@ -2659,6 +2818,39 @@ mod tests {
         assert_eq!(facts.password_check(), None);
     }
 
+    #[test]
+    fn rar5_parts_disagreeing_about_the_unpack_version_are_still_one_encrypted_member() {
+        // `compression_version` selects the cipher in the RAR4 family and
+        // nothing at all under RAR5, which keys off its `FHEXTRA_CRYPT` record.
+        // Recording it as part of a RAR5 part's encryption record would make
+        // two parts that disagree about it `Mixed` — demoting a member both
+        // parts describe identically everywhere it matters.
+        let mut builder = layout();
+        let unpacked_size = 4096u64;
+        for (number, version, split_before, split_after) in
+            [(0u32, 29u8, false, true), (1, 50, true, false)]
+        {
+            let mut facts = split_part(
+                EPISODE,
+                64,
+                unpacked_size / 2,
+                unpacked_size,
+                split_before,
+                split_after,
+            );
+            facts = encrypted(facts, crypt_record());
+            facts.compression_version = version;
+            if !split_after {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            add(&mut builder, number, &volume(vec![facts]));
+        }
+
+        let store = encrypted_store(&builder, 0);
+        assert!(store.resolved, "the chain is complete and sums to align16");
+        assert_eq!(store.keying(), MemberKeying::Rar5(crypt_record()));
+    }
+
     /// Build a three-part encrypted chain summing to exactly `packed_total`.
     fn encrypted_chain(unpacked_size: u64, packed_total: u64) -> StoredLayoutBuilder {
         let head = packed_total / 3;
@@ -3092,6 +3284,7 @@ mod tests {
         facts.unpacked_size = Some(290);
         facts.is_encrypted = true;
         facts.data_crc32 = Some(0x1234_5678);
+        facts.compression_version = 29;
 
         let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
         builder
@@ -3102,6 +3295,197 @@ mod tests {
         assert_eq!(store.crypt, None);
         assert_eq!(store.rar4_salt, None);
         assert!(store.resolved);
+        assert_eq!(store.keying(), MemberKeying::Rar4 { salt: None });
+    }
+
+    /// One RAR4 encrypted `Store` member at `unpack_version`, sized so that the
+    /// chain sums to `align16(unpacked_size)`.
+    fn rar4_encrypted_member(unpacked_size: u64, unpack_version: u8) -> RarVolumeMemberFacts {
+        let cipher_size = align16(unpacked_size).expect("test sizes are small");
+        let mut facts = member(EPISODE, 100, cipher_size);
+        facts.unpacked_size = Some(unpacked_size);
+        facts.is_encrypted = true;
+        facts.rar4_salt = Some([0x9B; 8]);
+        facts.data_crc32 = Some(0x1234_5678);
+        facts.compression_version = unpack_version;
+        facts
+    }
+
+    #[test]
+    fn the_pre_aes_rar4_ciphers_stay_ineligible_rather_than_being_decrypted_as_aes() {
+        // Plan 136 E3. RAR4 has carried four encryptions and only "RAR 3.0" is
+        // AES-128-CBC. The older three obey neither of the two rules the whole
+        // encrypted-store classification rests on — a CBC chain whose block N
+        // needs only block N−1, and a total padded once to `align16` — so a
+        // router must never be handed a key for one. RAR 2.0 is the dangerous
+        // case and the reason this is a version test rather than a size test:
+        // its stream *is* block-padded, so the `align16` sum passes and nothing
+        // downstream but the member checksum would notice.
+        for version in [13u8, 15, 20, 26] {
+            let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+            builder
+                .add_volume(0, &rar4_volume(vec![rar4_encrypted_member(290, version)]))
+                .expect("volume accepted");
+            assert_eq!(
+                builder.members()[0].eligibility,
+                MemberEligibility::Ineligible(IneligibilityReason::Encrypted),
+                "unpack version {version} is not AES and must not classify as an encrypted store"
+            );
+            assert!(!builder.members()[0].eligibility.routes_direct());
+        }
+
+        // And the versions that *are* AES still classify, so the gate is a gate
+        // and not a blanket refusal.
+        for version in [29u8, 36, 50] {
+            let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+            builder
+                .add_volume(0, &rar4_volume(vec![rar4_encrypted_member(290, version)]))
+                .expect("volume accepted");
+            assert!(
+                builder.members()[0].eligibility.encrypted_store().is_some(),
+                "unpack version {version} is AES-128 and must classify"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rar14_encrypted_member_is_never_keyable_whatever_its_version_says() {
+        // RAR 1.4 predates every version-selected cipher: its encryption is
+        // always the RAR 1.3 one, so the unpack-version byte cannot be trusted
+        // to say otherwise.
+        let mut facts = rar4_encrypted_member(290, 29);
+        facts.compression_version = 29;
+        let mut volume_facts = rar4_volume(vec![facts]);
+        volume_facts.format = 14;
+
+        let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar14);
+        builder
+            .add_volume(0, &volume_facts)
+            .expect("volume accepted");
+        assert_eq!(
+            builder.members()[0].eligibility,
+            MemberEligibility::Ineligible(IneligibilityReason::Encrypted)
+        );
+    }
+
+    /// The RAR4 twin of [`encrypted_chain`]: a three-part encrypted chain
+    /// summing to exactly `packed_total`, keyed by a file salt rather than by a
+    /// `FHEXTRA_CRYPT` record.
+    fn rar4_encrypted_chain(unpacked_size: u64, packed_total: u64) -> StoredLayoutBuilder {
+        let head = packed_total / 3;
+        let middle = packed_total / 3;
+        let tail = packed_total - head - middle;
+
+        let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+        for (number, size, split_before, split_after) in [
+            (0u32, head, false, true),
+            (1, middle, true, true),
+            (2, tail, true, false),
+        ] {
+            let mut facts = split_part(EPISODE, 64, size, unpacked_size, split_before, split_after);
+            facts.is_encrypted = true;
+            facts.rar4_salt = Some([0x9B; 8]);
+            facts.compression_version = 29;
+            if !split_after {
+                facts.data_crc32 = Some(0xFEED_BEEF);
+            }
+            builder
+                .add_volume(number, &rar4_volume(vec![facts]))
+                .expect("volume accepted");
+        }
+        builder
+    }
+
+    #[test]
+    fn a_rar4_encrypted_chain_sums_to_align16_exactly_as_a_rar5_one_does() {
+        // The completeness rule is the format's, not RAR5's: RAR4 encrypts a
+        // member's whole plaintext as one CBC stream too, padded once at the
+        // end, so the same three slacks are the same three answers.
+        for (unpacked_size, slack) in [(4096u64, 0u64), (4095, 1), (4081, 15)] {
+            let cipher_size = unpacked_size + slack;
+            assert_eq!(align16(unpacked_size), Some(cipher_size), "test arithmetic");
+
+            let builder = rar4_encrypted_chain(unpacked_size, cipher_size);
+            let store = encrypted_store(&builder, 0);
+            assert!(
+                store.resolved,
+                "unpacked {unpacked_size} padded to {cipher_size} is a complete RAR4 chain"
+            );
+            assert_eq!(store.cipher_size, Some(cipher_size));
+            assert_eq!(store.tail_padding, Some(slack as u8));
+            assert_eq!(
+                store.keying(),
+                MemberKeying::Rar4 {
+                    salt: Some([0x9B; 8])
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_rar4_encrypted_chain_carrying_a_whole_extra_block_is_rejected() {
+        // The other half of the same rule, and the half a "within one block"
+        // tolerance gets wrong: `align16` of an already-aligned member adds
+        // nothing, so a chain one block longer is one block of bytes that
+        // belong to nobody. The RAR5 twin is
+        // `an_encrypted_chain_carrying_a_whole_extra_block_is_rejected`; the
+        // logic is shared, and this states that RAR4 really does reach it.
+        for (unpacked_size, cipher_size) in [(4096u64, 4096u64), (4095, 4096), (4081, 4096)] {
+            assert_eq!(align16(unpacked_size), Some(cipher_size), "test arithmetic");
+
+            let builder = rar4_encrypted_chain(unpacked_size, cipher_size + 16);
+            assert_eq!(
+                ineligible(&builder, 0),
+                IneligibilityReason::MalformedChain(MalformedReason::ExceedsDeclaredSize {
+                    packed_total: cipher_size + 16,
+                    unpacked_size,
+                }),
+                "a whole block past align16({unpacked_size}) is a mismatch even though the \
+                 slack is only 16 bytes"
+            );
+        }
+
+        // And one byte short of the padded length, which the plaintext rule
+        // would have accepted for an unencrypted member.
+        let builder = rar4_encrypted_chain(4095, 4095);
+        assert_eq!(
+            ineligible(&builder, 0),
+            IneligibilityReason::MalformedChain(MalformedReason::SizeMismatch {
+                packed_total: 4095,
+                unpacked_size: 4095,
+            })
+        );
+    }
+
+    #[test]
+    fn keying_is_the_discriminant_for_both_formats() {
+        // The surface a router dispatches on: one exhaustive answer per member,
+        // and never a `None` to fall through — a member nothing can key is
+        // `Ineligible` and cannot reach this call at all.
+        let mut rar5 = layout();
+        add(
+            &mut rar5,
+            0,
+            &volume(vec![encrypted_member(EPISODE, 100, 290)]),
+        );
+        assert_eq!(
+            encrypted_store(&rar5, 0).keying(),
+            MemberKeying::Rar5(crypt_record())
+        );
+
+        let mut rar4 = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+        rar4.add_volume(0, &rar4_volume(vec![rar4_encrypted_member(290, 29)]))
+            .expect("volume accepted");
+        assert_eq!(
+            encrypted_store(&rar4, 0).keying(),
+            MemberKeying::Rar4 {
+                salt: Some([0x9B; 8])
+            }
+        );
+        assert!(
+            !encrypted_store(&rar4, 0).claims_password_check(),
+            "RAR4 has no password-check value, so admission can never refute a password"
+        );
     }
 
     #[test]

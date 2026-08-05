@@ -229,6 +229,75 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
 ) -> RarResult<ParsedHeaders> {
+    match walk_all_headers(reader, password, kdf_cache, options)? {
+        HeaderWalk::Parsed(parsed) => Ok(parsed),
+        HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
+    }
+}
+
+/// Read a header-encrypted (`-hp`) RAR5 stream's archive encryption record
+/// **with no password**.
+///
+/// The reader should be positioned right after the RAR5 signature, exactly as
+/// for [`parse_all_headers`].
+///
+/// `-hp` withholds *layout* facts, not *keying* facts: the type-4 record is
+/// plaintext, and the walk parses it before it consults the password. This is
+/// the accessor for it — [`parse_all_headers`] discards it along with the rest
+/// of the result when it refuses.
+///
+/// - `Ok(Some(header))` — the stream is `-hp` and this is what it states.
+/// - `Ok(None)` — the walk completed without meeting a type-4 record, so the
+///   stream's headers are readable and there is nothing archive-level to key.
+///   A `-p` (file-data-only) archive answers `None`: its crypt records are
+///   per file header, not archive level.
+/// - `Err(_)` — the stream could not be walked that far, or the record itself
+///   is one this build refuses (an encryption version it does not implement, or
+///   a KDF count over [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`]). A refusal is
+///   deliberately *not* flattened into `None`: "no archive encryption" and "an
+///   archive encryption this build will not derive from" are different answers
+///   and a caller that keys from this must not conflate them.
+///
+/// Quick Open is suppressed. The cache is forgeable and this walk exists to
+/// report what the physical stream states.
+pub fn parse_header_encryption<R: Read + Seek>(
+    reader: &mut R,
+) -> RarResult<Option<encryption::EncryptionHeader>> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    let walk = walk_all_headers(
+        reader,
+        None,
+        &kdf_cache,
+        HeaderParseOptions {
+            allow_quick_open: false,
+        },
+    )?;
+    Ok(match walk {
+        HeaderWalk::HeaderEncrypted(encryption) => Some(encryption),
+        HeaderWalk::Parsed(_) => None,
+    })
+}
+
+/// Where the plaintext header walk stopped.
+///
+/// Split out of [`parse_all_headers_with_kdf_cache_and_options`] so the
+/// archive's own type-4 record can be *returned* rather than dropped on the way
+/// to `Err(EncryptedArchive)`. Nothing about the walk changes; only what the
+/// caller is allowed to see when it stops at an encryption header it has no
+/// password for.
+enum HeaderWalk {
+    Parsed(ParsedHeaders),
+    /// A type-4 archive encryption record was reached with no password. Every
+    /// header past it is ciphertext; this record is not.
+    HeaderEncrypted(encryption::EncryptionHeader),
+}
+
+fn walk_all_headers<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+) -> RarResult<HeaderWalk> {
     let mut result = empty_parsed_headers();
 
     // Parse plaintext headers until we hit an encryption header or end.
@@ -237,7 +306,7 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
             Some(raw) => raw,
             None => {
                 debug!("reached EOF while reading headers");
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
         };
 
@@ -260,7 +329,11 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
 
                 let pwd = match password {
                     Some(p) => p,
-                    None => return Err(RarError::EncryptedArchive),
+                    // The record itself is plaintext and is handed back rather
+                    // than dropped: `-hp` withholds the layout, not the keying
+                    // facts. `parse_all_headers` turns this into
+                    // `Err(EncryptedArchive)` exactly as it always did.
+                    None => return Ok(HeaderWalk::HeaderEncrypted(enc)),
                 };
 
                 if let Some(check_data) = enc.check_data
@@ -276,13 +349,13 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
                 let encrypted_result = parse_encrypted_headers(reader, &key, &mut result);
                 key.zeroize();
                 encrypted_result?;
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
             HeaderType::EndArchive => {
                 let end = end_archive::parse(&raw)?;
                 debug!("end of archive: more_volumes={}", end.more_volumes);
                 result.end = Some(end);
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
             HeaderType::MainArchive => {
                 dispatch_header(&raw, data_offset, &mut result)?;
@@ -292,7 +365,7 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
                     && let Some(quick_open) =
                         try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
                 {
-                    return Ok(quick_open);
+                    return Ok(HeaderWalk::Parsed(quick_open));
                 }
                 common::skip_data_area(reader, &raw)?;
             }
@@ -1014,6 +1087,134 @@ mod tests {
         assert!(
             cache.rar5_cached_entry_count() > 0,
             "encrypted RAR5 header parsing should populate the caller-provided KDF cache"
+        );
+    }
+
+    /// A type-4 archive encryption header, built the way a `-hp` writer does.
+    fn build_test_crypt_header(kdf_count: u8, salt: [u8; 16], check: Option<[u8; 8]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&vint::encode_vint(0)); // AES-256.
+        body.extend_from_slice(&vint::encode_vint(u64::from(check.is_some())));
+        body.push(kdf_count);
+        body.extend_from_slice(&salt);
+        if let Some(check) = check {
+            body.extend_from_slice(&check);
+            body.extend_from_slice(&crate::crypto::sha256_digest(&check)[..4]);
+        }
+        build_test_raw_header(4, 0, &body, &[], None)
+    }
+
+    /// The E4 surfacing: the type-4 record comes out with no password, and
+    /// `parse_all_headers` still refuses exactly as it did.
+    ///
+    /// Held against a synthetic header rather than only the fixture so the
+    /// *values* can be pinned: a `parse_header_encryption` that returned a
+    /// default-constructed record would pass a `.is_some()` test and fail this
+    /// one, and a caller proving password candidates against a defaulted salt
+    /// would verify the first thing it tried.
+    #[test]
+    fn header_encryption_record_is_readable_with_no_password() {
+        let salt = [0x27u8; 16];
+        let check = [0x91u8; 8];
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(11, salt, Some(check)));
+        // Whatever follows is ciphertext to a reader with no key; the walk must
+        // stop at the record above without touching it.
+        image.extend_from_slice(&[0xEE; 256]);
+
+        let mut cursor = std::io::Cursor::new(image.clone());
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let surfaced = parse_header_encryption(&mut cursor)
+            .expect("the type-4 record is plaintext")
+            .expect("a `-hp` stream states one");
+        assert_eq!(surfaced.kdf_count, 11);
+        assert_eq!(surfaced.salt, salt);
+        assert!(surfaced.has_password_check);
+        assert_eq!(
+            surfaced.check_data.map(|data| data[..8].to_vec()),
+            Some(check.to_vec())
+        );
+
+        // Unchanged behaviour for the ordinary entry point.
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(matches!(
+            parse_all_headers(&mut cursor, None),
+            Err(RarError::EncryptedArchive)
+        ));
+    }
+
+    /// A stream with no type-4 record answers `None` — the non-vacuity for the
+    /// test above, and the answer every `-p` archive gives.
+    #[test]
+    fn a_stream_without_archive_encryption_surfaces_no_record() {
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_raw_header(
+            1,
+            0,
+            &vint::encode_vint(0),
+            &[],
+            None,
+        ));
+        image.extend_from_slice(&build_test_file_header("member.bin", 0, 0));
+
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(parse_header_encryption(&mut cursor).unwrap().is_none());
+    }
+
+    /// The KDF ceiling is the crate's, and a record over it is an **error**,
+    /// never `None`.
+    ///
+    /// `lg2_count` is the archive's claim, so an unbounded one lets a hostile
+    /// post decide how much PBKDF2 a password-candidate loop runs.
+    /// [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] bounds it before the salt is
+    /// even read. Flattening the refusal to `None` would be the dangerous
+    /// shape: a caller would read it as "not header-encrypted" and keep waiting
+    /// for a layout that is never coming.
+    #[test]
+    fn an_archive_kdf_count_over_the_ceiling_refuses_rather_than_reporting_none() {
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(
+            crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX + 1,
+            [0x27; 16],
+            None,
+        ));
+
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(matches!(
+            parse_header_encryption(&mut cursor),
+            Err(RarError::UnsupportedEncryptionKdf { count, max })
+                if count == crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX + 1
+                    && max == crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX
+        ));
+
+        // At the ceiling it is accepted, so the refusal above is the bound
+        // discriminating rather than the record never parsing.
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(
+            crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX,
+            [0x27; 16],
+            None,
+        ));
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert_eq!(
+            parse_header_encryption(&mut cursor)
+                .unwrap()
+                .map(|record| record.kdf_count),
+            Some(crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX)
         );
     }
 

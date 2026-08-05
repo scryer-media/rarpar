@@ -166,7 +166,10 @@ jobs:
           git lfs install --local
           git lfs ls-files --name-only > .ci-lfs-files.txt
           test -s .ci-lfs-files.txt
-          if grep -Ev '^crates/(unrar-rs|par2-rs)/tests/fixtures/' .ci-lfs-files.txt; then
+          # Directory paths, not package names. The crates were renamed in their
+          # manifests but their directories were deliberately left in place, and
+          # every other path in this workflow reflects that.
+          if grep -Ev '^crates/(weaver-unrar|weaver-par2)/tests/fixtures/' .ci-lfs-files.txt; then
             echo "::error::unexpected Git LFS path outside fixture corpora"
             exit 1
           fi
@@ -469,6 +472,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Install the UnRAR oracle
+        run: |
+          set -euo pipefail
+
+          # RARLAB's unrar is freeware under RARLAB's own UnRAR license: free to
+          # use and redistribute, but the source may not be used to re-create
+          # the RAR compressor. It is therefore installed from Ubuntu's
+          # multiverse component at job time and never vendored into this repo.
+          # Installing it from apt keeps the oracle off any extra network
+          # surface: this job already depends on apt for mold and nasm.
+          sudo apt-get install -y --no-install-recommends unrar
+
+          unrar_bin="$(command -v unrar)"
+          # Ubuntu also carries `unrar-free`, an unrelated implementation that
+          # would be a worthless differential oracle. Refuse anything that does
+          # not identify itself as RARLAB's UnRAR.
+          banner="$("$unrar_bin" 2>&1 | head -n 5 || true)"
+          if ! printf '%s\n' "$banner" | grep -qE '^UNRAR .* freeware'; then
+            echo "::error::$unrar_bin is not RARLAB UnRAR"
+            printf '%s\n' "$banner"
+            exit 1
+          fi
+          printf '%s\n' "$banner" | grep -E '^UNRAR .* freeware'
+
+          {
+            echo "UNRAR_BIN=$unrar_bin"
+            # WEAVER_REQUIRE_UNRAR_ORACLE must be set wherever UNRAR_BIN is, so
+            # that a missing binary fails the job instead of silently skipping
+            # every oracle comparison.
+            echo "WEAVER_REQUIRE_UNRAR_ORACLE=1"
+          } >> "$GITHUB_ENV"
       - name: Restore sccache directory
         id: sccache-restore
         uses: actions/cache/restore@v6

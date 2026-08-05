@@ -167,32 +167,25 @@ impl Drop for AwsLcCbcDecryptor {
     }
 }
 
-/// AES-256-CBC block **encryptor**, in place, no padding.
+/// AES-CBC block **encryptor**, in place, no padding.
 ///
 /// Unlike [`encrypt_cbc_for_test`] this is a real seam item: it is what
-/// [`crate::crypto::encrypt_cipher_range`] runs on, so it allocates nothing,
-/// chunks its input the way the decryptor does rather than asserting a length,
-/// and reports a backend failure to its caller instead of panicking.
-pub(crate) struct Aes256CbcEnc {
+/// [`crate::crypto::MemberCipherKey::encrypt_range`] runs on, so it allocates
+/// nothing, chunks its input the way the decryptor does rather than asserting a
+/// length, and reports a backend failure to its caller instead of panicking.
+struct AwsLcCbcEncryptor {
     ctx: *mut EVP_CIPHER_CTX,
 }
 
-unsafe impl Send for Aes256CbcEnc {}
+unsafe impl Send for AwsLcCbcEncryptor {}
 
-impl Aes256CbcEnc {
-    pub(crate) fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
+impl AwsLcCbcEncryptor {
+    fn new(cipher: *const EVP_CIPHER, key: &[u8], iv: &[u8; AES_BLOCK]) -> Self {
         let ctx = unsafe { EVP_CIPHER_CTX_new() };
         assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
 
-        let init = unsafe {
-            EVP_EncryptInit_ex(
-                ctx,
-                EVP_aes_256_cbc(),
-                null_mut(),
-                key.as_ptr(),
-                iv.as_ptr(),
-            )
-        };
+        let init =
+            unsafe { EVP_EncryptInit_ex(ctx, cipher, null_mut(), key.as_ptr(), iv.as_ptr()) };
         assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
 
         let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
@@ -207,7 +200,7 @@ impl Aes256CbcEnc {
     /// Encrypts `data` in place as whole blocks. `false` if aws-lc refused,
     /// which the caller turns into an error rather than a panic; `data` may then
     /// hold a partial transform and must not be used.
-    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+    fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
         debug_assert!(data.len().is_multiple_of(AES_BLOCK));
         for chunk in data.chunks_mut(AWS_LC_MAX_UPDATE_LEN) {
             let mut out_len = 0_i32;
@@ -229,9 +222,47 @@ impl Aes256CbcEnc {
     }
 }
 
-impl Drop for Aes256CbcEnc {
+impl Drop for AwsLcCbcEncryptor {
     fn drop(&mut self) {
         unsafe { EVP_CIPHER_CTX_free(self.ctx) };
+    }
+}
+
+/// AES-256-CBC block encryptor (RAR5).
+pub(crate) struct Aes256CbcEnc(AwsLcCbcEncryptor);
+
+impl Aes256CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
+        Self(AwsLcCbcEncryptor::new(
+            unsafe { EVP_aes_256_cbc() },
+            key,
+            iv,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        self.0.encrypt_blocks(data)
+    }
+}
+
+/// AES-128-CBC block encryptor (RAR4).
+pub(crate) struct Aes128CbcEnc(AwsLcCbcEncryptor);
+
+impl Aes128CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
+        Self(AwsLcCbcEncryptor::new(
+            unsafe { EVP_aes_128_cbc() },
+            key,
+            iv,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        self.0.encrypt_blocks(data)
     }
 }
 

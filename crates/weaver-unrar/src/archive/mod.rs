@@ -11,8 +11,9 @@ mod volume;
 
 pub use cache::CachedArchiveHeaders;
 pub use facts::{
-    RarVolumeFacts, RarVolumeHostOs, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts,
-    RarVolumeServiceFacts, RarVolumeUnixOwnerFacts,
+    RarVolumeFacts, RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
+    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeUnixOwnerFacts,
 };
 
 use std::io::{Read, Seek, SeekFrom};

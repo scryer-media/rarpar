@@ -1079,6 +1079,7 @@ mod tests {
         // Stated as the consumer sees it: the two accessors must never
         // disagree about whether this member has a password check.
         let store = crate::stored_layout::EncryptedStore {
+            format: ArchiveFormat::Rar5,
             crypt: Some(crate::RarVolumeMemberEncryptionFacts {
                 version: encryption.version,
                 kdf_count_lg2: encryption.kdf_count,

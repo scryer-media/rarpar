@@ -1702,6 +1702,133 @@ pub fn encrypt_cipher_range(
     }
 }
 
+/// Decrypt one arbitrary range of a **RAR4** member's cipher stream, in place.
+///
+/// The AES-128 twin of [`decrypt_cipher_range`], with the same contract in every
+/// respect — see it for what `preceding_block` must be and what happens when it
+/// is wrong. The only difference is the key width, and where the key comes from:
+/// RAR4 derives both key and IV together from the password plus the header's
+/// optional 8-byte file salt ([`KdfCache::derive_key_rar4`]), where RAR5 derives
+/// the key from a `FHEXTRA_CRYPT` record and reads the IV out of it.
+///
+/// Prefer [`MemberCipherKey::decrypt_range`] where the format is not known
+/// statically; this is the direct entry point for a RAR4-only caller.
+pub fn decrypt_cipher_range_rar4(
+    key: &[u8; 16],
+    preceding_block: &[u8; AES_BLOCK],
+    cipher: &mut [u8],
+) -> RarResult<()> {
+    if cipher.is_empty() {
+        return Ok(());
+    }
+    if !cipher.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                cipher.len()
+            ),
+        });
+    }
+
+    Rar4CbcDecryptor::new(key, preceding_block).decrypt_blocks(cipher);
+    Ok(())
+}
+
+/// Encrypt one arbitrary range of a **RAR4** member's cipher stream, in place.
+///
+/// The AES-128 twin of [`encrypt_cipher_range`], with the same contract: same
+/// argument order, same in-place semantics, same fallibility, and the same
+/// "the caller owns the predecessor" rule whose damage does *not* stop at the
+/// first block.
+///
+/// Prefer [`MemberCipherKey::encrypt_range`] where the format is not known
+/// statically; this is the direct entry point for a RAR4-only caller.
+pub fn encrypt_cipher_range_rar4(
+    key: &[u8; 16],
+    preceding_block: &[u8; AES_BLOCK],
+    plain: &mut [u8],
+) -> RarResult<()> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    if !plain.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                plain.len()
+            ),
+        });
+    }
+
+    match backend::Aes128CbcEnc::new(key, preceding_block).encrypt_blocks(plain) {
+        true => Ok(()),
+        false => Err(RarError::CorruptArchive {
+            detail: format!(
+                "AES-128-CBC encryption of a {}-byte range was refused by the crypto backend",
+                plain.len()
+            ),
+        }),
+    }
+}
+
+/// The AES key that turns one member's cipher stream into its plaintext, and
+/// back.
+///
+/// RAR encrypts a stored member's whole plaintext as **one CBC stream** whatever
+/// the format — the difference is only the key width and where the key and IV
+/// come from — so a router that has to decrypt at write time and re-encrypt on
+/// read wants one type it can carry per member and one pair of calls it can
+/// make. That is this: format-agnostic at the call site, exact at the cipher.
+///
+/// Which variant a member takes is not a guess. [`crate::MemberKeying`] is what
+/// the headers state, and it maps one-to-one:
+/// [`crate::MemberKeying::Rar5`] is [`Self::Aes256`] over
+/// [`KdfCache::derive_key_rar5`], and [`crate::MemberKeying::Rar4`] is
+/// [`Self::Aes128`] over [`KdfCache::derive_key_rar4`].
+///
+/// This is key material. It carries no `Debug`, no `Display` and no
+/// serialization, deliberately: a key in a log is a key on disk. `PartialEq` is
+/// here for *identity* — "did these two members derive the same key" — and is a
+/// plain byte comparison; nothing authenticates against it, and nothing should.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemberCipherKey {
+    /// RAR5 file encryption: AES-256-CBC, keyed by PBKDF2-HMAC-SHA256 over the
+    /// `FHEXTRA_CRYPT` salt and iteration count.
+    Aes256([u8; 32]),
+    /// RAR4/RAR3 "RAR 3.0" file encryption: AES-128-CBC, keyed by the legacy
+    /// iterative SHA-1 KDF over the password and the header's optional 8-byte
+    /// file salt.
+    Aes128([u8; 16]),
+}
+
+impl MemberCipherKey {
+    /// Decrypt `cipher` in place — see [`decrypt_cipher_range`] for the whole
+    /// contract, which is the same for both widths.
+    pub fn decrypt_range(
+        &self,
+        preceding_block: &[u8; AES_BLOCK],
+        cipher: &mut [u8],
+    ) -> RarResult<()> {
+        match self {
+            Self::Aes256(key) => decrypt_cipher_range(key, preceding_block, cipher),
+            Self::Aes128(key) => decrypt_cipher_range_rar4(key, preceding_block, cipher),
+        }
+    }
+
+    /// Encrypt `plain` in place — see [`encrypt_cipher_range`] for the whole
+    /// contract, which is the same for both widths.
+    pub fn encrypt_range(
+        &self,
+        preceding_block: &[u8; AES_BLOCK],
+        plain: &mut [u8],
+    ) -> RarResult<()> {
+        match self {
+            Self::Aes256(key) => encrypt_cipher_range(key, preceding_block, plain),
+            Self::Aes128(key) => encrypt_cipher_range_rar4(key, preceding_block, plain),
+        }
+    }
+}
+
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
     decryptor: backend::Aes128CbcDec,
@@ -2564,6 +2691,91 @@ mod tests {
             );
         }
         assert!(encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn the_rar4_cipher_range_pair_is_an_exact_inverse_at_every_block_boundary() {
+        // Plan 136 E3: the AES-128 twin of the two properties above, stated as
+        // one test because the RAR4 pair is the same claim over the same shape.
+        // The key and IV are a real derivation rather than constants, so what is
+        // exercised is the key a router would actually hold.
+        let (key, iv) = rar4_derive_key("moonlit-harbour", Some(&[0x11u8; 8]));
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 11 + 5) as u8).collect();
+        let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..plaintext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=plaintext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = plaintext[start..end].to_vec();
+                encrypt_cipher_range_rar4(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, ciphertext[start..end], "encrypt {start}..{end}");
+                decrypt_cipher_range_rar4(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "round trip {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rar4_cipher_range_pair_refuses_a_partial_block_and_accepts_an_empty_one() {
+        let (key, _) = rar4_derive_key("moonlit-harbour", None);
+        for length in [1usize, AES_BLOCK - 1, AES_BLOCK + 1, AES_BLOCK * 2 + 3] {
+            let mut partial = vec![0u8; length];
+            assert!(matches!(
+                encrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut partial),
+                Err(RarError::CorruptArchive { .. })
+            ));
+            assert!(matches!(
+                decrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut partial),
+                Err(RarError::CorruptArchive { .. })
+            ));
+        }
+        assert!(encrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+        assert!(decrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn member_cipher_key_dispatches_to_the_width_its_variant_names() {
+        // The one thing a dispatching enum can get wrong is dispatching: an
+        // `Aes128` that quietly ran AES-256 over the first 16 bytes of a wider
+        // key would decrypt nothing correctly, and an `Aes256` that truncated
+        // would be worse. Both variants are held to the free functions they
+        // stand for, byte for byte.
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 6).map(|i| (i * 13 + 7) as u8).collect();
+        let preceding = [0x3Cu8; 16];
+
+        let (rar4_key, _) = rar4_derive_key("moonlit-harbour", Some(&[0x22u8; 8]));
+        let mut through_enum = plaintext.clone();
+        MemberCipherKey::Aes128(rar4_key)
+            .encrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(
+            through_enum,
+            encrypt_aes128_cbc_for_test(&rar4_key, &preceding, &plaintext)
+        );
+        MemberCipherKey::Aes128(rar4_key)
+            .decrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(through_enum, plaintext);
+
+        let rar5_key = derive_rar5_material("moonlit-harbour", &[0x5Au8; 16], 4)
+            .unwrap()
+            .key;
+        let mut through_enum = plaintext.clone();
+        MemberCipherKey::Aes256(rar5_key)
+            .encrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(
+            through_enum,
+            encrypt_aes256_cbc_for_test(&rar5_key, &preceding, &plaintext)
+        );
+        MemberCipherKey::Aes256(rar5_key)
+            .decrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(through_enum, plaintext);
     }
 
     #[test]
