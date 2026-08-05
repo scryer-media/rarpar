@@ -59,6 +59,67 @@ pub struct RarVolumeMemberEncryptionFacts {
     pub psw_check: Option<[u8; 12]>,
 }
 
+/// The RAR5 **archive-level** encryption record (`HEAD_CRYPT`, type 4) a
+/// header-encrypted (`-hp`) volume states, exactly as it states it.
+///
+/// Facts, not keys, and — this is the whole point of the type — obtainable with
+/// **no password**. `-hp` encrypts every header after this one, so the layout
+/// (member names, offsets, sizes) is unreadable without a key; the record that
+/// says how to *make* that key is plaintext and sits at the front of the
+/// volume. A caller with a list of candidate passwords can therefore prove one
+/// against [`Self::psw_check`] through
+/// [`crate::crypto::check_member_password`] before it decrypts anything, and
+/// only then re-parse with [`super::RarArchive::parse_volume_facts`].
+///
+/// The same shape as [`RarVolumeMemberEncryptionFacts`] minus the IV, which
+/// this record does not carry: each encrypted header stores its own IV inline,
+/// ahead of its ciphertext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RarVolumeHeaderEncryptionFacts {
+    /// Encryption version the record states. Only 0 (AES-256) is supported, and
+    /// unlike the per-member record this one *is* validated — a version this
+    /// build does not implement is an error rather than a reported number,
+    /// because nothing past it can be read at all.
+    pub version: u64,
+    /// PBKDF2 iteration count as its base-2 logarithm, exactly as stored.
+    /// Bounded by [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] at parse time: the
+    /// count is the *archive's* claim, so an unbounded one would let a hostile
+    /// post choose how much work a candidate loop does.
+    pub kdf_count_lg2: u8,
+    /// 16-byte KDF salt.
+    pub salt: [u8; 16],
+    /// Whether the record's flags claim a password-check value
+    /// (`enc_flags & 0x0001`).
+    pub psw_check_present: bool,
+    /// The 12-byte password-check field — 8 check bytes plus a 4-byte SHA-256
+    /// tag over them — kept only when the flag is set *and* the tag matched.
+    /// `psw_check_present` with `None` here means the writer claimed a check
+    /// this parse could not trust, which refutes no password and must never be
+    /// read as confirming one.
+    pub psw_check: Option<[u8; 12]>,
+}
+
+/// What one volume's headers say about **archive-level** (`-hp`) encryption,
+/// read with no password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RarVolumeHeaderEncryption {
+    /// No `-hp`: this volume's headers are readable as they stand. A `-p`
+    /// archive — file data encrypted, headers in the clear — answers this, and
+    /// so does an unencrypted one.
+    None,
+    /// RAR5 `-hp`. The type-4 record is plaintext and comes back whole.
+    Rar5(RarVolumeHeaderEncryptionFacts),
+    /// RAR4/RAR3 `-hp`, which states only that it *is* header-encrypted.
+    ///
+    /// There is deliberately nothing else to report. RAR4 derives a fresh key
+    /// per header from that header's own 8-byte salt and carries **no
+    /// password-check value anywhere** in the format, so a wrong password is
+    /// detected only by walking off the end of the archive. Nothing here can
+    /// prove a candidate before something is decrypted, which is why a caller
+    /// that requires proof must refuse this variant rather than guess.
+    Rar4,
+}
+
 /// Unix owner/group metadata from RAR5 `FHEXTRA_UOWNER`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RarVolumeUnixOwnerFacts {
@@ -550,6 +611,65 @@ impl RarArchive {
     ) -> RarResult<RarVolumeFacts> {
         let reader: Box<dyn ReadSeek> = Box::new(reader);
         Self::parse_volume_facts_boxed(reader, password)
+    }
+
+    /// Read one physical volume's **archive-level** encryption record with no
+    /// password.
+    ///
+    /// The companion to [`Self::parse_volume_facts`] for the one case that
+    /// function cannot answer: a header-encrypted (`-hp`) volume, whose headers
+    /// it refuses with `RarError::EncryptedArchive`. `-hp` withholds *layout*
+    /// facts, not *keying* facts, and this returns the keying facts.
+    ///
+    /// Errors are the walk's own, and a refused record — an encryption version
+    /// this build does not implement, or a KDF count over
+    /// [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] — is one of them rather than
+    /// [`RarVolumeHeaderEncryption::None`].
+    pub fn parse_volume_header_encryption(
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+    ) -> RarResult<RarVolumeHeaderEncryption> {
+        let reader: Box<dyn ReadSeek> = Box::new(reader);
+        Self::parse_volume_header_encryption_boxed(reader)
+    }
+
+    pub(crate) fn parse_volume_header_encryption_boxed(
+        mut reader: Box<dyn ReadSeek>,
+    ) -> RarResult<RarVolumeHeaderEncryption> {
+        use std::io::{Seek, SeekFrom};
+
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(crate::error::RarError::Io)?;
+        let format = signature::read_signature(&mut reader)?;
+
+        if format.is_rar4_family() {
+            // RAR 1.4 has no header encryption; RAR3/RAR4 signal it with the
+            // archive header's `ENCRYPTED_HEADERS` flag, which is the *only*
+            // thing the format states in the clear. `parse_rar4_headers` stops
+            // at that flag with no password, and it is the first header after
+            // the signature, so this costs one header read.
+            if format == ArchiveFormat::Rar14 {
+                return Ok(RarVolumeHeaderEncryption::None);
+            }
+            return match crate::rar4::parse_rar4_headers(&mut reader, None) {
+                Ok(_) => Ok(RarVolumeHeaderEncryption::None),
+                Err(crate::error::RarError::EncryptedArchive) => {
+                    Ok(RarVolumeHeaderEncryption::Rar4)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        Ok(match crate::header::parse_header_encryption(&mut reader)? {
+            Some(encryption) => RarVolumeHeaderEncryption::Rar5(RarVolumeHeaderEncryptionFacts {
+                version: encryption.version,
+                kdf_count_lg2: encryption.kdf_count,
+                salt: encryption.salt,
+                psw_check_present: encryption.has_password_check,
+                psw_check: encryption.check_data,
+            }),
+            None => RarVolumeHeaderEncryption::None,
+        })
     }
 
     pub(crate) fn parse_volume_facts_boxed(

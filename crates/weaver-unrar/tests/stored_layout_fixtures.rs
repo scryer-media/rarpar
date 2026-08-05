@@ -18,13 +18,18 @@ use std::path::{Path, PathBuf};
 
 use weaver_unrar::{
     ArchiveFormat, EncryptedStore, IneligibilityReason, KdfCache, MappedSlice, MemberEligibility,
-    PasswordCheck, RarArchive, RarVolumeFacts, StoredLayoutBuilder, StoredMember,
-    check_member_password, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
+    MemberKeying, PasswordCheck, RarArchive, RarVolumeFacts, RarVolumeHeaderEncryption,
+    StoredLayoutBuilder, StoredMember, check_member_password, convert_crc32_to_mac,
+    decrypt_cipher_range, decrypt_cipher_range_rar4, derive_rar5_material,
 };
 
 /// The corpus-wide fixture password, as `generate_encrypted.sh` and
 /// `generate_stored_layout.sh` both set it.
 const TEST_PASSWORD: &str = "testpass123";
+
+/// The password the `-hp` (header-encrypted) fixtures were written with, which
+/// differs from the corpus-wide one — see `tests/fixtures/README.md`.
+const HP_PASSWORD: &str = "secretpass";
 
 // ---------------------------------------------------------------------------
 // Fixture loading
@@ -69,6 +74,28 @@ impl Fixture {
             facts,
             lens,
             paths,
+        })
+    }
+
+    /// [`Self::load`] for a test that may not silently skip.
+    ///
+    /// Missing-means-skip is right for a fixture that adds coverage to
+    /// something already pinned by synthetic tests. It is wrong for a fixture
+    /// that is the *only* check of its kind, because a corpus regression would
+    /// then delete the check rather than fail it — and this one is exactly
+    /// that: `a_rar4_encrypted_chain_is_one_cbc_stream_keyed_by_its_file_salt`
+    /// is the only place RAR4 key derivation is validated against an archive
+    /// `rar` itself wrote. Every synthetic RAR4 fixture on either side of the
+    /// crate boundary is built with the same derivation it is later checked
+    /// with, so a wrong KDF would agree with itself everywhere else.
+    fn require(name: &'static str, dir: &str, files: &[String]) -> Self {
+        Self::load(name, dir, files).unwrap_or_else(|| {
+            panic!(
+                "{name} fixtures are required, not optional: this test is the only \
+                 real-archive check of RAR4 key derivation, and skipping it would \
+                 leave nothing validating the KDF against bytes `rar` wrote. Fetch \
+                 the Git LFS payloads under tests/fixtures/{dir}."
+            )
         })
     }
 
@@ -1345,6 +1372,470 @@ fn decrypting_any_cipher_range_from_its_preceding_block_matches_the_extractor() 
         "the preceding block must come from an earlier volume somewhere, or \
          this test never exercises the boundary case it exists for"
     );
+}
+
+/// The RAR4 twin of the test above (plan 136, E3), and the one that proves the
+/// premise the whole RAR4 half rests on: **RAR4 encrypts a split member's whole
+/// plaintext as one AES-128-CBC stream running unbroken across the volume
+/// boundaries**, seeded by the IV the KDF produces beside the key.
+///
+/// That is not a formality. If RAR restarted the cipher at each part — which the
+/// format would allow, since each part's header carries its own salt copy — then
+/// a part's first block would chain from the derived IV rather than from the
+/// previous volume's last cipher block, every cross-volume decrypt would be
+/// wrong by one block, and the `align16` rule would have to hold per part rather
+/// than per member. The assertions below fail loudly in that world: the whole
+/// chain is decrypted with one CBC stream and compared byte for byte against the
+/// conventional extractor's output, and every part boundary is decrypted again
+/// as a bare range from its own preceding block alone.
+///
+/// It loads through [`Fixture::require`] rather than [`Fixture::load`]: this is
+/// also the only test anywhere that checks RAR4 key derivation against an
+/// archive `rar` wrote, so a missing corpus must fail here rather than quietly
+/// remove the check.
+#[test]
+fn a_rar4_encrypted_chain_is_one_cbc_stream_keyed_by_its_file_salt() {
+    let files = parts("rar4_enc_mv_store", 1..=5, 1);
+    let fixture = Fixture::require("rar4_enc_mv_store", "rar4", &files);
+
+    let builder = fixture.build(ArchiveFormat::Rar4);
+    let member = only_member(&builder);
+    let store = member.eligibility.encrypted_store().expect("encrypted");
+    assert_eq!(
+        store.keying(),
+        MemberKeying::Rar4 {
+            salt: store.rar4_salt
+        },
+        "a RAR4 member keys off its file salt and nothing else"
+    );
+    let MemberKeying::Rar4 { salt } = store.keying() else {
+        panic!("a RAR4 fixture must key as RAR4");
+    };
+    let cipher_size = store.cipher_size.expect("resolved");
+    let unpacked_size = member.unpacked_size.expect("resolved");
+
+    // The member's cipher stream read straight off the volumes at the offsets
+    // the layout maps: exactly the byte sequence a router sees on the wire.
+    let mut cipher = Vec::with_capacity(cipher_size as usize);
+    for (index, part) in member.parts.iter().enumerate() {
+        assert_eq!(
+            builder.map_physical_range(part.volume, part.data_offset, part.data_size),
+            vec![MappedSlice::EncryptedMember {
+                member_index: 0,
+                logical_offset: part.logical_offset.expect("resolved"),
+                len: part.data_size,
+            }],
+            "part {index} maps to its own cipher span"
+        );
+        let volume = std::fs::read(&fixture.paths[part.volume as usize]).expect("volume");
+        let start = part.data_offset as usize;
+        cipher.extend_from_slice(&volume[start..start + part.data_size as usize]);
+    }
+    assert_eq!(cipher.len() as u64, cipher_size);
+
+    // The key and the IV come out of the same derivation — no header states
+    // either — and the KDF cache is the surface a router calls.
+    let cache = KdfCache::new();
+    let (key, iv) = cache.derive_key_rar4(TEST_PASSWORD, salt.as_ref());
+
+    let plaintext = extract_member(&fixture.paths, &member.name);
+    assert_eq!(plaintext.len() as u64, unpacked_size);
+
+    // (1) One stream, from the derived IV, across every volume boundary.
+    let mut whole = cipher.clone();
+    decrypt_cipher_range_rar4(&key, &iv, &mut whole).expect("block-aligned");
+    assert_eq!(
+        &whole[..unpacked_size as usize],
+        plaintext.as_slice(),
+        "the chain is one CBC stream: a per-part restart would diverge at the \
+         first volume boundary"
+    );
+
+    // (2) And every part boundary decrypts as a bare range from its own
+    // preceding 16 cipher bytes, which for a boundary live in the previous
+    // volume — the CBC random-access property E-D2 rests on, over RAR4.
+    let mut offsets = vec![0u64, cipher_size - 16];
+    let mut running = 0u64;
+    for part in &member.parts {
+        running += part.data_size;
+        let aligned = running.next_multiple_of(16);
+        if aligned > 0 && aligned < cipher_size {
+            offsets.push(aligned);
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut boundary_cases = 0usize;
+    for offset in offsets {
+        let preceding: [u8; 16] = if offset == 0 {
+            iv
+        } else {
+            cipher[(offset - 16) as usize..offset as usize]
+                .try_into()
+                .expect("one block")
+        };
+        let len = (cipher_size - offset).min(32);
+        let mut range = cipher[offset as usize..(offset + len) as usize].to_vec();
+        decrypt_cipher_range_rar4(&key, &preceding, &mut range).expect("block-aligned range");
+        let compare = (unpacked_size.saturating_sub(offset)).min(len) as usize;
+        assert_eq!(
+            &range[..compare],
+            &plaintext[offset as usize..offset as usize + compare],
+            "range {offset}+{len}"
+        );
+
+        if offset > 0 && offset < cipher_size {
+            let owner = |position: u64| {
+                member
+                    .parts
+                    .iter()
+                    .position(|part| {
+                        let start = part.logical_offset.expect("resolved");
+                        position >= start && position < start + part.data_size
+                    })
+                    .expect("inside the member")
+            };
+            if owner(offset - 16) != owner(offset) {
+                boundary_cases += 1;
+            }
+        }
+    }
+    assert!(
+        boundary_cases > 0,
+        "the preceding block must come from an earlier volume somewhere, or this \
+         test never exercises the boundary case it exists for"
+    );
+
+    // (3) The wrong password produces garbage and nothing refutes it earlier:
+    // RAR4 has no password-check value, so the member's plain CRC32 is the only
+    // detector there is — and it is a *plain* one, never a keyed fold, because
+    // no RAR4 header can set the hash-MAC flag.
+    assert!(
+        !member.data_hash_uses_mac,
+        "RAR4 has no tweaked-checksum flag: the whole-member CRC32 is the bare one"
+    );
+    let (wrong_key, wrong_iv) = cache.derive_key_rar4("not-the-password", salt.as_ref());
+    let mut garbage = cipher;
+    decrypt_cipher_range_rar4(&wrong_key, &wrong_iv, &mut garbage).expect("block-aligned");
+    garbage.truncate(unpacked_size as usize);
+    assert_ne!(
+        crc32(&garbage),
+        member.data_crc32.expect("whole-member CRC32"),
+        "the plain whole-member CRC32 is RAR4's only wrong-password gate, and it \
+         must reject"
+    );
+    assert_eq!(
+        crc32(&plaintext),
+        member.data_crc32.expect("whole-member CRC32"),
+        "and it accepts the real password, so the rejection above discriminates"
+    );
+}
+
+/// The RAR4 `align16` slack, on a real archive: a 290-byte member occupies 304
+/// packed bytes, all of which are member bytes on the wire.
+///
+/// The multi-volume RAR4 fixture cannot show this — its payload is exactly
+/// 256 KiB, so `align16` is a no-op there and a chain that summed to the
+/// unpadded size would pass it just as happily.
+#[test]
+fn a_single_volume_rar4_encrypted_store_maps_its_tail_padding_as_member_bytes() {
+    let Some(fixture) = Fixture::load(
+        "rar4_enc_store",
+        "rar4",
+        &["rar4_enc_store.rar".to_string()],
+    ) else {
+        return;
+    };
+
+    let mut builder = StoredLayoutBuilder::new(ArchiveFormat::Rar4);
+    builder
+        .add_volume(0, &fixture.facts[0])
+        .expect("fixture volume accepted");
+
+    let member = only_member(&builder);
+    let store = member.eligibility.encrypted_store().expect("encrypted");
+    assert_eq!(member.unpacked_size, Some(290));
+    assert_eq!(store.cipher_size, Some(304));
+    assert_eq!(store.tail_padding, Some(14));
+    assert!(store.resolved);
+
+    let part = &member.parts[0];
+    assert_eq!(
+        part.data_size, 304,
+        "the packed bytes are the padded cipher length, not the declared size"
+    );
+    assert_eq!(
+        builder.map_physical_range(0, part.data_offset, part.data_size),
+        vec![MappedSlice::EncryptedMember {
+            member_index: 0,
+            logical_offset: 0,
+            len: 304,
+        }],
+        "the padding bytes are member bytes on the wire, not envelope"
+    );
+
+    // And the padding really is what the final block decrypts to past the end:
+    // 14 bytes that exist only in the cipher, which is why they are retained.
+    let MemberKeying::Rar4 { salt } = store.keying() else {
+        panic!("a RAR4 fixture must key as RAR4");
+    };
+    let (key, iv) = KdfCache::new().derive_key_rar4(TEST_PASSWORD, salt.as_ref());
+    let volume = std::fs::read(&fixture.paths[0]).expect("volume");
+    let start = part.data_offset as usize;
+    let mut plain = volume[start..start + part.data_size as usize].to_vec();
+    decrypt_cipher_range_rar4(&key, &iv, &mut plain).expect("block-aligned");
+    assert_eq!(
+        &plain[..290],
+        extract_member(&fixture.paths, &member.name).as_slice()
+    );
+    assert_eq!(plain.len(), 304);
+
+    assert_maps_every_volume_whole(&builder, &fixture);
+}
+
+/// What `-hp` (header encryption) actually costs a one-pass router, measured
+/// rather than assumed — the evidence behind plan 136 E3's scoping of it.
+///
+/// Three facts, and they do not all point the same way:
+///
+/// 1. **The keying facts are in the clear.** RAR5's type-4 encryption header is
+///    itself plaintext, and `header::parse_all_headers` parses it *before* it
+///    looks at the password: salt, lg2 count and the 12-byte password check all
+///    come out of the first article of the first volume, at exactly the place
+///    D2's header walk already reads. `-hp` withholds **layout** facts, not
+///    **keying** facts.
+/// 2. **And `parse_volume_header_encryption` surfaces them** (E4). The walk
+///    used to return `EncryptedArchive` and drop the whole result, so there was
+///    no way to obtain the record without a password; the walk now hands it
+///    back and `RarArchive::parse_volume_header_encryption` is the accessor.
+///    `parse_all_headers` still refuses exactly as it did.
+/// 3. **The layout half needs the password and is otherwise unchanged.** Given
+///    one, `parse_volume_facts` returns ordinary facts and the stored layout
+///    classifies the set exactly as a `-p` set: same eligibility, same
+///    `align16`, same member keying. Nothing downstream of the parse is
+///    `-hp`-shaped.
+#[test]
+fn header_encryption_withholds_the_layout_but_not_the_keying_facts() {
+    for (dir, file) in [("rar5", "rar5_hp_store.rar"), ("rar4", "rar4_hp_store.rar")] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir)
+            .join(file);
+        if !path.exists() {
+            eprintln!("skipping: {file} not present");
+            continue;
+        }
+
+        // (a) Without a password there are no facts at all — so a router that
+        // learns its layout from the volume's own first article learns nothing,
+        // which is the premise `-hp` really does break.
+        let refused = RarArchive::parse_volume_facts(
+            std::fs::File::open(&path).expect("fixture readable"),
+            None,
+        );
+        assert!(
+            refused.is_err(),
+            "{file}: a header-encrypted volume must yield no facts without a password"
+        );
+
+        // (b) With one, the facts are ordinary and the layout classifies the set
+        // with no `-hp`-specific handling anywhere.
+        let facts = RarArchive::parse_volume_facts(
+            std::fs::File::open(&path).expect("fixture readable"),
+            Some(HP_PASSWORD),
+        )
+        .expect("a header-encrypted volume parses with its password");
+        assert!(
+            !facts.members.is_empty(),
+            "{file}: the password must yield the member list"
+        );
+        let format = facts.archive_format();
+        let mut builder = StoredLayoutBuilder::new(format);
+        builder.add_volume(0, &facts).expect("volume accepted");
+        assert_eq!(builder.members().len(), facts.members.len());
+    }
+
+    // (c) And the keying facts really are readable with no password: the type-4
+    // block is plaintext, and the walk parses it before it consults the
+    // password. It is only the *return* that throws them away.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_hp_store.rar");
+    if !path.exists() {
+        return;
+    }
+    let mut image = std::io::Cursor::new(std::fs::read(&path).expect("fixture readable"));
+    assert_eq!(
+        weaver_unrar::signature::read_signature(&mut image).expect("a RAR5 signature"),
+        ArchiveFormat::Rar5
+    );
+    let error = weaver_unrar::header::parse_all_headers(&mut image, None)
+        .expect_err("no password, no headers");
+    assert!(
+        matches!(error, weaver_unrar::RarError::EncryptedArchive),
+        "the refusal must name header encryption rather than corruption, got {error:?}"
+    );
+
+    // The same walk with the password reaches the same type-4 record it had
+    // already parsed a moment before refusing — which is the measurement: the
+    // salt and the KDF count are the archive's, stated in the clear, and a
+    // password-candidate loop could be proved against them before a byte of
+    // anyone's data is decrypted.
+    let mut image = std::io::Cursor::new(std::fs::read(&path).expect("fixture readable"));
+    weaver_unrar::signature::read_signature(&mut image).expect("a RAR5 signature");
+    let parsed = weaver_unrar::header::parse_all_headers(&mut image, Some(HP_PASSWORD))
+        .expect("the password opens the headers");
+    let encryption = parsed
+        .encryption
+        .expect("a `-hp` archive states its type-4 record");
+    let cache = KdfCache::new();
+    assert_eq!(
+        check_member_password(
+            &cache,
+            HP_PASSWORD,
+            &encryption.salt,
+            encryption.kdf_count,
+            encryption.check_data.as_ref(),
+        ),
+        PasswordCheck::Verified,
+        "the archive-level check proves the right password"
+    );
+    assert_eq!(
+        check_member_password(
+            &cache,
+            "not-the-password",
+            &encryption.salt,
+            encryption.kdf_count,
+            encryption.check_data.as_ref(),
+        ),
+        PasswordCheck::Wrong,
+        "and refutes a wrong one — the gate a candidate loop would need already exists"
+    );
+    // The third outcome, which is the one that must never be mistaken for the
+    // first: a check the parser could not validate refutes nothing, for any
+    // password. `parse` degrades such a field to `None` (pinned in
+    // `header::encryption`'s own tests), and `None` reads as `Unverifiable`.
+    assert_eq!(
+        check_member_password(
+            &cache,
+            "not-the-password",
+            &encryption.salt,
+            encryption.kdf_count,
+            None,
+        ),
+        PasswordCheck::Unverifiable,
+        "an unusable check must be exactly as informative as no check at all — never a \
+         verification"
+    );
+}
+
+/// The E4 surfacing itself: the same keying facts, obtained with **no
+/// password**, and provably the same ones the password-bearing walk reaches.
+///
+/// The failure this is shaped against is the one that would make E4 silently
+/// useless *and* silently wrong: a `parse_volume_header_encryption` that
+/// answered `None`, or answered with a zeroed/defaulted record, would still let
+/// a caller "verify" nothing and route. So every assertion below is against the
+/// **no-password** value, and the record it returns is compared field by field
+/// with the one `parse_all_headers(.., Some(password))` produces — a stub could
+/// not pass that, and a candidate loop proved against a stub would admit the
+/// first password it tried.
+#[test]
+fn header_encryption_keying_facts_come_out_with_no_password() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+
+    // (a) RAR5 `-hp`: the whole type-4 record, from a reader that was never
+    //     given a password.
+    let path = fixtures.join("rar5/rar5_hp_store.rar");
+    if !path.exists() {
+        eprintln!("skipping: rar5_hp_store.rar not present");
+        return;
+    }
+    let surfaced =
+        RarArchive::parse_volume_header_encryption(std::fs::File::open(&path).expect("fixture"))
+            .expect("the type-4 record is plaintext");
+    let RarVolumeHeaderEncryption::Rar5(facts) = surfaced else {
+        panic!("a RAR5 `-hp` volume must report its archive encryption, got {surfaced:?}");
+    };
+
+    // It is the archive's record, not a default: compared against the one the
+    // password-bearing walk reaches, field by field.
+    let mut image = std::io::Cursor::new(std::fs::read(&path).expect("fixture readable"));
+    weaver_unrar::signature::read_signature(&mut image).expect("a RAR5 signature");
+    let keyed = weaver_unrar::header::parse_all_headers(&mut image, Some(HP_PASSWORD))
+        .expect("the password opens the headers")
+        .encryption
+        .expect("a `-hp` archive states its type-4 record");
+    assert_eq!(facts.version, keyed.version);
+    assert_eq!(facts.kdf_count_lg2, keyed.kdf_count);
+    assert_eq!(facts.salt, keyed.salt);
+    assert_eq!(facts.psw_check_present, keyed.has_password_check);
+    assert_eq!(facts.psw_check, keyed.check_data);
+
+    // And they are load-bearing: the right password verifies against the
+    // no-password facts and the wrong one is refuted, which is the entire gate
+    // an `-hp` admission decision rests on.
+    let cache = KdfCache::new();
+    assert!(
+        facts.psw_check_present && facts.psw_check.is_some(),
+        "WinRAR writes a check by default; without one this fixture proves nothing"
+    );
+    assert_eq!(
+        check_member_password(
+            &cache,
+            HP_PASSWORD,
+            &facts.salt,
+            facts.kdf_count_lg2,
+            facts.psw_check.as_ref(),
+        ),
+        PasswordCheck::Verified,
+    );
+    assert_eq!(
+        check_member_password(
+            &cache,
+            "not-the-password",
+            &facts.salt,
+            facts.kdf_count_lg2,
+            facts.psw_check.as_ref(),
+        ),
+        PasswordCheck::Wrong,
+    );
+
+    // (b) RAR4 `-hp` reports *that* it is header-encrypted and nothing more.
+    //     The format has no password-check value anywhere, so there is nothing
+    //     a candidate could be proved against — which is why this variant
+    //     carries no facts rather than carrying empty ones.
+    let path = fixtures.join("rar4/rar4_hp_store.rar");
+    if path.exists() {
+        assert_eq!(
+            RarArchive::parse_volume_header_encryption(
+                std::fs::File::open(&path).expect("fixture")
+            )
+            .expect("the RAR4 archive header flag is in the clear"),
+            RarVolumeHeaderEncryption::Rar4,
+        );
+    }
+
+    // (c) Non-vacuity, both formats: a `-p` archive — file data encrypted,
+    //     headers readable — is **not** header-encrypted. Without this the
+    //     function could be `Rar5(..)`-for-everything and (a) would still pass.
+    for (dir, file) in [
+        ("rar5", "rar5_enc_store.rar"),
+        ("rar5", "rar5_store.rar"),
+        ("rar4", "rar4_enc_store.rar"),
+        ("rar4", "rar4_store.rar"),
+    ] {
+        let path = fixtures.join(dir).join(file);
+        if !path.exists() {
+            continue;
+        }
+        assert_eq!(
+            RarArchive::parse_volume_header_encryption(
+                std::fs::File::open(&path).expect("fixture")
+            )
+            .expect("a readable-header volume walks without a password"),
+            RarVolumeHeaderEncryption::None,
+            "{file}: `-p` encrypts file data, not headers"
+        );
+    }
 }
 
 /// Extract one member conventionally, with the password, as the reference

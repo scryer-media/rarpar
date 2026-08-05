@@ -245,6 +245,47 @@ fn aes_cbc_encrypt_in_place_matches_across_backends() {
     }
 }
 
+/// (e) The RAR4 twin of (d): AES-128-CBC **encrypt**, in place. Same three
+/// claims — the two backends agree with each other, both agree with the
+/// reference helper, and the result round-trips back through a decrypt — for
+/// the cipher an encrypted RAR4 store member's posted bytes are re-derived with
+/// (plan 136, E3).
+#[test]
+fn aes128_cbc_encrypt_in_place_matches_across_backends() {
+    let mut rng = XorShift64::new(0x1A28_4455_6677_8899);
+
+    for case in 0..64u32 {
+        let max_blocks = (256 * 1024) / AES_BLOCK;
+        let len = (1 + rng.next_usize(max_blocks)) * AES_BLOCK;
+        let mut plaintext = vec![0u8; len];
+        rng.fill(&mut plaintext);
+        let mut preceding = [0u8; 16];
+        rng.fill(&mut preceding);
+        let mut key = [0u8; 16];
+        rng.fill(&mut key);
+
+        let mut aws_out = plaintext.clone();
+        assert!(
+            aws_lc::Aes128CbcEnc::new(&key, &preceding).encrypt_blocks(&mut aws_out),
+            "aws-lc encrypt must not refuse a block-aligned range, case {case}"
+        );
+        let mut rust_out = plaintext.clone();
+        assert!(rust::Aes128CbcEnc::new(&key, &preceding).encrypt_blocks(&mut rust_out));
+
+        assert_eq!(aws_out, rust_out, "aes128 encrypt mismatch, case {case}");
+        assert_eq!(
+            aws_out,
+            aws_lc::encrypt_aes128_cbc_for_test(&key, &preceding, &plaintext),
+            "aes128 in-place encrypt must equal the reference helper, case {case}"
+        );
+        assert_eq!(
+            decrypt_chunked_rust128(&key, &preceding, &aws_out, &mut rng),
+            plaintext,
+            "aes128 encrypt/decrypt round trip, case {case}"
+        );
+    }
+}
+
 /// Yield a randomized sequence of block-multiple chunk sizes summing to `total`
 /// (a multiple of `AES_BLOCK`). Includes single-block (16) and odd multi-block
 /// chunks to stress IV-state carry across `decrypt_blocks` calls.

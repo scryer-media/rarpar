@@ -48,13 +48,13 @@
 // decryptors below differ (they call the host). `HmacSha256Key` is part of the
 // seam for parity with the other backends even though the shared crypto code
 // only names the `hmac_sha256*` functions, so allow it to ride along unused.
-// `Aes256CbcEnc` rides along with them: re-encryption is not a decrypt path, so
-// there is no host call to delegate it to and no reason to invent one — the
-// portable encryptor is already in the guest.
+// The two `Aes*CbcEnc` encryptors ride along with them: re-encryption is not a
+// decrypt path, so there is no host call to delegate it to and no reason to
+// invent one — the portable encryptors are already in the guest.
 #[allow(unused_imports)]
 pub(crate) use super::rust::{
-    Aes256CbcEnc, HmacSha256Key, encrypt_aes128_cbc_for_test, encrypt_aes256_cbc_for_test,
-    hmac_sha256, hmac_sha256_key, sha256,
+    Aes128CbcEnc, Aes256CbcEnc, HmacSha256Key, encrypt_aes128_cbc_for_test,
+    encrypt_aes256_cbc_for_test, hmac_sha256, hmac_sha256_key, sha256,
 };
 
 use crate::crypto::AES_BLOCK;

@@ -172,20 +172,20 @@ fn parse_version_file_name(name: &str) -> Option<u64> {
     (saw_digit && version != 0).then_some(version)
 }
 
+/// Which RAR4 cipher this header selects, or `None` when it is not encrypted.
+///
+/// The version table lives in exactly one place —
+/// [`Rar4EncryptionMethod::for_unpack_version`] — and this delegates to it. It
+/// used to carry a byte-for-byte copy of those arms with nothing pinning the
+/// two equal, and both the extraction path and the stored-layout classification
+/// read the shared one: a drift here would have decided a legacy cipher was AES
+/// (or the reverse) for a member the rest of the crate had already keyed the
+/// other way, which is a wrong-bytes hazard rather than a parse difference.
 fn rar4_file_encryption_method(
     unpack_version: u8,
     is_encrypted: bool,
 ) -> Option<Rar4EncryptionMethod> {
-    if !is_encrypted {
-        return None;
-    }
-
-    Some(match unpack_version {
-        13 => Rar4EncryptionMethod::Rar13,
-        15 => Rar4EncryptionMethod::Rar15,
-        20 | 26 => Rar4EncryptionMethod::Rar20,
-        _ => Rar4EncryptionMethod::Rar30,
-    })
+    is_encrypted.then(|| Rar4EncryptionMethod::for_unpack_version(unpack_version))
 }
 
 fn is_rar4_unix_symlink(host_os: Rar4HostOs, attributes: u32) -> bool {

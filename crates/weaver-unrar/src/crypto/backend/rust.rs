@@ -100,6 +100,27 @@ impl Aes256CbcEnc {
     }
 }
 
+/// AES-128-CBC block **encryptor**, in place, no padding. The RAR4 twin of
+/// [`Aes256CbcEnc`], and a real seam item for the same reason: it is what
+/// [`crate::crypto::MemberCipherKey::encrypt_range`] runs on for a RAR4 member.
+pub(crate) struct Aes128CbcEnc(cbc::Encryptor<aes::Aes128>);
+
+impl Aes128CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
+        Self(cbc::Encryptor::<aes::Aes128>::new(key.into(), iv.into()))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+        let (blocks, rest) = Array::<u8, _>::slice_as_chunks_mut(data);
+        debug_assert!(rest.is_empty());
+        self.0.encrypt_blocks(blocks);
+        true
+    }
+}
+
 /// AES-256-CBC block decryptor. Thin newtype over the RustCrypto CBC mode,
 /// carrying IV state across `decrypt_blocks` calls exactly like the AWS-LC
 /// EVP decryptor.

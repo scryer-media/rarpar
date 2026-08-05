@@ -70,23 +70,30 @@ pub mod test_support {
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeHostOs,
-    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
-    RarVolumeUnixOwnerFacts, ReadSeek,
+    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeHeaderEncryption,
+    RarVolumeHeaderEncryptionFacts, RarVolumeHostOs, RarVolumeMemberEncryptionFacts,
+    RarVolumeMemberFacts, RarVolumeServiceFacts, RarVolumeUnixOwnerFacts, ReadSeek,
 };
 /// The encrypted-member surface a one-pass router needs: derive a member's key
-/// material from a password and its `FHEXTRA_CRYPT` facts, decide up front
+/// material from a password and the facts its headers state, decide up front
 /// whether that password is right, decrypt an arbitrary cipher range — or
 /// re-encrypt one, for a reader that holds the plaintext and owes its caller the
 /// bytes that were posted — and fold a checksum the way a keyed header states
 /// it.
 ///
-/// None of this needs an archive object; all of it is driven by
-/// [`RarVolumeMemberEncryptionFacts`] plus bytes.
+/// Both formats are covered, and [`MemberKeying`] is the discriminant:
+/// RAR5 through [`RarVolumeMemberEncryptionFacts`] and
+/// [`KdfCache::derive_key_rar5`], RAR4 through its 8-byte file salt and
+/// [`KdfCache::derive_key_rar4`]. [`MemberCipherKey`] carries whichever key came
+/// out and dispatches the range calls, so a caller writes the transform once.
+///
+/// None of this needs an archive object; all of it is driven by header facts
+/// plus bytes.
 pub use crypto::{
-    CRYPT5_KDF_LG2_COUNT_MAX, KdfCache, PasswordCheck, Rar5KeyMaterial, check_member_password,
-    convert_blake2_to_mac, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
-    encrypt_cipher_range,
+    CRYPT5_KDF_LG2_COUNT_MAX, KdfCache, MemberCipherKey, PasswordCheck, Rar5KeyMaterial,
+    check_member_password, convert_blake2_to_mac, convert_crc32_to_mac, decrypt_cipher_range,
+    decrypt_cipher_range_rar4, derive_rar5_material, encrypt_cipher_range,
+    encrypt_cipher_range_rar4, rar4_derive_key,
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
@@ -98,7 +105,8 @@ pub use progress::{NoProgress, ProgressHandler};
 pub use recovery::{RecoveryOptions, RecoveryReport, restore_volumes_from_paths};
 pub use stored_layout::{
     EncryptedStore, IneligibilityReason, MalformedReason, MappedSlice, MemberEligibility,
-    StoredLayoutBuilder, StoredLayoutError, StoredMember, StoredMemberPart, VolumeSplitEvidence,
+    MemberKeying, StoredLayoutBuilder, StoredLayoutError, StoredMember, StoredMemberPart,
+    VolumeSplitEvidence,
 };
 pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
