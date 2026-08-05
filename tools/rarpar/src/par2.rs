@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
-use rarpar::cli::{Cli, ParArgs, ParCommand};
+use rarpar::cli::{Cli, ParArgs, ParCommand, ParPlacement};
 
 pub struct ParOutcome {
     pub set_id: String,
@@ -26,6 +26,7 @@ struct ResolvedPar2Input {
     par2_paths: Vec<PathBuf>,
     primary_dir: PathBuf,
     search_dirs: Vec<PathBuf>,
+    placement: ParPlacement,
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
@@ -60,6 +61,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
             .clone()
             .unwrap_or_else(|| set.base_dir.clone()),
         search_dirs: cli.search_dir.clone(),
+        placement: cli.par_placement,
     };
     run_flow(&resolved, true, false, cli.json)
 }
@@ -232,6 +234,7 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         par2_paths,
         primary_dir,
         search_dirs,
+        placement: cli.par_placement,
     })
 }
 
@@ -279,7 +282,7 @@ fn verify_set(
     resolved: &ResolvedPar2Input,
     par2_set: &par2_rs::Par2FileSet,
 ) -> Result<(par2_rs::VerificationResult, Option<par2_rs::PlacementPlan>), RarparError> {
-    if resolved.search_dirs.is_empty() {
+    if resolved.placement == ParPlacement::Smart && resolved.search_dirs.is_empty() {
         let placement_plan = par2_rs::scan_placement(&resolved.primary_dir, par2_set)?;
         if !placement_plan.conflicts.is_empty() {
             return Err(RarparError::Data(format!(
@@ -292,7 +295,13 @@ fn verify_set(
             par2_set,
             &placement_plan,
         );
-        let verification = par2_rs::verify_all(par2_set, &access);
+        // Initial discovery verification is independent per expected file. Use the
+        // library's equivalent file-parallel verifier; repair stays content-grounded.
+        let verification = par2_rs::verify::verify_selected_file_ids_parallel(
+            par2_set,
+            &access,
+            &par2_set.recovery_file_ids,
+        );
         Ok((verification, Some(placement_plan)))
     } else {
         let access = par2_rs::MultiDirectoryFileAccess::new(
@@ -300,7 +309,12 @@ fn verify_set(
             resolved.search_dirs.clone(),
             par2_set,
         );
-        let verification = par2_rs::verify_all(par2_set, &access);
+        // Canonical placement has the same independent-file verification shape.
+        let verification = par2_rs::verify::verify_selected_file_ids_parallel(
+            par2_set,
+            &access,
+            &par2_set.recovery_file_ids,
+        );
         Ok((verification, None))
     }
 }

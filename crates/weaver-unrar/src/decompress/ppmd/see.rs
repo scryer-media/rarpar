@@ -98,7 +98,7 @@ impl SeeTable {
     /// `idx0` is NS2Indx[Diff-1] (0..24).
     /// `idx1` is the combined index from context properties (0..15).
     pub fn get(&mut self, idx0: usize, idx1: usize) -> &mut SeeContext {
-        &mut self.contexts[idx0.min(24)][idx1.min(15)]
+        &mut self.contexts[idx0][idx1]
     }
 
     /// Get the dummy context (for NumStats == 256).

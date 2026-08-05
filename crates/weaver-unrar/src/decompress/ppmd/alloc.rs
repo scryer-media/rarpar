@@ -46,7 +46,7 @@ const HEAP_BASE_BYTES: usize = UNIT_SIZE;
 
 // Temporary intrusive RARPPM_MEM_BLK layout used only while gluing free
 // blocks. `insert_node` later overwrites the first four bytes with the normal
-// free-list link, exactly like canonical UnRAR's RAR_NODE overlay.
+// free-list link.
 const GLUE_STAMP: usize = 0;
 const GLUE_UNITS: usize = 2;
 const GLUE_NEXT: usize = 4;
@@ -84,6 +84,12 @@ pub(super) struct ValidatedArenaSpan {
     len: u16,
 }
 
+/// Compact form of an already validated arena span when the caller knows its
+/// fixed record width. This keeps hot fixed-capacity stacks at one word per
+/// entry without weakening the original range validation.
+#[derive(Clone, Copy)]
+pub(super) struct ValidatedArenaOffset(NonZeroU32);
+
 impl ValidatedArenaSpan {
     #[inline(always)]
     pub(super) const fn offset(self) -> usize {
@@ -93,6 +99,11 @@ impl ValidatedArenaSpan {
     #[inline(always)]
     pub(super) const fn len(self) -> usize {
         self.len as usize
+    }
+
+    #[inline(always)]
+    pub(super) const fn compact(self) -> ValidatedArenaOffset {
+        ValidatedArenaOffset(self.offset)
     }
 
     #[inline(always)]
@@ -106,6 +117,17 @@ impl ValidatedArenaSpan {
             offset: NonZeroU32::new(self.offset.get() + relative as u32)
                 .expect("validated arena subspan offset is non-zero"),
             len: u16::try_from(len).expect("validated PPMd span length fits u16"),
+        }
+    }
+}
+
+impl ValidatedArenaOffset {
+    #[inline(always)]
+    pub(super) fn span(self, len: usize) -> ValidatedArenaSpan {
+        debug_assert!(len != 0 && u16::try_from(len).is_ok());
+        ValidatedArenaSpan {
+            offset: self.0,
+            len: len as u16,
         }
     }
 }
@@ -189,7 +211,7 @@ impl SubAllocator {
     pub fn new(arena_size: usize) -> Self {
         let layout = Self::layout_for(arena_size);
 
-        let mut alloc = Self {
+        Self {
             arena: vec![0u8; layout.allocated_size],
             sub_allocator_size: arena_size.max(UNIT_SIZE * 8),
             arena_fault: Cell::new(false),
@@ -201,16 +223,13 @@ impl SubAllocator {
             hi_unit: layout.hi_unit,
             total_units: layout.total_units,
             glue_count: 0,
-        };
-        alloc.arena.fill(0);
-        alloc
+        }
     }
 
     /// Reset the allocator, freeing all allocations.
     pub fn reset(&mut self) {
         self.free_lists = [NodeRef::NULL; NUM_INDEXES];
         self.clear_arena_fault();
-        self.arena.fill(0);
 
         let layout = Self::layout_for(self.sub_allocator_size);
         debug_assert_eq!(layout.allocated_size, self.arena.len());
@@ -221,6 +240,11 @@ impl SubAllocator {
         self.total_units = layout.total_units;
         self.p_text = HEAP_BASE_BYTES;
         self.glue_count = 0;
+    }
+
+    #[inline]
+    pub fn allocated_size(&self) -> usize {
+        self.sub_allocator_size
     }
 
     // ---- Text region methods ----
@@ -285,6 +309,19 @@ impl SubAllocator {
     #[inline(always)]
     pub(super) fn validated_model_span(&self, off: u32, len: usize) -> Option<ValidatedArenaSpan> {
         if !self.model_range_valid(off, len) {
+            return None;
+        }
+        Some(ValidatedArenaSpan {
+            offset: NonZeroU32::new(off)?,
+            len: u16::try_from(len).ok()?,
+        })
+    }
+
+    #[inline(always)]
+    pub(super) fn validated_tail_span(&self, off: u32, len: usize) -> Option<ValidatedArenaSpan> {
+        let start = off as usize;
+        let end = start.checked_add(len)?;
+        if start <= self.p_text || end > self.arena.len() {
             return None;
         }
         Some(ValidatedArenaSpan {
@@ -390,7 +427,7 @@ impl SubAllocator {
     #[inline(always)]
     fn units_to_index(units: usize) -> usize {
         debug_assert!((1..=128).contains(&units));
-        UNITS_TO_INDEX[(units - 1).min(127)] as usize
+        UNITS_TO_INDEX[units - 1] as usize
     }
 
     #[inline]
@@ -481,9 +518,9 @@ impl SubAllocator {
             self.write_byte_at(NodeRef(self.lo_unit).offset(), 0);
         }
 
-        // Canonical UnRAR overlays a 12-byte doubly linked RARPPM_MEM_BLK on
-        // every free block and inserts each removal at the sentinel head. A
-        // null link represents that sentinel in this offset-based port.
+        // Overlay a 12-byte doubly linked block on every free block and insert
+        // each removal at the sentinel head. A null link represents the
+        // sentinel in the offset-based arena.
         let mut head = NodeRef::NULL;
         let mut tail = NodeRef::NULL;
         for idx in 0..NUM_INDEXES {
@@ -1095,6 +1132,19 @@ mod tests {
         let _n2 = alloc.alloc_one();
         alloc.reset();
         assert!(alloc.has_memory());
+    }
+
+    #[test]
+    fn reset_reuses_arena_without_clearing_payload_bytes() {
+        let mut alloc = SubAllocator::new(4096);
+        let node = alloc.alloc_one();
+        alloc.write_u32(node, 0, 0xDEAD_BEEF);
+
+        alloc.reset();
+        let reused = alloc.alloc_one();
+
+        assert_eq!(reused, node);
+        assert_eq!(alloc.read_u32(reused, 0), 0xDEAD_BEEF);
     }
 
     #[test]

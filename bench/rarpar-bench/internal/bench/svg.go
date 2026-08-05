@@ -77,7 +77,7 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 	fmt.Fprintf(&document, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" role=\"img\" aria-labelledby=\"title desc\">\n", chartWidth, height, chartWidth, height)
 	fmt.Fprintf(&document, "  <title id=\"title\">%s</title>\n  <desc id=\"desc\">%s</desc>\n", escapeXML(title), escapeXML(description))
 	document.WriteString(svgStyle)
-	fmt.Fprintf(&document, "  <metadata>schema=%d; report_sha256=%s; corpus_digest=%s; plan_id=%s; candidate_sha256=%s; rar_reference_sha256=%s; par2_reference_sha256=%s; lane=%s</metadata>\n", report.SchemaVersion, report.InputSHA256, report.CorpusDigest, report.Plan.ID, report.Candidate.SHA256, referenceDigest(report.Reference), referenceDigest(report.ReferencePAR2), report.Plan.Lane)
+	fmt.Fprintf(&document, "  <metadata>schema=%d; report_sha256=%s; corpus_digest=%s; plan_id=%s; candidate_sha256=%s; rar_reference_sha256=%s; par2_reference_sha256=%s; lane=%s; par2_placement=%s</metadata>\n", report.SchemaVersion, report.InputSHA256, report.CorpusDigest, report.Plan.ID, report.Candidate.SHA256, referenceDigest(report.Reference), referenceDigest(report.ReferencePAR2), report.Plan.Lane, report.Plan.Par2Placement)
 	fmt.Fprintf(&document, "  <rect class=\"bg\" width=\"%d\" height=\"%d\"/>\n", chartWidth, height)
 	fmt.Fprintf(&document, "  <text class=\"title\" x=\"48\" y=\"48\">%s</text>\n", escapeXML(title))
 	fmt.Fprintf(&document, "  <text class=\"subtitle\" x=\"48\" y=\"75\">Lower elapsed time is better. Ratio = %s time / rarpar time. Log scale keeps large gains compact.</text>\n", escapeXML(comparisons[0].ReferenceLabel))
@@ -99,7 +99,11 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 	}
 	document.WriteString("  </g>\n")
 	y := 144
-	fmt.Fprintf(&document, "  <g aria-label=\"%s benchmarks\"><text class=\"machine\" x=\"48\" y=\"140\">%s / %s / %s</text>\n", escapeXML(strings.ToUpper(family)), escapeXML(report.Machine.Label), escapeXML(report.Machine.Architecture), escapeXML(report.Plan.Lane))
+	machineDetails := report.Plan.Lane
+	if family == "par2" {
+		machineDetails += " / " + report.Plan.Par2Placement + " placement"
+	}
+	fmt.Fprintf(&document, "  <g aria-label=\"%s benchmarks\"><text class=\"machine\" x=\"48\" y=\"140\">%s / %s / %s</text>\n", escapeXML(strings.ToUpper(family)), escapeXML(report.Machine.Label), escapeXML(report.Machine.Architecture), escapeXML(machineDetails))
 	for _, comparison := range comparisons {
 		label := truncate(comparison.Workload, 66)
 		fmt.Fprintf(&document, "    <text class=\"workload\" x=\"48\" y=\"%d\">%s</text>\n", y+24, escapeXML(label))

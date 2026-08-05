@@ -117,13 +117,9 @@ impl<'a> RangeDecoder<'a> {
     /// current code point falls within the probability range.
     #[inline]
     pub fn get_current_count(&mut self, scale: u32) -> u32 {
-        if scale == 0 {
-            return 0;
-        }
+        debug_assert_ne!(scale, 0);
         self.range /= scale;
-        if self.range == 0 {
-            return 0;
-        }
+        debug_assert_ne!(self.range, 0);
         (self.code.wrapping_sub(self.low)) / self.range
     }
 
@@ -134,7 +130,7 @@ impl<'a> RangeDecoder<'a> {
         self.get_current_count(scale)
     }
 
-    /// UnRAR's `GetCurrentShiftCount(TOT_BITS)` binary fast path.
+    /// Binary range-coder fast path with a fixed 14-bit scale.
     #[inline(always)]
     pub fn get_binary_threshold(&mut self) -> u32 {
         self.range >>= 14;
@@ -215,7 +211,7 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
 
     #[inline(always)]
     fn read_byte(&mut self) -> u8 {
-        self.reader.read_byte().unwrap_or(0)
+        self.reader.read_byte_or_zero()
     }
 
     #[inline(always)]
@@ -276,13 +272,9 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
 
     #[inline(always)]
     fn get_current_count(&mut self, scale: u32) -> u32 {
-        if scale == 0 {
-            return 0;
-        }
+        debug_assert_ne!(scale, 0);
         self.range /= scale;
-        if self.range == 0 {
-            return 0;
-        }
+        debug_assert_ne!(self.range, 0);
         (self.code.wrapping_sub(self.low)) / self.range
     }
 

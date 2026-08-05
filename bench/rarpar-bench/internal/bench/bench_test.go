@@ -43,6 +43,25 @@ func TestReferenceRARArgumentsUseDirectoryDestination(t *testing.T) {
 	}
 }
 
+func TestCandidateArgumentsCarryPAR2PlacementPolicy(t *testing.T) {
+	stage := t.TempDir()
+	verify, err := candidateArguments(CorpusCaseManifest{Config: CaseConfig{Family: "par2", Mutation: "none"}}, stage, "canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(verify, "\x00"), strings.Join([]string{"par", "verify", "--par-placement", "canonical", filepath.Join(stage, "release.par2")}, "\x00"); got != want {
+		t.Fatalf("verify arguments = %q, want %q", verify, want)
+	}
+
+	repair, err := candidateArguments(CorpusCaseManifest{Config: CaseConfig{Family: "par2", Mutation: "damage"}}, stage, "smart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(repair[:4], "\x00"), strings.Join([]string{"auto", "--par-placement", "smart", "--output"}, "\x00"); got != want {
+		t.Fatalf("repair arguments = %q, want prefix %q", repair, want)
+	}
+}
+
 func TestPayloadGenerationIsDeterministic(t *testing.T) {
 	first := filepath.Join(t.TempDir(), "first.bin")
 	second := filepath.Join(t.TempDir(), "second.bin")
@@ -86,6 +105,51 @@ func TestCorpusConfigRejectsMutatedCaseWithoutRecovery(t *testing.T) {
 	}
 }
 
+func TestCorpusConfigRejectsPPMdOutsideRAR4(t *testing.T) {
+	config := validCorpusConfig()
+	config.Cases[0].PPMd = true
+	if err := config.Validate(); err == nil {
+		t.Fatal("PPMd outside RAR4 was accepted")
+	}
+}
+
+func TestCorpusConfigRequiresTextForPPMd(t *testing.T) {
+	config := validCorpusConfig()
+	config.Cases[0].Format = 4
+	config.Cases[0].PPMd = true
+	if err := config.Validate(); err == nil {
+		t.Fatal("binary PPMd case was accepted")
+	}
+	config.Cases[0].PayloadProfile = "text"
+	if err := config.Validate(); err != nil {
+		t.Fatalf("text PPMd case was rejected: %v", err)
+	}
+}
+
+func TestTextPayloadGenerationIsDeterministic(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first.txt")
+	second := filepath.Join(t.TempDir(), "second.txt")
+	firstDigest, err := writePayloadFileWithProfile(first, "seed", "case", "payload/part.txt", 97_321, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := writePayloadFileWithProfile(second, "seed", "case", "payload/part.txt", 97_321, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBytes, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBytes, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstBytes, secondBytes) || firstDigest != secondDigest || !bytes.Contains(firstBytes, []byte("archive ")) {
+		t.Fatal("deterministic text payload generation changed")
+	}
+}
+
 func TestPlanOrderIsStable(t *testing.T) {
 	ids := []string{"third", "first", "second"}
 	first := deterministicOrder(ids, "seed")
@@ -108,11 +172,11 @@ func TestRenderSVGIsDeterministicAndEscapesInput(t *testing.T) {
 	if !bytes.Equal(first, second) {
 		t.Fatal("SVG output is not byte deterministic")
 	}
-	const goldenRARSVG = "c0c5a03eb13dfb9f95ab9699e4a4f05b22139d28eb1d0da5ba04b5fee85fe1f5"
+	const goldenRARSVG = "eed298ba1db6925d6cc9e3d74da54f53ffc8ac63b1188abf7ee2b04d9b6ba89e"
 	if got := bytesSHA256(first); got != goldenRARSVG {
 		t.Fatalf("RAR SVG changed: got %s, want %s", got, goldenRARSVG)
 	}
-	for _, required := range []string{"<svg", "role=\"img\"", "1x parity", "&lt;unsafe&gt;", "report_sha256=report-digest"} {
+	for _, required := range []string{"<svg", "role=\"img\"", "1x parity", "&lt;unsafe&gt;", "report_sha256=report-digest", "par2_placement=canonical"} {
 		if !strings.Contains(string(first), required) {
 			t.Fatalf("SVG does not contain %q", required)
 		}
@@ -130,7 +194,7 @@ func TestRenderPAR2SVGGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const goldenPAR2SVG = "f52afcce95404fb00bac986ea8c543c937a46f3d124f6148fd33fab9ceb899d2"
+	const goldenPAR2SVG = "916c2208309b03eb3f89d2edb37d9f114cd4c60e8f4c9eecd457b5a6e95e9fbe"
 	if got := bytesSHA256(chart); got != goldenPAR2SVG {
 		t.Fatalf("PAR2 SVG changed: got %s, want %s", got, goldenPAR2SVG)
 	}
@@ -229,7 +293,7 @@ func validCorpusConfig() CorpusConfig {
 }
 
 func fixtureRunRecord() RunRecord {
-	plan := Plan{SchemaVersion: 1, ID: "plan-1", CorpusDigest: "corpus-digest", Seed: "seed", Warmups: 0, Repeats: 1, Lane: "cpu", Cases: []PlanCase{{ID: "case-1", Order: 1}}}
+	plan := Plan{SchemaVersion: PlanSchemaVersion, ID: "plan-1", CorpusDigest: "corpus-digest", Seed: "seed", Warmups: 0, Repeats: 1, Lane: "cpu", Par2Placement: "canonical", Cases: []PlanCase{{ID: "case-1", Order: 1}}}
 	return RunRecord{SchemaVersion: 1, Plan: plan, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{Label: "rarpar", SHA256: "candidate"}, Reference: &BinaryIdentity{Label: "reference", SHA256: "reference"}, Executions: []Execution{
 		{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "cpu", Measurement: Measurement{WallNanos: 500_000_000}},
 		{Subject: "reference", Role: "reference", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "reference", Measurement: Measurement{WallNanos: 1_000_000_000}},
@@ -237,5 +301,5 @@ func fixtureRunRecord() RunRecord {
 }
 
 func fixtureReport() Report {
-	return Report{SchemaVersion: 1, InputSHA256: "report-digest", Plan: Plan{ID: "plan-1", Lane: "cpu", Cases: []PlanCase{{ID: "case-1", Order: 1}}}, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{SHA256: "candidate"}, Reference: &BinaryIdentity{SHA256: "reference"}, Comparisons: []Comparison{{CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", CandidateLabel: "rarpar", ReferenceLabel: "UnRAR", Candidate: Summary{Median: 500_000_000}, Reference: Summary{Median: 1_000_000_000}, Ratio: 2, Backend: "cpu"}}}
+	return Report{SchemaVersion: 1, InputSHA256: "report-digest", Plan: Plan{ID: "plan-1", Lane: "cpu", Par2Placement: "canonical", Cases: []PlanCase{{ID: "case-1", Order: 1}}}, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{SHA256: "candidate"}, Reference: &BinaryIdentity{SHA256: "reference"}, Comparisons: []Comparison{{CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", CandidateLabel: "rarpar", ReferenceLabel: "UnRAR", Candidate: Summary{Median: 500_000_000}, Reference: Summary{Median: 1_000_000_000}, Ratio: 2, Backend: "cpu"}}}
 }

@@ -5,7 +5,7 @@ import "time"
 
 const (
 	CorpusSchemaVersion = 1
-	PlanSchemaVersion   = 1
+	PlanSchemaVersion   = 2
 	RunSchemaVersion    = 1
 	ReportSchemaVersion = 1
 )
@@ -50,6 +50,9 @@ type CaseConfig struct {
 	Writer          string `json:"writer"`
 	Format          int    `json:"format"`
 	Store           bool   `json:"store"`
+	PPMd            bool   `json:"ppmd"`
+	PayloadProfile  string `json:"payload_profile"`
+	VolumeSize      string `json:"volume_size"`
 	Solid           bool   `json:"solid"`
 	Encrypted       bool   `json:"encrypted"`
 	PAR2            bool   `json:"par2"`
@@ -90,6 +93,7 @@ type Plan struct {
 	Warmups       int        `json:"warmups"`
 	Repeats       int        `json:"repeats"`
 	Lane          string     `json:"lane"`
+	Par2Placement string     `json:"par2_placement"`
 	Cases         []PlanCase `json:"cases"`
 }
 

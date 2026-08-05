@@ -5,7 +5,7 @@
 //!
 //! Reference: 7-zip Ppmd7.c (public domain), Shkarin's original PPMd (public domain).
 
-use super::alloc::{NodeRef, SubAllocator, UNIT_SIZE, ValidatedArenaSpan};
+use super::alloc::{NodeRef, SubAllocator, UNIT_SIZE, ValidatedArenaOffset, ValidatedArenaSpan};
 use super::range::RangeCode;
 #[cfg(test)]
 use super::range::RangeDecoder;
@@ -89,9 +89,6 @@ pub struct Model {
 
     // Found state (byte offset of the matched state, 0 = not found).
     found_state: u32,
-    // Symbol from the last matched state. This avoids revalidating and
-    // rereading FoundState on the next binary or escape decision.
-    found_symbol: u8,
 
     order_fall: i32,
 
@@ -181,14 +178,13 @@ impl Model {
             min_context: 0,
             max_context: 0,
             found_state: 0,
-            found_symbol: 0,
             order_fall: 0,
             bin_summ: [[0u16; 64]; 128],
             ns2_indx: [0u8; 256],
             ns2_bs_indx: [0u8; 256],
             hb2_flag: [0u8; 256],
             char_mask: [0u8; 256],
-            esc_count: 0,
+            esc_count: 1,
             num_masked: 0,
             prev_success: 0,
             hi_bits_flag: 0,
@@ -202,9 +198,21 @@ impl Model {
             #[cfg(feature = "ppmd-debug")]
             debug: ppmd_debug_enabled(),
         };
-        model.build_lookup_tables();
-        model.restart();
+        model.start(max_order, alloc_size);
         model
+    }
+
+    pub fn start(&mut self, max_order: usize, alloc_size: usize) {
+        let max_order = max_order.clamp(2, MAX_ORDER);
+        let alloc_size = alloc_size.max(UNIT_SIZE * 8);
+        if self.alloc.allocated_size() != alloc_size {
+            self.alloc = SubAllocator::new(alloc_size);
+        }
+        self.max_order = max_order;
+        self.esc_count = 1;
+        self.model_fault = false;
+        self.restart();
+        self.build_lookup_tables();
     }
 
     fn build_lookup_tables(&mut self) {
@@ -231,7 +239,7 @@ impl Model {
             if k == 0 {
                 step += 1;
                 k = step;
-                m = m.saturating_add(1);
+                m += 1;
             }
         }
 
@@ -246,29 +254,14 @@ impl Model {
 
     /// Reset the model to initial state.
     pub fn restart(&mut self) {
-        self.alloc.reset();
-        self.see = SeeTable::new();
         self.char_mask = [0; 256];
-        self.esc_count = 1;
-        self.prev_success = 0;
-        self.run_length = self.init_rl;
-        self.order_fall = self.max_order as i32;
+        self.alloc.reset();
+        self.init_rl = -(self.max_order.min(12) as i32) - 1;
         #[cfg(feature = "ppmd-debug")]
         {
             self.debug_output_index = 0;
         }
 
-        // Initialize BinSumm.
-        for i in 0..128u16 {
-            for (k, &esc) in INIT_BIN_ESC.iter().enumerate() {
-                let val = BIN_SCALE as u16 - esc / (i + 2);
-                for m in (0..64).step_by(8) {
-                    self.bin_summ[i as usize][k + m] = val;
-                }
-            }
-        }
-
-        // Allocate root context.
         let root = self.alloc.alloc_context();
         if root.is_null() {
             return;
@@ -277,20 +270,21 @@ impl Model {
         self.min_context = root_off;
         self.max_context = root_off;
 
-        // Root has 256 symbols.
-        self.alloc.write_u32(root, CTX_SUFFIX, 0); // no suffix
+        self.alloc.write_u32(root, CTX_SUFFIX, 0);
+        self.order_fall = self.max_order as i32;
         self.alloc.write_u16(root, CTX_NUM_STATS, 256);
-        self.alloc.write_u16(root, CTX_SUMM_FREQ, 257); // 256 + 1
+        self.alloc.write_u16(root, CTX_SUMM_FREQ, 257);
 
-        // Allocate states array (256 states, 2 per unit = 128 units).
         let states = self.alloc.alloc_units(128);
         if states.is_null() {
             return;
         }
         let states_off = ref_to_off(states);
         self.alloc.write_u32(root, CTX_STATS, states_off);
+        self.found_state = states_off;
 
-        // Initialize 256 states: symbol=i, freq=1, successor=0.
+        self.run_length = self.init_rl;
+        self.prev_success = 0;
         for i in 0..256u32 {
             let off = states_off as usize + i as usize * STATE_SIZE;
             self.alloc.write_byte_at(off + STATE_SYM, i as u8);
@@ -298,9 +292,15 @@ impl Model {
             self.alloc.write_u32_at(off + STATE_SUCC, 0);
         }
 
-        // Set FoundState to first state (so found_state_symbol works).
-        self.found_state = states_off;
-        self.found_symbol = 0;
+        for i in 0..128u16 {
+            for (k, &esc) in INIT_BIN_ESC.iter().enumerate() {
+                let val = BIN_SCALE as u16 - esc / (i + 2);
+                for m in (0..64).step_by(8) {
+                    self.bin_summ[i as usize][k + m] = val;
+                }
+            }
+        }
+        self.see = SeeTable::new();
     }
 
     // --- Context field accessors ---
@@ -320,7 +320,7 @@ impl Model {
 
     #[inline(always)]
     fn validated_state(&self, state: u32) -> Option<ValidatedArenaSpan> {
-        self.alloc.validated_model_span(state, STATE_SIZE)
+        self.alloc.validated_tail_span(state, STATE_SIZE)
     }
 
     /// Packed context bytes 0..8: suffix, NumStats, and the first two union
@@ -371,11 +371,6 @@ impl Model {
     }
 
     #[inline(always)]
-    fn span_state_head(&self, span: ValidatedArenaSpan, index: usize) -> u16 {
-        self.alloc.span_read_u16(span, index * STATE_SIZE)
-    }
-
-    #[inline(always)]
     fn span_state_sym(&self, span: ValidatedArenaSpan, index: usize) -> u8 {
         self.alloc
             .span_read_u8(span, index * STATE_SIZE + STATE_SYM)
@@ -409,6 +404,22 @@ impl Model {
     fn span_set_state_succ(&mut self, span: ValidatedArenaSpan, index: usize, value: u32) {
         self.alloc
             .span_write_u32(span, index * STATE_SIZE + STATE_SUCC, value);
+    }
+
+    #[inline(always)]
+    fn span_write_state(
+        &mut self,
+        span: ValidatedArenaSpan,
+        index: usize,
+        symbol: u8,
+        frequency: u8,
+        successor: u32,
+    ) {
+        let relative = index * STATE_SIZE;
+        let head = u16::from(symbol) | (u16::from(frequency) << 8);
+        self.alloc.span_write_u16(span, relative, head);
+        self.alloc
+            .span_write_u32(span, relative + STATE_SUCC, successor);
     }
 
     #[inline(always)]
@@ -544,17 +555,6 @@ impl Model {
                 "PPMD decode_char start: index=117 min_context={} ns={} order_fall={} found_state={}",
                 self.min_context, ns, self.order_fall, self.found_state
             );
-        }
-        if self.min_context == 0 || self.alloc.text_exhausted() {
-            if self.debug_enabled() {
-                eprintln!(
-                    "PPMD decode_char early fail: min_context={} text_exhausted={} heap_end={}",
-                    self.min_context,
-                    self.alloc.text_exhausted(),
-                    self.alloc.heap_end_bytes()
-                );
-            }
-            return self.fail_model();
         }
         let Some(context_span) = self.validated_context(self.min_context) else {
             return self.fail_model();
@@ -692,7 +692,6 @@ impl Model {
             return self.fail_model();
         };
         let symbol = self.span_state_sym(found_span, 0);
-        self.found_symbol = symbol;
 
         if self.order_fall == 0 {
             let succ = self.span_state_succ(found_span, 0);
@@ -760,26 +759,33 @@ impl Model {
         let symbol = (context_head >> 48) as u8;
         let freq = (context_head >> 56) as u8;
 
-        // BinSumm index. `found_symbol` was copied from the last fully
-        // validated matched state and is reset with the model.
-        self.hi_bits_flag = self.hb2_flag[self.found_symbol as usize];
-        let suffix = context_head as u32;
-        let suffix_ns = if suffix != 0 {
-            let Some(suffix_span) = self.validated_context(suffix) else {
-                self.model_fault = true;
-                return false;
-            };
-            (self.span_context_head(suffix_span) >> 32) as u16
-        } else {
-            1 // Avoid underflow; won't be used if suffix is null.
+        let Some(previous_found_span) = self.validated_state(self.found_state) else {
+            self.model_fault = true;
+            return false;
         };
+        let previous_symbol = self.span_state_sym(previous_found_span, 0);
+        self.hi_bits_flag = self.hb2_flag[previous_symbol as usize];
+        let suffix = context_head as u32;
+        if freq == 0 || freq > 128 || suffix == 0 {
+            self.model_fault = true;
+            return false;
+        }
+        let Some(suffix_span) = self.validated_context(suffix) else {
+            self.model_fault = true;
+            return false;
+        };
+        let suffix_ns = (self.span_context_head(suffix_span) >> 32) as u16;
+        if suffix_ns == 0 || suffix_ns > 256 {
+            self.model_fault = true;
+            return false;
+        }
         let idx1 = self.prev_success as usize
-            + self.ns2_bs_indx[suffix_ns.wrapping_sub(1).min(255) as usize] as usize
+            + self.ns2_bs_indx[suffix_ns as usize - 1] as usize
             + self.hi_bits_flag as usize
             + 2 * self.hb2_flag[symbol as usize] as usize
             + ((self.run_length >> 26) as usize & 0x20);
-        let idx0 = (freq as usize).saturating_sub(1).min(127);
-        let idx1 = idx1.min(63);
+        let idx0 = freq as usize - 1;
+        debug_assert!(idx1 < 64);
         let bs = self.bin_summ[idx0][idx1];
         if self.debug_enabled() && (40272340..=40272346).contains(&self.debug_index()) {
             eprintln!(
@@ -869,6 +875,10 @@ impl Model {
         debug_assert_eq!(states_span.offset(), stats as usize);
         debug_assert_eq!(states_span.len(), ns * STATE_SIZE);
 
+        if sum_freq == 0 {
+            self.model_fault = true;
+            return false;
+        }
         let count = rc.get_current_count(sum_freq);
         if self.debug_enabled() && (40272340..=40272346).contains(&self.debug_index()) {
             eprintln!(
@@ -930,13 +940,17 @@ impl Model {
             }
             remaining -= 1;
             if remaining == 0 {
-                // Escape.
-                self.hi_bits_flag = self.hb2_flag[self.found_symbol as usize];
+                let Some(previous_found_span) = self.validated_state(self.found_state) else {
+                    self.model_fault = true;
+                    return false;
+                };
+                let previous_symbol = self.span_state_sym(previous_found_span, 0);
+                self.hi_bits_flag = self.hb2_flag[previous_symbol as usize];
                 self.num_masked = ns;
                 self.found_state = 0;
                 *found_span = None;
 
-                for index in 0..ns {
+                for index in (0..ns).rev() {
                     let sym = self.span_state_sym(states_span, index);
                     self.char_mask[sym as usize] = self.esc_count;
                 }
@@ -963,7 +977,7 @@ impl Model {
         let p = self.span_ctx_stats(context_span) + state_index as u32 * STATE_SIZE as u32;
         self.found_state = p;
         let freq = self.span_state_freq(states_span, state_index);
-        let new_freq = freq.saturating_add(4);
+        let new_freq = freq.wrapping_add(4);
         self.span_set_state_freq(states_span, state_index, new_freq);
 
         let sf = self.span_ctx_summ_freq(context_span);
@@ -1098,6 +1112,10 @@ impl Model {
 
         // makeEscFreq2
         let suffix_ns = suffix_data.map_or(0, |(_, head)| (head >> 32) as u16 as usize);
+        if ns != 256 && (suffix_ns < ns || suffix_ns > 256) {
+            self.model_fault = true;
+            return false;
+        }
         let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
 
         // Collect only the live state indices. The frequencies are already in
@@ -1105,22 +1123,26 @@ impl Model {
         // model-owned array avoids zeroing a padded 2 KiB stack allocation on
         // every escape decode.
         let mut hi_cnt = 0u32;
+        let esc_count = self.esc_count;
+        let alloc = &self.alloc;
+        let char_mask = &self.char_mask;
+        let scratch = &mut self.unmasked_scratch[..diff];
         let mut state_index = 0usize;
-        for scratch_index in 0..diff {
+        for slot in scratch.iter_mut() {
             let head = loop {
                 if state_index >= ns {
                     return false;
                 }
-                let head = self.span_state_head(states_span, state_index);
+                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
                 let sym = head as u8;
-                if self.char_mask[sym as usize] != self.esc_count {
+                if char_mask[sym as usize] != esc_count {
                     break head;
                 }
                 state_index += 1;
             };
 
             hi_cnt += (head >> 8) as u32;
-            self.unmasked_scratch[scratch_index] = pack_unmasked_state(state_index, head);
+            *slot = pack_unmasked_state(state_index, head);
             state_index += 1;
         }
         let n = diff;
@@ -1129,10 +1151,10 @@ impl Model {
         let count = rc.get_current_count(scale);
         if self.debug_enabled() && (40272340..=40272346).contains(&self.debug_index()) {
             let mut preview = Vec::new();
-            for index in 0..n.min(8) {
+            for &packed in self.unmasked_scratch[..n].iter().take(8) {
                 preview.push((
-                    unmasked_state_symbol(self.unmasked_scratch[index]),
-                    unmasked_state_frequency(self.unmasked_scratch[index]),
+                    unmasked_state_symbol(packed),
+                    unmasked_state_frequency(packed),
                 ));
             }
             eprintln!(
@@ -1165,26 +1187,29 @@ impl Model {
         if count < hi_cnt {
             // Symbol found among unmasked.
             let mut cum = 0u32;
-            for index in 0..n {
-                let packed = self.unmasked_scratch[index];
+            let mut selected = None;
+            for &packed in &self.unmasked_scratch[..n] {
                 let state_index = unmasked_state_index(packed);
                 let state_freq = unmasked_state_frequency(packed);
                 let freq = state_freq as u32;
                 cum += freq;
                 if cum > count {
-                    let low = cum - freq;
-                    rc.decode(low, freq, scale);
-                    // SEE update (success).
-                    self.see_update_success(see_index);
-                    return self.update2(
-                        ctx,
-                        context_span,
-                        states_span,
-                        state_index,
-                        state_freq,
-                        found_span,
-                    );
+                    selected = Some((state_index, state_freq, cum - freq));
+                    break;
                 }
+            }
+            if let Some((state_index, state_freq, low)) = selected {
+                rc.decode(low, u32::from(state_freq), scale);
+                // SEE update (success).
+                self.see_update_success(see_index);
+                return self.update2(
+                    ctx,
+                    context_span,
+                    states_span,
+                    state_index,
+                    state_freq,
+                    found_span,
+                );
             }
         }
 
@@ -1195,9 +1220,10 @@ impl Model {
         self.see_update_escape(see_index, scale);
 
         // Mask remaining unmasked symbols.
-        for index in 0..n {
-            let sym = unmasked_state_symbol(self.unmasked_scratch[index]);
-            self.char_mask[sym as usize] = self.esc_count;
+        let char_mask = &mut self.char_mask;
+        for &packed in &self.unmasked_scratch[..n] {
+            let sym = unmasked_state_symbol(packed);
+            char_mask[sym as usize] = esc_count;
         }
         self.num_masked = ns;
         *validated_suffix = suffix_data;
@@ -1214,17 +1240,17 @@ impl Model {
     ) -> (u32, Option<(usize, usize)>) {
         let ns = (context_head >> 32) as u16;
         if ns != 256 {
+            debug_assert!((1..=256).contains(&diff));
+            debug_assert!(suffix_ns >= ns as usize);
             let sf = (context_head >> 48) as u16;
-            let idx0 = self.ns2_indx[diff.saturating_sub(1).min(255)] as usize;
-            let idx1 = (if diff < suffix_ns.saturating_sub(ns as usize) {
-                1
-            } else {
-                0
-            }) + (if (sf as usize) < 11 * ns as usize {
-                2
-            } else {
-                0
-            }) + (if self.num_masked > diff { 4 } else { 0 })
+            let idx0 = self.ns2_indx[diff - 1] as usize;
+            let idx1 = (if diff < suffix_ns - ns as usize { 1 } else { 0 })
+                + (if (sf as usize) < 11 * ns as usize {
+                    2
+                } else {
+                    0
+                })
+                + (if self.num_masked > diff { 4 } else { 0 })
                 + self.hi_bits_flag as usize;
             let see_ctx = self.see.get(idx0, idx1);
             (see_ctx.get_mean(), Some((idx0, idx1)))
@@ -1265,7 +1291,7 @@ impl Model {
         debug_assert!(state_index < self.span_ctx_num_stats(context_span) as usize);
         let p = self.span_ctx_stats(context_span) + state_index as u32 * STATE_SIZE as u32;
         self.found_state = p;
-        let new_freq = freq.saturating_add(4);
+        let new_freq = freq.wrapping_add(4);
         self.span_set_state_freq(states_span, state_index, new_freq);
 
         let sf = self.span_ctx_summ_freq(context_span);
@@ -1325,7 +1351,7 @@ impl Model {
 
         // Boost first state.
         let f0 = self.span_state_freq(states_span, 0);
-        let new_f0 = f0.saturating_add(4);
+        let new_f0 = f0.wrapping_add(4);
         self.span_set_state_freq(states_span, 0, new_f0);
         let sf0 = self.span_ctx_summ_freq(context_span);
         self.span_set_ctx_summ_freq(context_span, sf0.wrapping_add(4));
@@ -1335,14 +1361,15 @@ impl Model {
             - self.span_state_freq(states_span, 0) as i32;
         let first_freq = ((self.span_state_freq(states_span, 0) as u16 + adder as u16) >> 1) as u8;
         self.span_set_state_freq(states_span, 0, first_freq);
-        let mut new_summ = first_freq as u16;
+        self.span_set_ctx_summ_freq(context_span, first_freq as u16);
 
         for state_index in 1..old_ns {
             esc_freq -= self.span_state_freq(states_span, state_index) as i32;
             let halved =
                 ((self.span_state_freq(states_span, state_index) as u16 + adder as u16) >> 1) as u8;
             self.span_set_state_freq(states_span, state_index, halved);
-            new_summ += halved as u16;
+            let summ = self.span_ctx_summ_freq(context_span);
+            self.span_set_ctx_summ_freq(context_span, summ.wrapping_add(halved as u16));
 
             // Maintain sorted order.
             if halved > self.span_state_freq(states_span, state_index - 1) {
@@ -1378,6 +1405,10 @@ impl Model {
             esc_freq += zero_count as i32;
             let new_ns = (old_ns - zero_count) as u16;
             self.span_set_ctx_num_stats(context_span, new_ns);
+            if new_ns == 0 || esc_freq < 0 {
+                self.model_fault = true;
+                return false;
+            }
 
             if new_ns == 1 {
                 // Collapse to single-state (OneState) context.
@@ -1388,9 +1419,12 @@ impl Model {
                 // Halve freq until escape is small.
                 let mut tf = tmp_freq;
                 let mut ef = esc_freq;
-                while ef > 1 {
-                    tf = tf.saturating_sub(tf >> 1);
+                loop {
+                    tf -= tf >> 1;
                     ef >>= 1;
+                    if ef <= 1 {
+                        break;
+                    }
                 }
 
                 // Free the stats array.
@@ -1405,13 +1439,24 @@ impl Model {
             }
         }
 
-        // Update SummFreq with halved escape.
-        new_summ += (esc_freq as u16).wrapping_sub((esc_freq as u16) >> 1);
-        self.span_set_ctx_summ_freq(context_span, new_summ);
+        if esc_freq < 0 {
+            self.model_fault = true;
+            return false;
+        }
+        let esc_freq = esc_freq as u16;
+        let summ = self.span_ctx_summ_freq(context_span);
+        self.span_set_ctx_summ_freq(
+            context_span,
+            summ.wrapping_add(esc_freq.wrapping_sub(esc_freq >> 1)),
+        );
 
         // Shrink stats array if needed.
         let n0 = (old_ns + 1) >> 1;
         let new_ns = self.span_ctx_num_stats(context_span) as usize;
+        if new_ns == 0 {
+            self.model_fault = true;
+            return false;
+        }
         let n1 = (new_ns + 1) >> 1;
         let mut new_stats = stats;
         if n0 != n1 {
@@ -1485,15 +1530,8 @@ impl Model {
                                 fs_sym, self.min_context, suffix, sns
                             );
                         }
-                        // Symbol not found in suffix — skip update.
-                        return self.do_update_model_core(
-                            found_span,
-                            min_context_span,
-                            fs_sym,
-                            fs_freq,
-                            fs_succ,
-                            0,
-                        );
+                        self.model_fault = true;
+                        return false;
                     }
                     // Swap with predecessor if freq is higher.
                     if self.span_state_freq(suffix_states, state_index)
@@ -1677,15 +1715,14 @@ impl Model {
                     self.model_fault = true;
                     return false;
                 };
-                self.span_set_state_sym(new_states_span, 0, os_sym);
+                self.span_write_state(new_states_span, 0, os_sym, os_freq, os_succ);
+                self.span_set_ctx_stats(context_span, new_stats);
                 let adj_freq = if os_freq < MAX_FREQ / 4 - 1 {
                     os_freq * 2
                 } else {
                     MAX_FREQ - 4
                 };
                 self.span_set_state_freq(new_states_span, 0, adj_freq);
-                self.span_set_state_succ(new_states_span, 0, os_succ);
-                self.span_set_ctx_stats(context_span, new_stats);
                 self.span_set_ctx_summ_freq(
                     context_span,
                     adj_freq as u16 + self.init_esc as u16 + if ns > 3 { 1 } else { 0 },
@@ -1711,7 +1748,6 @@ impl Model {
                 self.span_set_ctx_summ_freq(context_span, new_sf as u16);
             }
 
-            // Append new state at the end.
             self.span_set_state_succ(states_span, ns1 as usize, final_succ);
             self.span_set_state_sym(states_span, ns1 as usize, fs_sym);
             self.span_set_state_freq(states_span, ns1 as usize, new_freq as u8);
@@ -1768,11 +1804,11 @@ impl Model {
         }
 
         let mut pc = self.min_context;
-        let mut ps = [found_span; MAX_ORDER + 1];
+        let mut ps = [found_span.compact(); MAX_ORDER];
         let mut ps_len = 0usize;
 
         if !skip {
-            ps[ps_len] = found_span;
+            ps[ps_len] = found_span.compact();
             ps_len += 1;
             if min_suffix == 0 {
                 // NO_LOOP
@@ -1793,10 +1829,11 @@ impl Model {
                 pc = p1_succ;
                 return self.finish_create_successors(&ps[..ps_len], pc, up_branch, found_sym);
             }
-            if ps_len < MAX_ORDER + 1 {
-                ps[ps_len] = p1_span;
-                ps_len += 1;
+            if ps_len >= MAX_ORDER {
+                return 0;
             }
+            ps[ps_len] = p1_span.compact();
+            ps_len += 1;
             // Fall through to suffix walk.
             let Some(context_span) = self.validated_context(pc) else {
                 self.model_fault = true;
@@ -1832,7 +1869,8 @@ impl Model {
                 };
                 let Some(state_index) = self.span_find_state(states_span, ns as usize, found_sym)
                 else {
-                    break; // Not found — shouldn't happen in valid data.
+                    self.model_fault = true;
+                    return 0;
                 };
                 p_span = states_span.subspan(state_index * STATE_SIZE, STATE_SIZE);
                 p_succ = self.span_state_succ(states_span, state_index);
@@ -1860,10 +1898,10 @@ impl Model {
                 pc = p_succ;
                 break;
             }
-            if ps_len > MAX_ORDER {
-                return 0; // Safety limit.
+            if ps_len >= MAX_ORDER {
+                return 0;
             }
-            ps[ps_len] = p_span;
+            ps[ps_len] = p_span.compact();
             ps_len += 1;
 
             let suffix = self.span_ctx_suffix(context_span);
@@ -1879,7 +1917,7 @@ impl Model {
     #[inline(always)]
     fn finish_create_successors(
         &mut self,
-        ps: &[ValidatedArenaSpan],
+        ps: &[ValidatedArenaOffset],
         mut pc: u32,
         up_branch: u32,
         found_sym: u8,
@@ -1895,15 +1933,12 @@ impl Model {
         }
 
         // Read the symbol and successor from the text chain (UpBranch).
-        let up_sym;
-        let up_succ;
-        if up_branch != 0 && self.is_text_succ(up_branch) {
-            up_sym = self.alloc.read_byte_at(up_branch as usize);
-            up_succ = up_branch + 1;
-        } else {
-            up_sym = found_sym;
-            up_succ = up_branch;
+        if up_branch == 0 || !self.is_text_succ(up_branch) {
+            self.model_fault = true;
+            return 0;
         }
+        let up_sym = self.alloc.read_byte_at(up_branch as usize);
+        let up_succ = up_branch + 1;
 
         // Determine the frequency for the new state.
         let Some(context_span) = self.validated_context(pc) else {
@@ -1918,26 +1953,35 @@ impl Model {
                 self.model_fault = true;
                 return 0;
             };
-            if let Some(state_index) = self.span_find_state(states_span, ns_pc as usize, up_sym) {
-                let Some(cf) = self
-                    .span_state_freq(states_span, state_index)
-                    .checked_sub(1)
-                    .map(u32::from)
-                else {
+            let Some(state_index) = self.span_find_state(states_span, ns_pc as usize, up_sym)
+            else {
+                self.model_fault = true;
+                return 0;
+            };
+            let Some(cf) = self
+                .span_state_freq(states_span, state_index)
+                .checked_sub(1)
+                .map(u32::from)
+            else {
+                self.model_fault = true;
+                return 0;
+            };
+            let Some(s0) = (self.span_ctx_summ_freq(context_span) as u32)
+                .checked_sub(ns_pc as u32)
+                .and_then(|summ| summ.checked_sub(cf))
+            else {
+                self.model_fault = true;
+                return 0;
+            };
+            up_freq = if 2 * cf <= s0 {
+                1 + u8::from(5 * cf > s0)
+            } else {
+                if s0 == 0 {
                     self.model_fault = true;
                     return 0;
-                };
-                let s0 = (self.span_ctx_summ_freq(context_span) as u32)
-                    .wrapping_sub(ns_pc as u32)
-                    .wrapping_sub(cf);
-                up_freq = if 2 * cf <= s0 {
-                    1 + (if 5 * cf > s0 { 1 } else { 0 })
-                } else {
-                    (1 + ((2 * cf + 3 * s0 - 1) / (2 * s0))).min(255) as u8
-                };
-            } else {
-                up_freq = 1;
-            }
+                }
+                (1 + ((2 * cf + 3 * s0 - 1) / (2 * s0))) as u8
+            };
         } else {
             up_freq = self.span_one_freq(context_span);
         }
@@ -1954,7 +1998,8 @@ impl Model {
                 up_freq
             );
         }
-        for &state_span in ps.iter().rev() {
+        for &state_offset in ps.iter().rev() {
+            let state_span = state_offset.span(STATE_SIZE);
             let child_ref = self.alloc.alloc_context();
             if child_ref.is_null() {
                 return 0;
@@ -1965,14 +2010,11 @@ impl Model {
                 return 0;
             };
 
-            // Initialize as single-state context.
             self.span_set_ctx_num_stats(child_span, 1);
             self.span_set_one_sym(child_span, up_sym);
             self.span_set_one_freq(child_span, up_freq);
             self.span_set_one_succ(child_span, up_succ);
             self.span_set_ctx_suffix(child_span, pc);
-
-            // Update the state's successor to point to this new child.
             self.span_set_state_succ(state_span, 0, child);
 
             pc = child;
@@ -2022,6 +2064,18 @@ mod tests {
         let mut model = Model::new(6, 1024 * 1024);
         model.restart();
         assert_ne!(model.min_context, 0);
+    }
+
+    #[test]
+    fn start_reuses_same_sized_allocator_storage() {
+        let mut model = Model::new(6, 1024 * 1024);
+        let untouched_text_offset = UNIT_SIZE + 100;
+        model.alloc.write_byte_at(untouched_text_offset, 0xA5);
+
+        model.start(16, 1024 * 1024);
+
+        assert_eq!(model.max_order, 16);
+        assert_eq!(model.alloc.read_byte_at(untouched_text_offset), 0xA5);
     }
 
     #[test]
@@ -2154,5 +2208,25 @@ mod tests {
         let result = model.decode_char_result(&mut rc);
 
         assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
+    }
+
+    #[test]
+    fn rescale_single_state_collapse_always_halves_once() {
+        let mut model = Model::new(6, 1024 * 1024);
+        let context_span = model.validated_context(model.min_context).unwrap();
+        let stats = model.span_ctx_stats(context_span);
+        let states_span = model.validated_states(stats, 2).unwrap();
+
+        model.span_set_ctx_num_stats(context_span, 2);
+        model.span_set_ctx_summ_freq(context_span, 3);
+        model.span_write_state(states_span, 0, 10, 2, 0);
+        model.span_write_state(states_span, 1, 11, 1, 0);
+        model.found_state = stats;
+        model.order_fall = 0;
+
+        assert!(model.rescale(model.min_context));
+        assert_eq!(model.span_ctx_num_stats(context_span), 1);
+        assert_eq!(model.span_one_sym(context_span), 10);
+        assert_eq!(model.span_one_freq(context_span), 2);
     }
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const ROOT_LONG_ABOUT: &str = "\
 rarpar is a smart RAR/PAR2 repair and extraction tool.
@@ -66,6 +66,10 @@ pub struct Cli {
     /// Additional directory to search for PAR2-protected data files.
     #[arg(long, global = true, value_name = "DIR")]
     pub search_dir: Vec<PathBuf>,
+
+    /// PAR2 file placement policy: smart scans by content; canonical uses recorded paths only.
+    #[arg(long, global = true, value_enum, default_value_t = ParPlacement::Smart)]
+    pub par_placement: ParPlacement,
 
     /// File containing candidate archive passwords, one per line; values are never printed.
     #[arg(long, global = true, value_name = "PATH")]
@@ -161,6 +165,11 @@ files are rejected unless --overwrite is supplied.")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ParCommand {
     /// Verify files against a PAR2 set.
+    #[command(long_about = "\
+Verify files against a PAR2 set. The default smart placement mode can locate
+renamed or moved protected files by content. Use --par-placement canonical to
+verify only the paths recorded by the PAR2 set, which is useful for direct
+comparison with conventional PAR2 verification tools.")]
     Verify(ParArgs),
     /// Repair files using a PAR2 set.
     #[command(long_about = "\
@@ -177,4 +186,12 @@ pub struct ParArgs {
     /// Additional directories containing protected data files.
     #[arg(value_name = "SEARCH_DIR")]
     pub search_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParPlacement {
+    /// Locate renamed or moved files by content before verification or repair.
+    Smart,
+    /// Verify only the paths recorded by PAR2 and explicitly supplied search directories.
+    Canonical,
 }

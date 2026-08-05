@@ -45,6 +45,19 @@ func (config CorpusConfig) Validate() error {
 		if item.Format < 3 || item.Format > 5 || item.Writer == "" {
 			return fmt.Errorf("case %q has unsupported RAR writer configuration", item.ID)
 		}
+		if item.PPMd && item.Format != 4 {
+			return fmt.Errorf("case %q requests PPMd outside RAR4", item.ID)
+		}
+		profile := item.PayloadProfile
+		if profile == "" {
+			profile = "binary"
+		}
+		if profile != "binary" && profile != "text" {
+			return fmt.Errorf("case %q has unsupported payload profile %q", item.ID, item.PayloadProfile)
+		}
+		if item.PPMd && profile != "text" {
+			return fmt.Errorf("PPMd case %q must use the text payload profile", item.ID)
+		}
 		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "remove-volume" {
 			return fmt.Errorf("case %q has unsupported mutation %q", item.ID, item.Mutation)
 		}
@@ -101,11 +114,15 @@ func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusC
 	if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
 		return err
 	}
-	expected, err := writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes)
+	expected, err := writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes, item.PayloadProfile)
 	if err != nil {
 		return fmt.Errorf("write payload for %s: %w", item.ID, err)
 	}
-	archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + config.VolumeSize}
+	volumeSize := config.VolumeSize
+	if item.VolumeSize != "" {
+		volumeSize = item.VolumeSize
+	}
+	archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + volumeSize}
 	// The legacy writers naturally emit their own format; RAR 3.93 does not
 	// understand -ma3. RAR 5 is the only case that needs an explicit selector.
 	if item.Format == 5 {
@@ -113,6 +130,11 @@ func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusC
 	}
 	if item.Store {
 		archiveArgs = append(archiveArgs, "-m0")
+	}
+	if item.PPMd {
+		// RAR4's text module is its PPMd decoder path. Force it and pin its
+		// order and memory so this corpus case has stable codec provenance.
+		archiveArgs = append(archiveArgs, "-mc10:32t+")
 	}
 	if !item.Solid {
 		archiveArgs = append(archiveArgs, "-s-")
@@ -177,13 +199,20 @@ func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusC
 	return writeJSON(filepath.Join(caseRoot, "manifest.json"), manifest)
 }
 
-func writeDeterministicPayload(root, seed, caseID string, total int64) ([]ExpectedFile, error) {
+func writeDeterministicPayload(root, seed, caseID string, total int64, profile string) ([]ExpectedFile, error) {
+	if profile == "" {
+		profile = "binary"
+	}
 	parts := []int64{total * 3 / 4, total / 8, total - (total*3/4 + total/8)}
 	var expected []ExpectedFile
+	extension := "bin"
+	if profile == "text" {
+		extension = "txt"
+	}
 	for index, bytes := range parts {
-		relative := filepath.Join("payload", fmt.Sprintf("part-%02d.bin", index+1))
+		relative := filepath.Join("payload", fmt.Sprintf("part-%02d.%s", index+1, extension))
 		path := filepath.Join(filepath.Dir(root), relative)
-		digest, err := writePayloadFile(path, seed, caseID, relative, bytes)
+		digest, err := writePayloadFileWithProfile(path, seed, caseID, relative, bytes, profile)
 		if err != nil {
 			return nil, err
 		}
@@ -193,6 +222,10 @@ func writeDeterministicPayload(root, seed, caseID string, total int64) ([]Expect
 }
 
 func writePayloadFile(path, seed, caseID, fileID string, bytes int64) (string, error) {
+	return writePayloadFileWithProfile(path, seed, caseID, fileID, bytes, "binary")
+}
+
+func writePayloadFileWithProfile(path, seed, caseID, fileID string, bytes int64, profile string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
@@ -206,14 +239,13 @@ func writePayloadFile(path, seed, caseID, fileID string, bytes int64) (string, e
 	remaining := bytes
 	buffer := make([]byte, 32*1024)
 	for remaining > 0 {
-		for offset := 0; offset < len(buffer); offset += sha256.Size {
-			input := []byte(seed + "\x00" + caseID + "\x00" + fileID)
-			var counter [16]byte
-			binary.LittleEndian.PutUint64(counter[:8], block)
-			binary.LittleEndian.PutUint64(counter[8:], uint64(offset/sha256.Size))
-			input = append(input, counter[:]...)
-			digest := sha256.Sum256(input)
-			copy(buffer[offset:], digest[:])
+		switch profile {
+		case "binary":
+			fillBinaryPayloadBlock(buffer, seed, caseID, fileID, block)
+		case "text":
+			fillTextPayloadBlock(buffer, seed, caseID, fileID, block)
+		default:
+			return "", fmt.Errorf("unsupported payload profile %q", profile)
 		}
 		count := int64(len(buffer))
 		if count > remaining {
@@ -229,6 +261,31 @@ func writePayloadFile(path, seed, caseID, fileID string, bytes int64) (string, e
 		block++
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func fillBinaryPayloadBlock(buffer []byte, seed, caseID, fileID string, block uint64) {
+	for offset := 0; offset < len(buffer); offset += sha256.Size {
+		input := []byte(seed + "\x00" + caseID + "\x00" + fileID)
+		var counter [16]byte
+		binary.LittleEndian.PutUint64(counter[:8], block)
+		binary.LittleEndian.PutUint64(counter[8:], uint64(offset/sha256.Size))
+		input = append(input, counter[:]...)
+		digest := sha256.Sum256(input)
+		copy(buffer[offset:], digest[:])
+	}
+}
+
+func fillTextPayloadBlock(buffer []byte, seed, caseID, fileID string, block uint64) {
+	words := [...]string{"archive", "block", "checksum", "content", "extract", "header", "member", "parity", "repair", "volume"}
+	input := []byte(seed + "\x00" + caseID + "\x00" + fileID)
+	for offset, word := 0, uint64(0); offset < len(buffer); word++ {
+		var counter [16]byte
+		binary.LittleEndian.PutUint64(counter[:8], block)
+		binary.LittleEndian.PutUint64(counter[8:], word)
+		digest := sha256.Sum256(append(input, counter[:]...))
+		token := words[int(digest[0])%len(words)] + " "
+		offset += copy(buffer[offset:], token)
+	}
 }
 
 func verifyWithWriter(ctx context.Context, docker string, writer RARWriter, root string, encrypted bool, expected []ExpectedFile) error {

@@ -111,6 +111,72 @@ fn command_help_documents_mutation_safety() {
 }
 
 #[test]
+fn par_help_documents_canonical_placement_mode() {
+    let output = run(&[
+        OsStr::new("par"),
+        OsStr::new("verify"),
+        OsStr::new("--help"),
+    ]);
+    assert!(
+        output.status.success(),
+        "par verify --help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--par-placement"));
+    assert!(stdout.contains("canonical"));
+    assert!(stdout.contains("renamed or moved"));
+}
+
+#[test]
+fn par_canonical_placement_does_not_scan_for_renamed_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+    std::fs::rename(
+        work_dir.join("fixture_rar5_lz_plain.part2.rar"),
+        work_dir.join("relocated-volume"),
+    )
+    .unwrap();
+
+    let canonical = run(&[
+        OsStr::new("par"),
+        OsStr::new("verify"),
+        OsStr::new("--par-placement"),
+        OsStr::new("canonical"),
+        work_dir.as_os_str(),
+    ]);
+    assert!(
+        !canonical.status.success(),
+        "canonical placement must not hash-scan renamed files: stdout={} stderr={}",
+        String::from_utf8_lossy(&canonical.stdout),
+        String::from_utf8_lossy(&canonical.stderr)
+    );
+
+    let smart = run(&[
+        OsStr::new("par"),
+        OsStr::new("verify"),
+        OsStr::new("--par-placement"),
+        OsStr::new("smart"),
+        work_dir.as_os_str(),
+    ]);
+    assert!(
+        smart.status.success(),
+        "smart placement should locate the renamed volume: stdout={} stderr={}",
+        String::from_utf8_lossy(&smart.stdout),
+        String::from_utf8_lossy(&smart.stderr)
+    );
+}
+
+#[test]
 fn inspect_detects_obfuscated_rar_by_magic_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[

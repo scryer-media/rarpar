@@ -111,6 +111,7 @@ compile_error!(
 );
 
 pub mod checksum;
+mod cpu_repair_controller;
 pub mod disk;
 pub mod error;
 pub mod evidence;

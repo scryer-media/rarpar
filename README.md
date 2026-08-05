@@ -175,6 +175,14 @@ rarpar par verify release.par2
 rarpar par repair release.par2
 ```
 
+PAR2 placement defaults to `smart`, which can locate renamed or moved data by
+content. For a conventional expected-path-only verification or repair, use:
+
+```bash
+rarpar par verify --par-placement canonical release.par2
+rarpar auto --par-placement canonical ./release
+```
+
 Discovery controls are global:
 
 ```bash

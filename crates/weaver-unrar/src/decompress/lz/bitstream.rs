@@ -32,6 +32,15 @@ pub trait BitRead {
     fn read_byte(&mut self) -> RarResult<u8> {
         Ok(self.read_bits(8)? as u8)
     }
+
+    /// Range decoders conventionally pad truncated input with zero. The
+    /// default preserves that behavior for external readers without changing
+    /// the checked `read_byte` contract.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn read_byte_or_zero(&mut self) -> u8 {
+        self.read_byte().unwrap_or(0)
+    }
     #[inline(always)]
     fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
         debug_assert!(count <= 64);
@@ -410,6 +419,21 @@ impl<'a> BitReader<'a> {
         Ok(byte)
     }
 
+    #[inline(always)]
+    fn read_byte_or_zero(&mut self) -> u8 {
+        if self.acc_bits < 8 {
+            self.refill();
+            if self.acc_bits < 8 {
+                return 0;
+            }
+        }
+
+        let byte = (self.acc >> 56) as u8;
+        self.acc <<= 8;
+        self.acc_bits -= 8;
+        byte
+    }
+
     /// Read a 32-bit little-endian value from the bitstream.
     /// This reads 4 bytes, where each byte is read MSB-first in the bitstream.
     pub fn read_u32_le(&mut self) -> RarResult<u32> {
@@ -467,6 +491,11 @@ impl BitRead for BitReader<'_> {
     #[inline(always)]
     fn read_byte(&mut self) -> RarResult<u8> {
         BitReader::read_byte(self)
+    }
+
+    #[inline(always)]
+    fn read_byte_or_zero(&mut self) -> u8 {
+        BitReader::read_byte_or_zero(self)
     }
 
     fn peek_16_raw(&mut self) -> RarResult<u32> {
@@ -737,6 +766,21 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         self.acc_bits -= 8;
         self.bit_pos += 8;
         Ok(byte)
+    }
+
+    #[inline(always)]
+    fn read_byte_or_zero(&mut self) -> u8 {
+        if self.acc_bits < 8 {
+            if self.refill().is_err() || self.acc_bits < 8 {
+                return 0;
+            }
+        }
+
+        let byte = (self.acc >> 56) as u8;
+        self.acc <<= 8;
+        self.acc_bits -= 8;
+        self.bit_pos += 8;
+        byte
     }
 
     #[inline(always)]

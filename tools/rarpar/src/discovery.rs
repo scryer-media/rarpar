@@ -648,10 +648,35 @@ fn looks_like_rar(path: &Path, prefix: &[u8]) -> bool {
 }
 
 fn looks_rarish_by_name(path: &Path) -> bool {
-    is_ext(path, "rar")
-        || path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
-            ext.len() == 3 && ext.starts_with('r') && ext[1..].chars().all(|ch| ch.is_ascii_digit())
-        })
+    is_ext(path, "rar") || old_rar_volume_index(path).is_some()
+}
+
+fn old_rar_volume_index(path: &Path) -> Option<usize> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    let bytes = ext.as_bytes();
+    if bytes.len() != 3 {
+        return None;
+    }
+
+    if bytes.iter().all(u8::is_ascii_digit) {
+        let number = usize::from(bytes[0] - b'0') * 100
+            + usize::from(bytes[1] - b'0') * 10
+            + usize::from(bytes[2] - b'0');
+        return number.checked_sub(1);
+    }
+    if !bytes[1].is_ascii_digit() || !bytes[2].is_ascii_digit() {
+        return None;
+    }
+
+    let prefix = bytes[0];
+    let number = usize::from(bytes[1] - b'0') * 10 + usize::from(bytes[2] - b'0');
+    if (b'a'..b'r').contains(&prefix) {
+        return Some(999 + usize::from(prefix - b'a') * 100 + number);
+    }
+    if !(b'r'..=b'z').contains(&prefix) {
+        return None;
+    }
+    Some(usize::from(prefix - b'r') * 100 + number + 1)
 }
 
 fn set_hint(path: &Path) -> Option<String> {
@@ -674,6 +699,9 @@ fn filename_volume_index(path: &Path) -> usize {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".rar") && !lower.contains(".part") {
         return 0;
+    }
+    if let Some(index) = old_rar_volume_index(path) {
+        return index;
     }
     for marker in [".part", ".r", ".vol"] {
         if let Some(index) = lower.find(marker) {
@@ -740,4 +768,26 @@ fn is_ext(path: &Path, expected: &str) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_rar_volume_rollover_is_recognized_and_sorted() {
+        for (name, index) in [
+            ("movie.r00", 1),
+            ("movie.r99", 100),
+            ("movie.s00", 101),
+            ("movie.z99", 900),
+            ("movie.001", 0),
+            ("movie.999", 998),
+            ("movie.a00", 999),
+        ] {
+            let path = Path::new(name);
+            assert!(looks_rarish_by_name(path), "{name}");
+            assert_eq!(filename_volume_index(path), index, "{name}");
+        }
+    }
 }

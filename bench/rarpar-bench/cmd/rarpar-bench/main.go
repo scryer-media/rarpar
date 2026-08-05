@@ -50,13 +50,14 @@ func usage() {
   rarpar-bench toolchains validate|build [--config PATH] [--docker PATH]
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
-  rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--warmups N] [--repeats N]
+  rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--par2-placement MODE] [--warmups N] [--repeats N]
   rarpar-bench preflight [--docker PATH]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE]
   rarpar-bench report --input FILE --out FILE
   rarpar-bench render --input FILE --out DIR
 
-LANE is cpu or docker-cpu. Corpus data and run evidence are
+LANE is cpu or docker-cpu. PAR2 placement is canonical or smart; canonical
+matches conventional expected-path verification for direct comparisons. Corpus data and run evidence are
 intentionally external to source control; use target/bench by convention.
 `)
 }
@@ -132,6 +133,7 @@ func runPlan(args []string) error {
 	out := flags.String("out", "", "plan JSON path")
 	seed := flags.String("seed", "rarpar-benchmark-plan-v1", "ordering seed")
 	lane := flags.String("lane", "cpu", "execution lane")
+	par2Placement := flags.String("par2-placement", "canonical", "PAR2 placement policy: canonical or smart")
 	warmups := flags.Int("warmups", 1, "warmup count")
 	repeats := flags.Int("repeats", 5, "measurement count")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -140,7 +142,7 @@ func runPlan(args []string) error {
 	if *corpus == "" || *out == "" {
 		return fmt.Errorf("--corpus and --out are required")
 	}
-	plan, err := bench.CreatePlan(workspacePath(*corpus), *seed, *lane, *warmups, *repeats)
+	plan, err := bench.CreatePlan(workspacePath(*corpus), *seed, *lane, *par2Placement, *warmups, *repeats)
 	if err != nil {
 		return err
 	}

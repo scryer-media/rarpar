@@ -172,7 +172,7 @@ func executeSubject(ctx context.Context, role, label, binary string, manifest Co
 			cleanup()
 		}
 	}()
-	args, err := candidateArguments(manifest, stage)
+	args, err := candidateArguments(manifest, stage, options.Plan.Par2Placement)
 	if err != nil {
 		return failedExecution(role, label, manifest, run, warmup, err)
 	}
@@ -283,11 +283,11 @@ func applyMutation(stage string, manifest CorpusCaseManifest) error {
 	}
 }
 
-func candidateArguments(manifest CorpusCaseManifest, stage string) ([]string, error) {
+func candidateArguments(manifest CorpusCaseManifest, stage, par2Placement string) ([]string, error) {
 	if manifest.Config.Family == "par2" && manifest.Config.Mutation == "none" {
-		return []string{"par", "verify", filepath.Join(stage, "release.par2")}, nil
+		return []string{"par", "verify", "--par-placement", par2Placement, filepath.Join(stage, "release.par2")}, nil
 	}
-	args := []string{"auto", "--output", filepath.Join(stage, "out")}
+	args := []string{"auto", "--par-placement", par2Placement, "--output", filepath.Join(stage, "out")}
 	if manifest.Config.Encrypted {
 		passwordFile := filepath.Join(stage, "passwords.txt")
 		if err := os.WriteFile(passwordFile, []byte(benchmarkPassword+"\n"), 0o600); err != nil {

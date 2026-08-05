@@ -26,16 +26,28 @@ only its archive/parity source material, a manifest, and expected extracted
 file hashes. The temporary original payload is independently extracted and
 verified before it is discarded.
 
+The default RAR extraction suite covers legacy RAR3 volumes, RAR4 LZ, and RAR5
+normal, solid, and encrypted archives. The in-progress RAR4 PPMd multi-volume
+cases are retained separately in `bench/rarpar-bench/config/corpus-ppmd.json`.
+They use deterministic text payloads and are intentionally opt-in until the
+decoder work settles.
+
 ## Runs
 
 Create and retain a plan before measuring. The default plan has one warmup and
-five measured samples in deterministic order.
+five measured samples in deterministic order. It records `canonical` PAR2
+placement by default: rarpar verifies the paths recorded in the PAR2 set,
+without its optional content-based relocation scan. This is the comparable lane
+for conventional PAR2 tools. Use `--par2-placement smart` to measure rarpar's
+relocated-file workflow instead; do not compare those reports as the same
+operation.
 
 ```sh
 cargo run --locked -p xtask -- bench plan create \
   --corpus target/bench/corpus \
   --out target/bench/plan.json \
-  --lane cpu
+  --lane cpu \
+  --par2-placement canonical
 
 cargo run --locked -p xtask -- bench run \
   --corpus target/bench/corpus \

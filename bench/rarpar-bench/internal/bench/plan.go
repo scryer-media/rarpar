@@ -6,12 +6,15 @@ import (
 	"sort"
 )
 
-func CreatePlan(corpusRoot, seed, lane string, warmups, repeats int) (Plan, error) {
+func CreatePlan(corpusRoot, seed, lane, par2Placement string, warmups, repeats int) (Plan, error) {
 	if warmups < 0 || repeats < 1 {
 		return Plan{}, fmt.Errorf("warmups must be non-negative and repeats must be positive")
 	}
 	if lane != "cpu" && lane != "docker-cpu" {
 		return Plan{}, fmt.Errorf("lane must be cpu or docker-cpu")
+	}
+	if par2Placement != "canonical" && par2Placement != "smart" {
+		return Plan{}, fmt.Errorf("PAR2 placement must be canonical or smart")
 	}
 	var index struct {
 		Digest string `json:"digest"`
@@ -53,16 +56,18 @@ func CreatePlan(corpusRoot, seed, lane string, warmups, repeats int) (Plan, erro
 		Warmups:       warmups,
 		Repeats:       repeats,
 		Lane:          lane,
+		Par2Placement: par2Placement,
 		Cases:         cases,
 	}
 	encoded, err := canonicalJSON(struct {
-		CorpusDigest string     `json:"corpus_digest"`
-		Seed         string     `json:"seed"`
-		Warmups      int        `json:"warmups"`
-		Repeats      int        `json:"repeats"`
-		Lane         string     `json:"lane"`
-		Cases        []PlanCase `json:"cases"`
-	}{plan.CorpusDigest, plan.Seed, plan.Warmups, plan.Repeats, plan.Lane, plan.Cases})
+		CorpusDigest  string     `json:"corpus_digest"`
+		Seed          string     `json:"seed"`
+		Warmups       int        `json:"warmups"`
+		Repeats       int        `json:"repeats"`
+		Lane          string     `json:"lane"`
+		Par2Placement string     `json:"par2_placement"`
+		Cases         []PlanCase `json:"cases"`
+	}{plan.CorpusDigest, plan.Seed, plan.Warmups, plan.Repeats, plan.Lane, plan.Par2Placement, plan.Cases})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -75,7 +80,7 @@ func LoadPlan(path, corpusDigest string) (Plan, error) {
 	if err := readJSON(path, &plan); err != nil {
 		return Plan{}, err
 	}
-	if plan.SchemaVersion != PlanSchemaVersion || plan.ID == "" || plan.CorpusDigest != corpusDigest || plan.Repeats < 1 {
+	if plan.SchemaVersion != PlanSchemaVersion || plan.ID == "" || plan.CorpusDigest != corpusDigest || plan.Repeats < 1 || (plan.Par2Placement != "canonical" && plan.Par2Placement != "smart") {
 		return Plan{}, fmt.Errorf("invalid plan %s", path)
 	}
 	seen := map[string]bool{}

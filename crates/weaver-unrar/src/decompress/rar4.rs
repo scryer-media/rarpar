@@ -1766,7 +1766,11 @@ impl Rar4LzDecoder {
             }
             let alloc_size = (max_mb + 1) * 1024 * 1024;
             trace!("RAR4 PPMd init: order={order}, alloc={alloc_size}");
-            self.ppm_model = Some(Model::new(order, alloc_size));
+            if let Some(model) = self.ppm_model.as_mut() {
+                model.start(order, alloc_size);
+            } else {
+                self.ppm_model = Some(Model::new(order, alloc_size));
+            }
         }
 
         Ok(())
@@ -2074,7 +2078,6 @@ impl Rar4LzDecoder {
         self.low_dist_rep_count = 0;
         self.prev_low_dist = 0;
         self.block_type = BlockType::Lz;
-        self.ppm_model = None;
         self.ppm_esc_char = 2;
         self.tables_read = false;
         self.vm_filters.clear();
@@ -2202,6 +2205,19 @@ mod tests {
         assert_eq!(decoder.window.dict_size(), 4 * 1024 * 1024);
         assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
         assert_eq!(decoder.last_length, 0);
+    }
+
+    #[test]
+    fn non_solid_reset_keeps_ppmd_allocation_for_the_next_header() {
+        let mut decoder = Rar4LzDecoder::new(1024 * 1024);
+        decoder.ppm_model = Some(Model::new(16, 1024 * 1024));
+        decoder.block_type = BlockType::Ppm;
+
+        decoder.reset();
+
+        assert!(decoder.ppm_model.is_some());
+        assert!(matches!(decoder.block_type, BlockType::Lz));
+        assert!(decoder.ppm_rc_state.is_none());
     }
 
     #[test]
