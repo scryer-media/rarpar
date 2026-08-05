@@ -70,6 +70,40 @@ non-final part, so damage is caught at the part carrying it rather than at the
 end of the member. Note that `-htb` archives replace CRC32 with BLAKE2sp rather
 than adding it.
 
+## Performance
+
+Measured against `unrar 7.20` on archives built natively with `rar 7.20` (and
+`rar 6.24` for RAR4). Extraction includes full verification, and every output is
+byte-compared against the source payload. Warm-cache medians from release builds
+with shipped flags. Test machines: Apple M5 Max (macOS), Intel Core Ultra 9 285H
+(Ubuntu 24.04, P-core pinned), AMD Ryzen 5 3600 (Windows, Zen 2).
+
+| Machine | Workload | unrar 7.20 | unrar-rs | |
+|---|---|---:|---:|---|
+| M5 Max | RAR7 video, 4.9 GB, 4.6 GB dictionary, `-m3` | 8.6 s | **5.8 s** | 1.5× |
+| M5 Max | RAR5 encrypted, AES-256 | 0.41 s | **0.25 s** | 1.6× |
+| M5 Max | RAR5 solid video, 225 MB | 0.27 s | **0.22 s** | 1.2× |
+| M5 Max | Store-mode verify, BLAKE2sp, 4.9 GB | 1.27 s | **0.76 s** | 1.7× |
+| M5 Max | RAR4 solid video *(CPU seconds)* | 1.21 s | **0.19 s** | 6× |
+| M5 Max | RAR4 PPMd solid text, 200 MB | **44.2 s** | 50.9 s | 0.87× |
+| 285H | RAR7 video, 4.9 GB, `-m3` | 17.7 s | **13.5 s** | 1.3× |
+| 285H | RAR5 encrypted, AES-256 | 0.83 s | **0.52 s** | 1.6× |
+| 285H | RAR5 solid video, 216 MB | 0.78 s | **0.54 s** | 1.4× |
+| 285H | RAR5 solid text, 157 MB | **1.52 s** | 2.98 s | 0.5× |
+| 285H | RAR4 PPMd solid text, 156 MB | **28.7 s** | 47.5 s | 0.6× |
+| Ryzen 5 3600 | RAR7 video, 4.94 GB, `-m3` | 13.5 s | 13.6 s | parity |
+| Ryzen 5 3600 | Store-mode verify, BLAKE2sp, 4.94 GB | 3.48 s | **1.80 s** | 1.9× |
+| Ryzen 5 3600 | Store-mode extract to disk, 4.94 GB | **3.28 s** | 5.0 s | 0.66× |
+
+Video, encrypted, and store-mode verification win. Compressible text and RAR4
+PPMd lose: PPMd keeps bounds checks where the reference uses raw pointers, and
+dense text is a tighter per-symbol Huffman loop upstream. Windows store-mode
+write-to-disk trails on the write path.
+
+Peak memory is archive-size-independent, roughly 275 MB on a 2.25 GB solid set
+(reference unrar MT: ~264 MB). Encrypted extraction costs almost nothing extra
+because AES runs through AWS-LC.
+
 ## Provenance
 
 This is a Rust port of RARLAB's reference UnRAR implementation, with additional

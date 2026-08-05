@@ -51,10 +51,48 @@ source with no file paths at all.
 
 ## Performance
 
-Repair is backed by [`reedsolomon-rs`], which selects GF(2¹⁶) SIMD kernels at
-runtime from the host CPU's features. Optional `metal` and `wgpu` features add
-GPU-accelerated repair, both falling back to CPU when no suitable device is
-present.
+Measured against `par2cmdline-turbo 1.4.0` on the same damaged sets, across an
+11-scenario differential suite. Warm-cache medians from release builds with
+shipped flags; every repair is byte-compared against pristine output. Test
+machines: Apple M5 Max (macOS), Intel Core Ultra 9 285H (Ubuntu 24.04), AMD
+Ryzen 5 3600 (Windows, Zen 2 — no GFNI).
+
+**Repair**
+
+| Machine | Workload | turbo | par2-rs | |
+|---|---|---:|---:|---|
+| M5 Max | 4 GB set, 1 MB slices, 407 missing | 112 s | **28.5 s** | 3.9× |
+| M5 Max | 2 GB set, 32,768 slices, 3,000 missing | 457 s | **95 s** | 4.8× |
+| 285H | 4 GB set, 1 MB slices, 407 missing | 12.1 s | **8.1 s** | 1.5× |
+| 285H | 2 GB set, 32,768 slices, 3,000 missing | **36.6 s** | 51.5 s | 0.7× |
+| Ryzen 5 3600 | 4 GB set, 1 MB slices, 407 damaged | 26.3 s | **20.0 s** | 1.3× |
+| Ryzen 5 3600 | 2 GB set, 32,768 slices, 3,000 damaged | **62.7 s** | 105.7 s | 0.6× |
+
+**Verification**
+
+| Machine | Workload | turbo | par2-rs | |
+|---|---|---:|---:|---|
+| M5 Max | Clean 1 GB set | 2.43 s | **0.09 s** | 27× |
+| 285H | Clean 1 GB set | 0.66 s | **0.37 s** | 1.8× |
+| 285H | Damaged 2 GB set, 3,000 bad blocks | 7.3 s | **5.4 s** | 1.35× |
+| Ryzen 5 3600 | Clean 1 GB set | 1.70 s | **0.30 s** | 5.7× |
+
+**GPU repair** (Apple Silicon, `metal` feature)
+
+| Workload | turbo | CPU (NEON) | Metal | |
+|---|---:|---:|---:|---|
+| 512 MB set, 64 KiB slices, 1,400 missing | 78.1 s | 8.96 s | **4.10 s** | 19× |
+| 76 MB set, 400 missing | 3.71 s | 0.62 s | **0.40 s** | 9× |
+
+Verification wins on every machine: candidate windows are CRC-gated, MD5 is
+confirmed only when needed, and a single file is scanned in parallel where
+turbo's damaged scan is serial.
+
+Repair is shape-dependent. The many-file case wins; the single-file,
+many-slice case still trails on x86 and Windows, where turbo's ParPar
+auto-selects an XOR-JIT kernel that runs the GF(2¹⁶) multiply on vector-XOR
+ports rather than the saturated shuffle ports. An equivalent tier is in
+progress.
 
 ## Provenance
 
