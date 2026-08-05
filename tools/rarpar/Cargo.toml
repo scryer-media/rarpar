@@ -27,7 +27,7 @@ runtime = [
 ]
 
 [dependencies]
-par2-rs = { path = "../../crates/weaver-par2", version = "0.2.3", default-features = false, optional = true }
+par2-rs = { path = "../../crates/weaver-par2", version = "0.3.0", default-features = false, optional = true }
 unrar-rs = { path = "../../crates/weaver-unrar", version = "0.3.1", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }

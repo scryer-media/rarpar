@@ -93,14 +93,14 @@ fn prefetch_src_l1(ptr: *const u8) {
 /// to PSHUFB / VTBL which operate on bytes.
 #[derive(Clone)]
 pub struct MulTables {
-    /// tables[0]: low byte of result contribution from nibble 0 (bits 0-3 of input low byte)
-    /// tables[1]: high byte of result contribution from nibble 0
-    /// tables[2]: low byte of result contribution from nibble 1 (bits 4-7 of input low byte)
-    /// tables[3]: high byte of result contribution from nibble 1
-    /// tables[4]: low byte of result contribution from nibble 2 (bits 0-3 of input high byte)
-    /// tables[5]: high byte of result contribution from nibble 2
-    /// tables[6]: low byte of result contribution from nibble 3 (bits 4-7 of input high byte)
-    /// tables[7]: high byte of result contribution from nibble 3
+    /// `tables[0]`: low byte of result contribution from nibble 0 (bits 0-3 of input low byte)
+    /// `tables[1]`: high byte of result contribution from nibble 0
+    /// `tables[2]`: low byte of result contribution from nibble 1 (bits 4-7 of input low byte)
+    /// `tables[3]`: high byte of result contribution from nibble 1
+    /// `tables[4]`: low byte of result contribution from nibble 2 (bits 0-3 of input high byte)
+    /// `tables[5]`: high byte of result contribution from nibble 2
+    /// `tables[6]`: low byte of result contribution from nibble 3 (bits 4-7 of input high byte)
+    /// `tables[7]`: high byte of result contribution from nibble 3
     pub tables: [[u8; 16]; 8],
     /// The original factor, stored for scalar tail processing.
     pub factor: u16,
@@ -491,7 +491,7 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 ///
 /// This is the AVX2 split *layout* gate. Both the GFNI folded kernel
 /// ([`mul_acc_folded_group`]) and the non-GFNI shuffle2x kernel
-/// ([`mul_acc_shuffle2x_group`]) consume the identical layout; which kernel
+/// (`mul_acc_shuffle2x_group_avx2`) consume the identical layout; which kernel
 /// runs is chosen per group by [`folded_uses_gfni`].
 pub fn altmap_supported() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -678,7 +678,7 @@ pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
 /// `swap_hi=[n1hi|n3lo]`. `norm` lookups land in the plane they belong to;
 /// `swap` lookups land in the opposite plane and are folded in with one
 /// `permute2x128` lane swap per destination block (see
-/// [`mul_acc_shuffle2x_group`]). This mirrors the affine `norm=[ll|hh]`,
+/// `mul_acc_shuffle2x_group_avx2`). This mirrors the affine `norm=[ll|hh]`,
 /// `swap=[hl|lh]` fold the GFNI kernel uses.
 #[derive(Clone)]
 pub struct Shuffle2xTables {

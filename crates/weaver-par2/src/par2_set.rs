@@ -86,7 +86,7 @@ impl Par2FileSet {
 
     /// Create a Par2FileSet with diagnostic information about parse errors.
     ///
-    /// Unlike [`from_files`], this does not fail on individual file parse errors.
+    /// Unlike [`Self::from_files`], this does not fail on individual file parse errors.
     /// Instead, errors are collected into [`Par2Diagnostic`]. Returns an error
     /// only if no valid main packet was found across all files.
     pub fn from_files_with_diagnostics(par2_files: &[&[u8]]) -> Result<Par2ParseResult> {

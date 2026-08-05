@@ -1,16 +1,97 @@
 //! General-purpose PAR2 verification and repair engine.
 //!
-//! This crate implements parsing and verification of PAR2 (Parity Archive Volume Set
-//! v2.0) files. It supports:
+//! A pure-Rust implementation of PAR2 (Parity Archive Volume Set v2.0): load a
+//! set, find out what is damaged, and repair it from the recovery data.
 //!
-//! - Parsing all PAR2 packet types (Main, File Description, IFSC, Recovery Slice, Creator)
-//! - Validating packet headers (magic, MD5 hash, length alignment)
-//! - Aggregating packets from multiple .par2 files into a unified set
-//! - Slice-level verification using CRC32 + MD5 from IFSC packets
-//! - 16KB quick-check hash for fast file identification
-//! - Full-file MD5 verification
-//! - Streaming checksum computation
-//! - Graceful handling of malformed/truncated packets (scan for next valid packet)
+//! # Verifying a set
+//!
+//! A PAR2 set is usually spread across several `.par2` files. Packets from all
+//! of them aggregate into one [`Par2FileSet`], and verification runs against
+//! that.
+//!
+//! ```no_run
+//! use par2_rs::{DiskFileAccess, Par2FileSet, Repairability, scan_packets_from_path, verify_all};
+//!
+//! # fn main() -> par2_rs::Result<()> {
+//! let packets = scan_packets_from_path(std::path::Path::new("release.par2"))?
+//!     .into_iter()
+//!     .map(|(packet, _offset)| packet)
+//!     .collect();
+//! let set = Par2FileSet::from_packets(packets)?;
+//!
+//! let access = DiskFileAccess::new("/downloads/release".into(), &set);
+//! let result = verify_all(&set, &access);
+//!
+//! println!("{} recovery blocks available", result.recovery_blocks_available);
+//! match result.repairable {
+//!     Repairability::NotNeeded => println!("everything verified clean"),
+//!     Repairability::Repairable { blocks_needed, .. } => {
+//!         println!("repairable: {blocks_needed} blocks to rebuild")
+//!     }
+//!     Repairability::Insufficient { blocks_needed, .. } => {
+//!         println!("not enough recovery data: {blocks_needed} blocks short")
+//!     }
+//!     other => println!("{other:?}"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Verification is **slice-level**, using the CRC32 + MD5 pairs in IFSC packets,
+//! so damage is localised to the slices that are actually wrong rather than
+//! condemning the whole file. Sets carrying no IFSC data fall back to full-file
+//! MD5, and [`quick_check_16k`] identifies a candidate file cheaply before
+//! either.
+//!
+//! # Verifying bytes that are not files
+//!
+//! [`verify_all`] reads through the [`FileAccess`] trait, not the filesystem.
+//! [`DiskFileAccess`] is the ordinary implementation; supply your own and a set
+//! can be verified against bytes still arriving over a network, or assembled
+//! from somewhere that has no paths at all. [`MemoryFileAccess`] is useful in
+//! tests.
+//!
+//! # Repair
+//!
+//! [`Par2Repairer`] drives the whole sequence — scan, verify, solve, repair,
+//! then verify again. Repair is placement-aware: files that were renamed or
+//! moved are matched by content rather than by name, so a set still repairs
+//! after its files have been reorganised.
+//!
+//! # Repairing across a whole download
+//!
+//! [`Par2RepairSession`] is the retained form: one session accumulates
+//! evidence — per-slice verdicts, whole-file proofs — while the data is still
+//! arriving, so assessment is incremental and repair runs from what is already
+//! known instead of a fresh walk. Its sources may be files under a base
+//! directory, or bytes served through a [`FileAccess`] handle
+//! ([`Par2RepairSessionOptions::with_source_access`]) for sets that never
+//! became files — and where the `.par2` volumes themselves never became files
+//! either, [`Par2RepairSessionOptions::from_set`] takes the parsed set
+//! directly. Repair *output* is always real files either way.
+//!
+//! # Damaged PAR2 files
+//!
+//! A malformed or truncated packet does not fail the set. The scanner skips
+//! forward to the next valid packet, because the recovery data that survived is
+//! usually still enough — which is the entire point of parity.
+//!
+//! # Feature flags
+//!
+//! - `native-crypto` *(default)*: AWS-LC-backed MD5.
+//! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], each
+//!   falling back to CPU when no suitable device or driver is present.
+//!
+//! # Provenance
+//!
+//! An independent Rust implementation, heavily informed by
+//! [par2cmdline-turbo](https://github.com/animetosho/par2cmdline-turbo), Anime
+//! Tosho's speed-focused fork of
+//! [par2cmdline](https://github.com/Parchive/par2cmdline). Both are
+//! GPL-2.0-or-later, and par2cmdline-turbo is the benchmark reference this
+//! crate is measured against.
+//!
+//! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
 #[cfg(all(
     feature = "native-crypto",
@@ -83,7 +164,7 @@ pub use repair_session::{
 pub use repairer::{
     BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
     Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock,
-    SourceFileEntry,
+    SourceFileEntry, SourceLocation,
 };
 pub use session::{
     FeedDisposition, FeedOutcome, SettleRead, SliceEvidence, SliceEvidenceStrength,

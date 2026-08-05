@@ -2422,8 +2422,7 @@ pub struct NativeRepairSolver<'a> {
 
 impl<'a> NativeRepairSolver<'a> {
     /// Build a solver over the plan's repair coefficient matrix. `chunk_words`
-    /// is the per-output word tiling used by the rayon kernel (see
-    /// [`RepairExecutionMode::InMemory`]).
+    /// is the per-output word tiling used by the rayon kernel.
     pub fn new(input_factors: &'a matrix::Matrix, chunk_words: usize) -> Self {
         Self {
             input_factors,

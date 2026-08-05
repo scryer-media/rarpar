@@ -5,7 +5,8 @@
 //! LZ+Huffman compression (no PPMd blocks).
 //!
 //! Block header (byte-aligned):
-//! - `flags` (1 byte): bit_size[0:2], byte_count[3:4], is_last[6], table_present[7]
+//! - `flags` (1 byte): `bit_size[0:2]`, `byte_count[3:4]`, `is_last[6]`,
+//!   `table_present[7]`
 //! - `checksum` (1 byte): XOR of flags and all size bytes, must equal 0x5A
 //! - `block_size_bytes` (1-3 bytes, LE): high part of block size
 //! - Extra bits from bitstream: low part of block size (bit_size+1 bits)
@@ -13,7 +14,7 @@
 //! Symbol interpretation (NC table, 306 symbols):
 //! - 0-255: literal bytes
 //! - 256: filter marker
-//! - 257: repeat previous match (same length, same distance[0])
+//! - 257: repeat previous match (same length, same `distance[0]`)
 //! - 258-261: repeat distance cache references (length from RC table)
 //! - 262-305: inline length codes with extra bits (distance from DC/LDC tables)
 

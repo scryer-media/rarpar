@@ -12,7 +12,7 @@
 //! the common case).
 //!
 //! All cryptographic primitives that touch the underlying crypto library live
-//! behind the [`backend`] seam; the code in this module only ever calls that
+//! behind the `backend` seam; the code in this module only ever calls that
 //! seam, so a second backend can be added without editing shared logic.
 
 mod backend;
@@ -372,7 +372,7 @@ pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
 /// same on every target; only the backend differs. `blake2s_simd` ships only
 /// AVX2/SSE4.1/portable backends, so on `aarch64` and `wasm32 + simd128` its
 /// BLAKE2sp runs scalar; on exactly those targets we substitute the in-crate
-/// [`blake2sp_simd`](crate::crypto::blake2sp_simd) NEON / `simd128` kernel.
+/// `blake2sp_simd` NEON / `simd128` kernel.
 /// Everywhere else (x86 AVX2, wasm without simd, other arches) it keeps calling
 /// `blake2s_simd` unchanged. The output is byte-identical either way.
 #[cfg(any(

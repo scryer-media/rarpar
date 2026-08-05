@@ -7,7 +7,11 @@ pub(crate) const MAX_SLICES_PER_FILE: usize = 32_768;
 pub(crate) const MAX_TOTAL_INPUT_SLICES: usize = 32_768;
 
 /// 16-byte MD5-based file identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The ordering is over the raw identifier bytes. It carries no meaning of its
+/// own; it exists so identifiers can be used as stable tie-breakers and in
+/// ordered collections.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(pub(crate) [u8; 16]);
 
 impl FileId {

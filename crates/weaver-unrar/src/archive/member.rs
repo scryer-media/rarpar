@@ -5461,8 +5461,8 @@ impl RarArchive {
     /// Currently supports:
     /// - **Store** (uncompressed): streams directly, minimal memory.
     /// - **LZ** (compressed, non-solid): reads compressed data through a
-    ///   [`ChainedSegmentReader`], then streams decompressed output.
-    /// - **Encrypted** (Store or LZ): wraps the reader in [`DecryptingReader`]
+    ///   chained segment reader, then streams decompressed output.
+    /// - **Encrypted** (Store or LZ): wraps the reader in a decrypting reader
     ///   for on-the-fly AES-CBC decryption.
     ///
     /// Falls back to the buffered path for solid archives.

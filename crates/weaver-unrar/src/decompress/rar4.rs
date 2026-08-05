@@ -6,7 +6,7 @@
 //! - 0-255: literal bytes
 //! - 256: end of block
 //! - 257: VM filter code (only recognized standard filters are applied)
-//! - 258: repeat previous match (last_length, dist_cache[0])
+//! - 258: repeat previous match (`last_length`, `dist_cache[0]`)
 //! - 259-262: repeat distance cache references (new length from RD table)
 //! - 263-270: short distance matches (length=2)
 //! - 271-298: inline length codes with extra bits (distance from DD/LDD tables)

@@ -289,7 +289,7 @@ impl EncryptedStore {
     /// Total by construction: a RAR5 member with no `FHEXTRA_CRYPT` record and a
     /// RAR4 member using one of the pre-AES ciphers are both
     /// [`IneligibilityReason::Encrypted`], so neither can reach this type — the
-    /// RAR5 half of that is stated in [`StoredLayoutBuilder::member_encryption`]
+    /// RAR5 half of that is decided where the builder reads member encryption,
     /// and is itself format-discriminated.
     pub fn keying(&self) -> MemberKeying {
         match self.crypt {
@@ -2604,8 +2604,17 @@ mod tests {
         let volumes: Vec<std::path::PathBuf> = (1..=5)
             .map(|part| fixtures.join(format!("rar5_mv_store.part{part}.rar")))
             .collect();
-        if volumes.iter().any(|path| !path.exists()) {
-            eprintln!("skipping test: rar5_mv_store fixtures not present");
+        // Existence is the wrong guard under partial Git LFS hydration: the
+        // no-fixture CI lane checks these out as pointer files, which exist and
+        // then fail the signature parse. A hydrated fixture starts with `Rar!`;
+        // a pointer starts with `version https://git-lfs…`.
+        let hydrated = |path: &std::path::Path| {
+            std::fs::read(path)
+                .ok()
+                .is_some_and(|bytes| bytes.starts_with(b"Rar!"))
+        };
+        if !volumes.iter().all(|path| hydrated(path)) {
+            eprintln!("skipping test: rar5_mv_store fixtures not hydrated");
             return;
         }
 
