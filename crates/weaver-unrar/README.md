@@ -78,6 +78,10 @@ byte-compared against the source payload. Warm-cache medians from release builds
 with shipped flags. Test machines: Apple M5 Max (macOS), Intel Core Ultra 9 285H
 (Ubuntu 24.04, P-core pinned), AMD Ryzen 5 3600 (Windows, Zen 2).
 
+![unrar-rs relative speed against unrar 7.20, by workload and machine](https://raw.githubusercontent.com/scryer-media/rarpar/948edda929dcb4b4d48af91ff58eeefb099afc4d/docs/img/unrar-benchmark.svg)
+
+Absolute times behind the chart:
+
 | Machine | Workload | unrar 7.20 | unrar-rs | |
 |---|---|---:|---:|---|
 | M5 Max | RAR7 video, 4.9 GB, 4.6 GB dictionary, `-m3` | 8.6 s | **5.8 s** | 1.5× |
