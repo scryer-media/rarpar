@@ -6542,6 +6542,40 @@ fn test_rar4_ppmd_order16_32m_payload() {
     );
 }
 
+/// Classic `.rar`/`.r00` volumes exercise PPMd range decoding across reader
+/// boundaries as well as old-style volume ordering.
+#[test]
+fn test_rar4_ppmd_classic_multivolume_payload() {
+    use sha2::{Digest, Sha256};
+
+    let mut archive = open_multi(
+        "rar4",
+        &[
+            "rar4_ppm_oldmv.rar",
+            "rar4_ppm_oldmv.r00",
+            "rar4_ppm_oldmv.r01",
+            "rar4_ppm_oldmv.r02",
+        ],
+    );
+    let opts = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result.len(), 256 * 1024);
+    let bytes = result.to_bytes().unwrap();
+    let digest = Sha256::digest(&bytes);
+    assert_eq!(
+        &digest[..],
+        &[
+            0xc8, 0xf9, 0x58, 0x6b, 0xdf, 0xd5, 0x97, 0x68, 0xd2, 0x67, 0xe8, 0xa8, 0xeb, 0xb8,
+            0xd9, 0x6e, 0x35, 0x06, 0xe4, 0xbe, 0x7f, 0x6c, 0x3c, 0x8a, 0x5a, 0x99, 0xa6, 0x9a,
+            0xd8, 0x26, 0x05, 0xb0,
+        ]
+    );
+}
+
 /// Multi-member v29 solid streams end each member with an in-stream marker
 /// (LZ code 256 with new-file/new-table flags) that must be consumed after
 /// the member's last output symbol. Skipping it leaves stale Huffman tables

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::par2_set::Par2FileSet;
 use crate::placement::PlacementPlan;
 use crate::types::FileId;
-use crate::verify::FileAccess;
+use crate::verify::{FileAccess, FileRangeReader};
 
 /// A [`FileAccess`] implementation that reads and writes files on disk.
 ///
@@ -76,6 +76,13 @@ impl FileAccess for DiskFileAccess {
         Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
             &path,
         )?)))
+    }
+
+    fn open_range_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn FileRangeReader>>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        Ok(Some(Box::new(File::open(path)?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -198,6 +205,13 @@ impl FileAccess for PlacementFileAccess {
         )?)))
     }
 
+    fn open_range_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn FileRangeReader>>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        Ok(Some(Box::new(File::open(path)?)))
+    }
+
     fn file_exists(&self, file_id: &FileId) -> bool {
         self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
@@ -298,6 +312,16 @@ impl FileAccess for MultiDirectoryFileAccess {
     fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
         match self.find_reader(file_id) {
             Some(accessor) => accessor.open_sequential_reader(file_id),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found in any directory",
+            )),
+        }
+    }
+
+    fn open_range_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn FileRangeReader>>> {
+        match self.find_reader(file_id) {
+            Some(accessor) => accessor.open_range_reader(file_id),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "file not found in any directory",

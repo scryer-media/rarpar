@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use rarpar::cli::{Cli, ParArgs, ParCommand, ParPlacement};
+use tracing::info;
 
 pub struct ParOutcome {
     pub set_id: String,
@@ -78,7 +79,12 @@ fn run_flow(
         validate_directory_path(dir, "search directory")?;
     }
 
+    let load_started = std::time::Instant::now();
     let par2_set = par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?;
+    info!(
+        elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0,
+        "PAR2 set loaded"
+    );
     if !quiet {
         print_context(
             if repair { "repair" } else { "verify" },
@@ -87,7 +93,12 @@ fn run_flow(
         );
     }
 
+    let verify_started = std::time::Instant::now();
     let (verification, placement_plan) = verify_set(resolved, &par2_set)?;
+    info!(
+        elapsed_ms = verify_started.elapsed().as_secs_f64() * 1_000.0,
+        "initial PAR2 verification complete"
+    );
     if !quiet {
         print_verification_report(&verification, placement_plan.as_ref(), &par2_set);
     }
@@ -132,7 +143,12 @@ fn run_flow(
         par2_rs::Repairability::Repairable { .. } => {}
     }
 
+    let plan_started = std::time::Instant::now();
     let repair_plan = par2_rs::plan_repair(&par2_set, &verification)?;
+    info!(
+        elapsed_ms = plan_started.elapsed().as_secs_f64() * 1_000.0,
+        "PAR2 repair plan complete"
+    );
     if dry_run {
         if let Some(plan) = &placement_plan
             && (!plan.swaps.is_empty() || !plan.renames.is_empty())
@@ -182,9 +198,19 @@ fn run_flow(
     let options = par2_rs::RepairOptions::default();
     let mut repair_access: Box<dyn par2_rs::FileAccess> =
         build_repair_access(resolved, &par2_set, placement_plan.as_ref());
+    let execute_started = std::time::Instant::now();
     par2_rs::execute_repair_with_options(&repair_plan, &par2_set, &mut *repair_access, &options)?;
+    info!(
+        elapsed_ms = execute_started.elapsed().as_secs_f64() * 1_000.0,
+        "PAR2 repair execution complete"
+    );
 
-    let final_verification = verify_after_repair(resolved, &par2_set)?;
+    let post_verify_started = std::time::Instant::now();
+    let final_verification = verify_after_repair(resolved, &par2_set, &verification, &repair_plan)?;
+    info!(
+        elapsed_ms = post_verify_started.elapsed().as_secs_f64() * 1_000.0,
+        "post-repair PAR2 verification complete"
+    );
     if !quiet {
         print_verification_report(&final_verification, None, &par2_set);
     }
@@ -322,17 +348,44 @@ fn verify_set(
 fn verify_after_repair(
     resolved: &ResolvedPar2Input,
     par2_set: &par2_rs::Par2FileSet,
+    initial: &par2_rs::VerificationResult,
+    repair_plan: &par2_rs::RepairPlan,
 ) -> Result<par2_rs::VerificationResult, RarparError> {
+    let repaired: std::collections::HashSet<_> = repair_plan
+        .missing_slices
+        .iter()
+        .map(|(file_id, _)| *file_id)
+        .collect();
+    let repaired_file_ids: Vec<_> = par2_set
+        .recovery_file_ids
+        .iter()
+        .filter(|file_id| repaired.contains(file_id))
+        .copied()
+        .collect();
     if resolved.search_dirs.is_empty() {
         let access = par2_rs::DiskFileAccess::new(resolved.primary_dir.clone(), par2_set);
-        Ok(par2_rs::verify_all(par2_set, &access))
+        let updated = par2_rs::verify::verify_repaired_file_ids_parallel(
+            par2_set,
+            &access,
+            &repaired_file_ids,
+        );
+        Ok(par2_rs::verify::merge_verification_results(
+            par2_set, initial, updated,
+        ))
     } else {
         let access = par2_rs::MultiDirectoryFileAccess::new(
             resolved.primary_dir.clone(),
             resolved.search_dirs.clone(),
             par2_set,
         );
-        Ok(par2_rs::verify_all(par2_set, &access))
+        let updated = par2_rs::verify::verify_repaired_file_ids_parallel(
+            par2_set,
+            &access,
+            &repaired_file_ids,
+        );
+        Ok(par2_rs::verify::merge_verification_results(
+            par2_set, initial, updated,
+        ))
     }
 }
 

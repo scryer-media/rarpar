@@ -301,9 +301,10 @@ impl SubAllocator {
 
     #[inline(always)]
     pub fn model_range_valid(&self, off: u32, len: usize) -> bool {
+        debug_assert!(len >= UNIT_SIZE);
         let off = off as usize;
         let arena_len = self.arena.len();
-        off > self.p_text && off <= arena_len.saturating_sub(UNIT_SIZE) && len <= arena_len - off
+        off > self.p_text && off <= arena_len.saturating_sub(len)
     }
 
     #[inline(always)]

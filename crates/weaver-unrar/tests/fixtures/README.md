@@ -1,8 +1,8 @@
 # unrar-rs test fixtures
 
-Binary fixtures live in Git LFS. `.gitattributes` at the repo root routes
-`crates/weaver-unrar/tests/fixtures/**/*.{rar,rev,exe,bin,mkv,wav}` through the
-LFS filter; anything added here under a different extension needs a new pattern
+Binary fixtures live in Git LFS. `.gitattributes` at the repo root routes the
+listed binary extensions, including classic RAR volume names, through the LFS
+filter; anything added here under a different extension needs a new pattern
 before it will be stored correctly.
 
 Tests soft-skip when a fixture is absent, so a checkout without LFS payloads
@@ -19,7 +19,7 @@ the published crate.
 | `generate_generated_matrix.sh` | `generated_matrix_*` multi-volume matrix | `rar:latest`, `rar:4`, ffmpeg |
 | `generate_encrypted.sh` | `*_enc_*` / `*_hp_*` sets | `rar:latest`, `rar:4` |
 | `generate_stored_layout.sh` | the stored-layout sets listed below | `rar:latest` |
-| `generate_ppmd_perf.py` | deterministic 32 MiB RAR4 order-16 PPMd corpus | RARLAB rar 6.24 |
+| `generate_ppmd_perf.py` | deterministic RAR4 order-16 PPMd performance and classic-volume corpora | RARLAB rar 6.24 |
 
 The `rar:latest` image is RARLAB rar **7.20**. It dropped `-ma4` and `-vn`, so
 it can no longer write RAR4 archives or old-style (`.r00`, `.r01`) volume
@@ -34,6 +34,25 @@ base64-like text member and is compressed with
 because later releases cannot create RAR4 archives. The script prints both
 archive and decompressed-payload SHA-256 values; the integration test pins the
 payload hash while the archive remains an LFS object.
+
+## RAR4 PPMd classic volumes
+
+`rar4_ppm_oldmv.rar` through `rar4_ppm_oldmv.r02` contain the first 262,144
+bytes of the same deterministic payload. They exercise PPMd decoding across
+classic volume boundaries. Generate them with:
+
+```console
+python3 generate_ppmd_perf.py \
+  --rar-bin /path/to/rar-6.24 \
+  --payload-size 262144 \
+  --payload-name ppmd-oldmv.txt \
+  --volume-size 64k \
+  --old-volume-names \
+  --output rar4/rar4_ppm_oldmv.rar
+```
+
+The decompressed SHA-256 is
+`c8f9586bdfd59768d267e8a8ebb8d96e3506e4be7f6c3c8a5a99a69ad82605b0`.
 
 ## Imported corpora
 

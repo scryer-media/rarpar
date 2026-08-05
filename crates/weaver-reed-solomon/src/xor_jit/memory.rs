@@ -12,11 +12,12 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use memmap2::Mmap;
+use std::sync::Arc;
 
 /// A block of finalized (read+execute) JIT'd machine code.
 pub struct JitCode {
     /// Keeps the R+X mapping alive; `entry` points into it.
-    _exec: Mmap,
+    _exec: Arc<Mmap>,
     entry: *const u8,
 }
 
@@ -31,9 +32,47 @@ impl JitCode {
         assert!(!code.is_empty(), "empty JIT code");
         let mut w = memmap2::MmapMut::map_anon(code.len())?;
         w.copy_from_slice(code);
-        let exec = w.make_exec()?;
+        let exec = Arc::new(w.make_exec()?);
         let entry = exec.as_ptr();
         Ok(JitCode { _exec: exec, entry })
+    }
+
+    /// Pack several generated bodies into one mapping and finalize the whole
+    /// arena with a single W-to-X transition. Entries are cache-line aligned;
+    /// the returned handles share ownership of the immutable executable map.
+    pub fn new_batch(codes: &[Vec<u8>]) -> std::io::Result<Vec<Self>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        assert!(codes.iter().all(|code| !code.is_empty()), "empty JIT code");
+
+        const CODE_ALIGNMENT: usize = 64;
+        let mut offsets = Vec::with_capacity(codes.len());
+        let mut total = 0usize;
+        for code in codes {
+            total = total
+                .checked_add(CODE_ALIGNMENT - 1)
+                .map(|value| value & !(CODE_ALIGNMENT - 1))
+                .and_then(|value| value.checked_add(code.len()))
+                .ok_or_else(|| std::io::Error::other("JIT code arena size overflow"))?;
+            offsets.push(total - code.len());
+        }
+
+        let mut writable = memmap2::MmapMut::map_anon(total)?;
+        for (code, &offset) in codes.iter().zip(&offsets) {
+            writable[offset..offset + code.len()].copy_from_slice(code);
+        }
+        let exec = Arc::new(writable.make_exec()?);
+        let base = exec.as_ptr();
+        Ok(offsets
+            .into_iter()
+            .map(|offset| Self {
+                _exec: Arc::clone(&exec),
+                // SAFETY: every offset was allocated within `exec`, and the
+                // shared Arc keeps the mapping alive for every entry handle.
+                entry: unsafe { base.add(offset) },
+            })
+            .collect())
     }
 
     /// Execute the muladd body over the `len`-byte planar `src`/`dst` regions
@@ -95,5 +134,25 @@ impl JitCode {
             out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _,
             out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_entries_share_one_finalized_aligned_mapping() {
+        let entries = JitCode::new_batch(&[vec![0xc3], vec![0x90, 0xc3]]).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(Arc::ptr_eq(&entries[0]._exec, &entries[1]._exec));
+        assert_eq!((entries[0].entry as usize) % 64, 0);
+        assert_eq!((entries[1].entry as usize) % 64, 0);
+        assert!(entries[1].entry as usize >= entries[0].entry as usize + 64);
+    }
+
+    #[test]
+    fn empty_batch_needs_no_executable_mapping() {
+        assert!(JitCode::new_batch(&[]).unwrap().is_empty());
     }
 }

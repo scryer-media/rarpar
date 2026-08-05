@@ -1812,7 +1812,6 @@ impl Rar4LzDecoder {
                 self.block_type = BlockType::Lz;
                 return Ok(output_size);
             };
-            let mut keep_ppm_model = true;
             let mut literals = [0u8; 1024];
             let mut literal_len = 0usize;
             macro_rules! flush_literals {
@@ -1833,8 +1832,6 @@ impl Rar4LzDecoder {
                 }
 
                 let Some(ch) = ppm_model.decode_char_result(&mut rc)? else {
-                    flush_literals!();
-                    // Corrupt PPM data — switch to LZ mode.
                     if rar4_debug_filters_enabled() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
                         if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
@@ -1857,9 +1854,9 @@ impl Rar4LzDecoder {
                             );
                         }
                     }
-                    keep_ppm_model = false;
-                    self.block_type = BlockType::Lz;
-                    break;
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR4: corrupt PPMd symbol stream".into(),
+                    });
                 };
 
                 if ch == self.ppm_esc_char {
@@ -1890,9 +1887,9 @@ impl Rar4LzDecoder {
                                 );
                             }
                         }
-                        keep_ppm_model = false;
-                        self.block_type = BlockType::Lz;
-                        break;
+                        return Err(RarError::CorruptArchive {
+                            detail: "RAR4: corrupt PPMd command stream".into(),
+                        });
                     };
 
                     match next_ch {
@@ -1929,9 +1926,9 @@ impl Rar4LzDecoder {
                                 }
                             }
                             if failed {
-                                keep_ppm_model = false;
-                                self.block_type = BlockType::Lz;
-                                break;
+                                return Err(RarError::CorruptArchive {
+                                    detail: "RAR4: corrupt PPMd match command".into(),
+                                });
                             }
                             if rar4_debug_filters_enabled() {
                                 eprintln!(
@@ -1950,9 +1947,9 @@ impl Rar4LzDecoder {
                         }
                         5 => {
                             let Some(len_byte) = ppm_model.decode_char_result(&mut rc)? else {
-                                keep_ppm_model = false;
-                                self.block_type = BlockType::Lz;
-                                break;
+                                return Err(RarError::CorruptArchive {
+                                    detail: "RAR4: corrupt PPMd run-length command".into(),
+                                });
                             };
                             if rar4_debug_filters_enabled() {
                                 eprintln!(
@@ -1988,7 +1985,7 @@ impl Rar4LzDecoder {
                 self.window.put_bytes(&literals[..literal_len]);
             }
 
-            if !switch_to_lz_tables && matches!(self.block_type, BlockType::Ppm) && keep_ppm_model {
+            if !switch_to_lz_tables && matches!(self.block_type, BlockType::Ppm) {
                 // The output check is strictly `Written > DestSize`, so
                 // the esc,2 end-of-file marker following a member's last
                 // output byte is consumed before its decode ends. Consume it
@@ -2016,9 +2013,7 @@ impl Rar4LzDecoder {
                 // the next solid member resumes with these registers.
                 self.ppm_rc_state = Some(rc.state());
             }
-            if keep_ppm_model {
-                self.ppm_model = Some(ppm_model);
-            }
+            self.ppm_model = Some(ppm_model);
         }
 
         if switch_to_lz_tables {
@@ -2218,6 +2213,21 @@ mod tests {
         assert!(decoder.ppm_model.is_some());
         assert!(matches!(decoder.block_type, BlockType::Lz));
         assert!(decoder.ppm_rc_state.is_none());
+    }
+
+    #[test]
+    fn corrupt_ppmd_symbol_stops_the_unpack_loop() {
+        let mut decoder = Rar4LzDecoder::new(1024 * 1024);
+        decoder.ppm_model = Some(Model::new(16, 1024 * 1024));
+        decoder.block_type = BlockType::Ppm;
+        let input = [0xff; 4];
+        let mut reader = BitReader::new(&input);
+        let mut output = Vec::new();
+
+        let result = decoder.decode_ppm_symbols(&mut reader, 1, 0, None, &mut output);
+
+        assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
+        assert!(matches!(decoder.block_type, BlockType::Ppm));
     }
 
     #[test]

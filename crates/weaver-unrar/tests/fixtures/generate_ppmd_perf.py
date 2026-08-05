@@ -23,15 +23,15 @@ FIXED_MTIME = 1_700_000_000
 SEED = b"rarpar/unrar-rs deterministic RAR4 PPMd order-16 corpus v1"
 
 
-def write_payload(path: Path) -> str:
+def write_payload(path: Path, payload_size: int = PAYLOAD_SIZE) -> str:
     digest = hashlib.sha256()
     written = 0
     counter = 0
     with path.open("wb") as output:
-        while written < PAYLOAD_SIZE:
+        while written < payload_size:
             block = hashlib.sha256(SEED + counter.to_bytes(8, "little")).digest()
             encoded = base64.b64encode(block) + b"\n"
-            encoded = encoded[: PAYLOAD_SIZE - written]
+            encoded = encoded[: payload_size - written]
             output.write(encoded)
             digest.update(encoded)
             written += len(encoded)
@@ -66,6 +66,17 @@ def main() -> None:
         type=Path,
         default=Path(__file__).parent / "rar4" / "rar4_ppm_order16_32m.rar",
     )
+    parser.add_argument("--payload-size", type=int, default=PAYLOAD_SIZE)
+    parser.add_argument("--payload-name", default=PAYLOAD_NAME)
+    parser.add_argument(
+        "--volume-size",
+        help="optional RAR volume size such as 64k",
+    )
+    parser.add_argument(
+        "--old-volume-names",
+        action="store_true",
+        help="use classic .rar/.r00 volume names",
+    )
     args = parser.parse_args()
     rar_bin = args.rar_bin.resolve()
     output = args.output.resolve()
@@ -73,28 +84,32 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="rarpar-ppmd-perf-") as temp_dir:
-        payload = Path(temp_dir) / PAYLOAD_NAME
-        payload_sha256 = write_payload(payload)
+        payload = Path(temp_dir) / args.payload_name
+        payload_sha256 = write_payload(payload, args.payload_size)
         output.unlink(missing_ok=True)
+        command = [
+            rar_bin,
+            "a",
+            "-idq",
+            "-ma4",
+            "-m5",
+            "-mc16:16t+",
+            "-md4m",
+            "-ep",
+            "-o+",
+        ]
+        if args.volume_size:
+            command.append(f"-v{args.volume_size}")
+        if args.old_volume_names:
+            command.append("-vn")
+        command.extend([output, payload])
         subprocess.run(
-            [
-                rar_bin,
-                "a",
-                "-idq",
-                "-ma4",
-                "-m5",
-                "-mc16:16t+",
-                "-md4m",
-                "-ep",
-                "-o+",
-                output,
-                payload,
-            ],
+            command,
             check=True,
         )
 
     archive_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
-    print(f"payload_size={PAYLOAD_SIZE}")
+    print(f"payload_size={args.payload_size}")
     print(f"payload_sha256={payload_sha256}")
     print(f"archive_sha256={archive_sha256}")
     print(f"archive={output}")

@@ -83,11 +83,18 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 		}
 		for run := 0; run < options.Plan.Warmups+options.Plan.Repeats; run++ {
 			warmup := run < options.Plan.Warmups
-			candidateExecution := executeSubject(ctx, "candidate", candidate.Label, options.CandidatePath, manifest, options, run+1, warmup)
-			record.Executions = append(record.Executions, candidateExecution)
-			if reference != nil {
+			if referenceRunsFirst(run, reference != nil) {
 				referenceExecution := executeReference(ctx, *reference, manifest, options, run+1, warmup)
 				record.Executions = append(record.Executions, referenceExecution)
+				candidateExecution := executeSubject(ctx, "candidate", candidate.Label, options.CandidatePath, manifest, options, run+1, warmup)
+				record.Executions = append(record.Executions, candidateExecution)
+			} else {
+				candidateExecution := executeSubject(ctx, "candidate", candidate.Label, options.CandidatePath, manifest, options, run+1, warmup)
+				record.Executions = append(record.Executions, candidateExecution)
+				if reference != nil {
+					referenceExecution := executeReference(ctx, *reference, manifest, options, run+1, warmup)
+					record.Executions = append(record.Executions, referenceExecution)
+				}
 			}
 		}
 	}
@@ -104,6 +111,10 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 		return record, fmt.Errorf("benchmark run recorded %d failed sample(s); inspect %s", failed, filepath.Join(options.Output, "raw.json"))
 	}
 	return record, nil
+}
+
+func referenceRunsFirst(run int, hasReference bool) bool {
+	return hasReference && run%2 == 1
 }
 
 func loadCase(corpusRoot, id, corpusDigest string) (CorpusCaseManifest, error) {

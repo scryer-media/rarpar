@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 
 use crate::checksum;
@@ -17,6 +17,12 @@ const QUICK_CHECK_16K_BYTES: usize = 16 * 1024;
 const VERIFY_FULL_HASH_CHUNK_BYTES: usize = 1024 * 1024;
 /// Read span per task for slice-parallel staged-file verification.
 const VERIFY_SPAN_TARGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Seekable reader used by repair streams that revisit many ranges in one
+/// source file. Implementations may return one to avoid reopening per slice.
+pub trait FileRangeReader: Read + Seek {}
+
+impl<T: Read + Seek> FileRangeReader for T {}
 
 /// Abstraction for file I/O during verification and repair.
 pub trait FileAccess {
@@ -38,6 +44,11 @@ pub trait FileAccess {
 
     /// Open a forward-only reader for hot paths that consume a whole file from offset 0.
     fn open_sequential_reader(&self, _file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        Ok(None)
+    }
+
+    /// Open a reusable seekable reader for range-oriented repair input.
+    fn open_range_reader(&self, _file_id: &FileId) -> io::Result<Option<Box<dyn FileRangeReader>>> {
         Ok(None)
     }
 

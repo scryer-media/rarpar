@@ -343,6 +343,39 @@ fn auto_json_outputs_single_final_report() {
 }
 
 #[test]
+fn auto_extracts_classic_multivolume_ppmd_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let download_dir = temp.path().join("download");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    for name in [
+        "rar4_ppm_oldmv.rar",
+        "rar4_ppm_oldmv.r00",
+        "rar4_ppm_oldmv.r01",
+        "rar4_ppm_oldmv.r02",
+    ] {
+        std::fs::copy(fixture_dir.join(name), download_dir.join(name)).unwrap();
+    }
+
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--output"),
+        out_dir.as_os_str(),
+        download_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "classic PPMd volume extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(out_dir.join("ppmd-oldmv.txt")).unwrap();
+    assert_eq!(bytes.len(), 256 * 1024);
+    assert_eq!(&bytes[..16], b"cevAd36NmwQavaFb");
+}
+
+#[test]
 fn auto_rediscovers_rar_volumes_after_par2_repair() {
     let temp = tempfile::tempdir().unwrap();
     let fixture_dir = fixture(&[

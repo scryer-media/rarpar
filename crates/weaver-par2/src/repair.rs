@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::cpu_repair_controller::{ControllerLayout, CpuControllerPlan, KernelCapabilities};
@@ -24,7 +25,7 @@ use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, MAX_TOTAL_INPUT_SLICES, ProgressCallback,
     ProgressStage, ProgressUpdate,
 };
-use crate::verify::{FileAccess, Repairability, VerificationResult};
+use crate::verify::{FileAccess, FileRangeReader, Repairability, VerificationResult};
 
 pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// The decode matrix is a transient planning workspace whose size is set by
@@ -368,9 +369,9 @@ pub struct RepairOptions {
     pub progress: Option<ProgressCallback>,
     /// Maximum transient repair workspace size in bytes.
     ///
-    /// Repair chooses the in-memory fast path only when its
-    /// estimated working set fits within `limit`; otherwise it switches to the
-    /// streamed chunk path and sizes chunk buffers from this budget.
+    /// The CPU repair controller sizes its streamed chunks from this budget.
+    /// Caller-provided solvers supplied through [`execute_repair_with_solver`]
+    /// retain their explicit in-memory contract.
     ///
     /// If `None`, the crate default bounded repair budget is used.
     pub memory_limit: Option<usize>,
@@ -384,12 +385,6 @@ impl Default for RepairOptions {
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RepairExecutionMode {
-    InMemory { chunk_words: usize },
-    Streaming { chunk_words: usize, budget: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -413,25 +408,6 @@ fn check_cancel(options: &RepairOptions) -> Result<()> {
         return Err(Par2Error::Cancelled);
     }
     Ok(())
-}
-
-fn estimated_in_memory_repair_bytes(plan: &RepairPlan) -> usize {
-    let slice_size = plan.slice_size as usize;
-    // Prepared multiply tables are deduplicated per distinct factor value, so
-    // they are bounded by the field size rather than outputs*inputs.
-    let prepared_tables = 65_535usize
-        .min(
-            plan.input_factors
-                .rows
-                .saturating_mul(plan.input_factors.cols),
-        )
-        .saturating_mul(std::mem::size_of::<crate::gf_simd::PreparedInputFactor>());
-    plan.input_factors
-        .cols
-        .saturating_mul(slice_size)
-        .saturating_add(plan.missing_slices.len().saturating_mul(slice_size))
-        .saturating_add(slice_size.saturating_mul(2))
-        .saturating_add(prepared_tables)
 }
 
 fn estimated_repair_matrix_bytes(total_inputs: usize, missing_rows: usize) -> usize {
@@ -505,75 +481,15 @@ fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize)
     (chunk_bytes / 2).max(1).min(word_count.max(1))
 }
 
-#[cfg(target_arch = "x86_64")]
-fn round_div(value: usize, divisor: usize) -> usize {
-    (value + (divisor / 2)) / divisor
-}
-
-fn method_tuned_chunk_words(slice_size: usize) -> usize {
-    let word_count = (slice_size / 2).max(1);
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            let ideal_chunk_bytes = 4 * 1024usize;
-            let stride_bytes = 64usize;
-            let threads = rayon::current_num_threads().max(1);
-            let aligned_slice_bytes =
-                slice_size.div_ceil(stride_bytes) * stride_bytes + stride_bytes;
-            let target_thread_chunk = aligned_slice_bytes.div_ceil(threads);
-
-            let mut num_chunks = if target_thread_chunk <= ideal_chunk_bytes / 2 {
-                round_div(aligned_slice_bytes, ideal_chunk_bytes).max(1)
-            } else {
-                round_div(target_thread_chunk, ideal_chunk_bytes).max(1) * threads
-            };
-
-            if num_chunks == 0 {
-                num_chunks = 1;
-            }
-
-            let chunk_bytes = aligned_slice_bytes
-                .div_ceil(num_chunks)
-                .div_ceil(stride_bytes)
-                * stride_bytes;
-            return (chunk_bytes / 2).max(1).min(word_count);
-        }
-    }
-
-    word_count
-}
-
-/// Repairs whose estimated in-memory footprint fits under this take the
-/// in-memory path; everything larger streams. Streaming outperforms the
-/// in-memory path on every measured large set (it received all the
-/// kernel/batching work), so a generous memory budget must not steer big
-/// repairs in-memory — the budget only sizes streaming chunks. Small repairs
-/// keep the in-memory path's lower fixed overhead.
-const IN_MEMORY_REPAIR_MAX_BYTES: usize = 128 * 1024 * 1024;
-
-fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> RepairExecutionMode {
-    let slice_size = plan.slice_size as usize;
-    let word_count = (slice_size / 2).max(1);
-
+fn controller_execution_parameters(plan: &RepairPlan, options: &RepairOptions) -> (usize, usize) {
+    let word_count = (plan.slice_size as usize / 2).max(1);
     let limit = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
-    let budget_chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
-    if estimated_in_memory_repair_bytes(plan) <= limit.min(IN_MEMORY_REPAIR_MAX_BYTES) {
-        // The in-memory path keeps its historical cache-tuned chunking.
-        let method_chunk_words = method_tuned_chunk_words(slice_size);
-        RepairExecutionMode::InMemory {
-            chunk_words: budget_chunk_words.min(method_chunk_words),
-        }
-    } else {
-        // Streaming chunks are budget-driven only: the outer chunk decides how
-        // many times every source is re-read from disk, so it must stay as
-        // large as the budget allows. Cache tiling happens inside the batch
-        // controller, never in the I/O loop.
-        RepairExecutionMode::Streaming {
-            chunk_words: budget_chunk_words,
-            budget: limit,
-        }
-    }
+    // The outer chunk decides how many times every source is re-read from
+    // disk. Cache tiling belongs inside the controller, never in this I/O loop.
+    (
+        chunk_words_for_budget(word_count, plan.missing_slices.len(), limit),
+        limit,
+    )
 }
 
 fn build_write_targets(
@@ -644,6 +560,30 @@ fn staging_bytes(cells: &[StagingCell]) -> &[u8] {
 
 fn staging_bytes_mut(cells: &mut [StagingCell]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(cells.as_mut_ptr() as *mut u8, cells.len() * 64) }
+}
+
+/// Persistent controller output rows. Each row starts on a 64-byte boundary,
+/// which satisfies every current CPU backend while keeping row pointers stable
+/// until output transfer has completed.
+struct AlignedOutputArea {
+    rows: Vec<Vec<StagingCell>>,
+}
+
+impl AlignedOutputArea {
+    fn new(output_count: usize, byte_len: usize) -> Self {
+        Self {
+            rows: (0..output_count)
+                .map(|_| staging_cells_for(byte_len))
+                .collect(),
+        }
+    }
+
+    fn pointers(&mut self) -> Vec<usize> {
+        self.rows
+            .iter_mut()
+            .map(|row| row.as_mut_ptr() as usize)
+            .collect()
+    }
 }
 
 /// Lazily prepared multiply tables, one slot per distinct GF(2^16) factor.
@@ -724,7 +664,8 @@ impl PreparedFactorMemo {
 /// XOR-JIT tier (x86_64, AVX2- or AVX512-without-GFNI): one JIT-compiled
 /// `dst ^= f*src` muladd body per distinct GF(2^16) factor in the decode
 /// matrix, at the detected [`JitWidth`] (512- or 1024-byte planar blocks).
-/// Built once, before any parallel compute; `JitCode` is `Send + Sync`.
+/// Built once in a shared immutable executable arena before parallel compute;
+/// `JitCode` is `Send + Sync`.
 /// `from_matrix` returns `None` when executable memory is unavailable,
 /// signalling the caller to fall back to the shuffle2x tier.
 #[cfg(target_arch = "x86_64")]
@@ -739,23 +680,24 @@ impl JitMemo {
         width: reedsolomon_rs::xor_jit::JitWidth,
         matrix: &matrix::Matrix,
     ) -> Option<Self> {
-        let mut codes: Vec<Option<reedsolomon_rs::xor_jit::memory::JitCode>> =
-            (0..1usize << 16).map(|_| None).collect();
+        let mut needed = vec![false; 1usize << 16];
+        let mut factors = Vec::new();
         for output_idx in 0..matrix.rows {
             for source_idx in 0..matrix.cols {
                 let factor = matrix.get(output_idx, source_idx);
                 // Factor 0 contributes nothing; already-built factors are reused.
-                if factor == 0 || codes[factor as usize].is_some() {
+                if factor == 0 || needed[factor as usize] {
                     continue;
                 }
-                match width.build_muladd(factor) {
-                    Ok(Some(code)) => codes[factor as usize] = Some(code),
-                    // build_muladd only yields Ok(None) for factor 0 (skipped above).
-                    Ok(None) => {}
-                    // Executable memory unavailable: abandon the tier entirely.
-                    Err(_) => return None,
-                }
+                needed[factor as usize] = true;
+                factors.push(factor);
             }
+        }
+        let built = width.build_muladd_batch(&factors).ok()?;
+        let mut codes: Vec<Option<reedsolomon_rs::xor_jit::memory::JitCode>> =
+            (0..1usize << 16).map(|_| None).collect();
+        for (factor, code) in factors.into_iter().zip(built) {
+            codes[factor as usize] = code;
         }
         Some(Self { codes, width })
     }
@@ -809,50 +751,67 @@ struct StreamBatchSet {
     /// blocks interleaved at 32-byte granularity into one 64-byte-aligned
     /// stream.
     staging: Vec<Vec<StagingCell>>,
+    /// Coefficients for this staged group, output-major with a fixed
+    /// `input_grouping` stride. Unused lanes in a short final group are zero.
+    coefficients: Vec<u16>,
+    input_grouping: usize,
     start: usize,
     len: usize,
 }
 
 impl StreamBatchSet {
-    fn new(max_byte_len: usize, input_grouping: usize, folded: bool, xorjit: bool) -> Self {
+    fn new(
+        max_byte_len: usize,
+        input_grouping: usize,
+        output_count: usize,
+        folded: bool,
+        xorjit: bool,
+    ) -> Self {
         let groups = input_grouping.div_ceil(crate::gf_simd::FOLDED_GROUP);
-        if xorjit {
+        let (bufs, staging) = if xorjit {
             // XOR-JIT path: `bufs` holds the per-source bit-planar blocks,
             // `scratch` is the pre-transpose read buffer.
-            Self {
-                bufs: vec![vec![0u8; max_byte_len]; input_grouping],
-                staging: Vec::new(),
-                start: 0,
-                len: 0,
-            }
+            (vec![vec![0u8; max_byte_len]; input_grouping], Vec::new())
         } else if folded {
-            Self {
-                bufs: Vec::new(),
-                staging: (0..groups)
+            (
+                Vec::new(),
+                (0..groups)
                     .map(|_| staging_cells_for(max_byte_len * crate::gf_simd::FOLDED_GROUP))
                     .collect(),
-                start: 0,
-                len: 0,
-            }
+            )
         } else {
-            Self {
-                bufs: vec![vec![0u8; max_byte_len]; input_grouping],
-                staging: Vec::new(),
-                start: 0,
-                len: 0,
-            }
+            (vec![vec![0u8; max_byte_len]; input_grouping], Vec::new())
+        };
+        Self {
+            bufs,
+            staging,
+            coefficients: vec![0; output_count.saturating_mul(input_grouping)],
+            input_grouping,
+            start: 0,
+            len: 0,
         }
+    }
+
+    #[inline]
+    fn coefficient(&self, output: usize, lane: usize) -> u16 {
+        self.coefficients[output * self.input_grouping + lane]
     }
 }
 
 /// Read one streamed source chunk (a present input slice range or a recovery
 /// block range) into `dst`, zero-padding any short tail.
+struct StreamSourceReader {
+    file_id: FileId,
+    reader: Box<dyn FileRangeReader>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_stream_source_chunk(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
     file_access: &mut dyn FileAccess,
     recovery_files: &mut HashMap<PathBuf, File>,
+    source_reader: &mut Option<StreamSourceReader>,
     available_inputs: usize,
     source_idx: usize,
     byte_start: usize,
@@ -862,11 +821,28 @@ fn read_stream_source_chunk(
         let global_idx = plan.available_input_global_indices[source_idx];
         let (file_id, local_slice) = plan.global_to_file[global_idx];
         let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
-        let read_len = file_access
-            .read_file_range_into(&file_id, offset, dst)
-            .map_err(Par2Error::Io)?;
+        if source_reader
+            .as_ref()
+            .is_none_or(|open| open.file_id != file_id)
+        {
+            *source_reader = file_access
+                .open_range_reader(&file_id)
+                .map_err(Par2Error::Io)?
+                .map(|reader| StreamSourceReader { file_id, reader });
+        }
+        let read_len = if let Some(open) = source_reader.as_mut() {
+            open.reader
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| open.reader.read(dst))
+                .map_err(Par2Error::Io)?
+        } else {
+            file_access
+                .read_file_range_into(&file_id, offset, dst)
+                .map_err(Par2Error::Io)?
+        };
         dst[read_len..].fill(0);
     } else {
+        *source_reader = None;
         let exp = plan.recovery_exponents[source_idx - available_inputs];
         let rs = par2_set
             .recovery_slices
@@ -919,43 +895,66 @@ fn prepare_stream_source(
     }
 }
 
-/// Read and prepare one input group with two bounded transfer buffers. File
-/// access stays on the caller thread while a preparation worker converts the
-/// preceding input into the active kernel's packed layout. Reusing a transfer
-/// buffer therefore waits for an explicit completion signal.
-#[allow(clippy::too_many_arguments)]
-fn fill_stream_batch(
-    set: &mut StreamBatchSet,
-    plan: &RepairPlan,
-    par2_set: &Par2FileSet,
-    file_access: &mut dyn FileAccess,
-    recovery_files: &mut HashMap<PathBuf, File>,
-    available_inputs: usize,
-    batch_start: usize,
+struct PrepareBatch {
+    set: StreamBatchSet,
     batch_len: usize,
-    byte_start: usize,
-    byte_len: usize,
     aligned_len: usize,
+}
+
+enum PreparationMessage {
+    Begin(PrepareBatch),
+    Input {
+        lane: usize,
+        buffer: Vec<u8>,
+    },
+    FinishOutput {
+        index: usize,
+        source: usize,
+        aligned_len: usize,
+        buffer: Vec<u8>,
+    },
+}
+
+struct FinishedOutput {
+    index: usize,
+    buffer: Vec<u8>,
+    elapsed: Duration,
+}
+
+struct CpuInputPreparer {
+    command_tx: std::sync::mpsc::SyncSender<PreparationMessage>,
+    complete_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    prepared_rx: std::sync::mpsc::Receiver<StreamBatchSet>,
+    finished_rx: std::sync::mpsc::Receiver<FinishedOutput>,
+    transfer_buffers: Vec<Vec<u8>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_preparation_worker(
+    command_rx: std::sync::mpsc::Receiver<PreparationMessage>,
+    complete_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    prepared_tx: std::sync::mpsc::SyncSender<StreamBatchSet>,
+    finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
     use_folded: bool,
     use_xorjit: bool,
-    #[cfg(target_arch = "x86_64")] jit_memo: Option<&JitMemo>,
-    options: &RepairOptions,
-) -> Result<()> {
-    #[cfg(target_arch = "x86_64")]
-    let jit_width = jit_memo.map(|memo| memo.width);
-    set.start = batch_start;
-    set.len = batch_len;
-
-    std::thread::scope(|scope| -> Result<()> {
-        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(2);
-        let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
-        let worker = scope.spawn(move || {
-            while let Ok((lane, buffer)) = input_rx.recv() {
+    #[cfg(target_arch = "x86_64")] jit_width: Option<reedsolomon_rs::xor_jit::JitWidth>,
+) {
+    let mut active: Option<PrepareBatch> = None;
+    while let Ok(message) = command_rx.recv() {
+        match message {
+            PreparationMessage::Begin(batch) => {
+                debug_assert!(active.is_none());
+                active = Some(batch);
+            }
+            PreparationMessage::Input { lane, buffer } => {
+                let Some(batch) = active.as_mut() else {
+                    break;
+                };
                 prepare_stream_source(
-                    set,
+                    &mut batch.set,
                     lane,
                     &buffer,
-                    aligned_len,
+                    batch.aligned_len,
                     use_folded,
                     use_xorjit,
                     #[cfg(target_arch = "x86_64")]
@@ -964,226 +963,572 @@ fn fill_stream_batch(
                 if complete_tx.send(buffer).is_err() {
                     break;
                 }
+                if lane + 1 == batch.batch_len {
+                    let batch = active.take().expect("active preparation batch");
+                    if prepared_tx.send(batch.set).is_err() {
+                        break;
+                    }
+                }
             }
-        });
-
-        let mut available = vec![vec![0u8; aligned_len], vec![0u8; aligned_len]];
-        let read_result = (|| -> Result<()> {
-            for lane in 0..batch_len {
-                check_cancel(options)?;
-                let mut buffer = if let Some(buffer) = available.pop() {
-                    buffer
-                } else {
-                    complete_rx
-                        .recv()
-                        .map_err(|_| Par2Error::ReedSolomonError {
-                            reason: "CPU repair preparation worker stopped unexpectedly"
-                                .to_string(),
-                        })?
-                };
-                read_stream_source_chunk(
-                    plan,
-                    par2_set,
-                    file_access,
-                    recovery_files,
-                    available_inputs,
-                    batch_start + lane,
-                    byte_start,
-                    &mut buffer[..byte_len],
-                )?;
-                buffer[byte_len..aligned_len].fill(0);
-                input_tx
-                    .send((lane, buffer))
-                    .map_err(|_| Par2Error::ReedSolomonError {
-                        reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
-                    })?;
+            PreparationMessage::FinishOutput {
+                index,
+                source,
+                aligned_len,
+                mut buffer,
+            } => {
+                let started = Instant::now();
+                debug_assert!(active.is_none());
+                // SAFETY: output storage stays fixed until every queued finish
+                // operation has completed and the transfer worker is joined.
+                let source =
+                    unsafe { std::slice::from_raw_parts(source as *const u8, aligned_len) };
+                buffer[..aligned_len].copy_from_slice(source);
+                if use_xorjit {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let width = jit_width.expect("jit width present when XOR-JIT is active");
+                        let block = width.block_bytes();
+                        for start in (0..aligned_len).step_by(block) {
+                            unsafe {
+                                width.finish_block(&mut buffer[start..start + block]);
+                            }
+                        }
+                    }
+                } else if use_folded {
+                    crate::gf_simd::altmap_decode(&mut buffer[..aligned_len]);
+                }
+                if finished_tx
+                    .send(FinishedOutput {
+                        index,
+                        buffer,
+                        elapsed: started.elapsed(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            Ok(())
-        })();
-        drop(input_tx);
+        }
+    }
+}
 
-        if worker.join().is_err() {
+fn queue_output_finish(
+    preparer: &mut CpuInputPreparer,
+    index: usize,
+    source: usize,
+    aligned_len: usize,
+    buffer: Vec<u8>,
+) -> Result<()> {
+    preparer
+        .command_tx
+        .send(PreparationMessage::FinishOutput {
+            index,
+            source,
+            aligned_len,
+            buffer,
+        })
+        .map_err(|_| Par2Error::ReedSolomonError {
+            reason: "CPU repair transfer worker stopped unexpectedly".to_string(),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_and_write_stream_outputs(
+    preparer: &mut CpuInputPreparer,
+    output_ptrs: &[usize],
+    aligned_len: usize,
+    byte_start: usize,
+    byte_len: usize,
+    write_targets: &[RepairWriteTarget],
+    file_access: &mut dyn FileAccess,
+    timings: &CpuControllerTimings,
+) -> Result<()> {
+    debug_assert_eq!(output_ptrs.len(), write_targets.len());
+    let initially_queued = output_ptrs.len().min(2);
+    for (index, &source) in output_ptrs.iter().take(initially_queued).enumerate() {
+        let buffer = preparer
+            .transfer_buffers
+            .pop()
+            .expect("two transfer buffers returned after input preparation");
+        queue_output_finish(preparer, index, source, aligned_len, buffer)?;
+    }
+
+    let mut next_to_queue = initially_queued;
+    for expected in 0..output_ptrs.len() {
+        let FinishedOutput {
+            index,
+            buffer,
+            elapsed,
+        } = preparer
+            .finished_rx
+            .recv()
+            .map_err(|_| Par2Error::ReedSolomonError {
+                reason: "CPU repair transfer worker stopped unexpectedly".to_string(),
+            })?;
+        if index != expected {
             return Err(Par2Error::ReedSolomonError {
-                reason: "CPU repair preparation worker panicked".to_string(),
+                reason: "CPU repair output transfer arrived out of order".to_string(),
             });
         }
-        read_result
-    })?;
+        CpuControllerTimings::record(&timings.finish_ns, elapsed);
 
+        let target = &write_targets[index];
+        let write_offset = target.offset + byte_start as u64;
+        let remaining = target.file_end.saturating_sub(write_offset);
+        let write_len = remaining.min(byte_len as u64) as usize;
+        let write_started = Instant::now();
+        if write_len != 0 {
+            file_access
+                .write_file_range(&target.file_id, write_offset, &buffer[..write_len])
+                .map_err(|error| Par2Error::RepairWriteFailed {
+                    filename: target.filename.clone(),
+                    offset: write_offset,
+                    source: error,
+                })?;
+        }
+        CpuControllerTimings::record(&timings.write_ns, write_started.elapsed());
+
+        if next_to_queue < output_ptrs.len() {
+            queue_output_finish(
+                preparer,
+                next_to_queue,
+                output_ptrs[next_to_queue],
+                aligned_len,
+                buffer,
+            )?;
+            next_to_queue += 1;
+        } else {
+            preparer.transfer_buffers.push(buffer);
+        }
+    }
     Ok(())
 }
 
-/// Apply one folded input group through the controller's static byte/output
-/// assignments. The closure selects the GFNI or shuffle2x multiply; grouping,
-/// initialization, accumulation, and worker decomposition remain identical.
-fn run_folded_assignments<F>(
-    layout: &ControllerLayout,
-    output_ptrs: &[usize],
-    groups: usize,
-    set: &StreamBatchSet,
-    add: bool,
-    kernel: F,
-) where
-    F: Fn(&mut [u8], &[&[u8]], usize) + Sync,
-{
-    layout.assignments.par_iter().for_each(|work| {
-        let s0 = work.byte_start;
-        let s1 = s0 + work.byte_len;
-        let j0 = work.output_start;
-        let j1 = j0 + work.output_len;
-        let stride = crate::gf_simd::FOLDED_GROUP;
-        let stagings: Vec<&[u8]> = (0..groups)
-            .map(|g| &staging_bytes(&set.staging[g])[s0 * stride..s1 * stride])
-            .collect();
-        for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
-            // Safe: controller assignments cover each (output, byte) pair
-            // exactly once and batches execute sequentially.
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0) };
-            if !add {
-                dst.fill(0);
-            }
-            kernel(dst, &stagings, j);
+/// Read and prepare one input group through the persistent preparation worker.
+/// File access remains on the caller thread, while exactly two transfer
+/// buffers apply backpressure before either input slot can be reused.
+#[allow(clippy::too_many_arguments)]
+fn fill_stream_batch(
+    preparer: &mut CpuInputPreparer,
+    mut set: StreamBatchSet,
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    recovery_files: &mut HashMap<PathBuf, File>,
+    source_reader: &mut Option<StreamSourceReader>,
+    available_inputs: usize,
+    batch_start: usize,
+    batch_len: usize,
+    byte_start: usize,
+    byte_len: usize,
+    aligned_len: usize,
+    options: &RepairOptions,
+    timings: &CpuControllerTimings,
+) -> Result<StreamBatchSet> {
+    set.start = batch_start;
+    set.len = batch_len;
+    for output in 0..plan.input_factors.rows {
+        let row_start = output * set.input_grouping;
+        let row = &mut set.coefficients[row_start..row_start + set.input_grouping];
+        row.fill(0);
+        for (lane, factor) in row.iter_mut().take(batch_len).enumerate() {
+            *factor = plan.input_factors.get(output, batch_start + lane);
         }
-    });
+    }
+
+    let started = Instant::now();
+    preparer
+        .command_tx
+        .send(PreparationMessage::Begin(PrepareBatch {
+            set,
+            batch_len,
+            aligned_len,
+        }))
+        .map_err(|_| Par2Error::ReedSolomonError {
+            reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
+        })?;
+    for lane in 0..batch_len {
+        check_cancel(options)?;
+        let mut buffer = if let Some(buffer) = preparer.transfer_buffers.pop() {
+            buffer
+        } else {
+            preparer
+                .complete_rx
+                .recv()
+                .map_err(|_| Par2Error::ReedSolomonError {
+                    reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
+                })?
+        };
+        read_stream_source_chunk(
+            plan,
+            par2_set,
+            file_access,
+            recovery_files,
+            source_reader,
+            available_inputs,
+            batch_start + lane,
+            byte_start,
+            &mut buffer[..byte_len],
+        )?;
+        buffer[byte_len..aligned_len].fill(0);
+        preparer
+            .command_tx
+            .send(PreparationMessage::Input { lane, buffer })
+            .map_err(|_| Par2Error::ReedSolomonError {
+                reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
+            })?;
+    }
+    while preparer.transfer_buffers.len() < 2 {
+        preparer
+            .transfer_buffers
+            .push(
+                preparer
+                    .complete_rx
+                    .recv()
+                    .map_err(|_| Par2Error::ReedSolomonError {
+                        reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
+                    })?,
+            );
+    }
+    let result = preparer
+        .prepared_rx
+        .recv()
+        .map_err(|_| Par2Error::ReedSolomonError {
+            reason: "CPU repair preparation worker stopped unexpectedly".to_string(),
+        });
+    CpuControllerTimings::record(&timings.read_prepare_ns, started.elapsed());
+    result
 }
 
-/// Multiply one prepared input group into the persistent output area using the
-/// controller's shared assignment plan for every CPU backend.
-#[allow(clippy::too_many_arguments)]
-fn run_stream_batch_compute(
-    output_ptrs: &[usize],
-    set: &StreamBatchSet,
-    plan: &RepairPlan,
-    memo: &PreparedFactorMemo,
-    #[cfg(target_arch = "x86_64")] jit_memo: Option<&JitMemo>,
-    layout: &ControllerLayout,
-    add: bool,
-    use_folded: bool,
-    use_xorjit: bool,
-) {
-    let matrix = &plan.input_factors;
-    if use_xorjit {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let jit_memo = jit_memo.expect("jit_memo present when use_xorjit is set");
-            let width = jit_memo.width;
-            debug_assert_eq!(layout.aligned_len % width.block_bytes(), 0);
-            layout.assignments.par_iter().for_each(|work| {
-                let s0 = work.byte_start;
-                let j0 = work.output_start;
-                let j1 = j0 + work.output_len;
-                for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
-                    // SAFETY: controller assignments cover each destination
-                    // byte exactly once, and every assignment is aligned to
-                    // the active JIT block width.
-                    let dst = unsafe { (output_ptr as *mut u8).add(s0) };
-                    if !add {
-                        unsafe { std::slice::from_raw_parts_mut(dst, work.byte_len) }.fill(0);
-                    }
-                    for b in 0..set.len {
-                        let factor = matrix.get(j, set.start + b);
-                        if factor == 0 {
-                            continue;
-                        }
-                        unsafe {
-                            width.run_muladd(
-                                jit_memo.get(factor),
-                                set.bufs[b].as_ptr().add(s0),
-                                dst,
-                                work.byte_len,
-                            );
-                        }
-                    }
-                }
-            });
+enum FoldedBatchCoefficients<'a> {
+    None,
+    Gfni(Vec<[&'a crate::gf_simd::AffineMulMatrices; crate::gf_simd::FOLDED_GROUP]>),
+    Shuffle2x(Vec<[&'a crate::gf_simd::Shuffle2xTables; crate::gf_simd::FOLDED_GROUP]>),
+}
+
+impl<'a> FoldedBatchCoefficients<'a> {
+    fn prepare(set: &StreamBatchSet, memo: &'a PreparedFactorMemo, output_count: usize) -> Self {
+        if set.staging.is_empty() {
+            return Self::None;
         }
-        return;
-    }
-    if use_folded {
         let groups = set.len.div_ceil(crate::gf_simd::FOLDED_GROUP);
-        // Resolve coefficients once per input group. All folded backends use
-        // the same controller assignments and differ only in their kernel.
         if crate::gf_simd::folded_uses_gfni() {
-            let mut batch_matrices: Vec<
-                [&crate::gf_simd::AffineMulMatrices; crate::gf_simd::FOLDED_GROUP],
-            > = Vec::with_capacity(output_ptrs.len() * groups);
-            for j in 0..output_ptrs.len() {
-                for g in 0..groups {
-                    batch_matrices.push(std::array::from_fn(|lane| {
-                        let b = g * crate::gf_simd::FOLDED_GROUP + lane;
-                        let factor = if b < set.len {
-                            matrix.get(j, set.start + b)
+            let mut matrices = Vec::with_capacity(output_count * groups);
+            for output in 0..output_count {
+                for group in 0..groups {
+                    matrices.push(std::array::from_fn(|lane| {
+                        let input = group * crate::gf_simd::FOLDED_GROUP + lane;
+                        memo.get_affine(if input < set.len {
+                            set.coefficient(output, input)
                         } else {
                             0
-                        };
-                        memo.get_affine(factor)
+                        })
                     }));
                 }
             }
-            run_folded_assignments(layout, output_ptrs, groups, set, add, |dst, stagings, j| {
-                crate::gf_simd::mul_acc_folded_batch(
-                    dst,
-                    stagings,
-                    &batch_matrices[j * groups..(j + 1) * groups],
-                );
-            });
+            Self::Gfni(matrices)
         } else {
-            let mut batch_tables: Vec<
-                [&crate::gf_simd::Shuffle2xTables; crate::gf_simd::FOLDED_GROUP],
-            > = Vec::with_capacity(output_ptrs.len() * groups);
-            for j in 0..output_ptrs.len() {
-                for g in 0..groups {
-                    batch_tables.push(std::array::from_fn(|lane| {
-                        let b = g * crate::gf_simd::FOLDED_GROUP + lane;
-                        let factor = if b < set.len {
-                            matrix.get(j, set.start + b)
+            let mut tables = Vec::with_capacity(output_count * groups);
+            for output in 0..output_count {
+                for group in 0..groups {
+                    tables.push(std::array::from_fn(|lane| {
+                        let input = group * crate::gf_simd::FOLDED_GROUP + lane;
+                        memo.get_shuffle2x(if input < set.len {
+                            set.coefficient(output, input)
                         } else {
                             0
-                        };
-                        memo.get_shuffle2x(factor)
+                        })
                     }));
                 }
             }
-            run_folded_assignments(layout, output_ptrs, groups, set, add, |dst, stagings, j| {
-                crate::gf_simd::mul_acc_shuffle2x_batch(
-                    dst,
-                    stagings,
-                    &batch_tables[j * groups..(j + 1) * groups],
+            Self::Shuffle2x(tables)
+        }
+    }
+}
+
+struct CpuComputeContext<'a> {
+    output_ptrs: &'a [usize],
+    set: &'a StreamBatchSet,
+    memo: &'a PreparedFactorMemo,
+    #[cfg(target_arch = "x86_64")]
+    jit_memo: Option<&'a JitMemo>,
+    layout: &'a ControllerLayout,
+    folded_coefficients: &'a FoldedBatchCoefficients<'a>,
+    add: bool,
+}
+
+#[derive(Default)]
+struct CpuWorkerScratch {
+    active_inputs: Vec<usize>,
+}
+
+fn run_cpu_worker(worker: usize, context: &CpuComputeContext<'_>, scratch: &mut CpuWorkerScratch) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(jit_memo) = context.jit_memo {
+        let width = jit_memo.width;
+        debug_assert_eq!(context.layout.aligned_len % width.block_bytes(), 0);
+        for work in context
+            .layout
+            .assignments
+            .iter()
+            .filter(|work| work.worker == worker)
+        {
+            let byte_start = work.byte_start;
+            for (output, output_ptr) in context
+                .output_ptrs
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(work.output_start)
+                .take(work.output_len)
+            {
+                let dst = unsafe { (output_ptr as *mut u8).add(byte_start) };
+                if !context.add {
+                    unsafe { std::slice::from_raw_parts_mut(dst, work.byte_len) }.fill(0);
+                }
+                scratch.active_inputs.clear();
+                scratch.active_inputs.extend(
+                    (0..context.set.len)
+                        .filter(|input| context.set.coefficient(output, *input) != 0),
                 );
-            });
+                for &input in &scratch.active_inputs {
+                    let factor = context.set.coefficient(output, input);
+                    unsafe {
+                        width.run_muladd(
+                            jit_memo.get(factor),
+                            context.set.bufs[input].as_ptr().add(byte_start),
+                            dst,
+                            work.byte_len,
+                        );
+                    }
+                }
+            }
         }
         return;
     }
 
-    layout.assignments.par_iter().for_each(|work| {
-        let s0 = work.byte_start;
-        let s1 = s0 + work.byte_len;
-        let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> = Vec::with_capacity(set.len);
-        let j0 = work.output_start;
-        let j1 = j0 + work.output_len;
-        for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
-            srcs.clear();
-            for b in 0..set.len {
-                let factor = matrix.get(j, set.start + b);
-                if factor == 0 {
-                    continue;
+    if !matches!(context.folded_coefficients, FoldedBatchCoefficients::None) {
+        let groups = context.set.len.div_ceil(crate::gf_simd::FOLDED_GROUP);
+        for work in context
+            .layout
+            .assignments
+            .iter()
+            .filter(|work| work.worker == worker)
+        {
+            let byte_start = work.byte_start;
+            let byte_end = byte_start + work.byte_len;
+            let stagings: Vec<&[u8]> = (0..groups)
+                .map(|group| {
+                    &staging_bytes(&context.set.staging[group])[byte_start
+                        * crate::gf_simd::FOLDED_GROUP
+                        ..byte_end * crate::gf_simd::FOLDED_GROUP]
+                })
+                .collect();
+            for (output, output_ptr) in context
+                .output_ptrs
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(work.output_start)
+                .take(work.output_len)
+            {
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (output_ptr as *mut u8).add(byte_start),
+                        work.byte_len,
+                    )
+                };
+                if !context.add {
+                    dst.fill(0);
                 }
-                srcs.push(crate::gf_simd::PreparedFactorSrc {
-                    prepared: memo.get(factor),
-                    src: &set.bufs[b][s0..s1],
-                });
-            }
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0) };
-            if !add {
-                dst.fill(0);
-            }
-            if !srcs.is_empty() {
-                crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
+                match context.folded_coefficients {
+                    FoldedBatchCoefficients::Gfni(matrices) => {
+                        crate::gf_simd::mul_acc_folded_batch(
+                            dst,
+                            &stagings,
+                            &matrices[output * groups..(output + 1) * groups],
+                        );
+                    }
+                    FoldedBatchCoefficients::Shuffle2x(tables) => {
+                        crate::gf_simd::mul_acc_shuffle2x_batch(
+                            dst,
+                            &stagings,
+                            &tables[output * groups..(output + 1) * groups],
+                        );
+                    }
+                    FoldedBatchCoefficients::None => unreachable!(),
+                }
             }
         }
-    });
+        return;
+    }
+
+    for work in context
+        .layout
+        .assignments
+        .iter()
+        .filter(|work| work.worker == worker)
+    {
+        let byte_start = work.byte_start;
+        let byte_end = byte_start + work.byte_len;
+        let mut sources = Vec::with_capacity(context.set.len);
+        for (output, output_ptr) in context
+            .output_ptrs
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(work.output_start)
+            .take(work.output_len)
+        {
+            sources.clear();
+            scratch.active_inputs.clear();
+            scratch.active_inputs.extend(
+                (0..context.set.len).filter(|input| context.set.coefficient(output, *input) != 0),
+            );
+            for &input in &scratch.active_inputs {
+                let factor = context.set.coefficient(output, input);
+                sources.push(crate::gf_simd::PreparedFactorSrc {
+                    prepared: context.memo.get(factor),
+                    src: &context.set.bufs[input][byte_start..byte_end],
+                });
+            }
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (output_ptr as *mut u8).add(byte_start),
+                    work.byte_len,
+                )
+            };
+            if !context.add {
+                dst.fill(0);
+            }
+            if !sources.is_empty() {
+                crate::gf_simd::mul_acc_input_batch_prepared(dst, &sources);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CpuComputeJob {
+    id: u64,
+    context: usize,
+}
+
+struct CpuComputeCompletion {
+    id: u64,
+    worker: usize,
+    elapsed: Duration,
+    failure: Option<String>,
+}
+
+struct CpuComputeTicket {
+    id: u64,
+    expected: usize,
+    submission_failure: Option<String>,
+}
+
+struct CpuComputePool {
+    senders: Vec<std::sync::mpsc::SyncSender<CpuComputeJob>>,
+    completion_rx: std::sync::mpsc::Receiver<CpuComputeCompletion>,
+    next_id: u64,
+}
+
+impl CpuComputePool {
+    fn submit(&mut self, context: &CpuComputeContext<'_>) -> CpuComputeTicket {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let active_workers = context
+            .layout
+            .assignments
+            .iter()
+            .map(|work| work.worker)
+            .max()
+            .map_or(0, |worker| worker + 1);
+        let mut expected = 0usize;
+        let mut submission_failure = None;
+        for sender in self.senders.iter().take(active_workers) {
+            if sender
+                .send(CpuComputeJob {
+                    id,
+                    context: context as *const CpuComputeContext<'_> as usize,
+                })
+                .is_err()
+            {
+                submission_failure =
+                    Some("CPU repair compute worker stopped unexpectedly".to_string());
+                break;
+            }
+            expected += 1;
+        }
+        CpuComputeTicket {
+            id,
+            expected,
+            submission_failure,
+        }
+    }
+
+    fn wait(&self, ticket: CpuComputeTicket, timings: &CpuControllerTimings) -> Result<()> {
+        let mut max_elapsed = Duration::ZERO;
+        let mut failure = ticket.submission_failure;
+        for _ in 0..ticket.expected {
+            let completion =
+                self.completion_rx
+                    .recv()
+                    .map_err(|_| Par2Error::ReedSolomonError {
+                        reason: "CPU repair compute workers stopped unexpectedly".to_string(),
+                    })?;
+            if completion.id != ticket.id {
+                return Err(Par2Error::ReedSolomonError {
+                    reason: "CPU repair compute completion arrived out of order".to_string(),
+                });
+            }
+            max_elapsed = max_elapsed.max(completion.elapsed);
+            if let Some(reason) = completion.failure {
+                failure.get_or_insert_with(|| {
+                    format!("CPU repair worker {} failed: {reason}", completion.worker)
+                });
+            }
+        }
+        CpuControllerTimings::record(&timings.compute_ns, max_elapsed);
+        if let Some(reason) = failure {
+            Err(Par2Error::ReedSolomonError { reason })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn run_compute_worker(
+    worker: usize,
+    receiver: std::sync::mpsc::Receiver<CpuComputeJob>,
+    completion_tx: std::sync::mpsc::SyncSender<CpuComputeCompletion>,
+) {
+    let mut scratch = CpuWorkerScratch::default();
+    while let Ok(job) = receiver.recv() {
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: the controller waits for every submitted worker before
+            // moving the staged input, layout, coefficient views, or output
+            // area referenced by this scoped job.
+            let context = unsafe { &*(job.context as *const CpuComputeContext<'_>) };
+            run_cpu_worker(worker, context, &mut scratch);
+        }));
+        let failed = result.is_err();
+        if completion_tx
+            .send(CpuComputeCompletion {
+                id: job.id,
+                worker,
+                elapsed: started.elapsed(),
+                failure: failed.then(|| "kernel panicked".to_string()),
+            })
+            .is_err()
+        {
+            break;
+        }
+        if failed {
+            break;
+        }
+    }
 }
 
 fn xor_out_known_data(
@@ -1914,6 +2259,29 @@ impl GpuComputeArm {
     }
 }
 
+#[derive(Default)]
+struct CpuControllerTimings {
+    read_prepare_ns: AtomicU64,
+    compute_ns: AtomicU64,
+    finish_ns: AtomicU64,
+    write_ns: AtomicU64,
+}
+
+impl CpuControllerTimings {
+    fn record(counter: &AtomicU64, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        counter.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    fn micros(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed) / 1_000
+    }
+
+    fn duration_micros(elapsed: Duration) -> u64 {
+        elapsed.as_micros().min(u64::MAX as u128) as u64
+    }
+}
+
 fn execute_repair_streaming(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
@@ -1922,6 +2290,7 @@ fn execute_repair_streaming(
     chunk_words: usize,
     budget: usize,
 ) -> Result<()> {
+    let controller_started = Instant::now();
     let n = plan.missing_slices.len();
     if n == 0 {
         return Ok(());
@@ -1993,7 +2362,13 @@ fn execute_repair_streaming(
     // Build the JIT memo up front so an executable-memory failure falls back to
     // shuffle2x before any buffer is shaped for the planar layout.
     #[cfg(target_arch = "x86_64")]
+    let jit_setup_started = Instant::now();
+    #[cfg(target_arch = "x86_64")]
     let jit_memo = jit_width.and_then(|width| JitMemo::from_matrix(width, &plan.input_factors));
+    #[cfg(target_arch = "x86_64")]
+    let jit_setup = jit_setup_started.elapsed();
+    #[cfg(not(target_arch = "x86_64"))]
+    let jit_setup = Duration::ZERO;
     #[cfg(target_arch = "x86_64")]
     let use_xorjit = jit_memo.is_some();
     #[cfg(not(target_arch = "x86_64"))]
@@ -2014,16 +2389,48 @@ fn execute_repair_streaming(
         CpuControllerPlan::new(max_byte_len, total_sources, n, workers, capabilities);
     let input_grouping = max_controller.input_grouping;
     let max_aligned_len = max_controller.layout.aligned_len;
+    let factor_setup_started = Instant::now();
     let memo = PreparedFactorMemo::from_matrix(&plan.input_factors, use_folded);
+    let factor_setup = factor_setup_started.elapsed();
+    let buffer_setup_started = Instant::now();
     let mut batch_sets = [
-        StreamBatchSet::new(max_aligned_len, input_grouping, use_folded, use_xorjit),
-        StreamBatchSet::new(max_aligned_len, input_grouping, use_folded, use_xorjit),
+        Some(StreamBatchSet::new(
+            max_aligned_len,
+            input_grouping,
+            n,
+            use_folded,
+            use_xorjit,
+        )),
+        Some(StreamBatchSet::new(
+            max_aligned_len,
+            input_grouping,
+            n,
+            use_folded,
+            use_xorjit,
+        )),
     ];
-    let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_aligned_len]; n];
+    let mut cpu_output_area = AlignedOutputArea::new(n, max_aligned_len);
+    let output_ptrs = cpu_output_area.pointers();
+    #[cfg(any(
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+        feature = "wgpu"
+    ))]
+    let mut gpu_chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_aligned_len]; n];
+    #[cfg(not(any(
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64"),
+        feature = "wgpu"
+    )))]
+    let mut gpu_chunk_output: Vec<Vec<u8>> = Vec::new();
+    let gpu_output_ptrs: Vec<usize> = gpu_chunk_output
+        .iter_mut()
+        .map(|output| output.as_mut_ptr() as usize)
+        .collect();
     // GPU arm: engages when nothing else owns accumulation — either no x86
     // fast path exists (the original non-x86 shape), or `gpu_preferred` above
     // pinned the fast tiers off in favor of a forced or discrete-auto GPU.
     let mut gpu = GpuComputeArm::engage(use_folded || use_xorjit, n, max_byte_len, effective_bytes);
+    let buffer_setup = buffer_setup_started.elapsed();
+    let timings = CpuControllerTimings::default();
 
     info!(
         missing_slices = n,
@@ -2035,210 +2442,259 @@ fn execute_repair_streaming(
         "repairing with CPU-controller streamed path"
     );
 
-    let mut chunk_idx = 0usize;
-    while chunk_idx < total_chunks_usize {
-        check_cancel(options)?;
-
-        let chunk_start = chunk_idx * chunk_words;
-        let chunk_end = (chunk_start + chunk_words).min(word_count);
-        let chunk_len = chunk_end - chunk_start;
-        let byte_start = chunk_start * 2;
-        let byte_len = chunk_len * 2;
-        let controller = CpuControllerPlan::new(byte_len, total_sources, n, workers, capabilities);
-        debug!(
-            chunk = chunk_idx,
-            aligned_bytes = controller.layout.aligned_len,
-            compute_chunk_bytes = controller.layout.chunk_len,
-            compute_chunks = controller.layout.num_chunks,
-            assignments = controller.layout.assignments.len(),
-            input_batches = controller.input_batches.len(),
-            "CPU repair controller plan"
-        );
-        let first_batch = controller
-            .input_batches
-            .first()
-            .expect("repair controller requires at least one input");
-        let output_ptrs: Vec<usize> = chunk_output
-            .iter_mut()
-            .map(|chunk| chunk.as_mut_ptr() as usize)
-            .collect();
-
-        // Batched source loop with read/compute overlap. CPU path: the
-        // batch's multiply runs on the rayon pool while the caller thread
-        // fills the other buffer set. GPU path: dispatches are queued
-        // asynchronously, so the caller thread fills the next batch while
-        // the GPU computes; a GPU failure redoes this whole chunk on the
-        // CPU. A GPU failure redoes this whole chunk through the controller;
-        // its first batch initializes every assigned output region.
-        let gpu_chunk = gpu.begin_chunk(byte_len);
-        fill_stream_batch(
-            &mut batch_sets[first_batch.staging_area],
-            plan,
-            par2_set,
-            file_access,
-            &mut recovery_files,
-            available_inputs,
-            first_batch.input_start,
-            first_batch.input_len,
-            byte_start,
-            byte_len,
-            controller.layout.aligned_len,
-            use_folded,
-            use_xorjit,
-            #[cfg(target_arch = "x86_64")]
-            jit_memo.as_ref(),
-            options,
-        )?;
-        let mut gpu_failed = false;
-        for (batch_idx, batch) in controller.input_batches.iter().copied().enumerate() {
-            check_cancel(options)?;
-            let (set_a, set_b) = batch_sets.split_at_mut(1);
-            let (current, next): (&StreamBatchSet, &mut StreamBatchSet) = if batch.staging_area == 0
-            {
-                (&set_a[0], &mut set_b[0])
-            } else {
-                (&set_b[0], &mut set_a[0])
-            };
-            let next_batch = controller.input_batches.get(batch_idx + 1).copied();
-
-            let mut read_result: Result<()> = Ok(());
-            if gpu_chunk {
-                if gpu.accumulate(current, plan, byte_len).is_err() {
-                    gpu_failed = true;
-                    break;
-                }
-                if let Some(next_batch) = next_batch {
-                    read_result = fill_stream_batch(
-                        next,
-                        plan,
-                        par2_set,
-                        file_access,
-                        &mut recovery_files,
-                        available_inputs,
-                        next_batch.input_start,
-                        next_batch.input_len,
-                        byte_start,
-                        byte_len,
-                        controller.layout.aligned_len,
-                        use_folded,
-                        use_xorjit,
-                        #[cfg(target_arch = "x86_64")]
-                        jit_memo.as_ref(),
-                        options,
-                    );
-                }
-            } else {
-                rayon::in_place_scope(|scope| {
-                    let output_ptrs = &output_ptrs;
-                    let memo = &memo;
-                    let compute_layout = &controller.layout;
-                    let aligned_len = controller.layout.aligned_len;
-                    #[cfg(target_arch = "x86_64")]
-                    let jit_memo = jit_memo.as_ref();
-                    scope.spawn(move |_| {
-                        run_stream_batch_compute(
-                            output_ptrs,
-                            current,
-                            plan,
-                            memo,
-                            #[cfg(target_arch = "x86_64")]
-                            jit_memo,
-                            compute_layout,
-                            batch.add,
-                            use_folded,
-                            use_xorjit,
-                        );
-                    });
-                    if let Some(next_batch) = next_batch {
-                        read_result = fill_stream_batch(
-                            next,
-                            plan,
-                            par2_set,
-                            file_access,
-                            &mut recovery_files,
-                            available_inputs,
-                            next_batch.input_start,
-                            next_batch.input_len,
-                            byte_start,
-                            byte_len,
-                            aligned_len,
-                            use_folded,
-                            use_xorjit,
-                            #[cfg(target_arch = "x86_64")]
-                            jit_memo,
-                            options,
-                        );
-                    }
-                });
-            }
-            read_result?;
+    let repair_result = std::thread::scope(|scope| -> Result<()> {
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(2);
+        let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel(2);
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(2);
+        #[cfg(target_arch = "x86_64")]
+        let preparation_jit_width = jit_memo.as_ref().map(|memo| memo.width);
+        let preparation_worker = scope.spawn(move || {
+            run_preparation_worker(
+                command_rx,
+                complete_tx,
+                prepared_tx,
+                finished_tx,
+                use_folded,
+                use_xorjit,
+                #[cfg(target_arch = "x86_64")]
+                preparation_jit_width,
+            );
+        });
+        let mut preparer = CpuInputPreparer {
+            command_tx,
+            complete_rx,
+            prepared_rx,
+            finished_rx,
+            transfer_buffers: vec![vec![0u8; max_aligned_len], vec![0u8; max_aligned_len]],
+        };
+        let (compute_completion_tx, compute_completion_rx) =
+            std::sync::mpsc::sync_channel(workers.saturating_mul(2).max(1));
+        let mut compute_senders = Vec::with_capacity(workers);
+        let mut compute_workers = Vec::with_capacity(workers);
+        for worker_index in 0..workers {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let completion_tx = compute_completion_tx.clone();
+            compute_senders.push(sender);
+            compute_workers.push(scope.spawn(move || {
+                run_compute_worker(worker_index, receiver, completion_tx);
+            }));
         }
-        if gpu_chunk && !gpu_failed && gpu.finish_chunk(&mut chunk_output, byte_len).is_err() {
-            gpu_failed = true;
-        }
-        if gpu_failed {
-            // The arm is disabled; redo this chunk from batch zero on the
-            // CPU path.
-            continue;
-        }
+        drop(compute_completion_tx);
+        let mut compute_pool = CpuComputePool {
+            senders: compute_senders,
+            completion_rx: compute_completion_rx,
+            next_id: 0,
+        };
 
-        if use_xorjit {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // Invert every aligned planar block; padding beyond byte_len
-                // is discarded during output transfer.
-                let width = jit_memo.as_ref().expect("jit_memo when use_xorjit").width;
-                let block = width.block_bytes();
-                chunk_output.par_iter_mut().for_each(|output| {
-                    for k in 0..controller.layout.aligned_len / block {
-                        let s = k * block;
-                        // SAFETY: use_xorjit implies AVX2; each window is exactly
-                        // one block and the blocks are disjoint.
-                        unsafe {
-                            width.finish_block(&mut output[s..s + block]);
+        let repair_result = (|| -> Result<()> {
+            let mut chunk_idx = 0usize;
+            let mut source_reader = None;
+            while chunk_idx < total_chunks_usize {
+                check_cancel(options)?;
+
+                let chunk_start = chunk_idx * chunk_words;
+                let chunk_end = (chunk_start + chunk_words).min(word_count);
+                let chunk_len = chunk_end - chunk_start;
+                let byte_start = chunk_start * 2;
+                let byte_len = chunk_len * 2;
+                let controller =
+                    CpuControllerPlan::new(byte_len, total_sources, n, workers, capabilities);
+                debug!(
+                    chunk = chunk_idx,
+                    aligned_bytes = controller.layout.aligned_len,
+                    compute_chunk_bytes = controller.layout.chunk_len,
+                    compute_chunks = controller.layout.num_chunks,
+                    assignments = controller.layout.assignments.len(),
+                    input_batches = controller.input_batches.len(),
+                    "CPU repair controller plan"
+                );
+                let first_batch = controller
+                    .input_batches
+                    .first()
+                    .expect("repair controller requires at least one input");
+
+                // Batched source loop with read/compute overlap. CPU path: the
+                // batch's multiply runs on persistent controller workers while
+                // the caller thread fills the other buffer set. GPU path:
+                // dispatches are queued
+                // asynchronously, so the caller thread fills the next batch while
+                // the GPU computes; a GPU failure redoes this whole chunk on the
+                // CPU. A GPU failure redoes this whole chunk through the controller;
+                // its first batch initializes every assigned output region.
+                let gpu_chunk = gpu.begin_chunk(byte_len);
+                let mut current_area = first_batch.staging_area;
+                let mut current = fill_stream_batch(
+                    &mut preparer,
+                    batch_sets[current_area]
+                        .take()
+                        .expect("controller staging area available"),
+                    plan,
+                    par2_set,
+                    file_access,
+                    &mut recovery_files,
+                    &mut source_reader,
+                    available_inputs,
+                    first_batch.input_start,
+                    first_batch.input_len,
+                    byte_start,
+                    byte_len,
+                    controller.layout.aligned_len,
+                    options,
+                    &timings,
+                )?;
+                let mut spare = batch_sets[1 - current_area].take();
+                let mut gpu_failed = false;
+                for (batch_idx, batch) in controller.input_batches.iter().copied().enumerate() {
+                    check_cancel(options)?;
+                    debug_assert_eq!(batch.staging_area, current_area);
+                    let next_batch = controller.input_batches.get(batch_idx + 1).copied();
+
+                    let mut read_result: Result<Option<StreamBatchSet>> = Ok(None);
+                    if gpu_chunk {
+                        if gpu.accumulate(&current, plan, byte_len).is_err() {
+                            gpu_failed = true;
+                            break;
                         }
+                        if let Some(next_batch) = next_batch {
+                            read_result = fill_stream_batch(
+                                &mut preparer,
+                                spare.take().expect("controller staging area available"),
+                                plan,
+                                par2_set,
+                                file_access,
+                                &mut recovery_files,
+                                &mut source_reader,
+                                available_inputs,
+                                next_batch.input_start,
+                                next_batch.input_len,
+                                byte_start,
+                                byte_len,
+                                controller.layout.aligned_len,
+                                options,
+                                &timings,
+                            )
+                            .map(Some);
+                        }
+                    } else {
+                        let folded_coefficients =
+                            FoldedBatchCoefficients::prepare(&current, &memo, n);
+                        let compute_context = CpuComputeContext {
+                            output_ptrs: &output_ptrs,
+                            set: &current,
+                            memo: &memo,
+                            #[cfg(target_arch = "x86_64")]
+                            jit_memo: jit_memo.as_ref(),
+                            layout: &controller.layout,
+                            folded_coefficients: &folded_coefficients,
+                            add: batch.add,
+                        };
+                        let ticket = compute_pool.submit(&compute_context);
+                        if let Some(next_batch) = next_batch {
+                            read_result = fill_stream_batch(
+                                &mut preparer,
+                                spare.take().expect("controller staging area available"),
+                                plan,
+                                par2_set,
+                                file_access,
+                                &mut recovery_files,
+                                &mut source_reader,
+                                available_inputs,
+                                next_batch.input_start,
+                                next_batch.input_len,
+                                byte_start,
+                                byte_len,
+                                controller.layout.aligned_len,
+                                options,
+                                &timings,
+                            )
+                            .map(Some);
+                        }
+                        compute_pool.wait(ticket, &timings)?;
                     }
-                });
+                    if let Some(next) = read_result? {
+                        spare = Some(current);
+                        current = next;
+                        current_area = next_batch.expect("prepared next batch").staging_area;
+                    }
+                }
+                batch_sets[current_area] = Some(current);
+                batch_sets[1 - current_area] = spare;
+                if gpu_chunk
+                    && !gpu_failed
+                    && gpu.finish_chunk(&mut gpu_chunk_output, byte_len).is_err()
+                {
+                    gpu_failed = true;
+                }
+                if gpu_failed {
+                    // The arm is disabled; redo this chunk from batch zero on the
+                    // CPU path.
+                    continue;
+                }
+
+                finish_and_write_stream_outputs(
+                    &mut preparer,
+                    if gpu_chunk {
+                        &gpu_output_ptrs
+                    } else {
+                        &output_ptrs
+                    },
+                    controller.layout.aligned_len,
+                    byte_start,
+                    byte_len,
+                    &write_targets,
+                    file_access,
+                    &timings,
+                )?;
+
+                if let Some(ref progress) = options.progress {
+                    progress(ProgressUpdate {
+                        stage: ProgressStage::Repairing,
+                        current: chunk_idx as u32 + 1,
+                        total: total_chunks,
+                        bytes_processed: ((chunk_idx + 1) as u64)
+                            .saturating_mul(chunk_words as u64)
+                            .saturating_mul(2)
+                            .min(operation_total_bytes),
+                        total_bytes: Some(operation_total_bytes),
+                    });
+                }
+                chunk_idx += 1;
             }
-        } else if use_folded {
-            chunk_output.par_iter_mut().for_each(|output| {
-                crate::gf_simd::altmap_decode(&mut output[..controller.layout.aligned_len]);
+            Ok(())
+        })();
+        drop(compute_pool);
+        drop(preparer);
+        let mut compute_panicked = false;
+        for worker in compute_workers {
+            compute_panicked |= worker.join().is_err();
+        }
+        if compute_panicked && repair_result.is_ok() {
+            return Err(Par2Error::ReedSolomonError {
+                reason: "CPU repair compute worker panicked".to_string(),
             });
         }
-
-        for (j, target) in write_targets.iter().enumerate() {
-            let write_offset = target.offset + byte_start as u64;
-            let remaining = target.file_end.saturating_sub(write_offset);
-            let write_len = remaining.min(byte_len as u64) as usize;
-            if write_len == 0 {
-                continue;
-            }
-
-            file_access
-                .write_file_range(&target.file_id, write_offset, &chunk_output[j][..write_len])
-                .map_err(|e| Par2Error::RepairWriteFailed {
-                    filename: target.filename.clone(),
-                    offset: write_offset,
-                    source: e,
-                })?;
-        }
-
-        if let Some(ref progress) = options.progress {
-            progress(ProgressUpdate {
-                stage: ProgressStage::Repairing,
-                current: chunk_idx as u32 + 1,
-                total: total_chunks,
-                bytes_processed: ((chunk_idx + 1) as u64)
-                    .saturating_mul(chunk_words as u64)
-                    .saturating_mul(2)
-                    .min(operation_total_bytes),
-                total_bytes: Some(operation_total_bytes),
+        if preparation_worker.join().is_err() && repair_result.is_ok() {
+            return Err(Par2Error::ReedSolomonError {
+                reason: "CPU repair preparation worker panicked".to_string(),
             });
         }
-        chunk_idx += 1;
-    }
+        repair_result
+    });
+    repair_result?;
 
-    info!("streaming repair complete: {} slices restored", n);
+    info!(
+        missing_slices = n,
+        total_us = CpuControllerTimings::duration_micros(controller_started.elapsed()),
+        jit_setup_us = CpuControllerTimings::duration_micros(jit_setup),
+        factor_setup_us = CpuControllerTimings::duration_micros(factor_setup),
+        buffer_setup_us = CpuControllerTimings::duration_micros(buffer_setup),
+        read_prepare_work_us = CpuControllerTimings::micros(&timings.read_prepare_ns),
+        compute_work_us = CpuControllerTimings::micros(&timings.compute_ns),
+        finish_us = CpuControllerTimings::micros(&timings.finish_ns),
+        write_us = CpuControllerTimings::micros(&timings.write_ns),
+        "streaming repair complete"
+    );
     Ok(())
 }
 
@@ -2627,9 +3083,9 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
 ///
 /// This always uses the in-memory reconstruct shape (all sources are read into
 /// memory and handed to the solver as byte regions), which is what an off-rayon
-/// host solver needs. The native rayon default is reached through
-/// [`execute_repair`] / [`execute_repair_with_options`]; use this entry to
-/// inject an alternative solver (e.g. a wasm host-thread dispatcher).
+/// host solver needs. Native repair uses the streamed CPU controller through
+/// [`execute_repair`] / [`execute_repair_with_options`]; use this entry only to
+/// inject an alternative solver (for example, a wasm host-thread dispatcher).
 pub fn execute_repair_with_solver<S: RepairSolver + ?Sized>(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
@@ -2667,21 +3123,8 @@ pub fn execute_repair_with_options(
         "PAR2 slice_size must be a multiple of 2"
     );
 
-    match select_repair_execution_mode(plan, options) {
-        RepairExecutionMode::Streaming {
-            chunk_words,
-            budget,
-        } => execute_repair_streaming(plan, par2_set, file_access, options, chunk_words, budget),
-        RepairExecutionMode::InMemory { chunk_words } => {
-            info!("reconstructing {} missing slices", n);
-            // The native default reconstruct runs through the RepairSolver seam
-            // (byte-identical to the pre-seam rayon path), so the crate's own
-            // repair tests exercise the default solver.
-            let solver = NativeRepairSolver::new(&plan.input_factors, chunk_words)
-                .with_cancellation(options.cancel.clone());
-            run_in_memory_repair(plan, par2_set, file_access, options, &solver)
-        }
-    }
+    let (chunk_words, budget) = controller_execution_parameters(plan, options);
+    execute_repair_streaming(plan, par2_set, file_access, options, chunk_words, budget)
 }
 
 #[cfg(test)]
@@ -2746,6 +3189,111 @@ mod tests {
             data: &[u8],
         ) -> std::io::Result<()> {
             self.inner.write_file_range(file_id, offset, data)
+        }
+    }
+
+    struct CountingRangeAccess {
+        inner: MemoryFileAccess,
+        range_opens: std::sync::atomic::AtomicUsize,
+        fallback_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FileAccess for CountingRangeAccess {
+        fn read_file_range(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            len: u64,
+        ) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file_range(file_id, offset, len)
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> std::io::Result<usize> {
+            self.fallback_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_file_range_into(file_id, offset, dst)
+        }
+
+        fn open_range_reader(
+            &self,
+            file_id: &FileId,
+        ) -> std::io::Result<Option<Box<dyn FileRangeReader>>> {
+            self.range_opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(Box::new(std::io::Cursor::new(
+                self.inner.read_file(file_id)?,
+            ))))
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.inner.file_exists(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.inner.file_length(file_id)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file(file_id)
+        }
+
+        fn write_file_range(
+            &mut self,
+            file_id: &FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> std::io::Result<()> {
+            self.inner.write_file_range(file_id, offset, data)
+        }
+    }
+
+    struct FailingWriteAccess {
+        inner: MemoryFileAccess,
+    }
+
+    impl FileAccess for FailingWriteAccess {
+        fn read_file_range(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            len: u64,
+        ) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file_range(file_id, offset, len)
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> std::io::Result<usize> {
+            self.inner.read_file_range_into(file_id, offset, dst)
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.inner.file_exists(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.inner.file_length(file_id)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file(file_id)
+        }
+
+        fn write_file_range(
+            &mut self,
+            _file_id: &FileId,
+            _offset: u64,
+            _data: &[u8],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected controller write failure"))
         }
     }
 
@@ -3409,6 +3957,191 @@ mod tests {
     }
 
     #[test]
+    fn streaming_controller_reuses_seekable_source_reader() {
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..25 * slice_size as u32)
+            .map(|i| ((i * 7 + 19) % 251) as u8)
+            .collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 4);
+        let mut damaged = file_data.clone();
+        for slice in [0usize, 12, 24] {
+            let start = slice * slice_size as usize;
+            damaged[start..start + slice_size as usize].fill(0);
+        }
+
+        let mut verification_access = MemoryFileAccess::new();
+        verification_access.add_file(file_id, damaged.clone());
+        let verification = verify::verify_all(&par2_set, &verification_access);
+        let plan = plan_repair(&par2_set, &verification).unwrap();
+
+        let mut inner = MemoryFileAccess::new();
+        inner.add_file(file_id, damaged);
+        let mut access = CountingRangeAccess {
+            inner,
+            range_opens: std::sync::atomic::AtomicUsize::new(0),
+            fallback_reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        execute_repair_with_options(
+            &plan,
+            &par2_set,
+            &mut access,
+            &RepairOptions {
+                memory_limit: Some(512),
+                ..RepairOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            access
+                .range_opens
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            access
+                .fallback_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(access.read_file(&file_id).unwrap(), file_data);
+    }
+
+    #[test]
+    fn streaming_controller_output_failure_is_not_accepted() {
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..13 * slice_size as u32)
+            .map(|i| ((i * 31 + 3) % 251) as u8)
+            .collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 2);
+        let mut damaged = file_data.clone();
+        damaged[..slice_size as usize].fill(0);
+
+        let mut verification_access = MemoryFileAccess::new();
+        verification_access.add_file(file_id, damaged.clone());
+        let verification = verify::verify_all(&par2_set, &verification_access);
+        let plan = plan_repair(&par2_set, &verification).unwrap();
+
+        let mut inner = MemoryFileAccess::new();
+        inner.add_file(file_id, damaged.clone());
+        let mut access = FailingWriteAccess { inner };
+        let error = execute_repair_with_options(
+            &plan,
+            &par2_set,
+            &mut access,
+            &RepairOptions {
+                memory_limit: Some(256),
+                ..RepairOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Par2Error::RepairWriteFailed { .. }));
+        assert_eq!(access.read_file(&file_id).unwrap(), damaged);
+    }
+
+    #[test]
+    fn compute_worker_failure_is_reported_before_output_transfer() {
+        let factors = matrix::Matrix::identity(1);
+        let memo = PreparedFactorMemo::from_matrix(&factors, false);
+        let mut set = StreamBatchSet::new(2, 1, 1, false, false);
+        set.len = 1;
+        set.coefficients[0] = 1;
+        let layout = ControllerLayout {
+            aligned_len: 4,
+            chunk_len: 4,
+            num_chunks: 1,
+            assignments: vec![crate::cpu_repair_controller::WorkAssignment {
+                worker: 0,
+                byte_start: 0,
+                byte_len: 4,
+                output_start: 0,
+                output_len: 1,
+            }],
+        };
+        let mut output = vec![0x5au8; 4];
+        let output_ptrs = vec![output.as_mut_ptr() as usize];
+        let folded = FoldedBatchCoefficients::None;
+        let context = CpuComputeContext {
+            output_ptrs: &output_ptrs,
+            set: &set,
+            memo: &memo,
+            #[cfg(target_arch = "x86_64")]
+            jit_memo: None,
+            layout: &layout,
+            folded_coefficients: &folded,
+            add: false,
+        };
+
+        std::thread::scope(|scope| {
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel(1);
+            let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = scope.spawn(move || run_compute_worker(0, job_rx, completion_tx));
+            job_tx
+                .send(CpuComputeJob {
+                    id: 7,
+                    context: &context as *const CpuComputeContext<'_> as usize,
+                })
+                .unwrap();
+            drop(job_tx);
+            let completion = completion_rx.recv().unwrap();
+            assert_eq!(completion.id, 7);
+            assert!(completion.failure.is_some());
+            worker.join().unwrap();
+        });
+        assert_eq!(output, vec![0x5a; 4]);
+    }
+
+    #[test]
+    fn preparation_failure_closes_batch_without_output() {
+        let set = StreamBatchSet::new(64, 12, 1, false, false);
+        std::thread::scope(|scope| {
+            let (command_tx, command_rx) = std::sync::mpsc::sync_channel(2);
+            let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel(2);
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = scope.spawn(move || {
+                run_preparation_worker(
+                    command_rx,
+                    complete_tx,
+                    prepared_tx,
+                    finished_tx,
+                    false,
+                    false,
+                    #[cfg(target_arch = "x86_64")]
+                    None,
+                );
+            });
+            command_tx
+                .send(PreparationMessage::Begin(PrepareBatch {
+                    set,
+                    batch_len: 1,
+                    aligned_len: 64,
+                }))
+                .unwrap();
+            command_tx
+                .send(PreparationMessage::Input {
+                    lane: 0,
+                    buffer: vec![0u8; 1],
+                })
+                .unwrap();
+            drop(command_tx);
+            assert!(worker.join().is_err());
+            assert!(complete_rx.recv().is_err());
+            assert!(prepared_rx.recv().is_err());
+        });
+    }
+
+    #[test]
+    fn controller_output_rows_are_aligned_and_stable() {
+        let mut area = AlignedOutputArea::new(3, 65_537);
+        let first = area.pointers();
+        let second = area.pointers();
+        assert_eq!(first, second);
+        assert!(first.iter().all(|pointer| pointer % 64 == 0));
+    }
+
+    #[test]
     fn repair_with_file_backed_recovery_streaming_succeeds() {
         let slice_size = 128u64;
         let file_data: Vec<u8> = (0..384u32).map(|i| ((i * 9 + 17) % 256) as u8).collect();
@@ -3472,29 +4205,31 @@ mod tests {
     }
 
     #[test]
-    fn repair_selector_prefers_streaming_when_budget_is_tight() {
-        let plan = synthetic_plan(450, 64 * 1024);
-        let mode = select_repair_execution_mode(
+    fn controller_parameters_shrink_chunks_to_a_tight_budget() {
+        let plan = synthetic_plan(450, 1024 * 1024);
+        let (chunk_words, budget) = controller_execution_parameters(
             &plan,
             &RepairOptions {
                 memory_limit: Some(50 * 1024 * 1024),
                 ..RepairOptions::default()
             },
         );
-        assert!(matches!(mode, RepairExecutionMode::Streaming { .. }));
+        assert_eq!(budget, 50 * 1024 * 1024);
+        assert!(chunk_words < plan.slice_size as usize / 2);
     }
 
     #[test]
-    fn repair_selector_keeps_fast_path_when_budget_allows() {
+    fn controller_parameters_use_a_full_slice_when_budget_allows() {
         let plan = synthetic_plan(8, 64 * 1024);
-        let mode = select_repair_execution_mode(
+        let (chunk_words, budget) = controller_execution_parameters(
             &plan,
             &RepairOptions {
                 memory_limit: Some(16 * 1024 * 1024),
                 ..RepairOptions::default()
             },
         );
-        assert!(matches!(mode, RepairExecutionMode::InMemory { .. }));
+        assert_eq!(budget, 16 * 1024 * 1024);
+        assert_eq!(chunk_words, plan.slice_size as usize / 2);
     }
 
     // ── Repair-solver seam (RFC 123 WP2.5) ─────────────────────────────────

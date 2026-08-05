@@ -100,7 +100,9 @@ impl ControllerLayout {
         let workers = worker_count.max(1);
         let stride = capabilities.stride.max(1);
         let ideal_chunk = align_up(capabilities.ideal_chunk_size.max(stride), stride);
-        let aligned_len = align_up(current_slice_size, stride);
+        // Turbo keeps one additional packed stride so preparation/finalization
+        // can safely carry its checksum/padding block through the controller.
+        let aligned_len = align_up(current_slice_size, stride) + stride;
 
         let target_thread_chunk = aligned_len.div_ceil(workers);
         let mut num_chunks = if target_thread_chunk <= ideal_chunk / 2 {
@@ -248,6 +250,40 @@ mod tests {
     }
 
     #[test]
+    fn input_group_boundaries_match_turbo_flush_decisions() {
+        let cases = [
+            (1, vec![1]),
+            (11, vec![11]),
+            (12, vec![12]),
+            (13, vec![12, 1]),
+            (23, vec![12, 11]),
+            (24, vec![12, 12]),
+            (25, vec![12, 12, 1]),
+        ];
+        for (inputs, expected_lengths) in cases {
+            let plan = CpuControllerPlan::new(64 * 1024, inputs, 3, 8, CAPS);
+            assert_eq!(
+                plan.input_batches
+                    .iter()
+                    .map(|batch| batch.input_len)
+                    .collect::<Vec<_>>(),
+                expected_lengths
+            );
+            assert_eq!(
+                plan.input_batches
+                    .iter()
+                    .map(|batch| batch.staging_area)
+                    .collect::<Vec<_>>(),
+                (0..plan.input_batches.len())
+                    .map(|batch| batch % 2)
+                    .collect::<Vec<_>>()
+            );
+            assert!(!plan.input_batches[0].add);
+            assert!(plan.input_batches.iter().skip(1).all(|batch| batch.add));
+        }
+    }
+
+    #[test]
     fn one_chunk_splits_outputs_across_workers() {
         let layout = ControllerLayout::new(64 * 1024, 512, 12, CAPS);
         assert_eq!(layout.num_chunks, 1);
@@ -257,7 +293,7 @@ mod tests {
             layout
                 .assignments
                 .iter()
-                .all(|work| work.byte_len == 64 * 1024)
+                .all(|work| work.byte_len == 64 * 1024 + CAPS.stride)
         );
         assert_eq!(
             layout
@@ -266,6 +302,38 @@ mod tests {
                 .map(|work| work.output_len)
                 .sum::<usize>(),
             512
+        );
+    }
+
+    #[test]
+    fn one_chunk_caps_workers_at_output_count() {
+        let layout = ControllerLayout::new(64 * 1024, 3, 12, CAPS);
+        assert_eq!(layout.num_chunks, 1);
+        assert_eq!(
+            layout.assignments,
+            vec![
+                WorkAssignment {
+                    worker: 0,
+                    byte_start: 0,
+                    byte_len: layout.aligned_len,
+                    output_start: 0,
+                    output_len: 1,
+                },
+                WorkAssignment {
+                    worker: 1,
+                    byte_start: 0,
+                    byte_len: layout.aligned_len,
+                    output_start: 1,
+                    output_len: 1,
+                },
+                WorkAssignment {
+                    worker: 2,
+                    byte_start: 0,
+                    byte_len: layout.aligned_len,
+                    output_start: 2,
+                    output_len: 1,
+                },
+            ]
         );
     }
 

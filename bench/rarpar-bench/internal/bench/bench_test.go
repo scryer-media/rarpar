@@ -159,6 +159,12 @@ func TestPlanOrderIsStable(t *testing.T) {
 	}
 }
 
+func TestBenchmarkPairsAlternateWhichSubjectRunsFirst(t *testing.T) {
+	if referenceRunsFirst(0, true) || !referenceRunsFirst(1, true) || referenceRunsFirst(1, false) {
+		t.Fatal("benchmark pair order did not alternate deterministically")
+	}
+}
+
 func TestRenderSVGIsDeterministicAndEscapesInput(t *testing.T) {
 	report := fixtureReport()
 	first, err := renderSVG(report, "rar", report.Comparisons)

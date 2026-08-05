@@ -35,7 +35,9 @@ decoder work settles.
 ## Runs
 
 Create and retain a plan before measuring. The default plan has one warmup and
-five measured samples in deterministic order. It records `canonical` PAR2
+five measured samples in deterministic order. Candidate/reference pairs
+alternate which subject runs first to reduce order bias. The plan records
+`canonical` PAR2
 placement by default: rarpar verifies the paths recorded in the PAR2 set,
 without its optional content-based relocation scan. This is the comparable lane
 for conventional PAR2 tools. Use `--par2-placement smart` to measure rarpar's

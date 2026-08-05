@@ -89,10 +89,25 @@ fn part_prefix_and_number(path: &Path) -> Option<(String, u32)> {
     Some((prefix.to_string(), digits.parse().ok()?))
 }
 
+fn classic_volume_prefix_and_number(path: &Path) -> Option<(String, u32)> {
+    let prefix = path.file_stem()?.to_str()?.to_string();
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let bytes = extension.as_bytes();
+    if bytes.len() != 3
+        || !(b'r'..=b'z').contains(&bytes[0])
+        || !bytes[1..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let suffix = u32::from(bytes[1] - b'0') * 10 + u32::from(bytes[2] - b'0');
+    Some((prefix, 1 + u32::from(bytes[0] - b'r') * 100 + suffix))
+}
+
 fn collect_oracle_fixture_groups() -> Vec<(String, Vec<PathBuf>, Option<&'static str>)> {
     let root = fixture_root();
     let mut singles = Vec::new();
     let mut parts = BTreeMap::<(PathBuf, String), Vec<(u32, PathBuf)>>::new();
+    let mut classic = BTreeMap::<(PathBuf, String), Vec<(u32, PathBuf)>>::new();
 
     for dir in ["rar4", "rar5"] {
         let dir_path = root.join(dir);
@@ -101,7 +116,18 @@ fn collect_oracle_fixture_groups() -> Vec<(String, Vec<PathBuf>, Option<&'static
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rar") {
+            if let Some((prefix, part)) = classic_volume_prefix_and_number(&path) {
+                classic
+                    .entry((dir_path.clone(), prefix))
+                    .or_default()
+                    .push((part, path));
+                continue;
+            }
+            if !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rar"))
+            {
                 continue;
             }
             if let Some((prefix, part)) = part_prefix_and_number(&path) {
@@ -115,12 +141,33 @@ fn collect_oracle_fixture_groups() -> Vec<(String, Vec<PathBuf>, Option<&'static
         }
     }
 
+    for ((dir, prefix), paths) in &mut classic {
+        let first = dir.join(format!("{prefix}.rar"));
+        if let Some(position) = singles.iter().position(|path| path == &first) {
+            singles.swap_remove(position);
+            paths.push((0, first));
+        }
+    }
+    classic.retain(|_, paths| paths.iter().any(|(part, _)| *part == 0));
+
     let mut groups = Vec::new();
     for path in singles {
         let label = path.strip_prefix(&root).unwrap().display().to_string();
         groups.push((label, vec![path], None));
     }
     for ((dir, prefix), mut paths) in parts {
+        paths.sort_by_key(|(part, _)| *part);
+        let password = prefix
+            .contains("_enc")
+            .then_some(GENERATED_FIXTURE_PASSWORD);
+        let label = format!("{}/{}", dir.strip_prefix(&root).unwrap().display(), prefix);
+        groups.push((
+            label,
+            paths.into_iter().map(|(_, path)| path).collect(),
+            password,
+        ));
+    }
+    for ((dir, prefix), mut paths) in classic {
         paths.sort_by_key(|(part, _)| *part);
         let password = prefix
             .contains("_enc")
