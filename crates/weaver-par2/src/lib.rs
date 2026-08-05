@@ -58,6 +58,16 @@
 //! moved are matched by content rather than by name, so a set still repairs
 //! after its files have been reorganised.
 //!
+//! # Repairing across a whole download
+//!
+//! [`Par2RepairSession`] is the retained form: one session accumulates
+//! evidence — per-slice verdicts, whole-file proofs — while the data is still
+//! arriving, so assessment is incremental and repair runs from what is already
+//! known instead of a fresh walk. Its sources may be files under a base
+//! directory, or bytes served through a [`FileAccess`] handle
+//! ([`Par2RepairSessionOptions::with_source_access`]) for sets that never
+//! became files. Repair *output* is always real files either way.
+//!
 //! # Damaged PAR2 files
 //!
 //! A malformed or truncated packet does not fail the set. The scanner skips
@@ -152,7 +162,7 @@ pub use repair_session::{
 pub use repairer::{
     BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
     Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock,
-    SourceFileEntry,
+    SourceFileEntry, SourceLocation,
 };
 pub use session::{
     FeedDisposition, FeedOutcome, SettleRead, SliceEvidence, SliceEvidenceStrength,

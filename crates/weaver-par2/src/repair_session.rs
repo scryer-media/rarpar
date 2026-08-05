@@ -4,10 +4,33 @@
 //! metadata and verified source locations across assessment and repair. It
 //! deliberately retains no open file handles or mapped data; repair reopens
 //! and validates every source as bytes are copied or consumed.
+//!
+//! # Sources that are not files
+//!
+//! A session reads its sources either from the filesystem — the default, and
+//! byte-for-byte the behaviour this API has always had — or through a
+//! [`FileAccess`] handle supplied by
+//! [`Par2RepairSessionOptions::with_source_access`]. The second form exists
+//! for sets whose sources have no paths at all: bytes still arriving over a
+//! network, or served out of somewhere that never became a file.
+//!
+//! The two arms differ in more than plumbing:
+//!
+//! - An access-backed session performs **no source scanning**. There is no
+//!   directory to walk, so [`Par2RepairSession::analyze`] resolves exactly what
+//!   evidence has named and leaves the rest unresolved.
+//! - Evidence for an access-backed source is named by [`FileId`]
+//!   ([`Par2RepairSession::add_slice_evidence_for_file`]), never by path.
+//! - Committed-file evidence stays physical-only; see
+//!   [`Par2RepairSession::add_committed_file`].
+//!
+//! Repair *outputs* are always real files in either arm. Only clean-source
+//! reads virtualize.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -18,18 +41,38 @@ use crate::par2_set::MergeResult;
 use crate::repair::{DEFAULT_REPAIR_MEMORY_LIMIT, repair_matrix_resource_limit_reason};
 use crate::repairer::{
     PacketDiagnostics, Par2RepairOutcome, Par2RepairStatus, Par2Repairer, Par2RepairerOptions,
-    RepairInstall, RepairState, RepairVerificationAccess, ScanDiagnostics,
+    RepairInstall, RepairState, RepairVerificationAccess, ScanDiagnostics, SourceLocation,
 };
 use crate::session::{SliceEvidence, SliceEvidenceStrength};
 use crate::types::{CancellationToken, FileId, ProgressCallback};
-use crate::verify::{self, FileStatus, Repairability, VerificationResult};
+use crate::verify::{self, FileAccess, FileStatus, Repairability, VerificationResult};
 
 /// Default upper bound for memory owned by a retained repair session.
 pub const DEFAULT_RETAINED_STATE_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Options used to open a [`Par2RepairSession`].
+///
+/// Build one with [`Par2RepairSessionOptions::new`] (filesystem sources) or
+/// [`Par2RepairSessionOptions::with_source_access`] (sources served by a
+/// [`FileAccess`] handle), then set the fields you care about. The type is
+/// `#[non_exhaustive]`: it will keep gaining fields, so construct it through a
+/// constructor rather than a struct literal.
+///
+/// ```no_run
+/// use par2_rs::Par2RepairSessionOptions;
+/// use std::path::PathBuf;
+///
+/// let mut options = Par2RepairSessionOptions::new(
+///     PathBuf::from("/downloads/release"),
+///     vec![PathBuf::from("/downloads/release/release.par2")],
+/// );
+/// options.retained_state_limit = 8 * 1024 * 1024;
+/// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Par2RepairSessionOptions {
+    /// Where repair *output* lands, and — for filesystem sessions only — where
+    /// source scanning looks. An access-backed session never reads from here.
     pub base_dir: PathBuf,
     /// The primary PAR2 files. Adjacent volumes are deliberately not loaded
     /// here; add them later with [`Par2RepairSession::merge_recovery_paths`].
@@ -44,13 +87,51 @@ pub struct Par2RepairSessionOptions {
     pub scan_skip_leeway: u64,
     pub cancel: Option<CancellationToken>,
     pub progress: Option<ProgressCallback>,
+    /// Handle serving this set's sources. `None` — the default — reads sources
+    /// from the filesystem under `base_dir`. When present, every source read
+    /// goes through the handle and no source is ever opened by path.
+    pub source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
 }
 
 impl Par2RepairSessionOptions {
+    /// Options for a session whose sources are files under `base_dir`.
     pub fn new(base_dir: PathBuf, par2_paths: Vec<PathBuf>) -> Self {
         Self {
             base_dir,
             par2_paths,
+            ..Self::default()
+        }
+    }
+
+    /// Options for a session whose sources are served by `source_access`
+    /// rather than read from disk.
+    ///
+    /// `base_dir` still names where repair output is staged and installed, and
+    /// `par2_paths` are still read as files — only the protected *sources*
+    /// move behind the handle.
+    ///
+    /// ```no_run
+    /// use par2_rs::{MemoryFileAccess, Par2RepairSessionOptions};
+    /// use std::path::PathBuf;
+    /// use std::sync::Arc;
+    ///
+    /// let access = Arc::new(MemoryFileAccess::new());
+    /// let options = Par2RepairSessionOptions::with_source_access(
+    ///     PathBuf::from("/var/tmp/repair-scratch"),
+    ///     vec![PathBuf::from("/downloads/release/release.par2")],
+    ///     access,
+    /// );
+    /// assert!(options.source_access.is_some());
+    /// ```
+    pub fn with_source_access(
+        base_dir: PathBuf,
+        par2_paths: Vec<PathBuf>,
+        source_access: Arc<dyn FileAccess + Send + Sync>,
+    ) -> Self {
+        Self {
+            base_dir,
+            par2_paths,
+            source_access: Some(source_access),
             ..Self::default()
         }
     }
@@ -70,12 +151,17 @@ impl Default for Par2RepairSessionOptions {
             scan_skip_leeway: 64,
             cancel: None,
             progress: None,
+            source_access: None,
         }
     }
 }
 
 /// Diagnostics accumulated by the retained session.
+///
+/// `#[non_exhaustive]`: counters get added as the session learns to report
+/// more. Read the fields you need; do not match the struct exhaustively.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Par2RepairSessionDiagnostics {
     pub packets: PacketDiagnostics,
     pub scan: ScanDiagnostics,
@@ -90,6 +176,12 @@ pub struct Par2RepairSessionDiagnostics {
     pub recovery_packets_rejected: u32,
     pub repair_validation_bytes: u64,
     pub analyzed: bool,
+    /// Slice evidence retained by [`FileId`] rather than by path. Always zero
+    /// on a filesystem session.
+    pub access_slice_evidence: u32,
+    /// Current source-coverage generation; see
+    /// [`Par2RepairSession::source_generation`].
+    pub source_generation: u64,
 }
 
 /// Errors specific to retaining PAR2 source analysis between calls.
@@ -121,7 +213,7 @@ pub enum Par2SessionError {
 /// source-location evidence between calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RetainedSliceEvidence {
-    path: PathBuf,
+    source: SourceLocation,
     valid: bool,
 }
 
@@ -133,6 +225,7 @@ pub struct Par2RepairSession {
     slice_evidence: HashMap<(FileId, u32), RetainedSliceEvidence>,
     merged_recovery_paths: HashSet<PathBuf>,
     sources_scanned: bool,
+    source_generation: u64,
     diagnostics: Par2RepairSessionDiagnostics,
     assessment: Option<Par2RepairOutcome>,
 }
@@ -152,7 +245,11 @@ impl Par2RepairSession {
                 required_bytes,
             });
         }
-        let state = RepairState::from_set(&options.base_dir, inventory.set)?;
+        let state = RepairState::from_set_with_access(
+            &options.base_dir,
+            inventory.set,
+            options.source_access.clone(),
+        )?;
         let mut session = Self {
             options,
             state,
@@ -161,6 +258,7 @@ impl Par2RepairSession {
             slice_evidence: HashMap::new(),
             merged_recovery_paths: HashSet::new(),
             sources_scanned: false,
+            source_generation: 0,
             diagnostics: Par2RepairSessionDiagnostics::default(),
             assessment: None,
         };
@@ -172,13 +270,45 @@ impl Par2RepairSession {
         Ok(session)
     }
 
+    /// Whether this session reads its sources through a [`FileAccess`] handle
+    /// instead of the filesystem.
+    pub fn is_access_backed(&self) -> bool {
+        self.options.source_access.is_some()
+    }
+
     /// Add independently captured committed-file evidence. Full MD5 evidence
     /// seeds a whole-file location. Contiguous CRC32 + 16 KiB evidence is
     /// quick-proved against its captured path and also seeds a complete file.
+    ///
+    /// # This evidence class is physical by definition
+    ///
+    /// Committed-file evidence is admitted on a stat fingerprint — device,
+    /// inode, mtime and length, captured when the evidence was taken and
+    /// re-checked before every analysis, merge and repair. That gate is not an
+    /// implementation limit that a virtual source happens to fail; it *is* the
+    /// definition of the class. The claim being made is "the file I hashed is
+    /// still the same file, unmoved and unrewritten", and only a filesystem
+    /// object can carry that claim.
+    ///
+    /// A source served through a [`FileAccess`] handle has no device, no inode
+    /// and no mtime. Its staleness is governed by the handle's own coverage
+    /// (see [`Par2RepairSession::source_generation`]), not by `stat`. So an
+    /// access-backed session refuses this evidence outright, with a named
+    /// reason, rather than letting the stat gate refuse it incidentally.
+    /// Feed wire evidence for such sources with
+    /// [`Par2RepairSession::add_slice_evidence_for_file`] instead.
     pub fn add_committed_file(
         &mut self,
         evidence: CommittedFileEvidence,
     ) -> Result<(), Par2SessionError> {
+        if self.is_access_backed() {
+            self.diagnostics.quick_proof_fallbacks =
+                self.diagnostics.quick_proof_fallbacks.saturating_add(1);
+            return Err(Par2SessionError::InvalidState {
+                reason: "committed-file evidence is physical-only: it is admitted by a stat \
+                         fingerprint, which an access-backed source cannot carry",
+            });
+        }
         match evidence_stat_matches(&evidence) {
             Ok(true) => {}
             Ok(false) => {
@@ -202,9 +332,10 @@ impl Par2RepairSession {
                 logical_name: evidence.logical_name().to_owned(),
             });
         }
+        let source = SourceLocation::Path(evidence.path().to_path_buf());
         let path_budget = self
             .state
-            .complete_location_path_budget(targets[0], evidence.path())
+            .complete_location_budget(targets[0], &source)
             .ok_or_else(|| Par2SessionError::EvidenceDoesNotMatch {
                 logical_name: evidence.logical_name().to_owned(),
             })?;
@@ -213,10 +344,7 @@ impl Par2RepairSession {
             .saturating_add(committed_evidence_bytes(&evidence))
             .saturating_add(path_budget);
         self.ensure_limit(projected)?;
-        if !self
-            .state
-            .seed_complete_location(targets[0], evidence.path().to_path_buf())
-        {
+        if !self.state.seed_complete_location(targets[0], source) {
             return Err(Par2SessionError::EvidenceDoesNotMatch {
                 logical_name: evidence.logical_name().to_owned(),
             });
@@ -232,9 +360,63 @@ impl Par2RepairSession {
     /// Add a settled IFSC verdict from [`crate::session::VerificationSession`]
     /// for the file at `path`. Only valid slices seed a source block; an
     /// invalid verdict invalidates prior locations for the supplied path.
+    ///
+    /// Use [`Self::add_slice_evidence_for_file`] for sources served by a
+    /// [`FileAccess`] handle, which have no path to name.
     pub fn add_slice_evidence(
         &mut self,
         path: impl Into<PathBuf>,
+        evidence: SliceEvidence,
+    ) -> Result<(), Par2SessionError> {
+        self.retain_slice_evidence(SourceLocation::Path(path.into()), evidence)
+    }
+
+    /// Add a settled IFSC verdict for a source named only by its PAR2
+    /// [`FileId`] — the form used when sources are served by a [`FileAccess`]
+    /// handle rather than found on disk.
+    ///
+    /// The identifier comes from the evidence itself, so there is nothing to
+    /// pass but the verdict. As with the path-keyed form, only
+    /// [`SliceEvidenceStrength::Crc32AndMd5`] evidence may seed repair input,
+    /// and an invalid verdict clears any location previously held for that
+    /// slice.
+    ///
+    /// This requires an access-backed session: without a handle there is no
+    /// way to read the bytes a [`FileId`] names, and quietly falling back to
+    /// `base_dir` would reintroduce exactly the filesystem coupling the handle
+    /// exists to remove.
+    ///
+    /// ```no_run
+    /// # use par2_rs::{MemoryFileAccess, Par2RepairSession, Par2RepairSessionOptions};
+    /// # use std::path::PathBuf;
+    /// # use std::sync::Arc;
+    /// # fn demo(evidence: par2_rs::SliceEvidence) -> Result<(), par2_rs::Par2SessionError> {
+    /// let access = Arc::new(MemoryFileAccess::new());
+    /// let mut session = Par2RepairSession::open(Par2RepairSessionOptions::with_source_access(
+    ///     PathBuf::from("/var/tmp/repair-scratch"),
+    ///     vec![PathBuf::from("/downloads/release/release.par2")],
+    ///     access,
+    /// ))?;
+    /// session.add_slice_evidence_for_file(evidence)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_slice_evidence_for_file(
+        &mut self,
+        evidence: SliceEvidence,
+    ) -> Result<(), Par2SessionError> {
+        if !self.is_access_backed() {
+            return Err(Par2SessionError::InvalidState {
+                reason: "FileId-keyed slice evidence requires a session opened with a \
+                         source-access handle",
+            });
+        }
+        self.retain_slice_evidence(SourceLocation::Access(evidence.file_id()), evidence)
+    }
+
+    fn retain_slice_evidence(
+        &mut self,
+        source: SourceLocation,
         evidence: SliceEvidence,
     ) -> Result<(), Par2SessionError> {
         if evidence.recovery_set_id() != self.state.set.recovery_set_id {
@@ -247,16 +429,16 @@ impl Par2RepairSession {
         }
         let key = (evidence.file_id(), evidence.slice_index());
         let retained = RetainedSliceEvidence {
-            path: path.into(),
+            source,
             valid: evidence.is_valid(),
         };
         if self.slice_evidence.get(&key) == Some(&retained) {
             return Ok(());
         }
-        let Some(location_budget) = self.state.block_location_path_budget(
+        let Some(location_budget) = self.state.block_location_budget(
             evidence.file_id(),
             evidence.slice_index(),
-            &retained.path,
+            &retained.source,
         ) else {
             return Err(Par2SessionError::EvidenceDoesNotMatch {
                 logical_name: format!(
@@ -278,17 +460,17 @@ impl Par2RepairSession {
             });
         self.ensure_limit(projected)?;
         if let Some(old) = self.slice_evidence.get(&key) {
-            self.state.invalidate_path(&old.path);
+            invalidate_source_in_state(&mut self.state, &old.source);
         }
         self.slice_evidence.insert(key, retained.clone());
         if evidence.is_valid() {
             self.state.seed_block_location(
                 evidence.file_id(),
                 evidence.slice_index(),
-                retained.path,
+                retained.source,
             );
         } else {
-            self.state.invalidate_path(&retained.path);
+            invalidate_source_in_state(&mut self.state, &retained.source);
         }
         self.diagnostics.live_slices = self.diagnostics.live_slices.saturating_add(1);
         self.sources_scanned = false;
@@ -298,12 +480,26 @@ impl Par2RepairSession {
     }
 
     /// Analyze sources once. Repeated calls return the cached assessment.
+    ///
+    /// A filesystem session scans `base_dir` for anything evidence has not
+    /// already resolved. An **access-backed session never scans**: there is no
+    /// directory that holds its sources, so a walk would at best waste I/O and
+    /// at worst bind the set to unrelated files that happen to share a name.
+    /// Blocks that no evidence has named simply stay unresolved, and the
+    /// caller decides what to do about them.
     pub fn analyze(&mut self) -> Result<Par2RepairOutcome, Par2SessionError> {
         self.ensure_committed_sources_unchanged()?;
         if let Some(assessment) = &self.assessment {
             return Ok(assessment.clone());
         }
-        let scan = if self.sources_scanned {
+        let scan = if self.is_access_backed() {
+            // No scan pass is counted, and no scan byte is read: the whole
+            // point of an access-backed session is that `base_dir` holds no
+            // sources to find.
+            self.state.refresh_access_file_states();
+            self.sources_scanned = true;
+            ScanDiagnostics::default()
+        } else if self.sources_scanned {
             self.diagnostics.scan.clone()
         } else {
             let scan = self
@@ -491,28 +687,102 @@ impl Par2RepairSession {
 
     /// Forget retained locations for one path. Packet metadata and other
     /// sources stay available for a later unresolved-only analysis.
+    ///
+    /// This is the disk-side invalidation and it names a disk object; it
+    /// cannot reach an access-backed source, which has no path. Use
+    /// [`Self::invalidate_file`] for those.
     pub fn invalidate_path(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref();
         self.state.invalidate_path(path);
         self.committed.retain(|evidence| evidence.path() != path);
         self.slice_evidence
-            .retain(|_, evidence| evidence.path != path);
+            .retain(|_, evidence| !evidence.source.is_path(path));
         self.sources_scanned = false;
         self.assessment = None;
         self.refresh_diagnostics();
     }
 
+    /// Forget every retained location and every piece of evidence belonging to
+    /// one PAR2 file, whichever kind of source backs it.
+    ///
+    /// This is the identity-keyed invalidation: it names the *file* in the
+    /// recovery set rather than a place on disk, so it is the right call when
+    /// a virtual source stops being trustworthy. Packet metadata, recovery
+    /// packets and every other file's evidence survive, so the next
+    /// [`Self::analyze`] re-resolves only what this dropped.
+    ///
+    /// Returns `true` when something was actually forgotten.
+    pub fn invalidate_file(&mut self, file_id: FileId) -> bool {
+        let mut changed = self.state.invalidate_file(file_id);
+        let before_committed = self.committed.len();
+        let state = &self.state;
+        self.committed
+            .retain(|evidence| evidence_targets_in_state(state, evidence) != vec![file_id]);
+        changed |= self.committed.len() != before_committed;
+        let before_slices = self.slice_evidence.len();
+        self.slice_evidence
+            .retain(|(key_id, _), _| *key_id != file_id);
+        changed |= self.slice_evidence.len() != before_slices;
+        self.sources_scanned = false;
+        self.assessment = None;
+        self.refresh_diagnostics();
+        changed
+    }
+
     /// Forget every retained source location and evidence while retaining the
     /// parsed packet set and lazily selected recovery packets.
+    ///
+    /// Also advances [`Self::source_generation`], because forgetting every
+    /// source is by definition a coverage change.
     pub fn invalidate_all_sources(&mut self) {
         self.state.invalidate_all_sources();
         self.committed.clear();
         self.slice_evidence.clear();
         self.sources_scanned = false;
         self.assessment = None;
+        self.source_generation = self.source_generation.saturating_add(1);
         self.refresh_diagnostics();
     }
 
+    /// The current source-coverage generation, starting at 0.
+    ///
+    /// This is a monotonic counter, not a walk over anything. A caller that
+    /// serves virtual sources holds the generation it last fed evidence under
+    /// and compares: unchanged means every access-backed location the session
+    /// holds is still the one it seeded, so nothing needs re-feeding. It never
+    /// goes backwards, and it is the session's whole answer to "is my view
+    /// still current?".
+    pub fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    /// Retire every access-backed source at once and return the new
+    /// generation.
+    ///
+    /// This is the counterpart to [`Self::invalidate_path`] for sources that
+    /// have no path: when a serving handle's coverage moves — a router
+    /// re-plans, a cache is dropped — one call retires everything read through
+    /// it, without the caller enumerating identifiers. Physical locations and
+    /// committed-file evidence are untouched, because nothing about them
+    /// changed.
+    pub fn invalidate_access_sources(&mut self) -> u64 {
+        self.state.invalidate_access_sources();
+        self.slice_evidence
+            .retain(|_, evidence| !evidence.source.is_access());
+        self.sources_scanned = false;
+        self.assessment = None;
+        self.source_generation = self.source_generation.saturating_add(1);
+        self.refresh_diagnostics();
+        self.source_generation
+    }
+
+    /// Conservative upper bound on the heap this session owns.
+    ///
+    /// Every mutation projects this figure forward before it applies, so a
+    /// caller budgeting several sessions against one ceiling can trust it.
+    /// Access-backed retention is counted the same way as path-backed
+    /// retention, and it is genuinely smaller: a [`FileId`] is 16 inline bytes
+    /// where a path owns its own allocation.
     pub fn estimated_retained_bytes(&self) -> usize {
         self.state
             .estimated_retained_bytes()
@@ -554,6 +824,7 @@ impl Par2RepairSession {
             &self.state.files,
             &repair.install_dir,
             &repair.staged_file_ids,
+            self.options.source_access.clone(),
         );
         let staged_ids = self
             .state
@@ -678,6 +949,12 @@ impl Par2RepairSession {
         self.diagnostics.retained_bytes = self.estimated_retained_bytes();
         self.diagnostics.committed_sources = self.committed.len() as u32;
         self.diagnostics.slice_evidence = self.slice_evidence.len() as u32;
+        self.diagnostics.access_slice_evidence = self
+            .slice_evidence
+            .values()
+            .filter(|evidence| evidence.source.is_access())
+            .count() as u32;
+        self.diagnostics.source_generation = self.source_generation;
         self.diagnostics.analyzed = self.assessment.is_some();
     }
 }
@@ -714,7 +991,10 @@ fn apply_committed_evidence_to_state(
     if targets.len() != 1 {
         return false;
     }
-    state.seed_complete_location(targets[0], evidence.path().to_path_buf())
+    state.seed_complete_location(
+        targets[0],
+        SourceLocation::Path(evidence.path().to_path_buf()),
+    )
 }
 
 fn apply_slice_evidence_to_state(
@@ -723,7 +1003,21 @@ fn apply_slice_evidence_to_state(
 ) {
     for (&(file_id, slice_index), evidence) in slice_evidence {
         if evidence.valid {
-            state.seed_block_location(file_id, slice_index, evidence.path.clone());
+            state.seed_block_location(file_id, slice_index, evidence.source.clone());
+        }
+    }
+}
+
+/// Drop retained locations backed by `source`. Paths invalidate by path;
+/// access-backed sources invalidate by the file identity they name, which is
+/// the only handle they have.
+fn invalidate_source_in_state(state: &mut RepairState, source: &SourceLocation) {
+    match source {
+        SourceLocation::Path(path) => {
+            state.invalidate_path(path);
+        }
+        SourceLocation::Access(file_id) => {
+            state.invalidate_file(*file_id);
         }
     }
 }
@@ -785,8 +1079,14 @@ fn committed_evidence_bytes(evidence: &CommittedFileEvidence) -> usize {
         .saturating_add(evidence.logical_name().len())
 }
 
+/// Bytes retained per slice verdict: the record itself plus whatever its
+/// source owns on the heap. A path owns its bytes; a [`FileId`] lives inline
+/// in the record and owns nothing further.
 fn retained_slice_evidence_bytes(evidence: &RetainedSliceEvidence) -> usize {
-    std::mem::size_of::<RetainedSliceEvidence>().saturating_add(evidence.path.as_os_str().len())
+    std::mem::size_of::<RetainedSliceEvidence>().saturating_add(match &evidence.source {
+        SourceLocation::Path(path) => path.as_os_str().len(),
+        SourceLocation::Access(_) => 0,
+    })
 }
 
 fn retained_path_buf_bytes(path: &Path) -> usize {
@@ -826,17 +1126,24 @@ mod tests {
     use crate::par2_set::{FileDescription, Par2FileSet, RecoverySlice};
     use crate::session::SliceEvidenceStrength;
     use crate::types::{RecoverySetId, SliceChecksum};
+    use crate::verify::MemoryFileAccess;
     use std::collections::BTreeMap;
 
     fn session_from_set(options: Par2RepairSessionOptions, set: Par2FileSet) -> Par2RepairSession {
         Par2RepairSession {
-            state: RepairState::from_set(&options.base_dir, set).unwrap(),
+            state: RepairState::from_set_with_access(
+                &options.base_dir,
+                set,
+                options.source_access.clone(),
+            )
+            .unwrap(),
             options,
             packet_diagnostics: PacketDiagnostics::default(),
             committed: Vec::new(),
             slice_evidence: HashMap::new(),
             merged_recovery_paths: HashSet::new(),
             sources_scanned: false,
+            source_generation: 0,
             diagnostics: Par2RepairSessionDiagnostics::default(),
             assessment: None,
         }
@@ -1394,6 +1701,224 @@ mod tests {
         let state = RepairState::from_set(Path::new("."), set).unwrap();
         assert!(preflight > 1024 * 1024);
         assert!(preflight >= state.estimated_retained_bytes());
+    }
+
+    fn access_session(
+        dir: &Path,
+        set: Par2FileSet,
+        access: Arc<dyn FileAccess + Send + Sync>,
+    ) -> Par2RepairSession {
+        let mut options = Par2RepairSessionOptions::new(dir.to_path_buf(), Vec::new());
+        options.source_access = Some(access);
+        session_from_set(options, set)
+    }
+
+    fn strong_evidence(
+        set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: u32,
+        valid: bool,
+    ) -> SliceEvidence {
+        SliceEvidence::for_test(
+            set_id,
+            file_id,
+            slice_index,
+            valid,
+            SliceEvidenceStrength::Crc32AndMd5,
+        )
+    }
+
+    /// A session over virtual sources resolves what evidence named and nothing
+    /// else, and never records a scan pass — `base_dir` holds no sources.
+    #[test]
+    fn access_backed_analysis_resolves_evidence_without_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"eight-bytes-of-payload!!";
+        let set_id = RecoverySetId::from_bytes([0x11; 16]);
+        let file_id = FileId::from_bytes([0x12; 16]);
+        // A decoy with the right name and length sits where a scan would find
+        // it. Its bytes are wrong, so resolving through it would be visible.
+        fs::write(dir.path().join("payload.bin"), vec![0xEE; payload.len()]).unwrap();
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        let assessment = session.analyze().unwrap();
+
+        assert_eq!(assessment.status, Par2RepairStatus::Insufficient);
+        assert_eq!(assessment.available_blocks, 1);
+        assert_eq!(assessment.missing_blocks, 2);
+        assert_eq!(session.diagnostics().source_scan_passes, 0);
+        assert_eq!(session.diagnostics().scan.files_scanned, 0);
+        assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+        assert_eq!(session.diagnostics().access_slice_evidence, 1);
+    }
+
+    /// All slices seeded through the handle promote the file to complete, with
+    /// no `stat` on the decoy that shares its name.
+    #[test]
+    fn fully_seeded_access_file_verifies_without_touching_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x21; 16]);
+        let file_id = FileId::from_bytes([0x22; 16]);
+        fs::write(dir.path().join("payload.bin"), vec![0xEE; payload.len()]).unwrap();
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+
+        for slice_index in 0..2 {
+            session
+                .add_slice_evidence_for_file(strong_evidence(set_id, file_id, slice_index, true))
+                .unwrap();
+        }
+
+        assert_eq!(
+            session.analyze().unwrap().status,
+            Par2RepairStatus::Verified
+        );
+    }
+
+    #[test]
+    fn invalidate_file_forgets_access_locations_and_resets_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x31; 16]);
+        let file_id = FileId::from_bytes([0x32; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+        let empty_bytes = session.estimated_retained_bytes();
+        for slice_index in 0..2 {
+            session
+                .add_slice_evidence_for_file(strong_evidence(set_id, file_id, slice_index, true))
+                .unwrap();
+        }
+        session.analyze().unwrap();
+        let seeded_bytes = session.estimated_retained_bytes();
+        assert!(seeded_bytes > empty_bytes);
+
+        assert!(session.invalidate_file(file_id));
+
+        assert!(session.slice_evidence.is_empty());
+        assert_eq!(session.diagnostics().slice_evidence, 0);
+        assert_eq!(session.diagnostics().access_slice_evidence, 0);
+        assert!(session.assessment.is_none());
+        assert!(matches!(
+            session.assessment(),
+            Err(Par2SessionError::InvalidState { .. })
+        ));
+        assert!(
+            session
+                .state
+                .blocks
+                .iter()
+                .all(|block| block.location.is_none())
+        );
+        assert!(
+            session
+                .state
+                .files
+                .iter()
+                .all(|file| file.complete_location.is_none())
+        );
+        assert!(session.estimated_retained_bytes() < seeded_bytes);
+        assert!(!session.invalidate_file(file_id));
+    }
+
+    /// The generation is the cheap thing a caller compares. Bumping it retires
+    /// every virtual location at once and leaves physical ones alone.
+    #[test]
+    fn access_source_generation_bump_retires_only_virtual_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let path = dir.path().join("payload.bin");
+        fs::write(&path, payload).unwrap();
+        let set_id = RecoverySetId::from_bytes([0x41; 16]);
+        let file_id = FileId::from_bytes([0x42; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+        assert_eq!(session.source_generation(), 0);
+
+        session
+            .add_slice_evidence(&path, strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 1, true))
+            .unwrap();
+        assert_eq!(session.diagnostics().slice_evidence, 2);
+        assert_eq!(session.diagnostics().access_slice_evidence, 1);
+        let seeded_bytes = session.estimated_retained_bytes();
+
+        assert_eq!(session.invalidate_access_sources(), 1);
+
+        assert_eq!(session.source_generation(), 1);
+        assert_eq!(session.diagnostics().source_generation, 1);
+        assert_eq!(session.diagnostics().slice_evidence, 1);
+        assert_eq!(session.diagnostics().access_slice_evidence, 0);
+        assert!(session.state.blocks[0].location.is_some());
+        assert!(session.state.blocks[1].location.is_none());
+        assert!(session.estimated_retained_bytes() < seeded_bytes);
+
+        // Monotonic: a second bump moves forward, never back.
+        assert_eq!(session.invalidate_access_sources(), 2);
+        assert!(session.state.blocks[0].location.is_some());
+    }
+
+    /// A FileId owns no heap, but the record holding it does. The budget must
+    /// see that record, or a session could retain evidence for free.
+    #[test]
+    fn access_keyed_slice_evidence_obeys_the_retained_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x51; 16]);
+        let file_id = FileId::from_bytes([0x52; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+        let before = session.estimated_retained_bytes();
+        session.options.retained_state_limit = before;
+
+        assert!(matches!(
+            session.add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true)),
+            Err(Par2SessionError::RetainedStateLimitExceeded { .. })
+        ));
+        assert_eq!(session.estimated_retained_bytes(), before);
+        assert!(session.slice_evidence.is_empty());
+        assert!(session.state.blocks[0].location.is_none());
+
+        // One record's worth of headroom is exactly enough for one record.
+        let record_bytes = std::mem::size_of::<(FileId, u32)>()
+            .saturating_add(std::mem::size_of::<RetainedSliceEvidence>());
+        session.options.retained_state_limit = before.saturating_add(record_bytes);
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        assert_eq!(session.diagnostics().access_slice_evidence, 1);
     }
 
     #[test]

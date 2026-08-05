@@ -32,7 +32,9 @@ use crate::repair::{
 use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
 };
-use crate::verify::{self, FileStatus, FileVerification, Repairability, VerificationResult};
+use crate::verify::{
+    self, FileAccess, FileStatus, FileVerification, Repairability, VerificationResult,
+};
 use rayon::prelude::*;
 use tracing::{debug, warn};
 
@@ -267,7 +269,7 @@ impl<'a> ScanBlockState<'a> {
     fn record_location(&mut self, block_index: usize, location: BlockLocation) {
         let replace = self.locations[block_index].as_ref().is_none_or(|existing| {
             location.kind < existing.kind
-                || (location.kind == existing.kind && location.path < existing.path)
+                || (location.kind == existing.kind && location.source < existing.source)
         });
         if replace {
             self.locations[block_index] = Some(location);
@@ -406,17 +408,128 @@ pub enum BlockLocationKind {
     Extra,
 }
 
+/// Where the bytes behind a verified source block actually live.
+///
+/// PAR2 sources are not always files. A [`SourceLocation::Path`] is read with
+/// `std::fs`; a [`SourceLocation::Access`] names its source only by PAR2
+/// [`FileId`] and is read exclusively through the session's
+/// [`FileAccess`] handle. The distinction is a type,
+/// not a convention: an access-backed source carries no path, so no code path
+/// can accidentally open it from disk.
+///
+/// ```
+/// use par2_rs::{BlockLocation, BlockLocationKind, FileId, SourceLocation};
+/// use std::path::PathBuf;
+///
+/// let on_disk = BlockLocation {
+///     source: SourceLocation::Path(PathBuf::from("/downloads/release.r00")),
+///     offset: 0,
+///     len: 4096,
+///     kind: BlockLocationKind::Canonical,
+/// };
+/// assert!(on_disk.path().is_some());
+/// assert!(on_disk.file_id().is_none());
+///
+/// let virtual_volume = BlockLocation {
+///     source: SourceLocation::Access(FileId::from_bytes([7; 16])),
+///     offset: 0,
+///     len: 4096,
+///     kind: BlockLocationKind::Canonical,
+/// };
+/// assert!(virtual_volume.path().is_none());
+/// assert_eq!(virtual_volume.file_id(), Some(FileId::from_bytes([7; 16])));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceLocation {
+    /// A real file on disk, addressed by path.
+    Path(PathBuf),
+    /// A source served by a [`FileAccess`] handle,
+    /// addressed only by its PAR2 file identifier.
+    Access(FileId),
+}
+
+impl SourceLocation {
+    /// The backing path, or `None` for an access-backed source.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Path(path) => Some(path.as_path()),
+            Self::Access(_) => None,
+        }
+    }
+
+    /// The backing PAR2 file identifier, or `None` for a path-backed source.
+    pub fn file_id(&self) -> Option<FileId> {
+        match self {
+            Self::Path(_) => None,
+            Self::Access(file_id) => Some(*file_id),
+        }
+    }
+
+    /// Whether this source is the file at `path`. Access-backed sources are
+    /// never at any path, so this is always `false` for them.
+    pub fn is_path(&self, path: &Path) -> bool {
+        matches!(self, Self::Path(owned) if owned == path)
+    }
+
+    /// Whether this source is served through a
+    /// [`FileAccess`] handle.
+    pub fn is_access(&self) -> bool {
+        matches!(self, Self::Access(_))
+    }
+
+    /// Whether this source *is* the described file rather than a copy of it
+    /// found elsewhere. For a path that means the file sits at its canonical
+    /// location; for an access-backed source it means the handle was asked for
+    /// this very file identifier, which is the only thing it can be asked for.
+    fn is_canonical_for(&self, file: &SourceFileEntry) -> bool {
+        match self {
+            Self::Path(path) => *path == file.safe_path,
+            Self::Access(file_id) => *file_id == file.file_id,
+        }
+    }
+
+    /// Heap bytes owned by this location. A [`FileId`] lives inline in the
+    /// enum, so an access-backed source owns nothing on the heap; a path owns
+    /// its own bytes.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Path(path) => path.as_os_str().len(),
+            Self::Access(_) => 0,
+        }
+    }
+}
+
+/// One resolved span of source data: where it lives, and how much of it
+/// belongs to the block or file that resolved to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockLocation {
-    pub path: PathBuf,
+    /// Where the bytes are. Scanning only ever produces
+    /// [`SourceLocation::Path`]; evidence fed to a session over a
+    /// [`FileAccess`] handle produces [`SourceLocation::Access`].
+    pub source: SourceLocation,
+    /// Byte offset of this span within `source`.
     pub offset: u64,
+    /// Length of this span.
     pub len: u64,
+    /// How this location was matched to the set.
     pub kind: BlockLocationKind,
+}
+
+impl BlockLocation {
+    /// The backing path, or `None` for an access-backed source.
+    pub fn path(&self) -> Option<&Path> {
+        self.source.path()
+    }
+
+    /// The backing PAR2 file identifier, or `None` for a path-backed source.
+    pub fn file_id(&self) -> Option<FileId> {
+        self.source.file_id()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockCopyRange {
-    src: PathBuf,
+    src: SourceLocation,
     src_offset: u64,
     dst: PathBuf,
     dst_offset: u64,
@@ -713,6 +826,7 @@ impl Par2Repairer {
             &state.files,
             &repair.install_dir,
             &repair.staged_file_ids,
+            state.source_access.clone(),
         );
         // Fresh repair passes read staged files back and verify them
         // slice-by-slice against IFSC before installation.
@@ -992,6 +1106,9 @@ pub(crate) struct RepairState {
     file_index_by_id: HashMap<FileId, usize>,
     block_index_by_file_slice: HashMap<(FileId, u32), usize>,
     hash_table: VerificationHashTable,
+    /// Handle serving every [`SourceLocation::Access`] location this state
+    /// holds. `None` is the ordinary filesystem-only state.
+    pub(crate) source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
     discarded_recovery_blocks: u32,
     inconsistent_packets: u32,
     discarded_recoverable_files: u32,
@@ -1034,6 +1151,9 @@ struct RepairExecutionAccess {
     source_locations: HashMap<(FileId, u32), BlockLocation>,
     source_blocks: HashMap<(FileId, u32), SourceBlock>,
     source_files: HashMap<PathBuf, File>,
+    /// Handle serving every [`SourceLocation::Access`] location. Absent when
+    /// the state has no access-backed sources.
+    source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
     source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
     stream_validation: Mutex<HashMap<(FileId, u32), StreamSourceValidation>>,
     validation_bytes: AtomicU64,
@@ -1053,6 +1173,7 @@ impl RepairExecutionAccess {
         blocks: &[SourceBlock],
         staged_file_ids: &HashSet<FileId>,
         slice_size: u64,
+        source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
         source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
     ) -> io::Result<Self> {
         let repair_paths = files
@@ -1074,9 +1195,11 @@ impl RepairExecutionAccess {
             .filter(|block| block.location.is_some())
             .map(|block| ((block.file_id, block.local_index), block.clone()))
             .collect();
+        // Only path-backed sources get a file handle. Access-backed sources
+        // are read through `source_access` and never opened from disk.
         let source_files = source_locations
             .values()
-            .map(|location| location.path.clone())
+            .filter_map(|location| location.path().map(Path::to_path_buf))
             .collect::<HashSet<_>>()
             .into_iter()
             .map(|path| {
@@ -1092,10 +1215,20 @@ impl RepairExecutionAccess {
             source_locations,
             source_blocks,
             source_files,
+            source_access,
             source_snapshots,
             stream_validation: Mutex::new(HashMap::new()),
             validation_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// The handle serving access-backed sources. Reaching an access-backed
+    /// location without one is a wiring defect, so it reports as a changed
+    /// source rather than silently falling back to disk.
+    fn access(&self, file_id: FileId) -> io::Result<&(dyn FileAccess + Send + Sync)> {
+        self.source_access
+            .as_deref()
+            .ok_or_else(|| source_location_changed_io(&SourceLocation::Access(file_id)))
     }
 
     fn validation_bytes(&self) -> u64 {
@@ -1148,8 +1281,8 @@ impl RepairExecutionAccess {
                 {
                     Ok(())
                 }
-                _ => Err(source_changed_io(
-                    &self.source_locations[&(file_id, local_slice)].path,
+                _ => Err(source_location_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].source,
                 )),
             };
         }
@@ -1163,14 +1296,14 @@ impl RepairExecutionAccess {
                     // replays a chunk after falling back to the CPU path.
                     Ok(())
                 }
-                _ => Err(source_changed_io(
-                    &self.source_locations[&(file_id, local_slice)].path,
+                _ => Err(source_location_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].source,
                 )),
             };
         }
         if state.next_offset.saturating_add(data.len() as u64) > expected.expected_len {
-            return Err(source_changed_io(
-                &self.source_locations[&(file_id, local_slice)].path,
+            return Err(source_location_changed_io(
+                &self.source_locations[&(file_id, local_slice)].source,
             ));
         }
         state
@@ -1189,8 +1322,8 @@ impl RepairExecutionAccess {
                 self.slice_size.saturating_sub(expected.expected_len),
             );
             if crc32.finalize() != expected.checksum.crc32 {
-                return Err(source_changed_io(
-                    &self.source_locations[&(file_id, local_slice)].path,
+                return Err(source_location_changed_io(
+                    &self.source_locations[&(file_id, local_slice)].source,
                 ));
             }
             state.finalized = true;
@@ -1217,32 +1350,45 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
             }) && len >= expected.expected_len
                 && location.len == expected.expected_len
             {
-                self.ensure_source_unchanged(&location.path)?;
-                let file = self.source_files.get(&location.path).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
-                })?;
                 let mut buf = vec![0u8; expected.expected_len as usize];
-                read_exact_file_at(file, &mut buf, location.offset)
-                    .map_err(|_| source_changed_io(&location.path))?;
+                match &location.source {
+                    SourceLocation::Path(path) => {
+                        self.ensure_source_unchanged(path)?;
+                        let file = self.source_files.get(path).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
+                        })?;
+                        read_exact_file_at(file, &mut buf, location.offset)
+                            .map_err(|_| source_changed_io(path))?;
+                        let file_len = file
+                            .metadata()
+                            .ok()
+                            .map_or(location.len, |metadata| metadata.len());
+                        crate::file_cache::drop_touched_file_cache(
+                            file,
+                            path,
+                            file_len,
+                            location.offset,
+                            buf.len() as u64,
+                        );
+                    }
+                    SourceLocation::Access(source_id) => {
+                        read_exact_from_access(
+                            self.access(*source_id)?,
+                            source_id,
+                            location.offset,
+                            &mut buf,
+                        )
+                        .map_err(|_| source_location_changed_io(&location.source))?;
+                    }
+                }
                 let mut checksum = checksum::SliceChecksumState::new();
                 checksum.update(&buf);
                 let (crc32, md5) = checksum.finalize(Some(self.slice_size));
                 if crc32 != expected.checksum.crc32 || md5 != expected.checksum.md5 {
-                    return Err(source_changed_io(&location.path));
+                    return Err(source_location_changed_io(&location.source));
                 }
                 self.validation_bytes
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                let file_len = file
-                    .metadata()
-                    .ok()
-                    .map_or(location.len, |metadata| metadata.len());
-                crate::file_cache::drop_touched_file_cache(
-                    file,
-                    &location.path,
-                    file_len,
-                    location.offset,
-                    buf.len() as u64,
-                );
                 return Ok(buf);
             }
         }
@@ -1262,33 +1408,49 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
             let local_slice = slice_index as u32;
             let slice_offset = offset % self.slice_size;
             if let Some(location) = self.source_locations.get(&(*file_id, local_slice)) {
-                self.ensure_source_unchanged(&location.path)?;
                 if slice_offset >= location.len {
+                    if let SourceLocation::Path(path) = &location.source {
+                        self.ensure_source_unchanged(path)?;
+                    }
                     return Ok(0);
                 }
                 let len = (dst.len() as u64).min(location.len - slice_offset) as usize;
-                let file = self.source_files.get(&location.path).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
-                })?;
                 let read_offset = location.offset + slice_offset;
-                let read = read_file_at(file, &mut dst[..len], read_offset)
-                    .map_err(|_| source_changed_io(&location.path))?;
-                if read != len {
-                    return Err(source_changed_io(&location.path));
+                match &location.source {
+                    SourceLocation::Path(path) => {
+                        self.ensure_source_unchanged(path)?;
+                        let file = self.source_files.get(path).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
+                        })?;
+                        let read = read_file_at(file, &mut dst[..len], read_offset)
+                            .map_err(|_| source_changed_io(path))?;
+                        if read != len {
+                            return Err(source_changed_io(path));
+                        }
+                        let file_len = file
+                            .metadata()
+                            .ok()
+                            .map_or(location.len, |metadata| metadata.len());
+                        crate::file_cache::drop_touched_file_cache(
+                            file,
+                            path,
+                            file_len,
+                            read_offset,
+                            read as u64,
+                        );
+                    }
+                    SourceLocation::Access(source_id) => {
+                        read_exact_from_access(
+                            self.access(*source_id)?,
+                            source_id,
+                            read_offset,
+                            &mut dst[..len],
+                        )
+                        .map_err(|_| source_location_changed_io(&location.source))?;
+                    }
                 }
-                self.validate_source_chunk(*file_id, local_slice, slice_offset, &dst[..read])?;
-                let file_len = file
-                    .metadata()
-                    .ok()
-                    .map_or(location.len, |metadata| metadata.len());
-                crate::file_cache::drop_touched_file_cache(
-                    file,
-                    &location.path,
-                    file_len,
-                    read_offset,
-                    read as u64,
-                );
-                return Ok(read);
+                self.validate_source_chunk(*file_id, local_slice, slice_offset, &dst[..len])?;
+                return Ok(len);
             }
         }
 
@@ -1391,6 +1553,10 @@ fn read_exact_file_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> io::R
 
 pub(crate) struct RepairVerificationAccess {
     paths: HashMap<FileId, PathBuf>,
+    /// Handle serving files that were *not* staged for repair. Present only
+    /// for access-backed states, where an unstaged file's bytes were never on
+    /// disk and reading its `safe_path` would read whatever else lives there.
+    unstaged_access: Option<Arc<dyn FileAccess + Send + Sync>>,
 }
 
 impl RepairVerificationAccess {
@@ -1398,9 +1564,11 @@ impl RepairVerificationAccess {
         files: &[SourceFileEntry],
         install_dir: &Path,
         staged_file_ids: &HashSet<FileId>,
+        unstaged_access: Option<Arc<dyn FileAccess + Send + Sync>>,
     ) -> Self {
         let paths = files
             .iter()
+            .filter(|file| unstaged_access.is_none() || staged_file_ids.contains(&file.file_id))
             .map(|file| {
                 let path = if staged_file_ids.contains(&file.file_id) {
                     install_dir.join(&file.safe_name)
@@ -1411,7 +1579,10 @@ impl RepairVerificationAccess {
             })
             .collect();
 
-        Self { paths }
+        Self {
+            paths,
+            unstaged_access,
+        }
     }
 
     fn path_for(&self, file_id: &FileId) -> io::Result<&Path> {
@@ -1420,10 +1591,22 @@ impl RepairVerificationAccess {
             .map(PathBuf::as_path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))
     }
+
+    /// The serving handle for a file that has no staged output. Only an
+    /// access-backed verification has one; otherwise the file is on disk.
+    fn unstaged(&self, file_id: &FileId) -> Option<&(dyn FileAccess + Send + Sync)> {
+        if self.paths.contains_key(file_id) {
+            return None;
+        }
+        self.unstaged_access.as_deref()
+    }
 }
 
 impl crate::verify::FileAccess for RepairVerificationAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        if let Some(access) = self.unstaged(file_id) {
+            return access.read_file_range(file_id, offset, len);
+        }
         let path = self.path_for(file_id)?;
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -1441,6 +1624,9 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
         offset: u64,
         dst: &mut [u8],
     ) -> io::Result<usize> {
+        if let Some(access) = self.unstaged(file_id) {
+            return access.read_file_range_into(file_id, offset, dst);
+        }
         let path = self.path_for(file_id)?;
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -1454,16 +1640,25 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
         &self,
         file_id: &FileId,
     ) -> io::Result<Option<Box<dyn std::io::Read>>> {
+        if self.unstaged(file_id).is_some() {
+            return Ok(None);
+        }
         Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
             self.path_for(file_id)?,
         )?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
+        if let Some(access) = self.unstaged(file_id) {
+            return access.file_exists(file_id);
+        }
         self.paths.get(file_id).is_some_and(|path| path.exists())
     }
 
     fn file_length(&self, file_id: &FileId) -> Option<u64> {
+        if let Some(access) = self.unstaged(file_id) {
+            return access.file_length(file_id);
+        }
         self.paths
             .get(file_id)
             .and_then(|path| fs::metadata(path).ok())
@@ -1471,6 +1666,9 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+        if let Some(access) = self.unstaged(file_id) {
+            return access.read_file(file_id);
+        }
         crate::file_cache::read_to_vec(self.path_for(file_id)?)
     }
 
@@ -1568,7 +1766,18 @@ impl RepairState {
         bytes
     }
 
-    pub(crate) fn from_set(base_dir: &Path, mut set: Par2FileSet) -> Result<Self> {
+    pub(crate) fn from_set(base_dir: &Path, set: Par2FileSet) -> Result<Self> {
+        Self::from_set_with_access(base_dir, set, None)
+    }
+
+    /// Build a state whose sources are served by `source_access` instead of
+    /// (or alongside) the filesystem. `base_dir` still names where repair
+    /// *output* lands; only source reads change.
+    pub(crate) fn from_set_with_access(
+        base_dir: &Path,
+        mut set: Par2FileSet,
+        source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
+    ) -> Result<Self> {
         let mut discarded_recovery_blocks = 0;
         let slice_size = set.slice_size;
         set.recovery_slices.retain(|_, recovery| {
@@ -1689,66 +1898,73 @@ impl RepairState {
             file_index_by_id,
             block_index_by_file_slice,
             hash_table,
+            source_access,
             discarded_recovery_blocks,
             inconsistent_packets,
             discarded_recoverable_files,
         })
     }
 
-    /// Conservative heap bytes that may be added when a complete source path
-    /// is cloned into the file entry and each of its block locations.
-    pub(crate) fn complete_location_path_budget(
+    /// Conservative heap bytes that may be added when a complete source
+    /// location is cloned into the file entry and each of its block locations.
+    /// An access-backed source owns no heap, so its budget is zero — which is
+    /// the honest number, not a placeholder.
+    pub(crate) fn complete_location_budget(
         &self,
         file_id: FileId,
-        path: &Path,
+        source: &SourceLocation,
     ) -> Option<usize> {
         let file = &self.files[*self.file_index_by_id.get(&file_id)?];
         file.recoverable.then(|| {
-            path.as_os_str()
-                .len()
+            source
+                .heap_bytes()
                 .saturating_mul(file.block_count.saturating_add(1))
         })
     }
 
     /// Conservative heap bytes that may be added for one slice location.
-    pub(crate) fn block_location_path_budget(
+    pub(crate) fn block_location_budget(
         &self,
         file_id: FileId,
         local_index: u32,
-        path: &Path,
+        source: &SourceLocation,
     ) -> Option<usize> {
         self.block_index_by_file_slice
             .contains_key(&(file_id, local_index))
-            .then_some(path.as_os_str().len())
+            .then_some(source.heap_bytes())
     }
 
     /// Seed a complete, independently committed source. The retained-session
     /// caller is responsible for checking its evidence before calling this;
     /// repair-time validation still checks every byte that is later consumed.
-    pub(crate) fn seed_complete_location(&mut self, file_id: FileId, path: PathBuf) -> bool {
+    pub(crate) fn seed_complete_location(
+        &mut self,
+        file_id: FileId,
+        source: SourceLocation,
+    ) -> bool {
         let Some(file_index) = self.file_index_by_id.get(&file_id).copied() else {
             return false;
         };
-        let (recoverable, safe_path, length, first_block, block_count) = {
+        let (recoverable, length, first_block, block_count, canonical) = {
             let file = &self.files[file_index];
             (
                 file.recoverable,
-                file.safe_path.clone(),
                 file.length,
                 file.first_block,
                 file.block_count,
+                source.is_canonical_for(file),
             )
         };
         if !recoverable {
             return false;
         }
-        let kind = if path == safe_path {
+        let kind = if canonical {
             BlockLocationKind::Canonical
         } else {
             BlockLocationKind::Extra
         };
         self.files[file_index].complete_location = Some(BlockLocation {
-            path: path.clone(),
+            source: source.clone(),
             offset: 0,
             len: length,
             kind,
@@ -1758,7 +1974,7 @@ impl RepairState {
             self.record_block_location(
                 block_index,
                 BlockLocation {
-                    path: path.clone(),
+                    source: source.clone(),
                     offset: block.local_index as u64 * self.set.slice_size,
                     len: block.expected_len,
                     kind,
@@ -1774,7 +1990,7 @@ impl RepairState {
         &mut self,
         file_id: FileId,
         local_index: u32,
-        path: PathBuf,
+        source: SourceLocation,
     ) -> bool {
         let Some(block_index) = self
             .block_index_by_file_slice
@@ -1788,7 +2004,7 @@ impl RepairState {
             .get(&file_id)
             .expect("block file exists")];
         let block = &self.blocks[block_index];
-        let kind = if path == file.safe_path {
+        let kind = if source.is_canonical_for(file) {
             BlockLocationKind::Canonical
         } else {
             BlockLocationKind::Extra
@@ -1796,7 +2012,7 @@ impl RepairState {
         self.record_block_location(
             block_index,
             BlockLocation {
-                path,
+                source,
                 offset: local_index as u64 * self.set.slice_size,
                 len: block.expected_len,
                 kind,
@@ -1805,13 +2021,104 @@ impl RepairState {
         true
     }
 
+    /// Forget every retained location belonging to one PAR2 file, whichever
+    /// kind of source backs it. Packet metadata and other files stay intact,
+    /// so the next analysis re-resolves only what this dropped.
+    pub(crate) fn invalidate_file(&mut self, file_id: FileId) -> bool {
+        let Some(file_index) = self.file_index_by_id.get(&file_id).copied() else {
+            return false;
+        };
+        let mut changed = false;
+        let file = &mut self.files[file_index];
+        if file.complete_location.take().is_some() {
+            changed = true;
+        }
+        file.target_exists = false;
+        file.non_canonical_complete_source_count = 0;
+        let (first_block, block_count) = (file.first_block, file.block_count);
+        for block in &mut self.blocks[first_block..first_block + block_count] {
+            if block.location.take().is_some() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Forget every access-backed location, leaving physical ones untouched.
+    /// Used when the handle's coverage generation moves on.
+    pub(crate) fn invalidate_access_sources(&mut self) -> bool {
+        let mut changed = false;
+        for file in &mut self.files {
+            if file
+                .complete_location
+                .as_ref()
+                .is_some_and(|location| location.source.is_access())
+            {
+                file.complete_location = None;
+                file.non_canonical_complete_source_count = 0;
+                changed = true;
+            }
+        }
+        for block in &mut self.blocks {
+            if block
+                .location
+                .as_ref()
+                .is_some_and(|location| location.source.is_access())
+            {
+                block.location = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Promote every access-backed file whose slices are all seeded, and mark
+    /// existence from the serving handle. This is the access counterpart of
+    /// [`Self::refresh_file_states`] and touches no filesystem path: a
+    /// directory walk over virtual sources would be meaningless.
+    pub(crate) fn refresh_access_file_states(&mut self) {
+        let Some(access) = self.source_access.clone() else {
+            return;
+        };
+        for file_index in 0..self.files.len() {
+            let file_id = self.files[file_index].file_id;
+            self.files[file_index].target_exists = access.file_exists(&file_id);
+            if !self.files[file_index].recoverable
+                || self.files[file_index].complete_location.is_some()
+            {
+                continue;
+            }
+            let file = &self.files[file_index];
+            if file.block_count == 0 || file.block_count != file.expected_block_count {
+                continue;
+            }
+            let complete = (0..file.block_count).all(|local| {
+                let block = &self.blocks[file.first_block + local];
+                block.location.as_ref().is_some_and(|location| {
+                    location.source == SourceLocation::Access(file_id)
+                        && location.offset == local as u64 * self.set.slice_size
+                        && location.len == block.expected_len
+                })
+            });
+            if complete {
+                let length = file.length;
+                self.files[file_index].complete_location = Some(BlockLocation {
+                    source: SourceLocation::Access(file_id),
+                    offset: 0,
+                    len: length,
+                    kind: BlockLocationKind::Canonical,
+                });
+            }
+        }
+    }
+
     pub(crate) fn invalidate_path(&mut self, path: &Path) -> bool {
         let mut changed = false;
         for file in &mut self.files {
             if file
                 .complete_location
                 .as_ref()
-                .is_some_and(|location| location.path == path)
+                .is_some_and(|location| location.source.is_path(path))
             {
                 file.complete_location = None;
                 changed = true;
@@ -1824,7 +2131,7 @@ impl RepairState {
             if block
                 .location
                 .as_ref()
-                .is_some_and(|location| location.path == path)
+                .is_some_and(|location| location.source.is_path(path))
             {
                 block.location = None;
                 changed = true;
@@ -1902,7 +2209,7 @@ impl RepairState {
                 .saturating_add(
                     file.complete_location
                         .as_ref()
-                        .map_or(0, |location| location.path.as_os_str().len()),
+                        .map_or(0, |location| location.source.heap_bytes()),
                 );
         }
         for block in &self.blocks {
@@ -1910,7 +2217,7 @@ impl RepairState {
                 block
                     .location
                     .as_ref()
-                    .map_or(0, |location| location.path.as_os_str().len()),
+                    .map_or(0, |location| location.source.heap_bytes()),
             );
         }
         for recovery in set.recovery_slices.values() {
@@ -2322,7 +2629,7 @@ impl RepairState {
             complete_files.push(CompleteFileMatch {
                 file_index: idx,
                 location: BlockLocation {
-                    path: path.to_path_buf(),
+                    source: SourceLocation::Path(path.to_path_buf()),
                     offset: 0,
                     len,
                     kind: complete_kind,
@@ -2341,7 +2648,7 @@ impl RepairState {
                 block_locations.push((
                     block_index,
                     BlockLocation {
-                        path: path.to_path_buf(),
+                        source: SourceLocation::Path(path.to_path_buf()),
                         offset,
                         len: expected_len,
                         kind: complete_kind,
@@ -2409,7 +2716,7 @@ impl RepairState {
             .as_ref()
             .is_none_or(|existing| {
                 location.kind < existing.kind
-                    || (location.kind == existing.kind && location.path < existing.path)
+                    || (location.kind == existing.kind && location.source < existing.source)
             });
         if replace {
             self.blocks[block_index].location = Some(location);
@@ -2428,7 +2735,7 @@ impl RepairState {
             if self.file_has_canonical_block_layout(file_index) {
                 let file = &self.files[file_index];
                 self.files[file_index].complete_location = Some(BlockLocation {
-                    path: file.safe_path.clone(),
+                    source: SourceLocation::Path(file.safe_path.clone()),
                     offset: 0,
                     len: file.length,
                     kind: BlockLocationKind::Canonical,
@@ -2459,7 +2766,7 @@ impl RepairState {
             let block = &self.blocks[file.first_block + local];
             block.location.as_ref().is_some_and(|location| {
                 location.kind == BlockLocationKind::Canonical
-                    && location.path == file.safe_path
+                    && location.source.is_path(&file.safe_path)
                     && location.offset == local as u64 * self.set.slice_size
                     && location.len == block.expected_len
             })
@@ -2468,18 +2775,23 @@ impl RepairState {
 
     /// Capture the scan's full effect (file states + block locations) plus
     /// a stat snapshot of every path it observed, for reuse by a later
-    /// pass over the same set.
+    /// pass over the same set. Access-backed locations contribute no snapshot
+    /// entry: their staleness is not a filesystem fact.
     fn scan_carry(&self, diagnostics: &ScanDiagnostics) -> ScanCarry {
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
         for file in &self.files {
             paths.insert(file.safe_path.clone());
-            if let Some(location) = &file.complete_location {
-                paths.insert(location.path.clone());
+            if let Some(path) = file
+                .complete_location
+                .as_ref()
+                .and_then(BlockLocation::path)
+            {
+                paths.insert(path.to_path_buf());
             }
         }
         for block in &self.blocks {
-            if let Some(location) = &block.location {
-                paths.insert(location.path.clone());
+            if let Some(path) = block.location.as_ref().and_then(BlockLocation::path) {
+                paths.insert(path.to_path_buf());
             }
         }
         ScanCarry {
@@ -2543,8 +2855,15 @@ impl RepairState {
 
             let status = if self.is_canonical_complete(file) {
                 FileStatus::Complete
-            } else if let Some(location) = file.complete_location.as_ref() {
-                FileStatus::Renamed(location.path.clone())
+            } else if let Some(path) = file
+                .complete_location
+                .as_ref()
+                .and_then(BlockLocation::path)
+            {
+                // Only a physical source can be "the same content under a
+                // different name". An access-backed complete source is always
+                // the file's own bytes, so it is complete, never renamed.
+                FileStatus::Renamed(path.to_path_buf())
             } else if !file.target_exists && file.complete_location.is_none() && missing > 0 {
                 FileStatus::Missing
             } else {
@@ -2605,20 +2924,28 @@ impl RepairState {
 
     fn is_canonical_complete(&self, file: &SourceFileEntry) -> bool {
         file.complete_location.as_ref().is_some_and(|location| {
-            location.kind == BlockLocationKind::Canonical && location.path == file.safe_path
+            location.kind == BlockLocationKind::Canonical && location.source.is_canonical_for(file)
         })
     }
 
+    /// Stat every physical repair input so a mid-repair change is caught.
+    /// Access-backed sources carry no stat: their staleness is governed by the
+    /// serving handle's own coverage, not by device/inode/mtime.
     fn snapshot_repair_input_sources(&self) -> HashMap<PathBuf, CarriedFileStat> {
         let mut snapshots = HashMap::new();
         for file in self.files.iter().filter(|file| file.recoverable) {
-            if let Some(location) = file.complete_location.as_ref() {
-                snapshots.insert(location.path.clone(), stat_for_carry(&location.path));
+            if let Some(path) = file
+                .complete_location
+                .as_ref()
+                .and_then(BlockLocation::path)
+            {
+                snapshots.insert(path.to_path_buf(), stat_for_carry(path));
             }
         }
-        for block in self.blocks.iter().filter(|block| block.location.is_some()) {
-            let location = block.location.as_ref().expect("location filtered above");
-            snapshots.insert(location.path.clone(), stat_for_carry(&location.path));
+        for block in &self.blocks {
+            if let Some(path) = block.location.as_ref().and_then(BlockLocation::path) {
+                snapshots.insert(path.to_path_buf(), stat_for_carry(path));
+            }
         }
         snapshots
     }
@@ -2692,11 +3019,19 @@ impl RepairState {
                     file,
                     &self.blocks[file.first_block..file.first_block + file.block_count],
                     self.set.slice_size,
-                    &location.path,
+                    &location.source,
+                    self.source_access.as_deref(),
                     &target,
                 )?;
             } else {
-                copy_range(&location.path, 0, &target, 0, file.length)?;
+                copy_source_range(
+                    &location.source,
+                    self.source_access.as_deref(),
+                    0,
+                    &target,
+                    0,
+                    file.length,
+                )?;
             }
             bytes_copied += file.length;
             whole_file_copied_ids.insert(file.file_id);
@@ -2719,7 +3054,7 @@ impl RepairState {
             };
             let target = install_dir.join(&self.files[file_idx].safe_name);
             let range = BlockCopyRange {
-                src: location.path.clone(),
+                src: location.source.clone(),
                 src_offset: location.offset,
                 dst: target,
                 dst_offset: block.local_index as u64 * self.set.slice_size,
@@ -2735,8 +3070,9 @@ impl RepairState {
         let copy_block_ranges = |ranges: &[BlockCopyRange]| -> Result<()> {
             for range in ranges {
                 check_cancel(options)?;
-                copy_range(
+                copy_source_range(
                     &range.src,
+                    self.source_access.as_deref(),
                     range.src_offset,
                     &range.dst,
                     range.dst_offset,
@@ -2748,7 +3084,12 @@ impl RepairState {
         let copy_validated_blocks = || -> Result<()> {
             for (block, range) in &validated_block_copies {
                 check_cancel(options)?;
-                copy_block_range_validated(block, self.set.slice_size, range)?;
+                copy_block_range_validated(
+                    block,
+                    self.set.slice_size,
+                    range,
+                    self.source_access.as_deref(),
+                )?;
             }
             Ok(())
         };
@@ -2763,6 +3104,7 @@ impl RepairState {
                     &self.blocks,
                     &staged_file_ids,
                     self.set.slice_size,
+                    self.source_access.clone(),
                     source_snapshots.clone(),
                 )?;
                 let plan =
@@ -2838,7 +3180,7 @@ impl RepairState {
             .filter(|file| repair.staged_file_ids.contains(&file.file_id))
             .filter_map(|file| {
                 let location = file.complete_location.as_ref()?;
-                let source = canonical_extra_path(&location.path);
+                let source = canonical_extra_path(location.path()?);
                 (source != canonical_extra_path(&file.safe_path)
                     && file.non_canonical_complete_source_count == 1
                     && explicit_extra_paths.contains(&source)
@@ -3738,7 +4080,7 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 selected,
                 BlockLocation {
-                    path: selection.path.to_path_buf(),
+                    source: SourceLocation::Path(selection.path.to_path_buf()),
                     offset: selection.offset,
                     len: block.expected_len,
                     kind: selection.kind,
@@ -4340,7 +4682,7 @@ impl<'a> RollingBlockScanner<'a> {
                             blocks,
                             *block_index,
                             BlockLocation {
-                                path: path.to_path_buf(),
+                                source: SourceLocation::Path(path.to_path_buf()),
                                 offset: offset as u64,
                                 len: block.expected_len,
                                 kind,
@@ -4360,7 +4702,7 @@ impl<'a> RollingBlockScanner<'a> {
                     blocks,
                     *block_index,
                     BlockLocation {
-                        path: path.to_path_buf(),
+                        source: SourceLocation::Path(path.to_path_buf()),
                         offset: tail_offset as u64,
                         len: block.expected_len,
                         kind,
@@ -4448,7 +4790,7 @@ fn can_select_ordered_match(
 ) -> bool {
     match blocks.location(block_index) {
         None => true,
-        Some(location) if Some(block_index) == expected_block => location.path != path,
+        Some(location) if Some(block_index) == expected_block => !location.source.is_path(path),
         Some(_) => false,
     }
 }
@@ -4675,7 +5017,7 @@ fn scan_short_blocks_from_file(
                             blocks,
                             *block_index,
                             BlockLocation {
-                                path: path.to_path_buf(),
+                                source: SourceLocation::Path(path.to_path_buf()),
                                 offset: offset as u64,
                                 len: block.expected_len,
                                 kind,
@@ -4694,7 +5036,7 @@ fn scan_short_blocks_from_file(
                 blocks,
                 *block_index,
                 BlockLocation {
-                    path: path.to_path_buf(),
+                    source: SourceLocation::Path(path.to_path_buf()),
                     offset: tail_offset as u64,
                     len: block.expected_len,
                     kind,
@@ -4902,7 +5244,7 @@ fn scan_shifted_short_windows(
                         blocks,
                         *block_index,
                         BlockLocation {
-                            path: path.to_path_buf(),
+                            source: SourceLocation::Path(path.to_path_buf()),
                             offset: absolute_offset,
                             len: short_len as u64,
                             kind,
@@ -4957,7 +5299,10 @@ fn can_record_block_location(
     kind: BlockLocationKind,
 ) -> bool {
     blocks.location(block_index).is_none_or(|existing| {
-        kind < existing.kind || (kind == existing.kind && path < existing.path.as_path())
+        // Scanning only ever produces path locations, so an access-backed
+        // incumbent (which scanning cannot have produced) is never displaced.
+        kind < existing.kind
+            || (kind == existing.kind && existing.path().is_some_and(|held| path < held))
     })
 }
 
@@ -4986,7 +5331,7 @@ fn record_matching_md5_block(
             blocks,
             block_index,
             BlockLocation {
-                path: path.to_path_buf(),
+                source: SourceLocation::Path(path.to_path_buf()),
                 offset,
                 len,
                 kind,
@@ -5015,7 +5360,7 @@ fn flush_pending_md5_checks(
                 blocks,
                 check.block_index,
                 BlockLocation {
-                    path: path.to_path_buf(),
+                    source: SourceLocation::Path(path.to_path_buf()),
                     offset: check.offset,
                     len: check.len,
                     kind: check.kind,
@@ -5252,6 +5597,7 @@ fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
 }
 
 const SOURCE_CHANGED_PREFIX: &str = "PAR2 source changed: ";
+const VIRTUAL_SOURCE_CHANGED_PREFIX: &str = "PAR2 virtual source changed: file ";
 
 fn source_changed_io(path: &Path) -> io::Error {
     io::Error::new(
@@ -5260,27 +5606,136 @@ fn source_changed_io(path: &Path) -> io::Error {
     )
 }
 
+/// The location-shaped counterpart to [`source_changed_io`]. Access-backed
+/// sources have no path to name, so they report their PAR2 file identifier
+/// under a distinct prefix that path-oriented callers do not misread.
+fn source_location_changed_io(source: &SourceLocation) -> io::Error {
+    match source {
+        SourceLocation::Path(path) => source_changed_io(path),
+        SourceLocation::Access(file_id) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{VIRTUAL_SOURCE_CHANGED_PREFIX}{file_id}"),
+        ),
+    }
+}
+
+/// Fill `dst` from an access-backed source, refusing a short read. Access
+/// implementations may return fewer bytes than requested; a source block is
+/// only usable whole, so a short read is a changed source.
+fn read_exact_from_access(
+    access: &(dyn FileAccess + Send + Sync),
+    file_id: &FileId,
+    offset: u64,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    let mut filled = 0usize;
+    while filled < dst.len() {
+        let read =
+            access.read_file_range_into(file_id, offset + filled as u64, &mut dst[filled..])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "access source ended before the requested range completed",
+            ));
+        }
+        filled += read;
+    }
+    Ok(())
+}
+
+/// A forward-only reader over one clean repair source, whichever kind it is.
+///
+/// The staging copies below consume their source strictly in order, which is
+/// the one shape both a `File` and a [`FileAccess`] handle serve equally well.
+/// Keeping the two behind this reader is what lets a virtual source stage into
+/// repair scratch without any code path holding a path for it.
+enum SourceReader<'a> {
+    File {
+        file: File,
+        path: &'a Path,
+        source_len: u64,
+    },
+    Access {
+        access: &'a (dyn FileAccess + Send + Sync),
+        file_id: FileId,
+        offset: u64,
+    },
+}
+
+impl<'a> SourceReader<'a> {
+    /// Open `source` for a sequential read of `len` bytes from `offset`.
+    /// A path source is opened and bounds-checked here; an access source is
+    /// bound to its handle, which is required to be present.
+    fn open(
+        source: &'a SourceLocation,
+        access: Option<&'a (dyn FileAccess + Send + Sync)>,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<Self> {
+        match source {
+            SourceLocation::Path(path) => {
+                let mut file = File::open(path).map_err(|_| source_changed_io(path))?;
+                let source_len = file.metadata().map_err(|_| source_changed_io(path))?.len();
+                if offset.checked_add(len).is_none_or(|end| end > source_len) {
+                    return Err(source_changed_io(path));
+                }
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|_| source_changed_io(path))?;
+                Ok(Self::File {
+                    file,
+                    path,
+                    source_len,
+                })
+            }
+            SourceLocation::Access(file_id) => {
+                let access = access.ok_or_else(|| source_location_changed_io(source))?;
+                Ok(Self::Access {
+                    access,
+                    file_id: *file_id,
+                    offset,
+                })
+            }
+        }
+    }
+
+    /// Total length of a path source. Access sources have no such fact: their
+    /// length is whatever the set says it is.
+    fn source_len(&self) -> Option<u64> {
+        match self {
+            Self::File { source_len, .. } => Some(*source_len),
+            Self::Access { .. } => None,
+        }
+    }
+
+    fn read_exact(&mut self, dst: &mut [u8]) -> io::Result<()> {
+        match self {
+            Self::File { file, path, .. } => {
+                file.read_exact(dst).map_err(|_| source_changed_io(path))
+            }
+            Self::Access {
+                access,
+                file_id,
+                offset,
+            } => {
+                read_exact_from_access(*access, file_id, *offset, dst)
+                    .map_err(|_| source_location_changed_io(&SourceLocation::Access(*file_id)))?;
+                *offset += dst.len() as u64;
+                Ok(())
+            }
+        }
+    }
+}
+
 fn copy_block_range_validated(
     block: &SourceBlock,
     slice_size: u64,
     range: &BlockCopyRange,
+    access: Option<&(dyn FileAccess + Send + Sync)>,
 ) -> io::Result<()> {
-    let mut input = File::open(&range.src).map_err(|_| source_changed_io(&range.src))?;
-    let source_len = input
-        .metadata()
-        .map_err(|_| source_changed_io(&range.src))?
-        .len();
-    if range.len != block.expected_len
-        || range
-            .src_offset
-            .checked_add(range.len)
-            .is_none_or(|end| end > source_len)
-    {
-        return Err(source_changed_io(&range.src));
+    if range.len != block.expected_len {
+        return Err(source_location_changed_io(&range.src));
     }
-    input
-        .seek(SeekFrom::Start(range.src_offset))
-        .map_err(|_| source_changed_io(&range.src))?;
+    let mut input = SourceReader::open(&range.src, access, range.src_offset, range.len)?;
     if let Some(parent) = range.dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5291,9 +5746,7 @@ fn copy_block_range_validated(
     let mut buf = vec![0u8; remaining.clamp(1, 256 * 1024) as usize];
     while remaining > 0 {
         let take = remaining.min(buf.len() as u64) as usize;
-        input
-            .read_exact(&mut buf[..take])
-            .map_err(|_| source_changed_io(&range.src))?;
+        input.read_exact(&mut buf[..take])?;
         output.write_all(&buf[..take])?;
         checksum.update(&buf[..take]);
         remaining -= take as u64;
@@ -5301,7 +5754,7 @@ fn copy_block_range_validated(
     output.flush()?;
     let (crc32, md5) = checksum.finalize(Some(slice_size));
     if crc32 != block.checksum.crc32 || md5 != block.checksum.md5 {
-        return Err(source_changed_io(&range.src));
+        return Err(source_location_changed_io(&range.src));
     }
     Ok(())
 }
@@ -5310,13 +5763,15 @@ fn copy_complete_file_validated(
     file: &SourceFileEntry,
     blocks: &[SourceBlock],
     slice_size: u64,
-    src: &Path,
+    src: &SourceLocation,
+    access: Option<&(dyn FileAccess + Send + Sync)>,
     dst: &Path,
 ) -> io::Result<()> {
-    let mut input = File::open(src).map_err(|_| source_changed_io(src))?;
-    let source_len = input.metadata().map_err(|_| source_changed_io(src))?.len();
-    if source_len != file.length {
-        return Err(source_changed_io(src));
+    let mut input = SourceReader::open(src, access, 0, file.length)?;
+    // A physical source of the wrong length is a changed source, even when its
+    // leading bytes still hash correctly.
+    if input.source_len().is_some_and(|len| len != file.length) {
+        return Err(source_location_changed_io(src));
     }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -5336,9 +5791,7 @@ fn copy_complete_file_validated(
         let mut slice_checksum = checksum::SliceChecksumState::new();
         while remaining > 0 {
             let take = remaining.min(buf.len() as u64) as usize;
-            input
-                .read_exact(&mut buf[..take])
-                .map_err(|_| source_changed_io(src))?;
+            input.read_exact(&mut buf[..take])?;
             output.write_all(&buf[..take])?;
             full_hash.update(&buf[..take]);
             slice_checksum.update(&buf[..take]);
@@ -5348,15 +5801,47 @@ fn copy_complete_file_validated(
         if let Some(block) = block {
             let (crc32, md5) = slice_checksum.finalize(Some(slice_size));
             if crc32 != block.checksum.crc32 || md5 != block.checksum.md5 {
-                return Err(source_changed_io(src));
+                return Err(source_location_changed_io(src));
             }
         }
     }
     output.flush()?;
     if copied != file.length || full_hash.finalize() != file.hash_full {
-        return Err(source_changed_io(src));
+        return Err(source_location_changed_io(src));
     }
     Ok(())
+}
+
+/// Copy a clean span from either source kind into a path-addressed target.
+/// Repair outputs are always real files; only the *read* side virtualizes.
+fn copy_source_range(
+    src: &SourceLocation,
+    access: Option<&(dyn FileAccess + Send + Sync)>,
+    src_offset: u64,
+    dst: &Path,
+    dst_offset: u64,
+    len: u64,
+) -> io::Result<()> {
+    let Some(path) = src.path() else {
+        let mut input = SourceReader::open(src, access, src_offset, len)?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = OpenOptions::new().write(true).open(dst)?;
+        output.seek(SeekFrom::Start(dst_offset))?;
+        let mut remaining = len;
+        let mut buf = vec![0u8; remaining.clamp(1, 256 * 1024) as usize];
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            input.read_exact(&mut buf[..take])?;
+            output.write_all(&buf[..take])?;
+            remaining -= take as u64;
+        }
+        output.flush()?;
+        crate::file_cache::drop_file_cache(&output, dst, dst_offset, len);
+        return Ok(());
+    };
+    copy_range(path, src_offset, dst, dst_offset, len)
 }
 
 fn copy_range(
@@ -5636,7 +6121,7 @@ mod tests {
             expected_len: expected.len() as u64,
             checksum: SliceChecksum { crc32, md5 },
             location: Some(BlockLocation {
-                path: path.to_path_buf(),
+                source: SourceLocation::Path(path.to_path_buf()),
                 offset: 0,
                 len: expected.len() as u64,
                 kind: BlockLocationKind::Canonical,
@@ -5661,6 +6146,7 @@ mod tests {
             &[block],
             &HashSet::new(),
             expected.len() as u64,
+            None,
             Some(snapshot),
         )
         .unwrap();
@@ -5689,7 +6175,7 @@ mod tests {
             expected_len: payload.len() as u64,
             checksum: SliceChecksum { crc32, md5 },
             location: Some(BlockLocation {
-                path: source,
+                source: SourceLocation::Path(source),
                 offset: 0,
                 len: payload.len() as u64,
                 kind: BlockLocationKind::Canonical,
@@ -5701,6 +6187,7 @@ mod tests {
             &[block],
             &HashSet::new(),
             8,
+            None,
             None,
         )
         .unwrap();
@@ -5752,7 +6239,8 @@ mod tests {
             &file,
             &[block],
             expected.len() as u64,
-            &source,
+            &SourceLocation::Path(source),
+            None,
             &destination,
         )
         .unwrap_err();
@@ -5760,6 +6248,140 @@ mod tests {
         drop(guard);
         assert!(!staging.exists());
         assert!(!file.safe_path.exists());
+    }
+
+    /// Staging from a virtual source writes the served bytes and validates
+    /// them, opening nothing on disk but the destination.
+    #[test]
+    fn whole_file_copy_stages_a_virtual_source_without_a_path() {
+        let dir = tempdir().unwrap();
+        let expected = b"virtual-whole-file-payload!!";
+        let file_id = FileId::from_bytes([0x71; 16]);
+        let mut memory = crate::verify::MemoryFileAccess::new();
+        memory.add_file(file_id, expected.to_vec());
+        let source = SourceLocation::Access(file_id);
+        let mut blocks = Vec::new();
+        for (index, chunk) in expected.chunks(8).enumerate() {
+            let mut state = SliceChecksumState::new();
+            state.update(chunk);
+            let (crc32, md5) = state.finalize(Some(8));
+            blocks.push(SourceBlock {
+                global_index: index,
+                file_id,
+                local_index: index as u32,
+                expected_len: chunk.len() as u64,
+                checksum: SliceChecksum { crc32, md5 },
+                location: Some(BlockLocation {
+                    source: source.clone(),
+                    offset: index as u64 * 8,
+                    len: chunk.len() as u64,
+                    kind: BlockLocationKind::Canonical,
+                }),
+            });
+        }
+        let file = SourceFileEntry {
+            file_id,
+            par2_name: "installed.bin".to_owned(),
+            safe_path: dir.path().join("installed.bin"),
+            safe_name: "installed.bin".to_owned(),
+            length: expected.len() as u64,
+            hash_full: checksum::md5(expected),
+            hash_16k: checksum::md5(expected),
+            recoverable: true,
+            first_block: 0,
+            expected_block_count: blocks.len(),
+            block_count: blocks.len(),
+            target_exists: false,
+            complete_location: None,
+            non_canonical_complete_source_count: 0,
+        };
+        let staging = dir.path().join(".weaver-par2-repair-virtual");
+        fs::create_dir_all(&staging).unwrap();
+        let destination = staging.join("installed.bin");
+        File::create(&destination).unwrap();
+
+        copy_complete_file_validated(&file, &blocks, 8, &source, Some(&memory), &destination)
+            .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        // Nothing was created at the file's own path: only the read side is
+        // virtual, and the write side went where it was told.
+        assert!(!file.safe_path.exists());
+    }
+
+    /// A virtual source serving the wrong bytes is refused exactly as a
+    /// changed file is, and names the file identity rather than a path.
+    #[test]
+    fn intact_block_copy_rejects_a_virtual_source_serving_wrong_bytes() {
+        let dir = tempdir().unwrap();
+        let expected = b"block";
+        let file_id = FileId::from_bytes([0x72; 16]);
+        let mut state = SliceChecksumState::new();
+        state.update(expected);
+        let (crc32, md5) = state.finalize(Some(expected.len() as u64));
+        let block = SourceBlock {
+            global_index: 0,
+            file_id,
+            local_index: 0,
+            expected_len: expected.len() as u64,
+            checksum: SliceChecksum { crc32, md5 },
+            location: None,
+        };
+        let mut memory = crate::verify::MemoryFileAccess::new();
+        memory.add_file(file_id, b"wrong".to_vec());
+        let staging = dir.path().join(".weaver-par2-repair-virtual-block");
+        fs::create_dir_all(&staging).unwrap();
+        let destination = staging.join("installed.bin");
+        File::create(&destination).unwrap();
+        let range = BlockCopyRange {
+            src: SourceLocation::Access(file_id),
+            src_offset: 0,
+            dst: destination,
+            dst_offset: 0,
+            len: expected.len() as u64,
+        };
+
+        let error =
+            copy_block_range_validated(&block, expected.len() as u64, &range, Some(&memory))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("virtual source changed"));
+    }
+
+    /// Without a handle there is nothing to read a virtual source from, and
+    /// the refusal must not degrade into a filesystem lookup.
+    #[test]
+    fn virtual_source_without_a_handle_is_refused_not_resolved() {
+        let dir = tempdir().unwrap();
+        let file_id = FileId::from_bytes([0x73; 16]);
+        let staging = dir.path().join(".weaver-par2-repair-no-handle");
+        fs::create_dir_all(&staging).unwrap();
+        let destination = staging.join("installed.bin");
+        File::create(&destination).unwrap();
+        let range = BlockCopyRange {
+            src: SourceLocation::Access(file_id),
+            src_offset: 0,
+            dst: destination,
+            dst_offset: 0,
+            len: 4,
+        };
+        let block = SourceBlock {
+            global_index: 0,
+            file_id,
+            local_index: 0,
+            expected_len: 4,
+            checksum: SliceChecksum {
+                crc32: 0,
+                md5: [0; 16],
+            },
+            location: None,
+        };
+
+        let error = copy_block_range_validated(&block, 4, &range, None).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("virtual source changed"));
     }
 
     #[test]
@@ -5776,7 +6398,7 @@ mod tests {
         let destination = staging.join("installed.bin");
         File::create(&destination).unwrap();
         let range = BlockCopyRange {
-            src: source,
+            src: SourceLocation::Path(source),
             src_offset: 0,
             dst: destination,
             dst_offset: 0,
@@ -5784,7 +6406,8 @@ mod tests {
         };
         let guard = RepairStagingGuard::new(staging.clone());
 
-        let error = copy_block_range_validated(&block, expected.len() as u64, &range).unwrap_err();
+        let error =
+            copy_block_range_validated(&block, expected.len() as u64, &range, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         drop(guard);
         assert!(!staging.exists());
@@ -6248,7 +6871,7 @@ mod tests {
         push_block_copy_range(
             &mut ranges,
             BlockCopyRange {
-                src: src.clone(),
+                src: SourceLocation::Path(src.clone()),
                 src_offset: 0,
                 dst: dst.clone(),
                 dst_offset: 0,
@@ -6258,7 +6881,7 @@ mod tests {
         push_block_copy_range(
             &mut ranges,
             BlockCopyRange {
-                src: src.clone(),
+                src: SourceLocation::Path(src.clone()),
                 src_offset: 1024,
                 dst: dst.clone(),
                 dst_offset: 1024,
@@ -6268,7 +6891,7 @@ mod tests {
         push_block_copy_range(
             &mut ranges,
             BlockCopyRange {
-                src: src.clone(),
+                src: SourceLocation::Path(src.clone()),
                 src_offset: 4096,
                 dst: dst.clone(),
                 dst_offset: 4096,
@@ -6278,7 +6901,7 @@ mod tests {
         push_block_copy_range(
             &mut ranges,
             BlockCopyRange {
-                src: other_src,
+                src: SourceLocation::Path(other_src),
                 src_offset: 5120,
                 dst: dst.clone(),
                 dst_offset: 5120,
@@ -6288,7 +6911,7 @@ mod tests {
         push_block_copy_range(
             &mut ranges,
             BlockCopyRange {
-                src,
+                src: SourceLocation::Path(src),
                 src_offset: 6144,
                 dst: other_dst,
                 dst_offset: 6144,
@@ -6472,7 +7095,10 @@ mod tests {
             .map(|block| {
                 block.location.as_ref().map(|location| {
                     (
-                        location.path.clone(),
+                        location
+                            .path()
+                            .expect("scanned location is a path")
+                            .to_path_buf(),
                         location.offset,
                         location.len,
                         location.kind,
@@ -7425,7 +8051,8 @@ mod tests {
                             location.len,
                             location.kind,
                             location
-                                .path
+                                .path()
+                                .expect("scanned location is a path")
                                 .file_name()
                                 .unwrap()
                                 .to_string_lossy()
@@ -7638,7 +8265,7 @@ mod tests {
             .unwrap();
 
         let location = blocks[0].location.as_ref().unwrap();
-        assert_eq!(location.path, candidate);
+        assert_eq!(location.path(), Some(candidate.as_path()));
         assert_eq!(location.offset, 150);
     }
 
@@ -7726,7 +8353,7 @@ mod tests {
             .find(|file| file.safe_name == "nested/movie.r00")
             .unwrap();
         state.blocks[file.first_block].location = Some(BlockLocation {
-            path: wrong_block_source,
+            source: SourceLocation::Path(wrong_block_source),
             offset: 0,
             len: state.blocks[file.first_block].expected_len,
             kind: BlockLocationKind::Extra,
@@ -7791,29 +8418,29 @@ mod tests {
             state.blocks[0]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&first)
+                .and_then(|location| location.path()),
+            Some(first.as_path())
         );
         assert_eq!(
             state.blocks[1]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&second)
+                .and_then(|location| location.path()),
+            Some(second.as_path())
         );
         assert_eq!(
             state.blocks[2]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&first)
+                .and_then(|location| location.path()),
+            Some(first.as_path())
         );
         assert_eq!(
             state.blocks[3]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&second)
+                .and_then(|location| location.path()),
+            Some(second.as_path())
         );
     }
 
@@ -7964,8 +8591,8 @@ mod tests {
             state.blocks[0]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&canonical_extra)
+                .and_then(|location| location.path()),
+            Some(canonical_extra.as_path())
         );
     }
 
@@ -8053,8 +8680,8 @@ mod tests {
             state.blocks[0]
                 .location
                 .as_ref()
-                .map(|location| &location.path),
-            Some(&visible)
+                .and_then(|location| location.path()),
+            Some(visible.as_path())
         );
     }
 
@@ -8385,7 +9012,10 @@ mod tests {
             .unwrap();
         let last_block = &state.blocks[file.first_block + file.block_count - 1];
         let location = last_block.location.as_ref().unwrap();
-        assert_eq!(location.path, dir.path().join("target.bin"));
+        assert_eq!(
+            location.path(),
+            Some(dir.path().join("target.bin").as_path())
+        );
         assert_eq!(location.offset, 8);
     }
 
@@ -8408,7 +9038,10 @@ mod tests {
             .unwrap();
         let last_block = &state.blocks[file.first_block + file.block_count - 1];
         let location = last_block.location.as_ref().unwrap();
-        assert_eq!(location.path, dir.path().join("interior.bin"));
+        assert_eq!(
+            location.path(),
+            Some(dir.path().join("interior.bin").as_path())
+        );
         assert_eq!(location.offset, 4);
     }
 
