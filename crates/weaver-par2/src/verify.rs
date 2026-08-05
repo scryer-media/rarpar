@@ -733,7 +733,7 @@ pub struct VerifyOptions {
     /// inherently serial full-file MD5. Off by default, in which case
     /// verification is byte-identical to the strict full-MD5 pipeline. The
     /// `WEAVER_PAR2_FAST_VERIFY` environment variable overrides this per verify
-    /// call (see [`fast_verify_enabled`]).
+    /// call, taking precedence over whatever is set here.
     pub fast_verify: bool,
 }
 

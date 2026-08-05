@@ -289,7 +289,7 @@ impl EncryptedStore {
     /// Total by construction: a RAR5 member with no `FHEXTRA_CRYPT` record and a
     /// RAR4 member using one of the pre-AES ciphers are both
     /// [`IneligibilityReason::Encrypted`], so neither can reach this type — the
-    /// RAR5 half of that is stated in [`StoredLayoutBuilder::member_encryption`]
+    /// RAR5 half of that is decided where the builder reads member encryption,
     /// and is itself format-discriminated.
     pub fn keying(&self) -> MemberKeying {
         match self.crypt {

@@ -37,7 +37,7 @@ use thiserror::Error;
 use crate::error::Par2Error;
 use crate::evidence::CommittedFileEvidence;
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
-use crate::par2_set::MergeResult;
+use crate::par2_set::{MergeResult, Par2FileSet};
 use crate::repair::{DEFAULT_REPAIR_MEMORY_LIMIT, repair_matrix_resource_limit_reason};
 use crate::repairer::{
     PacketDiagnostics, Par2RepairOutcome, Par2RepairStatus, Par2Repairer, Par2RepairerOptions,
@@ -74,8 +74,18 @@ pub struct Par2RepairSessionOptions {
     /// Where repair *output* lands, and — for filesystem sessions only — where
     /// source scanning looks. An access-backed session never reads from here.
     pub base_dir: PathBuf,
-    /// The primary PAR2 files. Adjacent volumes are deliberately not loaded
-    /// here; add them later with [`Par2RepairSession::merge_recovery_paths`].
+    /// An already-parsed set, used instead of reading [`par2_paths`]. Set this
+    /// when the `.par2` volumes are not files — a caller that assembled them
+    /// in memory has the packets already, and making it write them out just so
+    /// they can be read back is the cost this avoids.
+    ///
+    /// [`par2_paths`]: Self::par2_paths
+    pub file_set: Option<Par2FileSet>,
+    /// The primary PAR2 files. Ignored when [`file_set`] is set. Adjacent
+    /// volumes are deliberately not loaded here; add them later with
+    /// [`Par2RepairSession::merge_recovery_paths`].
+    ///
+    /// [`file_set`]: Self::file_set
     pub par2_paths: Vec<PathBuf>,
     /// Explicit recovery volumes to merge immediately after opening.
     pub recovery_paths: Vec<PathBuf>,
@@ -135,12 +145,50 @@ impl Par2RepairSessionOptions {
             ..Self::default()
         }
     }
+
+    /// Options for a session with no PAR2 files and no source files: the set
+    /// is already parsed, and sources are served by `source_access`.
+    ///
+    /// `base_dir` still names where repair output is staged and installed —
+    /// repair writes real files whatever the sources were.
+    ///
+    /// ```no_run
+    /// use par2_rs::{MemoryFileAccess, Par2FileSet, Par2RepairSessionOptions};
+    /// use std::path::PathBuf;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> par2_rs::Result<()> {
+    /// # let packets = Vec::new();
+    /// let set = Par2FileSet::from_packets(packets)?;
+    /// let access = Arc::new(MemoryFileAccess::new());
+    /// let options = Par2RepairSessionOptions::from_set(
+    ///     PathBuf::from("/var/tmp/repair-scratch"),
+    ///     set,
+    ///     access,
+    /// );
+    /// assert!(options.par2_paths.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_set(
+        base_dir: PathBuf,
+        file_set: Par2FileSet,
+        source_access: Arc<dyn FileAccess + Send + Sync>,
+    ) -> Self {
+        Self {
+            base_dir,
+            file_set: Some(file_set),
+            source_access: Some(source_access),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Par2RepairSessionOptions {
     fn default() -> Self {
         Self {
             base_dir: PathBuf::new(),
+            file_set: None,
             par2_paths: Vec::new(),
             recovery_paths: Vec::new(),
             extra_paths: Vec::new(),
@@ -1024,6 +1072,7 @@ fn invalidate_source_in_state(state: &mut RepairState, source: &SourceLocation) 
 
 fn repairer_options(options: &Par2RepairSessionOptions, repair: bool) -> Par2RepairerOptions {
     let mut out = Par2RepairerOptions::new(options.base_dir.clone(), options.par2_paths.clone());
+    out.file_set = options.file_set.clone();
     out.extra_paths = options.extra_paths.clone();
     out.repair = repair;
     out.memory_limit = options.memory_limit;
@@ -1951,5 +2000,52 @@ mod tests {
 
         fs::write(&path, b"contiguous-article-data!").unwrap();
         assert!(!evidence_stat_matches(&evidence).unwrap());
+    }
+
+    /// `open` accepts an already-parsed set, so a caller whose `.par2` volumes
+    /// never became files does not have to write them out to be read back.
+    /// Every other session test builds the struct directly; this one goes
+    /// through the public constructor, which is the whole point.
+    #[test]
+    fn open_takes_a_parsed_set_instead_of_reading_par2_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"eight-bytes-of-payload!!";
+        let set_id = RecoverySetId::from_bytes([0x71; 16]);
+        let file_id = FileId::from_bytes([0x72; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+
+        let mut session = Par2RepairSession::open(Par2RepairSessionOptions::from_set(
+            dir.path().to_path_buf(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        ))
+        .expect("a parsed set needs no PAR2 files on disk");
+
+        assert!(session.is_access_backed());
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        let assessment = session.analyze().unwrap();
+
+        assert_eq!(assessment.status, Par2RepairStatus::Insufficient);
+        assert_eq!(assessment.available_blocks, 1);
+        assert_eq!(assessment.missing_blocks, 2);
+        // Nothing was read by path: no PAR2 file existed to read, and the
+        // sources live behind the handle.
+        assert_eq!(session.diagnostics().source_scan_passes, 0);
+        assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+    }
+
+    /// The control for the test above: without the set, the same options have
+    /// no PAR2 input at all, and opening is an error rather than an empty
+    /// session that silently verifies nothing.
+    #[test]
+    fn open_without_a_set_or_par2_paths_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = Par2RepairSessionOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.source_access = Some(Arc::new(MemoryFileAccess::new()));
+
+        assert!(Par2RepairSession::open(options).is_err());
     }
 }

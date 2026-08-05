@@ -66,7 +66,9 @@
 //! known instead of a fresh walk. Its sources may be files under a base
 //! directory, or bytes served through a [`FileAccess`] handle
 //! ([`Par2RepairSessionOptions::with_source_access`]) for sets that never
-//! became files. Repair *output* is always real files either way.
+//! became files — and where the `.par2` volumes themselves never became files
+//! either, [`Par2RepairSessionOptions::from_set`] takes the parsed set
+//! directly. Repair *output* is always real files either way.
 //!
 //! # Damaged PAR2 files
 //!

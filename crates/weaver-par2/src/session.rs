@@ -573,10 +573,11 @@ enum SliceFeed {
 /// arrives during download.
 ///
 /// Usage:
-/// 1. Call [`add_par2_data`] when PAR2 metadata packets arrive.
-/// 2. Call [`feed_data`] as decoded file data arrives (slice-aligned).
-/// 3. Query [`file_status`], [`repairability`], or [`is_complete`] at any time.
-/// 4. Call [`verification_result`] once all data has been fed.
+/// 1. Call [`Self::add_par2_data`] when PAR2 metadata packets arrive.
+/// 2. Call [`Self::feed_data`] as decoded file data arrives (slice-aligned).
+/// 3. Query [`Self::file_status`], [`Self::repairability`], or
+///    [`Self::is_complete`] at any time.
+/// 4. Call [`Self::verification_result`] once all data has been fed.
 pub struct VerificationSession {
     par2_set: Option<Arc<Par2FileSet>>,
     file_states: HashMap<FileId, FileVerificationState>,
