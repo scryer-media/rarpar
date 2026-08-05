@@ -2604,8 +2604,17 @@ mod tests {
         let volumes: Vec<std::path::PathBuf> = (1..=5)
             .map(|part| fixtures.join(format!("rar5_mv_store.part{part}.rar")))
             .collect();
-        if volumes.iter().any(|path| !path.exists()) {
-            eprintln!("skipping test: rar5_mv_store fixtures not present");
+        // Existence is the wrong guard under partial Git LFS hydration: the
+        // no-fixture CI lane checks these out as pointer files, which exist and
+        // then fail the signature parse. A hydrated fixture starts with `Rar!`;
+        // a pointer starts with `version https://git-lfs…`.
+        let hydrated = |path: &std::path::Path| {
+            std::fs::read(path)
+                .ok()
+                .is_some_and(|bytes| bytes.starts_with(b"Rar!"))
+        };
+        if !volumes.iter().all(|path| hydrated(path)) {
+            eprintln!("skipping test: rar5_mv_store fixtures not hydrated");
             return;
         }
 
