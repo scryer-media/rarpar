@@ -1,72 +1,87 @@
 # unrar-rs
 
-A pure-Rust RAR archive **reader** and extractor. No C bindings, no shelling out
-to `unrar`.
+[![crates.io](https://img.shields.io/crates/v/unrar-rs.svg)](https://crates.io/crates/unrar-rs)
+[![docs.rs](https://docs.rs/unrar-rs/badge.svg)](https://docs.rs/unrar-rs)
 
-This crate reads existing archives only. It deliberately exposes no writer,
-builder, or archive-creation API — see the licence note at the bottom, which is
-the reason.
+RAR archive reading and extraction in pure Rust. No C bindings, no external
+`unrar` binary.
 
 ```toml
 [dependencies]
 unrar-rs = "0.3"
 ```
 
+This crate reads existing archives. It exposes no writer, builder, or
+archive-creation API, for the licensing reason given below.
+
+## Usage
+
 ```rust
 use unrar_rs::RarArchive;
 
-let mut archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
+let archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
 for member in &archive.metadata().members {
-    println!("{} ({} bytes)", member.name, member.unpacked_size);
+    println!("{} ({:?} bytes)", member.name, member.unpacked_size);
 }
 ```
 
-## What it handles
+Reading headers decompresses nothing, so listing a large set costs only its
+headers. Extraction verifies by default:
 
-- **RAR5 and RAR4**, including legacy RAR 1.5 / 2.0 / 2.9 archives, and SFX
-  (self-extracting) archives.
-- **Every RAR5 header type** — main, file, service, encryption, end — with vint
-  decoding and header CRC32 validation.
-- **Decompression**: Store, LZ (methods 1–5) with Huffman decoding and a sliding
-  window, and PPMd variant H, plus the post-decompression filters (Delta, E8,
-  E8E9, ARM).
-- **Encryption**: AES with RAR-compatible key derivation, for both file data
-  (`-p`) and encrypted headers (`-hp`).
-- **Multi-volume sets**, with topology tracking and cross-volume member layout.
-- **Metadata-only mode**, so you can inspect an archive without extracting it.
-- **Path sanitisation**, so a hostile archive cannot traverse out of its
-  destination directory.
+```rust
+use unrar_rs::{ExtractOptions, RarArchive};
 
-## Streaming extraction
+let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
+let index = archive.find_member("movie.mkv").expect("member present");
+archive.extract_member_to_file(
+    index,
+    &ExtractOptions { verify: true, password: None, restore_owners: false },
+    None,
+    "movie.mkv".as_ref(),
+)?;
+```
 
-Beyond the usual read-a-file-from-disk path, members can be extracted through a
-`VolumeProvider` — you supply the volume bytes, from wherever they live. Volumes
-are addressed in the **set's own numbering** throughout, so a member whose first
-segment lives in volume 5 asks the provider for volume 5.
+## Capabilities
 
-That makes it possible to extract a member while its volumes are still arriving,
-or to extract from volumes that never exist as files at all. It is what powers
-[Weaver](https://github.com/scryer-media/weaver)'s direct-store pipeline, where
-a stored member's payload is written straight to its destination as articles
-arrive off Usenet.
+- RAR5 and RAR4, including legacy RAR 1.5 / 2.0 / 2.9, and SFX archives.
+- All five RAR5 header types, vint decoding, header CRC32 validation.
+- Store, LZ (methods 1–5), and PPMd variant H decompression, plus the Delta,
+  E8, E8E9 and ARM filters.
+- AES decryption for file data (`-p`) and encrypted headers (`-hp`), with
+  RAR-compatible key derivation.
+- Multi-volume topology tracking and cross-volume member layout.
+- Metadata-only mode for inspection without extraction.
+- Path sanitisation against traversal, and header-declared limits that bound
+  allocation.
+
+## Extracting from volumes that are not files
+
+`extract_member_streaming` reads through a `VolumeProvider` rather than the
+filesystem, so a member can be extracted while its volumes are still arriving,
+or from volumes that never exist as files. Volumes are addressed in the set's
+own numbering throughout: a member whose first segment is in volume 5 requests
+volume 5.
 
 ## Verification
 
-Extraction verifies by default, and the checks match what the format actually
-provides: the whole-member CRC32 or BLAKE2sp, and — for a member split across
-volumes — the per-part packed checksum each non-final part carries, so damage is
-caught at the part that carries it rather than at the end of the member.
+Checks follow what the format provides. A member carries a whole-member CRC32 or
+BLAKE2sp. A member split across volumes also carries a packed checksum in every
+non-final part, so damage is caught at the part carrying it rather than at the
+end of the member. Note that `-htb` archives replace CRC32 with BLAKE2sp rather
+than adding it.
 
-## Related crates
+## Provenance
 
-- [`par2-rs`](https://crates.io/crates/par2-rs) — PAR2 verification and repair,
-  for recovering damaged volumes before extraction.
-- [`reedsolomon-rs`](https://crates.io/crates/reedsolomon-rs) — the GF(2¹⁶)
-  kernels underneath both.
+This is a Rust port of RARLAB's reference UnRAR implementation, with additional
+optimisations: runtime-dispatched SIMD, a streaming extraction path, and
+cross-volume layout assembly that the reference implementation does not provide.
 
-## Licence
+The RAR format is documented in RARLAB's
+[technical note](https://www.rarlab.com/technote.htm).
 
-GPL-3.0-or-later, **with the additional UnRAR source-code restriction**:
+## License
+
+GPL-3.0-or-later, with the additional UnRAR source-code restriction:
 
 > UnRAR source code may be used in any software to handle RAR archives without
 > limitations free of charge, but cannot be used to develop RAR (WinRAR)
@@ -77,5 +92,5 @@ GPL-3.0-or-later, **with the additional UnRAR source-code restriction**:
 > in documentation if license is not available, and in source code comments of
 > resulting package.
 
-This is why the crate ships no compression or archive-writing API, and why
-anything that links it inherits the same restriction.
+This restriction is why the crate provides no compression or archive-writing
+API, and it applies to anything that links this crate. See [LICENSE](LICENSE).

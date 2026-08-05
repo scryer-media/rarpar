@@ -107,10 +107,18 @@
 //!
 //! # Feature flags
 //!
-//! - `crypto-aws-lc` *(default)* — AWS-LC-backed AES and hashing.
-//! - `crypto-rust` — pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
+//! - `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
+//! - `crypto-rust`: pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
 //!   targets where AWS-LC will not build.
-//! - `crypto-host` — host-provided crypto, implying `crypto-rust`.
+//! - `crypto-host`: host-provided crypto, implying `crypto-rust`.
+//!
+//! # Provenance
+//!
+//! A Rust port of RARLAB's reference UnRAR implementation, with additional
+//! optimisations: runtime-dispatched SIMD, a streaming extraction path, and
+//! cross-volume layout assembly that the reference implementation does not
+//! provide. The format is documented in RARLAB's
+//! [technical note](https://www.rarlab.com/technote.htm).
 
 pub mod archive;
 pub(crate) mod crc;
