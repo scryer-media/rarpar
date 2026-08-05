@@ -824,6 +824,31 @@ impl Par2RepairSession {
         self.source_generation
     }
 
+    /// Point the session at a new serving handle, retiring everything read
+    /// through the old one, and return the new generation.
+    ///
+    /// A handle whose coverage is a snapshot gets *replaced* rather than
+    /// mutated — a router that re-plans builds a new one — so re-pointing is
+    /// the same event as [`Self::invalidate_access_sources`] and retires the
+    /// same set. Physical locations and committed-file evidence are untouched.
+    /// This is what lets one session outlive many handles instead of being
+    /// rebuilt, and with it every physical proof the session has accumulated.
+    ///
+    /// Returns `None` on a filesystem session, where adopting a handle would
+    /// silently redefine where sources come from. Open the session
+    /// access-backed if that is what you want.
+    pub fn set_source_access(
+        &mut self,
+        source_access: Arc<dyn FileAccess + Send + Sync>,
+    ) -> Option<u64> {
+        if !self.is_access_backed() {
+            return None;
+        }
+        self.options.source_access = Some(Arc::clone(&source_access));
+        self.state.source_access = Some(source_access);
+        Some(self.invalidate_access_sources())
+    }
+
     /// Conservative upper bound on the heap this session owns.
     ///
     /// Every mutation projects this figure forward before it applies, so a
@@ -2035,6 +2060,60 @@ mod tests {
         // sources live behind the handle.
         assert_eq!(session.diagnostics().source_scan_passes, 0);
         assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+    }
+
+    /// Re-pointing at a new handle serves reads from it, and retires what the
+    /// old one had proven — the new handle's coverage is its own.
+    #[test]
+    fn set_source_access_adopts_the_new_handle_and_retires_the_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"eight-bytes-of-payload!!";
+        let set_id = RecoverySetId::from_bytes([0x81; 16]);
+        let file_id = FileId::from_bytes([0x82; 16]);
+        let mut first = MemoryFileAccess::new();
+        first.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(first),
+        );
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        assert_eq!(session.analyze().unwrap().available_blocks, 1);
+
+        let mut second = MemoryFileAccess::new();
+        second.add_file(file_id, payload.to_vec());
+        let generation = session.set_source_access(Arc::new(second)).unwrap();
+
+        assert_eq!(generation, session.source_generation());
+        // The evidence was read through the retired handle, so it goes with it
+        // rather than being credited to a handle that never served it.
+        assert_eq!(session.analyze().unwrap().available_blocks, 0);
+        session
+            .add_slice_evidence_for_file(strong_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        assert_eq!(session.analyze().unwrap().available_blocks, 1);
+    }
+
+    /// A filesystem session refuses a handle rather than quietly redefining
+    /// where its sources come from.
+    #[test]
+    fn set_source_access_refuses_a_filesystem_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let set_id = RecoverySetId::from_bytes([0x91; 16]);
+        let file_id = FileId::from_bytes([0x92; 16]);
+        let mut session = session_from_set(
+            Par2RepairSessionOptions::new(dir.path().to_path_buf(), Vec::new()),
+            single_file_set(set_id, file_id, "payload.bin", b"eight-byt", 8),
+        );
+
+        assert!(
+            session
+                .set_source_access(Arc::new(MemoryFileAccess::new()))
+                .is_none()
+        );
+        assert!(!session.is_access_backed());
     }
 
     /// The control for the test above: without the set, the same options have
