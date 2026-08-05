@@ -12,21 +12,105 @@
 //!
 //! This crate provides reading, decompression, and extraction of existing RAR
 //! archives only. It intentionally exposes no archive writer, builder, or
-//! creation APIs. It supports:
-//! - Parsing all 5 RAR5 header types (main, file, service, encryption, end)
-//! - Variable-length integer (vint) decoding
-//! - Header CRC32 validation
-//! - Metadata extraction (header-only mode)
-//! - Store (method 0) extraction with CRC32 verification
+//! creation API — the restriction above is why.
+//!
+//! # Reading an archive
+//!
+//! [`RarArchive::open`] takes anything `Read + Seek`, so an archive can come
+//! from a file, a buffer, or your own source.
+//!
+//! ```no_run
+//! use unrar_rs::RarArchive;
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
+//! for member in &archive.metadata().members {
+//!     // `unpacked_size` is `None` until the header that states it arrives,
+//!     // which for a split member is its final part.
+//!     println!("{} ({:?} bytes)", member.name, member.unpacked_size);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Reading headers never decompresses anything, so listing a 50 GB set costs
+//! only its headers. Extraction verifies by default:
+//!
+//! ```no_run
+//! use unrar_rs::{ExtractOptions, RarArchive};
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
+//! let index = archive.find_member("movie.mkv").expect("member present");
+//! archive.extract_member_to_file(
+//!     index,
+//!     &ExtractOptions { verify: true, password: None, restore_owners: false },
+//!     None, // optional `&dyn ProgressHandler`
+//!     std::path::Path::new("movie.mkv"),
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Extracting from volumes that are not files
+//!
+//! [`extract_member_streaming`](RarArchive::extract_member_streaming) reads
+//! through a [`volume::VolumeProvider`] instead of the
+//! filesystem, so a member can be extracted while its volumes are still
+//! arriving — or from volumes that never exist as files at all.
+//!
+//! Volumes are addressed in the **set's own numbering** throughout, the same
+//! one [`RarVolumeFacts`] reports and `add_volume` accepts: a member whose first
+//! segment lives in volume 5 asks the provider for volume 5. Do not re-key a
+//! provider to the member's first volume.
+//!
+//! # Encrypted archives
+//!
+//! Both shapes are supported: file-data encryption (`rar -p`) and encrypted
+//! headers (`rar -hp`). Pass the password through
+//! [`ExtractOptions::password`], or [`RarArchive::open_with_password`] when the
+//! headers themselves are encrypted.
+//!
+//! For callers that route bytes themselves rather than extracting, the [`crypto`]
+//! module exposes the pieces directly — derive a member's key from header facts,
+//! prove a password *before* decrypting anything with
+//! [`check_member_password`], and decrypt or re-encrypt an arbitrary range.
+//! Note that a candidate can be `Verified`, `Wrong`, or `Unverifiable`, and the
+//! third must never be treated as the first: an archive whose stored check value
+//! is malformed rejects nothing for any password.
+//!
+//! # Integrity
+//!
+//! Verification matches what the format actually provides. A member carries a
+//! whole-member CRC32 or BLAKE2sp; a member split across volumes additionally
+//! carries a packed checksum in every non-final part, so damage is caught at the
+//! part that carries it rather than at the end of the member. `-htb` archives
+//! replace CRC32 with BLAKE2sp entirely rather than adding it.
+//!
+//! # Safety
+//!
+//! [`sanitize_path`] is applied to member names so a hostile archive cannot
+//! traverse out of its destination directory, and [`Limits`] bounds what a
+//! header may declare — a crafted dictionary size cannot make extraction
+//! allocate without bound.
+//!
+//! # Supported formats
+//!
+//! - All five RAR5 header types (main, file, service, encryption, end), vint
+//!   decoding, header CRC32 validation
+//! - RAR4, including legacy RAR 1.5 / 2.0 / 2.9 decompression
+//! - SFX (self-extracting) archives
+//! - Store, LZ (methods 1–5) with Huffman decoding and a sliding window, and
+//!   PPMd variant H
+//! - Post-decompression filters: Delta, E8, E8E9, ARM
 //! - Multi-volume topology tracking
-//! - Detection and extraction of supported encrypted archives
-//! - RAR4 archive support, including legacy RAR 1.5/2.0/2.9 decompression
-//! - SFX (self-extracting) archive support
-//! - AES decryption with RAR-compatible key derivation
-//! - LZ decompression (methods 1-5) with Huffman decoding and sliding window
-//! - PPMd decompression (variant H)
-//! - Post-decompression filters (Delta, E8, E8E9, ARM)
-//! - Path sanitization to prevent traversal attacks
+//!
+//! # Feature flags
+//!
+//! - `crypto-aws-lc` *(default)* — AWS-LC-backed AES and hashing.
+//! - `crypto-rust` — pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
+//!   targets where AWS-LC will not build.
+//! - `crypto-host` — host-provided crypto, implying `crypto-rust`.
 
 pub mod archive;
 pub(crate) mod crc;
