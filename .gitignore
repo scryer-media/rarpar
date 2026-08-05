@@ -1,6 +1,10 @@
 /target/
 /target-*/
 
+# Deterministic benchmark corpora, runs, and rendered reports.
+/target/bench/
+/bench/rarpar-bench/.cache/
+
 # Local CI/release artifacts
 /.ci/
 /dist/

@@ -1,0 +1,99 @@
+name: RAR4 PPMd performance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ppmd-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-unrar:
+    name: compare-unrar-${{ matrix.platform }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-26
+            unrar_url: https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz
+            unrar_sha256: 68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d
+          - platform: linux-x86_64
+            runs_on: ubuntu-24.04
+            unrar_url: https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz
+            unrar_sha256: 759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588
+    env:
+      CARGO_INCREMENTAL: "0"
+      PPMD_FIXTURES: >-
+        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_restart.rar,
+        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_mv.rar,
+        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_order16_32m.rar
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Hydrate PPMd fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="${PPMD_FIXTURES//[[:space:]]/}" --exclude=""
+          git lfs fsck --pointers
+          IFS=',' read -ra fixtures <<< "${PPMD_FIXTURES//[[:space:]]/}"
+          for fixture in "${fixtures[@]}"; do
+            if head -c 43 "$fixture" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $fixture"
+              exit 1
+            fi
+          done
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
+
+      - name: Install version-pinned RARLAB UnRAR
+        id: unrar
+        shell: bash
+        env:
+          UNRAR_URL: ${{ matrix.unrar_url }}
+          UNRAR_SHA256: ${{ matrix.unrar_sha256 }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/unrar-7.23.tar.gz"
+          curl --fail --location --retry 3 "$UNRAR_URL" --output "$archive"
+          printf '%s  %s\n' "$UNRAR_SHA256" "$archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/rar/unrar"
+          banner="$($RUNNER_TEMP/rar/unrar 2>&1 | head -n 5 || true)"
+          printf '%s\n' "$banner"
+          printf '%s\n' "$banner" | grep -q '^UNRAR 7\.23 freeware'
+          echo "bin=$RUNNER_TEMP/rar/unrar" >> "$GITHUB_OUTPUT"
+
+      - name: Build rarpar release binary
+        run: cargo build --locked --release -p rarpar
+
+      - name: Compare RAR4 PPMd extraction with UnRAR 7.23
+        env:
+          RARPAR_BIN: ${{ github.workspace }}/target/release/rarpar
+          UNRAR_BIN: ${{ steps.unrar.outputs.bin }}
+          WEAVER_REQUIRE_PPMD_PERF: "1"
+          PPMD_PERF_JSON: ${{ runner.temp }}/ppmd-perf-${{ matrix.platform }}.json
+        run: cargo bench --locked -p unrar-rs --bench ppmd_compare
+
+      - name: Upload timing report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ppmd-perf-${{ matrix.platform }}
+          path: ${{ runner.temp }}/ppmd-perf-${{ matrix.platform }}.json
+          if-no-files-found: warn

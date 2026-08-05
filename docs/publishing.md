@@ -64,23 +64,22 @@ Verify repository metadata before the first publish.
   package-root layout. Native build lanes use `sccache`, Linux `mold`,
   path-prefix remapping, and `--no-install-recommends` native dependency
   installs.
-- `.github/workflows/release.yml` builds ten release archives: GNU and musl
-  direct GPU builds plus CPU-only Docker builds for both Linux architectures,
-  Apple Silicon and Intel macOS, and x86_64 and ARM64 Windows. Apple Silicon
-  uses Metal; direct Linux and Windows use `wgpu`; Intel macOS and Docker are
-  CPU-only. It verifies this policy against the target-filtered dependency graph
+- `.github/workflows/release.yml` builds eight CPU-only release archives: GNU
+  and musl Linux builds for both Linux architectures, Apple Silicon and Intel
+  macOS, and x86_64 and ARM64 Windows. The musl archives also supply the GHCR
+  image. It verifies the CPU-only dependency policy against the target-filtered dependency graph
   and builds from `cargo package -p rarpar` output unpacked outside the
   workspace, so the binary resolves published `weaver-*` crates just as a
   downstream consumer would. GNU direct builds upload package-root inspection
-  artifacts for future distro packages; GitHub Releases receive ten archives
+  artifacts for future distro packages; GitHub Releases receive eight archives
   and `SHA256SUMS`.
 - The release workflow also publishes a CPU-only multi-architecture image to
-  `ghcr.io/scryer-media/rarpar` from the Docker-focused musl archives. It pushes
+  `ghcr.io/scryer-media/rarpar` from the portable musl archives. It pushes
   an exact tag for every release and minor plus `latest` tags for stable releases,
   then validates both image architectures and their manifest before publishing
   the GitHub Release and Homebrew update.
   Homebrew selects the GNU direct archive on glibc 2.35+ and the musl direct
-  archive otherwise; it never selects a Docker-focused archive.
+  archive otherwise.
 - `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
   selected package mode. It is manual-only and defaults to dry-run/preflight
   mode. Use `package=all` for coordinated releases or a specific package name
@@ -94,7 +93,7 @@ flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
 and `--remap-path-prefix`, are allowed. Every native artifact enables AWS-LC;
 the feature audit requires one resolved `aws-lc-sys` version and rejects GPU
-dependencies from Docker and CPU-only artifacts.
+dependencies from every shipped artifact.
 
 Required repository configuration:
 

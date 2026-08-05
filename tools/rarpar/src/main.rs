@@ -94,7 +94,12 @@ fn run_auto(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError
     let mut restored_paths = Vec::new();
     for rar_set in report.rar_sets.clone() {
         if !rar_set.recovery_volumes.is_empty() {
-            let outcome = rar::restore_volumes(cli, &rar_set)?;
+            // Restored volumes are intermediate set members. They must stay
+            // beside their sibling volumes even when extraction has a separate
+            // output directory.
+            let mut restore_cli = cli.clone();
+            restore_cli.output = None;
+            let outcome = rar::restore_volumes(&restore_cli, &rar_set)?;
             restored_paths.extend(outcome.restored_paths.clone());
             report.record_action(outcome.action());
             if !outcome.success {

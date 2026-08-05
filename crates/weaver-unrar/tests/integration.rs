@@ -6516,6 +6516,32 @@ fn test_rar4_ppmd_solid_restart_lockstep() {
     assert!(bytes.iter().all(|b| b.is_ascii()));
 }
 
+/// Large order-16 performance corpus. The hash pins the deterministic payload
+/// independently of RAR header metadata emitted by the fixture generator.
+#[test]
+fn test_rar4_ppmd_order16_32m_payload() {
+    use sha2::{Digest, Sha256};
+
+    let mut archive = open_single("rar4", "rar4_ppm_order16_32m.rar");
+    let opts = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result.len(), 32 * 1024 * 1024);
+    let bytes = result.to_bytes().unwrap();
+    let digest = Sha256::digest(&bytes);
+    assert_eq!(
+        &digest[..],
+        &[
+            0xfe, 0xd0, 0x04, 0x27, 0x61, 0xd0, 0xc6, 0x52, 0xcc, 0xdd, 0x8a, 0xc4, 0x65, 0xde,
+            0x03, 0xea, 0xfc, 0x30, 0x13, 0xf5, 0x81, 0xa0, 0x62, 0x27, 0xc4, 0xe1, 0x7e, 0x2c,
+            0xd1, 0x84, 0xef, 0x8b,
+        ]
+    );
+}
+
 /// Multi-member v29 solid streams end each member with an in-stream marker
 /// (LZ code 256 with new-file/new-table flags) that must be consumed after
 /// the member's last output symbol. Skipping it leaves stale Huffman tables

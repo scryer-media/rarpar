@@ -210,15 +210,6 @@ impl Rar4LzDecoder {
         self.window.dict_size()
     }
 
-    fn ppm_model_mut(&mut self) -> RarResult<&mut Model> {
-        self.ppm_model
-            .as_mut()
-            .ok_or_else(|| RarError::CorruptArchive {
-                detail: "RAR4 PPM escape sequence requested without an initialized PPM model"
-                    .to_string(),
-            })
-    }
-
     fn flush_threshold(&self) -> usize {
         self.window
             .dict_size()
@@ -1813,23 +1804,32 @@ impl Rar4LzDecoder {
                 Some(state) => BitReadRangeDecoder::from_state(reader, state),
                 None => BitReadRangeDecoder::new(reader)?,
             };
+            let Some(mut ppm_model) = self.ppm_model.take() else {
+                self.block_type = BlockType::Lz;
+                return Ok(output_size);
+            };
+            let mut keep_ppm_model = true;
+            let mut literals = [0u8; 1024];
+            let mut literal_len = 0usize;
+            macro_rules! flush_literals {
+                () => {
+                    if literal_len != 0 {
+                        self.window.put_bytes(&literals[..literal_len]);
+                        literal_len = 0;
+                    }
+                };
+            }
 
             while output_size < unpacked_size {
                 if let Some(threshold) = yield_threshold
-                    && self.window.unflushed_bytes() as usize >= threshold
+                    && self.window.unflushed_bytes() as usize + literal_len >= threshold
                 {
+                    flush_literals!();
                     self.flush_ready_output_to_writer(writer, false)?;
                 }
 
-                let model = match self.ppm_model.as_mut() {
-                    Some(m) => m,
-                    None => {
-                        self.block_type = BlockType::Lz;
-                        break;
-                    }
-                };
-
-                let Some(ch) = model.decode_char_result(&mut rc)? else {
+                let Some(ch) = ppm_model.decode_char_result(&mut rc)? else {
+                    flush_literals!();
                     // Corrupt PPM data — switch to LZ mode.
                     if rar4_debug_filters_enabled() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
@@ -1853,15 +1853,17 @@ impl Rar4LzDecoder {
                             );
                         }
                     }
-                    self.ppm_model = None;
+                    keep_ppm_model = false;
                     self.block_type = BlockType::Lz;
                     break;
                 };
 
                 if ch == self.ppm_esc_char {
+                    // Commands can inspect or copy the dictionary, so publish
+                    // preceding literals before interpreting the escape.
+                    flush_literals!();
                     // Escape sequence — decode the command byte.
-                    let model = self.ppm_model_mut()?;
-                    let Some(next_ch) = model.decode_char_result(&mut rc)? else {
+                    let Some(next_ch) = ppm_model.decode_char_result(&mut rc)? else {
                         if rar4_debug_filters_enabled() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
                             if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
@@ -1884,7 +1886,7 @@ impl Rar4LzDecoder {
                                 );
                             }
                         }
-                        self.ppm_model = None;
+                        keep_ppm_model = false;
                         self.block_type = BlockType::Lz;
                         break;
                     };
@@ -1905,15 +1907,14 @@ impl Rar4LzDecoder {
                             break;
                         }
                         3 => {
-                            self.read_vm_code_ppm(&mut rc, output_size)?;
+                            self.read_vm_code_ppm(&mut ppm_model, &mut rc, output_size)?;
                         }
                         4 => {
                             let mut distance: u32 = 0;
                             let mut length: u32 = 0;
                             let mut failed = false;
-                            let model = self.ppm_model_mut()?;
                             for i in 0..4 {
-                                let Some(b) = model.decode_char_result(&mut rc)? else {
+                                let Some(b) = ppm_model.decode_char_result(&mut rc)? else {
                                     failed = true;
                                     break;
                                 };
@@ -1924,7 +1925,7 @@ impl Rar4LzDecoder {
                                 }
                             }
                             if failed {
-                                self.ppm_model = None;
+                                keep_ppm_model = false;
                                 self.block_type = BlockType::Lz;
                                 break;
                             }
@@ -1944,9 +1945,8 @@ impl Rar4LzDecoder {
                             output_size += actual as u64;
                         }
                         5 => {
-                            let model = self.ppm_model_mut()?;
-                            let Some(len_byte) = model.decode_char_result(&mut rc)? else {
-                                self.ppm_model = None;
+                            let Some(len_byte) = ppm_model.decode_char_result(&mut rc)? else {
+                                keep_ppm_model = false;
                                 self.block_type = BlockType::Lz;
                                 break;
                             };
@@ -1963,29 +1963,35 @@ impl Rar4LzDecoder {
                             output_size += actual as u64;
                         }
                         _ => {
-                            self.window.put_byte(ch);
+                            literals[literal_len] = ch;
+                            literal_len += 1;
+                            if literal_len == literals.len() {
+                                flush_literals!();
+                            }
                             output_size += 1;
                         }
                     }
                 } else {
-                    self.window.put_byte(ch);
+                    literals[literal_len] = ch;
+                    literal_len += 1;
+                    if literal_len == literals.len() {
+                        flush_literals!();
+                    }
                     output_size += 1;
                 }
             }
+            if literal_len != 0 {
+                self.window.put_bytes(&literals[..literal_len]);
+            }
 
-            if !switch_to_lz_tables
-                && matches!(self.block_type, BlockType::Ppm)
-                && self.ppm_model.is_some()
-            {
+            if !switch_to_lz_tables && matches!(self.block_type, BlockType::Ppm) && keep_ppm_model {
                 // The output check is strictly `Written > DestSize`, so
                 // the esc,2 end-of-file marker following a member's last
                 // output byte is consumed before its decode ends. Consume it
                 // here when the loop stopped on exact output completion.
                 if !end_marker_seen && output_size >= unpacked_size {
                     let esc = self.ppm_esc_char;
-                    if let Some(model) = self.ppm_model.as_mut()
-                        && let Ok(Some(ch)) = model.decode_char_result(&mut rc)
-                    {
+                    if let Ok(Some(ch)) = ppm_model.decode_char_result(&mut rc) {
                         if rar4_debug_filters_enabled() {
                             eprintln!(
                                 "RAR4 PPM trailing consume: ch={ch} esc={esc} output_size={output_size}"
@@ -1994,7 +2000,7 @@ impl Rar4LzDecoder {
                         if ch == esc {
                             // Subcode 2 = end of file; anything else only
                             // occurs in malformed streams.
-                            let sub = model.decode_char_result(&mut rc);
+                            let sub = ppm_model.decode_char_result(&mut rc);
                             if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM trailing consume subcode: {sub:?}");
                             }
@@ -2006,6 +2012,9 @@ impl Rar4LzDecoder {
                 // the next solid member resumes with these registers.
                 self.ppm_rc_state = Some(rc.state());
             }
+            if keep_ppm_model {
+                self.ppm_model = Some(ppm_model);
+            }
         }
 
         if switch_to_lz_tables {
@@ -2016,14 +2025,13 @@ impl Rar4LzDecoder {
     }
 
     /// Read VM filter code in PPM mode and queue a standard filter block.
-    fn read_vm_code_ppm<R: RangeCode>(&mut self, rc: &mut R, output_size: u64) -> RarResult<()> {
-        let read_model_byte = |this: &mut Self, rc: &mut R| -> RarResult<u8> {
-            let model = this
-                .ppm_model
-                .as_mut()
-                .ok_or_else(|| RarError::CorruptArchive {
-                    detail: "RAR4: PPMd model missing during VM filter read".into(),
-                })?;
+    fn read_vm_code_ppm<R: RangeCode>(
+        &mut self,
+        model: &mut Model,
+        rc: &mut R,
+        output_size: u64,
+    ) -> RarResult<()> {
+        let read_model_byte = |model: &mut Model, rc: &mut R| -> RarResult<u8> {
             let Some(byte) = model.decode_char_result(rc)? else {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR4: PPMd corrupt during VM filter read".into(),
@@ -2032,11 +2040,11 @@ impl Rar4LzDecoder {
             Ok(byte)
         };
 
-        let first_byte = read_model_byte(self, rc)?;
-        let length = Self::decode_vm_code_length(first_byte, || read_model_byte(self, rc))?;
+        let first_byte = read_model_byte(model, rc)?;
+        let length = Self::decode_vm_code_length(first_byte, || read_model_byte(model, rc))?;
         let mut code = Vec::with_capacity(length);
         for _ in 0..length {
-            code.push(read_model_byte(self, rc)?);
+            code.push(read_model_byte(model, rc)?);
         }
 
         self.add_vm_code(first_byte, &code, output_size)

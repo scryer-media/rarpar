@@ -44,6 +44,7 @@ fn run() -> Result<()> {
         Some("docs") => run_docs(args.collect()),
         Some("package-root") => run_package_root(args.collect()),
         Some("feature-audit") => run_feature_audit(args.collect()),
+        Some("bench") => run_bench(args.collect()),
         Some("-h" | "--help") | None => {
             print_usage();
             Ok(())
@@ -59,8 +60,27 @@ Usage:
   cargo run -p xtask -- docs [--out DIR]
   cargo run -p xtask -- docs --check
   cargo run -p xtask -- package-root --binary PATH --out DIR [--docs DIR] [--target TRIPLE]
-  cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST --gpu POLICY"
+  cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST
+  cargo run -p xtask -- bench <toolchains|corpus|plan|preflight|run|report|render> [OPTIONS]"
     );
+}
+
+fn run_bench(args: Vec<OsString>) -> Result<()> {
+    let bench_root = workspace_root().join("bench/rarpar-bench");
+    if !bench_root.join("go.mod").is_file() {
+        return fail("benchmark harness is missing bench/rarpar-bench/go.mod");
+    }
+    let status = Command::new("go")
+        .args(["run", "./cmd/rarpar-bench"])
+        .args(args)
+        .current_dir(&bench_root)
+        .env("RARPAR_BENCH_WORKSPACE_ROOT", workspace_root())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        fail(format!("benchmark harness exited with {status}"))
+    }
 }
 
 fn run_docs(args: Vec<OsString>) -> Result<()> {
@@ -102,11 +122,7 @@ fn run_feature_audit(args: Vec<OsString>) -> Result<()> {
     reject_target_cpu_flags()?;
     let metadata = cargo_metadata(&options)?;
     audit_feature_metadata(&metadata, &options)?;
-    println!(
-        "feature audit passed: target={} gpu={}",
-        options.target,
-        options.gpu.as_str()
-    );
+    println!("feature audit passed: target={}", options.target);
     Ok(())
 }
 
@@ -175,7 +191,6 @@ struct FeatureAuditOptions {
     manifest: PathBuf,
     target: String,
     features: String,
-    gpu: GpuPolicy,
 }
 
 impl FeatureAuditOptions {
@@ -183,14 +198,12 @@ impl FeatureAuditOptions {
         let mut manifest = None;
         let mut target = None;
         let mut features = None;
-        let mut gpu = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.to_string_lossy().as_ref() {
                 "--manifest" => manifest = Some(next_path(&mut iter, "--manifest")?),
                 "--target" => target = Some(next_string(&mut iter, "--target")?),
                 "--features" => features = Some(next_string(&mut iter, "--features")?),
-                "--gpu" => gpu = Some(GpuPolicy::parse(&next_string(&mut iter, "--gpu")?)?),
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -202,34 +215,7 @@ impl FeatureAuditOptions {
             manifest: manifest.ok_or_else(|| error("--manifest is required"))?,
             target: target.ok_or_else(|| error("--target is required"))?,
             features: features.ok_or_else(|| error("--features is required"))?,
-            gpu: gpu.ok_or_else(|| error("--gpu is required"))?,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GpuPolicy {
-    None,
-    Metal,
-    Wgpu,
-}
-
-impl GpuPolicy {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "none" => Ok(Self::None),
-            "metal" => Ok(Self::Metal),
-            "wgpu" => Ok(Self::Wgpu),
-            _ => fail("--gpu must be one of: none, metal, wgpu"),
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Metal => "metal",
-            Self::Wgpu => "wgpu",
-        }
     }
 }
 
@@ -286,7 +272,7 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
+fn audit_feature_metadata(metadata: &CargoMetadata, _options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
     require_feature(metadata, "par2-rs", "native-crypto")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
@@ -299,11 +285,7 @@ fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOption
         ));
     }
 
-    match options.gpu {
-        GpuPolicy::None => assert_cpu_only(metadata)?,
-        GpuPolicy::Metal => assert_metal(metadata, &options.target)?,
-        GpuPolicy::Wgpu => assert_wgpu(metadata, &options.target)?,
-    }
+    assert_cpu_only(metadata)?;
     Ok(())
 }
 
@@ -323,40 +305,6 @@ fn reject_target_cpu_flags() -> Result<()> {
 fn assert_cpu_only(metadata: &CargoMetadata) -> Result<()> {
     reject_gpu_features(metadata)?;
     reject_resolved_package(metadata, "wgpu")?;
-    reject_resolved_package(metadata, "objc2-metal")
-}
-
-fn assert_metal(metadata: &CargoMetadata, target: &str) -> Result<()> {
-    if target != "aarch64-apple-darwin" {
-        return fail(format!(
-            "Metal policy is only valid for aarch64-apple-darwin, got {target}"
-        ));
-    }
-    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
-        require_feature(metadata, package, "metal")?;
-        reject_feature(metadata, package, "wgpu")?;
-    }
-    require_resolved_package(metadata, "objc2-metal")?;
-    reject_resolved_package(metadata, "wgpu")
-}
-
-fn assert_wgpu(metadata: &CargoMetadata, target: &str) -> Result<()> {
-    const WGPU_TARGETS: &[&str] = &[
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    ];
-    if !WGPU_TARGETS.contains(&target) {
-        return fail(format!("wgpu policy is not supported for target {target}"));
-    }
-    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
-        require_feature(metadata, package, "wgpu")?;
-        reject_feature(metadata, package, "metal")?;
-    }
-    require_resolved_package(metadata, "wgpu")?;
     reject_resolved_package(metadata, "objc2-metal")
 }
 
@@ -380,13 +328,6 @@ fn reject_feature(metadata: &CargoMetadata, package: &str, feature: &str) -> Res
     let (_, node) = resolved_package_node(metadata, package)?;
     if node.features.iter().any(|enabled| enabled == feature) {
         return fail(format!("{package} must not resolve feature {feature:?}"));
-    }
-    Ok(())
-}
-
-fn require_resolved_package(metadata: &CargoMetadata, package: &str) -> Result<()> {
-    if resolved_package_versions(metadata, package).is_empty() {
-        return fail(format!("expected resolved package {package}"));
     }
     Ok(())
 }
@@ -964,21 +905,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feature_audit_accepts_each_supported_policy() -> Result<()> {
-        for (gpu, target) in [
-            (GpuPolicy::None, "x86_64-apple-darwin"),
-            (GpuPolicy::Metal, "aarch64-apple-darwin"),
-            (GpuPolicy::Wgpu, "x86_64-unknown-linux-musl"),
-        ] {
-            let options = FeatureAuditOptions {
-                manifest: PathBuf::from("Cargo.toml"),
-                target: target.to_owned(),
-                features: "runtime".to_owned(),
-                gpu,
-            };
-            audit_feature_metadata(&feature_metadata(gpu, &["0.42.0"]), &options)?;
-        }
-        Ok(())
+    fn feature_audit_accepts_cpu_only_metadata() -> Result<()> {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        audit_feature_metadata(&feature_metadata(&["0.42.0"]), &options)
     }
 
     #[test]
@@ -987,13 +920,9 @@ mod tests {
             manifest: PathBuf::from("Cargo.toml"),
             target: "x86_64-apple-darwin".to_owned(),
             features: "runtime".to_owned(),
-            gpu: GpuPolicy::None,
         };
-        let error = audit_feature_metadata(
-            &feature_metadata(GpuPolicy::None, &["0.41.0", "0.42.0"]),
-            &options,
-        )
-        .expect_err("duplicate aws-lc-sys versions must fail the audit");
+        let error = audit_feature_metadata(&feature_metadata(&["0.41.0", "0.42.0"]), &options)
+            .expect_err("duplicate aws-lc-sys versions must fail the audit");
         assert!(
             error
                 .to_string()
@@ -1094,7 +1023,7 @@ mod tests {
         Ok(())
     }
 
-    fn feature_metadata(gpu: GpuPolicy, aws_lc_versions: &[&str]) -> CargoMetadata {
+    fn feature_metadata(aws_lc_versions: &[&str]) -> CargoMetadata {
         let mut packages = vec![
             CargoPackage {
                 id: "rarpar".to_owned(),
@@ -1147,42 +1076,6 @@ mod tests {
                 id,
                 features: Vec::new(),
             });
-        }
-
-        match gpu {
-            GpuPolicy::None => {}
-            GpuPolicy::Metal => {
-                for node in &mut nodes {
-                    if matches!(node.id.as_str(), "rarpar" | "par2-rs" | "reedsolomon-rs") {
-                        node.features.push("metal".to_owned());
-                    }
-                }
-                packages.push(CargoPackage {
-                    id: "objc2-metal".to_owned(),
-                    name: "objc2-metal".to_owned(),
-                    version: "0.3.2".to_owned(),
-                });
-                nodes.push(CargoNode {
-                    id: "objc2-metal".to_owned(),
-                    features: Vec::new(),
-                });
-            }
-            GpuPolicy::Wgpu => {
-                for node in &mut nodes {
-                    if matches!(node.id.as_str(), "rarpar" | "par2-rs" | "reedsolomon-rs") {
-                        node.features.push("wgpu".to_owned());
-                    }
-                }
-                packages.push(CargoPackage {
-                    id: "wgpu".to_owned(),
-                    name: "wgpu".to_owned(),
-                    version: "30.0.0".to_owned(),
-                });
-                nodes.push(CargoNode {
-                    id: "wgpu".to_owned(),
-                    features: Vec::new(),
-                });
-            }
         }
 
         CargoMetadata {

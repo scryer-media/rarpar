@@ -104,7 +104,19 @@ pub fn extract_set(
         for (index, member) in members.iter().enumerate() {
             let out_path = output_dir.join(&member.name);
             if !cli.json {
-                println!("Extracting  {}", member.name);
+                println!(
+                    "{}  {}",
+                    if member.is_directory {
+                        "Creating"
+                    } else {
+                        "Extracting"
+                    },
+                    member.name
+                );
+            }
+            if member.is_directory {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
             }
             archive.extract_member_to_file(index, &options, None, &out_path)?;
         }
@@ -192,6 +204,10 @@ pub fn test_set(set: &RarSet, passwords: &mut PasswordResolver) -> Result<RarOut
         let members = archive.metadata().members;
         for (index, member) in members.iter().enumerate() {
             let out_path = tempdir.path().join(&member.name);
+            if member.is_directory {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
+            }
             archive.extract_member_to_file(index, &options, None, &out_path)?;
         }
         Ok(())

@@ -3982,7 +3982,9 @@ impl RarArchive {
         let fh = entry.file_header.clone();
         let hash = entry.hash.clone();
         let mi = self.member_info(index);
-        let is_solid = fh.compression.solid;
+        // The first compressed member of a solid archive has no per-file
+        // SOLID flag, but its decoder state seeds every following member.
+        let is_solid = self.is_solid || fh.compression.solid;
         let archive_format = self.format;
         if !allow_link_payload {
             self.reject_link_member_without_file_target(entry, &fh)?;
@@ -4500,7 +4502,9 @@ impl RarArchive {
         let owner = entry.owner.clone();
         let rar4_salt = entry.rar4_salt;
         let mi = self.member_info(index);
-        let is_solid = fh.compression.solid;
+        // Preserve the first member's decoder state for archive-level solid
+        // continuation even though that member cannot reference a predecessor.
+        let is_solid = self.is_solid || fh.compression.solid;
         let archive_format = self.format;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
@@ -5478,7 +5482,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = fh.compression.solid;
+        let is_solid = self.is_solid || fh.compression.solid;
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -6049,7 +6053,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = fh.compression.solid;
+        let is_solid = self.is_solid || fh.compression.solid;
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;

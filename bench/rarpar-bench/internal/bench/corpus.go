@@ -1,0 +1,397 @@
+package bench
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+const benchmarkPassword = "rarpar-benchmark-only-password"
+
+func LoadCorpusConfig(path string) (CorpusConfig, error) {
+	var config CorpusConfig
+	if err := readJSON(path, &config); err != nil {
+		return CorpusConfig{}, err
+	}
+	if err := config.Validate(); err != nil {
+		return CorpusConfig{}, err
+	}
+	return config, nil
+}
+
+func (config CorpusConfig) Validate() error {
+	if config.SchemaVersion != 1 || config.ID == "" || config.Seed == "" || config.PayloadBytes <= 0 || config.VolumeSize == "" {
+		return fmt.Errorf("invalid corpus configuration")
+	}
+	if config.PAR2RedundancyPercent <= 0 || config.PAR2RedundancyPercent > 100 {
+		return fmt.Errorf("PAR2 redundancy must be in 1..100")
+	}
+	seen := map[string]bool{}
+	for _, item := range config.Cases {
+		if item.ID == "" || item.Workload == "" || seen[item.ID] {
+			return fmt.Errorf("corpus contains invalid or duplicate case %q", item.ID)
+		}
+		if item.Family != "rar" && item.Family != "par2" {
+			return fmt.Errorf("case %q has unsupported family %q", item.ID, item.Family)
+		}
+		if item.Format < 3 || item.Format > 5 || item.Writer == "" {
+			return fmt.Errorf("case %q has unsupported RAR writer configuration", item.ID)
+		}
+		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "remove-volume" {
+			return fmt.Errorf("case %q has unsupported mutation %q", item.ID, item.Mutation)
+		}
+		if item.Family == "par2" && !item.PAR2 {
+			return fmt.Errorf("PAR2 case %q must generate parity", item.ID)
+		}
+		if item.Mutation != "none" && !item.PAR2 && !item.RecoveryVolumes {
+			return fmt.Errorf("mutated case %q has no recovery material", item.ID)
+		}
+		seen[item.ID] = true
+	}
+	return nil
+}
+
+func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock ToolchainLock, config CorpusConfig) error {
+	if err := ensureEmptyDir(out); err != nil {
+		return err
+	}
+	configBytes, err := canonicalJSON(config)
+	if err != nil {
+		return err
+	}
+	toolchainBytes, err := canonicalJSON(lock)
+	if err != nil {
+		return err
+	}
+	corpusDigest := bytesSHA256(append(configBytes, toolchainBytes...))
+	for _, caseConfig := range config.Cases {
+		writer, found := lock.Writer(caseConfig.Writer)
+		if !found {
+			return fmt.Errorf("case %q references unavailable writer %q", caseConfig.ID, caseConfig.Writer)
+		}
+		if err := generateCase(ctx, docker, out, config, corpusDigest, lock, writer, caseConfig); err != nil {
+			return err
+		}
+	}
+	return writeJSON(filepath.Join(out, "corpus.json"), map[string]any{
+		"schema_version": CorpusSchemaVersion,
+		"id":             config.ID,
+		"digest":         corpusDigest,
+		"case_count":     len(config.Cases),
+		"harness_root":   filepath.Base(harnessRoot),
+	})
+}
+
+func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusConfig, corpusDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
+	caseRoot := filepath.Join(corpusRoot, item.ID)
+	workRoot, err := os.MkdirTemp("", "rarpar-bench-corpus-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workRoot)
+	payloadRoot := filepath.Join(workRoot, "payload")
+	if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
+		return err
+	}
+	expected, err := writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes)
+	if err != nil {
+		return fmt.Errorf("write payload for %s: %w", item.ID, err)
+	}
+	archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + config.VolumeSize}
+	// The legacy writers naturally emit their own format; RAR 3.93 does not
+	// understand -ma3. RAR 5 is the only case that needs an explicit selector.
+	if item.Format == 5 {
+		archiveArgs = append(archiveArgs, "-ma5")
+	}
+	if item.Store {
+		archiveArgs = append(archiveArgs, "-m0")
+	}
+	if !item.Solid {
+		archiveArgs = append(archiveArgs, "-s-")
+	}
+	if item.Encrypted {
+		archiveArgs = append(archiveArgs, "-hp"+benchmarkPassword)
+	}
+	if item.RecoveryVolumes {
+		archiveArgs = append(archiveArgs, "-rv2")
+	}
+	archiveArgs = append(archiveArgs, "release.rar", "payload")
+	if err := runCommand(ctx, docker, archiveArgs...); err != nil {
+		return fmt.Errorf("build archive for %s: %w", item.ID, err)
+	}
+	if item.PAR2 {
+		par2 := lock.PAR2Generator
+		par2Args := []string{"run", "--rm", "--platform", par2.Platform, "-v", workRoot + ":/work", "-w", "/work", par2.Image,
+			"c", "-q", fmt.Sprintf("-r%d", config.PAR2RedundancyPercent), "-s65536", "release.par2"}
+		archiveFiles, err := archiveFilesIn(workRoot)
+		if err != nil {
+			return err
+		}
+		par2Args = append(par2Args, archiveFiles...)
+		if err := runCommand(ctx, docker, par2Args...); err != nil {
+			return fmt.Errorf("create parity for %s: %w", item.ID, err)
+		}
+	}
+	if err := verifyWithWriter(ctx, docker, writer, workRoot, item.Encrypted, expected); err != nil {
+		return fmt.Errorf("verify generated archive %s: %w", item.ID, err)
+	}
+	if err := os.RemoveAll(payloadRoot); err != nil {
+		return err
+	}
+	sourceRoot := filepath.Join(caseRoot, "source")
+	if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+		return err
+	}
+	files, err := archiveFilesIn(workRoot)
+	if err != nil {
+		return err
+	}
+	for _, name := range files {
+		if err := copyTreeFile(filepath.Join(workRoot, name), filepath.Join(sourceRoot, name)); err != nil {
+			return err
+		}
+	}
+	sources, err := sourceManifest(sourceRoot)
+	if err != nil {
+		return err
+	}
+	manifest := CorpusCaseManifest{
+		SchemaVersion: "rarpar-bench-case-v1",
+		ID:            item.ID,
+		Config:        item,
+		CorpusID:      config.ID,
+		CorpusDigest:  corpusDigest,
+		Seed:          config.Seed,
+		Toolchains:    ToolchainIDs(lock, item),
+		Expected:      expected,
+		Sources:       sources,
+	}
+	return writeJSON(filepath.Join(caseRoot, "manifest.json"), manifest)
+}
+
+func writeDeterministicPayload(root, seed, caseID string, total int64) ([]ExpectedFile, error) {
+	parts := []int64{total * 3 / 4, total / 8, total - (total*3/4 + total/8)}
+	var expected []ExpectedFile
+	for index, bytes := range parts {
+		relative := filepath.Join("payload", fmt.Sprintf("part-%02d.bin", index+1))
+		path := filepath.Join(filepath.Dir(root), relative)
+		digest, err := writePayloadFile(path, seed, caseID, relative, bytes)
+		if err != nil {
+			return nil, err
+		}
+		expected = append(expected, ExpectedFile{Path: filepath.ToSlash(relative), Bytes: bytes, SHA256: digest})
+	}
+	return expected, nil
+}
+
+func writePayloadFile(path, seed, caseID, fileID string, bytes int64) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	block := uint64(0)
+	remaining := bytes
+	buffer := make([]byte, 32*1024)
+	for remaining > 0 {
+		for offset := 0; offset < len(buffer); offset += sha256.Size {
+			input := []byte(seed + "\x00" + caseID + "\x00" + fileID)
+			var counter [16]byte
+			binary.LittleEndian.PutUint64(counter[:8], block)
+			binary.LittleEndian.PutUint64(counter[8:], uint64(offset/sha256.Size))
+			input = append(input, counter[:]...)
+			digest := sha256.Sum256(input)
+			copy(buffer[offset:], digest[:])
+		}
+		count := int64(len(buffer))
+		if count > remaining {
+			count = remaining
+		}
+		if _, err := file.Write(buffer[:count]); err != nil {
+			return "", err
+		}
+		if _, err := hash.Write(buffer[:count]); err != nil {
+			return "", err
+		}
+		remaining -= count
+		block++
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func verifyWithWriter(ctx context.Context, docker string, writer RARWriter, root string, encrypted bool, expected []ExpectedFile) error {
+	verifyRoot := filepath.Join(root, "verify")
+	archive, err := firstRARVolume(root)
+	if err != nil {
+		return err
+	}
+	args := []string{"run", "--rm", "--platform", writer.Platform, "-v", root + ":/work", "-w", "/work", writer.Image, "x", "-idq", "-y"}
+	if encrypted {
+		args = append(args, "-p"+benchmarkPassword)
+	}
+	args = append(args, archive, "verify/")
+	if err := runCommand(ctx, docker, args...); err != nil {
+		return err
+	}
+	return validateExpected(verifyRoot, expected)
+}
+
+func archiveFilesIn(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name())
+		if entry.Type().IsRegular() && (strings.HasSuffix(name, ".rar") || strings.HasSuffix(name, ".rev") || strings.HasSuffix(name, ".par2") || regexp.MustCompile(`\.r\d\d$`).MatchString(name)) {
+			files = append(files, entry.Name())
+		}
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no archive files generated in %s", root)
+	}
+	return files, nil
+}
+
+func firstRARVolume(root string) (string, error) {
+	files, err := archiveFilesIn(root)
+	if err != nil {
+		return "", err
+	}
+	for _, name := range files {
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, ".part1.") || strings.Contains(lower, ".part01.") {
+			return name, nil
+		}
+	}
+	for _, name := range files {
+		if strings.HasSuffix(strings.ToLower(name), ".rar") {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no first RAR volume generated in %s", root)
+}
+
+func sourceManifest(root string) ([]SourceFile, error) {
+	files, err := sortedFiles(root)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SourceFile, 0, len(files))
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		digest, err := fileSHA256(path)
+		if err != nil {
+			return nil, err
+		}
+		relative, _ := filepath.Rel(root, path)
+		result = append(result, SourceFile{Path: filepath.ToSlash(relative), Bytes: info.Size(), SHA256: digest})
+	}
+	return result, nil
+}
+
+func VerifyCorpus(root string) error {
+	indexPath := filepath.Join(root, "corpus.json")
+	var index struct {
+		Digest string `json:"digest"`
+	}
+	if err := readJSON(indexPath, &index); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		manifestPath := filepath.Join(root, entry.Name(), "manifest.json")
+		var manifest CorpusCaseManifest
+		if err := readJSON(manifestPath, &manifest); err != nil {
+			return err
+		}
+		if manifest.CorpusDigest != index.Digest {
+			return fmt.Errorf("case %q belongs to a different corpus", manifest.ID)
+		}
+		for _, source := range manifest.Sources {
+			relative, err := cleanRelative(source.Path)
+			if err != nil {
+				return err
+			}
+			path := filepath.Join(root, entry.Name(), "source", relative)
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Size() != source.Bytes {
+				return fmt.Errorf("source verification failed for %s", path)
+			}
+			digest, err := fileSHA256(path)
+			if err != nil || digest != source.SHA256 {
+				return fmt.Errorf("source checksum verification failed for %s", path)
+			}
+		}
+		count++
+	}
+	if count == 0 {
+		return fmt.Errorf("corpus contains no cases")
+	}
+	return nil
+}
+
+func validateExpected(root string, expected []ExpectedFile) error {
+	for _, file := range expected {
+		relative, err := cleanRelative(file.Path)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(root, relative)
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != file.Bytes {
+			return fmt.Errorf("expected output missing or wrong size: %s", file.Path)
+		}
+		digest, err := fileSHA256(path)
+		if err != nil || digest != file.SHA256 {
+			return fmt.Errorf("expected output checksum mismatch: %s", file.Path)
+		}
+	}
+	return nil
+}
+
+func copyTreeFile(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func canonicalJSON(value any) ([]byte, error) {
+	return json.Marshal(value)
+}

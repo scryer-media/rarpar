@@ -176,6 +176,33 @@ fn bench_rar4_solid_extract_all_members(c: &mut Criterion) {
     );
 }
 
+fn bench_rar4_ppmd_restart(c: &mut Criterion) {
+    bench_solid_extract_all_members(
+        c,
+        "rar4",
+        "rar4_ppm_solid_restart.rar",
+        "rar4_ppmd_restart_extract_all_members",
+    );
+}
+
+fn bench_rar4_ppmd_solid_multi_member(c: &mut Criterion) {
+    bench_solid_extract_all_members(
+        c,
+        "rar4",
+        "rar4_ppm_solid_mv.rar",
+        "rar4_ppmd_solid_multi_member_extract_all_members",
+    );
+}
+
+fn bench_rar4_ppmd_order16_32m(c: &mut Criterion) {
+    bench_solid_extract_all_members(
+        c,
+        "rar4",
+        "rar4_ppm_order16_32m.rar",
+        "rar4_ppmd_order16_32m_extract_all_members",
+    );
+}
+
 fn bench_rar5_solid_extract_all_members(c: &mut Criterion) {
     bench_solid_extract_all_members(
         c,
@@ -253,6 +280,9 @@ criterion_group!(
     bench_rar5_encrypted_store_chunked_multivolume,
     bench_rar5_reopen_kdf_multivolume,
     bench_rar4_solid_extract_all_members,
+    bench_rar4_ppmd_restart,
+    bench_rar4_ppmd_solid_multi_member,
+    bench_rar4_ppmd_order16_32m,
     bench_rar5_solid_extract_all_members,
     bench_rar4_solid_reopen_later_member,
     bench_rar5_solid_reopen_later_member,

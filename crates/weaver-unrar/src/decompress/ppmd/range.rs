@@ -19,6 +19,9 @@ pub trait RangeCode {
     fn normalize(&mut self);
     fn get_current_count(&mut self, scale: u32) -> u32;
     fn get_threshold(&mut self, scale: u32) -> u32;
+    fn get_binary_threshold(&mut self) -> u32 {
+        self.get_threshold(1 << 14)
+    }
     fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32);
     fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool;
     fn position(&self) -> usize;
@@ -38,7 +41,7 @@ pub struct BitReadRangeDecoder<'a, R: BitRead> {
     low: u32,
     code: u32,
     range: u32,
-    pos: usize,
+    start_bit_position: usize,
 }
 
 /// Snapshot of the range coder registers.
@@ -77,6 +80,7 @@ impl<'a> RangeDecoder<'a> {
     }
 
     /// Read one byte from the input stream.
+    #[inline(always)]
     fn read_byte(&mut self) -> u8 {
         if self.pos < self.input.len() {
             let b = self.input[self.pos];
@@ -88,7 +92,7 @@ impl<'a> RangeDecoder<'a> {
     }
 
     /// Normalize the range decoder state using carryless TOP/BOT logic.
-    #[inline]
+    #[inline(always)]
     fn normalize(&mut self) {
         while {
             let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
@@ -130,6 +134,13 @@ impl<'a> RangeDecoder<'a> {
         self.get_current_count(scale)
     }
 
+    /// UnRAR's `GetCurrentShiftCount(TOT_BITS)` binary fast path.
+    #[inline(always)]
+    pub fn get_binary_threshold(&mut self) -> u32 {
+        self.range >>= 14;
+        (self.code.wrapping_sub(self.low)) / self.range
+    }
+
     /// Decode a symbol given cumulative frequency bounds.
     ///
     /// After determining which symbol the current code falls into (using
@@ -165,10 +176,11 @@ impl<'a> RangeDecoder<'a> {
 
 impl<R: BitRead> BitReadRangeDecoder<'_, R> {
     pub fn new(reader: &mut R) -> RarResult<BitReadRangeDecoder<'_, R>> {
-        let b0 = reader.read_bits(8)? as u8;
-        let b1 = reader.read_bits(8)? as u8;
-        let b2 = reader.read_bits(8)? as u8;
-        let b3 = reader.read_bits(8)? as u8;
+        let start_bit_position = reader.position();
+        let b0 = reader.read_byte()?;
+        let b1 = reader.read_byte()?;
+        let b2 = reader.read_byte()?;
+        let b3 = reader.read_byte()?;
         let code = u32::from_be_bytes([b0, b1, b2, b3]);
 
         Ok(BitReadRangeDecoder {
@@ -176,18 +188,19 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
             low: 0,
             code,
             range: u32::MAX,
-            pos: 4,
+            start_bit_position,
         })
     }
 
     /// Resume a coder from saved registers without consuming init bytes.
     pub fn from_state(reader: &mut R, state: RangeCoderState) -> BitReadRangeDecoder<'_, R> {
+        let start_bit_position = reader.position();
         BitReadRangeDecoder {
             reader,
             low: state.low,
             code: state.code,
             range: state.range,
-            pos: 0,
+            start_bit_position,
         }
     }
 
@@ -200,17 +213,12 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
         }
     }
 
+    #[inline(always)]
     fn read_byte(&mut self) -> u8 {
-        match self.reader.read_bits(8) {
-            Ok(byte) => {
-                self.pos += 1;
-                byte as u8
-            }
-            Err(_) => 0,
-        }
+        self.reader.read_byte().unwrap_or(0)
     }
 
-    #[inline]
+    #[inline(always)]
     fn normalize(&mut self) {
         while {
             let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
@@ -243,6 +251,10 @@ impl RangeCode for RangeDecoder<'_> {
         RangeDecoder::get_threshold(self, scale)
     }
 
+    fn get_binary_threshold(&mut self) -> u32 {
+        RangeDecoder::get_binary_threshold(self)
+    }
+
     fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
         RangeDecoder::decode(self, cum_freq, freq, scale)
     }
@@ -257,10 +269,12 @@ impl RangeCode for RangeDecoder<'_> {
 }
 
 impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
+    #[inline(always)]
     fn normalize(&mut self) {
         BitReadRangeDecoder::normalize(self)
     }
 
+    #[inline(always)]
     fn get_current_count(&mut self, scale: u32) -> u32 {
         if scale == 0 {
             return 0;
@@ -272,15 +286,24 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
         (self.code.wrapping_sub(self.low)) / self.range
     }
 
+    #[inline(always)]
     fn get_threshold(&mut self, scale: u32) -> u32 {
         self.get_current_count(scale)
     }
 
+    #[inline(always)]
+    fn get_binary_threshold(&mut self) -> u32 {
+        self.range >>= 14;
+        (self.code.wrapping_sub(self.low)) / self.range
+    }
+
+    #[inline(always)]
     fn decode(&mut self, cum_freq: u32, freq: u32, _scale: u32) {
         self.low = self.low.wrapping_add(cum_freq.wrapping_mul(self.range));
         self.range = freq.wrapping_mul(self.range);
     }
 
+    #[inline(always)]
     fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool {
         let threshold = self.get_threshold(scale);
         if threshold < freq0 {
@@ -292,8 +315,12 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
         }
     }
 
+    #[inline(always)]
     fn position(&self) -> usize {
-        self.pos
+        self.reader
+            .position()
+            .saturating_sub(self.start_bit_position)
+            / 8
     }
 }
 

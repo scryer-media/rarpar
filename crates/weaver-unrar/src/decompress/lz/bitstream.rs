@@ -24,6 +24,14 @@ pub trait BitRead {
         self.position() / 8
     }
     fn read_bits(&mut self, count: u8) -> RarResult<u32>;
+    /// Read the next eight bits without requiring byte alignment.
+    ///
+    /// Implementations can override this to amortize accumulator refills for
+    /// byte-oriented consumers such as the RAR4 PPMd range decoder.
+    #[inline(always)]
+    fn read_byte(&mut self) -> RarResult<u8> {
+        Ok(self.read_bits(8)? as u8)
+    }
     #[inline(always)]
     fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
         debug_assert!(count <= 64);
@@ -379,10 +387,27 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Read a full byte (8 bits) as u8. Must be byte-aligned or it reads
-    /// across the boundary.
+    /// Read the next eight bits, crossing a byte boundary when unaligned.
+    /// Unlike generic `read_bits`, this leaves the accumulator lazily
+    /// depleted so consecutive byte reads share one bulk refill.
+    #[inline(always)]
     pub fn read_byte(&mut self) -> RarResult<u8> {
-        Ok(self.read_bits(8)? as u8)
+        if self.acc_bits < 8 {
+            self.refill();
+            if self.acc_bits < 8 {
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "bitstream: need 8 bits but only {} remaining",
+                        self.bits_remaining()
+                    ),
+                });
+            }
+        }
+
+        let byte = (self.acc >> 56) as u8;
+        self.acc <<= 8;
+        self.acc_bits -= 8;
+        Ok(byte)
     }
 
     /// Read a 32-bit little-endian value from the bitstream.
@@ -437,6 +462,11 @@ impl BitRead for BitReader<'_> {
 
     fn read_bits(&mut self, count: u8) -> RarResult<u32> {
         BitReader::read_bits(self, count)
+    }
+
+    #[inline(always)]
+    fn read_byte(&mut self) -> RarResult<u8> {
+        BitReader::read_byte(self)
     }
 
     fn peek_16_raw(&mut self) -> RarResult<u32> {
@@ -687,6 +717,26 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         }
 
         self.read_bits_refill(count)
+    }
+
+    #[inline(always)]
+    fn read_byte(&mut self) -> RarResult<u8> {
+        if self.acc_bits < 8 {
+            self.refill()?;
+            if self.acc_bits < 8 {
+                let available =
+                    self.acc_bits as usize + (self.buf_len.saturating_sub(self.buf_pos)) * 8;
+                return Err(RarError::CorruptArchive {
+                    detail: format!("bitstream: need 8 bits but only {available} remaining"),
+                });
+            }
+        }
+
+        let byte = (self.acc >> 56) as u8;
+        self.acc <<= 8;
+        self.acc_bits -= 8;
+        self.bit_pos += 8;
+        Ok(byte)
     }
 
     #[inline(always)]
@@ -975,6 +1025,66 @@ mod tests {
         let byte = reader.read_byte().unwrap();
         // Next 8 bits: 00110_101 = 0b00110101 = 0x35
         assert_eq!(byte, 0b00110101);
+    }
+
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        position: usize,
+        chunk_size: usize,
+    }
+
+    impl std::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = &self.data[self.position..];
+            let count = remaining.len().min(output.len()).min(self.chunk_size);
+            output[..count].copy_from_slice(&remaining[..count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn read_byte_matches_read_bits_at_every_alignment() {
+        let data = [0xd3, 0x6a, 0xf0, 0x19, 0x87, 0x55, 0xaa, 0x0f, 0xc3];
+        for alignment in 0..8u32 {
+            let mut expected = BitReader::new(&data);
+            let mut actual = BitReader::new(&data);
+            expected.skip_bits(alignment).unwrap();
+            actual.skip_bits(alignment).unwrap();
+
+            while expected.bits_remaining() >= 8 {
+                assert_eq!(
+                    actual.read_byte().unwrap(),
+                    expected.read_bits(8).unwrap() as u8
+                );
+                assert_eq!(actual.position(), expected.position());
+            }
+            assert!(actual.read_byte().is_err());
+        }
+    }
+
+    #[test]
+    fn streaming_read_byte_matches_slice_reader_with_short_chunks() {
+        let data = [0xd3, 0x6a, 0xf0, 0x19, 0x87, 0x55, 0xaa, 0x0f, 0xc3];
+        for alignment in 0..8u32 {
+            let mut expected = BitReader::new(&data);
+            expected.skip_bits(alignment).unwrap();
+            let mut actual = StreamingBitReader::new(ChunkedReader {
+                data: &data,
+                position: 0,
+                chunk_size: 2,
+            });
+            actual.skip_bits(alignment).unwrap();
+
+            while expected.bits_remaining() >= 8 {
+                assert_eq!(
+                    actual.read_byte().unwrap(),
+                    expected.read_bits(8).unwrap() as u8
+                );
+                assert_eq!(actual.position(), expected.position());
+            }
+            assert!(actual.read_byte().is_err());
+        }
     }
 
     #[test]

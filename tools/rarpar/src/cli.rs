@@ -26,7 +26,7 @@ Examples:
 rarpar is not an official RAR, UnRAR, or PAR2 utility and does not create or
 modify RAR archives.";
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(
     name = "rarpar",
     version,

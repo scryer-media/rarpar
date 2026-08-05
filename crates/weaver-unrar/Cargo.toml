@@ -44,6 +44,10 @@ host-abi-extism = []
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]
 slow-tests = []
+# Compile the forensic per-symbol PPMd trace hooks. The hooks remain runtime
+# controlled by WEAVER_RAR4_DEBUG_PPM, but ordinary builds carry no trace
+# state, branches, counters, or formatting code.
+ppmd-debug = []
 
 [dependencies]
 reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
@@ -101,7 +105,12 @@ wasmtime = "46"
 wasmtime-wasi = "46"
 aes = { workspace = true }
 cbc = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "archive_hotspots"
+harness = false
+
+[[bench]]
+name = "ppmd_compare"
 harness = false

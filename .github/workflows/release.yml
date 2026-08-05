@@ -221,71 +221,49 @@ jobs:
             runs_on: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: true
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
-            package_root: false
-          - platform: linux-x86_64-docker
-            runs_on: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: true
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
-            package_root: false
-          - platform: linux-arm64-docker
-            runs_on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-            features: runtime,metal
-            gpu: metal
+            features: runtime
             package_root: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             archive_ext: zip
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: false
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
             archive_ext: zip
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: false
     steps:
       - uses: actions/checkout@v7
@@ -478,7 +456,7 @@ jobs:
         run: >-
           cargo run --locked -p xtask -- feature-audit
           --manifest "$RARPAR_RELEASE_SOURCE/Cargo.toml" --target ${{ matrix.target }}
-          --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+          --features ${{ matrix.features }}
       - name: Audit release target features (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -486,7 +464,7 @@ jobs:
           $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
           cargo run --locked -p xtask -- feature-audit `
             --manifest $manifest --target ${{ matrix.target }} `
-            --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+            --features ${{ matrix.features }}
       - name: Build rarpar (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -626,10 +604,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - name: Download Docker artifacts
+      - name: Download portable Linux artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: rarpar-release-linux-*-docker
+          pattern: rarpar-release-linux-*-musl-direct
           path: container-artifacts
           merge-multiple: true
       - name: Stage container context
@@ -638,8 +616,8 @@ jobs:
           set -euo pipefail
           rm -rf container-context
           mkdir -p container-context/amd64 container-context/arm64
-          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-x86_64-docker.tar.gz" -C container-context/amd64
-          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-arm64-docker.tar.gz" -C container-context/arm64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-x86_64-musl-direct.tar.gz" -C container-context/amd64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-arm64-musl-direct.tar.gz" -C container-context/arm64
           test -x container-context/amd64/rarpar
           test -x container-context/arm64/rarpar
           if find container-context -path '*/tests/fixtures/*' -print -quit | grep -q .; then
@@ -727,8 +705,8 @@ jobs:
                 cp "$file" "release-assets/$(basename "$file")"
               done
           asset_count="$(find release-assets -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) | wc -l | tr -d ' ')"
-          if [ "$asset_count" != 10 ]; then
-            echo "::error::expected 10 release archives, found $asset_count"
+          if [ "$asset_count" != 8 ]; then
+            echo "::error::expected 8 release archives, found $asset_count"
             find dist -maxdepth 4 -type f | sort
             exit 1
           fi

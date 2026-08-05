@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "rarpar-v1",
+  "seed": "rarpar-benchmark-v1",
+  "payload_bytes": 8388608,
+  "volume_size": "1m",
+  "par2_redundancy_percent": 20,
+  "cases": [
+    { "id": "rar3-multivolume-store", "family": "rar", "writer": "rarlab-3.93", "format": 3, "store": true, "solid": false, "encrypted": false, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR3 multi-volume store extraction" },
+    { "id": "rar4-normal", "family": "rar", "writer": "rarlab-4.20", "format": 4, "store": false, "solid": false, "encrypted": false, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR4 normal extraction" },
+    { "id": "rar4-solid", "family": "rar", "writer": "rarlab-4.20", "format": 4, "store": false, "solid": true, "encrypted": false, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR4 solid extraction" },
+    { "id": "rar5-normal", "family": "rar", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": false, "encrypted": false, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR5 normal extraction" },
+    { "id": "rar5-solid", "family": "rar", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": false, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR5 solid extraction" },
+    { "id": "rar5-encrypted", "family": "rar", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": true, "par2": false, "recovery_volumes": false, "mutation": "none", "workload": "RAR5 encrypted extraction" },
+    { "id": "par2-verify", "family": "par2", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": false, "par2": true, "recovery_volumes": false, "mutation": "none", "workload": "PAR2 verification" },
+    { "id": "par2-byte-damage", "family": "par2", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": false, "par2": true, "recovery_volumes": false, "mutation": "damage", "workload": "PAR2 byte-damage repair and extraction" },
+    { "id": "par2-missing-volume", "family": "par2", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": false, "par2": true, "recovery_volumes": false, "mutation": "remove-volume", "workload": "PAR2 missing-volume repair and extraction" },
+    { "id": "rar5-recovery-volume", "family": "rar", "writer": "rarlab-5.00", "format": 5, "store": false, "solid": true, "encrypted": false, "par2": false, "recovery_volumes": true, "mutation": "remove-volume", "workload": "RAR recovery-volume restore and extraction" }
+  ]
+}

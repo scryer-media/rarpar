@@ -90,7 +90,7 @@ jobs:
               crates/*|.github/workflows/publish-crates.yml|.gitattributes|.gitleaks.toml|.githooks/*)
                 crates_direct=true
                 ;;
-              tools/rarpar/*|xtask/*|.github/workflows/release.yml|README.md|docs/*)
+              tools/rarpar/*|xtask/*|bench/rarpar-bench/*|.github/workflows/release.yml|README.md|docs/*)
                 rarpar_direct=true
                 ;;
               .github/workflows/ci.yml)
@@ -659,53 +659,35 @@ jobs:
           - platform: linux-x86_64-gnu-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            features: runtime,wgpu
-            gpu: wgpu
-          - platform: linux-x86_64-docker
-            runs_on: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
             features: runtime
-            gpu: none
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            features: runtime,wgpu
-            gpu: wgpu
-          - platform: linux-arm64-docker
-            runs_on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
             features: runtime
-            gpu: none
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
-            features: runtime,metal
-            gpu: metal
+            features: runtime
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             features: runtime
-            gpu: none
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -803,7 +785,7 @@ jobs:
         run: >-
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
-          --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+          --features ${{ matrix.features }}
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
@@ -1102,6 +1084,26 @@ jobs:
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  benchmark-harness:
+    name: benchmark-harness
+    needs: [changes]
+    if: needs.changes.outputs.rarpar == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+      - name: Validate benchmark harness
+        working-directory: bench/rarpar-bench
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l cmd internal)"
+          go test ./...
+          go run ./cmd/rarpar-bench toolchains validate
 
   cli-smoke:
     name: cli-smoke
