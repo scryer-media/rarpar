@@ -1028,22 +1028,22 @@ mod tests {
             CargoPackage {
                 id: "rarpar".to_owned(),
                 name: "rarpar".to_owned(),
-                version: "0.2.5".to_owned(),
+                version: "0.3.0".to_owned(),
             },
             CargoPackage {
                 id: "par2-rs".to_owned(),
                 name: "par2-rs".to_owned(),
-                version: "0.2.3".to_owned(),
+                version: "0.3.0".to_owned(),
             },
             CargoPackage {
                 id: "unrar-rs".to_owned(),
                 name: "unrar-rs".to_owned(),
-                version: "0.3.1".to_owned(),
+                version: "0.4.0".to_owned(),
             },
             CargoPackage {
                 id: "reedsolomon-rs".to_owned(),
                 name: "reedsolomon-rs".to_owned(),
-                version: "0.2.3".to_owned(),
+                version: "0.3.0".to_owned(),
             },
         ];
         let mut nodes = vec![

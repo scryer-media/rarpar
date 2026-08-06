@@ -304,8 +304,11 @@ fn restore_rar5(
         .collect::<Vec<_>>();
 
     if missing_volume_numbers.is_empty() {
-        return Err(RarError::CorruptArchive {
-            detail: "all RAR5 data volumes are already present and valid".into(),
+        return Ok(RecoveryReport {
+            format: ArchiveFormat::Rar5,
+            restored_paths: Vec::new(),
+            used_recovery_paths: Vec::new(),
+            missing_volume_numbers,
         });
     }
 
@@ -786,8 +789,11 @@ fn restore_rar3(
         .filter(|&idx| slots[idx].is_none())
         .collect::<Vec<_>>();
     if missing_volume_numbers.is_empty() {
-        return Err(RarError::CorruptArchive {
-            detail: "all RAR3 data volumes are already present".into(),
+        return Ok(RecoveryReport {
+            format: ArchiveFormat::Rar4,
+            restored_paths: Vec::new(),
+            used_recovery_paths: Vec::new(),
+            missing_volume_numbers,
         });
     }
 

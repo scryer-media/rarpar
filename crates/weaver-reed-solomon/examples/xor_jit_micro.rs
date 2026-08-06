@@ -4,7 +4,7 @@
 //! the multiply is timed. Decides whether the XOR-JIT streaming wiring pays off
 //! on pre-GFNI x86 before it is built.
 //!
-//! Run on SYLIX: `cargo run --release --example xor_jit_micro`.
+//! Run with `cargo run --release --example xor_jit_micro`.
 
 #[cfg(target_arch = "x86_64")]
 fn main() {

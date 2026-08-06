@@ -8,7 +8,7 @@ RAR archive reading and extraction in pure Rust. No C bindings, no external
 
 ```toml
 [dependencies]
-unrar-rs = "0.3"
+unrar-rs = "0.4"
 ```
 
 This crate reads existing archives. It exposes no writer, builder, or
@@ -72,6 +72,22 @@ than adding it.
 
 ## Performance
 
+### rarpar 0.3.0 release validation
+
+These deterministic end-to-end runs use the synthetic `rarpar-bench` corpus,
+one warmup, seven measured runs, CPU-only release builds, and SHA-256 output
+validation. They include CLI discovery and output handling as well as archive
+extraction, so they are release-workflow measurements rather than isolated
+decoder microbenchmarks.
+
+![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-rar-benchmark-windows-x86_64.svg)
+
+![RAR workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-rar-benchmark-linux-x86_64.svg)
+
+![RAR workloads on Apple M5 Max with macOS arm64](docs/rarpar-rar-benchmark-macos-arm64.svg)
+
+### Broader library workloads
+
 Measured against `unrar 7.20` on archives built natively with `rar 7.20` (and
 `rar 6.24` for RAR4). Extraction includes full verification, and every output is
 byte-compared against the source payload. Warm-cache medians from release builds
@@ -116,6 +132,8 @@ cross-volume layout assembly that the reference implementation does not provide.
 
 The RAR format is documented in RARLAB's
 [technical note](https://www.rarlab.com/technote.htm).
+
+Versioned API and behavior notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

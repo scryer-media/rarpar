@@ -6153,6 +6153,41 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     );
 }
 
+#[test]
+fn test_recovery_restore_is_idempotent_for_complete_sets() {
+    let rar5_names = (1..=10)
+        .map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        .chain([
+            "rar5_recovery_volumes.part01.rev".to_string(),
+            "rar5_recovery_volumes.part02.rev".to_string(),
+        ])
+        .collect::<Vec<_>>();
+    let rar3_names = (1..=5)
+        .map(|volume| format!("rar3_recovery_volumes.part{volume}.rar"))
+        .chain([
+            "rar3_recovery_volumes.part1.rev".to_string(),
+            "rar3_recovery_volumes.part2.rev".to_string(),
+        ])
+        .collect::<Vec<_>>();
+
+    for (directory, names, format) in [
+        ("rar5", rar5_names, unrar_rs::ArchiveFormat::Rar5),
+        ("rar4", rar3_names, unrar_rs::ArchiveFormat::Rar4),
+    ] {
+        let paths = names
+            .iter()
+            .map(|name| fixture(directory, name))
+            .collect::<Vec<_>>();
+        let report =
+            unrar_rs::restore_volumes_from_paths(&paths, &unrar_rs::RecoveryOptions::default())
+                .unwrap();
+        assert_eq!(report.format, format);
+        assert!(report.missing_volume_numbers.is_empty());
+        assert!(report.restored_paths.is_empty());
+        assert!(report.used_recovery_paths.is_empty());
+    }
+}
+
 // -- Comment archives ---------------------------------------------------------
 
 #[test]

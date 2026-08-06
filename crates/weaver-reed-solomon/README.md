@@ -8,7 +8,7 @@ arithmetic underneath PAR2 repair and RAR5 recovery records.
 
 ```toml
 [dependencies]
-reedsolomon-rs = "0.2"
+reedsolomon-rs = "0.3"
 ```
 
 This is a kernel crate, not a codec. It provides field operations and
@@ -64,6 +64,8 @@ The GF(2¹⁶) approach and much of the kernel design are heavily informed by
 Tosho, and by their ancestor
 [par2cmdline](https://github.com/Parchive/par2cmdline). par2cmdline-turbo is
 GPL-2.0-or-later.
+
+Versioned API and migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

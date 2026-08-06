@@ -739,6 +739,137 @@ fn compat_unrar_extract_emits_downloader_contract() {
 }
 
 #[test]
+fn compat_unrar_extract_accepts_relative_archive_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let download_dir = temp.path().join("download");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    for volume in 1..=5 {
+        let name = format!("rar4_tiny_volumes.part{volume}.rar");
+        std::fs::copy(fixture_dir.join(&name), download_dir.join(name)).unwrap();
+    }
+    let out_dir = temp.path().join("out");
+
+    let output = run_in_dir(
+        &download_dir,
+        &[
+            OsStr::new("x"),
+            OsStr::new("-o+"),
+            OsStr::new("rar4_tiny_volumes.part1.rar"),
+            out_dir.as_os_str(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "relative compat extract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("random_4k.bin").is_file());
+}
+
+#[test]
+fn compat_unrar_extract_accepts_bare_relative_wildcard() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let download_dir = temp.path().join("download");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    for volume in 1..=5 {
+        let name = format!("rar4_tiny_volumes.part{volume}.rar");
+        std::fs::copy(fixture_dir.join(&name), download_dir.join(name)).unwrap();
+    }
+    let out_dir = temp.path().join("out");
+
+    let output = run_in_dir(
+        &download_dir,
+        &[
+            OsStr::new("x"),
+            OsStr::new("-o+"),
+            OsStr::new("*.rar"),
+            out_dir.as_os_str(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wildcard compat extract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("random_4k.bin").is_file());
+}
+
+#[test]
+fn compat_unrar_extracts_header_encrypted_multivolume_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let download_dir = temp.path().join("download");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    for volume in 1..=5 {
+        let name = format!("rar5_enc_mv_store.part{volume}.rar");
+        std::fs::copy(fixture_dir.join(&name), download_dir.join(name)).unwrap();
+    }
+    let archive = download_dir.join("rar5_enc_mv_store.part1.rar");
+    let out_dir = temp.path().join("out");
+
+    let output = run(&[
+        OsStr::new("x"),
+        OsStr::new("-o+"),
+        OsStr::new("-ptestpass123"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "encrypted multivolume extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("binary.bin").is_file());
+}
+
+#[test]
+fn compat_unrar_extract_restores_missing_recovery_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let download_dir = temp.path().join("download");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    let present = [
+        "rar5_recovery_volumes.part01.rar",
+        "rar5_recovery_volumes.part02.rar",
+        "rar5_recovery_volumes.part03.rar",
+        "rar5_recovery_volumes.part04.rar",
+        "rar5_recovery_volumes.part06.rar",
+        "rar5_recovery_volumes.part07.rar",
+        "rar5_recovery_volumes.part08.rar",
+        "rar5_recovery_volumes.part09.rar",
+        "rar5_recovery_volumes.part10.rar",
+        "rar5_recovery_volumes.part01.rev",
+        "rar5_recovery_volumes.part02.rev",
+    ];
+    for name in present {
+        std::fs::copy(fixture_dir.join(name), download_dir.join(name)).unwrap();
+    }
+    let archive = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let restored = download_dir.join("rar5_recovery_volumes.part05.rar");
+    let out_dir = temp.path().join("out");
+
+    let output = run(&[
+        OsStr::new("x"),
+        OsStr::new("-o+"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "recovery-volume extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(restored.is_file());
+    assert!(out_dir.join("payload.bin").is_file());
+}
+
+#[test]
 fn compat_unrar_lb_lists_bare_member_names() {
     let archive = fixture(&[
         "crates",

@@ -58,8 +58,21 @@ func (config CorpusConfig) Validate() error {
 		if item.PPMd && profile != "text" {
 			return fmt.Errorf("PPMd case %q must use the text payload profile", item.ID)
 		}
-		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "remove-volume" {
+		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "heavy-damage" && item.Mutation != "remove-volume" {
 			return fmt.Errorf("case %q has unsupported mutation %q", item.ID, item.Mutation)
+		}
+		if item.Mutation == "heavy-damage" && (item.DamageCount < 1 || item.DamageBytesPerSite < 1 || item.PAR2SliceSize < 1) {
+			return fmt.Errorf("heavy-damage case %q requires damage count, bytes per site, and PAR2 slice size", item.ID)
+		}
+		if item.Mutation != "heavy-damage" && (item.DamageCount != 0 || item.DamageBytesPerSite != 0 || item.PAR2SliceSize != 0) {
+			return fmt.Errorf("case %q has heavy-damage settings without the heavy-damage mutation", item.ID)
+		}
+		if item.FixtureDir != "" {
+			if item.FixturePrefix == "" || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(item.FixtureSHA256) {
+				return fmt.Errorf("fixture case %q requires a prefix and pinned SHA-256", item.ID)
+			}
+		} else if item.FixturePrefix != "" || item.FixtureSHA256 != "" {
+			return fmt.Errorf("case %q has incomplete fixture provenance", item.ID)
 		}
 		if item.Family == "par2" && !item.PAR2 {
 			return fmt.Errorf("PAR2 case %q must generate parity", item.ID)
@@ -90,7 +103,7 @@ func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock T
 		if !found {
 			return fmt.Errorf("case %q references unavailable writer %q", caseConfig.ID, caseConfig.Writer)
 		}
-		if err := generateCase(ctx, docker, out, config, corpusDigest, lock, writer, caseConfig); err != nil {
+		if err := generateCase(ctx, docker, harnessRoot, out, config, corpusDigest, lock, writer, caseConfig); err != nil {
 			return err
 		}
 	}
@@ -103,53 +116,64 @@ func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock T
 	})
 }
 
-func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusConfig, corpusDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
+func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, config CorpusConfig, corpusDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
 	caseRoot := filepath.Join(corpusRoot, item.ID)
 	workRoot, err := os.MkdirTemp("", "rarpar-bench-corpus-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(workRoot)
-	payloadRoot := filepath.Join(workRoot, "payload")
-	if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
-		return err
+	var expected []ExpectedFile
+	if item.FixtureDir != "" {
+		if err := importFixture(workRoot, harnessRoot, item); err != nil {
+			return err
+		}
+		expected, err = expectedFromWriter(ctx, docker, writer, workRoot, item.Encrypted)
+		if err != nil {
+			return fmt.Errorf("extract expected output for fixture %s: %w", item.ID, err)
+		}
+	} else {
+		payloadRoot := filepath.Join(workRoot, "payload")
+		if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
+			return err
+		}
+		expected, err = writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes, item.PayloadProfile)
+		if err != nil {
+			return fmt.Errorf("write payload for %s: %w", item.ID, err)
+		}
+		volumeSize := config.VolumeSize
+		if item.VolumeSize != "" {
+			volumeSize = item.VolumeSize
+		}
+		archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + volumeSize}
+		// The legacy writers naturally emit their own format; RAR 3.93 does not
+		// understand -ma3. RAR 5 is the only case that needs an explicit selector.
+		if item.Format == 5 {
+			archiveArgs = append(archiveArgs, "-ma5")
+		}
+		if item.Store {
+			archiveArgs = append(archiveArgs, "-m0")
+		}
+		if item.PPMd {
+			// RAR4's text module is its PPMd decoder path. Force it and pin its
+			// order and memory so this corpus case has stable codec provenance.
+			archiveArgs = append(archiveArgs, "-mc10:32t+")
+		}
+		if !item.Solid {
+			archiveArgs = append(archiveArgs, "-s-")
+		}
+		if item.Encrypted {
+			archiveArgs = append(archiveArgs, "-hp"+benchmarkPassword)
+		}
+		if item.RecoveryVolumes {
+			archiveArgs = append(archiveArgs, "-rv2")
+		}
+		archiveArgs = append(archiveArgs, "release.rar", "payload")
+		if err := runCommand(ctx, docker, archiveArgs...); err != nil {
+			return fmt.Errorf("build archive for %s: %w", item.ID, err)
+		}
 	}
-	expected, err := writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes, item.PayloadProfile)
-	if err != nil {
-		return fmt.Errorf("write payload for %s: %w", item.ID, err)
-	}
-	volumeSize := config.VolumeSize
-	if item.VolumeSize != "" {
-		volumeSize = item.VolumeSize
-	}
-	archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + volumeSize}
-	// The legacy writers naturally emit their own format; RAR 3.93 does not
-	// understand -ma3. RAR 5 is the only case that needs an explicit selector.
-	if item.Format == 5 {
-		archiveArgs = append(archiveArgs, "-ma5")
-	}
-	if item.Store {
-		archiveArgs = append(archiveArgs, "-m0")
-	}
-	if item.PPMd {
-		// RAR4's text module is its PPMd decoder path. Force it and pin its
-		// order and memory so this corpus case has stable codec provenance.
-		archiveArgs = append(archiveArgs, "-mc10:32t+")
-	}
-	if !item.Solid {
-		archiveArgs = append(archiveArgs, "-s-")
-	}
-	if item.Encrypted {
-		archiveArgs = append(archiveArgs, "-hp"+benchmarkPassword)
-	}
-	if item.RecoveryVolumes {
-		archiveArgs = append(archiveArgs, "-rv2")
-	}
-	archiveArgs = append(archiveArgs, "release.rar", "payload")
-	if err := runCommand(ctx, docker, archiveArgs...); err != nil {
-		return fmt.Errorf("build archive for %s: %w", item.ID, err)
-	}
-	if item.PAR2 {
+	if item.PAR2 && item.FixtureDir == "" {
 		par2 := lock.PAR2Generator
 		par2Args := []string{"run", "--rm", "--platform", par2.Platform, "-v", workRoot + ":/work", "-w", "/work", par2.Image,
 			"c", "-q", fmt.Sprintf("-r%d", config.PAR2RedundancyPercent), "-s65536", "release.par2"}
@@ -165,7 +189,7 @@ func generateCase(ctx context.Context, docker, corpusRoot string, config CorpusC
 	if err := verifyWithWriter(ctx, docker, writer, workRoot, item.Encrypted, expected); err != nil {
 		return fmt.Errorf("verify generated archive %s: %w", item.ID, err)
 	}
-	if err := os.RemoveAll(payloadRoot); err != nil {
+	if err := os.RemoveAll(filepath.Join(workRoot, "payload")); err != nil {
 		return err
 	}
 	sourceRoot := filepath.Join(caseRoot, "source")
@@ -286,6 +310,66 @@ func fillTextPayloadBlock(buffer []byte, seed, caseID, fileID string, block uint
 		token := words[int(digest[0])%len(words)] + " "
 		offset += copy(buffer[offset:], token)
 	}
+}
+
+func importFixture(workRoot, harnessRoot string, item CaseConfig) error {
+	fixtureRoot := filepath.Clean(filepath.Join(harnessRoot, item.FixtureDir))
+	entries, err := os.ReadDir(fixtureRoot)
+	if err != nil {
+		return fmt.Errorf("read fixture for %s: %w", item.ID, err)
+	}
+	matched := 0
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), item.FixturePrefix) {
+			continue
+		}
+		if err := copyTreeFile(filepath.Join(fixtureRoot, entry.Name()), filepath.Join(workRoot, entry.Name())); err != nil {
+			return err
+		}
+		matched++
+	}
+	if matched == 0 {
+		return fmt.Errorf("fixture case %q matched no files", item.ID)
+	}
+	manifest, err := sourceManifest(workRoot)
+	if err != nil {
+		return err
+	}
+	encoded, err := canonicalJSON(manifest)
+	if err != nil {
+		return err
+	}
+	digest := bytesSHA256(encoded)
+	if digest != item.FixtureSHA256 {
+		return fmt.Errorf("fixture case %q digest mismatch: got %s, want %s", item.ID, digest, item.FixtureSHA256)
+	}
+	return nil
+}
+
+func expectedFromWriter(ctx context.Context, docker string, writer RARWriter, root string, encrypted bool) ([]ExpectedFile, error) {
+	verifyRoot := filepath.Join(root, "verify")
+	defer os.RemoveAll(verifyRoot)
+	archive, err := firstRARVolume(root)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"run", "--rm", "--platform", writer.Platform, "-v", root + ":/work", "-w", "/work", writer.Image, "x", "-idq", "-y"}
+	if encrypted {
+		args = append(args, "-p"+benchmarkPassword)
+	}
+	args = append(args, archive, "verify/")
+	if err := runCommand(ctx, docker, args...); err != nil {
+		return nil, err
+	}
+	files, err := sourceManifest(verifyRoot)
+	if err != nil {
+		return nil, err
+	}
+	expected := make([]ExpectedFile, len(files))
+	for index, file := range files {
+		expected[index] = ExpectedFile{Path: file.Path, Bytes: file.Bytes, SHA256: file.SHA256}
+	}
+	return expected, nil
 }
 
 func verifyWithWriter(ctx context.Context, docker string, writer RARWriter, root string, encrypted bool, expected []ExpectedFile) error {

@@ -78,7 +78,7 @@ fn emit_command_outcome(
     Ok(())
 }
 
-/// Accept SABnzbd's `par2 r [options] PARFILE WILDCARD` invocation directly.
+/// Accept a `par2 r [options] PARFILE WILDCARD` invocation directly.
 ///
 /// This is deliberately limited to repair mode; Rarpar's documented `par`
 /// subcommands remain the general-purpose interface.

@@ -67,7 +67,7 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 	sort.SliceStable(comparisons, func(left, right int) bool {
 		return caseOrder(report.Plan, comparisons[left].CaseID) < caseOrder(report.Plan, comparisons[right].CaseID)
 	})
-	height := 178 + len(comparisons)*54
+	height := 198 + len(comparisons)*54
 	if height < 330 {
 		height = 330
 	}
@@ -80,16 +80,16 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 	fmt.Fprintf(&document, "  <metadata>schema=%d; report_sha256=%s; corpus_digest=%s; plan_id=%s; candidate_sha256=%s; rar_reference_sha256=%s; par2_reference_sha256=%s; lane=%s; par2_placement=%s</metadata>\n", report.SchemaVersion, report.InputSHA256, report.CorpusDigest, report.Plan.ID, report.Candidate.SHA256, referenceDigest(report.Reference), referenceDigest(report.ReferencePAR2), report.Plan.Lane, report.Plan.Par2Placement)
 	fmt.Fprintf(&document, "  <rect class=\"bg\" width=\"%d\" height=\"%d\"/>\n", chartWidth, height)
 	fmt.Fprintf(&document, "  <text class=\"title\" x=\"48\" y=\"48\">%s</text>\n", escapeXML(title))
-	fmt.Fprintf(&document, "  <text class=\"subtitle\" x=\"48\" y=\"75\">Lower elapsed time is better. Ratio = %s time / rarpar time. Log scale keeps large gains compact.</text>\n", escapeXML(comparisons[0].ReferenceLabel))
+	fmt.Fprintf(&document, "  <text class=\"subtitle\" x=\"48\" y=\"75\">Lower elapsed time is better. Bars show the faster side's multiplier on a symmetric log scale.</text>\n")
 	document.WriteString(legendSVG(family, comparisons[0].ReferenceLabel))
 	document.WriteString("  <text class=\"column\" x=\"48\" y=\"112\">Workload / elapsed time</text>\n  <text class=\"column\" x=\"620\" y=\"112\">Relative speed</text>\n")
-	axisStart, parity, axisEnd := 620.0, 752.5, 1150.0
+	axisStart, parity, axisEnd := 620.0, 885.0, 1150.0
 	axisBottom := height - 44
 	fmt.Fprintf(&document, "  <g aria-label=\"Relative speed axis\">\n")
 	for _, tick := range []struct {
 		ratio float64
 		label string
-	}{{0.5, "0.5x"}, {1, "1x parity"}, {2, "2x"}, {4, "4x"}, {8, "8x"}} {
+	}{{0.125, "8x"}, {0.25, "4x"}, {0.5, "2x"}, {1, "1x parity"}, {2, "2x"}, {4, "4x"}, {8, "8x"}} {
 		x := ratioX(tick.ratio, axisStart, parity, axisEnd)
 		class := "grid"
 		if tick.ratio == 1 {
@@ -97,6 +97,8 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 		}
 		fmt.Fprintf(&document, "    <line class=\"%s\" x1=\"%.1f\" y1=\"121\" x2=\"%.1f\" y2=\"%d\"/><text class=\"tick\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%s</text>\n", class, x, x, axisBottom-14, x, axisBottom+4, tick.label)
 	}
+	fmt.Fprintf(&document, "    <text class=\"tick\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%s faster</text>\n", (axisStart+parity)/2, axisBottom+24, escapeXML(comparisons[0].ReferenceLabel))
+	fmt.Fprintf(&document, "    <text class=\"tick\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">rarpar faster</text>\n", (parity+axisEnd)/2, axisBottom+24)
 	document.WriteString("  </g>\n")
 	y := 144
 	machineDetails := report.Plan.Lane
@@ -115,7 +117,7 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 			fmt.Fprintf(&document, "    <text class=\"ratio\" x=\"%.1f\" y=\"%d\">%.1fx</text>\n", x+8, y+28, comparison.Ratio)
 		} else {
 			fmt.Fprintf(&document, "    <rect class=\"%s\" x=\"%.1f\" y=\"%d\" width=\"%.1f\" height=\"14\" rx=\"2\"/>\n", class, x, y+16, parity-x)
-			fmt.Fprintf(&document, "    <text class=\"ratio\" x=\"%.1f\" y=\"%d\" text-anchor=\"end\">%.1fx</text>\n", x-8, y+28, comparison.Ratio)
+			fmt.Fprintf(&document, "    <text class=\"ratio\" x=\"%.1f\" y=\"%d\" text-anchor=\"end\">%.1fx</text>\n", x-8, y+28, 1/comparison.Ratio)
 		}
 		fmt.Fprintf(&document, "    <line class=\"rule\" x1=\"48\" y1=\"%d\" x2=\"1150\" y2=\"%d\"/>\n", y+50, y+50)
 		y += 54
@@ -125,10 +127,7 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 }
 
 func ratioX(ratio, start, parity, end float64) float64 {
-	clamped := math.Max(0.5, math.Min(8, ratio))
-	if clamped <= 1 {
-		return parity + math.Log2(clamped)*(parity-start)
-	}
+	clamped := math.Max(0.125, math.Min(8, ratio))
 	return parity + math.Log2(clamped)*(end-parity)/3
 }
 

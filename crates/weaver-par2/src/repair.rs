@@ -670,69 +670,6 @@ struct PreparedFactorMemo {
 
 impl PreparedFactorMemo {
     fn from_matrix(matrix: &matrix::Matrix, with_folded: bool) -> Self {
-        if std::env::var_os("WEAVER_XORJIT_MATRIX_DIAGNOSTICS").is_some() {
-            let mut frequencies = vec![0u32; 1usize << 16];
-            for &factor in &matrix.data {
-                frequencies[usize::from(factor)] += 1;
-            }
-            let mut ranked = frequencies
-                .iter()
-                .copied()
-                .enumerate()
-                .skip(1)
-                .filter(|(_, count)| *count != 0)
-                .collect::<Vec<_>>();
-            ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1));
-
-            let mut stamps = vec![0u32; 1usize << 16];
-            let mut epoch = 0u32;
-            let mut group_counts = Vec::new();
-            for start in (0..matrix.cols).step_by(12) {
-                epoch += 1;
-                let end = (start + 12).min(matrix.cols);
-                let mut unique = 0usize;
-                for row in matrix.data.chunks_exact(matrix.cols) {
-                    for &factor in &row[start..end] {
-                        if factor != 0 && stamps[usize::from(factor)] != epoch {
-                            stamps[usize::from(factor)] = epoch;
-                            unique += 1;
-                        }
-                    }
-                }
-                group_counts.push(unique);
-            }
-            let total_nonzero = frequencies
-                .iter()
-                .skip(1)
-                .map(|&count| u64::from(count))
-                .sum::<u64>();
-            let group_total = group_counts.iter().sum::<usize>();
-            eprintln!(
-                "xorjit matrix: rows={} cols={} nonzero={} unique={} groups={} group_unique_min={} group_unique_avg={:.1} group_unique_max={} max_frequency={}",
-                matrix.rows,
-                matrix.cols,
-                total_nonzero,
-                ranked.len(),
-                group_counts.len(),
-                group_counts.iter().min().copied().unwrap_or(0),
-                group_total as f64 / group_counts.len().max(1) as f64,
-                group_counts.iter().max().copied().unwrap_or(0),
-                ranked.first().map_or(0, |entry| entry.1),
-            );
-            for cached in [1024usize, 4096, 8192, 16384, 24576, 32768] {
-                let hits = ranked
-                    .iter()
-                    .take(cached)
-                    .map(|entry| u64::from(entry.1))
-                    .sum::<u64>();
-                eprintln!(
-                    "xorjit cache estimate: factors={} coefficient_hits={} hit_percent={:.2}",
-                    cached.min(ranked.len()),
-                    hits,
-                    hits as f64 * 100.0 / total_nonzero.max(1) as f64,
-                );
-            }
-        }
         let mut slots: Vec<Option<Box<MemoEntry>>> = (0..1usize << 16).map(|_| None).collect();
         // The folded split layout is shared; the GFNI affine kernel and the
         // non-GFNI shuffle2x kernel consume it with different coefficient
@@ -790,15 +727,21 @@ impl PreparedFactorMemo {
 }
 
 /// XOR-JIT tier (x86_64, AVX2- or AVX512-without-GFNI): packed dispatch for
-/// every controller batch/output row. AVX2 retains coefficient plans in the
-/// two staging areas while every compute worker owns its tiny strict-W^X
-/// executable buffer. AVX512 retains a per-area immutable code arena.
+/// every controller batch/output row. The normal bounded mode rotates two
+/// strict-W^X arenas. AVX2 may instead retain one immutable repair codebook
+/// when it fits without reducing the controller's data chunk.
+#[cfg(target_arch = "x86_64")]
+enum JitDispatchStorage {
+    RepairCodebook(Arc<reedsolomon_rs::xor_jit::packed::Avx2Codebook>),
+    ActiveArenas { arena_limit: usize },
+}
+
 #[cfg(target_arch = "x86_64")]
 struct JitMemo {
     width: reedsolomon_rs::xor_jit::JitWidth,
     input_grouping: usize,
     output_count: usize,
-    arena_limit: usize,
+    storage: JitDispatchStorage,
     reserved_bytes: usize,
 }
 
@@ -808,6 +751,8 @@ impl JitMemo {
         width: reedsolomon_rs::xor_jit::JitWidth,
         method: CpuMethodContract,
         output_count: usize,
+        repair_factors: &[u16],
+        codebook_limit: usize,
         available_bytes: usize,
     ) -> std::result::Result<Self, reedsolomon_rs::xor_jit::packed::PackedBuildError> {
         if !method.strict_wx_available {
@@ -818,45 +763,58 @@ impl JitMemo {
             );
         }
         let input_grouping = method.input_grouping();
-        // Each of the two controller staging areas owns one immutable active
-        // batch arena. The area returns to RW only after all workers finish.
-        let arena_limit =
-            reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
-                width,
-                output_count,
-                input_grouping,
-            )
-            .ok_or(
-                reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                    requested_bytes: usize::MAX,
-                    limit_bytes: available_bytes,
-                },
-            )?;
-        let reserved_bytes = arena_limit.checked_mul(2).ok_or(
-            reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                requested_bytes: usize::MAX,
-                limit_bytes: available_bytes,
-            },
-        )?;
-        if std::env::var_os("WEAVER_XORJIT_MATRIX_DIAGNOSTICS").is_some() {
-            eprintln!(
-                "xorjit memory: available_bytes={available_bytes} arena_limit={arena_limit} reserved_bytes={reserved_bytes}"
-            );
-        }
-        if reserved_bytes > available_bytes {
-            return Err(
-                reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                    requested_bytes: reserved_bytes,
-                    limit_bytes: available_bytes,
-                },
-            );
-        }
+        let codebook = matches!(width, reedsolomon_rs::xor_jit::JitWidth::Avx2)
+            .then(|| {
+                reedsolomon_rs::xor_jit::packed::Avx2Codebook::build(repair_factors, codebook_limit)
+            })
+            .transpose();
+        let (storage, reserved_bytes) = match codebook {
+            Ok(Some(codebook)) => {
+                let retained_bytes = codebook.retained_bytes();
+                (JitDispatchStorage::RepairCodebook(codebook), retained_bytes)
+            }
+            Ok(None) | Err(reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource { .. }) => {
+                // Each controller staging area owns one immutable active
+                // arena and returns it to RW only after all workers finish.
+                let arena_limit =
+                    reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
+                        width,
+                        output_count,
+                        input_grouping,
+                    )
+                    .ok_or(
+                        reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                            requested_bytes: usize::MAX,
+                            limit_bytes: available_bytes,
+                        },
+                    )?;
+                let reserved_bytes = arena_limit.checked_mul(2).ok_or(
+                    reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                        requested_bytes: usize::MAX,
+                        limit_bytes: available_bytes,
+                    },
+                )?;
+                if reserved_bytes > available_bytes {
+                    return Err(
+                        reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                            requested_bytes: reserved_bytes,
+                            limit_bytes: available_bytes,
+                        },
+                    );
+                }
+                (
+                    JitDispatchStorage::ActiveArenas { arena_limit },
+                    reserved_bytes,
+                )
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             width,
             input_grouping,
             output_count,
-            arena_limit,
+            storage,
             reserved_bytes,
         })
     }
@@ -893,7 +851,12 @@ impl JitMemo {
             .coefficients
             .chunks_exact(self.input_grouping)
             .collect::<Vec<_>>();
-        workspace.build(self.width, &rows, self.arena_limit)
+        match &self.storage {
+            JitDispatchStorage::RepairCodebook(codebook) => codebook.build_batch(&rows),
+            JitDispatchStorage::ActiveArenas { arena_limit } => {
+                workspace.build(self.width, &rows, *arena_limit)
+            }
+        }
     }
 
     #[inline]
@@ -2744,16 +2707,18 @@ fn complete_active_controller_batch<'a>(
     )?;
     #[cfg(target_arch = "x86_64")]
     if let Some(jit_batch) = finished.jit_batch.take() {
-        _preparer
-            .command_tx
-            .send(PreparationMessage::RecycleJit {
-                staging_area,
-                batch: jit_batch,
-            })
-            .map_err(|_| Par2Error::ReedSolomonError {
-                reason: "CPU repair preparation worker stopped before recycling XOR-JIT state"
-                    .to_string(),
-            })?;
+        if jit_batch.requires_workspace_recycle() {
+            _preparer
+                .command_tx
+                .send(PreparationMessage::RecycleJit {
+                    staging_area,
+                    batch: jit_batch,
+                })
+                .map_err(|_| Par2Error::ReedSolomonError {
+                    reason: "CPU repair preparation worker stopped before recycling XOR-JIT state"
+                        .to_string(),
+                })?;
+        }
     }
     batch_sets[staging_area] = Some(finished.set);
     lifecycle.complete_batch(staging_area);
@@ -3701,14 +3666,32 @@ fn execute_repair_streaming_with_trace(
             jit_staging_width,
         );
         let minimum_controller_bytes = minimum_controller.buffer_accounting().total_bytes;
-        let arena_limit = budget.checked_sub(minimum_controller_bytes).ok_or_else(|| {
+        let available_jit_bytes = budget.checked_sub(minimum_controller_bytes).ok_or_else(|| {
             Par2Error::ResourceLimitExceeded {
                 reason: format!(
                     "XOR-JIT controller base needs {minimum_controller_bytes} bytes, exceeding the {budget} byte memory limit"
                 ),
             }
         })?;
-        JitMemo::new(width, jit_method, n, arena_limit).map_err(|error| {
+        let full_controller_bytes = cpu_controller_plan(
+            slice_size,
+            n,
+            workers,
+            jit_method,
+            jit_staging_width,
+        )
+        .buffer_accounting()
+        .total_bytes;
+        let codebook_limit = budget.saturating_sub(full_controller_bytes);
+        JitMemo::new(
+            width,
+            jit_method,
+            n,
+            &plan.input_factors.data,
+            codebook_limit,
+            available_jit_bytes,
+        )
+        .map_err(|error| {
             Par2Error::ReedSolomonError {
                 reason: format!("XOR-JIT controller capacity setup failed: {error}"),
             }
@@ -3735,16 +3718,16 @@ fn execute_repair_streaming_with_trace(
     let method = cpu_kernel.method();
     let input_grouping = method.input_grouping();
     #[cfg(target_arch = "x86_64")]
-    let persistent_arena_bytes = jit_memo.as_ref().map_or(0, JitMemo::reserved_bytes);
+    let persistent_jit_bytes = jit_memo.as_ref().map_or(0, JitMemo::reserved_bytes);
     #[cfg(not(target_arch = "x86_64"))]
-    let persistent_arena_bytes = 0;
+    let persistent_jit_bytes = 0;
     let staging_width = method.staging_width();
     let (mut chunk_words, selected_budget, mut max_controller) = controller_execution_parameters(
         plan,
         options,
         method,
         staging_width,
-        persistent_arena_bytes,
+        persistent_jit_bytes,
         workers,
     )?;
     debug_assert_eq!(selected_budget, budget);
@@ -3782,7 +3765,7 @@ fn execute_repair_streaming_with_trace(
             .ok_or_else(|| Par2Error::ResourceLimitExceeded {
                 reason: "GPU state accounting overflowed".to_string(),
             })?;
-        let persistent_with_gpu_state = persistent_arena_bytes
+        let persistent_with_gpu_state = persistent_jit_bytes
             .checked_add(gpu_state_bytes)
             .ok_or_else(|| Par2Error::ResourceLimitExceeded {
                 reason: "GPU state accounting overflowed".to_string(),
@@ -6169,6 +6152,8 @@ mod tests {
                 width,
                 kernel.method(),
                 plan.missing_slices.len(),
+                &plan.input_factors.data,
+                0,
                 usize::MAX,
             )
             .expect("detected XOR-JIT method has bounded controller accounting");
@@ -6282,18 +6267,54 @@ mod tests {
         )
         .unwrap();
         let required = area * 2;
-        let memo =
-            JitMemo::new(reedsolomon_rs::xor_jit::JitWidth::Avx2, method, 1, required).unwrap();
+        let memo = JitMemo::new(
+            reedsolomon_rs::xor_jit::JitWidth::Avx2,
+            method,
+            1,
+            &[1],
+            0,
+            required,
+        )
+        .unwrap();
         assert_eq!(memo.reserved_bytes(), required);
         assert!(
             JitMemo::new(
                 reedsolomon_rs::xor_jit::JitWidth::Avx2,
                 method,
                 1,
+                &[1],
+                0,
                 required - 1,
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_jit_memo_uses_codebook_only_with_full_chunk_headroom() {
+        let method = CpuKernelKind::XorJit(reedsolomon_rs::xor_jit::JitWidth::Avx2).method();
+        let factors = [1u16, 2, 3, 2, 1];
+        let measured =
+            reedsolomon_rs::xor_jit::packed::Avx2Codebook::build(&factors, usize::MAX).unwrap();
+        let codebook_limit = measured.build_peak_bytes();
+        let retained_bytes = measured.retained_bytes();
+        drop(measured);
+
+        let memo = JitMemo::new(
+            reedsolomon_rs::xor_jit::JitWidth::Avx2,
+            method,
+            1,
+            &factors,
+            codebook_limit,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(matches!(
+            &memo.storage,
+            JitDispatchStorage::RepairCodebook(_)
+        ));
+        assert_eq!(memo.reserved_bytes(), retained_bytes);
     }
 
     #[test]

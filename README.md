@@ -175,6 +175,17 @@ rarpar par verify release.par2
 rarpar par repair release.par2
 ```
 
+Automation that already emits a PAR2-command-shaped repair invocation can use
+the compatibility form directly. This form accepts repair mode, `-B` as a
+separate or joined base-directory option, the PAR2 file, and an optional data
+wildcard:
+
+```bash
+rarpar r -B ./release ./release/release.par2 "*.rar"
+```
+
+The explicit `rarpar par ...` commands remain the general-purpose interface.
+
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
 
@@ -182,6 +193,12 @@ content. For a conventional expected-path-only verification or repair, use:
 rarpar par verify --par-placement canonical release.par2
 rarpar auto --par-placement canonical ./release
 ```
+
+Explicit RAR selection recognizes modern `partNN` names and old-style `.r00`,
+`.s00`, and numeric volume sequences. Discovery probes only name-compatible
+siblings for an explicitly selected multi-volume archive. During `auto`, RAR
+volumes restored from `.rev` files stay beside the source set; `--output`
+controls extracted payload placement, not those intermediate volumes.
 
 Discovery controls are global:
 
@@ -247,6 +264,10 @@ and `-riN[:S]`.
 incremental prompt expected by UnRAR-compatible callers. `rarpar` intentionally
 does not print an UnRAR banner and does not claim to be official UnRAR.
 
+Normal `x` and `e` extraction uses sibling `.rev` recovery files to restore
+missing volumes before extraction. The incremental `-vp` path does not mutate
+the archive set; it waits for each later volume instead.
+
 ## Workspace Packages
 
 - `crates/weaver-reed-solomon`: Reed-Solomon finite-field kernels shared by
@@ -283,6 +304,7 @@ cargo test --locked --workspace --no-fail-fast
 Release and crates.io publishing automation lives under `.github/workflows/`.
 Publishing notes are in `docs/publishing.md`.
 Linux packaging layout notes are in `docs/packaging.md`.
+Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

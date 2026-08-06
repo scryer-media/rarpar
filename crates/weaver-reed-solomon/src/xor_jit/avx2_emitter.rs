@@ -116,9 +116,8 @@ fn compose_factor_rows(factor: u16) -> [u16; 16] {
     rows
 }
 
-/// Logical form of `gf16_bitdep_init256`: expand multiplication by one factor
-/// into the sixteen bit-plane dependencies using PAR2's 0x1100b polynomial.
-/// The C routine materializes the same rows in its AVX2 lane arrangement.
+/// Expand multiplication by one factor into sixteen bit-plane dependencies
+/// using PAR2's 0x1100b polynomial.
 fn dependency_rows_for_factor(factor: u16) -> [u16; 16] {
     let mut rows = [0u16; 16];
     for input_plane in 0..16usize {
@@ -804,7 +803,6 @@ mod tests {
         let mut normal = Vec::with_capacity(MAX_BODY_BYTES);
         let mut prefetch = Vec::with_capacity(MAX_BODY_BYTES);
         let mut optional = Vec::with_capacity(MAX_BODY_BYTES);
-        let mut optional_arena_bytes = 0usize;
         for factor in 0..=u16::MAX {
             normal.clear();
             prefetch.clear();
@@ -825,12 +823,7 @@ mod tests {
                 optional_len <= MAX_BODY_BYTES,
                 "optional factor {factor:#06x}"
             );
-            if factor != 0 {
-                optional_arena_bytes = (optional_arena_bytes + 63) & !63;
-                optional_arena_bytes += optional_len;
-            }
         }
-        eprintln!("optional AVX2 arena bytes: {optional_arena_bytes}");
     }
 
     #[test]

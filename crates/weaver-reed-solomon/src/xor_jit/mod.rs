@@ -405,6 +405,7 @@ fn running_translated() -> bool {
             return rc == 0 && translated == 1;
         }
 
+        #[cfg(not(target_os = "macos"))]
         false
     })
 }

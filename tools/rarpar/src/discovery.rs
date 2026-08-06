@@ -207,7 +207,7 @@ pub fn discover_rar_set_for_archive(
 
     let archive_file = classify_path(archive);
     if let DiscoveredKind::RarVolume(info) = &archive_file.kind {
-        if !info.is_multi_volume {
+        if !info.is_multi_volume && !info.is_header_encrypted {
             return selected_rar_set(vec![archive_file], archive);
         }
 

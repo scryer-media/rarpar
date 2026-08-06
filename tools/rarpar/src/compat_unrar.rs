@@ -260,6 +260,7 @@ fn run_extract(invocation: &Invocation) -> Result<(), CompatFailure> {
         if invocation.incremental {
             run_incremental_extract(invocation, &set)?;
         } else {
+            let set = restore_recovery_volumes(&set)?;
             let password = password_candidate(&invocation.password);
             let mut archive = open_set(&set, password.as_deref())?;
             for path in ordered_volume_paths(&set) {
@@ -272,6 +273,40 @@ fn run_extract(invocation: &Invocation) -> Result<(), CompatFailure> {
         }
     }
     Ok(())
+}
+
+fn restore_recovery_volumes(set: &RarSet) -> Result<RarSet, CompatFailure> {
+    if set.recovery_volumes.is_empty() {
+        return Ok(set.clone());
+    }
+
+    let report = unrar_rs::restore_volumes_from_paths(
+        &set.source_paths(),
+        &unrar_rs::RecoveryOptions {
+            output_dir: None,
+            overwrite_existing: false,
+            verify_restored: true,
+        },
+    )
+    .map_err(map_rar_error)?;
+    if report.restored_paths.is_empty() {
+        return Ok(set.clone());
+    }
+
+    let anchor = report
+        .restored_paths
+        .first()
+        .or_else(|| set.volumes.first().map(|volume| &volume.path))
+        .ok_or_else(|| CompatFailure::stdout(EXIT_NO_FILES, "No files to extract"))?;
+    discovery::discover_rar_set_for_archive(
+        anchor,
+        &DiscoveryOptions {
+            recursive: false,
+            max_depth: 1,
+            max_files: 20_000,
+        },
+    )
+    .map_err(|error| CompatFailure::stdout(EXIT_OPEN, format!("Cannot open: {error}")))
 }
 
 fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), CompatFailure> {
@@ -500,7 +535,13 @@ fn resolve_sets(specs: &[PathBuf]) -> Result<Vec<RarSet>, CompatFailure> {
         max_files: 20_000,
     };
     for path in paths {
-        let set = discovery::discover_rar_set_for_archive(&path, &options).map_err(|error| {
+        let archive = std::fs::canonicalize(&path).map_err(|error| {
+            CompatFailure::stdout(
+                EXIT_OPEN,
+                format!("Cannot open {}: {error}", path.display()),
+            )
+        })?;
+        let set = discovery::discover_rar_set_for_archive(&archive, &options).map_err(|error| {
             CompatFailure::stdout(
                 EXIT_OPEN,
                 format!("Cannot open {}: {error}", path.display()),
@@ -540,7 +581,10 @@ fn has_wildcard(path: &Path) -> bool {
 }
 
 fn expand_wildcard(pattern: &Path) -> Result<Vec<PathBuf>, CompatFailure> {
-    let parent = pattern.parent().unwrap_or_else(|| Path::new("."));
+    let parent = pattern
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let file_pattern = pattern
         .file_name()
         .and_then(OsStr::to_str)

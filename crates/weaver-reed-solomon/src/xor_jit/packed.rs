@@ -7,16 +7,23 @@
 
 use super::{JitWidth, avx2_emitter, codegen512, deps, memory::JitCode};
 use memmap2::{Mmap, MmapMut};
-use std::{collections::HashMap, fmt, io, sync::Arc};
+use rayon::prelude::*;
+use std::{collections::HashMap, fmt, io, mem, sync::Arc};
 
 const AVX2_PREFETCH_OUTPUT_SOURCES: usize = 2;
 const CODE_ALIGNMENT: usize = 64;
+const MAPPING_ACCOUNT_ALIGNMENT: usize = 64 * 1024;
+const MISSING_CODEBOOK_ENTRY: u32 = u32::MAX;
 const AVX2_MAX_BODY_BYTES: usize = avx2_emitter::MAX_BODY_BYTES;
 const AVX512_MAX_BODY_BYTES: usize = 4096;
 
 struct Avx2Body {
     source: usize,
-    code: JitCode,
+    code: u32,
+}
+
+struct Avx2CodeStorage {
+    entries: Box<[JitCode]>,
 }
 
 struct Avx512Group {
@@ -65,6 +72,18 @@ pub struct PackedCodeSize {
     pub arena_bytes: usize,
 }
 
+/// Repair-scoped immutable AVX2 code indexed by field coefficient.
+///
+/// Construction emits directly into one writable mapping and seals it once.
+/// Batches retain only compact indexes into the shared executable storage.
+pub struct Avx2Codebook {
+    storage: Arc<Avx2CodeStorage>,
+    factor_to_entry: Box<[u32]>,
+    size: PackedCodeSize,
+    retained_bytes: usize,
+    build_peak_bytes: usize,
+}
+
 /// Failure while planning or finalizing a packed batch.
 #[derive(Debug)]
 pub enum PackedBuildError {
@@ -103,6 +122,7 @@ impl From<io::Error> for PackedBuildError {
 /// Failure while running a packed body.
 #[derive(Debug)]
 pub enum PackedExecutionError {
+    InvalidDispatch(&'static str),
     ScratchAllocation,
     Generator(avx2_emitter::Avx2EmitError),
     WxTransition(io::Error),
@@ -111,6 +131,7 @@ pub enum PackedExecutionError {
 impl fmt::Display for PackedExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidDispatch(message) => formatter.write_str(message),
             Self::ScratchAllocation => {
                 formatter.write_str("unable to reserve worker JIT body scratch")
             }
@@ -232,6 +253,7 @@ pub struct PackedRun {
 pub struct PackedJitCode {
     width: JitWidth,
     factors: Vec<u16>,
+    avx2_storage: Option<Arc<Avx2CodeStorage>>,
     avx2: Vec<Avx2Body>,
     avx512: Vec<Avx512Group>,
 }
@@ -243,8 +265,23 @@ pub struct PackedJitCode {
 pub struct PackedJitBatch {
     rows: Vec<PackedJitCode>,
     size: PackedCodeSize,
-    arena: Option<Arc<Mmap>>,
-    lease: Option<Arc<WorkspaceLease>>,
+    storage: PackedBatchStorage,
+}
+
+enum PackedBatchStorage {
+    Detached {
+        _arena: Option<Arc<Mmap>>,
+    },
+    Workspace {
+        arena: Option<Arc<Mmap>>,
+        lease: Arc<WorkspaceLease>,
+    },
+    SharedCodebook,
+}
+
+enum PackedBatchOwner {
+    Detached,
+    Workspace(Arc<WorkspaceLease>),
 }
 
 /// Identity token proving that an active batch still occupies its controller
@@ -260,6 +297,197 @@ pub struct PackedJitWorkspace {
     active: Option<Arc<WorkspaceLease>>,
 }
 
+fn resource_error(requested_bytes: usize, limit_bytes: usize) -> PackedBuildError {
+    PackedBuildError::Resource {
+        requested_bytes,
+        limit_bytes,
+    }
+}
+
+fn checked_accounted_mapping_bytes(
+    arena_bytes: usize,
+    limit_bytes: usize,
+) -> Result<usize, PackedBuildError> {
+    if arena_bytes == 0 {
+        return Ok(0);
+    }
+    arena_bytes
+        .checked_add(MAPPING_ACCOUNT_ALIGNMENT - 1)
+        .map(|bytes| bytes & !(MAPPING_ACCOUNT_ALIGNMENT - 1))
+        .ok_or_else(|| resource_error(usize::MAX, limit_bytes))
+}
+
+impl Avx2Codebook {
+    /// Build the exact set of nonzero coefficient bodies needed by a repair.
+    ///
+    /// The first pass establishes stable first-use ordering and exact sizes.
+    /// The second emits directly into the final RW mapping, which is sealed RX
+    /// once and remains immutable for the codebook lifetime.
+    pub fn build(factors: &[u16], limit_bytes: usize) -> Result<Arc<Self>, PackedBuildError> {
+        let factor_slots = usize::from(u16::MAX) + 1;
+        let factor_index_bytes = factor_slots
+            .checked_mul(mem::size_of::<u32>())
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        let control_bytes = mem::size_of::<Self>()
+            .checked_add(mem::size_of::<Avx2CodeStorage>())
+            .and_then(|bytes| bytes.checked_add(4 * mem::size_of::<usize>()))
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        let fixed_bytes = factor_index_bytes
+            .checked_add(control_bytes)
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        if fixed_bytes > limit_bytes {
+            return Err(resource_error(fixed_bytes, limit_bytes));
+        }
+
+        let mut factor_to_entry = vec![MISSING_CODEBOOK_ENTRY; factor_slots].into_boxed_slice();
+        let mut unique_count = 0usize;
+        for &factor in factors {
+            if factor != 0 && factor_to_entry[factor as usize] == MISSING_CODEBOOK_ENTRY {
+                factor_to_entry[factor as usize] = 0;
+                unique_count += 1;
+            }
+        }
+        factor_to_entry.fill(MISSING_CODEBOOK_ENTRY);
+
+        let temporary_capacity_bytes = unique_count
+            .checked_mul(mem::size_of::<u16>() + mem::size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(AVX2_MAX_BODY_BYTES))
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        let planning_bytes = fixed_bytes
+            .checked_add(temporary_capacity_bytes)
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        if planning_bytes > limit_bytes {
+            return Err(resource_error(planning_bytes, limit_bytes));
+        }
+
+        let mut code_factors = Vec::with_capacity(unique_count);
+        let mut offsets = Vec::with_capacity(unique_count);
+        let mut scratch = Vec::with_capacity(AVX2_MAX_BODY_BYTES);
+        let mut size = PackedCodeSize::default();
+        for &factor in factors {
+            let slot = &mut factor_to_entry[factor as usize];
+            if factor == 0 || *slot != MISSING_CODEBOOK_ENTRY {
+                continue;
+            }
+            scratch.clear();
+            avx2_emitter::append_muladd_body_optional_prefetch(&mut scratch, factor)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let offset = size
+                .arena_bytes
+                .checked_add(CODE_ALIGNMENT - 1)
+                .map(|bytes| bytes & !(CODE_ALIGNMENT - 1))
+                .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+            let arena_bytes = offset
+                .checked_add(scratch.len())
+                .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+            let generated_bytes = size
+                .generated_bytes
+                .checked_add(scratch.len())
+                .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+            let entry = u32::try_from(code_factors.len())
+                .map_err(|_| resource_error(usize::MAX, limit_bytes))?;
+            *slot = entry;
+            code_factors.push(factor);
+            offsets.push(offset);
+            size = PackedCodeSize {
+                generated_bytes,
+                arena_bytes,
+            };
+        }
+
+        let mapping_bytes = checked_accounted_mapping_bytes(size.arena_bytes, limit_bytes)?;
+        let entry_bytes = unique_count
+            .checked_mul(mem::size_of::<JitCode>())
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        let retained_bytes = fixed_bytes
+            .checked_add(mapping_bytes)
+            .and_then(|bytes| bytes.checked_add(entry_bytes))
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        let build_peak_bytes = retained_bytes
+            .checked_add(temporary_capacity_bytes)
+            .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        if build_peak_bytes > limit_bytes {
+            return Err(resource_error(build_peak_bytes, limit_bytes));
+        }
+
+        let entries = if code_factors.is_empty() {
+            Vec::new()
+        } else {
+            let mut writable = MmapMut::map_anon(size.arena_bytes)?;
+            for (&factor, &offset) in code_factors.iter().zip(&offsets) {
+                scratch.clear();
+                avx2_emitter::append_muladd_body_optional_prefetch(&mut scratch, factor)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let end = offset + scratch.len();
+                writable[offset..end].copy_from_slice(&scratch);
+            }
+            let (entries, arena) =
+                JitCode::finalize_writable_arena(writable, &offsets, size.arena_bytes)?;
+            drop(arena);
+            entries
+        };
+        debug_assert_eq!(entries.len(), unique_count);
+
+        Ok(Arc::new(Self {
+            storage: Arc::new(Avx2CodeStorage {
+                entries: entries.into_boxed_slice(),
+            }),
+            factor_to_entry,
+            size,
+            retained_bytes,
+            build_peak_bytes,
+        }))
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub fn build_peak_bytes(&self) -> usize {
+        self.build_peak_bytes
+    }
+
+    pub fn code_size(&self) -> PackedCodeSize {
+        self.size
+    }
+
+    /// Build a batch that references this immutable repair-scoped codebook.
+    pub fn build_batch(
+        self: &Arc<Self>,
+        rows: &[&[u16]],
+    ) -> Result<PackedJitBatch, PackedBuildError> {
+        validate_batch_rows(rows)?;
+        let mut packed_rows = Vec::with_capacity(rows.len());
+        for &factors in rows {
+            let mut bodies = Vec::with_capacity(factors.len());
+            for (source, &factor) in factors.iter().enumerate() {
+                if factor == 0 {
+                    continue;
+                }
+                let code = self.factor_to_entry[factor as usize];
+                if code == MISSING_CODEBOOK_ENTRY {
+                    return Err(PackedBuildError::InvalidInput(
+                        "repair codebook does not contain a required coefficient",
+                    ));
+                }
+                bodies.push(Avx2Body { source, code });
+            }
+            packed_rows.push(PackedJitCode {
+                width: JitWidth::Avx2,
+                factors: factors.to_vec(),
+                avx2_storage: Some(Arc::clone(&self.storage)),
+                avx2: bodies,
+                avx512: Vec::new(),
+            });
+        }
+        Ok(PackedJitBatch {
+            rows: packed_rows,
+            size: self.size,
+            storage: PackedBatchStorage::SharedCodebook,
+        })
+    }
+}
+
 impl PackedJitBatch {
     /// Estimate retained code state without allocating executable memory.
     pub fn estimate(width: JitWidth, rows: &[&[u16]]) -> Result<PackedCodeSize, PackedBuildError> {
@@ -268,9 +496,9 @@ impl PackedJitBatch {
 
     /// Conservative retained-code bound for one active input group.
     ///
-    /// The bound includes one aligned body slot per coefficient. The builder
-    /// deduplicates equal nonzero factors, so actual retained code is usually
-    /// smaller.
+    /// AVX2 uses one fixed-size aligned slot per distinct coefficient. The
+    /// bound assumes every coefficient is distinct, so actual retained code
+    /// is usually smaller.
     pub fn active_arena_upper_bound(
         width: JitWidth,
         row_count: usize,
@@ -279,7 +507,7 @@ impl PackedJitBatch {
         match width {
             JitWidth::Avx2 => row_count
                 .checked_mul(factors_per_row)?
-                .checked_mul(AVX2_MAX_BODY_BYTES.checked_add(CODE_ALIGNMENT.checked_sub(1)?)?),
+                .checked_mul(AVX2_MAX_BODY_BYTES),
             JitWidth::Avx512 => row_count
                 .checked_mul(factors_per_row)?
                 .checked_mul(AVX512_MAX_BODY_BYTES),
@@ -299,14 +527,14 @@ impl PackedJitBatch {
         limit_bytes: usize,
     ) -> Result<Self, PackedBuildError> {
         let plan = build_batch_plan(width, rows, limit_bytes)?;
-        Self::from_plan(width, plan, None, None)
+        Self::from_plan(width, plan, None, PackedBatchOwner::Detached)
     }
 
     fn from_plan(
         width: JitWidth,
         plan: PackedBatchPlan,
         reusable: Option<MmapMut>,
-        lease: Option<Arc<WorkspaceLease>>,
+        owner: PackedBatchOwner,
     ) -> Result<Self, PackedBuildError> {
         let PackedBatchPlan {
             generated,
@@ -320,7 +548,7 @@ impl PackedJitBatch {
             JitCode::new_arena_reusing(&generated, &offsets, reusable)?
         };
         Ok(Self::from_finalized(
-            width, plans, size, finalized, arena, lease,
+            width, plans, size, finalized, arena, owner,
         ))
     }
 
@@ -330,19 +558,26 @@ impl PackedJitBatch {
         size: PackedCodeSize,
         finalized: Vec<JitCode>,
         arena: Option<Arc<Mmap>>,
-        lease: Option<Arc<WorkspaceLease>>,
+        owner: PackedBatchOwner,
     ) -> Self {
+        let mut finalized = Some(finalized);
+        let avx2_storage = matches!(width, JitWidth::Avx2).then(|| {
+            Arc::new(Avx2CodeStorage {
+                entries: finalized.take().unwrap_or_default().into_boxed_slice(),
+            })
+        });
         let rows = plans
             .into_iter()
             .map(|plan| PackedJitCode {
                 width,
                 factors: plan.factors,
+                avx2_storage: avx2_storage.as_ref().map(Arc::clone),
                 avx2: plan
                     .avx2
                     .into_iter()
                     .map(|body| Avx2Body {
                         source: body.source,
-                        code: finalized[body.code].clone(),
+                        code: body.code as u32,
                     })
                     .collect(),
                 avx512: plan
@@ -353,32 +588,39 @@ impl PackedJitBatch {
                         codes: group
                             .codes
                             .into_iter()
-                            .map(|index| finalized[index].clone())
+                            .map(|index| {
+                                finalized.as_ref().expect("AVX512 finalized code storage")[index]
+                                    .clone()
+                            })
                             .collect(),
                     })
                     .collect(),
             })
             .collect();
+        let storage = match owner {
+            PackedBatchOwner::Detached => PackedBatchStorage::Detached { _arena: arena },
+            PackedBatchOwner::Workspace(lease) => PackedBatchStorage::Workspace { arena, lease },
+        };
         Self {
             rows,
             size,
-            arena,
-            lease,
+            storage,
         }
     }
 
-    fn into_workspace_parts(self) -> io::Result<(Option<MmapMut>, Option<Arc<WorkspaceLease>>)> {
+    fn into_workspace_mapping(self) -> io::Result<Option<MmapMut>> {
         let Self {
             rows,
             size: _,
-            arena,
-            lease,
+            storage,
         } = self;
         drop(rows);
-        Ok((
-            arena.map(JitCode::recover_batch_mapping).transpose()?,
-            lease,
-        ))
+        let PackedBatchStorage::Workspace { arena, lease: _ } = storage else {
+            return Err(io::Error::other(
+                "packed JIT batch is not owned by a recyclable workspace",
+            ));
+        };
+        arena.map(JitCode::recover_batch_mapping).transpose()
     }
 
     pub fn len(&self) -> usize {
@@ -395,6 +637,11 @@ impl PackedJitBatch {
 
     pub fn code_size(&self) -> PackedCodeSize {
         self.size
+    }
+
+    /// Whether this batch must return its executable arena to a workspace.
+    pub fn requires_workspace_recycle(&self) -> bool {
+        matches!(self.storage, PackedBatchStorage::Workspace { .. })
     }
 }
 
@@ -419,8 +666,8 @@ impl PackedJitWorkspace {
             JitWidth::Avx2 => build_avx2_batch(
                 rows,
                 limit_bytes,
-                self.writable.take(),
-                Some(Arc::clone(&lease)),
+                &mut self.writable,
+                PackedBatchOwner::Workspace(Arc::clone(&lease)),
             )?,
             JitWidth::Avx512 => {
                 // Plan before taking the retained mapping so shape/resource
@@ -430,7 +677,7 @@ impl PackedJitWorkspace {
                     width,
                     plan,
                     self.writable.take(),
-                    Some(Arc::clone(&lease)),
+                    PackedBatchOwner::Workspace(Arc::clone(&lease)),
                 )?
             }
         };
@@ -443,17 +690,16 @@ impl PackedJitWorkspace {
         let Some(expected) = self.active.as_ref() else {
             return Err(io::Error::other("packed JIT workspace has no active batch"));
         };
-        let owned = batch
-            .lease
-            .as_ref()
-            .is_some_and(|lease| Arc::ptr_eq(lease, expected));
+        let owned = match &batch.storage {
+            PackedBatchStorage::Workspace { lease, .. } => Arc::ptr_eq(lease, expected),
+            PackedBatchStorage::Detached { .. } | PackedBatchStorage::SharedCodebook => false,
+        };
         if !owned {
             return Err(io::Error::other(
                 "packed JIT batch belongs to a different workspace",
             ));
         }
-        let (writable, _) = batch.into_workspace_parts()?;
-        self.writable = writable;
+        self.writable = batch.into_workspace_mapping()?;
         self.active = None;
         Ok(())
     }
@@ -482,12 +728,10 @@ fn plan_avx2_batch(
 ) -> Result<Avx2BatchLayout, PackedBuildError> {
     validate_batch_rows(rows)?;
 
-    let mut code_by_factor = HashMap::<u16, usize>::new();
+    let mut code_by_factor = vec![MISSING_CODEBOOK_ENTRY; usize::from(u16::MAX) + 1];
     let mut code_factors = Vec::new();
     let mut offsets = Vec::new();
     let mut plans = Vec::with_capacity(rows.len());
-    let mut scratch = Vec::with_capacity(AVX2_MAX_BODY_BYTES);
-    let mut size = PackedCodeSize::default();
 
     for &factors in rows {
         let mut plan = PackedRowPlan {
@@ -499,73 +743,53 @@ fn plan_avx2_batch(
             if factor == 0 {
                 continue;
             }
-            let code = match code_by_factor.get(&factor) {
-                Some(&code) => code,
-                None => {
-                    scratch.clear();
-                    avx2_emitter::append_muladd_body_optional_prefetch(&mut scratch, factor)
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    let offset = size
-                        .arena_bytes
-                        .checked_add(CODE_ALIGNMENT - 1)
-                        .map(|value| value & !(CODE_ALIGNMENT - 1))
-                        .ok_or(PackedBuildError::Resource {
-                            requested_bytes: usize::MAX,
-                            limit_bytes,
-                        })?;
-                    let arena_bytes =
-                        offset
-                            .checked_add(scratch.len())
-                            .ok_or(PackedBuildError::Resource {
-                                requested_bytes: usize::MAX,
-                                limit_bytes,
-                            })?;
-                    if arena_bytes > limit_bytes {
-                        return Err(PackedBuildError::Resource {
-                            requested_bytes: arena_bytes,
-                            limit_bytes,
-                        });
-                    }
-                    let generated_bytes = size.generated_bytes.checked_add(scratch.len()).ok_or(
-                        PackedBuildError::Resource {
-                            requested_bytes: usize::MAX,
-                            limit_bytes,
-                        },
-                    )?;
-                    let code = code_factors.len();
-                    code_by_factor.insert(factor, code);
-                    code_factors.push(factor);
-                    offsets.push(offset);
-                    size = PackedCodeSize {
-                        generated_bytes,
-                        arena_bytes,
-                    };
-                    code
+            let slot = &mut code_by_factor[factor as usize];
+            if *slot == MISSING_CODEBOOK_ENTRY {
+                let code = u32::try_from(code_factors.len())
+                    .map_err(|_| resource_error(usize::MAX, limit_bytes))?;
+                let arena_bytes = code_factors
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(AVX2_MAX_BODY_BYTES))
+                    .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+                if arena_bytes > limit_bytes {
+                    return Err(resource_error(arena_bytes, limit_bytes));
                 }
-            };
-            plan.avx2.push(Avx2BodyPlan { source, code });
+                *slot = code;
+                code_factors.push(factor);
+                offsets.push(code as usize * AVX2_MAX_BODY_BYTES);
+            }
+            plan.avx2.push(Avx2BodyPlan {
+                source,
+                code: *slot as usize,
+            });
         }
         plans.push(plan);
     }
+
+    let arena_bytes = code_factors
+        .len()
+        .checked_mul(AVX2_MAX_BODY_BYTES)
+        .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
 
     Ok(Avx2BatchLayout {
         code_factors,
         offsets,
         rows: plans,
-        size,
+        size: PackedCodeSize {
+            generated_bytes: 0,
+            arena_bytes,
+        },
     })
 }
 
 fn build_avx2_batch(
     rows: &[&[u16]],
     limit_bytes: usize,
-    reusable: Option<MmapMut>,
-    lease: Option<Arc<WorkspaceLease>>,
+    reusable: &mut Option<MmapMut>,
+    owner: PackedBatchOwner,
 ) -> Result<PackedJitBatch, PackedBuildError> {
-    let diagnostic = std::env::var_os("WEAVER_XORJIT_BUILD_DIAGNOSTICS").is_some();
-    let started = std::time::Instant::now();
-    let layout = plan_avx2_batch(rows, limit_bytes)?;
-    let planned = started.elapsed();
+    let mut layout = plan_avx2_batch(rows, limit_bytes)?;
     if layout.code_factors.is_empty() {
         return Ok(PackedJitBatch::from_finalized(
             JitWidth::Avx2,
@@ -573,48 +797,48 @@ fn build_avx2_batch(
             layout.size,
             Vec::new(),
             None,
-            lease,
+            owner,
         ));
     }
 
-    let allocation_started = std::time::Instant::now();
-    let mut writable = match reusable {
-        Some(mapping) if mapping.len() >= layout.size.arena_bytes => mapping,
-        _ => MmapMut::map_anon(layout.size.arena_bytes)?,
+    let allocation_bytes = if limit_bytes == usize::MAX {
+        layout.size.arena_bytes
+    } else {
+        limit_bytes
     };
-    let allocated = allocation_started.elapsed();
-    let emit_started = std::time::Instant::now();
-    let mut scratch = Vec::with_capacity(AVX2_MAX_BODY_BYTES);
-    for (&factor, &offset) in layout.code_factors.iter().zip(&layout.offsets) {
-        scratch.clear();
-        avx2_emitter::append_muladd_body_optional_prefetch(&mut scratch, factor)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let end = offset + scratch.len();
-        writable[offset..end].copy_from_slice(&scratch);
-    }
-    let emitted = emit_started.elapsed();
-    let seal_started = std::time::Instant::now();
+    let mut writable = match reusable.take() {
+        Some(mapping) if mapping.len() >= layout.size.arena_bytes => mapping,
+        _ => MmapMut::map_anon(allocation_bytes)?,
+    };
+    layout.size.generated_bytes = writable[..layout.size.arena_bytes]
+        .par_chunks_mut(AVX2_MAX_BODY_BYTES)
+        .zip(layout.code_factors.par_iter())
+        .map_init(
+            || Vec::with_capacity(AVX2_MAX_BODY_BYTES),
+            |body, (slot, &factor)| -> Result<usize, io::Error> {
+                body.clear();
+                avx2_emitter::append_muladd_body_optional_prefetch(body, factor)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                slot[..body.len()].copy_from_slice(body);
+                Ok(body.len())
+            },
+        )
+        .try_reduce(
+            || 0usize,
+            |left, right| {
+                left.checked_add(right)
+                    .ok_or_else(|| io::Error::other("AVX2 generated-code size overflow"))
+            },
+        )?;
     let (finalized, arena) =
         JitCode::finalize_writable_arena(writable, &layout.offsets, layout.size.arena_bytes)?;
-    let sealed = seal_started.elapsed();
-    if diagnostic {
-        eprintln!(
-            "xorjit batch: bodies={} bytes={} plan_us={} alloc_us={} emit_us={} seal_us={}",
-            layout.code_factors.len(),
-            layout.size.arena_bytes,
-            planned.as_micros(),
-            allocated.as_micros(),
-            emitted.as_micros(),
-            sealed.as_micros(),
-        );
-    }
     Ok(PackedJitBatch::from_finalized(
         JitWidth::Avx2,
         layout.rows,
         layout.size,
         finalized,
         Some(arena),
-        lease,
+        owner,
     ))
 }
 
@@ -783,6 +1007,12 @@ impl PackedJitCode {
 
         match self.width {
             JitWidth::Avx2 => {
+                let storage =
+                    self.avx2_storage
+                        .as_ref()
+                        .ok_or(PackedExecutionError::InvalidDispatch(
+                            "AVX2 packed dispatch is missing executable storage",
+                        ))?;
                 for body in &self.avx2 {
                     if body.source >= run.live_regions {
                         break;
@@ -794,12 +1024,16 @@ impl PackedJitCode {
                         run.prefetch_in,
                         run.prefetch_out,
                     );
+                    let code = storage.entries.get(body.code as usize).ok_or(
+                        PackedExecutionError::InvalidDispatch(
+                            "AVX2 packed dispatch contains an invalid code index",
+                        ),
+                    )?;
                     match prefetch {
                         Some(prefetch) => {
-                            body.code
-                                .run_muladd_prefetch(source, run.dst, run.len, prefetch);
+                            code.run_muladd_prefetch(source, run.dst, run.len, prefetch);
                         }
-                        None => body.code.run_muladd(source, run.dst, run.len),
+                        None => code.run_muladd(source, run.dst, run.len),
                     }
                 }
             }
@@ -885,6 +1119,20 @@ unsafe fn prefetch_bytes(pointer: *const u8) {
 mod tests {
     use super::*;
 
+    fn batch_arena(batch: &PackedJitBatch) -> &Arc<Mmap> {
+        match &batch.storage {
+            PackedBatchStorage::Detached {
+                _arena: Some(arena),
+            }
+            | PackedBatchStorage::Workspace {
+                arena: Some(arena), ..
+            } => arena,
+            PackedBatchStorage::Detached { _arena: None }
+            | PackedBatchStorage::Workspace { arena: None, .. }
+            | PackedBatchStorage::SharedCodebook => panic!("batch has no owned arena"),
+        }
+    }
+
     #[test]
     fn avx512_groups_cover_all_prefix_shapes() {
         let dispatch = PackedJitCode::new(JitWidth::Avx512, &[1, 2, 3, 4, 5, 6]).unwrap();
@@ -958,7 +1206,7 @@ mod tests {
         );
 
         let batch = PackedJitBatch::new(JitWidth::Avx2, &[&row]).unwrap();
-        assert!(batch.arena.is_some());
+        assert!(!batch_arena(&batch).is_empty());
     }
 
     #[test]
@@ -970,13 +1218,14 @@ mod tests {
         assert_eq!(one, two);
 
         let batch = PackedJitBatch::new(JitWidth::Avx2, &[&first, &second]).unwrap();
-        assert!(batch.arena.is_some());
+        assert!(!batch_arena(&batch).is_empty());
         assert_eq!(batch.rows[0].avx2.len(), 2);
         assert_eq!(batch.rows[1].avx2.len(), 2);
-        assert!(super::super::memory::shares_mapping(
-            &batch.rows[0].avx2[0].code,
-            &batch.rows[1].avx2[1].code,
+        assert!(Arc::ptr_eq(
+            batch.rows[0].avx2_storage.as_ref().unwrap(),
+            batch.rows[1].avx2_storage.as_ref().unwrap(),
         ));
+        assert_eq!(batch.rows[0].avx2[0].code, batch.rows[1].avx2[1].code);
     }
 
     #[test]
@@ -1060,12 +1309,36 @@ mod tests {
     }
 
     #[test]
+    fn active_avx2_plan_uses_one_fixed_slot_per_distinct_factor() {
+        let first = [1u16, 2, 0];
+        let second = [2u16, 3, 0];
+        let layout = plan_avx2_batch(&[&first, &second], usize::MAX).unwrap();
+        assert_eq!(layout.code_factors, [1, 2, 3]);
+        assert_eq!(
+            layout.offsets,
+            [0, AVX2_MAX_BODY_BYTES, 2 * AVX2_MAX_BODY_BYTES]
+        );
+        assert_eq!(layout.size.generated_bytes, 0);
+        assert_eq!(layout.size.arena_bytes, 3 * AVX2_MAX_BODY_BYTES);
+
+        let limit =
+            PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 2, first.len()).unwrap();
+        let mut workspace = PackedJitWorkspace::default();
+        let batch = workspace
+            .build(JitWidth::Avx2, &[&first, &second], limit)
+            .unwrap();
+        assert!(batch.code_size().generated_bytes > 0);
+        assert_eq!(batch.code_size().arena_bytes, 3 * AVX2_MAX_BODY_BYTES);
+        workspace.recycle(batch).unwrap();
+    }
+
+    #[test]
     fn workspace_enforces_active_group_backpressure() {
         let row = [1u16, 2, 3];
         let limit = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 1, row.len()).unwrap();
         let mut workspace = PackedJitWorkspace::default();
         let first = workspace.build(JitWidth::Avx2, &[&row], limit).unwrap();
-        let mapping = first.arena.as_ref().unwrap().as_ptr();
+        let mapping = batch_arena(&first).as_ptr();
         let blocked = match workspace.build(JitWidth::Avx2, &[&row], limit) {
             Err(error) => error,
             Ok(_) => panic!("workspace must hold one active input group"),
@@ -1074,8 +1347,38 @@ mod tests {
         workspace.recycle(first).unwrap();
 
         let second = workspace.build(JitWidth::Avx2, &[&row], limit).unwrap();
-        assert_eq!(second.arena.as_ref().unwrap().as_ptr(), mapping);
+        assert_eq!(batch_arena(&second).as_ptr(), mapping);
         workspace.recycle(second).unwrap();
+    }
+
+    #[test]
+    fn repair_codebook_is_bounded_and_never_recyclable() {
+        let factors = [1u16, 2, 3, 2, 1];
+        let codebook = Avx2Codebook::build(&factors, usize::MAX).unwrap();
+        let peak = codebook.build_peak_bytes();
+        assert!(peak >= codebook.retained_bytes());
+        assert!(peak >= codebook.code_size().arena_bytes);
+
+        let batch = codebook.build_batch(&[&factors]).unwrap();
+        assert!(!batch.requires_workspace_recycle());
+        let mut workspace = PackedJitWorkspace::default();
+        assert!(workspace.recycle(batch).is_err());
+
+        drop(codebook);
+        assert!(Avx2Codebook::build(&factors, peak).is_ok());
+        assert!(matches!(
+            Avx2Codebook::build(&factors, peak - 1),
+            Err(PackedBuildError::Resource { .. })
+        ));
+    }
+
+    #[test]
+    fn repair_codebook_rejects_an_unplanned_factor() {
+        let codebook = Avx2Codebook::build(&[1u16, 2], usize::MAX).unwrap();
+        assert!(matches!(
+            codebook.build_batch(&[&[3u16]]),
+            Err(PackedBuildError::InvalidInput(_))
+        ));
     }
 
     #[cfg(target_arch = "x86_64")]

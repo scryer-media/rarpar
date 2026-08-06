@@ -3436,8 +3436,8 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
                 let mut acc = clmul_round1(first.2.as_ptr().add(offset), &first.1);
                 let rest = &group[1..];
                 if SHA3 && !FUSED {
-                    // EOR3 rotation: two fresh product sets per merge, odd
-                    // leftover via plain merge (gf16_clmul_sha3.c:86-112).
+                    // Merge pairs through EOR3 and handle an odd final product
+                    // with the single-product path.
                     let mut i = 0usize;
                     while i + 2 <= rest.len() {
                         let b = rest[i].unwrap();

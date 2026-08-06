@@ -188,10 +188,10 @@ func executeSubject(ctx context.Context, role, label, binary string, manifest Co
 		return failedExecution(role, label, manifest, run, warmup, err)
 	}
 	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, true)
-	backend, fallback := backendFromLogs(options.Plan.Lane, string(stderr))
-	if err == nil && requiresOutput(manifest) {
+	backend, fallback := backendFromLogs(options.Plan.Lane, string(stdout)+string(stderr))
+	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
-		err = validateExpected(filepath.Join(stage, "out"), manifest.Expected)
+		err = validateBenchmarkOutput(stage, manifest)
 		measurement.ValidationNanos = DurationNanos(time.Since(validationStart))
 	}
 	if err != nil {
@@ -225,23 +225,9 @@ func executeReference(ctx context.Context, reference BinaryIdentity, manifest Co
 		return failedExecution("reference", reference.Label, manifest, run, warmup, err)
 	}
 	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, false)
-	if err == nil && manifest.Config.Family == "par2" && manifest.Config.Mutation != "none" {
-		rarArgs, rarErr := referenceRARArguments(manifest, stage)
-		if rarErr != nil {
-			err = rarErr
-		} else {
-			rarMeasurement, rarStdout, rarStderr, rarErr := timedCommand(ctx, options.ReferenceRAR, rarArgs, stage, false)
-			measurement.WallNanos += rarMeasurement.WallNanos
-			measurement.UserNanos += rarMeasurement.UserNanos
-			measurement.SystemNanos += rarMeasurement.SystemNanos
-			stdout = append(stdout, rarStdout...)
-			stderr = append(stderr, rarStderr...)
-			err = rarErr
-		}
-	}
-	if err == nil && requiresOutput(manifest) {
+	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
-		err = validateExpected(filepath.Join(stage, "out"), manifest.Expected)
+		err = validateBenchmarkOutput(stage, manifest)
 		measurement.ValidationNanos = DurationNanos(time.Since(validationStart))
 	}
 	if err != nil {
@@ -283,6 +269,37 @@ func applyMutation(stage string, manifest CorpusCaseManifest) error {
 			return err
 		}
 		return file.Sync()
+	case "heavy-damage":
+		archive, err := firstArchive(stage)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(archive)
+		if err != nil {
+			return err
+		}
+		sliceSize := manifest.Config.PAR2SliceSize
+		totalSlices := (info.Size() + sliceSize - 1) / sliceSize
+		if int64(manifest.Config.DamageCount+1) > totalSlices {
+			return fmt.Errorf("heavy damage count exceeds available slices")
+		}
+		stride := totalSlices / int64(manifest.Config.DamageCount+1)
+		file, err := os.OpenFile(archive, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		damage := bytes.Repeat([]byte{0xA5}, manifest.Config.DamageBytesPerSite)
+		for index := 0; index < manifest.Config.DamageCount; index++ {
+			offset := stride*int64(index+1)*sliceSize + 100
+			if offset+int64(len(damage)) > info.Size() {
+				return fmt.Errorf("heavy damage site exceeds archive length")
+			}
+			if _, err := file.WriteAt(damage, offset); err != nil {
+				return err
+			}
+		}
+		return file.Sync()
 	case "remove-volume":
 		archive, err := removableArchive(stage, manifest.Config.RecoveryVolumes)
 		if err != nil {
@@ -307,17 +324,17 @@ func candidateArguments(manifest CorpusCaseManifest, stage, par2Placement string
 		return append(args, archive, filepath.Join(stage, "out")), nil
 	}
 	if manifest.Config.Family == "par2" && manifest.Config.Mutation == "none" {
-		return []string{"par", "verify", "--par-placement", par2Placement, filepath.Join(stage, "release.par2")}, nil
-	}
-	args := []string{"auto", "--par-placement", par2Placement, "--output", filepath.Join(stage, "out")}
-	if manifest.Config.Encrypted {
-		passwordFile := filepath.Join(stage, "passwords.txt")
-		if err := os.WriteFile(passwordFile, []byte(benchmarkPassword+"\n"), 0o600); err != nil {
+		main, err := mainPAR2(stage)
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, "--password-file", passwordFile)
+		return []string{"par", "verify", "--par-placement", par2Placement, main}, nil
 	}
-	return append(args, stage), nil
+	main, err := mainPAR2(stage)
+	if err != nil {
+		return nil, err
+	}
+	return []string{"par", "repair", "--par-placement", par2Placement, main}, nil
 }
 
 func referenceRARArguments(manifest CorpusCaseManifest, stage string) ([]string, error) {
@@ -334,10 +351,33 @@ func referenceRARArguments(manifest CorpusCaseManifest, stage string) ([]string,
 }
 
 func referencePAR2Arguments(manifest CorpusCaseManifest, stage string) ([]string, error) {
-	if manifest.Config.Mutation == "none" {
-		return []string{"v", filepath.Join(stage, "release.par2")}, nil
+	main, err := mainPAR2(stage)
+	if err != nil {
+		return nil, err
 	}
-	return []string{"r", filepath.Join(stage, "release.par2")}, nil
+	if manifest.Config.Mutation == "none" {
+		return []string{"v", main}, nil
+	}
+	return []string{"r", main}, nil
+}
+
+func mainPAR2(stage string) (string, error) {
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return "", err
+	}
+	var candidates []string
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name())
+		if entry.Type().IsRegular() && strings.HasSuffix(name, ".par2") && !strings.Contains(name, ".vol") {
+			candidates = append(candidates, filepath.Join(stage, entry.Name()))
+		}
+	}
+	sort.Strings(candidates)
+	if len(candidates) != 1 {
+		return "", fmt.Errorf("expected one main PAR2 file, found %d", len(candidates))
+	}
+	return candidates[0], nil
 }
 
 func firstArchive(stage string) (string, error) {
@@ -387,8 +427,19 @@ func rarVolumes(stage string) ([]string, error) {
 	return archives, nil
 }
 
-func requiresOutput(manifest CorpusCaseManifest) bool {
+func requiresValidation(manifest CorpusCaseManifest) bool {
 	return manifest.Config.Family == "rar" || manifest.Config.Mutation != "none"
+}
+
+func validateBenchmarkOutput(stage string, manifest CorpusCaseManifest) error {
+	if manifest.Config.Family == "rar" {
+		return validateExpected(filepath.Join(stage, "out"), manifest.Expected)
+	}
+	expected := make([]ExpectedFile, len(manifest.Sources))
+	for index, source := range manifest.Sources {
+		expected[index] = ExpectedFile{Path: source.Path, Bytes: source.Bytes, SHA256: source.SHA256}
+	}
+	return validateExpected(stage, expected)
 }
 
 func timedCommand(ctx context.Context, program string, args []string, directory string, candidate bool) (Measurement, []byte, []byte, error) {
@@ -410,7 +461,7 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	return measurement, stdout.Bytes(), stderr.Bytes(), err
 }
 
-var backendPattern = regexp.MustCompile(`backend=(metal|wgpu)`)
+var backendPattern = regexp.MustCompile(`backend="?(metal|wgpu)"?`)
 
 func backendFromLogs(lane, stderr string) (string, string) {
 	if match := backendPattern.FindStringSubmatch(stderr); len(match) == 2 {

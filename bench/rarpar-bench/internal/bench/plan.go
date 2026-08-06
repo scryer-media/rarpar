@@ -6,12 +6,15 @@ import (
 	"sort"
 )
 
-func CreatePlan(corpusRoot, seed, lane, par2Placement string, warmups, repeats int) (Plan, error) {
+func CreatePlan(corpusRoot, seed, lane, family, par2Placement string, warmups, repeats int) (Plan, error) {
 	if warmups < 0 || repeats < 1 {
 		return Plan{}, fmt.Errorf("warmups must be non-negative and repeats must be positive")
 	}
-	if lane != "cpu" && lane != "docker-cpu" {
-		return Plan{}, fmt.Errorf("lane must be cpu or docker-cpu")
+	if lane != "cpu" && lane != "metal" && lane != "wgpu" && lane != "docker-cpu" {
+		return Plan{}, fmt.Errorf("lane must be cpu, metal, wgpu, or docker-cpu")
+	}
+	if family != "" && family != "rar" && family != "par2" {
+		return Plan{}, fmt.Errorf("family must be rar or par2")
 	}
 	if par2Placement != "canonical" && par2Placement != "smart" {
 		return Plan{}, fmt.Errorf("PAR2 placement must be canonical or smart")
@@ -37,6 +40,9 @@ func CreatePlan(corpusRoot, seed, lane, par2Placement string, warmups, repeats i
 		}
 		if manifest.CorpusDigest != index.Digest {
 			return Plan{}, fmt.Errorf("case %q does not match corpus digest", manifest.ID)
+		}
+		if family != "" && manifest.Config.Family != family {
+			continue
 		}
 		ids = append(ids, manifest.ID)
 	}
@@ -65,9 +71,10 @@ func CreatePlan(corpusRoot, seed, lane, par2Placement string, warmups, repeats i
 		Warmups       int        `json:"warmups"`
 		Repeats       int        `json:"repeats"`
 		Lane          string     `json:"lane"`
+		Family        string     `json:"family,omitempty"`
 		Par2Placement string     `json:"par2_placement"`
 		Cases         []PlanCase `json:"cases"`
-	}{plan.CorpusDigest, plan.Seed, plan.Warmups, plan.Repeats, plan.Lane, plan.Par2Placement, plan.Cases})
+	}{plan.CorpusDigest, plan.Seed, plan.Warmups, plan.Repeats, plan.Lane, family, plan.Par2Placement, plan.Cases})
 	if err != nil {
 		return Plan{}, err
 	}

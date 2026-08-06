@@ -1,5 +1,7 @@
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, BufRead, Read};
 use std::path::Path;
 
 use crate::error::RarparError;

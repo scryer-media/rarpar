@@ -45,20 +45,26 @@ type CorpusConfig struct {
 }
 
 type CaseConfig struct {
-	ID              string `json:"id"`
-	Family          string `json:"family"`
-	Writer          string `json:"writer"`
-	Format          int    `json:"format"`
-	Store           bool   `json:"store"`
-	PPMd            bool   `json:"ppmd"`
-	PayloadProfile  string `json:"payload_profile"`
-	VolumeSize      string `json:"volume_size"`
-	Solid           bool   `json:"solid"`
-	Encrypted       bool   `json:"encrypted"`
-	PAR2            bool   `json:"par2"`
-	RecoveryVolumes bool   `json:"recovery_volumes"`
-	Mutation        string `json:"mutation"`
-	Workload        string `json:"workload"`
+	ID                 string `json:"id"`
+	Family             string `json:"family"`
+	Writer             string `json:"writer"`
+	Format             int    `json:"format"`
+	Store              bool   `json:"store"`
+	PPMd               bool   `json:"ppmd"`
+	PayloadProfile     string `json:"payload_profile"`
+	VolumeSize         string `json:"volume_size"`
+	Solid              bool   `json:"solid"`
+	Encrypted          bool   `json:"encrypted"`
+	PAR2               bool   `json:"par2"`
+	RecoveryVolumes    bool   `json:"recovery_volumes"`
+	Mutation           string `json:"mutation"`
+	DamageCount        int    `json:"damage_count,omitempty"`
+	DamageBytesPerSite int    `json:"damage_bytes_per_site,omitempty"`
+	PAR2SliceSize      int64  `json:"par2_slice_size,omitempty"`
+	FixtureDir         string `json:"fixture_dir,omitempty"`
+	FixturePrefix      string `json:"fixture_prefix,omitempty"`
+	FixtureSHA256      string `json:"fixture_sha256,omitempty"`
+	Workload           string `json:"workload"`
 }
 
 type ExpectedFile struct {

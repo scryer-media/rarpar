@@ -61,6 +61,9 @@ func TestCandidateRARArgumentsUseDirectExtraction(t *testing.T) {
 
 func TestCandidateArgumentsCarryPAR2PlacementPolicy(t *testing.T) {
 	stage := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stage, "release.par2"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	verify, err := candidateArguments(CorpusCaseManifest{Config: CaseConfig{Family: "par2", Mutation: "none"}}, stage, "canonical")
 	if err != nil {
 		t.Fatal(err)
@@ -73,8 +76,8 @@ func TestCandidateArgumentsCarryPAR2PlacementPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := strings.Join(repair[:4], "\x00"), strings.Join([]string{"auto", "--par-placement", "smart", "--output"}, "\x00"); got != want {
-		t.Fatalf("repair arguments = %q, want prefix %q", repair, want)
+	if got, want := strings.Join(repair, "\x00"), strings.Join([]string{"par", "repair", "--par-placement", "smart", filepath.Join(stage, "release.par2")}, "\x00"); got != want {
+		t.Fatalf("repair arguments = %q, want %q", repair, want)
 	}
 }
 
@@ -166,6 +169,63 @@ func TestTextPayloadGenerationIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestImportedFixtureDigestIsPinned(t *testing.T) {
+	harnessRoot := t.TempDir()
+	fixtureRoot := filepath.Join(harnessRoot, "fixture")
+	if err := os.Mkdir(fixtureRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtureRoot, "case.rar"), []byte("rar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixtureRoot, "case.r00"), []byte("volume"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := sourceManifest(fixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := canonicalJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CaseConfig{ID: "case", FixtureDir: "fixture", FixturePrefix: "case", FixtureSHA256: bytesSHA256(encoded)}
+	workRoot := t.TempDir()
+	if err := importFixture(workRoot, harnessRoot, item); err != nil {
+		t.Fatal(err)
+	}
+	item.FixtureSHA256 = strings.Repeat("0", 64)
+	if err := importFixture(t.TempDir(), harnessRoot, item); err == nil {
+		t.Fatal("fixture digest mismatch was accepted")
+	}
+}
+
+func TestHeavyDamageMutationUsesConfiguredSliceCount(t *testing.T) {
+	stage := t.TempDir()
+	archive := filepath.Join(stage, "release.rar")
+	if err := os.WriteFile(archive, make([]byte, 20*1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := CorpusCaseManifest{Config: CaseConfig{
+		Mutation:           "heavy-damage",
+		DamageCount:        3,
+		DamageBytesPerSite: 8,
+		PAR2SliceSize:      1024,
+	}}
+	if err := applyMutation(stage, manifest); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slice := range []int{5, 10, 15} {
+		if got := contents[slice*1024+100 : slice*1024+108]; !bytes.Equal(got, bytes.Repeat([]byte{0xA5}, 8)) {
+			t.Fatalf("slice %d was not damaged at the configured offset", slice)
+		}
+	}
+}
+
 func TestPlanOrderIsStable(t *testing.T) {
 	ids := []string{"third", "first", "second"}
 	first := deterministicOrder(ids, "seed")
@@ -194,7 +254,7 @@ func TestRenderSVGIsDeterministicAndEscapesInput(t *testing.T) {
 	if !bytes.Equal(first, second) {
 		t.Fatal("SVG output is not byte deterministic")
 	}
-	const goldenRARSVG = "eed298ba1db6925d6cc9e3d74da54f53ffc8ac63b1188abf7ee2b04d9b6ba89e"
+	const goldenRARSVG = "86a8334d37545446b547382aa3abd40650b7d1ffa7d5bbdd617f9323a86fc589"
 	if got := bytesSHA256(first); got != goldenRARSVG {
 		t.Fatalf("RAR SVG changed: got %s, want %s", got, goldenRARSVG)
 	}
@@ -216,7 +276,7 @@ func TestRenderPAR2SVGGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const goldenPAR2SVG = "916c2208309b03eb3f89d2edb37d9f114cd4c60e8f4c9eecd457b5a6e95e9fbe"
+	const goldenPAR2SVG = "5b6800f8856c019fa58d9b60cba0cdd3ba5c69f799ae870dd1a5e008d15239c3"
 	if got := bytesSHA256(chart); got != goldenPAR2SVG {
 		t.Fatalf("PAR2 SVG changed: got %s, want %s", got, goldenPAR2SVG)
 	}

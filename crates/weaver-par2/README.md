@@ -8,7 +8,7 @@ binary.
 
 ```toml
 [dependencies]
-par2-rs = "0.2"
+par2-rs = "0.3"
 ```
 
 ## Usage
@@ -50,6 +50,26 @@ bytes that are still arriving over a network, or that are assembled from a
 source with no file paths at all.
 
 ## Performance
+
+### rarpar 0.3.0 release validation
+
+These deterministic end-to-end runs use the synthetic `rarpar-bench` corpus,
+one warmup, seven measured runs, canonical PAR2 placement, and SHA-256 output
+validation. Windows and Linux use CPU-only release builds. Apple Silicon is
+shown once with the CPU backend and once with a Metal-capable build; normal
+runtime gating engages Metal only for the heavy repair rows. Verification and
+small repairs remain on CPU. The runs include CLI discovery, repair, and
+post-repair verification rather than measuring only the repair kernel.
+
+![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-par2-benchmark-windows-x86_64.svg)
+
+![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-par2-benchmark-linux-x86_64.svg)
+
+![PAR2 CPU workloads on Apple M5 Max with macOS arm64](docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
+
+![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+
+### Broader library workloads
 
 Measured against `par2cmdline-turbo 1.4.0` on the same damaged sets, across an
 11-scenario differential suite. Warm-cache medians from release builds with
@@ -105,6 +125,8 @@ measured against.
 
 The PAR2 format itself is specified in the
 [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
+
+Versioned API and migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
