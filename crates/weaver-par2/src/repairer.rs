@@ -3369,11 +3369,20 @@ impl RepairState {
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
                     }
-                    Ok(_) => {
+                    Ok(metadata) if metadata.file_type().is_file() => {
                         let backup = unique_backup_path(dst)?;
                         fs::rename(dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
+                    }
+                    Ok(_) => {
+                        return Err(Par2Error::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "repair target exists and is not a regular file: {}",
+                                dst.display()
+                            ),
+                        )));
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
@@ -3383,20 +3392,20 @@ impl RepairState {
                 installed_targets.push(dst.clone());
             }
 
-            for source in consumed_complete_sources {
-                match fs::remove_file(&source) {
-                    Ok(()) => crate::file_cache::drop_path_cache(&source),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
             Ok(())
         })();
 
         if install_result.is_err() {
             rollback_installed_files(&installed_targets, &backups);
-        } else if options.purge {
-            purge_files_best_effort(backups.iter().map(|(_, backup)| backup));
+        } else {
+            // The repaired targets are now accepted. Removing duplicate extra
+            // sources is cleanup, not part of the rollback transaction: a
+            // cleanup failure must never discard the valid source and then
+            // restore a damaged target.
+            purge_files_best_effort(&consumed_complete_sources);
+            if options.purge {
+                purge_files_best_effort(backups.iter().map(|(_, backup)| backup));
+            }
         }
         install_result
     }
@@ -9196,6 +9205,31 @@ mod tests {
         state.install_repaired_files(&repair, &options).unwrap();
 
         assert_eq!(fs::read(dir.path().join("target.bin")).unwrap(), data);
+    }
+
+    #[test]
+    fn install_repaired_files_does_not_replace_a_directory() {
+        let dir = tempdir().unwrap();
+        let data = b"target--target--".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        let extra = dir.path().join("target.extra");
+        let target = dir.path().join("target.bin");
+        fs::write(&extra, &data).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.extra_paths = vec![extra.clone()];
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+        let repair = state.repair(&options, &verification).unwrap();
+        let error = state
+            .install_repaired_files(&repair, &options)
+            .expect_err("a repair must not replace an existing directory");
+
+        assert!(matches!(error, Par2Error::Io(_)));
+        assert!(target.is_dir());
+        assert_eq!(fs::read(extra).unwrap(), data);
     }
 
     #[cfg(unix)]

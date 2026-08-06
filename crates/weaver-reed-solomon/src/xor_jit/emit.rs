@@ -129,6 +129,21 @@ pub fn cmp_rr(buf: &mut Vec<u8>, a: u8, b: u8) {
     buf.push((0b11 << 6) | ((b & 7) << 3) | (a & 7));
 }
 
+/// `TEST r64_a, r64_b` (`REX.W 85 /r`).
+pub fn test_rr(buf: &mut Vec<u8>, a: u8, b: u8) {
+    buf.push(0x48 | (((b >= 8) as u8) << 2) | ((a >= 8) as u8)); // REX.W (+R if b>=8, +B if a>=8)
+    buf.push(0x85);
+    buf.push((0b11 << 6) | ((b & 7) << 3) | (a & 7));
+}
+
+/// `JZ rel32` (`0F 84 cd`). `rel` is relative to the end of this 6-byte
+/// instruction.
+pub fn jz_rel32(buf: &mut Vec<u8>, rel: i32) {
+    buf.push(0x0F);
+    buf.push(0x84);
+    buf.extend_from_slice(&rel.to_le_bytes());
+}
+
 /// `JL rel32` (`0F 8C cd`). `rel` is relative to the end of this 6-byte
 /// instruction. Use [`jl_to`] to target an absolute buffer offset.
 pub fn jl_rel32(buf: &mut Vec<u8>, rel: i32) {
@@ -360,6 +375,13 @@ mod tests {
         );
         // cmp rdx, rcx -> 48 39 CA  (matches ParPar back-edge)
         assert_eq!(emit(|b| cmp_rr(b, RDX, RCX)), [0x48, 0x39, 0xCA]);
+        // test rsi, rsi -> 48 85 F6
+        assert_eq!(emit(|b| test_rr(b, RSI, RSI)), [0x48, 0x85, 0xF6]);
+        // jz +0x12345678 -> 0F 84 78 56 34 12
+        assert_eq!(
+            emit(|b| jz_rel32(b, 0x1234_5678)),
+            [0x0F, 0x84, 0x78, 0x56, 0x34, 0x12]
+        );
         // ret -> C3
         assert_eq!(emit(ret), [0xC3]);
         // prefetcht1 [rsi] -> 0F 18 16  (/2, base rsi=6)

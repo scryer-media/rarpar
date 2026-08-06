@@ -12,11 +12,15 @@ use std::{collections::HashMap, fmt, io};
 
 const AVX2_PREFETCH_OUTPUT_SOURCES: usize = 2;
 const CODE_ALIGNMENT: usize = 64;
+// Turbo's mutable XOR-JIT scratch reserves 1280 bytes for one generated body.
+// Keep the same bound so PAR2 can reserve two active strict-W^X arenas without
+// generating the complete coefficient domain up front.
+const AVX2_MAX_BODY_BYTES: usize = 1280;
+const AVX512_MAX_BODY_BYTES: usize = 4096;
 
 struct Avx2Body {
     source: usize,
     code: JitCode,
-    prefetch_code: JitCode,
 }
 
 struct Avx512Group {
@@ -27,8 +31,7 @@ struct Avx512Group {
 #[derive(Clone, Copy)]
 struct Avx2BodyPlan {
     source: usize,
-    normal: usize,
-    prefetch: usize,
+    code: usize,
 }
 
 struct Avx512GroupPlan {
@@ -208,6 +211,23 @@ impl PackedJitBatch {
         Ok(build_batch_plan(width, rows, usize::MAX)?.size)
     }
 
+    /// Conservative alignment-inclusive bound for one active coefficient
+    /// batch. This is intentionally allocation-free: controller owners use it
+    /// to reserve two rotating W^X arenas before choosing the JIT backend.
+    pub fn active_arena_upper_bound(
+        width: JitWidth,
+        row_count: usize,
+        factors_per_row: usize,
+    ) -> Option<usize> {
+        let body_bytes = match width {
+            JitWidth::Avx2 => AVX2_MAX_BODY_BYTES,
+            JitWidth::Avx512 => AVX512_MAX_BODY_BYTES,
+        };
+        row_count
+            .checked_mul(factors_per_row)?
+            .checked_mul(body_bytes)
+    }
+
     /// Build one shared executable arena for all coefficient rows.
     ///
     /// Integration contract: retain this batch for the input group and use
@@ -241,8 +261,7 @@ impl PackedJitBatch {
                     .into_iter()
                     .map(|body| Avx2Body {
                         source: body.source,
-                        code: finalized[body.normal].clone(),
-                        prefetch_code: finalized[body.prefetch].clone(),
+                        code: finalized[body.code].clone(),
                     })
                     .collect(),
                 avx512: plan
@@ -299,7 +318,7 @@ fn build_batch_plan(
     }
 
     let mut generated = GeneratedBodies::new(limit_bytes);
-    let mut avx2_bodies = HashMap::<u16, (usize, usize)>::new();
+    let mut avx2_bodies = HashMap::<u16, usize>::new();
     let mut plans = Vec::with_capacity(rows.len());
     for &factors in rows {
         let mut plan = PackedRowPlan {
@@ -313,21 +332,16 @@ fn build_batch_plan(
                     if factor == 0 {
                         continue;
                     }
-                    let (normal, prefetch) = if let Some(&slots) = avx2_bodies.get(&factor) {
-                        slots
+                    let code = if let Some(&slot) = avx2_bodies.get(&factor) {
+                        slot
                     } else {
                         let factor_deps = deps::compute_deps(factor);
-                        let normal = generated.push(codegen::generate_muladd(&factor_deps))?;
-                        let prefetch = generated
-                            .push(codegen::generate_muladd_with_prefetch(&factor_deps, true))?;
-                        avx2_bodies.insert(factor, (normal, prefetch));
-                        (normal, prefetch)
+                        let code = generated
+                            .push(codegen::generate_muladd_optional_prefetch(&factor_deps))?;
+                        avx2_bodies.insert(factor, code);
+                        code
                     };
-                    plan.avx2.push(Avx2BodyPlan {
-                        source,
-                        normal,
-                        prefetch,
-                    });
+                    plan.avx2.push(Avx2BodyPlan { source, code });
                 }
             }
             JitWidth::Avx512 => {
@@ -388,8 +402,7 @@ impl PackedJitCode {
                         continue;
                     }
                     let factor_deps = deps::compute_deps(factor);
-                    generated.push(codegen::generate_muladd(&factor_deps));
-                    generated.push(codegen::generate_muladd_with_prefetch(&factor_deps, true));
+                    generated.push(codegen::generate_muladd_optional_prefetch(&factor_deps));
                     avx2_sources.push(source);
                 }
             }
@@ -419,7 +432,6 @@ impl PackedJitCode {
                     packed.avx2.push(Avx2Body {
                         source,
                         code: finalized.next().expect("packed AVX2 body"),
-                        prefetch_code: finalized.next().expect("packed AVX2 prefetch body"),
                     });
                 }
             }
@@ -502,7 +514,7 @@ impl PackedJitCode {
                         run.prefetch_out,
                     );
                     if let Some(prefetch) = prefetch {
-                        body.prefetch_code
+                        body.code
                             .run_muladd_prefetch(source, run.dst, run.len, prefetch);
                     } else {
                         body.code.run_muladd(source, run.dst, run.len);
@@ -607,7 +619,8 @@ mod tests {
     #[test]
     fn add_packed_xors_each_live_region() {
         let mut dst = [0x11u8; 130];
-        let src = [0x22u8; 260];
+        let mut src = [0x22u8; 260];
+        src[130..].fill(0x44);
         unsafe {
             add_packed(PackedRun {
                 packed_regions: 2,
@@ -619,7 +632,7 @@ mod tests {
                 prefetch_out: None,
             });
         }
-        assert!(dst.iter().all(|&byte| byte == 0x33));
+        assert!(dst.iter().all(|&byte| byte == 0x77));
     }
 
     #[test]
@@ -649,6 +662,15 @@ mod tests {
                 input_base + len / 2,
             ]
         );
+    }
+
+    #[test]
+    fn packed_avx2_factor_uses_one_optional_prefetch_body() {
+        let row = [0xA53Cu16];
+        let size = PackedJitBatch::estimate(JitWidth::Avx2, &[&row]).unwrap();
+        let body = codegen::generate_muladd_optional_prefetch(&deps::compute_deps(row[0]));
+        assert_eq!(size.generated_bytes, body.len());
+        assert_eq!(size.arena_bytes, body.len());
     }
 
     #[test]

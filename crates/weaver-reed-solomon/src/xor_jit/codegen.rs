@@ -43,7 +43,14 @@ fn plane_off(p: usize) -> i32 {
 /// output accumulators, `ymm2` the shared (CSE) accumulator; source planes 3-15
 /// live in `ymm3..15`, planes 0-2 in memory.
 pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
-    generate_muladd_with_prefetch(deps, false)
+    generate_muladd_mode(deps, PrefetchMode::None)
+}
+
+#[derive(Clone, Copy)]
+enum PrefetchMode {
+    None,
+    Always,
+    Optional,
 }
 
 /// Generate the Turbo-style body with an optional dedicated prefetch stream.
@@ -52,6 +59,24 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
 /// `gf16_xor_avx2.c:262-267`). The call trampoline initializes `rsi` to
 /// `prefetch - 128`, matching `gf16_xor_jit_mul_avx2_base` at lines 403-408.
 pub fn generate_muladd_with_prefetch(deps: &XorDeps, prefetch: bool) -> Vec<u8> {
+    generate_muladd_mode(
+        deps,
+        if prefetch {
+            PrefetchMode::Always
+        } else {
+            PrefetchMode::None
+        },
+    )
+}
+
+/// Generate one immutable packed body that accepts both trampoline shapes.
+/// `rsi = 0` skips the dedicated prefetch stream; otherwise `rsi` follows the
+/// same `prefetch - 128` convention as [`generate_muladd_with_prefetch`].
+pub(crate) fn generate_muladd_optional_prefetch(deps: &XorDeps) -> Vec<u8> {
+    generate_muladd_mode(deps, PrefetchMode::Optional)
+}
+
+fn generate_muladd_mode(deps: &XorDeps, prefetch: PrefetchMode) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1280);
 
     // Loop top: advance to this block, (re)load the resident source planes.
@@ -63,11 +88,22 @@ pub fn generate_muladd_with_prefetch(deps: &XorDeps, prefetch: bool) -> Vec<u8> 
         emit::prefetcht1(&mut buf, RAX, BLOCK - 128);
         emit::prefetcht1(&mut buf, RDX, BLOCK - 128);
     }
-    if prefetch {
+    let skip_prefetch = matches!(prefetch, PrefetchMode::Optional).then(|| {
+        emit::test_rr(&mut buf, emit::RSI, emit::RSI);
+        let jump_start = buf.len();
+        emit::jz_rel32(&mut buf, 0);
+        jump_start
+    });
+    if !matches!(prefetch, PrefetchMode::None) {
         emit::add_ri(&mut buf, emit::RSI, 256);
         for offset in [-128, -64, 0, 64] {
             emit::prefetcht1(&mut buf, emit::RSI, offset);
         }
+    }
+    if let Some(jump_start) = skip_prefetch {
+        let jump_end = jump_start + 6;
+        let relative = i32::try_from(buf.len() - jump_end).expect("prefetch block fits rel32");
+        buf[jump_start + 2..jump_end].copy_from_slice(&relative.to_le_bytes());
     }
     for p in 3..16usize {
         emit::vmovdqu_load(&mut buf, p as u8, RAX, plane_off(p));
@@ -217,6 +253,39 @@ mod tests {
 
             assert_eq!(got, expected, "factor {factor:#06x}");
         }
+    }
+
+    #[test]
+    fn optional_prefetch_body_supports_both_trampolines() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let len = 3 * 512;
+        let factor = 0xA53Cu16;
+        let src = sample(0x5151, len);
+        let deps = compute_deps(factor);
+        let initial = sample(0x6262, len);
+        let mut expected = initial.clone();
+        muladd_planar(&deps, &src, &mut expected);
+
+        let code = generate_muladd_optional_prefetch(&deps);
+        let jit = JitCode::new(&code).expect("jit alloc");
+
+        let mut without_prefetch = initial.clone();
+        unsafe { jit.run_muladd(src.as_ptr(), without_prefetch.as_mut_ptr(), len) };
+        assert_eq!(without_prefetch, expected);
+
+        let prefetch = vec![0u8; len / 2];
+        let mut with_prefetch = initial;
+        unsafe {
+            jit.run_muladd_prefetch(
+                src.as_ptr(),
+                with_prefetch.as_mut_ptr(),
+                len,
+                prefetch.as_ptr(),
+            )
+        };
+        assert_eq!(with_prefetch, expected);
     }
 
     /// A non-zeroed destination must accumulate (muladd, not overwrite).

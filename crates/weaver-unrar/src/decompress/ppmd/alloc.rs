@@ -606,8 +606,8 @@ impl SubAllocator {
         // sentinel in the offset-based arena.
         let mut head = NodeRef::NULL;
         let mut tail = NodeRef::NULL;
-        for idx in 0..NUM_INDEXES {
-            let units = INDEX_TO_UNITS[idx] as u16;
+        for (idx, &units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
+            let units = units as u16;
             while !self.free_lists[idx].is_null() {
                 let node = self.remove_node(idx);
                 self.glue_insert_head(node, &mut head, &mut tail);

@@ -770,10 +770,8 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
 
     #[inline(always)]
     fn read_byte_or_zero(&mut self) -> u8 {
-        if self.acc_bits < 8 {
-            if self.refill().is_err() || self.acc_bits < 8 {
-                return 0;
-            }
+        if self.acc_bits < 8 && (self.refill().is_err() || self.acc_bits < 8) {
+            return 0;
         }
 
         let byte = (self.acc >> 56) as u8;

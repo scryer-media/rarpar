@@ -43,6 +43,22 @@ func TestReferenceRARArgumentsUseDirectoryDestination(t *testing.T) {
 	}
 }
 
+func TestCandidateRARArgumentsUseDirectExtraction(t *testing.T) {
+	stage := t.TempDir()
+	archive := filepath.Join(stage, "release.part01.rar")
+	if err := os.WriteFile(archive, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, err := candidateArguments(CorpusCaseManifest{Config: CaseConfig{Family: "rar"}}, stage, "canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"x", "-idp", "-o+", archive, filepath.Join(stage, "out")}
+	if got := strings.Join(args, "\x00"); got != strings.Join(want, "\x00") {
+		t.Fatalf("candidate RAR arguments = %q, want %q", args, want)
+	}
+}
+
 func TestCandidateArgumentsCarryPAR2PlacementPolicy(t *testing.T) {
 	stage := t.TempDir()
 	verify, err := candidateArguments(CorpusCaseManifest{Config: CaseConfig{Family: "par2", Mutation: "none"}}, stage, "canonical")

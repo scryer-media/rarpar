@@ -1,14 +1,28 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use rarpar::cli::{Cli, ParArgs, ParCommand, ParPlacement};
+use serde::Serialize;
 use tracing::info;
 
 pub struct ParOutcome {
     pub set_id: String,
     pub success: bool,
     pub message: String,
+    pub repaired: bool,
+    pub recovery_blocks_needed: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ParCommandReport<'a> {
+    schema_version: u8,
+    command: &'a str,
+    success: bool,
+    repaired: bool,
+    recovery_blocks_needed: Option<u32>,
+    message: &'a str,
 }
 
 impl ParOutcome {
@@ -31,25 +45,159 @@ struct ResolvedPar2Input {
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
-    match command {
-        ParCommand::Verify(args) => {
-            let resolved = resolve_input(cli, &args)?;
-            let outcome = run_flow(&resolved, false, false, cli.json)?;
-            Ok(if outcome.success {
+    let (command_name, repair, args) = match command {
+        ParCommand::Verify(args) => ("verify", false, args),
+        ParCommand::Repair(args) => ("repair", true, args),
+    };
+    let resolved = resolve_input(cli, &args)?;
+    let outcome = run_flow(&resolved, repair, cli.dry_run, cli.json)?;
+    emit_command_outcome(cli, command_name, &outcome)?;
+    Ok(if outcome.success {
+        EXIT_SUCCESS
+    } else {
+        EXIT_DATA_FAILURE
+    })
+}
+
+fn emit_command_outcome(
+    cli: &Cli,
+    command: &'static str,
+    outcome: &ParOutcome,
+) -> Result<(), RarparError> {
+    if cli.json {
+        let report = ParCommandReport {
+            schema_version: 1,
+            command,
+            success: outcome.success,
+            repaired: outcome.repaired,
+            recovery_blocks_needed: outcome.recovery_blocks_needed,
+            message: &outcome.message,
+        };
+        println!("{}", serde_json::to_string(&report)?);
+    }
+    Ok(())
+}
+
+/// Accept SABnzbd's `par2 r [options] PARFILE WILDCARD` invocation directly.
+///
+/// This is deliberately limited to repair mode; Rarpar's documented `par`
+/// subcommands remain the general-purpose interface.
+pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
+    let input = parse_par2cmdline_repair_input(args)?;
+    let resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("rarpar: {error}");
+            println!("Repair Failed.");
+            return Some(error.exit_code());
+        }
+    };
+
+    match run_flow(&resolved, true, false, true) {
+        Ok(outcome) => {
+            emit_par2cmdline_outcome(&outcome);
+            Some(if outcome.success {
                 EXIT_SUCCESS
             } else {
                 EXIT_DATA_FAILURE
             })
         }
-        ParCommand::Repair(args) => {
-            let resolved = resolve_input(cli, &args)?;
-            let outcome = run_flow(&resolved, true, cli.dry_run, cli.json)?;
-            Ok(if outcome.success {
-                EXIT_SUCCESS
-            } else {
-                EXIT_DATA_FAILURE
-            })
+        Err(error) => {
+            eprintln!("rarpar: {error}");
+            println!("Repair Failed.");
+            Some(error.exit_code())
         }
+    }
+}
+
+struct Par2cmdlineRepairInput {
+    par2_path: PathBuf,
+    base_dir: Option<PathBuf>,
+    wildcard: Option<PathBuf>,
+}
+
+fn parse_par2cmdline_repair_input(args: &[OsString]) -> Option<Par2cmdlineRepairInput> {
+    if !args
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("r"))
+    {
+        return None;
+    }
+
+    let mut base_dir = None;
+    let mut par2_path = None;
+    let mut wildcard = None;
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy();
+        if text == "-B" {
+            base_dir = iter.next().map(PathBuf::from);
+        } else if let Some(path) = text.strip_prefix("-B").filter(|path| !path.is_empty()) {
+            base_dir = Some(PathBuf::from(path));
+        } else {
+            let path = PathBuf::from(arg);
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"))
+            {
+                par2_path = Some(path);
+            } else if par2_path.is_some() && wildcard.is_none() {
+                wildcard = Some(path);
+            }
+        }
+    }
+
+    par2_path.map(|par2_path| Par2cmdlineRepairInput {
+        par2_path,
+        base_dir,
+        wildcard,
+    })
+}
+
+fn resolve_compat_input(
+    input: &Path,
+    base_dir: Option<PathBuf>,
+    wildcard: Option<PathBuf>,
+) -> Result<ResolvedPar2Input, RarparError> {
+    if !input.exists() {
+        return Err(RarparError::MissingInput(input.to_path_buf()));
+    }
+
+    let par2_paths = discover_compat_par2_paths(input, wildcard.as_deref())?;
+    let set_id = par2_rs::Par2FileSet::from_paths(&par2_paths)
+        .map(|set| set.recovery_set_id.to_string())
+        .unwrap_or_else(|_| format!("par2:{}", input.display()));
+    let primary_dir = base_dir.unwrap_or_else(|| {
+        input
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+
+    Ok(ResolvedPar2Input {
+        set_id,
+        par2_paths,
+        primary_dir,
+        search_dirs: Vec::new(),
+        placement: ParPlacement::Smart,
+    })
+}
+
+fn emit_par2cmdline_outcome(outcome: &ParOutcome) {
+    if outcome.success {
+        if outcome.repaired {
+            println!("Repair is required");
+            println!("Repair is possible");
+            println!("Repair complete");
+        } else {
+            println!("All files are correct");
+        }
+    } else if let Some(blocks) = outcome.recovery_blocks_needed {
+        println!("Repair is required.");
+        println!("You need {blocks} more recovery blocks to be able to repair.");
+    } else {
+        println!("Repair Failed.");
     }
 }
 
@@ -113,6 +261,8 @@ fn run_flow(
                 started.elapsed(),
                 verification.total_missing_blocks
             ),
+            repaired: false,
+            recovery_blocks_needed: None,
         });
     }
 
@@ -122,6 +272,8 @@ fn run_flow(
                 set_id: resolved.set_id.clone(),
                 success: true,
                 message: format!("no repair needed; completed in {:.2?}", started.elapsed()),
+                repaired: false,
+                recovery_blocks_needed: None,
             });
         }
         par2_rs::Repairability::Insufficient {
@@ -135,6 +287,8 @@ fn run_flow(
                 message: format!(
                     "repair not possible: need {blocks_needed} blocks, have {blocks_available} (deficit {deficit})"
                 ),
+                repaired: false,
+                recovery_blocks_needed: Some(*deficit),
             });
         }
         par2_rs::Repairability::ResourceLimited { reason } => {
@@ -175,6 +329,8 @@ fn run_flow(
                 repair_plan.recovery_exponents.len(),
                 started.elapsed()
             ),
+            repaired: false,
+            recovery_blocks_needed: None,
         });
     }
 
@@ -223,6 +379,8 @@ fn run_flow(
             started.elapsed(),
             final_verification.total_missing_blocks
         ),
+        repaired: success,
+        recovery_blocks_needed: None,
     })
 }
 
@@ -246,6 +404,7 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         } else {
             args.input
                 .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf()
         }
@@ -292,9 +451,44 @@ fn collect_par2_paths_from_dir(dir: &Path) -> Result<Vec<PathBuf>, RarparError> 
     Ok(par2_paths)
 }
 
+fn discover_compat_par2_paths(
+    input: &Path,
+    wildcard: Option<&Path>,
+) -> Result<Vec<PathBuf>, RarparError> {
+    let Some(wildcard) = wildcard else {
+        return discover_matching_par2_paths(input);
+    };
+    let parent = wildcard
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let pattern = wildcard
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let mut par2_paths = std::fs::read_dir(parent)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (entry.file_type().ok()?.is_file()
+                && is_ext(&path, "par2")
+                && wildcard_match(&pattern, &entry.file_name().to_string_lossy()))
+            .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    par2_paths.sort();
+    if par2_paths.is_empty() {
+        return discover_matching_par2_paths(input);
+    }
+    Ok(par2_paths)
+}
+
 fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparError> {
     let seed_set = par2_rs::Par2FileSet::from_paths(&[input])?;
-    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let parent = input
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let mut par2_paths = par2_rs::identify_par2_files(parent, &seed_set.recovery_set_id)?;
     if par2_paths.is_empty() {
         par2_paths.push(input.to_path_buf());
@@ -302,6 +496,26 @@ fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparErro
     par2_paths.sort();
     par2_paths.dedup();
     Ok(par2_paths)
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let mut remainder = text;
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    if !remainder.starts_with(first) {
+        return false;
+    }
+    remainder = &remainder[first.len()..];
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[index + part.len()..];
+    }
+    pattern.ends_with('*') || remainder.is_empty()
 }
 
 fn verify_set(

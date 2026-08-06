@@ -190,7 +190,7 @@ impl Model {
     fn debug_enabled(&self) -> bool {
         #[cfg(feature = "ppmd-debug")]
         {
-            return self.debug;
+            self.debug
         }
         #[cfg(not(feature = "ppmd-debug"))]
         {
@@ -202,7 +202,7 @@ impl Model {
     fn debug_index(&self) -> u64 {
         #[cfg(feature = "ppmd-debug")]
         {
-            return self.debug_output_index;
+            self.debug_output_index
         }
         #[cfg(not(feature = "ppmd-debug"))]
         {
@@ -1467,7 +1467,7 @@ impl Model {
             self.model_fault = true;
             return false;
         };
-        if found_delta as usize % STATE_SIZE != 0 {
+        if !(found_delta as usize).is_multiple_of(STATE_SIZE) {
             self.model_fault = true;
             return false;
         }

@@ -41,6 +41,14 @@ fn run(args: &[&OsStr]) -> Output {
     Command::new(bin()).args(args).output().unwrap()
 }
 
+fn run_in_dir(dir: &Path, args: &[&OsStr]) -> Output {
+    Command::new(bin())
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn run_with_input(args: &[&OsStr], input: &[u8]) -> Output {
     let mut child = Command::new(bin())
         .args(args)
@@ -436,6 +444,161 @@ fn par_repair_dry_run_does_not_create_missing_file() {
         "dry-run must not recreate missing files"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("dry-run: would repair"));
+}
+
+#[test]
+fn par_repair_accepts_relative_par2_file_and_emits_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+
+    let output = run_in_dir(
+        &work_dir,
+        &[
+            OsStr::new("--json"),
+            OsStr::new("par"),
+            OsStr::new("repair"),
+            OsStr::new("fixture_rar5_lz_plain_repair.par2"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "relative PAR2 repair failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "repair");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["repaired"], false);
+    assert!(report["recovery_blocks_needed"].is_null());
+}
+
+#[test]
+fn sab_par2_repair_invocation_accepts_a_healthy_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+    let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");
+    let wildcard = work_dir.join("fixture_rar5_lz_plain*");
+
+    let output = run(&[
+        OsStr::new("r"),
+        OsStr::new("-t6"),
+        par2_path.as_os_str(),
+        wildcard.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "SAB PAR2 invocation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "All files are correct"
+    );
+}
+
+#[test]
+fn sab_par2_repair_invocation_accepts_a_recovery_volume_as_parfile() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+    std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
+
+    let output = run(&[
+        OsStr::new("r"),
+        OsStr::new("-t6"),
+        work_dir
+            .join("fixture_rar5_lz_plain_repair.vol00+2.par2")
+            .as_os_str(),
+        work_dir.join("fixture_rar5_lz_plain*").as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "SAB PAR2 recovery-volume invocation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Repair is required"));
+    assert!(stdout.contains("Repair is possible"));
+    assert!(stdout.contains("Repair complete"));
+    assert!(work_dir.join("fixture_rar5_lz_plain.part2.rar").is_file());
+}
+
+#[test]
+fn sab_par2_repair_invocation_requests_missing_recovery_blocks() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+    std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
+    for entry in std::fs::read_dir(&work_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains(".vol"))
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    let output = run(&[
+        OsStr::new("r"),
+        OsStr::new("-t6"),
+        work_dir
+            .join("fixture_rar5_lz_plain_repair.par2")
+            .as_os_str(),
+        work_dir.join("fixture_rar5_lz_plain*").as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("You need ")
+            && String::from_utf8_lossy(&output.stdout).contains("to be able to repair."),
+        "unexpected downloader output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json = run(&[
+        OsStr::new("--json"),
+        OsStr::new("par"),
+        OsStr::new("repair"),
+        work_dir.as_os_str(),
+    ]);
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    assert!(report["recovery_blocks_needed"].as_u64().is_some());
 }
 
 #[test]

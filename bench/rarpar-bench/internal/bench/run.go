@@ -295,6 +295,17 @@ func applyMutation(stage string, manifest CorpusCaseManifest) error {
 }
 
 func candidateArguments(manifest CorpusCaseManifest, stage, par2Placement string) ([]string, error) {
+	if manifest.Config.Family == "rar" {
+		archive, err := firstArchive(stage)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"x", "-idp", "-o+"}
+		if manifest.Config.Encrypted {
+			args = append(args, "-p"+benchmarkPassword)
+		}
+		return append(args, archive, filepath.Join(stage, "out")), nil
+	}
 	if manifest.Config.Family == "par2" && manifest.Config.Mutation == "none" {
 		return []string{"par", "verify", "--par-placement", par2Placement, filepath.Join(stage, "release.par2")}, nil
 	}

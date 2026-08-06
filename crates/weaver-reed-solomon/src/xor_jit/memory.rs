@@ -96,8 +96,9 @@ impl JitCode {
     /// and `ret`s. `vzeroupper` clears the AVX upper state on return.
     ///
     /// # Safety
-    /// `self` must hold a muladd body from [`super::codegen::generate_muladd`],
-    /// AVX2 must be available, `src`/`dst` valid for `len` bytes, `len % 512 == 0`.
+    /// `self` must hold a muladd body from [`super::codegen::generate_muladd`]
+    /// or the packed optional-prefetch generator, AVX2 must be available,
+    /// `src`/`dst` valid for `len` bytes, and `len % 512 == 0`.
     pub unsafe fn run_muladd(&self, src: *const u8, dst: *mut u8, len: usize) {
         let rax = src.wrapping_sub(384);
         let rdx = dst.wrapping_sub(384);
@@ -122,11 +123,11 @@ impl JitCode {
     /// advances that stream by 256 bytes and emits four T1 hints per block.
     ///
     /// # Safety
-    /// This handle must contain an AVX2 prefetch body from
-    /// [`super::codegen::generate_muladd_with_prefetch`], and AVX2 must be
-    /// available. `src` must be readable and `dst` writable for `len`
-    /// non-overlapping bytes, with `len` a multiple of 512. `prefetch` must
-    /// support every address hinted while processing those bytes.
+    /// This handle must contain an AVX2 prefetch body or packed
+    /// optional-prefetch body, and AVX2 must be available. `src` must be
+    /// readable and `dst` writable for `len` non-overlapping bytes, with `len`
+    /// a multiple of 512. `prefetch` must support every address hinted while
+    /// processing those bytes.
     pub unsafe fn run_muladd_prefetch(
         &self,
         src: *const u8,

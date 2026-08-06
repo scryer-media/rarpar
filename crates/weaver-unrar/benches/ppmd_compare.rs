@@ -220,11 +220,12 @@ fn run_timed(binary: &Path, args: &[&OsStr]) -> Result<f64, Box<dyn Error>> {
     Ok(elapsed)
 }
 
-fn rarpar_args<'a>(archive: &'a Path, destination: &'a Path) -> [&'a OsStr; 5] {
+fn rarpar_args<'a>(archive: &'a Path, destination: &'a Path) -> [&'a OsStr; 6] {
     [
-        OsStr::new("--overwrite"),
-        OsStr::new("rar"),
-        OsStr::new("extract"),
+        OsStr::new("x"),
+        OsStr::new("-idp"),
+        OsStr::new("-p-"),
+        OsStr::new("-o+"),
         archive.as_os_str(),
         destination.as_os_str(),
     ]

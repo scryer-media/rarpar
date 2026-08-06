@@ -227,5 +227,5 @@ fn run_rar_command(cli: &Cli, command: RarCommand) -> Result<u8, RarparError> {
 }
 
 fn dispatch_compat(args: &[OsString]) -> Option<u8> {
-    compat_unrar::dispatch(args)
+    par2::dispatch_par2cmdline_compat(args).or_else(|| compat_unrar::dispatch(args))
 }
