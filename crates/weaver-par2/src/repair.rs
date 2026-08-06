@@ -984,14 +984,11 @@ fn prepare_stream_source(
     aligned_len: usize,
     #[cfg(target_arch = "x86_64")] chunk_len: usize,
     #[cfg(not(target_arch = "x86_64"))] _chunk_len: usize,
-    use_folded: bool,
-    use_xorjit: bool,
-    #[cfg(target_arch = "x86_64")] jit_width: Option<reedsolomon_rs::xor_jit::JitWidth>,
+    kernel: CpuKernelKind,
 ) {
-    if use_xorjit {
+    match kernel {
         #[cfg(target_arch = "x86_64")]
-        {
-            let width = jit_width.expect("jit width present when XOR-JIT is active");
+        CpuKernelKind::XorJit(width) => {
             let block = width.block_bytes();
             debug_assert_eq!(aligned_len % block, 0);
             debug_assert_eq!(chunk_len % block, 0);
@@ -1018,16 +1015,18 @@ fn prepare_stream_source(
                 }
             }
         }
-    } else if use_folded {
-        let group = lane / crate::gf_simd::FOLDED_GROUP;
-        let group_lane = lane % crate::gf_simd::FOLDED_GROUP;
-        crate::gf_simd::split_encode_scatter(
-            &source[..aligned_len],
-            staging_bytes_mut(&mut set.staging[group]),
-            group_lane,
-        );
-    } else {
-        set.bufs[lane][..aligned_len].copy_from_slice(&source[..aligned_len]);
+        CpuKernelKind::Folded => {
+            let group = lane / crate::gf_simd::FOLDED_GROUP;
+            let group_lane = lane % crate::gf_simd::FOLDED_GROUP;
+            crate::gf_simd::split_encode_scatter(
+                &source[..aligned_len],
+                staging_bytes_mut(&mut set.staging[group]),
+                group_lane,
+            );
+        }
+        CpuKernelKind::Plain => {
+            set.bufs[lane][..aligned_len].copy_from_slice(&source[..aligned_len]);
+        }
     }
 }
 
@@ -1072,9 +1071,7 @@ fn run_preparation_worker(
     complete_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     prepared_tx: std::sync::mpsc::SyncSender<StreamBatchSet>,
     finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
-    use_folded: bool,
-    use_xorjit: bool,
-    #[cfg(target_arch = "x86_64")] jit_width: Option<reedsolomon_rs::xor_jit::JitWidth>,
+    kernel: CpuKernelKind,
 ) {
     let mut active: Option<PrepareBatch> = None;
     while let Ok(message) = command_rx.recv() {
@@ -1093,10 +1090,7 @@ fn run_preparation_worker(
                     &buffer,
                     batch.aligned_len,
                     batch.chunk_len,
-                    use_folded,
-                    use_xorjit,
-                    #[cfg(target_arch = "x86_64")]
-                    jit_width,
+                    kernel,
                 );
                 if complete_tx.send(buffer).is_err() {
                     break;
@@ -1121,10 +1115,9 @@ fn run_preparation_worker(
                 let source =
                     unsafe { std::slice::from_raw_parts(source as *const u8, aligned_len) };
                 buffer[..aligned_len].copy_from_slice(source);
-                if use_xorjit {
+                match kernel {
                     #[cfg(target_arch = "x86_64")]
-                    {
-                        let width = jit_width.expect("jit width present when XOR-JIT is active");
+                    CpuKernelKind::XorJit(width) => {
                         let block = width.block_bytes();
                         for start in (0..aligned_len).step_by(block) {
                             unsafe {
@@ -1132,8 +1125,10 @@ fn run_preparation_worker(
                             }
                         }
                     }
-                } else if use_folded {
-                    crate::gf_simd::altmap_decode(&mut buffer[..aligned_len]);
+                    CpuKernelKind::Folded => {
+                        crate::gf_simd::altmap_decode(&mut buffer[..aligned_len]);
+                    }
+                    CpuKernelKind::Plain => {}
                 }
                 if finished_tx
                     .send(FinishedOutput {
@@ -1515,13 +1510,15 @@ fn run_cpu_worker(worker: usize, context: &CpuComputeContext<'_>, scratch: &mut 
                         width.run_packed(
                             jit_memo.get(batch, output),
                             &mut scratch.packed_scratch,
-                            packed_regions,
-                            context.set.len,
-                            dst,
-                            packed_chunk,
-                            chunk_len,
-                            prefetch_in,
-                            prefetch_out,
+                            reedsolomon_rs::xor_jit::packed::PackedRun {
+                                packed_regions,
+                                live_regions: context.set.len,
+                                dst,
+                                src: packed_chunk,
+                                len: chunk_len,
+                                prefetch_in,
+                                prefetch_out,
+                            },
                         );
                     }
                 }
@@ -2794,18 +2791,13 @@ fn execute_repair_streaming(
         let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel(2);
         let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(2);
-        #[cfg(target_arch = "x86_64")]
-        let preparation_jit_width = jit_memo.as_ref().map(|memo| memo.width);
         let preparation_worker = scope.spawn(move || {
             run_preparation_worker(
                 command_rx,
                 complete_tx,
                 prepared_tx,
                 finished_tx,
-                use_folded,
-                use_xorjit,
-                #[cfg(target_arch = "x86_64")]
-                preparation_jit_width,
+                cpu_kernel,
             );
         });
         let mut preparer = CpuInputPreparer {
@@ -4527,10 +4519,7 @@ mod tests {
                     complete_tx,
                     prepared_tx,
                     finished_tx,
-                    false,
-                    false,
-                    #[cfg(target_arch = "x86_64")]
-                    None,
+                    CpuKernelKind::Plain,
                 );
             });
             command_tx

@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(one, two);
 
         let batch = PackedJitBatch::new(JitWidth::Avx2, &[&first, &second]).unwrap();
-        assert!(super::memory::shares_mapping(
+        assert!(super::super::memory::shares_mapping(
             &batch.rows[0].avx2[0].code,
             &batch.rows[1].avx2[0].code,
         ));
@@ -671,7 +671,7 @@ mod tests {
         let first = [1u16, 2, 3];
         let second = [4u16, 5, 6];
         let batch = PackedJitBatch::new(JitWidth::Avx512, &[&first, &second]).unwrap();
-        assert!(super::memory::shares_mapping(
+        assert!(super::super::memory::shares_mapping(
             &batch.rows[0].avx512[0].codes[0],
             &batch.rows[1].avx512[0].codes[0],
         ));

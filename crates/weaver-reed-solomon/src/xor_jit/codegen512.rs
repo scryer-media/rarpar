@@ -258,7 +258,7 @@ mod tests {
         let code = generate_muladd_with_prefetch(&deps, true);
         assert!(
             code.windows(2)
-                .filter(|window| window == [0x0F, 0x18])
+                .filter(|window| *window == [0x0F, 0x18])
                 .count()
                 >= 8
         );

@@ -820,10 +820,12 @@ mod tests {
         assert_eq!(layout.num_chunks, 1);
         assert_eq!(layout.assignments.len(), 12);
         assert!(layout.assignments.iter().all(|work| work.byte_start == 0));
-        assert!(layout
-            .assignments
-            .iter()
-            .all(|work| work.byte_len == 64 * 1024 + CAPS.stride));
+        assert!(
+            layout
+                .assignments
+                .iter()
+                .all(|work| work.byte_len == 64 * 1024 + CAPS.stride)
+        );
         assert_eq!(
             layout
                 .assignments
@@ -1004,10 +1006,12 @@ mod tests {
                 staging_area: 0,
             }
         )));
-        assert!(lifecycle
-            .trace()
-            .iter()
-            .any(|event| matches!(event, ControllerTraceEvent::WaitForAdd { staging_area: 0 })));
+        assert!(
+            lifecycle
+                .trace()
+                .iter()
+                .any(|event| matches!(event, ControllerTraceEvent::WaitForAdd { staging_area: 0 }))
+        );
     }
 
     #[test]
