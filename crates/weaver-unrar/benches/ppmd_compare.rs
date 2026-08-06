@@ -313,12 +313,21 @@ fn measure_case(
     rarpar: &Path,
     unrar: &Path,
 ) -> Result<CaseResult, Box<dyn Error>> {
-    let (mut rarpar_samples, mut unrar_samples) = sample_batch(rarpar, unrar, archive)?;
+    let isolated_input = tempfile::tempdir()?;
+    let archive_name = archive
+        .file_name()
+        .ok_or_else(|| format!("fixture has no file name: {}", archive.display()))?;
+    let isolated_archive = isolated_input.path().join(archive_name);
+    if std::fs::hard_link(archive, &isolated_archive).is_err() {
+        std::fs::copy(archive, &isolated_archive)?;
+    }
+
+    let (mut rarpar_samples, mut unrar_samples) = sample_batch(rarpar, unrar, &isolated_archive)?;
     let mut rarpar_mad = relative_mad(&rarpar_samples);
     let mut unrar_mad = relative_mad(&unrar_samples);
     let retried = rarpar_mad > MAX_RELATIVE_MAD || unrar_mad > MAX_RELATIVE_MAD;
     if retried {
-        (rarpar_samples, unrar_samples) = sample_batch(rarpar, unrar, archive)?;
+        (rarpar_samples, unrar_samples) = sample_batch(rarpar, unrar, &isolated_archive)?;
         rarpar_mad = relative_mad(&rarpar_samples);
         unrar_mad = relative_mad(&unrar_samples);
     }

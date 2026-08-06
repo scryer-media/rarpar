@@ -355,6 +355,88 @@ impl SubAllocator {
         u16::from_le(value)
     }
 
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    #[inline(always)]
+    pub(super) fn span_read_state_heads8(
+        &self,
+        span: ValidatedArenaSpan,
+        relative: usize,
+    ) -> [u16; 8] {
+        use std::arch::aarch64::{vld3q_u16, vst1q_u16};
+
+        const STATE_BATCH_BYTES: usize = 8 * 6;
+        debug_assert!(
+            relative
+                .checked_add(STATE_BATCH_BYTES)
+                .is_some_and(|end| end <= span.len())
+        );
+
+        let mut heads = [0u16; 8];
+        // SAFETY: the validated span covers all 48 bytes loaded by `vld3q_u16`.
+        // AArch64 permits unaligned vector loads, and neither raw pointer escapes.
+        unsafe {
+            let states = vld3q_u16(
+                self.arena
+                    .as_ptr()
+                    .add(span.offset() + relative)
+                    .cast::<u16>(),
+            );
+            vst1q_u16(heads.as_mut_ptr(), states.0);
+        }
+        heads.map(u16::from_le)
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    pub(super) unsafe fn span_read_state_heads8_ssse3(
+        &self,
+        span: ValidatedArenaSpan,
+        relative: usize,
+    ) -> [u16; 8] {
+        use std::arch::x86_64::{
+            _mm_loadu_si128, _mm_or_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
+        };
+
+        const STATE_BATCH_BYTES: usize = 8 * 6;
+        debug_assert!(
+            relative
+                .checked_add(STATE_BATCH_BYTES)
+                .is_some_and(|end| end <= span.len())
+        );
+
+        let mut heads = [0u16; 8];
+        // SAFETY: the validated span covers the three contiguous 16-byte loads.
+        // SSSE3 availability is checked once by `Model`, and the shuffle masks
+        // select only the two-byte head at the start of each six-byte state.
+        unsafe {
+            let ptr = self.arena.as_ptr().add(span.offset() + relative);
+            let chunk0 = _mm_loadu_si128(ptr.cast());
+            let chunk1 = _mm_loadu_si128(ptr.add(16).cast());
+            let chunk2 = _mm_loadu_si128(ptr.add(32).cast());
+
+            let mask0 = _mm_setr_epi8(
+                0, 1, 6, 7, 12, 13, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128,
+            );
+            let mask1 = _mm_setr_epi8(
+                -128, -128, -128, -128, -128, -128, 2, 3, 8, 9, 14, 15, -128, -128, -128, -128,
+            );
+            let mask2 = _mm_setr_epi8(
+                -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 4, 5, 10,
+                11,
+            );
+            let packed = _mm_or_si128(
+                _mm_or_si128(
+                    _mm_shuffle_epi8(chunk0, mask0),
+                    _mm_shuffle_epi8(chunk1, mask1),
+                ),
+                _mm_shuffle_epi8(chunk2, mask2),
+            );
+            _mm_storeu_si128(heads.as_mut_ptr().cast(), packed);
+        }
+        heads.map(u16::from_le)
+    }
+
     #[inline(always)]
     pub(super) fn span_read_u32(&self, span: ValidatedArenaSpan, relative: usize) -> u32 {
         debug_assert!(relative.checked_add(4).is_some_and(|end| end <= span.len()));
@@ -1157,6 +1239,42 @@ mod tests {
         assert_eq!(alloc.read_byte_at(off + 3), 0x77);
         alloc.write_u32_at(off + 4, 0x12345678);
         assert_eq!(alloc.read_u32_at(off + 4), 0x12345678);
+    }
+
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(miri)))]
+    #[test]
+    fn state_head_batch_matches_scalar_across_arena_alignments() {
+        const STATE_SIZE: usize = 6;
+        const STATE_COUNT: usize = 8;
+        const BATCH_BYTES: usize = STATE_SIZE * STATE_COUNT;
+
+        let mut alloc = SubAllocator::new(4096);
+        for batch in 0..4u16 {
+            let states = alloc.alloc_units(BATCH_BYTES / UNIT_SIZE);
+            assert!(!states.is_null());
+
+            for lane in 0..STATE_COUNT {
+                let head = (batch << 12) | ((lane as u16) << 8) | (0x80 + lane as u16);
+                alloc.write_u16(states, lane * STATE_SIZE, head);
+            }
+
+            let span = alloc
+                .validated_model_span(states.offset() as u32, BATCH_BYTES)
+                .expect("allocated state batch is a valid model span");
+            let expected = std::array::from_fn(|lane| alloc.span_read_u16(span, lane * STATE_SIZE));
+
+            #[cfg(target_arch = "aarch64")]
+            let actual = alloc.span_read_state_heads8(span, 0);
+            #[cfg(target_arch = "x86_64")]
+            let actual = {
+                assert!(std::arch::is_x86_feature_detected!("ssse3"));
+                // SAFETY: SSSE3 was detected and the validated span covers the batch.
+                unsafe { alloc.span_read_state_heads8_ssse3(span, 0) }
+            };
+
+            assert_eq!(actual, expected);
+            assert!(!alloc.alloc_one().is_null());
+        }
     }
 
     #[test]

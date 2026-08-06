@@ -284,7 +284,7 @@ pub fn apply_placement_plan(dir: &Path, plan: &PlacementPlan) -> io::Result<u32>
     for (entry_a, entry_b) in &plan.swaps {
         let path_a = dir.join(&entry_a.current_name);
         let path_b = dir.join(&entry_b.current_name);
-        let temp = dir.join(format!(".swap.{}.tmp", &entry_a.current_name));
+        let temp = dir.join(format!(".swap.{}.tmp", entry_a.current_name));
 
         // Atomic-ish three-step swap.
         fs::rename(&path_a, &temp).map_err(|e| {

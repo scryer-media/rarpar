@@ -27,14 +27,9 @@ use super::emit::{self, RAX, RCX, RDX};
 /// Bytes per bit-planar block.
 const BLOCK: i32 = 512;
 
-/// Emit `prefetcht1` hints for the NEXT block's src/dst first lines inside
-/// each loop iteration. Upstream's JIT bodies carry software prefetch
-/// (`gf16_xor_common.h` threads a dedicated `pf` stream); this port dropped
-/// it on the modern-HW-prefetcher rationale. UNMEASURED: off by default —
-/// flip and A/B per the bench playbook (same protocol as `NEON_SRC_PREFETCH`
-/// in gf_simd.rs). Note the scratchpad symbolic-verifier harness decodes only
-/// the default instruction subset; teach it `0F 18 /2` before verifying a
-/// `true` build.
+/// Keep the old next-block hints disabled. Turbo's controller-facing prefetch
+/// body is emitted by `generate_muladd_prefetch` below and uses its dedicated
+/// `rsi` stream instead of guessing from the source and destination pointers.
 const JIT_NEXT_BLOCK_PREFETCH: bool = false;
 
 /// Signed byte offset of plane `p` from the mid-block pointer (after the
@@ -48,6 +43,15 @@ fn plane_off(p: usize) -> i32 {
 /// output accumulators, `ymm2` the shared (CSE) accumulator; source planes 3-15
 /// live in `ymm3..15`, planes 0-2 in memory.
 pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
+    generate_muladd_with_prefetch(deps, false)
+}
+
+/// Generate the Turbo-style body with an optional dedicated prefetch stream.
+/// When enabled, `rsi` advances by 256 bytes per 512-byte block and issues the
+/// four T1 hints used by `xor_write_jit_avx` (Turbo's
+/// `gf16_xor_avx2.c:262-267`). The call trampoline initializes `rsi` to
+/// `prefetch - 128`, matching `gf16_xor_jit_mul_avx2_base` at lines 403-408.
+pub fn generate_muladd_with_prefetch(deps: &XorDeps, prefetch: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1280);
 
     // Loop top: advance to this block, (re)load the resident source planes.
@@ -58,6 +62,12 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
         // block_start+128, so the next block's first byte is at +384).
         emit::prefetcht1(&mut buf, RAX, BLOCK - 128);
         emit::prefetcht1(&mut buf, RDX, BLOCK - 128);
+    }
+    if prefetch {
+        emit::add_ri(&mut buf, emit::RSI, 256);
+        for offset in [-128, -64, 0, 64] {
+            emit::prefetcht1(&mut buf, emit::RSI, offset);
+        }
     }
     for p in 3..16usize {
         emit::vmovdqu_load(&mut buf, p as u8, RAX, plane_off(p));

@@ -11,6 +11,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.4"
 edition = "2024"
+rust-version = "1.97.1"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/rarpar"
 

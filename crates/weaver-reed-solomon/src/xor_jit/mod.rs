@@ -16,6 +16,7 @@ pub mod codegen512;
 pub mod deps;
 pub mod emit;
 pub mod memory;
+pub mod packed;
 pub mod transpose;
 pub mod transpose512;
 
@@ -86,6 +87,45 @@ impl JitWidth {
         Ok(result)
     }
 
+    /// Build packed dispatch for one coefficient row. AVX2 uses ordered
+    /// single-source bodies; AVX512 uses the oracle's six-source multi-input
+    /// body with prefix variants for short final groups.
+    pub fn build_packed(self, factors: &[u16]) -> std::io::Result<packed::PackedJitCode> {
+        packed::PackedJitCode::new(self, factors)
+    }
+
+    /// Estimate one shared packed arena for all output coefficient rows.
+    ///
+    /// The `JitMemo` owner should call this once per input batch, before
+    /// shaping repair buffers, and use the result to select folded fallback
+    /// when the arena exceeds its resource budget.
+    pub fn estimate_packed_batch(
+        self,
+        rows: &[&[u16]],
+    ) -> Result<packed::PackedCodeSize, packed::PackedBuildError> {
+        packed::PackedJitBatch::estimate(self, rows)
+    }
+
+    /// Build one shared W^X arena for all output coefficient rows. Retain the
+    /// returned batch and select each output with [`packed::PackedJitBatch::row`].
+    /// Do not build one [`packed::PackedJitCode`] per output.
+    pub fn build_packed_batch(
+        self,
+        rows: &[&[u16]],
+    ) -> Result<packed::PackedJitBatch, packed::PackedBuildError> {
+        packed::PackedJitBatch::new(self, rows)
+    }
+
+    /// Build a shared packed arena only when its alignment-inclusive code size
+    /// is within `limit_bytes`; callers can choose folded fallback on error.
+    pub fn build_packed_batch_with_limit(
+        self,
+        rows: &[&[u16]],
+        limit_bytes: usize,
+    ) -> Result<packed::PackedJitBatch, packed::PackedBuildError> {
+        packed::PackedJitBatch::new_with_limit(self, rows, limit_bytes)
+    }
+
     /// Transpose one block (`block_bytes` long) into planar layout.
     ///
     /// # Safety
@@ -126,8 +166,10 @@ impl JitWidth {
     /// bytes (`len % block_bytes == 0`).
     ///
     /// # Safety
-    /// Per [`memory::JitCode::run_muladd`] / [`memory::JitCode::run_muladd_512`]
-    /// for the corresponding width.
+    /// `code` must have been built by [`Self::build_muladd`] for this exact
+    /// width, and that width's CPU features must be available. `src` must be
+    /// readable and `dst` writable for `len` non-overlapping bytes. `len` must
+    /// be a multiple of [`Self::block_bytes`].
     pub unsafe fn run_muladd(
         self,
         code: &memory::JitCode,
@@ -141,6 +183,62 @@ impl JitWidth {
                 JitWidth::Avx512 => code.run_muladd_512(src, dst, len),
             }
         }
+    }
+
+    /// Build a single-factor body with Turbo's dedicated RSI prefetch stream.
+    pub fn build_muladd_prefetch(self, factor: u16) -> std::io::Result<Option<memory::JitCode>> {
+        if factor == 0 {
+            return Ok(None);
+        }
+        let deps = deps::compute_deps(factor);
+        let code = match self {
+            JitWidth::Avx2 => codegen::generate_muladd_with_prefetch(&deps, true),
+            JitWidth::Avx512 => codegen512::generate_muladd_with_prefetch(&deps, true),
+        };
+        Ok(Some(memory::JitCode::new(&code)?))
+    }
+
+    /// Run a prefetch-enabled single-factor body. The body must have been
+    /// created by [`Self::build_muladd_prefetch`].
+    ///
+    /// # Safety
+    /// `code` must have been built by [`Self::build_muladd_prefetch`] for this
+    /// exact width, and that width's CPU features must be available. `src`
+    /// must be readable and `dst` writable for `len` non-overlapping bytes;
+    /// `len` must be a multiple of [`Self::block_bytes`]. `prefetch` must
+    /// support every address hinted by the selected width's prefetch stream.
+    pub unsafe fn run_muladd_prefetch(
+        self,
+        code: &memory::JitCode,
+        src: *const u8,
+        dst: *mut u8,
+        len: usize,
+        prefetch: *const u8,
+    ) {
+        unsafe {
+            match self {
+                JitWidth::Avx2 => code.run_muladd_prefetch(src, dst, len, prefetch),
+                JitWidth::Avx512 => code.run_muladd_prefetch_512(src, dst, len, prefetch),
+            }
+        }
+    }
+
+    /// Run packed multiply-add with optional input/output prefetch hints.
+    /// Coefficient rows containing only one use the packed add shortcut.
+    ///
+    /// # Safety
+    /// `code` must have been built for this exact width, which must be
+    /// available on the current CPU. The caller must satisfy the pointer,
+    /// length, region-count, non-overlap, and prefetch requirements of
+    /// [`packed::PackedJitCode::run`]. `scratch` must remain worker-exclusive.
+    pub unsafe fn run_packed(
+        self,
+        code: &packed::PackedJitCode,
+        scratch: &mut packed::PackedScratch,
+        run: packed::PackedRun,
+    ) {
+        debug_assert_eq!(self, code.width());
+        unsafe { code.run_with_scratch(scratch, run) }
     }
 }
 

@@ -17,7 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  RUST_TOOLCHAIN: 1.96.0
+  RUST_TOOLCHAIN: 1.97.1
   SCCACHE_CACHE_VERSION: v1
   WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
   WEAVER_LFS_PAR2_FIXTURES: crates/weaver-par2/tests/fixtures/**

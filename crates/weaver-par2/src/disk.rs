@@ -20,6 +20,9 @@ pub struct DiskFileAccess {
     base_dir: PathBuf,
     /// Map from FileId to filename (populated from Par2FileSet).
     file_map: HashMap<FileId, String>,
+    /// Repair outputs stay open for the accessor lifetime so a multi-slice
+    /// repair does not reopen the same destination for every block.
+    write_files: HashMap<FileId, File>,
 }
 
 impl DiskFileAccess {
@@ -31,7 +34,11 @@ impl DiskFileAccess {
         for (file_id, desc) in &par2_set.files {
             file_map.insert(*file_id, desc.filename.clone());
         }
-        Self { base_dir, file_map }
+        Self {
+            base_dir,
+            file_map,
+            write_files: HashMap::new(),
+        }
     }
 
     /// Resolve the full path for a given file ID.
@@ -105,14 +112,19 @@ impl FileAccess for DiskFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = if let Some(file) = self.write_files.get_mut(file_id) {
+            file
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            self.write_files.entry(*file_id).or_insert(file)
+        };
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
         Ok(())
@@ -127,6 +139,7 @@ pub struct PlacementFileAccess {
     base_dir: PathBuf,
     file_map: HashMap<FileId, String>,
     overrides: HashMap<FileId, String>,
+    write_files: HashMap<FileId, File>,
 }
 
 impl PlacementFileAccess {
@@ -143,6 +156,7 @@ impl PlacementFileAccess {
             base_dir,
             file_map,
             overrides,
+            write_files: HashMap::new(),
         }
     }
 
@@ -232,14 +246,19 @@ impl FileAccess for PlacementFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = if let Some(file) = self.write_files.get_mut(file_id) {
+            file
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            self.write_files.entry(*file_id).or_insert(file)
+        };
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
         Ok(())
@@ -563,6 +582,8 @@ mod tests {
 
         // write_file_range
         access.write_file_range(&file_id, 7, b"par2").unwrap();
+        access.write_file_range(&file_id, 11, b"!").unwrap();
+        assert_eq!(access.write_files.len(), 1);
         let after_write = access.read_file_range(&file_id, 7, 4).unwrap();
         assert_eq!(&after_write, b"par2");
     }

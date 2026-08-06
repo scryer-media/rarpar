@@ -536,6 +536,11 @@ struct BlockCopyRange {
     len: u64,
 }
 
+/// Destination for an intact source block while reconstruction is active.
+/// The source bytes are copied from the same buffer that is submitted to the
+/// Reed-Solomon controller, matching Turbo's ProcessData ordering.
+type ReconstructionCopyTargets = HashMap<(FileId, u32), BlockCopyRange>;
+
 impl BlockCopyRange {
     fn can_extend(&self, next: &Self) -> bool {
         self.src == next.src
@@ -1151,12 +1156,21 @@ struct RepairExecutionAccess {
     source_locations: HashMap<(FileId, u32), BlockLocation>,
     source_blocks: HashMap<(FileId, u32), SourceBlock>,
     source_files: HashMap<PathBuf, File>,
+    reconstruction_copy_targets: ReconstructionCopyTargets,
+    staged_writers: Mutex<HashMap<FileId, File>>,
     /// Handle serving every [`SourceLocation::Access`] location. Absent when
     /// the state has no access-backed sources.
     source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
     source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
     stream_validation: Mutex<HashMap<(FileId, u32), StreamSourceValidation>>,
     validation_bytes: AtomicU64,
+}
+
+#[derive(Default)]
+struct RepairExecutionContext {
+    source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
+    source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
+    reconstruction_copy_targets: ReconstructionCopyTargets,
 }
 
 struct StreamSourceValidation {
@@ -1173,10 +1187,14 @@ impl RepairExecutionAccess {
         blocks: &[SourceBlock],
         staged_file_ids: &HashSet<FileId>,
         slice_size: u64,
-        source_access: Option<Arc<dyn FileAccess + Send + Sync>>,
-        source_snapshots: Option<HashMap<PathBuf, CarriedFileStat>>,
+        context: RepairExecutionContext,
     ) -> io::Result<Self> {
-        let repair_paths = files
+        let RepairExecutionContext {
+            source_access,
+            source_snapshots,
+            reconstruction_copy_targets,
+        } = context;
+        let repair_paths: HashMap<FileId, PathBuf> = files
             .iter()
             .filter(|file| staged_file_ids.contains(&file.file_id))
             .map(|file| (file.file_id, install_dir.join(&file.safe_name)))
@@ -1208,6 +1226,15 @@ impl RepairExecutionAccess {
                     .map_err(|_| source_changed_io(&path))
             })
             .collect::<io::Result<HashMap<_, _>>>()?;
+        let staged_writers = repair_paths
+            .iter()
+            .map(|(file_id, path)| {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map(|file| (*file_id, file))
+            })
+            .collect::<io::Result<HashMap<_, _>>>()?;
 
         Ok(Self {
             slice_size,
@@ -1215,6 +1242,8 @@ impl RepairExecutionAccess {
             source_locations,
             source_blocks,
             source_files,
+            reconstruction_copy_targets,
+            staged_writers: Mutex::new(staged_writers),
             source_access,
             source_snapshots,
             stream_validation: Mutex::new(HashMap::new()),
@@ -1279,6 +1308,8 @@ impl RepairExecutionAccess {
                 Some((start, len, crc))
                     if start == slice_offset && len == data.len() && crc == stripe_crc =>
                 {
+                    // GPU fallback replays only the current outer stripe.
+                    // Do not advance checksum or accounting twice.
                     Ok(())
                 }
                 _ => Err(source_location_changed_io(
@@ -1291,9 +1322,8 @@ impl RepairExecutionAccess {
                 Some((start, len, crc))
                     if start == slice_offset && len == data.len() && crc == stripe_crc =>
                 {
-                    // A retry of the most recent streaming stripe must not be
-                    // counted twice. This occurs when a compute backend
-                    // replays a chunk after falling back to the CPU path.
+                    // GPU fallback replays only the current outer stripe.
+                    // Do not advance checksum or accounting twice.
                     Ok(())
                 }
                 _ => Err(source_location_changed_io(
@@ -1337,6 +1367,46 @@ impl RepairExecutionAccess {
             .map(PathBuf::as_path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "repair target not staged"))
     }
+
+    /// Copy one source stripe into its staged destination after the source
+    /// bytes have been read and, when requested, checksum-validated. Replays
+    /// after a backend fallback write the same positional range again, which
+    /// keeps the operation idempotent without rereading the source.
+    fn copy_reconstruction_chunk(
+        &self,
+        file_id: FileId,
+        local_slice: u32,
+        slice_offset: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let Some(target) = self
+            .reconstruction_copy_targets
+            .get(&(file_id, local_slice))
+        else {
+            return Ok(());
+        };
+        let Some(relative_end) = slice_offset.checked_add(data.len() as u64) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reconstruction copy range overflow",
+            ));
+        };
+        if relative_end > target.len {
+            return Err(source_location_changed_io(&target.src));
+        }
+        let dst_offset = target
+            .dst_offset
+            .checked_add(slice_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "staged offset overflow"))?;
+        let mut writers = self
+            .staged_writers
+            .lock()
+            .map_err(|_| io::Error::other("staged writer lock poisoned"))?;
+        let writer = writers.get_mut(&file_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "staged writer handle not cached")
+        })?;
+        write_all_file_at(writer, data, dst_offset)
+    }
 }
 
 impl crate::verify::FileAccess for RepairExecutionAccess {
@@ -1347,7 +1417,7 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                 self.source_locations
                     .get(&(*file_id, local_slice))
                     .zip(self.source_blocks.get(&(*file_id, local_slice)))
-            }) && len >= expected.expected_len
+            }) && len == expected.expected_len
                 && location.len == expected.expected_len
             {
                 let mut buf = vec![0u8; expected.expected_len as usize];
@@ -1389,12 +1459,37 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                 }
                 self.validation_bytes
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                let local_slice = u32::try_from(offset / self.slice_size).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "source slice index overflow")
+                })?;
+                self.copy_reconstruction_chunk(*file_id, local_slice, 0, &buf)?;
                 return Ok(buf);
             }
         }
-        let mut buf = vec![0u8; len as usize];
-        let read_len = self.read_file_range_into(file_id, offset, &mut buf)?;
-        buf.truncate(read_len);
+        let requested = usize::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read range too large"))?;
+        let mut buf = Vec::with_capacity(requested);
+        let mut current_offset = offset;
+        while buf.len() < requested {
+            let slice_offset = current_offset % self.slice_size;
+            let chunk_len =
+                (self.slice_size - slice_offset).min((requested - buf.len()) as u64) as usize;
+            if chunk_len == 0 {
+                break;
+            }
+            let start = buf.len();
+            buf.resize(start + chunk_len, 0);
+            let read_len = self.read_file_range_into(
+                file_id,
+                current_offset,
+                &mut buf[start..start + chunk_len],
+            )?;
+            buf.truncate(start + read_len);
+            if read_len == 0 {
+                break;
+            }
+            current_offset += read_len as u64;
+        }
         Ok(buf)
     }
 
@@ -1450,6 +1545,7 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                     }
                 }
                 self.validate_source_chunk(*file_id, local_slice, slice_offset, &dst[..len])?;
+                self.copy_reconstruction_chunk(*file_id, local_slice, slice_offset, &dst[..len])?;
                 return Ok(len);
             }
         }
@@ -1502,19 +1598,52 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)
+        let mut writers = self
+            .staged_writers
+            .lock()
+            .map_err(|_| io::Error::other("staged writer lock poisoned"))?;
+        let file = writers.get_mut(file_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "staged writer handle not cached")
+        })?;
+        write_all_file_at(file, data, offset)
     }
 }
 
 #[cfg(unix)]
 fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
     file.read_at(dst, offset)
+}
+
+#[cfg(unix)]
+fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
+    file.write_at(src, offset)
+}
+
+#[cfg(windows)]
+fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
+    file.seek_write(src, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.write(src)
+}
+
+fn write_all_file_at(file: &File, mut src: &[u8], mut offset: u64) -> io::Result<()> {
+    while !src.is_empty() {
+        let written = write_file_at(file, src, offset)?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write the complete staged range",
+            ));
+        }
+        src = &src[written..];
+        offset += written as u64;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3004,12 +3133,16 @@ impl RepairState {
             out.set_len(file.length)?;
         }
 
+        let reconstruction_active = verification.total_missing_blocks > 0;
         let mut whole_file_copied_ids = HashSet::new();
         for file in self
             .files
             .iter()
             .filter(|file| staged_file_ids.contains(&file.file_id))
         {
+            if reconstruction_active {
+                continue;
+            }
             let Some(location) = file.complete_location.as_ref() else {
                 continue;
             };
@@ -3038,6 +3171,7 @@ impl RepairState {
         }
 
         let mut block_copy_ranges = Vec::new();
+        let mut reconstruction_copy_targets = ReconstructionCopyTargets::new();
         let mut validated_block_copies = Vec::new();
         for block in &self.blocks {
             check_cancel(options)?;
@@ -3060,7 +3194,9 @@ impl RepairState {
                 dst_offset: block.local_index as u64 * self.set.slice_size,
                 len: block.expected_len,
             };
-            if validate_sources {
+            if reconstruction_active {
+                reconstruction_copy_targets.insert((block.file_id, block.local_index), range);
+            } else if validate_sources {
                 validated_block_copies.push((block.clone(), range));
             } else {
                 push_block_copy_range(&mut block_copy_ranges, range);
@@ -3104,8 +3240,11 @@ impl RepairState {
                     &self.blocks,
                     &staged_file_ids,
                     self.set.slice_size,
-                    self.source_access.clone(),
-                    source_snapshots.clone(),
+                    RepairExecutionContext {
+                        source_access: self.source_access.clone(),
+                        source_snapshots: source_snapshots.clone(),
+                        reconstruction_copy_targets: reconstruction_copy_targets.clone(),
+                    },
                 )?;
                 let plan =
                     plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
@@ -3133,7 +3272,10 @@ impl RepairState {
             Ok((bytes_reconstructed, validation_bytes))
         };
 
-        // The intact block copies run serially AHEAD of reconstruction:
+        // Copy-only repairs retain the direct copy path. When reconstruction
+        // is active, intact blocks are copied by RepairExecutionAccess from
+        // the source buffer immediately before that buffer enters the
+        // controller, matching Turbo's ProcessData ordering.
         // overlapping the two was measured twice as no better — first as a
         // net loss (page-cache dirtying plus memory-bandwidth competition
         // with the GF16 compute), then as noise-level even after the
@@ -6146,8 +6288,10 @@ mod tests {
             &[block],
             &HashSet::new(),
             expected.len() as u64,
-            None,
-            Some(snapshot),
+            RepairExecutionContext {
+                source_snapshots: Some(snapshot),
+                ..RepairExecutionContext::default()
+            },
         )
         .unwrap();
 
@@ -6187,8 +6331,7 @@ mod tests {
             &[block],
             &HashSet::new(),
             8,
-            None,
-            None,
+            RepairExecutionContext::default(),
         )
         .unwrap();
 
@@ -6202,6 +6345,118 @@ mod tests {
             assert_eq!(read, payload);
         }
         assert_eq!(access.validation_bytes(), payload.len() as u64);
+    }
+
+    #[test]
+    fn streaming_validation_replays_only_current_outer_stripe() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("multistripe.bin");
+        let payload = b"12345678";
+        fs::write(&source, payload).unwrap();
+        let file_id = FileId::from_bytes([0x46; 16]);
+        let block = validated_source_block(file_id, &source, payload);
+        let access = RepairExecutionAccess::new(
+            dir.path().join("staging"),
+            &[],
+            &[block],
+            &HashSet::new(),
+            payload.len() as u64,
+            RepairExecutionContext::default(),
+        )
+        .unwrap();
+
+        for (offset, expected) in [(0, &payload[..4]), (4, &payload[4..])] {
+            let mut read = vec![0u8; expected.len()];
+            assert_eq!(
+                crate::verify::FileAccess::read_file_range_into(
+                    &access, &file_id, offset, &mut read,
+                )
+                .unwrap(),
+                expected.len()
+            );
+            assert_eq!(read, expected);
+        }
+        let mut replay = vec![0u8; 4];
+        assert_eq!(
+            crate::verify::FileAccess::read_file_range_into(&access, &file_id, 4, &mut replay)
+                .unwrap(),
+            replay.len()
+        );
+        assert_eq!(replay, &payload[4..]);
+
+        let mut stale = vec![0u8; 4];
+        assert!(
+            crate::verify::FileAccess::read_file_range_into(&access, &file_id, 0, &mut stale,)
+                .is_err()
+        );
+        assert_eq!(access.validation_bytes(), payload.len() as u64);
+    }
+
+    #[test]
+    fn reconstruction_copy_uses_read_buffer_and_cached_positional_writer() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let staging = dir.path().join("staging");
+        let target = staging.join("installed.bin");
+        let payload = b"copy-me!";
+        fs::write(&source, payload).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(&target, vec![0u8; payload.len()]).unwrap();
+
+        let file_id = FileId::from_bytes([0x45; 16]);
+        let block = validated_source_block(file_id, &source, payload);
+        let file = SourceFileEntry {
+            file_id,
+            par2_name: "installed.bin".to_owned(),
+            safe_path: target.clone(),
+            safe_name: "installed.bin".to_owned(),
+            length: payload.len() as u64,
+            hash_full: [0; 16],
+            hash_16k: [0; 16],
+            recoverable: true,
+            first_block: 0,
+            expected_block_count: 1,
+            block_count: 1,
+            target_exists: false,
+            complete_location: None,
+            non_canonical_complete_source_count: 0,
+        };
+        let mut staged = HashSet::new();
+        staged.insert(file_id);
+        let access = RepairExecutionAccess::new(
+            staging,
+            &[file],
+            &[block],
+            &staged,
+            8,
+            RepairExecutionContext {
+                reconstruction_copy_targets: HashMap::from([(
+                    (file_id, 0),
+                    BlockCopyRange {
+                        src: SourceLocation::Path(source),
+                        src_offset: 0,
+                        dst: target,
+                        dst_offset: 0,
+                        len: payload.len() as u64,
+                    },
+                )]),
+                ..RepairExecutionContext::default()
+            },
+        )
+        .unwrap();
+
+        let mut read = vec![0u8; payload.len()];
+        assert_eq!(
+            crate::verify::FileAccess::read_file_range_into(&access, &file_id, 0, &mut read)
+                .unwrap(),
+            payload.len()
+        );
+        assert_eq!(read, payload);
+        assert_eq!(
+            fs::read(access.repair_path_for(&file_id).unwrap()).unwrap(),
+            payload
+        );
+        assert_eq!(access.staged_writers.lock().unwrap().len(), 1);
     }
 
     #[test]

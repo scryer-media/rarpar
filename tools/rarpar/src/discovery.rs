@@ -198,14 +198,81 @@ pub fn discover_rar_set_for_archive(
     if !archive.exists() {
         return Err(RarparError::MissingInput(archive.to_path_buf()));
     }
+
+    if options.max_files == 0 {
+        return Err(RarparError::Resource(
+            "discovery exceeded max files (0)".to_string(),
+        ));
+    }
+
+    let archive_file = classify_path(archive);
+    if let DiscoveredKind::RarVolume(info) = &archive_file.kind {
+        if !info.is_multi_volume {
+            return selected_rar_set(vec![archive_file], archive);
+        }
+
+        if looks_rarish_by_name(archive)
+            && let Some(label) = archive_file.set_hint.as_deref()
+        {
+            let family = discover_named_rar_family(archive, archive_file.clone(), label, options)?;
+            return selected_rar_set(family, archive);
+        }
+    }
+
     let root = archive
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let report = discover(vec![root], options)?;
-    report
-        .rar_sets
-        .into_iter()
+    selected_rar_set_from_sets(report.rar_sets, archive)
+}
+
+fn discover_named_rar_family(
+    archive: &Path,
+    archive_file: DiscoveredFile,
+    label: &str,
+    options: &DiscoveryOptions,
+) -> Result<Vec<DiscoveredFile>, RarparError> {
+    let root = archive.parent().unwrap_or_else(|| Path::new("."));
+    let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_archive = same_path(&path, archive);
+        let is_family_candidate = set_hint(&path).as_deref() == Some(label)
+            && (looks_rarish_by_name(&path) || is_ext(&path, "rev"));
+        if !is_archive && !is_family_candidate {
+            continue;
+        }
+        if files.len() >= options.max_files {
+            return Err(RarparError::Resource(format!(
+                "discovery exceeded max files ({})",
+                options.max_files
+            )));
+        }
+
+        if is_archive {
+            files.push(archive_file.clone());
+        } else {
+            files.push(classify_path(&path));
+        }
+    }
+    Ok(files)
+}
+
+fn selected_rar_set(files: Vec<DiscoveredFile>, archive: &Path) -> Result<RarSet, RarparError> {
+    selected_rar_set_from_sets(build_rar_sets(&files), archive)
+}
+
+fn selected_rar_set_from_sets(sets: Vec<RarSet>, archive: &Path) -> Result<RarSet, RarparError> {
+    sets.into_iter()
         .find(|set| {
             set.volumes
                 .iter()
@@ -774,6 +841,12 @@ fn is_ext(path: &Path, expected: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn rar4_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/weaver-unrar/tests/fixtures/rar4")
+            .join(name)
+    }
+
     #[test]
     fn old_rar_volume_rollover_is_recognized_and_sorted() {
         for (name, index) in [
@@ -789,5 +862,63 @@ mod tests {
             assert!(looks_rarish_by_name(path), "{name}");
             assert_eq!(filename_volume_index(path), index, "{name}");
         }
+    }
+
+    #[test]
+    fn explicit_single_volume_does_not_scan_unrelated_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("selected.rar");
+        std::fs::copy(rar4_fixture("rar4_store.rar"), &archive).unwrap();
+        std::fs::write(temp.path().join("unrelated.bin"), b"not an archive").unwrap();
+
+        let set = discover_rar_set_for_archive(
+            &archive,
+            &DiscoveryOptions {
+                recursive: true,
+                max_depth: 8,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(set.volumes.len(), 1);
+        assert!(same_path(&set.volumes[0].path, &archive));
+    }
+
+    #[test]
+    fn explicit_multi_volume_probes_only_name_compatible_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        for part in 1..=5 {
+            let name = format!("rar4_tiny_volumes.part{part}.rar");
+            std::fs::copy(rar4_fixture(&name), temp.path().join(&name)).unwrap();
+        }
+        for index in 0..8 {
+            std::fs::copy(
+                rar4_fixture("rar4_store.rar"),
+                temp.path().join(format!("unrelated{index}.rar")),
+            )
+            .unwrap();
+        }
+
+        let first = temp.path().join("rar4_tiny_volumes.part1.rar");
+        let set = discover_rar_set_for_archive(
+            &first,
+            &DiscoveryOptions {
+                recursive: true,
+                max_depth: 8,
+                max_files: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(set.volumes.len(), 5);
+        assert!(set.volumes.iter().all(|volume| {
+            volume
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rar4_tiny_volumes.part")
+        }));
     }
 }

@@ -1146,14 +1146,11 @@ impl VerificationSession {
 
         // Ensure file state exists.
         if !self.file_states.contains_key(file_id) {
-            if let Some(desc) = par2_set.file_description(file_id) {
-                self.file_states.insert(
-                    *file_id,
-                    FileVerificationState::new(desc.length, par2_set.slice_size),
-                );
-            } else {
-                return None;
-            }
+            let desc = par2_set.file_description(file_id)?;
+            self.file_states.insert(
+                *file_id,
+                FileVerificationState::new(desc.length, par2_set.slice_size),
+            );
         }
 
         let state = self.file_states.get_mut(file_id)?;

@@ -15,15 +15,19 @@
 //! - 2-byte VEX (`C5`) when the ModRM.rm register/base is < 8; else 3-byte
 //!   (`C4`). `VEX.R`/`VEX.B`/`VEX.vvvv` are stored inverted.
 //! - Displacement: none when `off == 0`, `disp8` when it fits a signed byte,
-//!   else `disp32`. The only base registers used (rax/rcx/rdx/rsi) are never
-//!   rsp(4)/rbp(5), so no SIB byte and no `mod=00`/rbp special case arises.
+//!   else `disp32`. The base registers used by packed dispatch avoid rsp/rbp,
+//!   so no SIB byte and no `mod=00`/rbp special case arises.
 
 /// General-purpose register encodings (low 8). These are the only GPRs the
-/// generated code touches — as pointers and the loop counter.
+/// generated code touches as pointers and loop state.
 pub const RAX: u8 = 0;
 pub const RCX: u8 = 1;
 pub const RDX: u8 = 2;
 pub const RSI: u8 = 6;
+pub const RDI: u8 = 7;
+pub const R8: u8 = 8;
+pub const R9: u8 = 9;
+pub const R10: u8 = 10;
 
 /// Emit a VEX prefix + opcode for a 256-bit AVX instruction.
 ///
@@ -381,6 +385,22 @@ mod tests {
         assert_eq!(
             emit(|b| vmovdqu32_load(b, 31, RAX, 960)),
             [0x62, 0x61, 0x7E, 0x48, 0x6F, 0x78, 0x0F]
+        );
+        // Packed AVX512 sources use r8/r9/r10 as memory bases.
+        // vmovdqu32 zmm16, [r8+64] -> 62 C1 7E 48 6F 40 01
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 16, R8, 64)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x40, 0x01]
+        );
+        // vmovdqu32 zmm17, [r9+128] -> 62 C1 7E 48 6F 49 02
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 17, R9, 128)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x49, 0x02]
+        );
+        // vmovdqu32 zmm18, [r10+960] -> 62 C1 7E 48 6F 52 0F
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 18, R10, 960)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x52, 0x0F]
         );
         // vmovdqu32 [rdx+128], zmm0 -> 62 F1 7E 48 7F 42 02
         assert_eq!(

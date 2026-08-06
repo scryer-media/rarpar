@@ -77,6 +77,54 @@ const fn unmasked_state_frequency(packed: u32) -> u8 {
     (packed >> 16) as u8
 }
 
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "ssse3")]
+#[inline]
+unsafe fn collect_unmasked_states_ssse3(
+    alloc: &SubAllocator,
+    states_span: ValidatedArenaSpan,
+    ns: usize,
+    char_mask: &[u8; 256],
+    esc_count: u8,
+    scratch: &mut [u32],
+) -> Option<u32> {
+    let mut hi_cnt = 0u32;
+    let mut state_index = 0usize;
+    let mut scratch_index = 0usize;
+    while state_index + 8 <= ns && scratch_index < scratch.len() {
+        // SAFETY: this function requires SSSE3 and the validated state span
+        // covers the complete batch.
+        let heads =
+            unsafe { alloc.span_read_state_heads8_ssse3(states_span, state_index * STATE_SIZE) };
+        for (lane, head) in heads.into_iter().enumerate() {
+            let sym = head as u8;
+            if char_mask[sym as usize] != esc_count {
+                hi_cnt += (head >> 8) as u32;
+                scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
+                scratch_index += 1;
+                if scratch_index == scratch.len() {
+                    break;
+                }
+            }
+        }
+        state_index += 8;
+    }
+    while scratch_index < scratch.len() {
+        if state_index >= ns {
+            return None;
+        }
+        let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+        let sym = head as u8;
+        if char_mask[sym as usize] != esc_count {
+            hi_cnt += (head >> 8) as u32;
+            scratch[scratch_index] = pack_unmasked_state(state_index, head);
+            scratch_index += 1;
+        }
+        state_index += 1;
+    }
+    Some(hi_cnt)
+}
+
 /// PPMd variant H model.
 pub struct Model {
     alloc: SubAllocator,
@@ -114,6 +162,8 @@ pub struct Model {
     // Reused packed escape-decode state index/head values. Keeping this on the model avoids
     // clearing a padded 2 KiB `(u32, u8)` array on every masked-context walk.
     unmasked_scratch: [u32; 256],
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    use_ssse3_state_batches: bool,
     #[cfg(feature = "ppmd-debug")]
     debug_output_index: u64,
     model_fault: bool,
@@ -192,6 +242,8 @@ impl Model {
             run_length: 0,
             init_rl: -(max_order.min(12) as i32) - 1,
             unmasked_scratch: [0; 256],
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            use_ssse3_state_batches: std::arch::is_x86_feature_detected!("ssse3"),
             #[cfg(feature = "ppmd-debug")]
             debug_output_index: 0,
             model_fault: false,
@@ -1132,26 +1184,103 @@ impl Model {
         // every escape decode.
         let mut hi_cnt = 0u32;
         let esc_count = self.esc_count;
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        let use_ssse3_state_batches = self.use_ssse3_state_batches;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
         let scratch = &mut self.unmasked_scratch[..n];
-        let mut state_index = 0usize;
-        for slot in scratch.iter_mut() {
-            let head = loop {
+
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        {
+            let mut state_index = 0usize;
+            let mut scratch_index = 0usize;
+            while state_index + 8 <= ns as usize && scratch_index < n {
+                let heads = alloc.span_read_state_heads8(states_span, state_index * STATE_SIZE);
+                for (lane, head) in heads.into_iter().enumerate() {
+                    let sym = head as u8;
+                    if char_mask[sym as usize] != esc_count {
+                        hi_cnt += (head >> 8) as u32;
+                        scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
+                        scratch_index += 1;
+                        if scratch_index == n {
+                            break;
+                        }
+                    }
+                }
+                state_index += 8;
+            }
+            while scratch_index < n {
                 if state_index >= ns as usize {
                     return false;
                 }
                 let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
                 let sym = head as u8;
                 if char_mask[sym as usize] != esc_count {
-                    break head;
+                    hi_cnt += (head >> 8) as u32;
+                    scratch[scratch_index] = pack_unmasked_state(state_index, head);
+                    scratch_index += 1;
                 }
                 state_index += 1;
-            };
+            }
+        }
 
-            hi_cnt += (head >> 8) as u32;
-            *slot = pack_unmasked_state(state_index, head);
-            state_index += 1;
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if use_ssse3_state_batches {
+            // SAFETY: SSSE3 support was detected once when the model was created.
+            let Some(total) = (unsafe {
+                collect_unmasked_states_ssse3(
+                    alloc,
+                    states_span,
+                    ns as usize,
+                    char_mask,
+                    esc_count,
+                    scratch,
+                )
+            }) else {
+                return false;
+            };
+            hi_cnt = total;
+        } else {
+            let mut state_index = 0usize;
+            for slot in scratch.iter_mut() {
+                let head = loop {
+                    if state_index >= ns as usize {
+                        return false;
+                    }
+                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                    let sym = head as u8;
+                    if char_mask[sym as usize] != esc_count {
+                        break head;
+                    }
+                    state_index += 1;
+                };
+
+                hi_cnt += (head >> 8) as u32;
+                *slot = pack_unmasked_state(state_index, head);
+                state_index += 1;
+            }
+        }
+
+        #[cfg(any(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")), miri))]
+        {
+            let mut state_index = 0usize;
+            for slot in scratch.iter_mut() {
+                let head = loop {
+                    if state_index >= ns as usize {
+                        return false;
+                    }
+                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                    let sym = head as u8;
+                    if char_mask[sym as usize] != esc_count {
+                        break head;
+                    }
+                    state_index += 1;
+                };
+
+                hi_cnt += (head >> 8) as u32;
+                *slot = pack_unmasked_state(state_index, head);
+                state_index += 1;
+            }
         }
         let scale = esc_freq + hi_cnt;
         let count = rc.get_current_count(scale);
@@ -1194,6 +1323,7 @@ impl Model {
             // Symbol found among unmasked.
             let mut cum = 0u32;
             let mut selected = None;
+
             for &packed in &self.unmasked_scratch[..n] {
                 let state_index = unmasked_state_index(packed);
                 let state_freq = unmasked_state_frequency(packed);
@@ -1519,13 +1649,9 @@ impl Model {
                 };
                 let mut state_index = 0usize;
                 if self.span_state_sym(suffix_states, state_index) != fs_sym {
-                    state_index = 1;
-                    while state_index < sns as usize
-                        && self.span_state_sym(suffix_states, state_index) != fs_sym
-                    {
-                        state_index += 1;
-                    }
-                    if state_index >= sns as usize {
+                    let Some(found_index) =
+                        self.span_find_state_from(suffix_states, 1, sns as usize, fs_sym)
+                    else {
                         if self.debug_enabled() {
                             eprintln!(
                                 "PPMD update_model missing suffix symbol: fs_sym={} min_context={} suffix={} suffix_ns={}",
@@ -1534,7 +1660,8 @@ impl Model {
                         }
                         self.model_fault = true;
                         return false;
-                    }
+                    };
+                    state_index = found_index;
                     // Swap with predecessor if freq is higher.
                     if self.span_state_freq(suffix_states, state_index)
                         >= self.span_state_freq(suffix_states, state_index - 1)
@@ -2045,7 +2172,66 @@ impl Model {
         ns: usize,
         sym: u8,
     ) -> Option<usize> {
-        (0..ns).find(|&index| self.span_state_sym(states_span, index) == sym)
+        self.span_find_state_from(states_span, 0, ns, sym)
+    }
+
+    #[inline(always)]
+    fn span_find_state_from(
+        &self,
+        states_span: ValidatedArenaSpan,
+        start: usize,
+        ns: usize,
+        sym: u8,
+    ) -> Option<usize> {
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        let mut index = start;
+        #[cfg(any(not(target_arch = "aarch64"), miri))]
+        let index = start;
+
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if self.use_ssse3_state_batches {
+            // SAFETY: SSSE3 support was detected once when the model was created.
+            return unsafe { self.span_find_state_from_ssse3(states_span, index, ns, sym) };
+        }
+
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        while index + 8 <= ns {
+            let heads = self
+                .alloc
+                .span_read_state_heads8(states_span, index * STATE_SIZE);
+            if let Some(lane) = heads.iter().position(|&head| head as u8 == sym) {
+                return Some(index + lane);
+            }
+            index += 8;
+        }
+
+        (index..ns).find(|&state_index| self.span_state_sym(states_span, state_index) == sym)
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn span_find_state_from_ssse3(
+        &self,
+        states_span: ValidatedArenaSpan,
+        mut index: usize,
+        ns: usize,
+        sym: u8,
+    ) -> Option<usize> {
+        while index + 8 <= ns {
+            // SAFETY: this function requires SSSE3 and the validated span covers
+            // the complete state batch.
+            let heads = unsafe {
+                self.alloc
+                    .span_read_state_heads8_ssse3(states_span, index * STATE_SIZE)
+            };
+            if let Some(lane) = heads.iter().position(|&head| head as u8 == sym) {
+                return Some(index + lane);
+            }
+            index += 8;
+        }
+
+        (index..ns).find(|&state_index| self.span_state_sym(states_span, state_index) == sym)
     }
 
     fn clear_mask(&mut self) {
