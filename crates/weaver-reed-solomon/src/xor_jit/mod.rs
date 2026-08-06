@@ -19,6 +19,7 @@ pub mod memory;
 pub mod packed;
 pub mod transpose;
 pub mod transpose512;
+mod turbo_avx2;
 
 /// JIT tier width: the AVX2 512-byte-block tier or the AVX512 1024-byte-block
 /// tier ([`codegen512`]). Consumers (par2-rs's streaming tier) hold one of
@@ -30,16 +31,14 @@ pub enum JitWidth {
 }
 
 impl JitWidth {
-    /// Pick the widest supported JIT tier, mirroring upstream's (non-SLIM)
-    /// preference for the AVX512 JIT over the AVX2 one on AVX512-no-GFNI
-    /// hardware (ParPar gf16mul.cpp default_method). Setting
-    /// `WEAVER_GF16_XORJIT_512=0` pins the AVX2 tier so the two can be A/B'd
-    /// (and the new tier disabled) without a rebuild — same escape-hatch
-    /// pattern as `WEAVER_GF16_FOLDED_AVX512`.
+    /// Select Turbo's default XOR-JIT method.
+    ///
+    /// Turbo does not select its AVX512 XOR-JIT automatically. It selects the
+    /// AVX2 tier only on CPUs marked as fast for JIT, after rejecting binary
+    /// translation and GFNI-capable machines. Other CPU methods remain the
+    /// controller's fallback.
     pub fn detect() -> Option<JitWidth> {
-        if supported_512() && jit512_enabled() {
-            Some(JitWidth::Avx512)
-        } else if supported() {
+        if supported() && fast_jit_cpu() {
             Some(JitWidth::Avx2)
         } else {
             None
@@ -69,15 +68,15 @@ impl JitWidth {
         self,
         factors: &[u16],
     ) -> std::io::Result<Vec<Option<memory::JitCode>>> {
-        let generated: Vec<Vec<u8>> = factors
+        let generated = factors
             .iter()
             .copied()
             .filter(|&factor| factor != 0)
             .map(|factor| match self {
-                JitWidth::Avx2 => codegen::generate_muladd(&deps::compute_deps(factor)),
-                JitWidth::Avx512 => codegen512::generate_muladd(&deps::compute_deps(factor)),
+                JitWidth::Avx2 => generate_avx2_body(factor, false),
+                JitWidth::Avx512 => Ok(codegen512::generate_muladd(&deps::compute_deps(factor))),
             })
-            .collect();
+            .collect::<std::io::Result<Vec<_>>>()?;
         let mut built = memory::JitCode::new_batch(&generated)?.into_iter();
         let result = factors
             .iter()
@@ -190,10 +189,11 @@ impl JitWidth {
         if factor == 0 {
             return Ok(None);
         }
-        let deps = deps::compute_deps(factor);
         let code = match self {
-            JitWidth::Avx2 => codegen::generate_muladd_with_prefetch(&deps, true),
-            JitWidth::Avx512 => codegen512::generate_muladd_with_prefetch(&deps, true),
+            JitWidth::Avx2 => generate_avx2_body(factor, true)?,
+            JitWidth::Avx512 => {
+                codegen512::generate_muladd_with_prefetch(&deps::compute_deps(factor), true)
+            }
         };
         Ok(Some(memory::JitCode::new(&code)?))
     }
@@ -236,26 +236,30 @@ impl JitWidth {
         code: &packed::PackedJitCode,
         scratch: &mut packed::PackedScratch,
         run: packed::PackedRun,
-    ) {
-        debug_assert_eq!(self, code.width());
-        unsafe { code.run_with_scratch(scratch, run) }
+    ) -> Result<(), packed::PackedExecutionError> {
+        unsafe { self.try_run_packed(code, scratch, run) }
     }
-}
 
-/// `WEAVER_GF16_XORJIT_512=0` disables the AVX512 JIT tier (AVX2 tier and all
-/// other tiers unaffected).
-fn jit512_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_GF16_XORJIT_512").is_none_or(|v| v != "0"))
+    /// Fallible packed dispatch for repair controllers. A returned error means
+    /// the caller must discard any staged output touched by this operation.
+    ///
+    /// # Safety
+    /// The caller must satisfy all requirements of [`Self::run_packed`].
+    pub unsafe fn try_run_packed(
+        self,
+        code: &packed::PackedJitCode,
+        scratch: &mut packed::PackedScratch,
+        run: packed::PackedRun,
+    ) -> Result<(), packed::PackedExecutionError> {
+        debug_assert_eq!(self, code.width());
+        unsafe { code.try_run_with_scratch(scratch, run) }
+    }
 }
 
 /// Whether the AVX512 XOR-JIT tier should run: AVX512BW+VL present, GFNI
 /// absent (GFNI boxes use the affine kernels, which beat every XOR tier), not
-/// under binary translation. Targets AVX512-without-GFNI silicon
-/// (Skylake-X/-SP, Cascade Lake, Cannon Lake) — upstream's non-SLIM
-/// default_method prefers the AVX512 JIT there; par2cmdline-turbo's SLIM
-/// build compiles it out, so this tier goes beyond as-built upstream (like
-/// rarpar's shuffle2x/affine2x ports already do).
+/// under binary translation. This reports explicit method availability; Turbo
+/// does not choose this tier from `default_method`.
 pub fn supported_512() -> bool {
     // BW+VL is deliberately stricter than the kernel's AVX512F-only needs:
     // it matches the crate's other AVX512 gates and scopes the tier to
@@ -265,6 +269,7 @@ pub fn supported_512() -> bool {
         && std::is_x86_feature_detected!("avx512vl")
         && !std::is_x86_feature_detected!("gfni")
         && !running_translated()
+        && strict_wx_available()
 }
 
 /// Build the AVX512 JIT'd muladd code for `factor` (`None` for factor 0).
@@ -276,10 +281,8 @@ pub fn build_muladd_512(factor: u16) -> std::io::Result<Option<memory::JitCode>>
     Ok(Some(memory::JitCode::new(&code)?))
 }
 
-/// Whether the XOR-JIT tier should run: AVX2 present, GFNI absent, and not
-/// running under binary translation. GFNI boxes use the faster affine folded
-/// kernel; this tier targets pre-GFNI x86 (Zen1/2, pre-Ice-Lake Intel), where
-/// it beats the shuffle2x tier ~1.4×.
+/// Whether the AVX2 XOR-JIT method is available: AVX2 present, GFNI absent,
+/// strict W^X available, and not running under binary translation.
 ///
 /// The `!running_translated()` gate mirrors ParPar, which skips the JIT methods
 /// when `isEmulated` (gf16mul.cpp:133-162): an x86_64 binary running under
@@ -289,22 +292,85 @@ pub fn supported() -> bool {
     std::is_x86_feature_detected!("avx2")
         && !std::is_x86_feature_detected!("gfni")
         && !running_translated()
+        && strict_wx_available()
+}
+
+/// Turbo's `propFastJit` family gate. Its encoded family calculation keeps
+/// the base family in the low nibble and extended family in the upper nibble.
+fn fast_jit_cpu() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        let info = std::arch::x86_64::__cpuid(1);
+        turbo_fast_jit_family(turbo_encoded_family(info.eax))
+    })
+}
+
+const fn turbo_encoded_family(eax: u32) -> u32 {
+    ((eax >> 8) & 0x0f) + ((eax >> 16) & 0x0ff0)
+}
+
+const fn turbo_fast_jit_family(family: u32) -> bool {
+    matches!(family, 0x6f | 0x7f | 0x8f | 0xaf)
+}
+
+const fn turbo_emulated_vendor(ebx: u32, edx: u32, ecx: u32) -> bool {
+    matches!(
+        (ebx, edx, ecx),
+        // "Virtual CPU "
+        (0x7472_6956, 0x206c_6175, 0x2055_5043)
+            // "MicrosoftXTA"
+            | (0x7263_694d, 0x666f_736f, 0x4154_5874)
+            // "VirtualApple"
+            | (0x7472_6956, 0x416c_6175, 0x656c_7070)
+    )
+}
+
+/// Whether this process can perform the strict RW -> RX -> RW transitions
+/// required by the worker-local JIT lifecycle.
+pub fn strict_wx_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| memory::preflight_wx().is_ok())
 }
 
 /// Whether this x86_64 process is executing under binary translation, in which
-/// case the JIT tier must not be selected. Mirrors the Rosetta 2 arm of
-/// ParPar's `isEmulated` check (gf16mul.cpp:133-162): translators re-JIT the
-/// emitted native code on every emulated run, so the XOR-JIT / `canMemWX` fast
-/// path becomes pathologically slow.
+/// case the JIT tier must not be selected. This mirrors Turbo's CPUID vendor,
+/// Windows brand-string, and Rosetta checks.
 ///
 /// The result is cached: `supported()` may be called once per batch.
 fn running_translated() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::sync::OnceLock;
+    static TRANSLATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRANSLATED.get_or_init(|| {
+        let vendor = std::arch::x86_64::__cpuid(0);
+        if turbo_emulated_vendor(vendor.ebx, vendor.edx, vendor.ecx) {
+            return true;
+        }
 
-        static TRANSLATED: OnceLock<bool> = OnceLock::new();
-        *TRANSLATED.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 11 x64-on-ARM can present an ordinary CPU vendor while
+            // identifying the translator in the extended brand string.
+            let max_extended = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+            if max_extended >= 0x8000_0004 {
+                let mut brand = [0u8; 48];
+                for (index, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+                    let words = std::arch::x86_64::__cpuid(leaf);
+                    let start = index * 16;
+                    brand[start..start + 4].copy_from_slice(&words.eax.to_le_bytes());
+                    brand[start + 4..start + 8].copy_from_slice(&words.ebx.to_le_bytes());
+                    brand[start + 8..start + 12].copy_from_slice(&words.ecx.to_le_bytes());
+                    brand[start + 12..start + 16].copy_from_slice(&words.edx.to_le_bytes());
+                }
+                if brand
+                    .windows(b"Virtual CPU".len())
+                    .any(|part| part == b"Virtual CPU")
+                {
+                    return true;
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
             use std::os::raw::{c_char, c_int, c_void};
 
             // sysctlbyname(3) — declared locally so this crate keeps its
@@ -338,16 +404,11 @@ fn running_translated() -> bool {
             // A non-zero return (ENOENT on a genuine pre-Rosetta Intel Mac, where
             // the key does not exist) means "not translated"; only
             // proc_translated == 1 signals a Rosetta 2 (translated) process.
-            rc == 0 && translated == 1
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Only the Rosetta 2 case of ParPar's isEmulated is mirrored. User-mode
-        // QEMU (the other x86-emulation vector, on Linux) is deliberately not
-        // detected: reliable detection is fragile and the payoff is low.
+            return rc == 0 && translated == 1;
+        }
+
         false
-    }
+    })
 }
 
 /// Build the JIT'd muladd code for `factor` (returns `None` for factor 0, which
@@ -357,8 +418,14 @@ pub fn build_muladd(factor: u16) -> std::io::Result<Option<memory::JitCode>> {
     if factor == 0 {
         return Ok(None);
     }
-    let code = codegen::generate_muladd(&deps::compute_deps(factor));
+    let code = generate_avx2_body(factor, false)?;
     Ok(Some(memory::JitCode::new(&code)?))
+}
+
+fn generate_avx2_body(factor: u16, prefetch: bool) -> std::io::Result<Vec<u8>> {
+    let mut code = Vec::with_capacity(turbo_avx2::MAX_BODY_BYTES);
+    turbo_avx2::append_muladd_body(&mut code, factor, prefetch).map_err(std::io::Error::other)?;
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -371,12 +438,32 @@ mod tests {
         // and runs on an x86_64 build. The probe result depends on the host —
         // an x86_64 test run on Apple Silicon executes under Rosetta 2 and
         // legitimately reports true — so assert the deterministic properties:
-        // no panic, a cached/stable answer, and false where Rosetta cannot
-        // exist.
+        // no panic and a cached/stable answer.
         let first = running_translated();
         assert_eq!(first, running_translated());
-        #[cfg(not(target_os = "macos"))]
-        assert!(!first);
+    }
+
+    #[test]
+    fn turbo_default_jit_family_gate_matches_the_oracle() {
+        for family in [0x6f, 0x7f, 0x8f, 0xaf] {
+            assert!(turbo_fast_jit_family(family));
+        }
+        for family in [0x06, 0x0f, 0x1f, 0x9f, 0xbf] {
+            assert!(!turbo_fast_jit_family(family));
+        }
+        assert_eq!(turbo_encoded_family(0x0080_0f00), 0x8f);
+    }
+
+    #[test]
+    fn turbo_emulation_vendor_gate_matches_the_oracle() {
+        assert!(turbo_emulated_vendor(0x7472_6956, 0x206c_6175, 0x2055_5043));
+        assert!(turbo_emulated_vendor(0x7263_694d, 0x666f_736f, 0x4154_5874));
+        assert!(turbo_emulated_vendor(0x7472_6956, 0x416c_6175, 0x656c_7070));
+        assert!(!turbo_emulated_vendor(
+            0x6874_7541,
+            0x6974_6e65,
+            0x444d_4163
+        ));
     }
 
     #[test]

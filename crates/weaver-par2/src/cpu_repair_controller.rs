@@ -8,7 +8,111 @@
 const DEFAULT_INPUT_GROUPING: usize = 12;
 const CONTROLLER_STAGING_AREAS: usize = 2;
 const CONTROLLER_TRANSFER_BUFFERS: usize = 2;
-const CONTROLLER_PHYSICAL_ROW_ALIGNMENT: usize = 64;
+
+/// Normalized live-execution events. These are distinct from the deterministic
+/// lifecycle trace: they describe the operations the real controller actually
+/// performed, including failure before staged output can be accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerExecutionEvent {
+    SlotState {
+        status: ControllerAddStatus,
+        staging_area: usize,
+    },
+    Backpressure {
+        staging_area: usize,
+    },
+    WaitForAdd {
+        staging_area: usize,
+    },
+    SourceRead {
+        source_index: usize,
+        staging_area: usize,
+    },
+    InputQueued {
+        source_index: usize,
+        staging_area: usize,
+        slot: usize,
+    },
+    PreparationCompleted {
+        staging_area: usize,
+        input_len: usize,
+    },
+    BatchSubmitted {
+        staging_area: usize,
+        input_start: usize,
+        input_len: usize,
+        add: bool,
+        reason: BatchSubmitReason,
+    },
+    StagingRotated {
+        from: usize,
+        to: usize,
+    },
+    ComputeSubmitted {
+        staging_area: usize,
+        add: bool,
+    },
+    ComputeCompleted {
+        staging_area: usize,
+    },
+    OutputTransferQueued {
+        output: usize,
+    },
+    OutputWritten {
+        output: usize,
+    },
+    InputEnded {
+        partial_batch_flushed: bool,
+    },
+    ProcessingFinished,
+    Failed {
+        phase: ControllerFailurePhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerFailurePhase {
+    Read,
+    Prepare,
+    Compute,
+    OutputTransfer,
+    Write,
+}
+
+/// Disabled by default and enabled only by execution-level tests. The runtime
+/// always emits through this object, so test traces cannot drift into a second
+/// simulated controller path.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ControllerExecutionTrace {
+    #[cfg(test)]
+    events: Option<std::sync::Arc<std::sync::Mutex<Vec<ControllerExecutionEvent>>>>,
+}
+
+impl ControllerExecutionTrace {
+    #[cfg(test)]
+    pub(crate) fn capture() -> Self {
+        Self {
+            events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+        }
+    }
+
+    pub(crate) fn record(&self, event: ControllerExecutionEvent) {
+        #[cfg(test)]
+        if let Some(events) = &self.events {
+            events.lock().expect("controller trace lock").push(event);
+        }
+        #[cfg(not(test))]
+        let _ = event;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> Vec<ControllerExecutionEvent> {
+        self.events
+            .as_ref()
+            .map(|events| events.lock().expect("controller trace lock").clone())
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerAddStatus {
@@ -50,11 +154,12 @@ impl ControllerBufferAccounting {
         input_grouping: usize,
         allocated_staging_width: usize,
         output_count: usize,
+        method: CpuMethodContract,
     ) -> Self {
         assert!(aligned_slice_len > 0);
         assert!(input_grouping > 0);
         assert!(allocated_staging_width >= input_grouping);
-        let physical_row_len = align_up(aligned_slice_len, CONTROLLER_PHYSICAL_ROW_ALIGNMENT);
+        let physical_row_len = align_up(aligned_slice_len, method.alignment.max(1));
         let staging_area_bytes = allocated_staging_width
             .checked_mul(physical_row_len)
             .expect("controller staging allocation size overflow");
@@ -161,18 +266,46 @@ macro_rules! record_controller_trace {
     ($lifecycle:expr, $event:expr) => {};
 }
 
+/// The complete scheduling contract supplied by the selected CPU arithmetic
+/// method.  It is deliberately a value rather than a collection of ad-hoc
+/// kernel queries: allocation, transfer checksums, layout and invocation
+/// prefetching must all describe the same method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KernelCapabilities {
+pub(crate) struct CpuMethodContract {
     pub(crate) stride: usize,
+    pub(crate) alignment: usize,
     pub(crate) ideal_input_multiple: usize,
+    /// Physical source rows required per logical input group.
+    pub(crate) staging_multiple: usize,
     pub(crate) ideal_chunk_size: usize,
+    pub(crate) checksum_width: usize,
+    pub(crate) prefetch: CpuPrefetch,
+    /// Cached process capability for a strict RW -> RX -> RW worker JIT
+    /// transition. It is false for methods that do not execute JIT code.
+    pub(crate) strict_wx_available: bool,
 }
 
-impl KernelCapabilities {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CpuPrefetch {
+    /// Inputs prepared per packed invocation. Zero disables input prefetch.
+    pub(crate) inputs_per_invoke: usize,
+    /// Exponent used by Turbo's input prefetch distance calculation.
+    pub(crate) input_distance_shift: usize,
+    /// Whether the next output range should be prefetched when available.
+    pub(crate) output: bool,
+}
+
+impl CpuMethodContract {
     pub(crate) fn input_grouping(self) -> usize {
         let multiple = self.ideal_input_multiple.max(1);
         let rounded = (DEFAULT_INPUT_GROUPING + multiple / 2) / multiple * multiple;
         rounded.max(multiple)
+    }
+
+    pub(crate) fn staging_width(self) -> usize {
+        let grouping = self.input_grouping();
+        let multiple = self.staging_multiple.max(1);
+        grouping.div_ceil(multiple) * multiple
     }
 }
 
@@ -219,7 +352,7 @@ pub(crate) enum ControllerAddResult {
 /// The arithmetic backend consumes the submitted batches; this type owns the
 /// slot protocol around them. An active area cannot be reused, and the caller
 /// must complete it before retrying an add that reports `Full`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ControllerLifecycle {
     pub(crate) input_grouping: usize,
     pub(crate) min_input_batch_size: usize,
@@ -230,6 +363,7 @@ pub(crate) struct ControllerLifecycle {
     pub(crate) processing_add: bool,
     pub(crate) ended: bool,
     pub(crate) batches_started: usize,
+    execution_trace: ControllerExecutionTrace,
     #[cfg(test)]
     trace: Vec<ControllerTraceEvent>,
 }
@@ -247,9 +381,15 @@ impl ControllerLifecycle {
             processing_add: false,
             ended: false,
             batches_started: 0,
+            execution_trace: ControllerExecutionTrace::default(),
             #[cfg(test)]
             trace: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_execution_trace(mut self, trace: ControllerExecutionTrace) -> Self {
+        self.execution_trace = trace;
+        self
     }
 
     #[cfg(test)]
@@ -264,18 +404,28 @@ impl ControllerLifecycle {
     }
 
     pub(crate) fn can_add(&self) -> ControllerAddStatus {
-        if self.active_staging[self.current_staging_area] {
+        let status = if self.active_staging[self.current_staging_area] {
             ControllerAddStatus::Full
         } else if self.active_staging[self.previous_staging_area()] {
             ControllerAddStatus::ReadyBusy
         } else {
             ControllerAddStatus::Ready
-        }
+        };
+        self.execution_trace
+            .record(ControllerExecutionEvent::SlotState {
+                status,
+                staging_area: self.current_staging_area,
+            });
+        status
     }
 
     pub(crate) fn observe_backpressure(&mut self) -> ControllerAddStatus {
         let status = self.can_add();
         if status == ControllerAddStatus::Full {
+            self.execution_trace
+                .record(ControllerExecutionEvent::Backpressure {
+                    staging_area: self.current_staging_area,
+                });
             record_controller_trace!(
                 self,
                 ControllerTraceEvent::Backpressure {
@@ -338,6 +488,10 @@ impl ControllerLifecycle {
 
     pub(crate) fn wait_for_add(&mut self) {
         assert_eq!(self.can_add(), ControllerAddStatus::Full);
+        self.execution_trace
+            .record(ControllerExecutionEvent::WaitForAdd {
+                staging_area: self.current_staging_area,
+            });
         record_controller_trace!(
             self,
             ControllerTraceEvent::WaitForAdd {
@@ -355,6 +509,10 @@ impl ControllerLifecycle {
             None
         };
         self.ended = true;
+        self.execution_trace
+            .record(ControllerExecutionEvent::InputEnded {
+                partial_batch_flushed,
+            });
         record_controller_trace!(
             self,
             ControllerTraceEvent::InputEnded {
@@ -374,6 +532,8 @@ impl ControllerLifecycle {
     pub(crate) fn processing_finished(&mut self) {
         assert!(self.ended);
         assert!(self.active_staging.iter().all(|active| !active));
+        self.execution_trace
+            .record(ControllerExecutionEvent::ProcessingFinished);
         record_controller_trace!(self, ControllerTraceEvent::ProcessingFinished);
     }
 
@@ -411,7 +571,20 @@ impl ControllerLifecycle {
                 reason,
             }
         );
+        self.execution_trace
+            .record(ControllerExecutionEvent::BatchSubmitted {
+                staging_area,
+                input_start: batch.input_start,
+                input_len,
+                add: batch.add,
+                reason,
+            });
         self.current_staging_area = (staging_area + 1) % CONTROLLER_STAGING_AREAS;
+        self.execution_trace
+            .record(ControllerExecutionEvent::StagingRotated {
+                from: staging_area,
+                to: self.current_staging_area,
+            });
         record_controller_trace!(
             self,
             ControllerTraceEvent::StagingRotated {
@@ -423,14 +596,17 @@ impl ControllerLifecycle {
     }
 }
 
-struct ControllerSimulation {
-    batches: Vec<InputBatch>,
-    #[cfg(test)]
-    trace: Vec<ControllerTraceEvent>,
+#[cfg(test)]
+pub(crate) struct ControllerSimulation {
+    pub(crate) batches: Vec<InputBatch>,
+    pub(crate) trace: Vec<ControllerTraceEvent>,
 }
 
+#[cfg(test)]
 impl ControllerLifecycle {
-    fn simulate(input_count: usize, input_grouping: usize) -> ControllerSimulation {
+    /// Model-only driver for controller unit tests. Production execution drives
+    /// this lifecycle directly; plans never synthesize submission events.
+    pub(crate) fn simulate(input_count: usize, input_grouping: usize) -> ControllerSimulation {
         assert!(input_count > 0);
         let mut lifecycle = Self::new(input_grouping);
         let mut batches = Vec::new();
@@ -469,9 +645,7 @@ impl ControllerLifecycle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CpuControllerPlan {
-    input_grouping: usize,
     layout: ControllerLayout,
-    input_batches: Vec<InputBatch>,
     buffer_accounting: ControllerBufferAccounting,
 }
 
@@ -479,36 +653,34 @@ impl CpuControllerPlan {
     #[cfg(test)]
     pub(crate) fn new(
         current_slice_size: usize,
-        input_count: usize,
         output_count: usize,
         worker_count: usize,
-        capabilities: KernelCapabilities,
+        method: CpuMethodContract,
     ) -> Self {
-        Self::new_with_input_grouping(
+        let input_grouping = method.input_grouping();
+        Self::new_with_input_grouping_and_staging_width(
             current_slice_size,
-            input_count,
             output_count,
             worker_count,
-            capabilities,
-            capabilities.input_grouping(),
+            method,
+            input_grouping,
+            input_grouping,
         )
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_input_grouping(
         current_slice_size: usize,
-        input_count: usize,
         output_count: usize,
         worker_count: usize,
-        capabilities: KernelCapabilities,
+        method: CpuMethodContract,
         input_grouping: usize,
     ) -> Self {
         Self::new_with_input_grouping_and_staging_width(
             current_slice_size,
-            input_count,
             output_count,
             worker_count,
-            capabilities,
+            method,
             input_grouping,
             input_grouping,
         )
@@ -518,43 +690,34 @@ impl CpuControllerPlan {
     /// Folded kernels can pass a width larger than `input_grouping`.
     pub(crate) fn new_with_input_grouping_and_staging_width(
         current_slice_size: usize,
-        input_count: usize,
         output_count: usize,
         worker_count: usize,
-        capabilities: KernelCapabilities,
+        method: CpuMethodContract,
         input_grouping: usize,
         allocated_staging_width: usize,
     ) -> Self {
-        assert!(input_count > 0);
         assert!(input_grouping > 0);
         assert!(allocated_staging_width >= input_grouping);
-        let simulation = ControllerLifecycle::simulate(input_count, input_grouping);
-        let layout =
-            ControllerLayout::new(current_slice_size, output_count, worker_count, capabilities);
+        let layout = ControllerLayout::new(current_slice_size, output_count, worker_count, method);
         let buffer_accounting = ControllerBufferAccounting::new(
             layout.aligned_len,
             input_grouping,
             allocated_staging_width,
             output_count,
+            method,
         );
         Self {
-            input_grouping,
             layout,
-            input_batches: simulation.batches,
             buffer_accounting,
         }
     }
 
     pub(crate) fn input_grouping(&self) -> usize {
-        self.input_grouping
+        self.buffer_accounting.input_grouping
     }
 
     pub(crate) fn layout(&self) -> &ControllerLayout {
         &self.layout
-    }
-
-    pub(crate) fn input_batches(&self) -> &[InputBatch] {
-        &self.input_batches
     }
 
     pub(crate) fn buffer_accounting(&self) -> &ControllerBufferAccounting {
@@ -563,17 +726,12 @@ impl CpuControllerPlan {
 
     #[cfg(test)]
     pub(crate) fn trace(&self) -> Vec<ControllerTraceEvent> {
-        let lifecycle_trace = ControllerLifecycle::simulate(
-            self.input_batches.iter().map(|batch| batch.input_len).sum(),
-            self.input_grouping,
-        )
-        .trace;
         build_plan_trace(
             self.buffer_accounting.output_count,
             self.layout.worker_count,
             &self.layout,
             &self.buffer_accounting,
-            lifecycle_trace,
+            Vec::new(),
         )
     }
 }
@@ -583,13 +741,13 @@ impl ControllerLayout {
         current_slice_size: usize,
         output_count: usize,
         worker_count: usize,
-        capabilities: KernelCapabilities,
+        method: CpuMethodContract,
     ) -> Self {
         assert!(current_slice_size > 0);
         assert!(output_count > 0);
         let workers = worker_count.max(1);
-        let stride = capabilities.stride.max(1);
-        let ideal_chunk = align_up(capabilities.ideal_chunk_size.max(stride), stride);
+        let stride = method.stride.max(1);
+        let ideal_chunk = align_up(method.ideal_chunk_size.max(stride), stride);
         // Turbo keeps one additional packed stride so preparation/finalization
         // can safely carry its checksum/padding block through the controller.
         let aligned_len = align_up(current_slice_size, stride) + stride;
@@ -721,27 +879,40 @@ fn round_div(value: usize, divisor: usize) -> usize {
 mod tests {
     use super::*;
 
-    const CAPS: KernelCapabilities = KernelCapabilities {
+    const METHOD: CpuMethodContract = CpuMethodContract {
         stride: 32,
+        alignment: 64,
         ideal_input_multiple: 1,
+        staging_multiple: 1,
         ideal_chunk_size: 64 * 1024,
+        checksum_width: 32,
+        prefetch: CpuPrefetch {
+            inputs_per_invoke: 0,
+            input_distance_shift: 0,
+            output: false,
+        },
+        strict_wx_available: false,
     };
+
+    fn simulated_batches(input_count: usize, grouping: usize) -> Vec<InputBatch> {
+        ControllerLifecycle::simulate(input_count, grouping).batches
+    }
 
     #[test]
     fn input_grouping_rounds_twelve_to_kernel_multiple() {
-        assert_eq!(CAPS.input_grouping(), 12);
+        assert_eq!(METHOD.input_grouping(), 12);
         assert_eq!(
-            KernelCapabilities {
+            CpuMethodContract {
                 ideal_input_multiple: 6,
-                ..CAPS
+                ..METHOD
             }
             .input_grouping(),
             12
         );
         assert_eq!(
-            KernelCapabilities {
+            CpuMethodContract {
                 ideal_input_multiple: 8,
-                ..CAPS
+                ..METHOD
             }
             .input_grouping(),
             16
@@ -750,10 +921,9 @@ mod tests {
 
     #[test]
     fn input_batches_rotate_staging_and_flush_partial_group() {
-        let plan = CpuControllerPlan::new(64 * 1024, 25, 4, 8, CAPS);
-        assert_eq!(plan.input_grouping, 12);
+        let batches = simulated_batches(25, METHOD.input_grouping());
         assert_eq!(
-            plan.input_batches,
+            batches,
             vec![
                 InputBatch {
                     staging_area: 0,
@@ -792,31 +962,31 @@ mod tests {
             (25, vec![12, 12, 1]),
         ];
         for (inputs, expected_lengths) in cases {
-            let plan = CpuControllerPlan::new(64 * 1024, inputs, 3, 8, CAPS);
+            let batches = simulated_batches(inputs, METHOD.input_grouping());
             assert_eq!(
-                plan.input_batches
+                batches
                     .iter()
                     .map(|batch| batch.input_len)
                     .collect::<Vec<_>>(),
                 expected_lengths
             );
             assert_eq!(
-                plan.input_batches
+                batches
                     .iter()
                     .map(|batch| batch.staging_area)
                     .collect::<Vec<_>>(),
-                (0..plan.input_batches.len())
+                (0..batches.len())
                     .map(|batch| batch % 2)
                     .collect::<Vec<_>>()
             );
-            assert!(!plan.input_batches[0].add);
-            assert!(plan.input_batches.iter().skip(1).all(|batch| batch.add));
+            assert!(!batches[0].add);
+            assert!(batches.iter().skip(1).all(|batch| batch.add));
         }
     }
 
     #[test]
     fn one_chunk_splits_outputs_across_workers() {
-        let layout = ControllerLayout::new(64 * 1024, 512, 12, CAPS);
+        let layout = ControllerLayout::new(64 * 1024, 512, 12, METHOD);
         assert_eq!(layout.num_chunks, 1);
         assert_eq!(layout.assignments.len(), 12);
         assert!(layout.assignments.iter().all(|work| work.byte_start == 0));
@@ -824,7 +994,7 @@ mod tests {
             layout
                 .assignments
                 .iter()
-                .all(|work| work.byte_len == 64 * 1024 + CAPS.stride)
+                .all(|work| work.byte_len == 64 * 1024 + METHOD.stride)
         );
         assert_eq!(
             layout
@@ -838,7 +1008,7 @@ mod tests {
 
     #[test]
     fn one_chunk_caps_workers_at_output_count() {
-        let layout = ControllerLayout::new(64 * 1024, 3, 12, CAPS);
+        let layout = ControllerLayout::new(64 * 1024, 3, 12, METHOD);
         assert_eq!(layout.num_chunks, 1);
         assert_eq!(
             layout.assignments,
@@ -870,7 +1040,7 @@ mod tests {
 
     #[test]
     fn large_slice_distributes_full_chunks_across_workers() {
-        let layout = ControllerLayout::new(1024 * 1024, 8, 12, CAPS);
+        let layout = ControllerLayout::new(1024 * 1024, 8, 12, METHOD);
         assert_eq!(layout.num_chunks, 12);
         assert_eq!(layout.assignments.len(), 12);
         assert!(layout.assignments.iter().all(|work| work.output_len == 8));
@@ -886,11 +1056,11 @@ mod tests {
 
     #[test]
     fn leftover_chunks_split_outputs_then_assign_full_chunks() {
-        let caps = KernelCapabilities {
+        let method = CpuMethodContract {
             ideal_chunk_size: 96 * 1024,
-            ..CAPS
+            ..METHOD
         };
-        let layout = ControllerLayout::new(3 * 1024 * 1024, 17, 8, caps);
+        let layout = ControllerLayout::new(3 * 1024 * 1024, 17, 8, method);
         assert!(layout.num_chunks > 8);
 
         let mut coverage = vec![0u8; layout.aligned_len * 17];
@@ -906,30 +1076,28 @@ mod tests {
 
     #[test]
     fn short_slice_is_stride_aligned() {
-        let layout = ControllerLayout::new(65_537, 3, 4, CAPS);
-        assert_eq!(layout.aligned_len % CAPS.stride, 0);
-        assert_eq!(layout.chunk_len % CAPS.stride, 0);
+        let layout = ControllerLayout::new(65_537, 3, 4, METHOD);
+        assert_eq!(layout.aligned_len % METHOD.stride, 0);
+        assert_eq!(layout.chunk_len % METHOD.stride, 0);
         assert!(layout.aligned_len >= 65_537);
     }
 
     #[test]
     fn explicit_grouping_is_the_single_plan_source_of_truth() {
-        let default_plan = CpuControllerPlan::new(64 * 1024, 9, 3, 4, CAPS);
+        let default_plan = CpuControllerPlan::new(64 * 1024, 3, 4, METHOD);
         let explicit_plan = CpuControllerPlan::new_with_input_grouping(
             64 * 1024,
-            9,
             3,
             4,
-            CAPS,
-            CAPS.input_grouping(),
+            METHOD,
+            METHOD.input_grouping(),
         );
         assert_eq!(default_plan, explicit_plan);
 
-        let small_source = CpuControllerPlan::new_with_input_grouping(64 * 1024, 9, 3, 4, CAPS, 4);
+        let small_source = CpuControllerPlan::new_with_input_grouping(64 * 1024, 3, 4, METHOD, 4);
         assert_eq!(small_source.input_grouping(), 4);
         assert_eq!(
-            small_source
-                .input_batches()
+            simulated_batches(9, small_source.input_grouping())
                 .iter()
                 .map(|batch| (batch.input_len, batch.reason))
                 .collect::<Vec<_>>(),
@@ -1044,7 +1212,7 @@ mod tests {
 
     #[test]
     fn plan_accounts_for_two_transfer_buffers_double_staging_and_outputs() {
-        let plan = CpuControllerPlan::new(65_536, 13, 3, 4, CAPS);
+        let plan = CpuControllerPlan::new(65_536, 3, 4, METHOD);
         let accounting = &plan.buffer_accounting;
         assert_eq!(accounting.transfer_buffer_count, 2);
         assert_eq!(accounting.staging_area_count, 2);
@@ -1075,10 +1243,9 @@ mod tests {
     fn folded_small_group_accounts_physical_staging_width() {
         let plan = CpuControllerPlan::new_with_input_grouping_and_staging_width(
             64 * 1024,
-            5,
             3,
             4,
-            CAPS,
+            METHOD,
             1,
             6,
         );
@@ -1089,21 +1256,21 @@ mod tests {
             6 * plan.buffer_accounting().physical_row_len
         );
         assert_eq!(
-            plan.input_batches()
+            simulated_batches(5, plan.input_grouping())
                 .iter()
                 .map(|batch| batch.input_len)
                 .collect::<Vec<_>>(),
             vec![1, 1, 1, 1, 1]
         );
         assert_eq!(
-            plan.input_batches(),
-            ControllerLifecycle::simulate(5, 1).batches.as_slice()
+            simulated_batches(5, plan.input_grouping()),
+            ControllerLifecycle::simulate(5, 1).batches
         );
     }
 
     #[test]
-    fn plan_trace_contains_schedule_modes_and_partial_flush() {
-        let plan = CpuControllerPlan::new(64 * 1024, 25, 4, 8, CAPS);
+    fn plan_trace_contains_only_static_layout_and_runtime_trace_owns_lifecycle() {
+        let plan = CpuControllerPlan::new(64 * 1024, 4, 8, METHOD);
         assert!(matches!(
             plan.trace().first(),
             Some(ControllerTraceEvent::Initialized {
@@ -1120,30 +1287,18 @@ mod tests {
                 .count(),
             plan.layout.assignments.len()
         );
-        assert!(plan.trace().iter().any(|event| matches!(
+        assert!(plan.trace().iter().all(|event| !matches!(
             event,
-            ControllerTraceEvent::BatchSubmitted {
-                input_start: 0,
-                input_len: 12,
-                add: false,
-                reason: BatchSubmitReason::GroupFull,
-                ..
-            }
+            ControllerTraceEvent::BatchSubmitted { .. } | ControllerTraceEvent::Backpressure { .. }
         )));
-        assert!(plan.trace().iter().any(|event| matches!(
+        let trace = ControllerLifecycle::simulate(25, METHOD.input_grouping()).trace;
+        assert!(trace.iter().any(|event| matches!(
             event,
             ControllerTraceEvent::BatchSubmitted {
                 input_start: 24,
                 input_len: 1,
                 add: true,
                 reason: BatchSubmitReason::EndInput,
-                ..
-            }
-        )));
-        assert!(plan.trace().iter().any(|event| matches!(
-            event,
-            ControllerTraceEvent::Backpressure {
-                status: ControllerAddStatus::Full,
                 ..
             }
         )));
