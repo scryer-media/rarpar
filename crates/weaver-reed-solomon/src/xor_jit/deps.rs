@@ -4,9 +4,8 @@
 //! `output_plane[o] = XOR of input_plane[k]` over the set bits of row `o` of a
 //! 16×16 GF(2) matrix — the same linear map the GFNI affine kernel and the
 //! shuffle tables encode, in the bit-plane basis the JIT'd `vpxor` kernel
-//! consumes. The matrix is fixed per factor (once-per-factor setup); ParPar
-//! builds it with a SIMD generator, but the result is pure GF math, so it is
-//! computed scalar here and validated byte-exact end to end.
+//! consumes. The matrix is fixed per factor, computed scalar during setup,
+//! and validated byte-exact end to end.
 //!
 //! [`muladd_planar`] is the correctness oracle the JIT codegen must reproduce.
 

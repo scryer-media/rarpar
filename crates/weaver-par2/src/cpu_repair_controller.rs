@@ -289,7 +289,7 @@ pub(crate) struct CpuMethodContract {
 pub(crate) struct CpuPrefetch {
     /// Inputs prepared per packed invocation. Zero disables input prefetch.
     pub(crate) inputs_per_invoke: usize,
-    /// Exponent used by Turbo's input prefetch distance calculation.
+    /// Exponent used by the input prefetch distance calculation.
     pub(crate) input_distance_shift: usize,
     /// Whether the next output range should be prefetched when available.
     pub(crate) output: bool,
@@ -347,7 +347,7 @@ pub(crate) enum ControllerAddResult {
     Full,
 }
 
-/// Deterministic state for Turbo's two-area controller protocol.
+/// Deterministic state for the two-area controller protocol.
 ///
 /// The arithmetic backend consumes the submitted batches; this type owns the
 /// slot protocol around them. An active area cannot be reused, and the caller
@@ -748,8 +748,8 @@ impl ControllerLayout {
         let workers = worker_count.max(1);
         let stride = method.stride.max(1);
         let ideal_chunk = align_up(method.ideal_chunk_size.max(stride), stride);
-        // Turbo keeps one additional packed stride so preparation/finalization
-        // can safely carry its checksum/padding block through the controller.
+        // Keep one additional packed stride so preparation/finalization can
+        // safely carry its checksum/padding block through the controller.
         let aligned_len = align_up(current_slice_size, stride) + stride;
 
         let target_thread_chunk = aligned_len.div_ceil(workers);
@@ -951,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn input_group_boundaries_match_turbo_flush_decisions() {
+    fn input_group_boundaries_flush_complete_and_partial_groups() {
         let cases = [
             (1, vec![1]),
             (11, vec![11]),
@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_exposes_turbo_backpressure_and_rotation() {
+    fn lifecycle_exposes_backpressure_and_area_rotation() {
         let mut lifecycle = ControllerLifecycle::new(2);
         assert_eq!(lifecycle.can_add(), ControllerAddStatus::Ready);
         assert!(matches!(

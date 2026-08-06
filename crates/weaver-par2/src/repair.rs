@@ -498,7 +498,7 @@ fn total_input_slices_for_set(par2_set: &Par2FileSet) -> Result<usize> {
     Ok(total)
 }
 
-fn turbo_controller_plan(
+fn cpu_controller_plan(
     current_slice_size: usize,
     output_count: usize,
     worker_count: usize,
@@ -534,7 +534,7 @@ fn controller_execution_parameters(
     })?;
     let mut chunk_words = word_count;
     loop {
-        let controller = turbo_controller_plan(
+        let controller = cpu_controller_plan(
             chunk_words.saturating_mul(2),
             plan.missing_slices.len(),
             workers,
@@ -602,8 +602,7 @@ fn grouped_input_factors(coefficients: &matrix::Matrix) -> Vec<Vec<FactorIndex>>
         .collect()
 }
 
-// ParPar's cache-tile preferences for the corresponding kernel families.
-// These are scheduling capabilities, not correctness limits.
+// Cache-tile preferences are scheduling capabilities, not correctness limits.
 const PLAIN_IDEAL_CHUNK_BYTES: usize = 32 * 1024;
 const FOLDED_IDEAL_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_arch = "x86_64")]
@@ -633,9 +632,9 @@ fn staging_bytes_mut(cells: &mut [StagingCell]) -> &mut [u8] {
 
 /// Persistent chunk-major controller output area.
 ///
-/// Within each compute chunk, all output regions are contiguous. This matches
-/// Turbo's processing area and keeps the active input/output working set local
-/// to the worker before the transfer thread gathers one output for writing.
+/// Within each compute chunk, all output regions are contiguous, keeping the
+/// active input/output working set local to the worker before the transfer
+/// thread gathers one output for writing.
 struct AlignedOutputArea {
     cells: Vec<StagingCell>,
 }
@@ -671,6 +670,69 @@ struct PreparedFactorMemo {
 
 impl PreparedFactorMemo {
     fn from_matrix(matrix: &matrix::Matrix, with_folded: bool) -> Self {
+        if std::env::var_os("WEAVER_XORJIT_MATRIX_DIAGNOSTICS").is_some() {
+            let mut frequencies = vec![0u32; 1usize << 16];
+            for &factor in &matrix.data {
+                frequencies[usize::from(factor)] += 1;
+            }
+            let mut ranked = frequencies
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, count)| *count != 0)
+                .collect::<Vec<_>>();
+            ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+
+            let mut stamps = vec![0u32; 1usize << 16];
+            let mut epoch = 0u32;
+            let mut group_counts = Vec::new();
+            for start in (0..matrix.cols).step_by(12) {
+                epoch += 1;
+                let end = (start + 12).min(matrix.cols);
+                let mut unique = 0usize;
+                for row in matrix.data.chunks_exact(matrix.cols) {
+                    for &factor in &row[start..end] {
+                        if factor != 0 && stamps[usize::from(factor)] != epoch {
+                            stamps[usize::from(factor)] = epoch;
+                            unique += 1;
+                        }
+                    }
+                }
+                group_counts.push(unique);
+            }
+            let total_nonzero = frequencies
+                .iter()
+                .skip(1)
+                .map(|&count| u64::from(count))
+                .sum::<u64>();
+            let group_total = group_counts.iter().sum::<usize>();
+            eprintln!(
+                "xorjit matrix: rows={} cols={} nonzero={} unique={} groups={} group_unique_min={} group_unique_avg={:.1} group_unique_max={} max_frequency={}",
+                matrix.rows,
+                matrix.cols,
+                total_nonzero,
+                ranked.len(),
+                group_counts.len(),
+                group_counts.iter().min().copied().unwrap_or(0),
+                group_total as f64 / group_counts.len().max(1) as f64,
+                group_counts.iter().max().copied().unwrap_or(0),
+                ranked.first().map_or(0, |entry| entry.1),
+            );
+            for cached in [1024usize, 4096, 8192, 16384, 24576, 32768] {
+                let hits = ranked
+                    .iter()
+                    .take(cached)
+                    .map(|entry| u64::from(entry.1))
+                    .sum::<u64>();
+                eprintln!(
+                    "xorjit cache estimate: factors={} coefficient_hits={} hit_percent={:.2}",
+                    cached.min(ranked.len()),
+                    hits,
+                    hits as f64 * 100.0 / total_nonzero.max(1) as f64,
+                );
+            }
+        }
         let mut slots: Vec<Option<Box<MemoEntry>>> = (0..1usize << 16).map(|_| None).collect();
         // The folded split layout is shared; the GFNI affine kernel and the
         // non-GFNI shuffle2x kernel consume it with different coefficient
@@ -746,7 +808,6 @@ impl JitMemo {
         width: reedsolomon_rs::xor_jit::JitWidth,
         method: CpuMethodContract,
         output_count: usize,
-        workers: usize,
         available_bytes: usize,
     ) -> std::result::Result<Self, reedsolomon_rs::xor_jit::packed::PackedBuildError> {
         if !method.strict_wx_available {
@@ -757,54 +818,31 @@ impl JitMemo {
             );
         }
         let input_grouping = method.input_grouping();
-        // AVX2 keeps bounded worker-local scratch. AVX512 keeps one immutable
-        // arena in each of the two controller areas.
-        let (arena_limit, reserved_bytes) = match width {
-            reedsolomon_rs::xor_jit::JitWidth::Avx2 => {
-                let arena_limit =
-                    reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
-                        width,
-                        output_count,
-                        input_grouping,
-                    )
-                    .ok_or(
-                        reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                            requested_bytes: usize::MAX,
-                            limit_bytes: available_bytes,
-                        },
-                    )?;
-                let reserved = workers
-                    .checked_mul(reedsolomon_rs::xor_jit::packed::AVX2_WORKER_SCRATCH_BYTES)
-                    .ok_or(
-                        reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                            requested_bytes: usize::MAX,
-                            limit_bytes: available_bytes,
-                        },
-                    )?;
-                (arena_limit, reserved)
-            }
-            reedsolomon_rs::xor_jit::JitWidth::Avx512 => {
-                let area_limit =
-                    reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
-                        width,
-                        output_count,
-                        input_grouping,
-                    )
-                    .ok_or(
-                        reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                            requested_bytes: usize::MAX,
-                            limit_bytes: available_bytes,
-                        },
-                    )?;
-                let reserved = area_limit.checked_mul(2).ok_or(
-                    reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
-                        requested_bytes: usize::MAX,
-                        limit_bytes: available_bytes,
-                    },
-                )?;
-                (area_limit, reserved)
-            }
-        };
+        // Each of the two controller staging areas owns one immutable active
+        // batch arena. The area returns to RW only after all workers finish.
+        let arena_limit =
+            reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
+                width,
+                output_count,
+                input_grouping,
+            )
+            .ok_or(
+                reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                    requested_bytes: usize::MAX,
+                    limit_bytes: available_bytes,
+                },
+            )?;
+        let reserved_bytes = arena_limit.checked_mul(2).ok_or(
+            reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                requested_bytes: usize::MAX,
+                limit_bytes: available_bytes,
+            },
+        )?;
+        if std::env::var_os("WEAVER_XORJIT_MATRIX_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "xorjit memory: available_bytes={available_bytes} arena_limit={arena_limit} reserved_bytes={reserved_bytes}"
+            );
+        }
         if reserved_bytes > available_bytes {
             return Err(
                 reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
@@ -873,8 +911,8 @@ enum CpuKernelKind {
 }
 
 impl CpuKernelKind {
-    /// Complete Turbo-style method contract. All controller policy reads this
-    /// value; the enum below is only the arithmetic dispatch selector.
+    /// Complete method contract. Controller policy reads this value; the enum
+    /// itself is only the arithmetic dispatch selector.
     fn method(self) -> CpuMethodContract {
         match self {
             Self::Plain => CpuMethodContract {
@@ -1277,9 +1315,9 @@ enum PreparationMessage {
     },
 }
 
-/// One of Turbo's two controller-owned transfer buffers. The slot identity
-/// survives preparation and output finishing so a completion cannot duplicate
-/// or replace a checked-out buffer.
+/// One of two controller-owned transfer buffers. The slot identity survives
+/// preparation and output finishing so a completion cannot duplicate or
+/// replace a checked-out buffer.
 struct TransferBuffer {
     slot: usize,
     bytes: Vec<u8>,
@@ -1493,8 +1531,8 @@ fn run_preparation_worker<'a>(
                         });
                     }
                 }
-                // Turbo launches the completed group before resolving the input
-                // future. Compute is already queued when this buffer is returned.
+                // Launch the completed group before resolving the input future;
+                // compute is already queued when this buffer is returned.
                 if complete_tx.send(buffer).is_err() {
                     trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
@@ -1870,8 +1908,8 @@ fn fill_gpu_stream_batch(
 }
 
 /// Start one controller staging area. Inputs are admitted individually by
-/// [`queue_live_stream_input`], matching Turbo's `waitForAdd`/`addInput`
-/// protocol rather than filling a group before the lifecycle sees it.
+/// [`queue_live_stream_input`] rather than filling a group before the
+/// lifecycle sees it.
 fn begin_live_stream_batch(
     preparer: &CpuInputPreparer,
     mut set: StreamBatchSet,
@@ -1903,8 +1941,8 @@ fn begin_live_stream_batch(
         })
 }
 
-/// Fill one of Turbo's transfer buffers before waiting for the destination
-/// staging area. This keeps disk work overlapped with the older active batch.
+/// Fill one transfer buffer before waiting for the destination staging area.
+/// This keeps disk work overlapped with the older active batch.
 #[allow(clippy::too_many_arguments)]
 fn read_live_stream_input(
     preparer: &mut CpuInputPreparer,
@@ -2196,8 +2234,8 @@ fn run_cpu_worker(
                     input_prefetch_out_offset =
                         local_output_count.saturating_sub(input_prefetch_passes);
                 }
-                // Turbo prefetches input only between rounds owned by this
-                // worker request, never across an assignment boundary.
+                // Prefetch input only between rounds owned by this worker
+                // request, never across an assignment boundary.
                 let next_packed_chunk = (byte_start + chunk_len < work_end)
                     .then(|| unsafe { packed.add((chunk_index + 1) * packed_chunk_bytes) });
                 for (local_output, output) in
@@ -3639,16 +3677,15 @@ fn execute_repair_streaming_with_trace(
     #[cfg(not(feature = "wgpu"))]
     let gpu_discrete_auto = false;
     let gpu_preferred = gpu_forced || gpu_discrete_auto;
-    // Turbo's default-method policy selects AVX2 XOR-JIT only on its
-    // fast-JIT CPU families; other machines retain the folded controller.
-    // A W^X/JIT construction failure is a controller error, never a hidden
-    // downgrade to a different arithmetic method.
+    // Select AVX2 XOR-JIT only on tuned CPU families; other machines retain
+    // the folded controller. A W^X/JIT construction failure is a controller
+    // error, never a hidden downgrade to a different arithmetic method.
     #[cfg(target_arch = "x86_64")]
     let jit_width = reedsolomon_rs::xor_jit::JitWidth::detect();
     let workers = rayon::current_num_threads().max(1);
     // Shape the JIT controller from its selected method contract. The cached
     // strict-W^X capability was established by the Reed-Solomon supported()
-    // gate; the first worker transition remains a fallible execution event.
+    // gate; sealing each active batch remains fallible.
     #[cfg(target_arch = "x86_64")]
     let jit_setup_started = Instant::now();
     #[cfg(target_arch = "x86_64")]
@@ -3656,7 +3693,7 @@ fn execute_repair_streaming_with_trace(
         let jit_kernel = CpuKernelKind::XorJit(width);
         let jit_method = jit_kernel.method();
         let jit_staging_width = jit_method.staging_width();
-        let minimum_controller = turbo_controller_plan(
+        let minimum_controller = cpu_controller_plan(
             2,
             n,
             workers,
@@ -3671,7 +3708,7 @@ fn execute_repair_streaming_with_trace(
                 ),
             }
         })?;
-        JitMemo::new(width, jit_method, n, workers, arena_limit).map_err(|error| {
+        JitMemo::new(width, jit_method, n, arena_limit).map_err(|error| {
             Par2Error::ReedSolomonError {
                 reason: format!("XOR-JIT controller capacity setup failed: {error}"),
             }
@@ -3921,7 +3958,7 @@ fn execute_repair_streaming_with_trace(
                 let chunk_len = chunk_end - chunk_start;
                 let byte_start = chunk_start * 2;
                 let byte_len = chunk_len * 2;
-                let controller = turbo_controller_plan(byte_len, n, workers, method, staging_width);
+                let controller = cpu_controller_plan(byte_len, n, workers, method, staging_width);
                 let controller_layout = Arc::new(controller.layout().clone());
                 debug!(
                     chunk = chunk_idx,
@@ -3999,9 +4036,9 @@ fn execute_repair_streaming_with_trace(
                     batch_sets[current_area] = Some(current);
                     batch_sets[1 - current_area] = spare;
                 } else {
-                    // This is the authoritative Turbo-style CPU lifecycle. A
-                    // transfer buffer is filled while the older staging area is
-                    // still active; waitForAdd gates admission, not disk I/O.
+                    // A transfer buffer is filled while the older staging area
+                    // is still active; controller backpressure gates admission,
+                    // not disk I/O.
                     let mut lifecycle = ControllerLifecycle::new(controller.input_grouping())
                         .with_execution_trace(trace.clone());
                     let mut active: [Option<CpuComputeTicket<'_>>; 2] = [None, None];
@@ -6107,7 +6144,7 @@ mod tests {
 
     fn minimum_controller_bytes_for_test(plan: &RepairPlan, kernel: CpuKernelKind) -> usize {
         let method = kernel.method();
-        turbo_controller_plan(
+        cpu_controller_plan(
             2,
             plan.missing_slices.len(),
             rayon::current_num_threads().max(1),
@@ -6132,7 +6169,6 @@ mod tests {
                 width,
                 kernel.method(),
                 plan.missing_slices.len(),
-                rayon::current_num_threads().max(1),
                 usize::MAX,
             )
             .expect("detected XOR-JIT method has bounded controller accounting");
@@ -6185,11 +6221,11 @@ mod tests {
     }
 
     #[test]
-    fn turbo_controller_keeps_kernel_grouping_for_small_source_sets() {
+    fn cpu_controller_keeps_kernel_grouping_for_small_source_sets() {
         let method = CpuKernelKind::Plain.method();
         let expected_grouping = method.input_grouping();
         for sources in [1, 2, 3, 4, 5, 23, 24] {
-            let controller = turbo_controller_plan(4096, 2, 4, method, expected_grouping);
+            let controller = cpu_controller_plan(4096, 2, 4, method, expected_grouping);
             assert_eq!(controller.input_grouping(), expected_grouping);
             assert_eq!(
                 crate::cpu_repair_controller::ControllerLifecycle::simulate(
@@ -6224,9 +6260,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_jit_memo_accounts_each_worker_mapping_and_body() {
-        const WORKERS: usize = 3;
-        const PER_WORKER: usize = 4 * 1024 + 1280;
+    fn avx2_jit_memo_accounts_two_active_batch_arenas() {
         let method = CpuMethodContract {
             stride: 32,
             alignment: 64,
@@ -6241,22 +6275,21 @@ mod tests {
             },
             strict_wx_available: true,
         };
-        let required = WORKERS * PER_WORKER;
-        let memo = JitMemo::new(
+        let area = reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
             reedsolomon_rs::xor_jit::JitWidth::Avx2,
-            method,
             1,
-            WORKERS,
-            required,
+            method.input_grouping(),
         )
         .unwrap();
+        let required = area * 2;
+        let memo =
+            JitMemo::new(reedsolomon_rs::xor_jit::JitWidth::Avx2, method, 1, required).unwrap();
         assert_eq!(memo.reserved_bytes(), required);
         assert!(
             JitMemo::new(
                 reedsolomon_rs::xor_jit::JitWidth::Avx2,
                 method,
                 1,
-                WORKERS,
                 required - 1,
             )
             .is_err()
@@ -6309,8 +6342,8 @@ mod tests {
         sources
     }
 
-    /// Naive per-word serial GF(2^16) reconstruct: the independent oracle that
-    /// the pre-seam rayon kernel and the seam must both reproduce.
+    /// Naive per-word serial GF(2^16) reconstruction used as an independent
+    /// reference for every parallel controller path.
     fn serial_reconstruct(
         input_factors: &matrix::Matrix,
         sources: &[Vec<u8>],

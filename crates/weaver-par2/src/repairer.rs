@@ -538,7 +538,7 @@ struct BlockCopyRange {
 
 /// Destination for an intact source block while reconstruction is active.
 /// The source bytes are copied from the same buffer that is submitted to the
-/// Reed-Solomon controller, matching Turbo's ProcessData ordering.
+/// Reed-Solomon controller so copy and reconstruction observe identical data.
 type ReconstructionCopyTargets = HashMap<(FileId, u32), BlockCopyRange>;
 
 impl BlockCopyRange {
@@ -3274,14 +3274,9 @@ impl RepairState {
 
         // Copy-only repairs retain the direct copy path. When reconstruction
         // is active, intact blocks are copied by RepairExecutionAccess from
-        // the source buffer immediately before that buffer enters the
-        // controller, matching Turbo's ProcessData ordering.
-        // overlapping the two was measured twice as no better — first as a
-        // net loss (page-cache dirtying plus memory-bandwidth competition
-        // with the GF16 compute), then as noise-level even after the
-        // L1-resident compute tiles and the in-kernel copy changed the
-        // contention profile. The copy is not the bottleneck; keep it
-        // simple and ordered.
+        // the source buffer immediately before it enters the controller.
+        // Overlapping the copy with compute adds page-cache and memory-bandwidth
+        // contention without improving throughput, so keep the work ordered.
         copy_block_ranges(&block_copy_ranges)?;
         copy_validated_blocks()?;
         let (bytes_reconstructed, reconstruction_validation_bytes) = reconstruct()?;
@@ -5551,7 +5546,7 @@ fn discover_related_par2_files(path: &Path) -> io::Result<Vec<PathBuf>> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let Some(stem) = turbo_par2_base_name(path) else {
+    let Some(stem) = par2_base_name(path) else {
         return Ok(Vec::new());
     };
 
@@ -5616,7 +5611,7 @@ fn related_par2_name_matches(stem: &str, path: &Path) -> bool {
         })
 }
 
-fn turbo_par2_base_name(path: &Path) -> Option<String> {
+fn par2_base_name(path: &Path) -> Option<String> {
     let mut name = path.file_name()?.to_str()?.to_owned();
     loop {
         let dot = name.rfind('.')?;
@@ -5628,7 +5623,7 @@ fn turbo_par2_base_name(path: &Path) -> Option<String> {
     }
 
     if let Some(dot) = name.rfind('.')
-        && turbo_volume_suffix_matches(&name[dot + 1..])
+        && volume_suffix_matches(&name[dot + 1..])
     {
         name.truncate(dot);
     }
@@ -5636,7 +5631,7 @@ fn turbo_par2_base_name(path: &Path) -> Option<String> {
     Some(name)
 }
 
-fn turbo_volume_suffix_matches(tail: &str) -> bool {
+fn volume_suffix_matches(tail: &str) -> bool {
     let mut state = 0u8;
     for byte in tail.bytes() {
         match state {
@@ -6829,23 +6824,23 @@ mod tests {
     }
 
     #[test]
-    fn turbo_par2_base_name_strips_volume_suffix() {
+    fn par2_base_name_strips_volume_suffix() {
         assert_eq!(
-            turbo_par2_base_name(Path::new("movie.vol000+001.par2")).as_deref(),
+            par2_base_name(Path::new("movie.vol000+001.par2")).as_deref(),
             Some("movie")
         );
         assert_eq!(
-            turbo_par2_base_name(Path::new("movie.vol000-001.PAR2")).as_deref(),
+            par2_base_name(Path::new("movie.vol000-001.PAR2")).as_deref(),
             Some("movie")
         );
         assert_eq!(
-            turbo_par2_base_name(Path::new("movie.extra.par2")).as_deref(),
+            par2_base_name(Path::new("movie.extra.par2")).as_deref(),
             Some("movie.extra")
         );
     }
 
     #[test]
-    fn discover_adjacent_par2_files_matches_turbo_sibling_scope() {
+    fn discover_adjacent_par2_files_uses_set_stem_sibling_scope() {
         let dir = tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -6876,7 +6871,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_source_primary_par2_file_matches_turbo_setparfilename() {
+    fn discover_source_primary_par2_file_uses_set_stem() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("movie.mkv");
         let volume_only = dir.path().join("movie.mkv.vol000+001.par2");
@@ -6907,7 +6902,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discover_adjacent_par2_files_skips_unreadable_sibling_directory_like_turbo() {
+    fn discover_adjacent_par2_files_skips_unreadable_sibling_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -7106,7 +7101,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_backup_path_uses_turbo_numbered_suffixes() {
+    fn unique_backup_path_uses_numbered_suffixes() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("target.bin");
         fs::write(&target, b"target").unwrap();
@@ -8914,7 +8909,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scan_skips_unreadable_extra_directories_like_turbo() {
+    fn scan_skips_unreadable_extra_directories() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -9131,7 +9126,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_file_without_description_is_discarded_like_turbo() {
+    fn recoverable_file_without_description_is_discarded() {
         let dir = tempdir().unwrap();
         let data = b"aaaabbbb".to_vec();
         let mut set = synthetic_set(&[("target.bin", &data)], 4);

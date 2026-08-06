@@ -1,20 +1,16 @@
-//! Turbo-grounded AVX2 XOR-JIT body generator.
+//! AVX2 XOR-JIT body generator.
 //!
-//! This is a direct Rust port of the AVX2 `xor_write_jit_avx` generator in
-//! par2cmdline-turbo. It keeps the oracle's factor decomposition, pairwise
-//! common accumulator, 64-entry memory fragment table, and packed register
-//! instruction encoding. The caller owns the RW-to-RX transition; this module
-//! only emits bytes into ordinary writable memory.
+//! The generator decomposes each field factor into dependency rows, combines
+//! common terms across row pairs, and emits a compact multiply-add program.
+//! The caller owns the RW-to-RX transition; this module only writes bytes into
+//! ordinary writable memory.
 //!
-//! Turbo uses aligned `VMOVDQA` loads and stores because its internal planar
-//! buffers have that contract. Weaver's public packed-JIT contract permits
-//! unaligned planar pointers, so the three load/store forms below deliberately
-//! use `VMOVDQU`. `VPXOR` memory operands are unaligned-safe already. This is
-//! the only intentional instruction-level deviation from the oracle.
+//! Public packed-JIT inputs may be unaligned, so generated loads and stores use
+//! `VMOVDQU`. `VPXOR` memory operands are unaligned-safe already.
 
 use std::{mem::MaybeUninit, sync::OnceLock};
 
-/// Turbo's `XORDEP_JIT_CODE_SIZE` bound for one AVX2 generated body.
+/// Maximum encoded size of one AVX2 multiply-add body.
 pub const MAX_BODY_BYTES: usize = 1280;
 
 const BLOCK_BYTES: i32 = 512;
@@ -30,12 +26,12 @@ const REGISTER_LUT_ENTRIES: usize = 128;
 
 /// Failure while assembling one bounded AVX2 body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TurboAvx2EmitError {
-    /// The fixed Turbo-compatible body buffer was exhausted.
+pub enum Avx2EmitError {
+    /// The fixed body buffer was exhausted.
     BodyTooLarge,
 }
 
-impl std::fmt::Display for TurboAvx2EmitError {
+impl std::fmt::Display for Avx2EmitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BodyTooLarge => formatter.write_str("AVX2 XOR-JIT body exceeds 1280 bytes"),
@@ -43,27 +39,49 @@ impl std::fmt::Display for TurboAvx2EmitError {
     }
 }
 
-impl std::error::Error for TurboAvx2EmitError {}
+impl std::error::Error for Avx2EmitError {}
 
-/// Append one Turbo MULADD program for `factor` with an explicit prefetch
-/// lifecycle.
+/// Append one multiply-add program for `factor` with an explicit prefetch mode.
 ///
-/// This matches Turbo's writer contract: the field coefficient is the input,
-/// and the four nibble dependency lookups produce the generated schedule.
+/// The field coefficient is the input, and four nibble dependency lookups
+/// produce the generated schedule.
 pub(crate) fn append_muladd_body(
     out: &mut Vec<u8>,
     factor: u16,
     prefetch: bool,
-) -> Result<usize, TurboAvx2EmitError> {
+) -> Result<usize, Avx2EmitError> {
     let rows = compose_factor_rows(factor);
-    append_muladd_body_from_rows(out, &rows, prefetch)
+    append_muladd_body_from_rows(
+        out,
+        &rows,
+        if prefetch {
+            PrefetchMode::Always
+        } else {
+            PrefetchMode::None
+        },
+    )
 }
 
-/// Turbo's `gf16_bitdep_init256` creates four sixteen-entry groups. Each group
-/// supplies the contribution of one factor nibble; the final 16 dependency
-/// rows are four XORs. The native implementation stores those as 32-byte SIMD
-/// lanes. The logical data here is identical and feeds the same extraction
-/// schedule as `xor_write_jit_avx`.
+/// Append one immutable body that accepts both normal and prefetch call
+/// conventions. A null prefetch register skips the hint block.
+pub(crate) fn append_muladd_body_optional_prefetch(
+    out: &mut Vec<u8>,
+    factor: u16,
+) -> Result<usize, Avx2EmitError> {
+    let rows = compose_factor_rows(factor);
+    append_muladd_body_from_rows(out, &rows, PrefetchMode::Optional)
+}
+
+#[derive(Clone, Copy)]
+enum PrefetchMode {
+    None,
+    Always,
+    Optional,
+}
+
+/// Four sixteen-entry groups supply the contribution of each factor nibble.
+/// XORing the selected groups produces the final dependency rows used by the
+/// instruction scheduler.
 type DependencyLut = [[[u16; 16]; 16]; 4];
 
 fn dependency_lut() -> &'static DependencyLut {
@@ -149,11 +167,8 @@ impl Fragment {
     }
 }
 
-/// Immutable versions of Turbo's code and operand lookup tables:
-///
-/// * `memory` is `xor256_jit_clut_code1` plus `xor256_jit_clut_info_mem`;
-/// * `nums`, `rmask`, and `register_len` are the source-index and ModRM
-///   tables consumed by `xor_write_avx_main_part`.
+/// Immutable instruction-fragment and operand lookup tables used while
+/// scheduling dependency rows.
 struct GeneratorLuts {
     memory: [Fragment; 64],
     nums: [[u8; 8]; REGISTER_LUT_ENTRIES],
@@ -181,8 +196,8 @@ impl GeneratorLuts {
             for source in 0..8usize {
                 if mask & (1 << source) != 0 {
                     nums[mask][position] = source as u8;
-                    // Turbo's `rmask` encodes `modrm - 0xb7`: 9 selects
-                    // ymm0, 18 selects ymm1, and their OR selects ymm2.
+                    // These role bits select the even, odd, or shared
+                    // accumulator when folded into the ModRM byte.
                     rmask[mask][source] = 9;
                     position += 1;
                 }
@@ -199,9 +214,9 @@ impl GeneratorLuts {
     }
 }
 
-/// Build one of Turbo's 64 memory-plane fragments. The index has three even
-/// bits followed by three odd bits. `gf16_xor_avx2.c:34-53` interleaves them so
-/// each plane chooses accumulator 0, 1, or 2 (both rows => common accumulator).
+/// Build one of 64 memory-plane fragments. The index has three even bits
+/// followed by three odd bits; interleaving them selects the even, odd, or
+/// shared accumulator for each plane.
 fn memory_fragment(index: u8) -> Fragment {
     let mut interleaved = (index & 1)
         | ((index & 8) >> 2)
@@ -230,9 +245,9 @@ struct PairPlan {
     common_highest: Option<u8>,
 }
 
-/// Match Turbo's common-mask extraction. The lowest and highest common source
-/// are used to seed `ymm2`; every interior common source remains in both masks
-/// so the memory/register fragment tables route it to `ymm2` as well.
+/// Extract shared sources from a row pair. The lowest and highest common source
+/// seed `ymm2`; interior common sources remain in both masks so the fragment
+/// tables route them to the shared accumulator as well.
 #[inline]
 fn pair_plan(even: u16, odd: u16) -> PairPlan {
     let common = even & odd;
@@ -261,27 +276,35 @@ fn highest_bit(mask: u16) -> Option<u8> {
 fn append_muladd_body_from_rows(
     out: &mut Vec<u8>,
     rows: &[u16; 16],
-    prefetch: bool,
-) -> Result<usize, TurboAvx2EmitError> {
+    prefetch: PrefetchMode,
+) -> Result<usize, Avx2EmitError> {
     let luts = generator_luts();
     let mut writer = BodyWriter::new();
 
-    // `xor_write_init_jit`: pointers arrive 384 bytes before a block. Move to
-    // its 128-byte point, then retain planes 3..15 in ymm3..ymm15.
+    // Pointers arrive 384 bytes before a block. Move to its 128-byte point,
+    // then retain planes 3..15 in ymm3..ymm15.
     writer.add_ri(RAX, BLOCK_BYTES)?;
     writer.add_ri(RDX, BLOCK_BYTES)?;
     for plane in 3..16usize {
         writer.vmovdqu_load(plane as u8, RAX, plane_offset(plane))?;
     }
 
-    // Turbo emits distinct generated programs. The prefetch version advances
-    // `rsi = prefetch - 128` and issues exactly its four T1 hints; the normal
-    // version contains none of these instructions or a runtime branch.
-    if prefetch {
+    // Optional prefetching branches on a null `rsi`; enabled programs advance
+    // the pointer and issue four T1 hints before entering the compute body.
+    let skip_prefetch = if matches!(prefetch, PrefetchMode::Optional) {
+        writer.test_rr(RSI, RSI)?;
+        Some(writer.jz_placeholder()?)
+    } else {
+        None
+    };
+    if !matches!(prefetch, PrefetchMode::None) {
         writer.add_ri(RSI, 256)?;
         for offset in [-128, -64, 0, 64] {
             writer.prefetcht1(RSI, offset)?;
         }
+    }
+    if let Some(displacement) = skip_prefetch {
+        writer.patch_rel32_to_here(displacement)?;
     }
 
     for pair in 0..8usize {
@@ -303,7 +326,7 @@ fn append_pair(
     luts: &GeneratorLuts,
     pair: usize,
     plan: PairPlan,
-) -> Result<(), TurboAvx2EmitError> {
+) -> Result<(), Avx2EmitError> {
     let even_offset = plane_offset(pair * 2);
     let odd_offset = plane_offset(pair * 2 + 1);
 
@@ -313,8 +336,8 @@ fn append_pair(
     append_muladd_output_seed(writer, ODD_ACC, odd_offset, odd_highest)?;
     append_common_seed(writer, plan.common_lowest, plan.common_highest)?;
 
-    // `memDeps` and `deps1`/`deps2` from Turbo are built only after removing
-    // the top source that seeded each output accumulator.
+    // Build memory and register dependencies after removing the source that
+    // seeded each output accumulator.
     let memory_index = usize::from((even_rest & 0x0007) | ((odd_rest & 0x0007) << 3));
     writer.fragment(&luts.memory[memory_index])?;
 
@@ -349,13 +372,13 @@ fn split_highest(mask: u16) -> (Option<u8>, u16) {
     }
 }
 
-/// Turbo's MULADD destination initialization from lines 302-316.
+/// Seed an output accumulator from its destination and highest dependency.
 fn append_muladd_output_seed(
     writer: &mut BodyWriter,
     accumulator: u8,
     destination_offset: i32,
     highest: Option<u8>,
-) -> Result<(), TurboAvx2EmitError> {
+) -> Result<(), Avx2EmitError> {
     match highest {
         Some(source) if source > 2 => {
             writer.vpxor_rrm(accumulator, source, RDX, destination_offset)
@@ -368,12 +391,12 @@ fn append_muladd_output_seed(
     }
 }
 
-/// Port of `xor_write_avx_load_part` for Turbo's common accumulator.
+/// Seed the shared accumulator for dependencies common to both output rows.
 fn append_common_seed(
     writer: &mut BodyWriter,
     lowest: Option<u8>,
     highest: Option<u8>,
-) -> Result<(), TurboAvx2EmitError> {
+) -> Result<(), Avx2EmitError> {
     let Some(lowest) = lowest else {
         return Ok(());
     };
@@ -397,20 +420,15 @@ fn append_common_seed(
     }
 }
 
-/// Scalar spelling of Turbo's AVX2 `xor_write_avx_main_part` byte formula.
-///
-/// The C implementation expands eight source records at once with AVX2, then
-/// writes up to eight four-byte `VPXOR` instructions. The generated byte stream
-/// is determined solely by `nums`, `rmask`, and the fixed `0xb7effdc5` base;
-/// emitting those records directly is byte-for-byte equivalent while keeping
-/// the generator portable to every host that can cross-compile this module.
+/// Emit the packed register dependencies as four-byte `VPXOR` instructions.
+/// The byte stream is determined by the source and accumulator lookup tables.
 fn append_packed_register_xors(
     writer: &mut BodyWriter,
     luts: &GeneratorLuts,
     even_mask: u8,
     odd_mask: u8,
     source_base: u8,
-) -> Result<(), TurboAvx2EmitError> {
+) -> Result<(), Avx2EmitError> {
     let union = usize::from(even_mask | odd_mask);
     let instruction_count = usize::from(luts.register_len[union] / 4);
     for position in 0..instruction_count {
@@ -421,8 +439,8 @@ fn append_packed_register_xors(
         debug_assert!(matches!(role, 9 | 18 | 27));
 
         let source = source_base + source_index as u8;
-        // `srcs ^ (regs + 0xb7effdc5)` in Turbo. `role` changes `0xb7` to
-        // ModRM c0/c9/d2, selecting ymm0/ymm1/ymm2 for even/odd/common work.
+        // `role` changes the ModRM byte to select ymm0, ymm1, or ymm2 for
+        // even, odd, or shared work.
         writer.extend(&[0xc5, 0xfd ^ (source << 3), 0xef, 0xb7 + role])?;
     }
     Ok(())
@@ -460,7 +478,7 @@ impl BodyWriter {
     fn into_fragment(self) -> Fragment {
         assert!(
             self.len <= MEMORY_FRAGMENT_BYTES,
-            "Turbo memory fragment bound"
+            "AVX2 memory fragment bound"
         );
         let mut bytes = [0u8; MEMORY_FRAGMENT_BYTES];
         bytes[..self.len].copy_from_slice(self.bytes());
@@ -470,25 +488,25 @@ impl BodyWriter {
         }
     }
 
-    fn fragment(&mut self, fragment: &Fragment) -> Result<(), TurboAvx2EmitError> {
+    fn fragment(&mut self, fragment: &Fragment) -> Result<(), Avx2EmitError> {
         self.extend(&fragment.bytes[..usize::from(fragment.len)])
     }
 
-    fn push(&mut self, byte: u8) -> Result<(), TurboAvx2EmitError> {
+    fn push(&mut self, byte: u8) -> Result<(), Avx2EmitError> {
         if self.len == MAX_BODY_BYTES {
-            return Err(TurboAvx2EmitError::BodyTooLarge);
+            return Err(Avx2EmitError::BodyTooLarge);
         }
         self.bytes[self.len].write(byte);
         self.len += 1;
         Ok(())
     }
 
-    fn extend(&mut self, bytes: &[u8]) -> Result<(), TurboAvx2EmitError> {
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), Avx2EmitError> {
         let end = self
             .len
             .checked_add(bytes.len())
             .filter(|&end| end <= MAX_BODY_BYTES)
-            .ok_or(TurboAvx2EmitError::BodyTooLarge)?;
+            .ok_or(Avx2EmitError::BodyTooLarge)?;
         // SAFETY: the checked destination range is initialized from a distinct
         // immutable source slice.
         unsafe {
@@ -502,14 +520,7 @@ impl BodyWriter {
         Ok(())
     }
 
-    fn vex(
-        &mut self,
-        reg: u8,
-        rm: u8,
-        vvvv: u8,
-        pp: u8,
-        opcode: u8,
-    ) -> Result<(), TurboAvx2EmitError> {
+    fn vex(&mut self, reg: u8, rm: u8, vvvv: u8, pp: u8, opcode: u8) -> Result<(), Avx2EmitError> {
         let vvvv_inv = (!vvvv) & 0x0f;
         if rm < 8 {
             let r_inv = u8::from(reg < 8);
@@ -526,11 +537,11 @@ impl BodyWriter {
         }
     }
 
-    fn modrm_reg(&mut self, reg: u8, rm: u8) -> Result<(), TurboAvx2EmitError> {
+    fn modrm_reg(&mut self, reg: u8, rm: u8) -> Result<(), Avx2EmitError> {
         self.push(0b11_000_000 | ((reg & 7) << 3) | (rm & 7))
     }
 
-    fn modrm_mem(&mut self, reg: u8, base: u8, offset: i32) -> Result<(), TurboAvx2EmitError> {
+    fn modrm_mem(&mut self, reg: u8, base: u8, offset: i32) -> Result<(), Avx2EmitError> {
         debug_assert!(base & 7 != 4, "rsp/r12 needs a SIB byte");
         let modrm = (reg & 7) << 3 | (base & 7);
         if offset == 0 {
@@ -543,40 +554,33 @@ impl BodyWriter {
         }
     }
 
-    fn vpxor_rrr(&mut self, dst: u8, left: u8, right: u8) -> Result<(), TurboAvx2EmitError> {
+    fn vpxor_rrr(&mut self, dst: u8, left: u8, right: u8) -> Result<(), Avx2EmitError> {
         self.vex(dst, right, left, 0b01, 0xef)?;
         self.modrm_reg(dst, right)
     }
 
-    fn vpxor_rrm(
-        &mut self,
-        dst: u8,
-        left: u8,
-        base: u8,
-        offset: i32,
-    ) -> Result<(), TurboAvx2EmitError> {
+    fn vpxor_rrm(&mut self, dst: u8, left: u8, base: u8, offset: i32) -> Result<(), Avx2EmitError> {
         self.vex(dst, base, left, 0b01, 0xef)?;
         self.modrm_mem(dst, base, offset)
     }
 
-    fn vmovdqa_rr(&mut self, dst: u8, src: u8) -> Result<(), TurboAvx2EmitError> {
+    fn vmovdqa_rr(&mut self, dst: u8, src: u8) -> Result<(), Avx2EmitError> {
         self.vex(dst, src, 0, 0b01, 0x6f)?;
         self.modrm_reg(dst, src)
     }
 
-    fn vmovdqu_load(&mut self, dst: u8, base: u8, offset: i32) -> Result<(), TurboAvx2EmitError> {
+    fn vmovdqu_load(&mut self, dst: u8, base: u8, offset: i32) -> Result<(), Avx2EmitError> {
         self.vex(dst, base, 0, 0b10, 0x6f)?;
         self.modrm_mem(dst, base, offset)
     }
 
-    fn vmovdqu_store(&mut self, base: u8, offset: i32, src: u8) -> Result<(), TurboAvx2EmitError> {
+    fn vmovdqu_store(&mut self, base: u8, offset: i32, src: u8) -> Result<(), Avx2EmitError> {
         self.vex(src, base, 0, 0b10, 0x7f)?;
         self.modrm_mem(src, base, offset)
     }
 
-    fn add_ri(&mut self, register: u8, immediate: i32) -> Result<(), TurboAvx2EmitError> {
-        // `_jit_add_i` uses the shorter accumulator form for rax, preserving
-        // Turbo's fixed body accounting.
+    fn add_ri(&mut self, register: u8, immediate: i32) -> Result<(), Avx2EmitError> {
+        // Use the shorter accumulator form for rax to keep body size bounded.
         if register == RAX {
             self.extend(&[0x48, 0x05])?;
             self.extend(&immediate.to_le_bytes())
@@ -593,7 +597,7 @@ impl BodyWriter {
         }
     }
 
-    fn cmp_rr(&mut self, left: u8, right: u8) -> Result<(), TurboAvx2EmitError> {
+    fn cmp_rr(&mut self, left: u8, right: u8) -> Result<(), Avx2EmitError> {
         self.extend(&[
             0x48 | (u8::from(right >= 8) << 2) | u8::from(left >= 8),
             0x39,
@@ -601,7 +605,38 @@ impl BodyWriter {
         ])
     }
 
-    fn prefetcht1(&mut self, base: u8, offset: i32) -> Result<(), TurboAvx2EmitError> {
+    fn test_rr(&mut self, left: u8, right: u8) -> Result<(), Avx2EmitError> {
+        self.extend(&[
+            0x48 | (u8::from(right >= 8) << 2) | u8::from(left >= 8),
+            0x85,
+            0b11_000_000 | ((right & 7) << 3) | (left & 7),
+        ])
+    }
+
+    fn jz_placeholder(&mut self) -> Result<usize, Avx2EmitError> {
+        self.extend(&[0x0f, 0x84])?;
+        let displacement = self.len;
+        self.extend(&0i32.to_le_bytes())?;
+        Ok(displacement)
+    }
+
+    fn patch_rel32_to_here(&mut self, displacement: usize) -> Result<(), Avx2EmitError> {
+        let instruction_end = displacement
+            .checked_add(4)
+            .filter(|&end| end <= self.len)
+            .ok_or(Avx2EmitError::BodyTooLarge)?;
+        let relative =
+            i32::try_from(self.len - instruction_end).map_err(|_| Avx2EmitError::BodyTooLarge)?;
+        for (slot, byte) in self.bytes[displacement..instruction_end]
+            .iter_mut()
+            .zip(relative.to_le_bytes())
+        {
+            slot.write(byte);
+        }
+        Ok(())
+    }
+
+    fn prefetcht1(&mut self, base: u8, offset: i32) -> Result<(), Avx2EmitError> {
         if base >= 8 {
             self.push(0x41)?;
         }
@@ -609,18 +644,15 @@ impl BodyWriter {
         self.modrm_mem(2, base, offset)
     }
 
-    fn jl_to(&mut self, target: usize) -> Result<(), TurboAvx2EmitError> {
-        let end = self
-            .len
-            .checked_add(6)
-            .ok_or(TurboAvx2EmitError::BodyTooLarge)?;
-        let relative = i32::try_from(target as i64 - end as i64)
-            .map_err(|_| TurboAvx2EmitError::BodyTooLarge)?;
+    fn jl_to(&mut self, target: usize) -> Result<(), Avx2EmitError> {
+        let end = self.len.checked_add(6).ok_or(Avx2EmitError::BodyTooLarge)?;
+        let relative =
+            i32::try_from(target as i64 - end as i64).map_err(|_| Avx2EmitError::BodyTooLarge)?;
         self.extend(&[0x0f, 0x8c])?;
         self.extend(&relative.to_le_bytes())
     }
 
-    fn ret(&mut self) -> Result<(), TurboAvx2EmitError> {
+    fn ret(&mut self) -> Result<(), Avx2EmitError> {
         self.push(0xc3)
     }
 }
@@ -661,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_lut_matches_turbo_interleaving_for_all_masks() {
+    fn memory_lut_matches_interleaving_for_all_masks() {
         let luts = generator_luts();
         for index in 0u8..64 {
             let mut interleaved = (index & 1)
@@ -685,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_register_luts_match_turbo_nums_rmask_and_length() {
+    fn packed_register_luts_match_masks_and_lengths() {
         let luts = generator_luts();
         for mask in 0..REGISTER_LUT_ENTRIES {
             let mut position = 0usize;
@@ -708,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_register_encoding_matches_turbo_formula_exhaustively() {
+    fn packed_register_encoding_matches_formula_exhaustively() {
         let luts = generator_luts();
         for source_base in [3u8, 10] {
             let width = if source_base == 3 { 128 } else { 64 };
@@ -768,14 +800,18 @@ mod tests {
     }
 
     #[test]
-    fn all_factor_bodies_fit_turbo_bound() {
+    fn all_factor_bodies_fit_size_bound() {
         let mut normal = Vec::with_capacity(MAX_BODY_BYTES);
         let mut prefetch = Vec::with_capacity(MAX_BODY_BYTES);
+        let mut optional = Vec::with_capacity(MAX_BODY_BYTES);
+        let mut optional_arena_bytes = 0usize;
         for factor in 0..=u16::MAX {
             normal.clear();
             prefetch.clear();
+            optional.clear();
             let normal_len = append_muladd_body(&mut normal, factor, false).unwrap();
             let prefetch_len = append_muladd_body(&mut prefetch, factor, true).unwrap();
+            let optional_len = append_muladd_body_optional_prefetch(&mut optional, factor).unwrap();
             assert_eq!(normal_len, normal.len());
             assert_eq!(prefetch_len, prefetch.len());
             assert_eq!(normal.last(), Some(&0xc3));
@@ -785,14 +821,22 @@ mod tests {
                 prefetch_len <= MAX_BODY_BYTES,
                 "prefetch factor {factor:#06x}"
             );
+            assert!(
+                optional_len <= MAX_BODY_BYTES,
+                "optional factor {factor:#06x}"
+            );
+            if factor != 0 {
+                optional_arena_bytes = (optional_arena_bytes + 63) & !63;
+                optional_arena_bytes += optional_len;
+            }
         }
+        eprintln!("optional AVX2 arena bytes: {optional_arena_bytes}");
     }
 
     #[test]
-    fn generated_bodies_match_normalized_turbo_oracle_fixtures() {
-        // Generated from par2cmdline-turbo 4db49ca45ab258c230061fb3f0d29273f7c524ea
-        // with its actual AVX2 dependency initializer and writer. The oracle
-        // bytes normalize only memory VMOVDQA to this crate's VMOVDQU contract.
+    fn generated_bodies_match_pinned_fixtures() {
+        // These byte-length and hash fixtures pin the instruction emitter's
+        // output while allowing memory loads to use the VMOVDQU contract.
         let fixtures = [
             (0x0001, false, 332, 0x775b_78fb_f25b_ce45),
             (0x0001, true, 354, 0x172b_5ff8_d928_71a1),
@@ -813,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_and_normal_programs_have_distinct_turbo_lifecycles() {
+    fn prefetch_and_normal_programs_have_distinct_lifecycles() {
         let mut normal = Vec::new();
         let mut prefetch = Vec::new();
         append_muladd_body(&mut normal, 0xa53c, false).unwrap();
@@ -828,7 +872,7 @@ mod tests {
 
     #[test]
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn sampled_bodies_execute_like_scalar_oracle_with_and_without_prefetch() {
+    fn sampled_bodies_match_scalar_reference_with_and_without_prefetch() {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -875,7 +919,7 @@ mod tests {
 
     #[test]
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn one_block_misaligned_buffers_match_scalar_oracle() {
+    fn one_block_misaligned_buffers_match_scalar_reference() {
         if !is_x86_feature_detected!("avx2") {
             return;
         }

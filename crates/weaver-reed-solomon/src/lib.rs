@@ -48,15 +48,6 @@
 //! Both fall back to CPU whenever a suitable device or driver is unavailable, so
 //! enabling a feature never makes a build refuse to run.
 //!
-//! # Provenance
-//!
-//! The GF(2¹⁶) approach and much of the kernel design are heavily informed by
-//! [par2cmdline-turbo](https://github.com/animetosho/par2cmdline-turbo) and the
-//! [ParPar](https://github.com/animetosho/parpar) work it draws on, both by
-//! Anime Tosho, and by their ancestor
-//! [par2cmdline](https://github.com/Parchive/par2cmdline). par2cmdline-turbo is
-//! GPL-2.0-or-later.
-
 pub mod gf;
 pub mod gf_pmul;
 pub mod gf_simd;

@@ -1,12 +1,8 @@
 //! Rank-k tiled Gauss-Jordan inversion for PAR2 repair-matrix solves.
 //!
-//! Ports the grouped (register-blocked) elimination from par2cmdline-turbo's
-//! ParPar `gf16/gfmat_inv.cpp` — `Galois16RecMatrix::scaleRows`/`invertLoop`
-//! (the in-group pivot reduction over up to 6 rows) and the `Compute` driver's
-//! `INVERT_GROUP` ladder (`gfmat_inv.cpp:654-670`, max group of 6) — adapted to
-//! rarpar's natural row-major `u16` layout. Upstream's prepare/finish/
-//! replace_word/stripe machinery is intentionally dropped: rarpar's kernels
-//! consume the natural layout directly, so no per-word marshalling is needed.
+//! Grouped elimination reduces up to six pivot rows together, then applies
+//! those rows to the remaining matrix in one batched pass. Kernels consume the
+//! natural row-major `u16` layout directly, without per-word marshalling.
 //!
 //! # Algorithm
 //!
@@ -14,10 +10,9 @@
 //! `[g, g+k)`:
 //!
 //! 1. In-group reduction (serial, scalar): reduce the `k` group rows against
-//!    each other so the `k*k` block ends as an exact identity, mirroring
-//!    ParPar's `scaleRows` (`SCALE_ROW`/`MULADD_ROW`). Diagonals are read in
-//!    the same sequential column order as the rank-1 path, so a zero pivot
-//!    surfaces the same `Err(col)`.
+//!    each other so the `k*k` block ends as an exact identity. Diagonals are
+//!    read in the same sequential column order as the rank-1 path, so a zero
+//!    pivot surfaces the same `Err(col)`.
 //! 2. Rank-k apply (batched, parallel): for every row outside the group, read
 //!    the `k` group-column coefficients up front (valid because the block is
 //!    identity, so each pivot touches only its own group column in that row),
@@ -41,13 +36,9 @@ use rayon::prelude::*;
 
 /// Pivot columns processed per group (rank-k width).
 ///
-/// ParPar caps its groups at 6 because it register-blocks the pivot rows in C
-/// (`gfmat_inv.cpp:268`, "max out at 6 groups (registers + cache assoc?)").
-/// rarpar's apply kernel ([`gf_simd::mul_acc_input_batch`]) loops over the
-/// group internally rather than holding each pivot row in a named register, so
-/// the register-pressure ceiling does not apply and a wider group amortises the
-/// per-row tail traversal further. This value is tuned on the `matrix_solve`
-/// bench (Apple Silicon); a divergence from upstream's <=6 is deliberate.
+/// The batched apply kernel ([`gf_simd::mul_acc_input_batch`]) loops over the
+/// group internally rather than holding every pivot row in a named register.
+/// Eight columns amortize row-tail traversal without excessive cache pressure.
 pub const TILE_GROUP: usize = 8;
 
 // Row-batching / parallelism thresholds mirror `par2-rs`'s rank-1 path
@@ -108,9 +99,8 @@ pub fn invert_augmented_tiled(
 
 /// Reduce the `k` group rows `[g, g+k)` so the `k*k` block over columns
 /// `[g, g+k)` ends as an exact identity, tracking the same operations in
-/// `augmented`. Mirrors ParPar `scaleRows` (`gfmat_inv.cpp:140-278`): forward-
-/// eliminate against already-reduced pivots, scale the diagonal to 1, then
-/// back-eliminate the new pivot column from the earlier group rows.
+/// `augmented`: forward-eliminate against reduced pivots, scale the diagonal
+/// to 1, then back-eliminate the new pivot column from earlier group rows.
 fn in_group_reduce(
     submatrix: &mut [u16],
     augmented: &mut [u16],

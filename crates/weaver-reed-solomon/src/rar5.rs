@@ -1,7 +1,7 @@
 //! RAR5 recovery-volume Reed-Solomon coder.
 //!
-//! This ports UnRAR's `RSCoder16` matrix semantics: a Cauchy matrix over
-//! GF(2^16) with primitive polynomial `0x1100B`. The arithmetic and SIMD
+//! Recovery uses a Cauchy matrix over GF(2^16) with primitive polynomial
+//! `0x1100B`. The arithmetic and SIMD
 //! multiply-accumulate kernels are shared with PAR2 through `gf`/`gf_simd`,
 //! but the row ordering here is RAR5-specific and intentionally not PAR2's
 //! Vandermonde repair matrix.
@@ -22,7 +22,7 @@ impl Rar5RsCoder {
     ///
     /// `valid_flags` is ordered as all data volumes followed by all recovery
     /// volumes. Missing data rows are reconstructed with the first available
-    /// recovery rows, matching UnRAR's `MakeDecoderMatrix`.
+    /// recovery rows.
     pub fn new_decoder(data_count: usize, rec_count: usize, valid_flags: &[bool]) -> Option<Self> {
         if data_count == 0
             || rec_count == 0

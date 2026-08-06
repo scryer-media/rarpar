@@ -2,10 +2,8 @@
 //!
 //! Emits only the instruction subset the XOR reconstruction codegen needs:
 //! 256-bit `vpxor`/`vmovdqa`, and the scalar
-//! `add`/`cmp`/`jl`/`ret`/`prefetcht1` for the block loop. The byte formulas
-//! follow ParPar's `x86_jit.h` where an upstream counterpart exists; the
-//! `vmovdqu` (F3-prefixed, unaligned) forms are rarpar additions — upstream
-//! emits only `vmovdqa` because its buffers are alignment-guaranteed.
+//! `add`/`cmp`/`jl`/`ret`/`prefetcht1` for the block loop. Both aligned
+//! `vmovdqa` and F3-prefixed unaligned `vmovdqu` forms are supported.
 //!
 //! Every function appends little-endian machine code to a `Vec<u8>`. Nothing
 //! here executes code — that is the caller's job via a W^X buffer
@@ -171,9 +169,9 @@ pub fn ret(buf: &mut Vec<u8>) {
 // forms X/B carry ModRM.rm bits 4/3, for memory forms X=1 and B carries the
 // base's bit 3), P1 = [W=0 | !vvvv:4 | 1 | pp], P2 = [z=0 L'L=10 b=0 | !V' |
 // aaa=000] where V' is vvvv bit 4. Memory displacements use EVEX compressed
-// disp8 (scale 64 for full-width zmm ops) — every plane offset the codegen
-// uses is a multiple of 64 within disp8 range, so upstream's `-384` pointer
-// bias trick (gf16_xor_common.h) is unnecessary here: bias 0, all disp8.
+// disp8 (scale 64 for full-width zmm ops). Every plane offset is a multiple of
+// 64 within disp8 range, so the emitter uses direct offsets without a pointer
+// bias.
 // Encodings pinned byte-exact against the system assembler in the tests.
 // ---------------------------------------------------------------------------
 
@@ -308,7 +306,7 @@ mod tests {
 
     #[test]
     fn vpxor_reg_reg() {
-        // vpxor ymm0, ymm0, ymm0  -> C5 FD EF C0  (matches ParPar template)
+        // vpxor ymm0, ymm0, ymm0 -> C5 FD EF C0
         assert_eq!(emit(|b| vpxor_rrr(b, 0, 0, 0)), [0xC5, 0xFD, 0xEF, 0xC0]);
         // vpxor ymm1, ymm2, ymm3  -> C5 ED EF CB
         assert_eq!(emit(|b| vpxor_rrr(b, 1, 2, 3)), [0xC5, 0xED, 0xEF, 0xCB]);
@@ -373,7 +371,7 @@ mod tests {
             emit(|b| add_ri(b, RDX, 512)),
             [0x48, 0x81, 0xC2, 0x00, 0x02, 0x00, 0x00]
         );
-        // cmp rdx, rcx -> 48 39 CA  (matches ParPar back-edge)
+        // cmp rdx, rcx -> 48 39 CA
         assert_eq!(emit(|b| cmp_rr(b, RDX, RCX)), [0x48, 0x39, 0xCA]);
         // test rsi, rsi -> 48 85 F6
         assert_eq!(emit(|b| test_rr(b, RSI, RSI)), [0x48, 0x85, 0xF6]);

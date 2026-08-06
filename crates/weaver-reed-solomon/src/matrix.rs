@@ -197,7 +197,7 @@ mod tests {
     /// Encode recovery blocks, drop members, rebuild the coefficient matrix, and
     /// confirm a serial GF matmul recovers the original bytes (the same property
     /// the PoC's `host_side_reconstruct_recovers_original` checks). This is the
-    /// host-side correctness oracle.
+    /// host-side correctness reference.
     #[test]
     fn build_repair_matrix_recovers_original() {
         let total = 12usize;

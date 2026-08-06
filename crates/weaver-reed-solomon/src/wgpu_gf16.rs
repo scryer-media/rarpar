@@ -3,10 +3,8 @@
 //! The wgpu twin of [`crate::metal_gf16`], for the platforms the native Metal
 //! backend does not cover (Windows/Linux discrete GPUs). Same product and the
 //! same 4×16-entry nibble-table formulation: each output's coefficient tables
-//! are staged into workgroup memory, the inner loop is on-chip table lookups.
-//! Not an upstream par2cmdline-turbo port — ParPar's GPU story is OpenCL and
-//! is not compiled there; this is rarpar-native engineering like the Metal
-//! arm.
+//! are staged into workgroup memory, and the inner loop uses on-chip table
+//! lookups.
 //!
 //! WGSL has no 16-bit integer type, so words travel in packed pairs: every
 //! `u32` holds two LE u16 words, tables store two entries per `u32`

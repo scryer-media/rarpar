@@ -1,23 +1,15 @@
 //! Element-wise GF(2^16) multiply: `dst[i] = a[i] * b[i]`.
 //!
-//! Port of ParPar's `gf16pmul` kernel family (par2cmdline-turbo
-//! `parpar/gf16/gf16pmul.{h,cpp}`), used upstream to build recovery-matrix
-//! rows with sequential exponents by iterated multiplication instead of a
-//! log/antilog `pow` per element (`gfmat_inv.cpp` `Construct`, :506-554).
+//! Sequential recovery-matrix exponents are built by iterated multiplication,
+//! avoiding a log/antilog `pow` for every element.
 //!
-//! The aarch64 kernel ports `gf16pmul_neon.c` structure-for-structure (with
-//! two deliberate generalizations: a scalar tail for arbitrary even lengths
-//! where upstream asserts 32-byte multiples, and a const-generic SHA3 flavor
-//! where upstream uses per-file feature flags): per 32-byte
-//! block, `vld2` splits both operands into even/odd byte planes, six PMULLs
-//! form the Karatsuba partials with *both* multiplicands taken from memory,
-//! and the same packed Barrett reduction as the input-batch CLMUL kernels
-//! (`gf16_clmul_neon_reduction`) folds the product — note the plain-store
-//! finish: pmul overwrites `dst`, it does not accumulate.
+//! On aarch64, each 32-byte block uses `vld2` to split both operands into
+//! even/odd byte planes, six PMULLs to form Karatsuba partials, and the packed
+//! Barrett reduction shared with input-batch CLMUL. The scalar tail handles
+//! arbitrary even lengths. This operation overwrites `dst`; it does not
+//! accumulate.
 //!
-//! The x86 variants (`gf16pmul_{sse,avx2,vpclmul,vpclgfni}.c`) are not yet
-//! ported (deferred to the strict-parity completeness phase); non-NEON
-//! targets use the scalar fallback.
+//! Non-NEON targets use the scalar fallback.
 
 use crate::gf;
 
@@ -37,9 +29,8 @@ pub fn pmul_region(dst: &mut [u8], a: &[u8], b: &[u8]) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // The SHA3 flavor only changes the reduction's internal ops (EOR3 vs
-        // the vqtbl1q bit-fold), exactly as upstream's per-file feature flags
-        // would; both are byte-identical in output.
+        // The SHA3 flavor changes only the reduction's internal operations;
+        // both paths are byte-identical in output.
         if std::arch::is_aarch64_feature_detected!("sha3") {
             unsafe { pmul_region_neon_sha3(dst, a, b) };
         } else {
@@ -63,7 +54,7 @@ fn pmul_region_scalar(dst: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
-/// Shared NEON body (upstream `gf16pmul_neon`, gf16pmul_neon.c:13-45).
+/// Shared NEON element-wise multiply body.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn pmul_region_neon_body<const SHA3: bool>(dst: &mut [u8], a: &[u8], b: &[u8]) {
@@ -130,7 +121,7 @@ mod tests {
         *state
     }
 
-    /// Oracle sweep: dispatched path and (on aarch64) both direct kernel
+    /// Reference sweep: dispatched path and (on aarch64) both direct kernel
     /// flavors against a per-word `gf::mul` reference, across block-tail
     /// straddles and operand edge patterns.
     #[test]

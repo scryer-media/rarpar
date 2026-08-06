@@ -7,25 +7,18 @@
 //! `memmap2` handles the platform specifics (Linux `mmap`/`mprotect`, Windows
 //! `VirtualAlloc`/`VirtualProtect`).
 //!
-//! The JIT'd body uses ParPar's register convention (`rax`/`rcx`/`rdx`/`rsi`),
-//! which matches no Rust extern ABI, so it is invoked via an `asm!` trampoline.
+//! Generated bodies use an internal register convention that matches no Rust
+//! extern ABI, so they are invoked through an `asm!` trampoline.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use memmap2::{Mmap, MmapMut};
 use std::sync::Arc;
 
-/// Turbo reserves one 4 KiB mutable code page for each repair worker.  The
-/// page is intentionally small enough to hold one bounded AVX2 body and its
-/// fixed setup, rather than an archive-sized coefficient cache.
-pub(crate) const WORKER_JIT_BYTES: usize = 4096;
+const PREFLIGHT_JIT_BYTES: usize = 4096;
 
-/// Probe the strict W^X transition sequence used by repair workers.
-///
-/// The mapping is never writable and executable at the same time. Returning
-/// to writable state matters because workers rotate through RW -> RX -> RW for
-/// every generated coefficient body.
+/// Probe the strict W^X transition sequence used by active batch arenas.
 pub(crate) fn preflight_wx() -> std::io::Result<()> {
-    let writable = MmapMut::map_anon(WORKER_JIT_BYTES)?;
+    let writable = MmapMut::map_anon(PREFLIGHT_JIT_BYTES)?;
     let executable = writable.make_exec()?;
     let _writable = executable.make_mut()?;
     Ok(())
@@ -36,137 +29,6 @@ pub struct JitCode {
     /// Keeps the R+X mapping alive; `entry` points into it.
     _exec: Arc<Mmap>,
     entry: *const u8,
-}
-
-/// One worker's rotating code page.
-///
-/// Turbo overwrites a worker-local scratch program for each multiply-add.
-/// This stricter adaptation owns exactly one mapping and alternates its
-/// protection between writable and executable states.  There is never a
-/// writable executable alias, and a failed transition discards the mapping so
-/// the next body can recover with a fresh anonymous page.
-pub(crate) struct WorkerJitBuffer {
-    writable: Option<MmapMut>,
-    executable: Option<Mmap>,
-    capacity: usize,
-}
-
-impl Default for WorkerJitBuffer {
-    fn default() -> Self {
-        Self::new(WORKER_JIT_BYTES)
-    }
-}
-
-impl WorkerJitBuffer {
-    pub(crate) const fn new(capacity: usize) -> Self {
-        Self {
-            writable: None,
-            executable: None,
-            capacity,
-        }
-    }
-
-    fn writable_mapping(&mut self) -> std::io::Result<MmapMut> {
-        if let Some(writable) = self.writable.take() {
-            return Ok(writable);
-        }
-        if let Some(executable) = self.executable.take() {
-            return executable.make_mut();
-        }
-        MmapMut::map_anon(self.capacity)
-    }
-
-    fn seal(&mut self, code: &[u8]) -> std::io::Result<*const u8> {
-        if code.is_empty() || code.len() > self.capacity {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "worker JIT body does not fit its bounded scratch page",
-            ));
-        }
-
-        let mut writable = self.writable_mapping()?;
-        writable[..code.len()].copy_from_slice(code);
-        match writable.make_exec() {
-            Ok(executable) => {
-                let entry = executable.as_ptr();
-                self.executable = Some(executable);
-                Ok(entry)
-            }
-            Err(error) => {
-                // `make_exec` consumes the writable handle. Do not retain a
-                // partially transitioned mapping; a later request will map a
-                // clean page and can retry independently.
-                self.writable = None;
-                self.executable = None;
-                Err(error)
-            }
-        }
-    }
-
-    fn make_writable(&mut self) -> std::io::Result<()> {
-        if self.writable.is_some() {
-            return Ok(());
-        }
-        let Some(executable) = self.executable.take() else {
-            return Ok(());
-        };
-        match executable.make_mut() {
-            Ok(writable) => {
-                self.writable = Some(writable);
-                Ok(())
-            }
-            Err(error) => {
-                self.writable = None;
-                Err(error)
-            }
-        }
-    }
-
-    /// Execute one normal multiply-add body and return the page to its
-    /// writable state before the worker accepts another coefficient.
-    pub(crate) unsafe fn run_muladd(
-        &mut self,
-        code: &[u8],
-        src: *const u8,
-        dst: *mut u8,
-        len: usize,
-    ) -> std::io::Result<()> {
-        let entry = self.seal(code)?;
-        JitCode::run_muladd_entry(entry, src, dst, len);
-        // This transition happens after the body has updated `dst`. Returning
-        // its error is still important: the repair controller must abandon
-        // the staged output rather than accept an operation whose JIT scratch
-        // lifecycle became unhealthy. The failed mapping is already dropped,
-        // so a later operation can acquire a fresh page.
-        self.make_writable()
-    }
-
-    /// Execute one prefetching multiply-add body and return the page to RW.
-    pub(crate) unsafe fn run_muladd_prefetch(
-        &mut self,
-        code: &[u8],
-        src: *const u8,
-        dst: *mut u8,
-        len: usize,
-        prefetch: *const u8,
-    ) -> std::io::Result<()> {
-        let entry = self.seal(code)?;
-        JitCode::run_muladd_prefetch_entry(entry, src, dst, len, prefetch);
-        self.make_writable()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mapping_address(&self) -> Option<*const u8> {
-        self.writable
-            .as_ref()
-            .map(|mapping| mapping.as_ptr())
-            .or_else(|| self.executable.as_ref().map(|mapping| mapping.as_ptr()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_writable(&self) -> bool {
-        self.writable.is_some()
-    }
 }
 
 // SAFETY: the code is immutable after construction and `entry` stays valid for
@@ -254,6 +116,25 @@ impl JitCode {
             _ => MmapMut::map_anon(bytes.len())?,
         };
         writable[..bytes.len()].copy_from_slice(bytes);
+        let (entries, exec) = Self::finalize_writable_arena(writable, offsets, bytes.len())?;
+        Ok((entries, Some(exec)))
+    }
+
+    pub(crate) fn finalize_writable_arena(
+        writable: MmapMut,
+        offsets: &[usize],
+        used_len: usize,
+    ) -> std::io::Result<(Vec<Self>, Arc<Mmap>)> {
+        if used_len == 0
+            || used_len > writable.len()
+            || offsets.is_empty()
+            || offsets.iter().any(|&offset| offset >= used_len)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid writable JIT arena entries",
+            ));
+        }
         let exec = Arc::new(writable.make_exec()?);
         let base = exec.as_ptr();
         let entries = offsets
@@ -266,7 +147,7 @@ impl JitCode {
                 entry: unsafe { base.add(offset) },
             })
             .collect();
-        Ok((entries, Some(exec)))
+        Ok((entries, exec))
     }
 
     pub(crate) fn recover_batch_mapping(exec: Arc<Mmap>) -> std::io::Result<MmapMut> {
@@ -283,7 +164,7 @@ impl JitCode {
     ///
     /// # Safety
     /// `self` must hold a normal body from
-    /// [`super::turbo_avx2::append_muladd_body`], AVX2 must be available,
+    /// [`super::avx2_emitter::append_muladd_body`], AVX2 must be available,
     /// `src`/`dst` valid for `len` bytes, and `len` must be a non-zero multiple
     /// of 512.
     pub unsafe fn run_muladd(&self, src: *const u8, dst: *mut u8, len: usize) {
@@ -315,14 +196,13 @@ impl JitCode {
         );
     }
 
-    /// Execute an AVX2 body generated with `prefetch = true`. Turbo's
-    /// `gf16_xor_jit_mul_avx2_base` passes `prefetch - 128` in `rsi`; the body
-    /// advances that stream by 256 bytes and emits four T1 hints per block.
+    /// Execute an AVX2 body with a dedicated prefetch stream. The generated
+    /// body advances that stream and emits four T1 hints per block.
     ///
     /// # Safety
-    /// This handle must contain a prefetch body from
-    /// [`super::turbo_avx2::append_muladd_body`] with prefetch enabled, and AVX2 must be
-    /// available. `src` must be
+    /// This handle must contain a prefetch-capable body from
+    /// [`super::avx2_emitter::append_muladd_body`], and AVX2 must be available.
+    /// `src` must be
     /// readable and `dst` writable for `len` non-overlapping bytes, with `len`
     /// a multiple of 512. `prefetch` must support every address hinted while
     /// processing those bytes.
@@ -365,9 +245,8 @@ impl JitCode {
 
     /// Execute an AVX512 muladd body ([`super::codegen512`]) over `len`-byte
     /// planar regions (`len` a multiple of 1024). Convention: `rax=src-1024,
-    /// rdx=dst-1024, rcx=dst_end-1024` (no upstream `-384` bias — EVEX
-    /// compressed disp8 covers the plane offsets); the body advances one
-    /// 1024-byte block per iteration and `ret`s.
+    /// rdx=dst-1024, rcx=dst_end-1024`; EVEX compressed disp8 covers the plane
+    /// offsets. The body advances one 1024-byte block per iteration and `ret`s.
     ///
     /// # Safety
     /// `self` must hold a body from [`super::codegen512::generate_muladd`],
@@ -397,10 +276,9 @@ impl JitCode {
         );
     }
 
-    /// Execute an AVX512 single-source body with Turbo's dedicated prefetch
-    /// stream. The body advances `rsi` by 512 bytes and uses the eight hints
-    /// from `gf16_xor_avx512.c:262-268`; the trampoline seeds it at
-    /// `prefetch - 384` as the oracle does at lines 751-761.
+    /// Execute an AVX512 single-source body with a dedicated prefetch stream.
+    /// The body advances `rsi` by 512 bytes and issues eight hints per block;
+    /// the trampoline seeds it at `prefetch - 384`.
     ///
     /// # Safety
     /// This handle must contain an AVX512 prefetch body from
@@ -441,8 +319,8 @@ impl JitCode {
     }
 
     /// Execute an AVX512 packed multi-source body. Source zero is in `rdx`,
-    /// followed by `rsi`, `rdi`, `r8`, `r9`, and `r10`, matching Turbo's
-    /// multi-region stub register order. The code itself is immutable RX.
+    /// followed by `rsi`, `rdi`, `r8`, `r9`, and `r10`. The code itself is
+    /// immutable RX.
     ///
     /// # Safety
     /// This handle must contain the AVX512 prefix body generated for exactly
@@ -523,38 +401,5 @@ mod tests {
     #[test]
     fn empty_batch_needs_no_executable_mapping() {
         assert!(JitCode::new_batch(&[]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn worker_buffer_reuses_one_mapping_across_wx_transitions() {
-        let mut worker = WorkerJitBuffer::default();
-        let entry = worker.seal(&[0xc3]).unwrap();
-        let mapping = worker.mapping_address().unwrap();
-        assert_eq!(entry, mapping);
-        assert!(!worker.is_writable());
-
-        worker.make_writable().unwrap();
-        assert!(worker.is_writable());
-        assert_eq!(worker.mapping_address(), Some(mapping));
-
-        let entry = worker.seal(&[0x90, 0xc3]).unwrap();
-        assert_eq!(entry, mapping);
-        worker.make_writable().unwrap();
-        assert!(worker.is_writable());
-    }
-
-    #[test]
-    fn worker_buffer_rejects_oversized_body_without_losing_reusable_page() {
-        let mut worker = WorkerJitBuffer::new(8);
-        worker.seal(&[0xc3]).unwrap();
-        worker.make_writable().unwrap();
-        let mapping = worker.mapping_address().unwrap();
-
-        assert!(worker.seal(&[0x90; 9]).is_err());
-        assert!(worker.is_writable());
-        assert_eq!(worker.mapping_address(), Some(mapping));
-
-        worker.seal(&[0xc3]).unwrap();
-        assert_eq!(worker.mapping_address(), Some(mapping));
     }
 }

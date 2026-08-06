@@ -1,25 +1,22 @@
-//! Compatibility wrappers for the AVX2 XOR-JIT writer.
+//! Dependency-matrix wrappers for the AVX2 XOR-JIT emitter.
 //!
-//! [`super::turbo_avx2`] is the single AVX2 MULADD implementation. These
-//! dependency-matrix entry points remain for callers that already prepared a
-//! canonical multiplication matrix, but they validate it before delegating to
-//! the coefficient-based Turbo contract.
+//! These entry points accept a canonical multiplication matrix, validate it,
+//! recover its coefficient, and delegate to the coefficient-based emitter.
 
-use super::{deps, deps::XorDeps, turbo_avx2};
+use super::{avx2_emitter, deps, deps::XorDeps};
 
-/// Generate the normal Turbo AVX2 MULADD body for a canonical dependency
-/// matrix.
+/// Generate the normal AVX2 MULADD body for a canonical dependency matrix.
 pub fn generate_muladd(input: &XorDeps) -> Vec<u8> {
     generate_muladd_with_prefetch(input, false)
 }
 
-/// Generate either the normal or dedicated-prefetch Turbo AVX2 MULADD body
-/// for a canonical dependency matrix.
+/// Generate either the normal or dedicated-prefetch AVX2 MULADD body for a
+/// canonical dependency matrix.
 pub fn generate_muladd_with_prefetch(input: &XorDeps, prefetch: bool) -> Vec<u8> {
     let factor = factor_from_canonical_deps(input);
-    let mut body = Vec::with_capacity(turbo_avx2::MAX_BODY_BYTES);
-    turbo_avx2::append_muladd_body(&mut body, factor, prefetch)
-        .expect("Turbo AVX2 body fits its fixed 1280-byte bound");
+    let mut body = Vec::with_capacity(avx2_emitter::MAX_BODY_BYTES);
+    avx2_emitter::append_muladd_body(&mut body, factor, prefetch)
+        .expect("AVX2 body fits its fixed size bound");
     body
 }
 
@@ -47,7 +44,7 @@ mod tests {
             for prefetch in [false, true] {
                 let actual = generate_muladd_with_prefetch(&input, prefetch);
                 let mut expected = Vec::new();
-                turbo_avx2::append_muladd_body(&mut expected, factor, prefetch).unwrap();
+                avx2_emitter::append_muladd_body(&mut expected, factor, prefetch).unwrap();
                 assert_eq!(actual, expected);
             }
         }

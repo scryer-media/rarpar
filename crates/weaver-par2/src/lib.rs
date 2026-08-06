@@ -82,15 +82,6 @@
 //! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], each
 //!   falling back to CPU when no suitable device or driver is present.
 //!
-//! # Provenance
-//!
-//! An independent Rust implementation, heavily informed by
-//! [par2cmdline-turbo](https://github.com/animetosho/par2cmdline-turbo), Anime
-//! Tosho's speed-focused fork of
-//! [par2cmdline](https://github.com/Parchive/par2cmdline). Both are
-//! GPL-2.0-or-later, and par2cmdline-turbo is the benchmark reference this
-//! crate is measured against.
-//!
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
 #[cfg(all(
