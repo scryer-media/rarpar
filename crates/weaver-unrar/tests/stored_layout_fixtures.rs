@@ -1374,7 +1374,7 @@ fn decrypting_any_cipher_range_from_its_preceding_block_matches_the_extractor() 
     );
 }
 
-/// The RAR4 twin of the test above (plan 136, E3), and the one that proves the
+/// The RAR4 twin of the test above, and the one that proves the
 /// premise the whole RAR4 half rests on: **RAR4 encrypts a split member's whole
 /// plaintext as one AES-128-CBC stream running unbroken across the volume
 /// boundaries**, seeded by the IV the KDF produces beside the key.
@@ -1594,7 +1594,7 @@ fn a_single_volume_rar4_encrypted_store_maps_its_tail_padding_as_member_bytes() 
 }
 
 /// What `-hp` (header encryption) actually costs a one-pass router, measured
-/// rather than assumed — the evidence behind plan 136 E3's scoping of it.
+/// rather than assumed — the evidence behind how narrowly it is scoped.
 ///
 /// Three facts, and they do not all point the same way:
 ///

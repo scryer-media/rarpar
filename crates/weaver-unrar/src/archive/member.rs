@@ -6724,7 +6724,7 @@ fn finalize_shared_hash(
 }
 
 enum SegmentPackedHashState {
-    Crc32(crate::crc::Crc32),
+    Crc32(Box<crate::crc::Crc32>),
     Blake2sp(Box<Blake2spHasher>),
 }
 
@@ -6742,7 +6742,9 @@ impl SegmentPackedHashVerifier {
         // A header may carry both packed checksums; extraction verifies one.
         let expected = segment.packed_hashes.preferred()?;
         let state = match expected {
-            PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crate::crc::Crc32::new()),
+            PackedDataHash::Crc32(_) => {
+                SegmentPackedHashState::Crc32(Box::new(crate::crc::Crc32::new()))
+            }
             PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Box::default()),
         };
         Some(Self {

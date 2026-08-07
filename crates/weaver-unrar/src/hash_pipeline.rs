@@ -512,7 +512,7 @@ enum StreamState {
     /// seam, which delegates to the host under `crc-host` and is byte-identical
     /// `crc32fast` everywhere else.
     Inline {
-        crc: Option<crate::crc::Crc32>,
+        crc: Option<Box<crate::crc::Crc32>>,
         rar14: Option<u16>,
         blake: Option<Box<crate::crypto::Blake2spHasher>>,
         pool: Vec<Vec<u8>>,
@@ -558,7 +558,7 @@ impl SharedHashStream {
             }
         } else {
             StreamState::Inline {
-                crc: compute_crc.then(crate::crc::Crc32::new),
+                crc: compute_crc.then(|| Box::new(crate::crc::Crc32::new())),
                 rar14: compute_rar14.then_some(0u16),
                 blake: compute_blake.then(|| Box::new(crate::crypto::Blake2spHasher::new())),
                 pool: Vec::new(),
@@ -677,7 +677,7 @@ impl SharedHashStream {
 }
 
 fn inline_update(
-    crc: &mut Option<crate::crc::Crc32>,
+    crc: &mut Option<Box<crate::crc::Crc32>>,
     rar14: &mut Option<u16>,
     blake: &mut Option<Box<crate::crypto::Blake2spHasher>>,
     data: &[u8],

@@ -3322,7 +3322,7 @@ mod tests {
 
     #[test]
     fn the_pre_aes_rar4_ciphers_stay_ineligible_rather_than_being_decrypted_as_aes() {
-        // Plan 136 E3. RAR4 has carried four encryptions and only "RAR 3.0" is
+        // RAR4 has carried four encryptions and only "RAR 3.0" is
         // AES-128-CBC. The older three obey neither of the two rules the whole
         // encrypted-store classification rests on — a CBC chain whose block N
         // needs only block N−1, and a total padded once to `align16` — so a

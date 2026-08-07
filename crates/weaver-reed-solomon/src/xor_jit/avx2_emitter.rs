@@ -192,12 +192,12 @@ impl GeneratorLuts {
         let mut register_len = [0u8; REGISTER_LUT_ENTRIES];
         for mask in 0..REGISTER_LUT_ENTRIES {
             let mut position = 0usize;
-            for source in 0..8usize {
+            for (source, role) in rmask[mask].iter_mut().enumerate() {
                 if mask & (1 << source) != 0 {
                     nums[mask][position] = source as u8;
                     // These role bits select the even, odd, or shared
                     // accumulator when folded into the ModRM byte.
-                    rmask[mask][source] = 9;
+                    *role = 9;
                     position += 1;
                 }
             }

@@ -248,8 +248,7 @@ fn aes_cbc_encrypt_in_place_matches_across_backends() {
 /// (e) The RAR4 twin of (d): AES-128-CBC **encrypt**, in place. Same three
 /// claims — the two backends agree with each other, both agree with the
 /// reference helper, and the result round-trips back through a decrypt — for
-/// the cipher an encrypted RAR4 store member's posted bytes are re-derived with
-/// (plan 136, E3).
+/// the cipher an encrypted RAR4 store member's posted bytes are re-derived with.
 #[test]
 fn aes128_cbc_encrypt_in_place_matches_across_backends() {
     let mut rng = XorShift64::new(0x1A28_4455_6677_8899);

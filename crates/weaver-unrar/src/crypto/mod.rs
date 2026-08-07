@@ -2695,7 +2695,7 @@ mod tests {
 
     #[test]
     fn the_rar4_cipher_range_pair_is_an_exact_inverse_at_every_block_boundary() {
-        // Plan 136 E3: the AES-128 twin of the two properties above, stated as
+        // The AES-128 twin of the two properties above, stated as
         // one test because the RAR4 pair is the same claim over the same shape.
         // The key and IV are a real derivation rather than constants, so what is
         // exercised is the key a router would actually hold.
