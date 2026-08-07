@@ -979,7 +979,7 @@ mod tests {
         header.extend_from_slice(&flags.to_le_bytes());
         header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
         header.extend_from_slice(body);
-        let crc16 = (crc32fast::hash(&header[2..]) & 0xffff) as u16;
+        let crc16 = (crate::crc::hash(&header[2..]) & 0xffff) as u16;
         header[0..2].copy_from_slice(&crc16.to_le_bytes());
         header
     }
@@ -1015,7 +1015,7 @@ mod tests {
         body.extend_from_slice(type_body);
 
         let header_size = crate::vint::encode_vint(body.len() as u64);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(&header_size);
         hasher.update(&body);
 
@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn rar5_split_after_facts_keep_packed_crc32_alongside_blake2() {
         let payload = vec![0xA5u8; 64];
-        let packed_crc32 = crc32fast::hash(&payload);
+        let packed_crc32 = crate::crc::hash(&payload);
         let blake2 = [0x7Bu8; 32];
         let bytes = rar5_split_after_archive_bytes(
             "Silver.Horizon.S01E01.mkv",

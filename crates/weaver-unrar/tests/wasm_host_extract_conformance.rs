@@ -215,10 +215,13 @@ fn reference_host_crc32(
         return -1;
     }
 
-    // crc32fast resume-from-seed == the guest's byte-identical reference.
-    let mut hasher = crc32fast::Hasher::new_with_initial(seed);
+    // Resume from the finalized CRC seed used by the guest contract.
+    let mut hasher = crc_fast::Digest::new_with_init_state(
+        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        u64::from(!seed),
+    );
     hasher.update(&buf);
-    hasher.finalize() as u64 as i64
+    hasher.finalize() as i64
 }
 
 #[test]
@@ -319,18 +322,21 @@ fn reference_crc_host_fn_chains() {
     let a = b"the quick brown fox ";
     let b = b"jumps over the lazy dog";
     let whole = {
-        let mut h = crc32fast::Hasher::new();
+        let mut h = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
         h.update(a);
         h.update(b);
-        h.finalize()
+        h.finalize() as u32
     };
     let seeded = {
-        let mut h = crc32fast::Hasher::new_with_initial(0);
+        let mut h = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
         h.update(a);
-        let crc_a = h.finalize();
-        let mut h2 = crc32fast::Hasher::new_with_initial(crc_a);
+        let crc_a = h.finalize() as u32;
+        let mut h2 = crc_fast::Digest::new_with_init_state(
+            crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+            u64::from(!crc_a),
+        );
         h2.update(b);
-        h2.finalize()
+        h2.finalize() as u32
     };
     assert_eq!(
         seeded, whole,
@@ -338,10 +344,13 @@ fn reference_crc_host_fn_chains() {
     );
 
     let empty_seed = 0x1234_5678u32;
-    let mut h = crc32fast::Hasher::new_with_initial(empty_seed);
+    let mut h = crc_fast::Digest::new_with_init_state(
+        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        u64::from(!empty_seed),
+    );
     h.update(&[]);
     assert_eq!(
-        h.finalize(),
+        h.finalize() as u32,
         empty_seed,
         "empty update must return the seed unchanged"
     );

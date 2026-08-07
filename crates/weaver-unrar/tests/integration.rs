@@ -7,6 +7,28 @@ use std::io::Cursor;
 
 use unrar_rs::test_support::encrypt_aes128_cbc;
 
+mod crc32fast {
+    pub fn hash(data: &[u8]) -> u32 {
+        crc_fast::crc32_iso_hdlc(data)
+    }
+
+    pub struct Hasher(crc_fast::Digest);
+
+    impl Hasher {
+        pub fn new() -> Self {
+            Self(crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc))
+        }
+
+        pub fn update(&mut self, data: &[u8]) {
+            self.0.update(data);
+        }
+
+        pub fn finalize(self) -> u32 {
+            self.0.finalize() as u32
+        }
+    }
+}
+
 #[cfg(unix)]
 fn current_unix_owner_names() -> Option<(String, String)> {
     unsafe {

@@ -264,9 +264,9 @@ fn bench_crc_hasher(c: &mut Criterion) {
         .map(|i| (i as u8).wrapping_mul(31))
         .collect();
 
-    c.bench_function("rar_crc32fast_baseline", |b| {
+    c.bench_function("rar_crc_fast_baseline", |b| {
         b.iter(|| {
-            let mut hasher = crc32fast::Hasher::new();
+            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
             hasher.update(black_box(&data));
             black_box(hasher.finalize());
         });

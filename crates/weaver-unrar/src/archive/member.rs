@@ -316,7 +316,7 @@ impl RarArchive {
                     &self.limits,
                 )?;
                 let written = output.len() as u64;
-                let actual_crc = expected_crc.map(|_| crc32fast::hash(&output));
+                let actual_crc = expected_crc.map(|_| crate::crc::hash(&output));
                 let actual_blake = expected_blake.map(|_| {
                     let mut hasher = Blake2spHasher::new();
                     hasher.update(&output);
@@ -334,7 +334,7 @@ impl RarArchive {
             });
         }
         if let Some(expected) = service.comment_crc16 {
-            let actual = (crc32fast::hash(&output) & 0xffff) as u16;
+            let actual = (crate::crc::hash(&output) & 0xffff) as u16;
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
                     member: fh.name.clone(),
@@ -1110,7 +1110,7 @@ impl RarArchive {
             .unwrap_or(payload.len());
         let target_bytes = &payload[..nul_pos];
         if verify && let Some(expected) = fh.data_crc32 {
-            let actual = crc32fast::hash(target_bytes);
+            let actual = crate::crc::hash(target_bytes);
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
                     member: fh.name.clone(),
@@ -6645,7 +6645,7 @@ impl RarArchive {
 /// Writer wrapper that updates a shared CRC hasher.
 struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
-    crc: Option<crc32fast::Hasher>,
+    crc: Option<crate::crc::Crc32>,
     blake2: Option<Blake2spHasher>,
 }
 
@@ -6653,7 +6653,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, compute_crc: bool, compute_blake2: bool) -> Self {
         Self {
             inner,
-            crc: compute_crc.then(crc32fast::Hasher::new),
+            crc: compute_crc.then(crate::crc::Crc32::new),
             blake2: compute_blake2.then(Blake2spHasher::new),
         }
     }
@@ -6724,7 +6724,7 @@ fn finalize_shared_hash(
 }
 
 enum SegmentPackedHashState {
-    Crc32(crc32fast::Hasher),
+    Crc32(crate::crc::Crc32),
     Blake2sp(Box<Blake2spHasher>),
 }
 
@@ -6742,7 +6742,7 @@ impl SegmentPackedHashVerifier {
         // A header may carry both packed checksums; extraction verifies one.
         let expected = segment.packed_hashes.preferred()?;
         let state = match expected {
-            PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crc32fast::Hasher::new()),
+            PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crate::crc::Crc32::new()),
             PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Box::default()),
         };
         Some(Self {
@@ -8432,7 +8432,7 @@ mod tests {
             reader: Box::new(Cursor::new(target.to_vec())),
         }));
 
-        let mut fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
+        let mut fh = test_rar3_symlink_header(Some(crate::crc::hash(target)));
         fh.unpacked_size = Some(target.len() as u64);
         fh.data_size = target.len() as u64;
         archive.members.push(MemberEntry {

@@ -100,11 +100,11 @@ fn main() {
         let data = vec![0x3Cu8; HASH_TOTAL_BYTES];
         let mut sink = 0u32;
         let secs = best_secs(|| {
-            let mut hasher = crc32fast::Hasher::new();
+            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
             for chunk in data.chunks(HASH_CHUNK_BYTES) {
                 hasher.update(chunk);
             }
-            sink ^= hasher.finalize();
+            sink ^= hasher.finalize() as u32;
         });
         std::hint::black_box(sink);
         println!("crc32\t{:.2}", mb_per_s(HASH_TOTAL_BYTES, secs));

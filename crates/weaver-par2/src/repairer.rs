@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use crate::DiskFileAccess;
-use crate::checksum::{self, Md5State};
+use crate::checksum::{self, Crc32Hasher, Md5State};
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
@@ -1175,7 +1175,7 @@ struct RepairExecutionContext {
 
 struct StreamSourceValidation {
     next_offset: u64,
-    crc32: Option<crc32fast::Hasher>,
+    crc32: Option<Crc32Hasher>,
     last_stripe: Option<(u64, usize, u32)>,
     finalized: bool,
 }
@@ -1298,7 +1298,7 @@ impl RepairExecutionAccess {
                 .entry((file_id, local_slice))
                 .or_insert_with(|| StreamSourceValidation {
                     next_offset: 0,
-                    crc32: Some(crc32fast::Hasher::new()),
+                    crc32: Some(Crc32Hasher::new()),
                     last_stripe: None,
                     finalized: false,
                 });
@@ -6110,14 +6110,14 @@ where
 }
 
 fn padded_crc(data: &[u8], pad_to: u64) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = Crc32Hasher::new();
     hasher.update(data);
     update_crc_zeros(&mut hasher, pad_to.saturating_sub(data.len() as u64));
     hasher.finalize()
 }
 
 fn crc32_zeros(len: u64) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = Crc32Hasher::new();
     update_crc_zeros(&mut hasher, len);
     hasher.finalize()
 }
@@ -6133,7 +6133,7 @@ fn padded_md5(data: &[u8], pad_to: u64) -> [u8; 16] {
     }
 }
 
-fn update_crc_zeros(hasher: &mut crc32fast::Hasher, mut len: u64) {
+fn update_crc_zeros(hasher: &mut Crc32Hasher, mut len: u64) {
     while len > 0 {
         let take = len.min(ZERO_PAD_CHUNK.len() as u64) as usize;
         hasher.update(&ZERO_PAD_CHUNK[..take]);

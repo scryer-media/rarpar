@@ -4,7 +4,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crc32fast::hash as crc32;
+use crc_fast::crc32_iso_hdlc as crc32;
 use tempfile::TempDir;
 use unrar_rs::{ArchiveFormat, ExtractOptions, FileHash, RarArchive, ReadSeek, UnixOwnerInfo};
 

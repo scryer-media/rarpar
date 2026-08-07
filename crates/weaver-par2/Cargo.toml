@@ -30,7 +30,7 @@ reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.3.0", default-f
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 md-5 = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }

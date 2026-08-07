@@ -1,11 +1,32 @@
 #[cfg(feature = "native-crypto")]
 use aws_lc_sys::{MD5_CTX, MD5_Final, MD5_Init, MD5_Update};
-use crc32fast::Hasher as Crc32Hasher;
+use crc_fast::{CrcAlgorithm, Digest as FastCrcDigest};
 use md5::{Digest as Md5Digest, Md5 as RustCryptoMd5};
 #[cfg(feature = "native-crypto")]
 use std::mem::MaybeUninit;
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
+
+#[derive(Clone)]
+pub(crate) struct Crc32Hasher {
+    inner: FastCrcDigest,
+}
+
+impl Crc32Hasher {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: FastCrcDigest::new(CrcAlgorithm::Crc32IsoHdlc),
+        }
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub(crate) fn finalize(self) -> u32 {
+        self.inner.finalize() as u32
+    }
+}
 
 #[cfg_attr(feature = "native-crypto", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

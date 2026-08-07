@@ -792,7 +792,7 @@ mod tests {
 
         let header_size = body.len() as u64;
         let header_size_bytes = crate::vint::encode_vint(header_size);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(&header_size_bytes);
         hasher.update(&body);
 
@@ -835,7 +835,7 @@ mod tests {
         body.extend_from_slice(cached_header);
 
         let size = crate::vint::encode_vint(body.len() as u64);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(&size);
         hasher.update(&body);
 

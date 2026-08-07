@@ -741,6 +741,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48ed47e602652e3410f9387fc0db70fefadcee4d78a78881421aabcab4e26b89"
 
 [[package]]
+name = "crc-fast"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+dependencies = [
+ "digest 0.10.7",
+ "spin",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1932,7 +1942,7 @@ version = "0.3.0"
 dependencies = [
  "aws-lc-sys",
  "bytes",
- "crc32fast",
+ "crc-fast",
  "criterion",
  "libc",
  "md-5",
@@ -2507,6 +2517,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
 name = "spirv"
 version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2815,7 +2831,7 @@ dependencies = [
  "aws-lc-sys",
  "blake2s_simd",
  "cbc",
- "crc32fast",
+ "crc-fast",
  "criterion",
  "filetime",
  "hmac",

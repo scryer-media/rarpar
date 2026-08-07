@@ -30,10 +30,10 @@ crypto-rust = ["dep:sha2", "dep:hmac", "dep:aes", "dep:cbc"]
 crypto-host = ["crypto-rust"]
 # WASM-only: delegate the bulk member-data CRC-32 to a host function
 # (`host_crc32`, same neutral `host` namespace as `crypto-host`'s AES) instead
-# of computing it in-wasm with `crc32fast`. Opt-in and wasm-only in intent; on
+# of computing it in-wasm with `crc-fast`. Opt-in and wasm-only in intent; on
 # native targets it is a harmless no-op — the `crate::crc::Crc32` seam keeps
-# its portable `crc32fast` backend regardless. Adds NO new dependency:
-# `crc32fast` is already a normal dep that the native/portable seam path (and
+# its portable `crc-fast` backend regardless. Adds NO new dependency:
+# `crc-fast` is already a normal dep that the native/portable seam path (and
 # the header/probe CRCs) use unchanged.
 crc-host = []
 # Retarget the host imports' namespace from the embedder-neutral `host` to
@@ -54,7 +54,7 @@ ppmd-debug = []
 reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.3.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 blake2s_simd = { workspace = true }
 sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
