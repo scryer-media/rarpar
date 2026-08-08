@@ -2739,19 +2739,19 @@ fn complete_active_controller_batch<'a>(
         timings,
     )?;
     #[cfg(target_arch = "x86_64")]
-    if let Some(jit_batch) = finished.jit_batch.take() {
-        if jit_batch.requires_workspace_recycle() {
-            _preparer
-                .command_tx
-                .send(PreparationMessage::RecycleJit {
-                    staging_area,
-                    batch: jit_batch,
-                })
-                .map_err(|_| Par2Error::ReedSolomonError {
-                    reason: "CPU repair preparation worker stopped before recycling XOR-JIT state"
-                        .to_string(),
-                })?;
-        }
+    if let Some(jit_batch) = finished.jit_batch.take()
+        && jit_batch.requires_workspace_recycle()
+    {
+        _preparer
+            .command_tx
+            .send(PreparationMessage::RecycleJit {
+                staging_area,
+                batch: jit_batch,
+            })
+            .map_err(|_| Par2Error::ReedSolomonError {
+                reason: "CPU repair preparation worker stopped before recycling XOR-JIT state"
+                    .to_string(),
+            })?;
     }
     batch_sets[staging_area] = Some(finished.set);
     lifecycle.complete_batch(staging_area);
