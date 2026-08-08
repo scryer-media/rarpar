@@ -22,7 +22,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  RARPAR_LFS_TEST_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**
+  RARPAR_LFS_TEST_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_recovery_volumes.part*,crates/weaver-unrar/tests/fixtures/rar4/rar4_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_oldmv*,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**
   RARPAR_LFS_SMOKE_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
