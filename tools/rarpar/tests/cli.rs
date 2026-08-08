@@ -138,6 +138,216 @@ fn par_help_documents_canonical_placement_mode() {
 }
 
 #[test]
+fn par_create_help_documents_output_and_file_contract() {
+    let output = run(&[
+        OsStr::new("par"),
+        OsStr::new("create"),
+        OsStr::new("--help"),
+    ]);
+    assert!(
+        output.status.success(),
+        "par create --help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("<OUTPUT>"));
+    assert!(stdout.contains("<FILE>..."));
+    assert!(stdout.contains("--block-size"));
+    assert!(stdout.contains("--block-count"));
+    assert!(stdout.contains("--recovery-percent"));
+    assert!(stdout.contains("--recovery-count"));
+    assert!(stdout.contains("--memory-mib"));
+    assert!(stdout.contains("variable"));
+    assert!(stdout.contains("uniform"));
+    assert!(stdout.contains("limited"));
+}
+
+#[test]
+fn par_create_rejects_missing_files_and_fractional_recovery_percent() {
+    let missing_file = run(&[OsStr::new("par"), OsStr::new("create"), OsStr::new("set")]);
+    assert_eq!(missing_file.status.code(), Some(2));
+
+    let fractional_percent = run(&[
+        OsStr::new("par"),
+        OsStr::new("create"),
+        OsStr::new("set"),
+        OsStr::new("input.bin"),
+        OsStr::new("--recovery-percent"),
+        OsStr::new("5.5"),
+    ]);
+    assert_eq!(fractional_percent.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&fractional_percent.stderr).contains("invalid value"));
+}
+
+#[test]
+fn par_create_rejects_volume_count_above_public_limit() {
+    let output = run(&[
+        OsStr::new("par"),
+        OsStr::new("create"),
+        OsStr::new("set"),
+        OsStr::new("input.bin"),
+        OsStr::new("--volume-count"),
+        OsStr::new("32"),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[test]
+fn par_create_dry_run_reports_real_plan_without_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("input.bin"), b"123456789").unwrap();
+    let output_path = temp.path().join("set");
+
+    let output = run_in_dir(
+        temp.path(),
+        &[
+            OsStr::new("--dry-run"),
+            OsStr::new("--json"),
+            OsStr::new("par"),
+            OsStr::new("create"),
+            output_path.as_os_str(),
+            OsStr::new("--block-size"),
+            OsStr::new("4"),
+            OsStr::new("--recovery-count"),
+            OsStr::new("1"),
+            OsStr::new("input.bin"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["command"], "create");
+    assert_eq!(report["status"], "planned");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["plan"]["slice_size"], 4);
+    assert_eq!(report["plan"]["file_count"], 1);
+    assert_eq!(report["plan"]["volume_count"], 1);
+    assert_eq!(report["plan"]["volume_scheme"], "variable");
+    assert_eq!(report["plan"]["source_slice_count"], 3);
+    assert_eq!(report["plan"]["recovery_count"], 1);
+    assert_eq!(report["plan"]["sources"][0]["par2_name"], "input.bin");
+    assert_eq!(
+        report["plan"]["recovery_set_id"].as_str().unwrap().len(),
+        32
+    );
+    assert!(report["plan"]["memory"]["controller_overhead_blocks"].is_number());
+    assert!(report["plan"]["memory"]["critical_packet_bytes"].is_number());
+    assert!(report["plan"]["memory"]["main_file_id_workspace_bytes"].is_number());
+    assert!(report["plan"]["memory"]["validation_workspace_bytes"].is_number());
+    assert!(report["plan"]["memory"]["total_creation_peak_bytes"].is_number());
+    assert!(report["outcome"].is_null());
+    for path in report["plan"]["output_paths"].as_array().unwrap() {
+        assert!(!Path::new(path.as_str().unwrap()).exists());
+    }
+}
+
+#[test]
+fn par_create_json_reports_real_outcome_and_writes_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("input.bin"), b"123456789").unwrap();
+    let output_path = temp.path().join("set");
+
+    let output = run_in_dir(
+        temp.path(),
+        &[
+            OsStr::new("--json"),
+            OsStr::new("par"),
+            OsStr::new("create"),
+            output_path.as_os_str(),
+            OsStr::new("--block-size"),
+            OsStr::new("4"),
+            OsStr::new("--recovery-count"),
+            OsStr::new("1"),
+            OsStr::new("--volume-count"),
+            OsStr::new("1"),
+            OsStr::new("--volume-scheme"),
+            OsStr::new("uniform"),
+            OsStr::new("input.bin"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "created");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["outcome"]["dry_run"], false);
+    assert_eq!(report["outcome"]["recovery_count"], 1);
+    assert!(report["outcome"]["bytes_written"].as_u64().unwrap() > 0);
+    assert_eq!(
+        report["outcome"]["output_paths"].as_array().unwrap().len(),
+        2
+    );
+    for path in report["outcome"]["output_paths"].as_array().unwrap() {
+        assert!(Path::new(path.as_str().unwrap()).is_file());
+    }
+}
+
+#[test]
+fn par_create_rejects_existing_outputs_without_overwrite() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("input.bin"), b"123456789").unwrap();
+    let output_path = temp.path().join("set");
+    let args = [
+        OsStr::new("par"),
+        OsStr::new("create"),
+        output_path.as_os_str(),
+        OsStr::new("--block-size"),
+        OsStr::new("4"),
+        OsStr::new("--recovery-count"),
+        OsStr::new("1"),
+        OsStr::new("--volume-count"),
+        OsStr::new("1"),
+        OsStr::new("input.bin"),
+    ];
+
+    let first = run_in_dir(temp.path(), &args);
+    assert!(first.status.success());
+    let main_path = temp.path().join("set.par2");
+    let original = std::fs::read(&main_path).unwrap();
+
+    let second = run_in_dir(temp.path(), &args);
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("already exists"));
+    assert_eq!(std::fs::read(&main_path).unwrap(), original);
+
+    let overwritten = run_in_dir(
+        temp.path(),
+        &[
+            OsStr::new("--overwrite"),
+            OsStr::new("--quiet"),
+            OsStr::new("par"),
+            OsStr::new("create"),
+            output_path.as_os_str(),
+            OsStr::new("--block-size"),
+            OsStr::new("4"),
+            OsStr::new("--recovery-count"),
+            OsStr::new("1"),
+            OsStr::new("--volume-count"),
+            OsStr::new("1"),
+            OsStr::new("input.bin"),
+        ],
+    );
+    assert!(overwritten.status.success());
+    assert!(overwritten.stdout.is_empty());
+    assert!(overwritten.stderr.is_empty());
+    assert!(main_path.is_file());
+}
+
+#[test]
 fn par_canonical_placement_does_not_scan_for_renamed_files() {
     let temp = tempfile::tempdir().unwrap();
     let fixture_dir = fixture(&[

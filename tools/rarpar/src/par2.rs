@@ -1,9 +1,16 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
-use rarpar::cli::{Cli, ParArgs, ParCommand, ParPlacement};
+use crate::report;
+use par2_rs::{
+    BlockSizing, Par2CreateOutcome, Par2CreatePlan, Par2Creator, Par2CreatorOptions,
+    RecoveryAmount, VolumeScheme,
+};
+use rarpar::cli::{Cli, ParArgs, ParCommand, ParCreateArgs, ParPlacement, ParVolumeScheme};
 use serde::Serialize;
 use tracing::info;
 
@@ -45,17 +52,127 @@ struct ResolvedPar2Input {
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
+    let command = match command {
+        ParCommand::Create(args) => return run_create(cli, args),
+        ParCommand::Verify(args) => ParCommand::Verify(args),
+        ParCommand::Repair(args) => ParCommand::Repair(args),
+    };
     let (command_name, repair, args) = match command {
         ParCommand::Verify(args) => ("verify", false, args),
         ParCommand::Repair(args) => ("repair", true, args),
+        ParCommand::Create(_) => unreachable!("create handled above"),
     };
     let resolved = resolve_input(cli, &args)?;
-    let outcome = run_flow(&resolved, repair, cli.dry_run, cli.json)?;
+    let outcome = run_flow(&resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
     emit_command_outcome(cli, command_name, &outcome)?;
     Ok(if outcome.success {
         EXIT_SUCCESS
     } else {
         EXIT_DATA_FAILURE
+    })
+}
+
+fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
+    let base_path = args.base_path.clone().unwrap_or_else(|| {
+        args.output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    for input in &args.files {
+        let candidate = if input.is_absolute() {
+            input.clone()
+        } else {
+            base_path.join(input)
+        };
+        if !candidate.exists() {
+            return Err(RarparError::MissingInput(input.clone()));
+        }
+        if !candidate.is_file() {
+            return Err(RarparError::Usage(format!(
+                "par create accepts explicit files only; input is not a regular file: {}",
+                input.display()
+            )));
+        }
+    }
+
+    let memory_limit = args
+        .memory_mib
+        .map(|mib| {
+            if mib == 0 {
+                Err(RarparError::Usage(
+                    "--memory-mib must be greater than zero".into(),
+                ))
+            } else {
+                mib.checked_mul(1024 * 1024).ok_or_else(|| {
+                    RarparError::Resource("--memory-mib exceeds the supported memory limit".into())
+                })
+            }
+        })
+        .transpose()?;
+    let mut options =
+        Par2CreatorOptions::with_output(args.output.clone(), Some(base_path), args.files.clone());
+    options.block_sizing = match (args.block_size, args.block_count) {
+        (Some(bytes), None) => BlockSizing::Bytes(bytes),
+        (None, Some(count)) => BlockSizing::Count(count),
+        (None, None) => BlockSizing::Auto,
+        (Some(_), Some(_)) => unreachable!("clap rejects block-size and block-count together"),
+    };
+    options.recovery_amount = match (args.recovery_percent, args.recovery_count) {
+        (Some(percent), None) => RecoveryAmount::Percent(percent),
+        (None, Some(count)) => RecoveryAmount::Count(count),
+        (None, None) => RecoveryAmount::default(),
+        (Some(_), Some(_)) => {
+            unreachable!("clap rejects recovery-percent and recovery-count together")
+        }
+    };
+    options.first_exponent = args.first_exponent;
+    options.volume_scheme = match args.volume_scheme {
+        ParVolumeScheme::Variable => VolumeScheme::Variable,
+        ParVolumeScheme::Uniform => VolumeScheme::Uniform,
+        ParVolumeScheme::Limited => VolumeScheme::Limited,
+    };
+    options.volume_count = args.volume_count;
+    options.memory_limit = memory_limit;
+    options.overwrite = cli.overwrite;
+    options.dry_run = cli.dry_run;
+
+    if !cli.json && !cli.quiet {
+        options.progress = Some(create_progress_callback());
+    }
+
+    let creator = Par2Creator::new(options);
+    let plan: Par2CreatePlan = creator.plan()?;
+    report::emit_par_create_plan(cli, &plan)?;
+    if cli.dry_run {
+        return Ok(EXIT_SUCCESS);
+    }
+
+    let outcome: Par2CreateOutcome = creator.create(&plan)?;
+    report::emit_par_create_outcome(cli, &plan, &outcome)?;
+    Ok(EXIT_SUCCESS)
+}
+
+fn create_progress_callback() -> par2_rs::ProgressCallback {
+    let last = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+    let last_update = Arc::clone(&last);
+    Arc::new(move |update| {
+        let now = Instant::now();
+        let mut last = last_update.lock().expect("creation progress mutex");
+        if now.duration_since(*last) < Duration::from_millis(250)
+            && update.current.saturating_add(1) < update.total
+        {
+            return;
+        }
+        *last = now;
+        eprintln!(
+            "create {:?}: {}/{} ({} bytes)",
+            update.stage,
+            update.current.saturating_add(1).min(update.total),
+            update.total,
+            update.bytes_processed
+        );
     })
 }
 
@@ -212,7 +329,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
     };
-    run_flow(&resolved, true, false, cli.json)
+    run_flow(&resolved, true, false, cli.quiet || cli.json)
 }
 
 fn run_flow(

@@ -1,4 +1,5 @@
 pub mod creator;
+pub(crate) mod encode;
 pub mod file_desc;
 pub mod file_verify;
 pub mod header;
@@ -13,9 +14,9 @@ use tracing::{debug, trace, warn};
 
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
-use crate::types::RecoverySetId;
+use crate::types::{CancellationToken, MAX_FILES_PER_SET, RecoverySetId};
 
-const MAX_MAIN_BODY_BYTES: usize = 12 + 32_768 * 16;
+const MAX_MAIN_BODY_BYTES: usize = 12 + MAX_FILES_PER_SET * 16;
 const MAX_FILE_DESC_BODY_BYTES: usize = 56 + 100_000;
 const MAX_IFSC_BODY_BYTES: usize = 16 + 32_768 * 20;
 const MAX_CREATOR_BODY_BYTES: usize = 100_000;
@@ -199,10 +200,12 @@ fn scan_packets_internal(
 fn find_next_magic_in_reader(
     reader: &mut BufReader<File>,
     offset: &mut u64,
-) -> io::Result<Option<u64>> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<u64>> {
     let mut matched = 0usize;
 
     loop {
+        check_scan_cancel(cancellation)?;
         let mut found = None;
         let mut consumed = 0usize;
 
@@ -213,6 +216,7 @@ fn find_next_magic_in_reader(
             }
 
             while consumed < buf.len() {
+                check_scan_cancel(cancellation)?;
                 let byte = buf[consumed];
                 if byte == MAGIC[matched] {
                     matched += 1;
@@ -259,6 +263,7 @@ fn validate_streamed_packet_from_reader(
     header_bytes: &[u8; HEADER_SIZE],
     body_len: usize,
     offset: u64,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<()> {
     let mut hasher = Md5State::new();
     hasher.update(&header_bytes[32..HEADER_SIZE]);
@@ -266,6 +271,7 @@ fn validate_streamed_packet_from_reader(
     let mut remaining = body_len;
     let mut buf = [0u8; 64 * 1024];
     while remaining > 0 {
+        check_scan_cancel(cancellation)?;
         let take = remaining.min(buf.len());
         reader.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
         hasher.update(&buf[..take]);
@@ -277,6 +283,31 @@ fn validate_streamed_packet_from_reader(
         return Err(Par2Error::PacketHashMismatch { offset });
     }
     Ok(())
+}
+
+fn read_exact_cancellable(
+    reader: &mut BufReader<File>,
+    destination: &mut [u8],
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    while offset < destination.len() {
+        check_scan_cancel(cancellation)?;
+        let take = (destination.len() - offset).min(64 * 1024);
+        reader
+            .read_exact(&mut destination[offset..offset + take])
+            .map_err(Par2Error::Io)?;
+        offset += take;
+    }
+    Ok(())
+}
+
+fn check_scan_cancel(cancellation: Option<&CancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        Err(Par2Error::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn max_buffered_non_recovery_body_len(packet_type: PacketType) -> Option<usize> {
@@ -294,6 +325,7 @@ fn parse_non_recovery_packet_from_reader(
     header: &PacketHeader,
     header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<Option<Packet>> {
     let body_len =
         usize::try_from(header.body_length()).map_err(|_| Par2Error::ResourceLimitExceeded {
@@ -303,16 +335,30 @@ fn parse_non_recovery_packet_from_reader(
             ),
         })?;
     let Some(max_body_len) = max_buffered_non_recovery_body_len(header.packet_type) else {
-        validate_streamed_packet_from_reader(reader, header, header_bytes, body_len, offset)?;
+        validate_streamed_packet_from_reader(
+            reader,
+            header,
+            header_bytes,
+            body_len,
+            offset,
+            cancellation,
+        )?;
         return Ok(None);
     };
     if body_len > max_body_len {
-        validate_streamed_packet_from_reader(reader, header, header_bytes, body_len, offset)?;
+        validate_streamed_packet_from_reader(
+            reader,
+            header,
+            header_bytes,
+            body_len,
+            offset,
+            cancellation,
+        )?;
         return Ok(None);
     }
 
     let mut body = vec![0u8; body_len];
-    reader.read_exact(&mut body).map_err(Par2Error::Io)?;
+    read_exact_cancellable(reader, &mut body, cancellation)?;
     validate_streamed_hash(header, header_bytes, &body, offset)?;
     parse_packet_body(header, body).map(Some).or(Ok(None))
 }
@@ -322,6 +368,7 @@ fn parse_recovery_packet_from_reader(
     header: &PacketHeader,
     offset: u64,
     path: &Path,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<Packet> {
     let body_len =
         usize::try_from(header.body_length()).map_err(|_| Par2Error::ResourceLimitExceeded {
@@ -337,9 +384,7 @@ fn parse_recovery_packet_from_reader(
     }
 
     let mut exponent_bytes = [0u8; 4];
-    reader
-        .read_exact(&mut exponent_bytes)
-        .map_err(Par2Error::Io)?;
+    read_exact_cancellable(reader, &mut exponent_bytes, cancellation)?;
     let exponent = u32::from_le_bytes(exponent_bytes);
     let payload_len = body_len - 4;
     let payload_offset = offset + HEADER_SIZE as u64 + 4;
@@ -362,6 +407,20 @@ fn parse_recovery_packet_from_reader(
 }
 
 pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPacket>> {
+    scan_packets_from_path_with_set_ids_inner(path, None)
+}
+
+pub(crate) fn scan_packets_from_path_with_set_ids_cancellable(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<Vec<ScannedPacket>> {
+    scan_packets_from_path_with_set_ids_inner(path, Some(cancellation))
+}
+
+fn scan_packets_from_path_with_set_ids_inner(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<ScannedPacket>> {
     let file = File::open(path).map_err(Par2Error::Io)?;
     let file_len = file.metadata().map_err(Par2Error::Io)?.len();
     crate::file_cache::advise_sequential(&file, path, file_len);
@@ -370,15 +429,16 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
     let mut offset = 0u64;
 
     while let Some(packet_offset) =
-        find_next_magic_in_reader(&mut reader, &mut offset).map_err(Par2Error::Io)?
+        find_next_magic_in_reader(&mut reader, &mut offset, cancellation)?
     {
+        check_scan_cancel(cancellation)?;
         let mut header_bytes = [0u8; HEADER_SIZE];
         header_bytes[..MAGIC.len()].copy_from_slice(MAGIC);
 
-        match reader.read_exact(&mut header_bytes[MAGIC.len()..]) {
+        match read_exact_cancellable(&mut reader, &mut header_bytes[MAGIC.len()..], cancellation) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(Par2Error::Io(e)),
+            Err(Par2Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
         }
 
         let header = match PacketHeader::parse(&header_bytes, packet_offset) {
@@ -403,15 +463,20 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
         }
 
         let packet = match header.packet_type {
-            PacketType::RecoverySlice => {
-                parse_recovery_packet_from_reader(&mut reader, &header, packet_offset, path)
-                    .map(Some)
-            }
+            PacketType::RecoverySlice => parse_recovery_packet_from_reader(
+                &mut reader,
+                &header,
+                packet_offset,
+                path,
+                cancellation,
+            )
+            .map(Some),
             _ => parse_non_recovery_packet_from_reader(
                 &mut reader,
                 &header,
                 &header_bytes,
                 packet_offset,
+                cancellation,
             ),
         };
 
@@ -426,6 +491,7 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
                 }
                 offset = packet_offset + header.length;
             }
+            Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
             Err(_) => {
                 reader
                     .seek(SeekFrom::Start(packet_offset + 1))

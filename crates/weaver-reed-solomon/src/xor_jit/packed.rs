@@ -72,6 +72,25 @@ pub struct PackedCodeSize {
     pub arena_bytes: usize,
 }
 
+/// Conservative peak storage for one packed dispatch build and invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackedMemoryEstimate {
+    /// Alignment-inclusive executable mapping bytes.
+    pub mapping_bytes: usize,
+    /// The unfinalized generated-code Vec retained during mapping creation.
+    pub generated_bytes: usize,
+    /// Planning, row, factor, and retained dispatch metadata.
+    pub planning_bytes: usize,
+    /// Per-worker code-generation buffers used by the AVX2 planner.
+    pub worker_bytes: usize,
+    /// Pointer-region scratch retained while a packed body runs.
+    pub pointer_scratch_bytes: usize,
+    /// The unrounded executable arena bound passed to the builder.
+    pub executable_arena_bytes: usize,
+    /// Sum of all accounted peak components.
+    pub peak_bytes: usize,
+}
+
 /// Repair-scoped immutable AVX2 code indexed by field coefficient.
 ///
 /// Construction emits directly into one writable mapping and seals it once.
@@ -514,6 +533,103 @@ impl PackedJitBatch {
         }
     }
 
+    /// Estimate the complete peak for one active packed input group.
+    ///
+    /// The result includes the executable mapping, construction Vecs, AVX2
+    /// planning tables, parallel generator buffers, retained row metadata, and
+    /// the pointer scratch used by AVX512 execution. The executable arena
+    /// bound is reported separately so callers can pass only that bound to the
+    /// builder while reserving the complete peak.
+    pub fn memory_upper_bound(
+        width: JitWidth,
+        row_count: usize,
+        factors_per_row: usize,
+    ) -> Option<PackedMemoryEstimate> {
+        let executable_arena_bytes =
+            Self::active_arena_upper_bound(width, row_count, factors_per_row)?;
+        let mapping_bytes = executable_arena_bytes
+            .checked_add(MAPPING_ACCOUNT_ALIGNMENT - 1)
+            .map(|bytes| bytes & !(MAPPING_ACCOUNT_ALIGNMENT - 1))?;
+        let code_count = row_count.checked_mul(factors_per_row)?;
+        let group_count = factors_per_row.div_ceil(codegen512::MAX_PACKED_REGIONS);
+        let row_capacity_bytes = vector_capacity_bytes(row_count, mem::size_of::<PackedRowPlan>())?;
+        let factor_bytes = row_count.checked_mul(vector_capacity_bytes(
+            factors_per_row,
+            mem::size_of::<u16>(),
+        )?)?;
+        let avx2_body_bytes = row_count.checked_mul(vector_capacity_bytes(
+            factors_per_row,
+            mem::size_of::<Avx2BodyPlan>(),
+        )?)?;
+        let avx512_group_bytes = row_count.checked_mul(vector_capacity_bytes(
+            group_count,
+            mem::size_of::<Avx512GroupPlan>(),
+        )?)?;
+        let avx512_code_bytes = row_count.checked_mul(group_count.checked_mul(
+            vector_capacity_bytes(codegen512::MAX_PACKED_REGIONS, mem::size_of::<usize>())?,
+        )?)?;
+        let dispatch_rows_bytes = row_capacity_bytes
+            .checked_add(row_count.checked_mul(mem::size_of::<PackedJitCode>())?)?
+            .checked_add(factor_bytes)?
+            .checked_add(avx2_body_bytes)?
+            .checked_add(avx512_group_bytes)?
+            .checked_add(avx512_code_bytes)?;
+        let code_index_bytes = vector_capacity_bytes(code_count, mem::size_of::<usize>())?;
+        let code_factor_bytes = vector_capacity_bytes(code_count, mem::size_of::<u16>())?;
+        let generated_capacity_bytes = if matches!(width, JitWidth::Avx512) {
+            vector_capacity_bytes(executable_arena_bytes, 1)?
+        } else {
+            0
+        };
+        let generated_bytes = generated_capacity_bytes
+            .checked_add(code_index_bytes)?
+            .checked_add(mem::size_of::<GeneratedBodies>())?;
+        let avx2_planning_bytes = if matches!(width, JitWidth::Avx2) {
+            (usize::from(u16::MAX) + 1)
+                .checked_mul(mem::size_of::<u32>())?
+                .checked_add(code_factor_bytes)?
+                .checked_add(code_index_bytes)?
+        } else {
+            0
+        };
+        let dependency_bytes = if matches!(width, JitWidth::Avx512) {
+            code_count
+                .checked_mul(mem::size_of::<usize>())?
+                .checked_add(group_count.checked_mul(mem::size_of::<Vec<usize>>())?)?
+        } else {
+            0
+        };
+        let planning_bytes = mem::size_of::<PackedBatchPlan>()
+            .checked_add(mem::size_of::<Avx2BatchLayout>())?
+            .checked_add(dispatch_rows_bytes)?
+            .checked_add(avx2_planning_bytes)?
+            .checked_add(dependency_bytes)?
+            .checked_add(mem::size_of::<PackedJitBatch>())?
+            .checked_add(code_count.checked_mul(mem::size_of::<JitCode>())?)?;
+        let worker_bytes = if matches!(width, JitWidth::Avx2) {
+            rayon::current_num_threads().checked_mul(AVX2_MAX_BODY_BYTES)?
+        } else {
+            0
+        };
+        let pointer_scratch_bytes = mem::size_of::<PackedScratch>().checked_add(
+            vector_capacity_bytes(factors_per_row, mem::size_of::<*const u8>())?,
+        )?;
+        let peak_bytes = mapping_bytes
+            .checked_add(generated_bytes)?
+            .checked_add(planning_bytes)?
+            .checked_add(worker_bytes)?
+            .checked_add(pointer_scratch_bytes)?;
+        Some(PackedMemoryEstimate {
+            mapping_bytes,
+            generated_bytes,
+            planning_bytes,
+            worker_bytes,
+            pointer_scratch_bytes,
+            executable_arena_bytes,
+            peak_bytes,
+        })
+    }
+
     /// Build one immutable coefficient plan for an active input group.
     pub fn new(width: JitWidth, rows: &[&[u16]]) -> Result<Self, PackedBuildError> {
         Self::new_with_limit(width, rows, usize::MAX)
@@ -643,6 +759,15 @@ impl PackedJitBatch {
     pub fn requires_workspace_recycle(&self) -> bool {
         matches!(self.storage, PackedBatchStorage::Workspace { .. })
     }
+}
+
+fn vector_capacity_bytes(length: usize, element_size: usize) -> Option<usize> {
+    if length == 0 {
+        return Some(0);
+    }
+    length
+        .checked_next_power_of_two()?
+        .checked_mul(element_size)
 }
 
 impl PackedJitWorkspace {
@@ -1193,6 +1318,24 @@ mod tests {
                 input_base + len / 2,
             ]
         );
+    }
+
+    #[test]
+    fn packed_memory_bound_covers_build_and_pointer_storage() {
+        for width in [JitWidth::Avx2, JitWidth::Avx512] {
+            let estimate = PackedJitBatch::memory_upper_bound(width, 1, 12).unwrap();
+            assert!(estimate.mapping_bytes >= estimate.executable_arena_bytes);
+            assert!(estimate.peak_bytes >= estimate.mapping_bytes);
+            assert!(estimate.peak_bytes >= estimate.generated_bytes);
+            assert!(estimate.peak_bytes >= estimate.planning_bytes);
+            assert!(estimate.peak_bytes >= estimate.worker_bytes);
+            assert!(estimate.peak_bytes >= estimate.pointer_scratch_bytes);
+            assert!(estimate.pointer_scratch_bytes >= mem::size_of::<*const u8>() * 12);
+        }
+
+        let avx2 = PackedJitBatch::memory_upper_bound(JitWidth::Avx2, 1, 12).unwrap();
+        assert!(avx2.planning_bytes >= (usize::from(u16::MAX) + 1) * mem::size_of::<u32>());
+        assert!(avx2.worker_bytes >= AVX2_MAX_BODY_BYTES);
     }
 
     #[test]

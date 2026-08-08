@@ -103,6 +103,7 @@ compile_error!(
 
 pub mod checksum;
 mod cpu_repair_controller;
+pub mod create;
 pub mod disk;
 pub mod error;
 pub mod evidence;
@@ -123,6 +124,10 @@ pub mod verify;
 
 // Re-export key types for convenience.
 pub use checksum::{FileHashState, SliceChecksumState};
+pub use create::{
+    BlockSizing, CreationSource, ForwardKernel, Par2CreateOutcome, Par2CreatePlan, Par2Creator,
+    Par2CreatorOptions, Par2MemoryPlan, RecoveryAmount, RecoveryVolumePlan, VolumeScheme,
+};
 pub use disk::{DiskFileAccess, MultiDirectoryFileAccess, PlacementFileAccess};
 pub use error::{Par2Error, Result};
 pub use evidence::{CommittedFileEvidence, ContiguousAssemblyProof, FileStatFingerprint};
