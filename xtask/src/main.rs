@@ -477,6 +477,10 @@ fn normalize_manpage(manpage: &str) -> String {
             continue;
         }
 
+        if !in_example && (line.is_empty() || line == ".br") && output.ends_with(".br\n") {
+            continue;
+        }
+
         if in_example || line.starts_with('.') {
             output.push_str(&line);
             output.push('\n');
