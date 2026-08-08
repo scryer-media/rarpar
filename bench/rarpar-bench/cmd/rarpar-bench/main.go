@@ -56,7 +56,7 @@ func usage() {
   rarpar-bench report --input FILE --out FILE
   rarpar-bench render --input FILE --out DIR
 
-LANE is cpu, metal, wgpu, or docker-cpu. PAR2 placement is canonical or smart; canonical
+LANE is cpu, metal, or docker-cpu. PAR2 placement is canonical or smart; canonical
 matches conventional expected-path verification for direct comparisons. Corpus data and run evidence are
 intentionally external to source control; use target/bench by convention.
 `)
@@ -213,19 +213,28 @@ func runReport(args []string) error {
 
 func runRender(args []string) error {
 	flags := flag.NewFlagSet("render", flag.ContinueOnError)
-	input := flags.String("input", "", "report.json")
+	var inputs []string
+	flags.Func("input", "report.json; repeat for another comparable lane", func(value string) error {
+		if value == "" {
+			return fmt.Errorf("--input cannot be empty")
+		}
+		inputs = append(inputs, value)
+		return nil
+	})
 	out := flags.String("out", "", "fresh chart directory")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *input == "" || *out == "" {
+	if len(inputs) == 0 || *out == "" {
 		return fmt.Errorf("--input and --out are required")
 	}
-	var report bench.Report
-	if err := readReport(workspacePath(*input), &report); err != nil {
-		return err
+	reports := make([]bench.Report, len(inputs))
+	for index, input := range inputs {
+		if err := readReport(workspacePath(input), &reports[index]); err != nil {
+			return err
+		}
 	}
-	_, err := bench.RenderCharts(report, workspacePath(*out))
+	_, err := bench.RenderChartSet(reports, workspacePath(*out))
 	return err
 }
 

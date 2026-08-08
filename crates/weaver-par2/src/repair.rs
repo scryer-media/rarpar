@@ -1209,10 +1209,16 @@ struct SubmittedControllerBatch<'a> {
     ticket: CpuComputeTicket<'a>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputEncoding {
+    Plain,
+    CpuEncoded,
+}
+
 #[derive(Clone, Copy)]
 enum OutputTransferSource {
-    Contiguous(usize),
-    ChunkInterleaved {
+    PlainContiguous(usize),
+    CpuEncodedChunkInterleaved {
         base: usize,
         output: usize,
         output_count: usize,
@@ -1220,9 +1226,18 @@ enum OutputTransferSource {
     },
 }
 
+impl OutputTransferSource {
+    fn encoding(self) -> OutputEncoding {
+        match self {
+            Self::PlainContiguous(_) => OutputEncoding::Plain,
+            Self::CpuEncodedChunkInterleaved { .. } => OutputEncoding::CpuEncoded,
+        }
+    }
+}
+
 enum OutputTransferLayout<'a> {
-    Contiguous(&'a [usize]),
-    ChunkInterleaved {
+    PlainContiguous(&'a [usize]),
+    CpuEncodedChunkInterleaved {
         base: usize,
         output_count: usize,
         chunk_len: usize,
@@ -1232,19 +1247,21 @@ enum OutputTransferLayout<'a> {
 impl OutputTransferLayout<'_> {
     fn len(&self) -> usize {
         match self {
-            Self::Contiguous(outputs) => outputs.len(),
-            Self::ChunkInterleaved { output_count, .. } => *output_count,
+            Self::PlainContiguous(outputs) => outputs.len(),
+            Self::CpuEncodedChunkInterleaved { output_count, .. } => *output_count,
         }
     }
 
     fn source(&self, output: usize) -> OutputTransferSource {
         match self {
-            Self::Contiguous(outputs) => OutputTransferSource::Contiguous(outputs[output]),
-            Self::ChunkInterleaved {
+            Self::PlainContiguous(outputs) => {
+                OutputTransferSource::PlainContiguous(outputs[output])
+            }
+            Self::CpuEncodedChunkInterleaved {
                 base,
                 output_count,
                 chunk_len,
-            } => OutputTransferSource::ChunkInterleaved {
+            } => OutputTransferSource::CpuEncodedChunkInterleaved {
                 base: *base,
                 output,
                 output_count: *output_count,
@@ -1372,6 +1389,40 @@ impl CpuInputPreparer<'_> {
         }
         Ok(())
     }
+}
+
+fn finalize_output_bytes(
+    kernel: CpuKernelKind,
+    method: CpuMethodContract,
+    encoding: OutputEncoding,
+    buffer: &mut [u8],
+) -> bool {
+    match encoding {
+        OutputEncoding::Plain => return true,
+        OutputEncoding::CpuEncoded => {}
+    }
+
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelKind::XorJit(width) => {
+            let block = width.block_bytes();
+            debug_assert!(buffer.len().is_multiple_of(block));
+            for bytes in buffer.chunks_exact_mut(block) {
+                // SAFETY: XOR-JIT selection proves the required CPU features;
+                // the controller provides one complete JIT block at a time.
+                unsafe { width.finish_block(bytes) };
+            }
+        }
+        CpuKernelKind::Folded => crate::gf_simd::altmap_decode(buffer),
+        CpuKernelKind::Plain => {}
+    }
+
+    packed_checksum_matches(
+        buffer,
+        buffer.len() - method.stride,
+        method.stride,
+        method.checksum_width,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1577,17 +1628,16 @@ fn run_preparation_worker<'a>(
             } => {
                 let started = Instant::now();
                 debug_assert!(active.is_none());
-                let validate_checksum =
-                    matches!(&source, OutputTransferSource::ChunkInterleaved { .. });
+                let encoding = source.encoding();
                 // SAFETY: output storage stays fixed until every queued finish
                 // operation has completed and the transfer worker is joined.
                 match source {
-                    OutputTransferSource::Contiguous(source) => {
+                    OutputTransferSource::PlainContiguous(source) => {
                         let source =
                             unsafe { std::slice::from_raw_parts(source as *const u8, aligned_len) };
                         buffer.bytes[..aligned_len].copy_from_slice(source);
                     }
-                    OutputTransferSource::ChunkInterleaved {
+                    OutputTransferSource::CpuEncodedChunkInterleaved {
                         base,
                         output,
                         output_count,
@@ -1607,29 +1657,12 @@ fn run_preparation_worker<'a>(
                         }
                     }
                 }
-                match kernel {
-                    #[cfg(target_arch = "x86_64")]
-                    CpuKernelKind::XorJit(width) => {
-                        let block = width.block_bytes();
-                        for start in (0..aligned_len).step_by(block) {
-                            unsafe {
-                                width.finish_block(&mut buffer.bytes[start..start + block]);
-                            }
-                        }
-                    }
-                    CpuKernelKind::Folded => {
-                        crate::gf_simd::altmap_decode(&mut buffer.bytes[..aligned_len]);
-                    }
-                    CpuKernelKind::Plain => {}
-                }
-                let checksum_block_len = method.stride;
-                let checksum_valid = !validate_checksum
-                    || packed_checksum_matches(
-                        &buffer.bytes[..aligned_len],
-                        aligned_len - checksum_block_len,
-                        checksum_block_len,
-                        method.checksum_width,
-                    );
+                let checksum_valid = finalize_output_bytes(
+                    kernel,
+                    method,
+                    encoding,
+                    &mut buffer.bytes[..aligned_len],
+                );
                 if finished_tx
                     .send(FinishedOutput {
                         index,
@@ -4212,9 +4245,9 @@ fn execute_repair_streaming_with_trace(
                 finish_and_write_stream_outputs(
                     &mut preparer,
                     if gpu_chunk {
-                        OutputTransferLayout::Contiguous(gpu_output_ptrs.as_slice())
+                        OutputTransferLayout::PlainContiguous(gpu_output_ptrs.as_slice())
                     } else {
-                        OutputTransferLayout::ChunkInterleaved {
+                        OutputTransferLayout::CpuEncodedChunkInterleaved {
                             base: output_base,
                             output_count: n,
                             chunk_len: controller.layout().chunk_len,
@@ -4723,6 +4756,29 @@ mod tests {
     use bytes::Bytes;
     use md5::{Digest, Md5};
     use tempfile::tempdir;
+
+    #[test]
+    fn plain_output_bypasses_every_cpu_finalizer() {
+        let assert_plain = |kernel| {
+            let mut output: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+            let expected = output.clone();
+            assert!(finalize_output_bytes(
+                kernel,
+                kernel.method(),
+                OutputTransferSource::PlainContiguous(0).encoding(),
+                &mut output,
+            ));
+            assert_eq!(output, expected, "plain output changed under {kernel:?}");
+        };
+
+        for kernel in [CpuKernelKind::Plain, CpuKernelKind::Folded] {
+            assert_plain(kernel);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(width) = reedsolomon_rs::xor_jit::JitWidth::detect() {
+            assert_plain(CpuKernelKind::XorJit(width));
+        }
+    }
 
     struct FailingReadAccess {
         inner: MemoryFileAccess,

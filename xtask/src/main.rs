@@ -272,7 +272,7 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn audit_feature_metadata(metadata: &CargoMetadata, _options: &FeatureAuditOptions) -> Result<()> {
+fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
     require_feature(metadata, "par2-rs", "native-crypto")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
@@ -285,8 +285,19 @@ fn audit_feature_metadata(metadata: &CargoMetadata, _options: &FeatureAuditOptio
         ));
     }
 
-    assert_cpu_only(metadata)?;
+    if requested_feature(options, "metal") {
+        assert_metal_only(metadata, &options.target)?;
+    } else {
+        assert_cpu_only(metadata)?;
+    }
     Ok(())
+}
+
+fn requested_feature(options: &FeatureAuditOptions, feature: &str) -> bool {
+    options
+        .features
+        .split([',', ' '])
+        .any(|requested| requested == feature)
 }
 
 fn reject_target_cpu_flags() -> Result<()> {
@@ -306,6 +317,23 @@ fn assert_cpu_only(metadata: &CargoMetadata) -> Result<()> {
     reject_gpu_features(metadata)?;
     reject_resolved_package(metadata, "wgpu")?;
     reject_resolved_package(metadata, "objc2-metal")
+}
+
+fn assert_metal_only(metadata: &CargoMetadata, target: &str) -> Result<()> {
+    if target != "aarch64-apple-darwin" {
+        return fail(format!(
+            "Metal is supported only for aarch64-apple-darwin, not {target}"
+        ));
+    }
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
+        require_feature(metadata, package, "metal")?;
+        reject_feature(metadata, package, "wgpu")?;
+    }
+    reject_resolved_package(metadata, "wgpu")?;
+    if resolved_package_versions(metadata, "objc2-metal").is_empty() {
+        return fail("Metal build must resolve objc2-metal");
+    }
+    Ok(())
 }
 
 fn reject_gpu_features(metadata: &CargoMetadata) -> Result<()> {
@@ -915,6 +943,28 @@ mod tests {
     }
 
     #[test]
+    fn feature_audit_accepts_apple_silicon_metal_metadata() -> Result<()> {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "aarch64-apple-darwin".to_owned(),
+            features: "runtime,metal".to_owned(),
+        };
+        audit_feature_metadata(&metal_feature_metadata(), &options)
+    }
+
+    #[test]
+    fn feature_audit_rejects_metal_on_intel_macos() {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime,metal".to_owned(),
+        };
+        let error = audit_feature_metadata(&metal_feature_metadata(), &options)
+            .expect_err("Intel macOS must not resolve Metal");
+        assert!(error.to_string().contains("aarch64-apple-darwin"));
+    }
+
+    #[test]
     fn feature_audit_rejects_duplicate_aws_lc_bindings() {
         let options = FeatureAuditOptions {
             manifest: PathBuf::from("Cargo.toml"),
@@ -1082,6 +1132,30 @@ mod tests {
             packages,
             resolve: CargoResolve { nodes },
         }
+    }
+
+    fn metal_feature_metadata() -> CargoMetadata {
+        let mut metadata = feature_metadata(&["0.42.0"]);
+        for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
+            metadata
+                .resolve
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == package)
+                .expect("test package node")
+                .features
+                .push("metal".to_owned());
+        }
+        metadata.packages.push(CargoPackage {
+            id: "objc2-metal".to_owned(),
+            name: "objc2-metal".to_owned(),
+            version: "0.3.2".to_owned(),
+        });
+        metadata.resolve.nodes.push(CargoNode {
+            id: "objc2-metal".to_owned(),
+            features: Vec::new(),
+        });
+        metadata
     }
 
     fn temp_path(label: &str) -> PathBuf {

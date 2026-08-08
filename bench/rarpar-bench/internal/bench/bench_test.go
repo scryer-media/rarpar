@@ -254,7 +254,7 @@ func TestRenderSVGIsDeterministicAndEscapesInput(t *testing.T) {
 	if !bytes.Equal(first, second) {
 		t.Fatal("SVG output is not byte deterministic")
 	}
-	const goldenRARSVG = "86a8334d37545446b547382aa3abd40650b7d1ffa7d5bbdd617f9323a86fc589"
+	const goldenRARSVG = "a6c8b4e7a1282748d862987dd10b32c534c5ef8c2fc33e3a56e740eef3626784"
 	if got := bytesSHA256(first); got != goldenRARSVG {
 		t.Fatalf("RAR SVG changed: got %s, want %s", got, goldenRARSVG)
 	}
@@ -276,7 +276,7 @@ func TestRenderPAR2SVGGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const goldenPAR2SVG = "5b6800f8856c019fa58d9b60cba0cdd3ba5c69f799ae870dd1a5e008d15239c3"
+	const goldenPAR2SVG = "c4f3c7a50a85c1422ecbc00b68fd97aee406de21cb0fcb9a911b707a79cfeca3"
 	if got := bytesSHA256(chart); got != goldenPAR2SVG {
 		t.Fatalf("PAR2 SVG changed: got %s, want %s", got, goldenPAR2SVG)
 	}
@@ -300,9 +300,41 @@ func TestRenderSVGLegendIsFamilySpecific(t *testing.T) {
 	if strings.Contains(string(par2), "rarpar / GPU") {
 		t.Fatalf("unexpected GPU legend: %s", par2)
 	}
-	for _, required := range []string{"par2cmdline-turbo faster", "<rect class=\"cpu\" x=\"760\"", "<rect class=\"slower\" x=\"920\""} {
+	for _, required := range []string{"par2cmdline-turbo faster", "<rect class=\"cpu\" x=\"570\"", "<rect class=\"slower\" x=\"890\""} {
 		if !strings.Contains(string(par2), required) {
 			t.Fatalf("PAR2 legend does not contain %q", required)
+		}
+	}
+}
+
+func TestRenderComparableCPUAndGPULanes(t *testing.T) {
+	cpu := fixtureReport()
+	cpu.Plan.Lane = "cpu"
+	cpu.Plan.ID = "cpu-plan"
+	cpu.InputSHA256 = strings.Repeat("a", 64)
+	cpu.Candidate.SHA256 = strings.Repeat("b", 64)
+	cpu.Comparisons[0].Family = "par2"
+	cpu.Comparisons[0].ReferenceLabel = "par2cmdline-turbo"
+
+	gpu := fixtureReport()
+	gpu.Plan.Lane = "wgpu"
+	gpu.Plan.ID = "wgpu-plan"
+	gpu.InputSHA256 = strings.Repeat("c", 64)
+	gpu.Candidate.SHA256 = strings.Repeat("d", 64)
+	gpu.Comparisons[0].Family = "par2"
+	gpu.Comparisons[0].ReferenceLabel = "par2cmdline-turbo"
+	gpu.Comparisons[0].Backend = "wgpu"
+
+	chart, err := renderSVGGroups("par2", []chartGroup{
+		{report: cpu, comparisons: cpu.Comparisons},
+		{report: gpu, comparisons: gpu.Comparisons},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"/ cpu /", "/ wgpu /", "rarpar / GPU", "class=\"gpu\"", cpu.Candidate.SHA256, gpu.Candidate.SHA256} {
+		if !strings.Contains(string(chart), required) {
+			t.Fatalf("combined chart does not contain %q", required)
 		}
 	}
 }
@@ -353,6 +385,34 @@ func TestFailureDiagnosticsRedactPasswordsAndPaths(t *testing.T) {
 	message := commandFailure(os.ErrPermission, nil, []byte("failed /tmp/private "+benchmarkPassword))
 	if strings.Contains(message, benchmarkPassword) || strings.Contains(message, "/tmp/private") {
 		t.Fatalf("unsafe diagnostic: %s", message)
+	}
+}
+
+func TestAuditFeaturesFollowBenchmarkLane(t *testing.T) {
+	tests := map[string]string{
+		"cpu":        "runtime",
+		"docker-cpu": "runtime",
+		"metal":      "runtime,metal",
+	}
+	for lane, expected := range tests {
+		actual, err := auditFeaturesForLane(lane)
+		if err != nil || actual != expected {
+			t.Fatalf("lane %q: features=%q err=%v", lane, actual, err)
+		}
+	}
+	if _, err := auditFeaturesForLane("unknown"); err == nil {
+		t.Fatal("unknown lane must fail source audit")
+	}
+	if _, err := auditFeaturesForLane("wgpu"); err == nil {
+		t.Fatal("disabled WGPU lane must fail source audit")
+	}
+}
+
+func TestBackendDetectionIgnoresAnsiFormatting(t *testing.T) {
+	log := "\x1b[3mbackend\x1b[0m\x1b[2m=\x1b[0m\x1b[32m\"wgpu\"\x1b[0m"
+	backend, fallback := backendFromLogs("wgpu", log)
+	if backend != "wgpu" || fallback != "" {
+		t.Fatalf("backend=%q fallback=%q", backend, fallback)
 	}
 }
 

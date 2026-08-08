@@ -55,11 +55,11 @@ source with no file paths at all.
 
 These deterministic end-to-end runs use the synthetic `rarpar-bench` corpus,
 one warmup, seven measured runs, canonical PAR2 placement, and SHA-256 output
-validation. Windows and Linux use CPU-only release builds. Apple Silicon is
-shown once with the CPU backend and once with a Metal-capable build; normal
-runtime gating engages Metal only for the heavy repair rows. Verification and
-small repairs remain on CPU. The runs include CLI discovery, repair, and
-post-repair verification rather than measuring only the repair kernel.
+validation. Windows and Linux CLI builds are CPU-only. Apple Silicon is shown
+with CPU-only and Metal-capable builds. Normal runtime gating, not a force
+override, chooses Metal only for qualifying heavy repairs, while verification
+and smaller repairs remain on CPU. These runs include CLI discovery, repair,
+and post-repair verification rather than measuring only the repair kernel.
 
 ![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-par2-benchmark-windows-x86_64.svg)
 

@@ -56,7 +56,7 @@ Verify repository metadata before the first publish.
 
 ## GitHub Actions
 
-- `rust-toolchain.toml` pins the repo to Rust `1.96.0`; workflows specify the
+- `rust-toolchain.toml` pins the repo to Rust `1.97.1`; workflows specify the
   same toolchain explicitly for action compatibility.
 - `.github/workflows/ci.yml` runs formatting, clippy, workspace tests, and
   package-content checks on pull requests, pushes to `main`, and manual runs.
@@ -64,11 +64,13 @@ Verify repository metadata before the first publish.
   package-root layout. Native build lanes use `sccache`, Linux `mold`,
   path-prefix remapping, and `--no-install-recommends` native dependency
   installs.
-- `.github/workflows/release.yml` builds eight CPU-only release archives: GNU
-  and musl Linux builds for both Linux architectures, Apple Silicon and Intel
-  macOS, and x86_64 and ARM64 Windows. The musl archives also supply the GHCR
-  image. It verifies the CPU-only dependency policy against the target-filtered dependency graph
-  and builds from `cargo package -p rarpar` output unpacked outside the
+- `.github/workflows/release.yml` builds eight release archives: GNU and musl
+  Linux builds for both Linux architectures, Apple Silicon and Intel macOS,
+  and x86_64 and ARM64 Windows. Apple Silicon enables the native Metal backend;
+  Linux, Intel macOS, and Windows builds are CPU-only. The musl archives also
+  supply the GHCR image. The workflow validates this target-specific feature
+  policy against the dependency graph and builds from `cargo package -p rarpar`
+  output unpacked outside the
   workspace, so the binary resolves published `weaver-*` crates just as a
   downstream consumer would. GNU direct builds upload package-root inspection
   artifacts for future distro packages; GitHub Releases receive eight archives
@@ -92,8 +94,8 @@ Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
 and `--remap-path-prefix`, are allowed. Every native artifact enables AWS-LC;
-the feature audit requires one resolved `aws-lc-sys` version and rejects GPU
-dependencies from every shipped artifact.
+the feature audit requires one resolved `aws-lc-sys`, permits Metal only for
+Apple Silicon, and blocks WGPU from every shipped `rarpar` artifact.
 
 Required repository configuration:
 

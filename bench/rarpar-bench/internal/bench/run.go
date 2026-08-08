@@ -461,10 +461,14 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	return measurement, stdout.Bytes(), stderr.Bytes(), err
 }
 
-var backendPattern = regexp.MustCompile(`backend="?(metal|wgpu)"?`)
+var (
+	ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	backendPattern    = regexp.MustCompile(`backend="?(metal|wgpu)"?`)
+)
 
 func backendFromLogs(lane, stderr string) (string, string) {
-	if match := backendPattern.FindStringSubmatch(stderr); len(match) == 2 {
+	plain := ansiEscapePattern.ReplaceAllString(stderr, "")
+	if match := backendPattern.FindStringSubmatch(plain); len(match) == 2 {
 		return match[1], ""
 	}
 	if lane == "metal" || lane == "wgpu" {
@@ -505,7 +509,11 @@ func auditSourceBuild(ctx context.Context, options RunOptions) (string, error) {
 	if workspace == "" {
 		return "", fmt.Errorf("source benchmark must run from a Git checkout")
 	}
-	command := exec.CommandContext(ctx, "cargo", "run", "--locked", "-p", "xtask", "--", "feature-audit", "--manifest", options.SourceManifest, "--target", options.SourceTarget, "--features", "runtime")
+	features, err := auditFeaturesForLane(options.Plan.Lane)
+	if err != nil {
+		return "", err
+	}
+	command := exec.CommandContext(ctx, "cargo", "run", "--locked", "-p", "xtask", "--", "feature-audit", "--manifest", options.SourceManifest, "--target", options.SourceTarget, "--features", features)
 	command.Dir = workspace
 	if output, err := command.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("source feature audit failed: %w: %s", err, redactRuntimeText(string(output)))
@@ -515,6 +523,19 @@ func auditSourceBuild(ctx context.Context, options RunOptions) (string, error) {
 		return "", fmt.Errorf("source benchmark must run from a Git checkout")
 	}
 	return revision, nil
+}
+
+func auditFeaturesForLane(lane string) (string, error) {
+	switch lane {
+	case "cpu", "docker-cpu":
+		return "runtime", nil
+	case "metal":
+		return "runtime,metal", nil
+	case "wgpu":
+		return "", fmt.Errorf("the rarpar CLI WGPU lane is disabled")
+	default:
+		return "", fmt.Errorf("unsupported benchmark lane %q", lane)
+	}
 }
 
 func redactRuntimeText(value string) string {

@@ -10,8 +10,8 @@ func CreatePlan(corpusRoot, seed, lane, family, par2Placement string, warmups, r
 	if warmups < 0 || repeats < 1 {
 		return Plan{}, fmt.Errorf("warmups must be non-negative and repeats must be positive")
 	}
-	if lane != "cpu" && lane != "metal" && lane != "wgpu" && lane != "docker-cpu" {
-		return Plan{}, fmt.Errorf("lane must be cpu, metal, wgpu, or docker-cpu")
+	if lane != "cpu" && lane != "metal" && lane != "docker-cpu" {
+		return Plan{}, fmt.Errorf("lane must be cpu, metal, or docker-cpu")
 	}
 	if family != "" && family != "rar" && family != "par2" {
 		return Plan{}, fmt.Errorf("family must be rar or par2")
