@@ -6,6 +6,9 @@ pub(crate) const MAX_SLICES_PER_FILE: usize = 32_768;
 /// constant-assignment sequence has exactly that many valid entries.
 pub(crate) const MAX_TOTAL_INPUT_SLICES: usize = 32_768;
 
+/// The Main packet parser's exact limit for the combined file-ID area.
+pub(crate) const MAX_FILES_PER_SET: usize = 32_768;
+
 /// 16-byte MD5-based file identifier.
 ///
 /// The ordering is over the raw identifier bytes. It carries no meaning of its
@@ -135,6 +138,8 @@ pub struct ProgressUpdate {
 /// Stage of a PAR2 operation for progress reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressStage {
+    /// Reading and hashing source files for PAR2 creation.
+    Creating,
     /// Verifying file integrity.
     Verifying,
     /// Reading recovery slice data.

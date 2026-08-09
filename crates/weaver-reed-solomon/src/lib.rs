@@ -42,11 +42,13 @@
 //!
 //! # Feature flags
 //!
-//! - `metal`: GPU repair on Apple Silicon.
+//! - `metal`: opt-in native Apple-GPU kernels for repair and PAR2 creation
+//!   adapters on Apple Silicon.
 //! - `wgpu`: cross-platform GPU repair.
 //!
-//! Both fall back to CPU whenever a suitable device or driver is unavailable, so
-//! enabling a feature never makes a build refuse to run.
+//! Native repair selection falls back to CPU whenever a suitable device or
+//! driver is unavailable. PAR2 creation adapters surface Metal admission to
+//! their caller, which applies the requested creation policy.
 //!
 pub mod gf;
 pub mod gf_pmul;

@@ -173,7 +173,33 @@ PAR2 operations:
 ```bash
 rarpar par verify release.par2
 rarpar par repair release.par2
+rarpar par create ./release/release --block-size 1048576 \
+  --recovery-percent 5 part01.rar part02.rar
 ```
+
+`par create` takes one OUTPUT path or stem followed by one or more explicit
+FILE inputs. Directories, recursion, and file-list expansion are rejected. If omitted,
+`--base-path` defaults to OUTPUT's parent, and input names are recorded relative
+to that directory. Use `--block-size` or `--block-count` to choose source-block
+sizing, then select recovery with `--recovery-percent` or the exact, long-only
+`--recovery-count`. Recovery blocks begin at `--first-exponent`; volumes use the
+variable scheme by default and can be selected as `uniform` with
+`--volume-scheme`, then split with `--volume-count`. `--memory-mib` sets the
+creator's bounded planning/working budget.
+
+Creation honors the global safety/reporting flags:
+
+```bash
+rarpar --dry-run --json par create ./release/release \
+  --block-count 256 --recovery-count 16 \
+  part01.rar part02.rar
+rarpar --overwrite par create ./release/release --recovery-percent 10 \
+  part01.rar part02.rar
+```
+
+Dry-run produces a creation-specific plan report and does not write PAR2 files.
+Human progress is rate-limited and goes to stderr; JSON mode emits one final
+structured creation report on stdout. Add `--quiet` to suppress human output.
 
 Automation that already emits a PAR2-command-shaped repair invocation can use
 the compatibility form directly. This form accepts repair mode, `-B` as a

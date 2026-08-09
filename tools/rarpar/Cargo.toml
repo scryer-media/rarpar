@@ -25,6 +25,7 @@ runtime = [
     "dep:unrar-rs",
     "unrar-rs/native-crypto",
 ]
+wgpu = ["runtime", "par2-rs/wgpu"]
 metal = ["runtime", "par2-rs/metal"]
 
 [dependencies]

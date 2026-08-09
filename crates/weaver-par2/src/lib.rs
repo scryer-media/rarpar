@@ -79,8 +79,13 @@
 //! # Feature flags
 //!
 //! - `native-crypto` *(default)*: AWS-LC-backed MD5.
-//! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], each
-//!   falling back to CPU when no suitable device or driver is present.
+//! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], with
+//!   repair fallback to CPU when no suitable device or driver is present. The
+//!   `metal` feature also enables policy-driven creation on native Apple
+//!   Silicon through [`CreationBackend`]. `CreationBackend::Auto` keeps
+//!   creation work below 16 GiB (slice size × source-slice count × recovery-
+//!   slice count) on CPU; on supported native Apple Silicon at or above that
+//!   threshold it preflights Metal and falls back to CPU when unavailable.
 //!
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
@@ -103,6 +108,7 @@ compile_error!(
 
 pub mod checksum;
 mod cpu_repair_controller;
+pub mod create;
 pub mod disk;
 pub mod error;
 pub mod evidence;
@@ -123,6 +129,11 @@ pub mod verify;
 
 // Re-export key types for convenience.
 pub use checksum::{FileHashState, SliceChecksumState};
+pub use create::{
+    BlockSizing, CreationBackend, CreationSource, ForwardKernel, Par2CreateOutcome, Par2CreatePlan,
+    Par2Creator, Par2CreatorOptions, Par2MemoryPlan, RecoveryAmount, RecoveryVolumePlan,
+    VolumeScheme,
+};
 pub use disk::{DiskFileAccess, MultiDirectoryFileAccess, PlacementFileAccess};
 pub use error::{Par2Error, Result};
 pub use evidence::{CommittedFileEvidence, ContiguousAssemblyProof, FileStatFingerprint};
