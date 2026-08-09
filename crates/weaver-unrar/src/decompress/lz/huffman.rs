@@ -17,6 +17,7 @@
 use crate::error::{RarError, RarResult};
 
 use super::bitstream::{BitRead, BitReader};
+use super::block_reader::BlockReader;
 
 /// Number of bit-length bootstrap codes.
 pub const HUFF_BC: usize = 20;
@@ -244,6 +245,35 @@ impl HuffmanTable {
         let bits = self.slow_path_bits(bit_field);
         reader.addbits(bits as u8)?;
         Ok(self.symbol_for_bits(bit_field, bits))
+    }
+
+    #[inline(always)]
+    pub(super) fn is_quick_code(&self, bit_field: u32) -> bool {
+        let quick_bits = self.quick_bits as usize;
+        if bit_field >= self.decode_len[quick_bits] {
+            return false;
+        }
+        let code = (bit_field >> (16 - self.quick_bits)) as usize;
+        self.quick_len[code] != 0
+    }
+
+    #[inline(always)]
+    pub(super) fn decode_block_reader(&self, reader: &mut BlockReader<'_>) -> (u16, bool) {
+        let bit_field = u32::from(reader.peek_u16()) & 0xfffe;
+        let quick_bits = self.quick_bits as usize;
+
+        if bit_field < self.decode_len[quick_bits] {
+            let code = (bit_field >> (16 - self.quick_bits)) as usize;
+            let bits = self.quick_len[code];
+            if bits != 0 {
+                reader.advance(bits as usize);
+                return (self.quick_num[code], true);
+            }
+        }
+
+        let bits = self.slow_path_bits(bit_field);
+        reader.advance(bits);
+        (self.symbol_for_bits(bit_field, bits), false)
     }
 
     /// Returns the number of symbols this table can decode.

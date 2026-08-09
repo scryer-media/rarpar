@@ -87,7 +87,7 @@ func LoadPlan(path, corpusDigest string) (Plan, error) {
 	if err := readJSON(path, &plan); err != nil {
 		return Plan{}, err
 	}
-	if plan.SchemaVersion != PlanSchemaVersion || plan.ID == "" || plan.CorpusDigest != corpusDigest || plan.Repeats < 1 || (plan.Par2Placement != "canonical" && plan.Par2Placement != "smart") {
+	if plan.SchemaVersion != PlanSchemaVersion || plan.ID == "" || plan.CorpusDigest != corpusDigest || plan.Warmups < 0 || plan.Repeats < 1 || len(plan.Cases) == 0 || (plan.Lane != "cpu" && plan.Lane != "metal" && plan.Lane != "docker-cpu") || (plan.Par2Placement != "canonical" && plan.Par2Placement != "smart") {
 		return Plan{}, fmt.Errorf("invalid plan %s", path)
 	}
 	seen := map[string]bool{}

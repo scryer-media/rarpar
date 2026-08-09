@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "label": "macos-arm64",
+      "host": "macos-bench.example.net",
+      "user": "bench",
+      "port": 22,
+      "identity_file": "~/.ssh/rarpar-bench-macos",
+      "ssh_options": ["-o", "ConnectTimeout=30"],
+      "workspace_dir": "/Users/bench/src/rarpar",
+      "corpus_dir": "/Volumes/bench-data/rarpar/corpus",
+      "output_dir": "/Volumes/bench-data/rarpar/results/2026-08-08",
+      "candidate": "/Users/bench/src/rarpar/target/release/rarpar",
+      "reference_rar": "/opt/homebrew/bin/unrar",
+      "reference_par2": "/opt/homebrew/bin/par2",
+      "source_target": "aarch64-apple-darwin",
+      "go_binary": "/opt/homebrew/bin/go",
+      "path": "/Users/bench/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin",
+      "candidate_label": "rarpar",
+      "reference_label": "reference",
+      "seed": "rarpar-benchmark-plan-v1",
+      "lane": "cpu",
+      "par2_placement": "canonical",
+      "warmups": 1,
+      "repeats": 5
+    },
+    {
+      "label": "linux-x86-64",
+      "host": "linux-bench.example.net",
+      "user": "bench",
+      "identity_file": "~/.ssh/rarpar-bench-linux",
+      "workspace_dir": "/home/bench/src/rarpar",
+      "corpus_dir": "/mnt/bench-data/rarpar/corpus",
+      "output_dir": "/mnt/bench-data/rarpar/results/2026-08-08",
+      "candidate": "/home/bench/src/rarpar/target/release/rarpar",
+      "reference_rar": "/opt/unrar/unrar",
+      "reference_par2": "/opt/par2cmdline-turbo/par2",
+      "source_target": "x86_64-unknown-linux-gnu"
+    }
+  ]
+}

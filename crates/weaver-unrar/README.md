@@ -80,11 +80,11 @@ validation. They include CLI discovery and output handling as well as archive
 extraction, so they are release-workflow measurements rather than isolated
 decoder microbenchmarks.
 
-![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-rar-benchmark-windows-x86_64.svg)
+![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-![RAR workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-rar-benchmark-linux-x86_64.svg)
+![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-![RAR workloads on Apple M5 Max with macOS arm64](docs/rarpar-rar-benchmark-macos-arm64.svg)
+![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
 
 ### Broader library workloads
 

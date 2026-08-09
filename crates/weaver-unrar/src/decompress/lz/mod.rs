@@ -19,9 +19,11 @@
 //! - 262-305: inline length codes with extra bits (distance from DC/LDC tables)
 
 pub mod bitstream;
+pub(super) mod block_reader;
 pub mod filter;
 pub mod huffman;
 mod parallel;
+pub(super) mod phase_diagnostics;
 pub mod window;
 
 use std::io::Write;
@@ -97,8 +99,8 @@ pub struct LzDecoder {
     /// This advances by filter block length even when unsupported filters
     /// suppress the corresponding output bytes.
     current_file_written_size: u64,
-    /// Recycled decoded-item buffer sets for RAR5 multithreaded block decode
-    /// (two sets so batch N+1 decodes while batch N applies).
+    /// Recycled decoded-item buffers for one bounded RAR5 controller batch.
+    /// Workers fill these slots before the caller applies them in archive order.
     parallel_item_buffer_sets: Vec<Vec<Vec<parallel::DecodedItem>>>,
 }
 
@@ -773,6 +775,7 @@ impl LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
+        phase_diagnostics::emit_zero(phase_diagnostics::Phase::Staging);
         if unpacked_size == 0 {
             return Ok(0);
         }
@@ -830,6 +833,7 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<u64> {
         if unpacked_size == 0 {
+            phase_diagnostics::emit_zero(phase_diagnostics::Phase::Staging);
             return Ok(0);
         }
 
@@ -850,24 +854,31 @@ impl LzDecoder {
                 && (staged_start >= STREAMING_PARALLEL_READ_BUFFER_SIZE / 2
                     || staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE)
             {
-                Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                phase_diagnostics::measure(phase_diagnostics::Phase::Staging, || {
+                    Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                });
             }
 
             while !reached_eof && staged.len() - staged_start < STREAMING_PARALLEL_READ_BUFFER_SIZE
             {
                 if staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE {
-                    Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                    phase_diagnostics::measure(phase_diagnostics::Phase::Staging, || {
+                        Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                    });
                 }
 
                 let max_read = STREAMING_PARALLEL_READ_BUFFER_SIZE - (staged.len() - staged_start);
-                let read = input
-                    .read(&mut read_buf[..max_read])
-                    .map_err(RarError::Io)?;
+                let read = phase_diagnostics::measure(phase_diagnostics::Phase::Staging, || {
+                    input.read(&mut read_buf[..max_read])
+                })
+                .map_err(RarError::Io)?;
                 if read == 0 {
                     reached_eof = true;
                     break;
                 }
-                staged.extend_from_slice(&read_buf[..read]);
+                phase_diagnostics::measure(phase_diagnostics::Phase::Staging, || {
+                    staged.extend_from_slice(&read_buf[..read]);
+                });
             }
 
             // A finished block can end mid-byte; the remaining bits of that

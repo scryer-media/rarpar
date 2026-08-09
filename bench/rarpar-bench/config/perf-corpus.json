@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "rarpar-rar5-performance-v1",
+  "seed": "rarpar-rar5-performance-v1",
+  "payload_bytes": 268435456,
+  "volume_size": "512m",
+  "par2_redundancy_percent": 20,
+  "cases": [
+    {
+      "id": "rar5-perf-normal-binary",
+      "family": "rar",
+      "writer": "rarlab-5.00",
+      "format": 5,
+      "store": false,
+      "solid": false,
+      "encrypted": false,
+      "par2": false,
+      "recovery_volumes": false,
+      "mutation": "none",
+      "payload_profile": "binary",
+      "workload": "RAR5 normal extraction, binary literal-heavy profile"
+    },
+    {
+      "id": "rar5-perf-normal-text",
+      "family": "rar",
+      "writer": "rarlab-5.00",
+      "format": 5,
+      "store": false,
+      "solid": false,
+      "encrypted": false,
+      "par2": false,
+      "recovery_volumes": false,
+      "mutation": "none",
+      "payload_profile": "text",
+      "workload": "RAR5 normal extraction, text match-heavy profile"
+    },
+    {
+      "id": "rar5-perf-solid-binary",
+      "family": "rar",
+      "writer": "rarlab-5.00",
+      "format": 5,
+      "store": false,
+      "solid": true,
+      "encrypted": false,
+      "par2": false,
+      "recovery_volumes": false,
+      "mutation": "none",
+      "payload_profile": "binary",
+      "workload": "RAR5 solid extraction, binary literal-heavy profile"
+    },
+    {
+      "id": "rar5-perf-solid-text",
+      "family": "rar",
+      "writer": "rarlab-5.00",
+      "format": 5,
+      "store": false,
+      "solid": true,
+      "encrypted": false,
+      "par2": false,
+      "recovery_volumes": false,
+      "mutation": "none",
+      "payload_profile": "text",
+      "workload": "RAR5 solid extraction, text match-heavy profile"
+    }
+  ]
+}

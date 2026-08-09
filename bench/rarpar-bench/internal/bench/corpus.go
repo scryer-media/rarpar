@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 const benchmarkPassword = "rarpar-benchmark-only-password"
@@ -58,6 +59,9 @@ func (config CorpusConfig) Validate() error {
 		if item.PPMd && profile != "text" {
 			return fmt.Errorf("PPMd case %q must use the text payload profile", item.ID)
 		}
+		if item.PayloadBytes < 0 {
+			return fmt.Errorf("case %q has a negative payload size", item.ID)
+		}
 		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "heavy-damage" && item.Mutation != "remove-volume" {
 			return fmt.Errorf("case %q has unsupported mutation %q", item.ID, item.Mutation)
 		}
@@ -97,26 +101,45 @@ func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock T
 	if err != nil {
 		return err
 	}
-	corpusDigest := bytesSHA256(append(configBytes, toolchainBytes...))
+	generationDigest := bytesSHA256(append(configBytes, toolchainBytes...))
 	for _, caseConfig := range config.Cases {
 		writer, found := lock.Writer(caseConfig.Writer)
 		if !found {
 			return fmt.Errorf("case %q references unavailable writer %q", caseConfig.ID, caseConfig.Writer)
 		}
-		if err := generateCase(ctx, docker, harnessRoot, out, config, corpusDigest, lock, writer, caseConfig); err != nil {
+		if err := generateCase(ctx, docker, harnessRoot, out, config, generationDigest, lock, writer, caseConfig); err != nil {
+			return err
+		}
+	}
+	manifests := make([]CorpusCaseManifest, 0, len(config.Cases))
+	for _, caseConfig := range config.Cases {
+		var manifest CorpusCaseManifest
+		if err := readJSON(filepath.Join(out, caseConfig.ID, "manifest.json"), &manifest); err != nil {
+			return err
+		}
+		manifests = append(manifests, manifest)
+	}
+	corpusDigest, err := corpusContentDigest(manifests)
+	if err != nil {
+		return err
+	}
+	for index := range manifests {
+		manifests[index].CorpusDigest = corpusDigest
+		if err := writeJSON(filepath.Join(out, manifests[index].ID, "manifest.json"), manifests[index]); err != nil {
 			return err
 		}
 	}
 	return writeJSON(filepath.Join(out, "corpus.json"), map[string]any{
-		"schema_version": CorpusSchemaVersion,
-		"id":             config.ID,
-		"digest":         corpusDigest,
-		"case_count":     len(config.Cases),
-		"harness_root":   filepath.Base(harnessRoot),
+		"schema_version":    CorpusSchemaVersion,
+		"id":                config.ID,
+		"digest":            corpusDigest,
+		"generation_digest": generationDigest,
+		"case_count":        len(config.Cases),
+		"harness_root":      filepath.Base(harnessRoot),
 	})
 }
 
-func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, config CorpusConfig, corpusDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
+func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, config CorpusConfig, generationDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
 	caseRoot := filepath.Join(corpusRoot, item.ID)
 	workRoot, err := os.MkdirTemp("", "rarpar-bench-corpus-")
 	if err != nil {
@@ -137,7 +160,7 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 		if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
 			return err
 		}
-		expected, err = writeDeterministicPayload(payloadRoot, config.Seed, item.ID, config.PayloadBytes, item.PayloadProfile)
+		expected, err = writeDeterministicPayload(payloadRoot, config.Seed, item.ID, payloadBytesForCase(config, item), item.PayloadProfile)
 		if err != nil {
 			return fmt.Errorf("write payload for %s: %w", item.ID, err)
 		}
@@ -145,7 +168,7 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 		if item.VolumeSize != "" {
 			volumeSize = item.VolumeSize
 		}
-		archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-v" + volumeSize}
+		archiveArgs := []string{"run", "--rm", "--platform", writer.Platform, "-v", workRoot + ":/work", "-w", "/work", writer.Image, "a", "-idq", "-tsm-", "-v" + volumeSize}
 		// The legacy writers naturally emit their own format; RAR 3.93 does not
 		// understand -ma3. RAR 5 is the only case that needs an explicit selector.
 		if item.Format == 5 {
@@ -210,24 +233,31 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 		return err
 	}
 	manifest := CorpusCaseManifest{
-		SchemaVersion: "rarpar-bench-case-v1",
-		ID:            item.ID,
-		Config:        item,
-		CorpusID:      config.ID,
-		CorpusDigest:  corpusDigest,
-		Seed:          config.Seed,
-		Toolchains:    ToolchainIDs(lock, item),
-		Expected:      expected,
-		Sources:       sources,
+		SchemaVersion:    "rarpar-bench-case-v1",
+		ID:               item.ID,
+		Config:           item,
+		CorpusID:         config.ID,
+		GenerationDigest: generationDigest,
+		Seed:             config.Seed,
+		Toolchains:       ToolchainIDs(lock, item),
+		Expected:         expected,
+		Sources:          sources,
 	}
 	return writeJSON(filepath.Join(caseRoot, "manifest.json"), manifest)
+}
+
+func payloadBytesForCase(config CorpusConfig, item CaseConfig) int64 {
+	if item.PayloadBytes > 0 {
+		return item.PayloadBytes
+	}
+	return config.PayloadBytes
 }
 
 func writeDeterministicPayload(root, seed, caseID string, total int64, profile string) ([]ExpectedFile, error) {
 	if profile == "" {
 		profile = "binary"
 	}
-	parts := []int64{total * 3 / 4, total / 8, total - (total*3/4 + total/8)}
+	parts := payloadPartSizes(total)
 	var expected []ExpectedFile
 	extension := "bin"
 	if profile == "text" {
@@ -243,6 +273,12 @@ func writeDeterministicPayload(root, seed, caseID string, total int64, profile s
 		expected = append(expected, ExpectedFile{Path: filepath.ToSlash(relative), Bytes: bytes, SHA256: digest})
 	}
 	return expected, nil
+}
+
+func payloadPartSizes(total int64) []int64 {
+	first := total/4*3 + total%4*3/4
+	second := total / 8
+	return []int64{first, second, total - first - second}
 }
 
 func writePayloadFile(path, seed, caseID, fileID string, bytes int64) (string, error) {
@@ -284,7 +320,27 @@ func writePayloadFileWithProfile(path, seed, caseID, fileID string, bytes int64,
 		remaining -= count
 		block++
 	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	deterministicTime := time.Unix(946684800, 0).UTC()
+	if err := os.Chtimes(path, deterministicTime, deterministicTime); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func corpusContentDigest(manifests []CorpusCaseManifest) (string, error) {
+	normalized := append([]CorpusCaseManifest(nil), manifests...)
+	sort.Slice(normalized, func(left, right int) bool { return normalized[left].ID < normalized[right].ID })
+	for index := range normalized {
+		normalized[index].CorpusDigest = ""
+	}
+	encoded, err := canonicalJSON(normalized)
+	if err != nil {
+		return "", err
+	}
+	return bytesSHA256(encoded), nil
 }
 
 func fillBinaryPayloadBlock(buffer []byte, seed, caseID, fileID string, block uint64) {
@@ -451,7 +507,8 @@ func sourceManifest(root string) ([]SourceFile, error) {
 func VerifyCorpus(root string) error {
 	indexPath := filepath.Join(root, "corpus.json")
 	var index struct {
-		Digest string `json:"digest"`
+		Digest    string `json:"digest"`
+		CaseCount int    `json:"case_count"`
 	}
 	if err := readJSON(indexPath, &index); err != nil {
 		return err
@@ -461,6 +518,7 @@ func VerifyCorpus(root string) error {
 		return err
 	}
 	count := 0
+	var manifests []CorpusCaseManifest
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -488,10 +546,21 @@ func VerifyCorpus(root string) error {
 				return fmt.Errorf("source checksum verification failed for %s", path)
 			}
 		}
+		manifests = append(manifests, manifest)
 		count++
 	}
 	if count == 0 {
 		return fmt.Errorf("corpus contains no cases")
+	}
+	if index.CaseCount != count {
+		return fmt.Errorf("corpus index declares %d cases, found %d", index.CaseCount, count)
+	}
+	digest, err := corpusContentDigest(manifests)
+	if err != nil {
+		return err
+	}
+	if digest != index.Digest {
+		return fmt.Errorf("corpus content digest mismatch")
 	}
 	return nil
 }

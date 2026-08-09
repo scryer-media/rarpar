@@ -15,12 +15,20 @@ func BuildReport(rawPath string) (Report, error) {
 	if raw.SchemaVersion != RunSchemaVersion || raw.Plan.SchemaVersion != PlanSchemaVersion || raw.CorpusDigest != raw.Plan.CorpusDigest {
 		return Report{}, fmt.Errorf("raw benchmark record has invalid provenance")
 	}
+	collectorMode := raw.CollectorMode
+	if collectorMode == "" {
+		collectorMode = wallClockCollector
+	}
+	if collectorMode != wallClockCollector && collectorMode != perfStatCollector {
+		return Report{}, fmt.Errorf("unsupported benchmark collector mode %q", collectorMode)
+	}
 	digest, err := fileSHA256(rawPath)
 	if err != nil {
 		return Report{}, err
 	}
 	report := Report{
 		SchemaVersion: ReportSchemaVersion,
+		CollectorMode: collectorMode,
 		InputSHA256:   digest,
 		Plan:          raw.Plan,
 		CorpusDigest:  raw.CorpusDigest,
@@ -35,6 +43,7 @@ func BuildReport(rawPath string) (Report, error) {
 	}
 	for _, planCase := range raw.Plan.Cases {
 		candidate := successfulMeasurements(raw.Executions, "candidate", planCase.ID)
+		candidateWarmups := successfulWarmups(raw.Executions, "candidate", planCase.ID)
 		reference := successfulMeasurements(raw.Executions, "reference", planCase.ID)
 		if len(candidate) != raw.Plan.Repeats || len(reference) != raw.Plan.Repeats {
 			report.Omitted = append(report.Omitted, fmt.Sprintf("%s: requires %d successful candidate and reference samples, got %d and %d", planCase.ID, raw.Plan.Repeats, len(candidate), len(reference)))
@@ -50,7 +59,7 @@ func BuildReport(rawPath string) (Report, error) {
 			report.Omitted = append(report.Omitted, fmt.Sprintf("%s: non-positive timing", planCase.ID))
 			continue
 		}
-		report.Comparisons = append(report.Comparisons, Comparison{
+		comparison := Comparison{
 			CaseID:             planCase.ID,
 			Family:             candidate[0].Family,
 			Workload:           candidate[0].Workload,
@@ -61,7 +70,9 @@ func BuildReport(rawPath string) (Report, error) {
 			Ratio:              float64(referenceSummary.Median) / float64(candidateSummary.Median),
 			CompiledCapability: consistentCapability(candidate),
 			Backend:            consistentBackend(candidate),
-		})
+		}
+		comparison.CandidateRAR5Phases = summarizeRAR5Phases(candidateWarmups)
+		report.Comparisons = append(report.Comparisons, comparison)
 	}
 	sort.SliceStable(report.Comparisons, func(left, right int) bool {
 		return caseOrder(raw.Plan, report.Comparisons[left].CaseID) < caseOrder(raw.Plan, report.Comparisons[right].CaseID)
@@ -90,6 +101,17 @@ func successfulMeasurements(executions []Execution, role, caseID string) []Execu
 	var successful []Execution
 	for _, execution := range executions {
 		if execution.Role == role && execution.CaseID == caseID && !execution.Warmup && execution.Success {
+			successful = append(successful, execution)
+		}
+	}
+	sort.Slice(successful, func(left, right int) bool { return successful[left].Run < successful[right].Run })
+	return successful
+}
+
+func successfulWarmups(executions []Execution, role, caseID string) []Execution {
+	var successful []Execution
+	for _, execution := range executions {
+		if execution.Role == role && execution.CaseID == caseID && execution.Warmup && execution.Success {
 			successful = append(successful, execution)
 		}
 	}

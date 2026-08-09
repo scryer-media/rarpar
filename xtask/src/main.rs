@@ -6,6 +6,9 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::CommandFactory;
@@ -61,11 +64,16 @@ Usage:
   cargo run -p xtask -- docs --check
   cargo run -p xtask -- package-root --binary PATH --out DIR [--docs DIR] [--target TRIPLE]
   cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST
-  cargo run -p xtask -- bench <toolchains|corpus|plan|preflight|run|report|render> [OPTIONS]"
+  cargo run -p xtask -- bench <toolchains|corpus|plan|preflight|run|report|render> [OPTIONS]
+  cargo run -p xtask -- bench all-hosts [--config PATH] [--jobs N]"
     );
 }
 
 fn run_bench(args: Vec<OsString>) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "all-hosts") {
+        return run_bench_all_hosts(args.into_iter().skip(1).collect());
+    }
+
     let bench_root = workspace_root().join("bench/rarpar-bench");
     if !bench_root.join("go.mod").is_file() {
         return fail("benchmark harness is missing bench/rarpar-bench/go.mod");
@@ -81,6 +89,494 @@ fn run_bench(args: Vec<OsString>) -> Result<()> {
     } else {
         fail(format!("benchmark harness exited with {status}"))
     }
+}
+
+struct BenchAllHostsOptions {
+    config: PathBuf,
+    jobs: Option<usize>,
+}
+
+impl BenchAllHostsOptions {
+    fn parse(args: Vec<OsString>) -> Result<Self> {
+        let mut config = None;
+        let mut jobs = None;
+        let mut args = args.into_iter();
+        while let Some(argument) = args.next() {
+            match argument.to_str() {
+                Some("--config") => config = Some(next_path(&mut args, "--config")?),
+                Some("--jobs") => {
+                    let value = next_string(&mut args, "--jobs")?;
+                    let parsed = value
+                        .parse::<usize>()
+                        .map_err(|_| error("--jobs must be a positive integer"))?;
+                    if parsed == 0 {
+                        return fail("--jobs must be a positive integer");
+                    }
+                    jobs = Some(parsed);
+                }
+                _ => return fail(format!("unknown bench all-hosts option {argument:?}")),
+            }
+        }
+        Ok(Self {
+            config: config.unwrap_or_else(default_bench_hosts_config),
+            jobs,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchHostsConfig {
+    schema_version: u32,
+    hosts: Vec<BenchHost>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchHost {
+    label: String,
+    host: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    identity_file: Option<PathBuf>,
+    #[serde(default)]
+    ssh_options: Vec<String>,
+    workspace_dir: String,
+    corpus_dir: String,
+    output_dir: String,
+    candidate: String,
+    reference_rar: String,
+    reference_par2: String,
+    source_target: String,
+    #[serde(default = "default_bench_go_binary")]
+    go_binary: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default = "default_bench_candidate_label")]
+    candidate_label: String,
+    #[serde(default = "default_bench_reference_label")]
+    reference_label: String,
+    #[serde(default = "default_bench_seed")]
+    seed: String,
+    #[serde(default = "default_bench_lane")]
+    lane: String,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default = "default_bench_par2_placement")]
+    par2_placement: String,
+    #[serde(default = "default_bench_warmups")]
+    warmups: usize,
+    #[serde(default = "default_bench_repeats")]
+    repeats: usize,
+}
+
+fn default_bench_hosts_config() -> PathBuf {
+    workspace_root().join("bench/rarpar-bench/config/hosts.local.json")
+}
+
+fn default_bench_go_binary() -> String {
+    "go".to_owned()
+}
+
+fn default_bench_candidate_label() -> String {
+    "rarpar".to_owned()
+}
+
+fn default_bench_reference_label() -> String {
+    "reference".to_owned()
+}
+
+fn default_bench_seed() -> String {
+    "rarpar-benchmark-plan-v1".to_owned()
+}
+
+fn default_bench_lane() -> String {
+    "cpu".to_owned()
+}
+
+fn default_bench_par2_placement() -> String {
+    "canonical".to_owned()
+}
+
+fn default_bench_warmups() -> usize {
+    1
+}
+
+fn default_bench_repeats() -> usize {
+    5
+}
+
+fn run_bench_all_hosts(args: Vec<OsString>) -> Result<()> {
+    if args.len() == 1 && matches!(args[0].to_str(), Some("-h" | "--help")) {
+        eprintln!(
+            "Usage: cargo run --locked -p xtask -- bench all-hosts [--config PATH] [--jobs N]"
+        );
+        return Ok(());
+    }
+    let options = BenchAllHostsOptions::parse(args)?;
+    let config = load_bench_hosts_config(&options.config)?;
+    let jobs = options
+        .jobs
+        .unwrap_or(config.hosts.len())
+        .min(config.hosts.len());
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(config.hosts.len()));
+
+    thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= config.hosts.len() {
+                        return;
+                    }
+                    let host = &config.hosts[index];
+                    eprintln!("bench all-hosts [{}]: started", host.label);
+                    let result = run_bench_host(host).map_err(|error| error.to_string());
+                    match &result {
+                        Ok(()) => eprintln!("bench all-hosts [{}]: completed", host.label),
+                        Err(error) => {
+                            eprintln!("bench all-hosts [{}]: failed: {error}", host.label)
+                        }
+                    }
+                    results
+                        .lock()
+                        .expect("benchmark result lock must not be poisoned")
+                        .push((host.label.as_str(), result));
+                }
+            });
+        }
+    });
+
+    let mut failures = results
+        .into_inner()
+        .expect("benchmark result lock must not be poisoned")
+        .into_iter()
+        .filter_map(|(label, result)| result.err().map(|error| format!("{label}: {error}")))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    failures.sort();
+    fail(format!("benchmark host failures:\n{}", failures.join("\n")))
+}
+
+fn load_bench_hosts_config(path: &Path) -> Result<BenchHostsConfig> {
+    let data =
+        fs::read(path).map_err(|source| error(format!("read {}: {source}", path.display())))?;
+    let config: BenchHostsConfig = serde_json::from_slice(&data)
+        .map_err(|source| error(format!("decode {}: {source}", path.display())))?;
+    validate_bench_hosts_config(&config)?;
+    Ok(config)
+}
+
+fn validate_bench_hosts_config(config: &BenchHostsConfig) -> Result<()> {
+    if config.schema_version != 1 {
+        return fail("benchmark hosts config schema_version must be 1");
+    }
+    if config.hosts.is_empty() {
+        return fail("benchmark hosts config must declare at least one host");
+    }
+    let mut labels = HashSet::new();
+    let mut outputs = HashSet::new();
+    for host in &config.hosts {
+        validate_bench_value("host label", &host.label)?;
+        if !labels.insert(&host.label) {
+            return fail(format!(
+                "benchmark host label is duplicated: {}",
+                host.label
+            ));
+        }
+        validate_bench_value("host", &host.host)?;
+        if host.host.starts_with('-') {
+            return fail(format!(
+                "benchmark host must not begin with '-': {}",
+                host.host
+            ));
+        }
+        let short_host = host.host.split('.').next().unwrap_or(&host.host);
+        if host.label.eq_ignore_ascii_case(&host.host)
+            || host.label.eq_ignore_ascii_case(short_host)
+        {
+            return fail(
+                "benchmark host label must describe the machine without using its hostname",
+            );
+        }
+        if let Some(user) = &host.user {
+            validate_bench_value("SSH user", user)?;
+            if user.contains('@') {
+                return fail("SSH user must not contain '@'");
+            }
+        }
+        for option in &host.ssh_options {
+            validate_bench_value("SSH option", option)?;
+        }
+        for (name, path) in [
+            ("workspace_dir", &host.workspace_dir),
+            ("corpus_dir", &host.corpus_dir),
+            ("output_dir", &host.output_dir),
+            ("candidate", &host.candidate),
+            ("reference_rar", &host.reference_rar),
+            ("reference_par2", &host.reference_par2),
+        ] {
+            validate_remote_absolute_path(name, path)?;
+        }
+        let output_key = format!(
+            "{}\0{}\0{}\0{}",
+            host.user.as_deref().unwrap_or(""),
+            host.host.to_ascii_lowercase(),
+            host.port.unwrap_or(22),
+            host.output_dir
+        );
+        if !outputs.insert(output_key) {
+            return fail("benchmark hosts must not share an SSH endpoint and output directory");
+        }
+        for (name, value) in [
+            ("source_target", &host.source_target),
+            ("go_binary", &host.go_binary),
+            ("candidate_label", &host.candidate_label),
+            ("reference_label", &host.reference_label),
+            ("seed", &host.seed),
+            ("lane", &host.lane),
+            ("par2_placement", &host.par2_placement),
+        ] {
+            validate_bench_value(name, value)?;
+        }
+        if let Some(path) = &host.path {
+            validate_bench_value("PATH", path)?;
+        }
+        if let Some(family) = &host.family
+            && family != "rar"
+            && family != "par2"
+        {
+            return fail("benchmark family must be rar or par2");
+        }
+        if host.lane != "cpu" && host.lane != "metal" && host.lane != "docker-cpu" {
+            return fail(format!("benchmark lane is unsupported: {}", host.lane));
+        }
+        if host.par2_placement != "canonical" && host.par2_placement != "smart" {
+            return fail(format!(
+                "benchmark PAR2 placement is unsupported: {}",
+                host.par2_placement
+            ));
+        }
+        if host.repeats == 0 {
+            return fail("benchmark repeats must be positive");
+        }
+        if let Some(identity_file) = &host.identity_file {
+            let identity_file = expand_home(identity_file)?;
+            if !fs::metadata(&identity_file).is_ok_and(|metadata| metadata.is_file()) {
+                return fail(format!(
+                    "SSH identity file for {} does not exist or is not a file: {}",
+                    host.label,
+                    identity_file.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bench_value(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return fail(format!(
+            "{name} must be non-empty and contain no control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_absolute_path(name: &str, path: &str) -> Result<()> {
+    validate_bench_value(name, path)?;
+    if !path.starts_with('/') {
+        return fail(format!("{name} must be an absolute POSIX path: {path}"));
+    }
+    Ok(())
+}
+
+fn expand_home(path: &Path) -> Result<PathBuf> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| error("SSH identity file must be valid UTF-8"))?;
+    if value == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| error("cannot expand ~ without HOME"));
+    }
+    if let Some(suffix) = value.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(suffix))
+            .ok_or_else(|| error("cannot expand ~/ without HOME"));
+    }
+    Ok(path.to_owned())
+}
+
+fn run_bench_host(host: &BenchHost) -> Result<()> {
+    let mut command = Command::new("ssh");
+    command.arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    if let Some(identity_file) = &host.identity_file {
+        command.arg("-i").arg(expand_home(identity_file)?);
+        command.arg("-o").arg("IdentitiesOnly=yes");
+    }
+    command.args(&host.ssh_options);
+    let target = match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let status = command.arg(target).arg(bench_host_script(host)).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        fail(format!("SSH benchmark command exited with {status}"))
+    }
+}
+
+fn bench_host_script(host: &BenchHost) -> String {
+    let harness_dir = remote_join(&host.workspace_dir, "bench/rarpar-bench");
+    let plan = remote_join(&host.output_dir, "plan.json");
+    let run_dir = remote_join(&host.output_dir, "run");
+    let raw = remote_join(&run_dir, "raw.json");
+    let report = remote_join(&host.output_dir, "report.json");
+    let charts = remote_join(&host.output_dir, "charts");
+    let source_manifest = remote_join(&host.workspace_dir, "tools/rarpar/Cargo.toml");
+    let output_parent = Path::new(&host.output_dir)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("/");
+
+    let mut plan_args = vec![
+        "plan".to_owned(),
+        "create".to_owned(),
+        "--corpus".to_owned(),
+        host.corpus_dir.clone(),
+        "--out".to_owned(),
+        plan,
+        "--seed".to_owned(),
+        host.seed.clone(),
+        "--lane".to_owned(),
+        host.lane.clone(),
+        "--par2-placement".to_owned(),
+        host.par2_placement.clone(),
+        "--warmups".to_owned(),
+        host.warmups.to_string(),
+        "--repeats".to_owned(),
+        host.repeats.to_string(),
+    ];
+    if let Some(family) = &host.family {
+        plan_args.extend(["--family".to_owned(), family.clone()]);
+    }
+
+    let run_args = vec![
+        "run".to_owned(),
+        "--corpus".to_owned(),
+        host.corpus_dir.clone(),
+        "--plan".to_owned(),
+        remote_join(&host.output_dir, "plan.json"),
+        "--candidate".to_owned(),
+        host.candidate.clone(),
+        "--candidate-label".to_owned(),
+        host.candidate_label.clone(),
+        "--reference-rar".to_owned(),
+        host.reference_rar.clone(),
+        "--reference-par2".to_owned(),
+        host.reference_par2.clone(),
+        "--reference-label".to_owned(),
+        host.reference_label.clone(),
+        "--machine".to_owned(),
+        host.label.clone(),
+        "--out".to_owned(),
+        run_dir,
+        "--source-manifest".to_owned(),
+        source_manifest,
+        "--source-target".to_owned(),
+        host.source_target.clone(),
+    ];
+
+    let mut lines = vec![
+        "set -eu".to_owned(),
+        format!("cd {}", shell_quote(&harness_dir)),
+    ];
+    if let Some(path) = &host.path {
+        lines.push(format!("export PATH={}", shell_quote(path)));
+    }
+    lines.push(format!(
+        "export RARPAR_BENCH_WORKSPACE_ROOT={}",
+        shell_quote(&host.workspace_dir)
+    ));
+    lines.push(format!("mkdir -p {}", shell_quote(output_parent)));
+    lines.push(format!(
+        "if ! mkdir {}; then printf '%s\\n' {} >&2; exit 64; fi",
+        shell_quote(&host.output_dir),
+        shell_quote(&format!(
+            "benchmark output already exists: {}",
+            host.output_dir
+        ))
+    ));
+    lines.push(format!("{} test ./...", shell_quote(&host.go_binary)));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "corpus".to_owned(),
+            "verify".to_owned(),
+            "--root".to_owned(),
+            host.corpus_dir.clone(),
+        ],
+    ));
+    lines.push(bench_go_command(&host.go_binary, &plan_args));
+    lines.push(bench_go_command(&host.go_binary, &run_args));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "report".to_owned(),
+            "--input".to_owned(),
+            raw,
+            "--out".to_owned(),
+            report,
+        ],
+    ));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "render".to_owned(),
+            "--input".to_owned(),
+            remote_join(&host.output_dir, "report.json"),
+            "--out".to_owned(),
+            charts,
+        ],
+    ));
+    lines.join("\n")
+}
+
+fn remote_join(base: &str, child: &str) -> String {
+    if base == "/" {
+        format!("/{child}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), child)
+    }
+}
+
+fn bench_go_command(go_binary: &str, args: &[String]) -> String {
+    let mut words = vec![
+        go_binary.to_owned(),
+        "run".to_owned(),
+        "./cmd/rarpar-bench".to_owned(),
+    ];
+    words.extend(args.iter().cloned());
+    words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
 fn run_docs(args: Vec<OsString>) -> Result<()> {
@@ -937,6 +1433,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bench_host_script_runs_the_complete_direct_harness_pipeline() {
+        let host = bench_host_fixture();
+        let script = bench_host_script(&host);
+
+        for required in [
+            "set -eu",
+            "cd '/remote/rarpar/bench/rarpar-bench'",
+            "export RARPAR_BENCH_WORKSPACE_ROOT='/remote/rarpar'",
+            "'/opt/go/bin/go' test ./...",
+            "corpus' 'verify' '--root' '/remote/corpus'",
+            "plan' 'create'",
+            "run' '--corpus' '/remote/corpus'",
+            "--candidate' '/remote/bin/rarpar'",
+            "report' '--input' '/remote/results/run/raw.json'",
+            "render' '--input' '/remote/results/report.json'",
+        ] {
+            assert!(
+                script.contains(required),
+                "missing {required:?} in {script}"
+            );
+        }
+        assert!(!script.contains("cargo run"));
+    }
+
+    #[test]
+    fn bench_host_config_rejects_relative_paths_and_duplicate_labels() {
+        let mut config = BenchHostsConfig {
+            schema_version: 1,
+            hosts: vec![bench_host_fixture()],
+        };
+        validate_bench_hosts_config(&config).expect("fixture must be valid");
+
+        config.hosts[0].output_dir = "relative/results".to_owned();
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("relative path must fail")
+                .to_string()
+                .contains("absolute POSIX path")
+        );
+
+        config.hosts = vec![bench_host_fixture(), bench_host_fixture()];
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("duplicate host label must fail")
+                .to_string()
+                .contains("duplicated")
+        );
+
+        let mut second = bench_host_fixture();
+        second.label = "Second Linux test machine".to_owned();
+        config.hosts = vec![bench_host_fixture(), second];
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("duplicate endpoint output must fail")
+                .to_string()
+                .contains("output directory")
+        );
+
+        config.hosts = vec![bench_host_fixture()];
+        config.hosts[0].label = "host-a".to_owned();
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("hostname label must fail")
+                .to_string()
+                .contains("without using its hostname")
+        );
+    }
+
+    #[test]
     fn feature_audit_accepts_cpu_only_metadata() -> Result<()> {
         let options = FeatureAuditOptions {
             manifest: PathBuf::from("Cargo.toml"),
@@ -1171,5 +1736,33 @@ mod tests {
             "rarpar-xtask-test-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn bench_host_fixture() -> BenchHost {
+        BenchHost {
+            label: "Linux test machine".to_owned(),
+            host: "host-a.example.net".to_owned(),
+            user: Some("bench".to_owned()),
+            port: Some(22),
+            identity_file: None,
+            ssh_options: vec!["-o".to_owned(), "ConnectTimeout=30".to_owned()],
+            workspace_dir: "/remote/rarpar".to_owned(),
+            corpus_dir: "/remote/corpus".to_owned(),
+            output_dir: "/remote/results".to_owned(),
+            candidate: "/remote/bin/rarpar".to_owned(),
+            reference_rar: "/remote/bin/unrar".to_owned(),
+            reference_par2: "/remote/bin/par2".to_owned(),
+            source_target: "x86_64-unknown-linux-gnu".to_owned(),
+            go_binary: "/opt/go/bin/go".to_owned(),
+            path: Some("/remote/bin:/usr/bin:/bin".to_owned()),
+            candidate_label: "rarpar".to_owned(),
+            reference_label: "reference".to_owned(),
+            seed: "seed".to_owned(),
+            lane: "cpu".to_owned(),
+            family: None,
+            par2_placement: "canonical".to_owned(),
+            warmups: 1,
+            repeats: 5,
+        }
     }
 }

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,9 +30,15 @@ type RunOptions struct {
 	Docker         string
 	SourceManifest string
 	SourceTarget   string
+	Perf           bool
 }
 
 func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
+	if options.Perf {
+		if err := ValidatePerf(ctx); err != nil {
+			return RunRecord{}, err
+		}
+	}
 	if err := VerifyCorpus(options.CorpusRoot); err != nil {
 		return RunRecord{}, err
 	}
@@ -69,12 +78,16 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 	}
 	record := RunRecord{
 		SchemaVersion: RunSchemaVersion,
+		CollectorMode: wallClockCollector,
 		Plan:          options.Plan,
 		CorpusDigest:  options.Plan.CorpusDigest,
 		Machine:       CollectMachine(ctx, options.MachineLabel, options.Docker),
 		Candidate:     candidate,
 		Reference:     reference,
 		ReferencePAR2: referencePAR2,
+	}
+	if options.Perf {
+		record.CollectorMode = perfStatCollector
 	}
 	for _, planCase := range options.Plan.Cases {
 		manifest, err := loadCase(options.CorpusRoot, planCase.ID, options.Plan.CorpusDigest)
@@ -187,7 +200,12 @@ func executeSubject(ctx context.Context, role, label, binary string, manifest Co
 	if err != nil {
 		return failedExecution(role, label, manifest, run, warmup, err)
 	}
-	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, true)
+	phaseDiagnostics := warmup && manifest.Config.Family == "rar" && manifest.Config.Format == 5
+	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, true, phaseDiagnostics, options.Perf)
+	if phaseDiagnostics {
+		measurement.RAR5Phases = collectRAR5PhaseDiagnostics(stdout, stderr)
+		measurement.RAR5Decode = collectRAR5DecodeDiagnostics(stdout, stderr)
+	}
 	backend, fallback := backendFromLogs(options.Plan.Lane, string(stdout)+string(stderr))
 	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
@@ -224,7 +242,7 @@ func executeReference(ctx context.Context, reference BinaryIdentity, manifest Co
 	if err != nil {
 		return failedExecution("reference", reference.Label, manifest, run, warmup, err)
 	}
-	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, false)
+	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, false, false, options.Perf)
 	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
 		err = validateBenchmarkOutput(stage, manifest)
@@ -442,23 +460,264 @@ func validateBenchmarkOutput(stage string, manifest CorpusCaseManifest) error {
 	return validateExpected(stage, expected)
 }
 
-func timedCommand(ctx context.Context, program string, args []string, directory string, candidate bool) (Measurement, []byte, []byte, error) {
-	command := exec.CommandContext(ctx, program, args...)
+var perfEvents = []string{
+	"cycles",
+	"instructions",
+	"branches",
+	"branch-misses",
+	"cache-references",
+	"cache-misses",
+	"task-clock",
+	"context-switches",
+	"cpu-migrations",
+	"duration_time",
+}
+
+const (
+	wallClockCollector = "wall-clock"
+	perfStatCollector  = "linux-perf-stat"
+)
+
+func ValidatePerf(ctx context.Context) error {
+	_ = ctx
+	return validatePerfCollector(runtime.GOOS, exec.LookPath)
+}
+
+func validatePerfCollector(goos string, lookup func(string) (string, error)) error {
+	if goos != "linux" {
+		return fmt.Errorf("--perf requires Linux; perf stat is unavailable on %s", goos)
+	}
+	if _, err := lookup("perf"); err != nil {
+		return fmt.Errorf("--perf requires perf stat: %w", err)
+	}
+	return nil
+}
+
+func perfStatArgs(program string, args []string) []string {
+	commandArgs := []string{
+		"stat",
+		"--no-big-num",
+		"--log-fd", "3",
+		"-x,",
+		"-e", strings.Join(perfEvents, ","),
+		"--",
+		program,
+	}
+	return append(commandArgs, args...)
+}
+
+func timedCommand(ctx context.Context, program string, args []string, directory string, candidate, phaseDiagnostics, collectPerf bool) (Measurement, []byte, []byte, error) {
+	var command *exec.Cmd
+	var perfReader, perfWriter *os.File
+	if collectPerf {
+		perfPath, err := exec.LookPath("perf")
+		if err != nil {
+			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: " + err.Error()}, nil, nil, err
+		}
+		perfReader, perfWriter, err = os.Pipe()
+		if err != nil {
+			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: cannot create log pipe: " + err.Error()}, nil, nil, err
+		}
+		command = exec.CommandContext(ctx, perfPath, perfStatArgs(program, args)...)
+		command.ExtraFiles = []*os.File{perfWriter}
+	} else {
+		command = exec.CommandContext(ctx, program, args...)
+	}
+	if perfWriter != nil {
+		defer perfReader.Close()
+		defer perfWriter.Close()
+	}
 	command.Dir = directory
-	if candidate {
-		command.Env = append(os.Environ(), "RUST_LOG=info")
+	command.Env = benchmarkCommandEnvironment(candidate, phaseDiagnostics)
+	if collectPerf {
+		command.Env = setEnvironmentValue(command.Env, "LC_ALL", "C")
+		command.Env = setEnvironmentValue(command.Env, "LANG", "C")
 	}
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	started := time.Now()
 	err := command.Run()
-	measurement := Measurement{WallNanos: DurationNanos(time.Since(started)), CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled"}
-	if command.ProcessState != nil {
+	var perfOutput []byte
+	var perfReadErr error
+	if perfWriter != nil {
+		if closeErr := perfWriter.Close(); closeErr != nil && perfReadErr == nil {
+			perfReadErr = closeErr
+		}
+		perfOutput, perfReadErr = io.ReadAll(perfReader)
+	}
+	measurement := Measurement{WallNanos: DurationNanos(time.Since(started))}
+	if !collectPerf {
+		measurement.CollectorNote = "instruction collector unavailable: opt-in Linux perf is not enabled"
+	}
+	if command.ProcessState != nil && !collectPerf {
 		measurement.UserNanos = DurationNanos(command.ProcessState.UserTime())
 		measurement.SystemNanos = DurationNanos(command.ProcessState.SystemTime())
 	}
+	var collectorErr error
+	if collectPerf {
+		if perfReadErr != nil {
+			measurement.PerfCollectorNote = "perf stat collector unavailable: " + perfReadErr.Error()
+			collectorErr = perfReadErr
+		} else if counters, parseErr := parsePerfStatOutput(perfOutput); parseErr != nil {
+			measurement.PerfCollectorNote = "perf stat collector unavailable: " + parseErr.Error()
+			collectorErr = parseErr
+		} else {
+			measurement.Perf = counters
+			measurement.Instructions = counters.Instructions
+			if counters.DurationNanos == nil || *counters.DurationNanos > uint64(^uint64(0)>>1) {
+				measurement.PerfCollectorNote = "perf stat collector unavailable: invalid duration_time"
+				collectorErr = fmt.Errorf("invalid perf duration_time")
+			} else {
+				measurement.WallNanos = int64(*counters.DurationNanos)
+			}
+		}
+	}
+	if err == nil && collectorErr != nil {
+		err = collectorErr
+	}
 	return measurement, stdout.Bytes(), stderr.Bytes(), err
+}
+
+func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
+	values := make(map[string]string, len(perfEvents))
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), ",")
+		if len(fields) == 0 || strings.TrimSpace(fields[0]) == "" {
+			continue
+		}
+		event := ""
+		eventIndex := -1
+		for index, field := range fields[1:] {
+			candidate := normalizePerfEvent(field)
+			for _, expected := range perfEvents {
+				if candidate == expected {
+					event = expected
+					eventIndex = index + 1
+					break
+				}
+			}
+			if event != "" {
+				break
+			}
+		}
+		if event == "" {
+			continue
+		}
+		if _, exists := values[event]; exists {
+			return nil, fmt.Errorf("%s was reported more than once", event)
+		}
+		if eventIndex+1 >= len(fields) {
+			return nil, fmt.Errorf("%s did not report a running percentage", event)
+		}
+		runningField := strings.TrimSpace(fields[eventIndex+1])
+		runningPercent, parseErr := strconv.ParseFloat(runningField, 64)
+		if parseErr != nil || math.IsNaN(runningPercent) || math.IsInf(runningPercent, 0) || runningPercent < 99.0 || runningPercent > 100.01 {
+			return nil, fmt.Errorf(
+				"%s ran for an incomplete percentage: %q",
+				event,
+				runningField,
+			)
+		}
+		value := strings.TrimSpace(fields[0])
+		if strings.HasPrefix(value, "<") {
+			return nil, fmt.Errorf("%s reported %s", event, value)
+		}
+		values[event] = value
+	}
+	for _, event := range perfEvents {
+		if _, ok := values[event]; !ok {
+			return nil, fmt.Errorf("%s was not reported", event)
+		}
+	}
+	counters := &PerfCounters{}
+	var err error
+	if counters.Cycles, err = parsePerfUint(values["cycles"]); err != nil {
+		return nil, fmt.Errorf("cycles: %w", err)
+	}
+	if counters.Instructions, err = parsePerfUint(values["instructions"]); err != nil {
+		return nil, fmt.Errorf("instructions: %w", err)
+	}
+	if counters.Branches, err = parsePerfUint(values["branches"]); err != nil {
+		return nil, fmt.Errorf("branches: %w", err)
+	}
+	if counters.BranchMisses, err = parsePerfUint(values["branch-misses"]); err != nil {
+		return nil, fmt.Errorf("branch-misses: %w", err)
+	}
+	if counters.CacheReferences, err = parsePerfUint(values["cache-references"]); err != nil {
+		return nil, fmt.Errorf("cache-references: %w", err)
+	}
+	if counters.CacheMisses, err = parsePerfUint(values["cache-misses"]); err != nil {
+		return nil, fmt.Errorf("cache-misses: %w", err)
+	}
+	if counters.TaskClockMillis, err = parsePerfFloat(values["task-clock"]); err != nil {
+		return nil, fmt.Errorf("task-clock: %w", err)
+	}
+	if counters.ContextSwitches, err = parsePerfUint(values["context-switches"]); err != nil {
+		return nil, fmt.Errorf("context-switches: %w", err)
+	}
+	if counters.CPUMigrations, err = parsePerfUint(values["cpu-migrations"]); err != nil {
+		return nil, fmt.Errorf("cpu-migrations: %w", err)
+	}
+	if counters.DurationNanos, err = parsePerfUint(values["duration_time"]); err != nil {
+		return nil, fmt.Errorf("duration_time: %w", err)
+	}
+	return counters, nil
+}
+
+func setEnvironmentValue(environment []string, name, value string) []string {
+	prefix := name + "="
+	filtered := environment[:0]
+	for _, item := range environment {
+		if !strings.HasPrefix(item, prefix) {
+			filtered = append(filtered, item)
+		}
+	}
+	return append(filtered, prefix+value)
+}
+
+func normalizePerfEvent(value string) string {
+	value = strings.TrimSpace(value)
+	if index := strings.IndexByte(value, ':'); index >= 0 {
+		value = value[:index]
+	}
+	return value
+}
+
+func parsePerfUint(value string) (*uint64, error) {
+	value = strings.ReplaceAll(strings.TrimSpace(value), ",", "")
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func parsePerfFloat(value string) (*float64, error) {
+	value = strings.ReplaceAll(strings.TrimSpace(value), ",", "")
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func benchmarkCommandEnvironment(candidate, phaseDiagnostics bool) []string {
+	prefix := phaseDiagnosticEnv + "="
+	environment := make([]string, 0, len(os.Environ())+2)
+	for _, item := range os.Environ() {
+		name, _, _ := strings.Cut(item, "=")
+		if !strings.EqualFold(name, phaseDiagnosticEnv) {
+			environment = append(environment, item)
+		}
+	}
+	if candidate {
+		environment = append(environment, "RUST_LOG=info")
+	}
+	if candidate && phaseDiagnostics {
+		environment = append(environment, prefix+"1")
+	}
+	return environment
 }
 
 var (
@@ -478,31 +737,40 @@ func backendFromLogs(lane, stderr string) (string, string) {
 }
 
 func failedExecution(role, label string, manifest CorpusCaseManifest, run int, warmup bool, err error) Execution {
-	return failedExecutionWithMeasurement(role, label, manifest, run, warmup, "unknown", "", Measurement{}, err.Error())
+	return failedExecutionWithMeasurement(role, label, manifest, run, warmup, "unknown", "", Measurement{}, sanitizeFailure(err.Error()))
 }
 
 func failedExecutionWithMeasurement(role, label string, manifest CorpusCaseManifest, run int, warmup bool, backend, fallback string, measurement Measurement, failure string) Execution {
-	return Execution{Subject: label, Role: role, CaseID: manifest.ID, Family: manifest.Config.Family, Workload: manifest.Config.Workload, Run: run, Warmup: warmup, Success: false, CompiledCapability: "unknown", Backend: backend, FallbackReason: fallback, Measurement: measurement, Failure: failure}
+	return Execution{Subject: label, Role: role, CaseID: manifest.ID, Family: manifest.Config.Family, Workload: manifest.Config.Workload, Run: run, Warmup: warmup, Success: false, CompiledCapability: "unknown", Backend: backend, FallbackReason: fallback, Measurement: measurement, Failure: sanitizeFailure(failure)}
 }
 
 func commandFailure(err error, stdout, stderr []byte) string {
+	stdout = stripPhaseDiagnosticLines(stdout)
+	stderr = stripPhaseDiagnosticLines(stderr)
 	message := strings.TrimSpace(string(stderr))
 	if message == "" {
 		message = strings.TrimSpace(string(stdout))
 	}
+	message = sanitizeFailure(message)
+	errMessage := sanitizeFailure(err.Error())
+	if message == "" {
+		return errMessage
+	}
+	return errMessage + ": " + message
+}
+
+var pathPattern = regexp.MustCompile(`(?:[A-Za-z]:)?[/\\][^[:space:]]+`)
+
+func sanitizeFailure(message string) string {
+	message = ansiEscapePattern.ReplaceAllString(message, "")
 	message = strings.ReplaceAll(message, benchmarkPassword, "[redacted]")
 	message = strings.ReplaceAll(message, "\n", " ")
 	message = pathPattern.ReplaceAllString(message, "[path]")
 	if len(message) > 400 {
 		message = message[:400]
 	}
-	if message == "" {
-		return err.Error()
-	}
-	return err.Error() + ": " + message
+	return strings.TrimSpace(message)
 }
-
-var pathPattern = regexp.MustCompile(`(?:[A-Za-z]:)?[/\\][^[:space:]]+`)
 
 func auditSourceBuild(ctx context.Context, options RunOptions) (string, error) {
 	workspace := commandLine(ctx, "git", "-C", filepath.Dir(options.SourceManifest), "rev-parse", "--show-toplevel")

@@ -60,8 +60,9 @@ cargo run --locked -p xtask -- bench run \
 ```
 
 For a comparative run, provide both a RAR reference executable and a PAR2
-reference executable. Their labels are supplied as benchmark metadata; they
-are not hard-coded into reports.
+reference executable. The raw evidence records their supplied label, version,
+and SHA-256; relative charts use the canonical UnRAR and par2cmdline-turbo
+reference roles.
 
 ```sh
 cargo run --locked -p xtask -- bench run \
@@ -92,6 +93,35 @@ cargo run --locked -p xtask -- bench run \
   --source-manifest tools/rarpar/Cargo.toml \
   --source-target aarch64-apple-darwin
 ```
+
+## Multi-host Full Suite
+
+For repeatable cross-machine evidence, copy the committed template to the
+ignored operator inventory and replace every example hostname, SSH identity,
+binary path, and host directory with real values:
+
+```sh
+cp bench/rarpar-bench/config/hosts.example.json \
+  bench/rarpar-bench/config/hosts.local.json
+$EDITOR bench/rarpar-bench/config/hosts.local.json
+cargo run --locked -p xtask -- bench all-hosts
+```
+
+`all-hosts` runs configured hosts in parallel by default (`--jobs N` limits the
+concurrency). On each host it runs `go test ./...`, verifies the configured
+corpus, creates the full plan, measures the configured direct candidate and
+reference executables, and writes the report and SVG charts. It never builds or
+replaces a corpus or candidate binary: provision those inputs first. The host
+output directory must not already exist, so prior evidence and failed staging
+directories are never overwritten. Every remote path is required to be an
+absolute POSIX path; `path` supplies the complete remote `PATH` when a
+non-interactive SSH session needs explicit Go or Cargo locations.
+
+The local inventory is intentionally ignored because it can identify private
+hosts and SSH key locations. The key remains outside the repository; the
+inventory only names its local path. SSH uses batch mode, supports optional
+per-host ports and additional OpenSSH options, and leaves host-key verification
+under the operator's normal SSH policy.
 
 ## Evidence And Charts
 

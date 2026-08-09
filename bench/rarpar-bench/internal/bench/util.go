@@ -106,26 +106,34 @@ func copyTree(source, destination string) error {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("benchmark source contains non-regular file %s", path)
 		}
-		input, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer input.Close()
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
-		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(output, input)
-		closeErr := output.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
+		return copyStagedFile(path, target, info.Mode().Perm())
 	})
+}
+
+func copyStagedFile(source, destination string, mode os.FileMode) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		_ = input.Close()
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		_ = input.Close()
+		return err
+	}
+	if err := output.Close(); err != nil {
+		_ = input.Close()
+		return err
+	}
+	return input.Close()
 }
 
 func sortedFiles(root string) ([]string, error) {

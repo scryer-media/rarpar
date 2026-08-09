@@ -26,9 +26,16 @@ func RenderChartSet(reports []Report, out string) ([]string, error) {
 	if len(reports) == 0 {
 		return nil, fmt.Errorf("at least one benchmark report is required")
 	}
+	collectorMode := reports[0].CollectorMode
+	if collectorMode != wallClockCollector && collectorMode != perfStatCollector {
+		return nil, fmt.Errorf("unsupported benchmark collector mode %q", collectorMode)
+	}
 	for _, report := range reports {
 		if report.SchemaVersion != ReportSchemaVersion || report.InputSHA256 == "" {
 			return nil, fmt.Errorf("invalid benchmark report")
+		}
+		if report.CollectorMode != collectorMode {
+			return nil, fmt.Errorf("benchmark reports must use the same collector mode")
 		}
 		if report.CorpusDigest != reports[0].CorpusDigest || report.Machine != reports[0].Machine {
 			return nil, fmt.Errorf("benchmark reports must use the same corpus and machine")
@@ -70,6 +77,7 @@ func RenderChartSet(reports []Report, out string) ([]string, error) {
 	}
 	if err := writeJSON(filepath.Join(out, "chart-summary.json"), map[string]any{
 		"schema_version": ReportSchemaVersion,
+		"collector_mode": reportValues(reports, func(report Report) string { return report.CollectorMode }),
 		"report_sha256":  reportValues(reports, func(report Report) string { return report.InputSHA256 }),
 		"corpus_digest":  reports[0].CorpusDigest,
 		"plan_id":        reportValues(reports, func(report Report) string { return report.Plan.ID }),
@@ -87,6 +95,9 @@ func validateChartGroups(family string, groups []chartGroup) error {
 	baseReference := familyReferenceDigest(family, base.report)
 	baseLabel := base.comparisons[0].ReferenceLabel
 	for _, group := range groups[1:] {
+		if group.report.CollectorMode != base.report.CollectorMode {
+			return fmt.Errorf("%s reports do not use the same collector mode", family)
+		}
 		if group.report.Plan.Seed != base.report.Plan.Seed ||
 			group.report.Plan.Warmups != base.report.Plan.Warmups ||
 			group.report.Plan.Repeats != base.report.Plan.Repeats ||
@@ -168,7 +179,7 @@ func renderSVGGroups(family string, groups []chartGroup) ([]byte, error) {
 	for index, group := range groups {
 		reports[index] = group.report
 	}
-	fmt.Fprintf(&document, "  <metadata>schema=%d; report_sha256=%s; corpus_digest=%s; plan_id=%s; candidate_sha256=%s; reference_sha256=%s; lane=%s; par2_placement=%s</metadata>\n", first.report.SchemaVersion, strings.Join(reportValues(reports, func(report Report) string { return report.InputSHA256 }), ","), first.report.CorpusDigest, strings.Join(reportValues(reports, func(report Report) string { return report.Plan.ID }), ","), strings.Join(reportValues(reports, func(report Report) string { return report.Candidate.SHA256 }), ","), familyReferenceDigest(family, first.report), strings.Join(reportValues(reports, func(report Report) string { return report.Plan.Lane }), ","), first.report.Plan.Par2Placement)
+	fmt.Fprintf(&document, "  <metadata>schema=%d; report_sha256=%s; corpus_digest=%s; plan_id=%s; candidate_sha256=%s; reference_sha256=%s; lane=%s; collector=%s; par2_placement=%s</metadata>\n", first.report.SchemaVersion, strings.Join(reportValues(reports, func(report Report) string { return report.InputSHA256 }), ","), first.report.CorpusDigest, strings.Join(reportValues(reports, func(report Report) string { return report.Plan.ID }), ","), strings.Join(reportValues(reports, func(report Report) string { return report.Candidate.SHA256 }), ","), familyReferenceDigest(family, first.report), strings.Join(reportValues(reports, func(report Report) string { return report.Plan.Lane }), ","), first.report.CollectorMode, first.report.Plan.Par2Placement)
 	fmt.Fprintf(&document, "  <rect class=\"bg\" width=\"%d\" height=\"%d\"/>\n", chartWidth, height)
 	fmt.Fprintf(&document, "  <text class=\"title\" x=\"48\" y=\"48\">%s</text>\n", escapeXML(title))
 	fmt.Fprintf(&document, "  <text class=\"subtitle\" x=\"48\" y=\"75\">Lower elapsed time is better. Bars show the faster side's multiplier on a symmetric log scale.</text>\n")

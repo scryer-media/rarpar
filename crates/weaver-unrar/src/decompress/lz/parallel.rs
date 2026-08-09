@@ -8,19 +8,20 @@
 //! distance cache updates, and filter application remain sequential because
 //! they depend on running output state.
 
-use rayon::prelude::*;
+use rayon::ThreadPool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::bitstream::{BitRead, BitReader};
+use super::block_reader::BlockReader;
 use super::filter::{FilterType, PendingFilter};
 use super::huffman::{self, HuffmanTable};
+use super::phase_diagnostics::{self, Phase, SymbolKind, WorkerCounters};
 use super::{LzDecoder, NUM_LENGTH_SLOTS};
 use crate::error::{RarError, RarResult};
 
-#[derive(Clone)]
-struct PreparsedBlocks {
+struct ScannedBlocks {
     blocks: Vec<BlockInfo>,
-    table_sets: Vec<TableSet>,
     consumed_bytes: usize,
     saw_last_block: bool,
 }
@@ -28,12 +29,6 @@ struct PreparsedBlocks {
 /// Minimum number of blocks to justify parallel dispatch.
 /// Below this, rayon overhead exceeds the benefit.
 const MIN_PARALLEL_BLOCKS: usize = 4;
-
-/// Maximum number of blocks per parallel dispatch. Typical RAR5 blocks carry
-/// tens of kilobytes of compressed data, so this covers a multi-megabyte span
-/// per fork/join — few enough barriers that worker wake/park churn stays
-/// negligible next to decode work.
-const MAX_BATCH_BLOCKS: usize = 64;
 
 /// Per-block decoded item buffer size.
 const DECODED_ITEMS_CAPACITY: usize = 0x4100;
@@ -82,13 +77,12 @@ pub enum DecodedItem {
 /// Metadata for one LZ block, parsed during the sequential header scan.
 #[derive(Clone)]
 struct BlockInfo {
-    /// Bit offset in the input where this block's compressed data starts
-    /// (after header and any table data have been consumed).
-    data_bit_offset: usize,
-    /// Number of compressed bits in this block's data section.
-    data_bits: i64,
-    /// Index into the `table_sets` array.
-    table_set_index: usize,
+    /// Bit offset at the start of the complete block payload.
+    payload_bit_offset: usize,
+    /// Number of bits in the complete payload, including optional tables.
+    payload_bits: usize,
+    /// A table-present block starts a new dependency span.
+    table_present: bool,
     /// Whether this block exceeds the large-block threshold.
     is_large: bool,
 }
@@ -96,10 +90,28 @@ struct BlockInfo {
 /// A set of Huffman tables shared by one or more blocks.
 #[derive(Clone)]
 struct TableSet {
-    nc: Arc<HuffmanTable>,
-    dc: Arc<HuffmanTable>,
-    ldc: Arc<HuffmanTable>,
-    rc: Arc<HuffmanTable>,
+    nc: HuffmanTable,
+    dc: HuffmanTable,
+    ldc: HuffmanTable,
+    rc: HuffmanTable,
+}
+
+struct WorkerState {
+    tables: Option<TableSet>,
+    code_lengths: Vec<u8>,
+    diagnostics: WorkerCounters,
+}
+
+#[derive(Clone, Copy)]
+struct BlockAssignment {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerOptions {
+    extra_dist: bool,
+    diagnostics_enabled: bool,
 }
 
 pub(super) fn parallel_enabled() -> bool {
@@ -131,11 +143,9 @@ pub(super) fn is_truncated_input_error(error: &RarError) -> bool {
     }
 }
 
-fn parse_next_block(
+fn scan_next_block(
     reader: &mut BitReader<'_>,
-    code_lengths: &mut [u8],
-    table_sets: &mut Vec<TableSet>,
-    extra_dist: bool,
+    has_inherited_tables: bool,
 ) -> RarResult<Option<(BlockInfo, bool)>> {
     if !reader.has_bits() {
         return Ok(None);
@@ -178,70 +188,57 @@ fn parse_next_block(
         });
     }
 
-    let mut block_bits_remaining = if block_bytes == 0 {
+    let block_bits_remaining = if block_bytes == 0 {
         0
     } else {
         extra_bits + (block_bytes - 1) * 8
     };
 
-    if !table_present && table_sets.is_empty() {
+    if !table_present && !has_inherited_tables {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 first block is missing Huffman tables".into(),
         });
     }
 
-    let table_set_index = if table_present {
-        let pos_before = reader.position();
-        let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths, extra_dist)?;
-        let bits_used = (reader.position() - pos_before) as i64;
-        block_bits_remaining -= bits_used;
-        table_sets.push(TableSet {
-            nc: Arc::new(nc),
-            dc: Arc::new(dc),
-            ldc: Arc::new(ldc),
-            rc: Arc::new(rc),
+    let payload_bit_offset = reader.position();
+    let payload_bits =
+        usize::try_from(block_bits_remaining).map_err(|_| RarError::CorruptArchive {
+            detail: "RAR5 block payload is too large".into(),
+        })?;
+    if payload_bits > u32::MAX as usize {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 block payload is too large".into(),
         });
-        table_sets.len() - 1
-    } else {
-        table_sets.len() - 1
-    };
-
-    let data_bit_offset = reader.position();
+    }
     let is_large = block_bits_remaining > LARGE_BLOCK_BITS;
 
-    if block_bits_remaining > 0 {
-        reader.skip_bits(block_bits_remaining as u32)?;
+    if payload_bits > 0 {
+        reader.skip_bits(payload_bits as u32)?;
     }
 
     Ok(Some((
         BlockInfo {
-            data_bit_offset,
-            data_bits: block_bits_remaining,
-            table_set_index,
+            payload_bit_offset,
+            payload_bits,
+            table_present,
             is_large,
         },
         is_last,
     )))
 }
 
-fn preparse_complete_blocks(
+fn scan_block_headers(
     input: &[u8],
     header_limit: usize,
-    code_lengths: &mut [u8],
-    existing_tables: Option<&TableSet>,
-    extra_dist: bool,
-) -> RarResult<PreparsedBlocks> {
+    has_inherited_tables: bool,
+    allow_incomplete_tail: bool,
+) -> RarResult<ScannedBlocks> {
     let mut reader = BitReader::new(input);
     let estimated_blocks = (input.len() / 0x4000).clamp(8, 512);
-    let mut blocks = Vec::with_capacity(estimated_blocks);
-    let mut table_sets = Vec::with_capacity(estimated_blocks.min(64));
-    let mut working_code_lengths = code_lengths.to_vec();
+    let mut blocks: Vec<BlockInfo> = Vec::with_capacity(estimated_blocks);
     let mut consumed_bytes = 0usize;
     let mut saw_last_block = false;
-
-    if let Some(ts) = existing_tables {
-        table_sets.push(ts.clone());
-    }
+    let mut have_tables = has_inherited_tables;
 
     loop {
         // Stop accepting blocks whose header would start at or beyond the
@@ -250,16 +247,9 @@ fn preparse_complete_blocks(
             break;
         }
 
-        let checkpoint_code_lengths = working_code_lengths.clone();
-        let checkpoint_table_set_len = table_sets.len();
-
-        match parse_next_block(
-            &mut reader,
-            &mut working_code_lengths,
-            &mut table_sets,
-            extra_dist,
-        ) {
+        match scan_next_block(&mut reader, have_tables) {
             Ok(Some((block, is_last))) => {
+                have_tables |= block.table_present;
                 blocks.push(block);
                 consumed_bytes = reader.position().div_ceil(8);
                 if is_last {
@@ -268,162 +258,133 @@ fn preparse_complete_blocks(
                 }
             }
             Ok(None) => {
-                working_code_lengths = checkpoint_code_lengths;
-                table_sets.truncate(checkpoint_table_set_len);
                 break;
             }
-            Err(error) if is_truncated_input_error(&error) => {
-                working_code_lengths = checkpoint_code_lengths;
-                table_sets.truncate(checkpoint_table_set_len);
+            Err(error) if allow_incomplete_tail && is_truncated_input_error(&error) => {
                 break;
             }
             Err(error) => return Err(error),
         }
     }
 
-    if !blocks.is_empty() {
-        code_lengths.copy_from_slice(&working_code_lengths);
-    }
-
-    Ok(PreparsedBlocks {
+    Ok(ScannedBlocks {
         blocks,
-        table_sets,
         consumed_bytes,
         saw_last_block,
     })
 }
 
-// ─── Phase 1: Sequential block header pre-parsing ────────────────────────────
-
-/// Pre-parse all RAR5 LZ block headers from the input.
-///
-/// Reads headers sequentially, resolving Huffman table dependencies
-/// (blocks with `table_present=false` inherit the previous block's tables).
-/// Returns the block metadata and the table sets, plus the final code_lengths
-/// state (for solid archive continuity).
-fn preparse_blocks(
+fn scan_complete_blocks(
     input: &[u8],
-    code_lengths: &mut [u8],
-    existing_tables: Option<&TableSet>,
-    extra_dist: bool,
-) -> RarResult<(Vec<BlockInfo>, Vec<TableSet>)> {
-    let mut reader = BitReader::new(input);
-    let mut blocks = Vec::new();
-    let mut table_sets: Vec<TableSet> = Vec::new();
+    header_limit: usize,
+    has_inherited_tables: bool,
+) -> RarResult<ScannedBlocks> {
+    scan_block_headers(input, header_limit, has_inherited_tables, true)
+}
 
-    // If we have existing tables from a prior call (solid archive),
-    // seed the table_sets so blocks can reference them.
-    if let Some(ts) = existing_tables {
-        table_sets.push(TableSet {
-            nc: ts.nc.clone(),
-            dc: ts.dc.clone(),
-            ldc: ts.ldc.clone(),
-            rc: ts.rc.clone(),
-        });
-    }
+// ─── Phase 1: Sequential generic-header scan ─────────────────────────────────
 
-    loop {
-        if !reader.has_bits() {
-            break;
-        }
-
-        // Block header is byte-aligned.
-        reader.align_byte();
-
-        if reader.bits_remaining() < 16 {
-            break; // Not enough for a minimal header.
-        }
-
-        let flags = reader.read_bits(8)? as u8;
-        let checksum = reader.read_bits(8)? as u8;
-
-        let extra_bits = (flags & 0x07) as i64 + 1;
-        let num_size_bytes = ((flags >> 3) & 0x03) + 1;
-        if num_size_bytes > 3 {
-            return Err(RarError::CorruptArchive {
-                detail: "RAR5 block header: invalid size byte count".into(),
-            });
-        }
-
-        let is_last = (flags & 0x40) != 0;
-        let table_present = (flags & 0x80) != 0;
-
-        let mut block_bytes: i64 = 0;
-        let mut xor_sum = 0x5Au8 ^ flags;
-        for i in 0..num_size_bytes {
-            let b = reader.read_bits(8)? as u8;
-            xor_sum ^= b;
-            block_bytes |= (b as i64) << (i * 8);
-        }
-
-        if xor_sum != checksum {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
-                    checksum, xor_sum
-                ),
-            });
-        }
-
-        let mut block_bits_remaining = if block_bytes == 0 {
-            0
-        } else {
-            extra_bits + (block_bytes - 1) * 8
-        };
-
-        if !table_present && table_sets.is_empty() {
-            return Err(RarError::CorruptArchive {
-                detail: "RAR5 first block is missing Huffman tables".into(),
-            });
-        }
-
-        // Read tables if present — this advances the reader and consumes bits.
-        let table_set_index = if table_present {
-            let pos_before = reader.position();
-            let (nc, dc, ldc, rc) =
-                huffman::read_tables_bitreader(&mut reader, code_lengths, extra_dist)?;
-            let bits_used = (reader.position() - pos_before) as i64;
-            block_bits_remaining -= bits_used;
-            table_sets.push(TableSet {
-                nc: Arc::new(nc),
-                dc: Arc::new(dc),
-                ldc: Arc::new(ldc),
-                rc: Arc::new(rc),
-            });
-            table_sets.len() - 1
-        } else {
-            table_sets.len() - 1
-        };
-
-        let data_bit_offset = reader.position();
-        let is_large = block_bits_remaining > LARGE_BLOCK_BITS;
-
-        blocks.push(BlockInfo {
-            data_bit_offset,
-            data_bits: block_bits_remaining,
-            table_set_index,
-            is_large,
-        });
-
-        // Skip past this block's data to reach the next header.
-        if block_bits_remaining > 0 {
-            reader.skip_bits(block_bits_remaining as u32)?;
-        }
-
-        if is_last {
-            break;
-        }
-    }
-
-    Ok((blocks, table_sets))
+/// Scan complete generic block headers without parsing Huffman tables.
+fn scan_blocks(input: &[u8], has_inherited_tables: bool) -> RarResult<ScannedBlocks> {
+    scan_block_headers(input, input.len(), has_inherited_tables, false)
 }
 
 // ─── Phase 2: Per-block Huffman decode (pure, parallelizable) ────────────────
 
+trait DecodeBits {
+    fn position(&self) -> usize;
+    fn has_bits(&self) -> bool;
+    fn read_bits(&mut self, count: u8) -> RarResult<u32>;
+    fn read_bits64(&mut self, count: u8) -> RarResult<u64>;
+    fn decode_symbol<const DIAGNOSTICS: bool>(
+        &mut self,
+        table: &HuffmanTable,
+    ) -> RarResult<(u16, bool)>;
+    fn validate_end(&self, end_bit: usize) -> RarResult<()>;
+}
+
+impl DecodeBits for BitReader<'_> {
+    #[inline(always)]
+    fn position(&self) -> usize {
+        BitReader::position(self)
+    }
+
+    #[inline(always)]
+    fn has_bits(&self) -> bool {
+        BitReader::has_bits(self)
+    }
+
+    #[inline(always)]
+    fn read_bits(&mut self, count: u8) -> RarResult<u32> {
+        BitReader::read_bits(self, count)
+    }
+
+    #[inline(always)]
+    fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
+        BitRead::read_bits64(self, count)
+    }
+
+    #[inline(always)]
+    fn decode_symbol<const DIAGNOSTICS: bool>(
+        &mut self,
+        table: &HuffmanTable,
+    ) -> RarResult<(u16, bool)> {
+        let quick = if DIAGNOSTICS {
+            table.is_quick_code(self.getbits()?)
+        } else {
+            false
+        };
+        Ok((table.decode_bitreader(self)?, quick))
+    }
+
+    fn validate_end(&self, end_bit: usize) -> RarResult<()> {
+        if self.position() > end_bit {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 block decode exceeded its logical boundary".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl DecodeBits for BlockReader<'_> {
+    #[inline(always)]
+    fn position(&self) -> usize {
+        BlockReader::position(self)
+    }
+
+    #[inline(always)]
+    fn has_bits(&self) -> bool {
+        self.position() < self.end()
+    }
+
+    #[inline(always)]
+    fn read_bits(&mut self, count: u8) -> RarResult<u32> {
+        Ok(BlockReader::read_bits(self, count) as u32)
+    }
+
+    #[inline(always)]
+    fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
+        Ok(BlockReader::read_bits(self, count))
+    }
+
+    #[inline(always)]
+    fn decode_symbol<const DIAGNOSTICS: bool>(
+        &mut self,
+        table: &HuffmanTable,
+    ) -> RarResult<(u16, bool)> {
+        Ok(table.decode_block_reader(self))
+    }
+
+    fn validate_end(&self, _end_bit: usize) -> RarResult<()> {
+        BlockReader::validate_end(self).map_err(|error| RarError::CorruptArchive {
+            detail: format!("RAR5 block reader: {error}"),
+        })
+    }
+}
+
 /// Decode Huffman symbols from one block into a DecodedItem buffer.
-///
-/// This is a pure function — it only reads from `input` and `tables`, and
-/// writes to `items`. No mutable shared state.
+#[cfg(test)]
 fn decode_block_symbols(
     input: &[u8],
     block: &BlockInfo,
@@ -431,32 +392,110 @@ fn decode_block_symbols(
     extra_dist: bool,
     items: &mut Vec<DecodedItem>,
 ) -> RarResult<()> {
-    // Create a BitReader positioned at this block's data.
-    let byte_offset = block.data_bit_offset / 8;
-    let bit_remainder = block.data_bit_offset % 8;
-    let slice = &input[byte_offset..];
-    let mut reader = BitReader::new(slice);
-    if bit_remainder > 0 {
-        reader.skip_bits(bit_remainder as u32)?;
+    let mut counters = WorkerCounters::new();
+    decode_block_symbols_counted(
+        input,
+        block,
+        tables,
+        extra_dist,
+        false,
+        items,
+        &mut counters,
+    )
+}
+
+fn decode_block_symbols_counted(
+    input: &[u8],
+    block: &BlockInfo,
+    tables: &TableSet,
+    extra_dist: bool,
+    diagnostics: bool,
+    items: &mut Vec<DecodedItem>,
+    counters: &mut WorkerCounters,
+) -> RarResult<()> {
+    let byte_offset = block.payload_bit_offset / 8;
+    let bit_remainder = block.payload_bit_offset % 8;
+    let slice = input
+        .get(byte_offset..)
+        .ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR5 block data starts beyond the staged input".into(),
+        })?;
+    let block_end_bits = bit_remainder + block.payload_bits;
+    if let Ok(mut reader) = BlockReader::new(slice, bit_remainder, block_end_bits) {
+        #[cfg(test)]
+        note_fast_reader_selection();
+        if diagnostics {
+            decode_block_symbols_inner::<_, true>(
+                &mut reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        } else {
+            decode_block_symbols_inner::<_, false>(
+                &mut reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        }
+    } else {
+        let mut reader = BitReader::new(slice);
+        if bit_remainder > 0 {
+            reader.skip_bits(bit_remainder as u32)?;
+        }
+        if diagnostics {
+            decode_block_symbols_inner::<_, true>(
+                &mut reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        } else {
+            decode_block_symbols_inner::<_, false>(
+                &mut reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        }
     }
+}
 
-    let block_end_bits = bit_remainder + block.data_bits as usize;
-
-    // Pending literal batch kept in locals: touching items.last_mut() per
-    // literal costs a load + discriminant check per byte on the hottest path.
-    // `lit_count` is the number of valid bytes (1-based); the stored item
-    // count stays 0-indexed.
+fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
+    reader: &mut R,
+    block_end_bits: usize,
+    tables: &TableSet,
+    extra_dist: bool,
+    items: &mut Vec<DecodedItem>,
+    counters: &mut WorkerCounters,
+) -> RarResult<()> {
     let mut lit_bytes = [0u8; 8];
     let mut lit_count: usize = 0;
 
-    while reader.position() < block_end_bits {
-        if !reader.has_bits() {
-            break;
+    while reader.position() < block_end_bits && reader.has_bits() {
+        let (sym, quick) = reader.decode_symbol::<DIAGNOSTICS>(&tables.nc)?;
+        let sym = u32::from(sym);
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
         }
 
-        let sym = tables.nc.decode_bitreader(&mut reader)? as u32;
-
         if sym < 256 {
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Literal);
+            }
             lit_bytes[lit_count] = sym as u8;
             lit_count += 1;
             if lit_count == 8 {
@@ -478,10 +517,18 @@ fn decode_block_symbols(
         }
 
         if sym >= 262 {
-            // Inline match — fully resolve length and distance from bitstream.
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Match);
+            }
             let length_idx = (sym - 262) as usize;
-            let length = slot_to_length(&mut reader, length_idx)?;
-            let distance = decode_distance(&mut reader, &tables.dc, &tables.ldc, extra_dist)?;
+            let length = slot_to_length(reader, length_idx)?;
+            let distance = decode_distance::<_, DIAGNOSTICS>(
+                reader,
+                &tables.dc,
+                &tables.ldc,
+                extra_dist,
+                counters,
+            )?;
             let length = adjust_length_for_distance(length, distance);
             items.push(DecodedItem::Match {
                 length: length as u32,
@@ -491,9 +538,11 @@ fn decode_block_symbols(
         }
 
         if sym == 256 {
-            // Filter — read descriptor, store raw delta.
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Filter);
+            }
             let (filter_type, block_start_delta, block_length, channels) =
-                read_filter_descriptor(&mut reader)?;
+                read_filter_descriptor(reader)?;
             items.push(DecodedItem::Filter {
                 filter_type,
                 block_start_delta,
@@ -503,15 +552,24 @@ fn decode_block_symbols(
             continue;
         }
 
+        if DIAGNOSTICS {
+            counters.record_symbol(SymbolKind::Repeat);
+        }
         if sym == 257 {
             items.push(DecodedItem::RepeatPrev);
             continue;
         }
 
-        // sym 258..=261: cache reference.
         let cache_idx = (sym - 258) as u8;
-        let slot = tables.rc.decode_bitreader(&mut reader)? as usize;
-        let length = slot_to_length(&mut reader, slot)?;
+        let (slot, quick) = reader.decode_symbol::<DIAGNOSTICS>(&tables.rc)?;
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
+        }
+        let length = slot_to_length(reader, slot as usize)?;
         items.push(DecodedItem::CacheRef {
             cache_idx,
             length: length as u32,
@@ -525,12 +583,12 @@ fn decode_block_symbols(
         });
     }
 
-    Ok(())
+    reader.validate_end(block_end_bits)
 }
 
 /// Read a filter descriptor from the bitstream (sym 256 handler).
 /// Returns (filter_type_code, block_start_delta, block_length, channels).
-fn read_filter_descriptor(reader: &mut BitReader) -> RarResult<(u8, u64, u32, u8)> {
+fn read_filter_descriptor<R: DecodeBits>(reader: &mut R) -> RarResult<(u8, u64, u32, u8)> {
     let block_start_delta = read_filter_data(reader)? as u64;
     let mut block_length = read_filter_data(reader)?;
     let filter_code = reader.read_bits(3)? as u8;
@@ -548,7 +606,7 @@ fn read_filter_descriptor(reader: &mut BitReader) -> RarResult<(u8, u64, u32, u8
     Ok((filter_code, block_start_delta, block_length, channels))
 }
 
-fn read_filter_data(reader: &mut BitReader) -> RarResult<u32> {
+fn read_filter_data<R: DecodeBits>(reader: &mut R) -> RarResult<u32> {
     let byte_count = reader.read_bits(2)? as usize + 1;
     let mut data = 0u32;
     for index in 0..byte_count {
@@ -559,7 +617,7 @@ fn read_filter_data(reader: &mut BitReader) -> RarResult<u32> {
 
 // ─── Standalone decode helpers (no &self, usable from parallel context) ──────
 
-fn slot_to_length(reader: &mut BitReader, slot: usize) -> RarResult<usize> {
+fn slot_to_length<R: DecodeBits>(reader: &mut R, slot: usize) -> RarResult<usize> {
     if slot >= NUM_LENGTH_SLOTS {
         return Err(RarError::CorruptArchive {
             detail: format!("length slot out of range: {slot}"),
@@ -579,13 +637,22 @@ fn slot_to_length(reader: &mut BitReader, slot: usize) -> RarResult<usize> {
     Ok(base + extra_val)
 }
 
-fn decode_distance(
-    reader: &mut BitReader,
+fn decode_distance<R: DecodeBits, const DIAGNOSTICS: bool>(
+    reader: &mut R,
     dc: &HuffmanTable,
     ldc: &HuffmanTable,
     extra_dist: bool,
+    counters: &mut WorkerCounters,
 ) -> RarResult<usize> {
-    let dist_code = dc.decode_bitreader(reader)? as usize;
+    let (dist_code, quick) = reader.decode_symbol::<DIAGNOSTICS>(dc)?;
+    if DIAGNOSTICS {
+        if quick {
+            counters.record_quick_huffman_hit();
+        } else {
+            counters.record_slow_huffman_hit();
+        }
+    }
+    let dist_code = dist_code as usize;
     let max_dist_code = if extra_dist { 79 } else { 63 };
     if dist_code > max_dist_code {
         return Err(RarError::CorruptArchive {
@@ -604,7 +671,15 @@ fn decode_distance(
         } else {
             0
         };
-        let low = ldc.decode_bitreader(reader)? as u64;
+        let (low, quick) = reader.decode_symbol::<DIAGNOSTICS>(ldc)?;
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
+        }
+        let low = u64::from(low);
         super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, high, low)?
     } else {
         let extra = reader.read_bits64(num_bits as u8)?;
@@ -626,6 +701,328 @@ fn adjust_length_for_distance(length: usize, distance: usize) -> usize {
         len += 1;
     }
     len
+}
+
+fn prepare_block(
+    input: &[u8],
+    source: &BlockInfo,
+    tables: &mut Option<TableSet>,
+    code_lengths: &mut [u8],
+    extra_dist: bool,
+) -> RarResult<BlockInfo> {
+    let byte_offset = source.payload_bit_offset / 8;
+    let bit_remainder = source.payload_bit_offset % 8;
+    let slice = input
+        .get(byte_offset..)
+        .ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR5 block payload starts beyond the staged input".into(),
+        })?;
+    let mut reader = BitReader::new(slice);
+    if bit_remainder > 0 {
+        reader.skip_bits(bit_remainder as u32)?;
+    }
+
+    if source.table_present {
+        let (nc, dc, ldc, rc) =
+            huffman::read_tables_bitreader(&mut reader, code_lengths, extra_dist)?;
+        *tables = Some(TableSet { nc, dc, ldc, rc });
+    }
+
+    if tables.is_none() {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 block has no Huffman tables".into(),
+        });
+    }
+    let table_bits = reader.position().saturating_sub(bit_remainder);
+    if table_bits > source.payload_bits {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 Huffman tables exceed block payload".into(),
+        });
+    }
+
+    Ok(BlockInfo {
+        payload_bit_offset: byte_offset * 8 + reader.position(),
+        payload_bits: source.payload_bits - table_bits,
+        table_present: false,
+        is_large: source.is_large,
+    })
+}
+
+fn next_span_end(blocks: &[BlockInfo], start: usize, limit: usize) -> usize {
+    let mut end = start.saturating_add(1).min(limit);
+    while end < limit && !blocks[end].table_present {
+        end += 1;
+    }
+    end
+}
+
+fn next_controller_batch_end(
+    blocks: &[BlockInfo],
+    start: usize,
+    limit: usize,
+    worker_count: usize,
+) -> usize {
+    if worker_count <= 1 {
+        return start;
+    }
+
+    let mut cursor = start;
+    let mut workers = 0usize;
+    let block_capacity = worker_count.saturating_mul(2);
+
+    if !blocks[start].table_present {
+        while cursor < limit
+            && cursor - start < block_capacity
+            && !blocks[cursor].table_present
+            && !blocks[cursor].is_large
+        {
+            cursor += 1;
+        }
+        return cursor;
+    }
+
+    while cursor < limit && workers < worker_count && cursor - start < block_capacity {
+        let first_end = next_span_end(blocks, cursor, limit);
+        let first_len = first_end - cursor;
+        if first_len > 2 || blocks[cursor..first_end].iter().any(|block| block.is_large) {
+            break;
+        }
+
+        let mut assignment_end = first_end;
+        if first_len == 1 && assignment_end < limit {
+            let second_end = next_span_end(blocks, assignment_end, limit);
+            if second_end - assignment_end == 1 && !blocks[assignment_end].is_large {
+                assignment_end = second_end;
+            }
+        }
+        if assignment_end - start > block_capacity {
+            break;
+        }
+        cursor = assignment_end;
+        workers += 1;
+    }
+    cursor
+}
+
+fn build_assignments(
+    blocks: &[BlockInfo],
+    start: usize,
+    end: usize,
+    worker_count: usize,
+) -> RarResult<Vec<BlockAssignment>> {
+    if worker_count <= 1 || end - start > worker_count.saturating_mul(2) {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 parallel controller received an oversized batch".into(),
+        });
+    }
+
+    let mut assignments = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        if !blocks[cursor].table_present {
+            let assignment_end = cursor.saturating_add(2).min(end);
+            if blocks[cursor..assignment_end]
+                .iter()
+                .any(|block| block.table_present || block.is_large)
+            {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 parallel controller received a mixed inherited-table batch"
+                        .into(),
+                });
+            }
+            assignments.push(BlockAssignment {
+                start: cursor,
+                end: assignment_end,
+            });
+            cursor = assignment_end;
+            continue;
+        }
+
+        let span_end = next_span_end(blocks, cursor, end);
+        if span_end - cursor > 2 {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 parallel controller received an unbounded table span".into(),
+            });
+        }
+        let mut assignment_end = span_end;
+        if span_end - cursor == 1 && assignment_end < end {
+            let next_end = next_span_end(blocks, assignment_end, end);
+            if next_end - assignment_end == 1 {
+                assignment_end = next_end;
+            }
+        }
+        assignments.push(BlockAssignment {
+            start: cursor,
+            end: assignment_end,
+        });
+        cursor = assignment_end;
+    }
+    if assignments.len() > worker_count {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 parallel controller exceeded its worker pool".into(),
+        });
+    }
+    Ok(assignments)
+}
+
+fn decode_worker_assignment(
+    input: &[u8],
+    blocks: &[BlockInfo],
+    assignment: BlockAssignment,
+    inherited_tables: Option<TableSet>,
+    initial_code_lengths: &[u8],
+    options: WorkerOptions,
+    items: &mut [Vec<DecodedItem>],
+) -> RarResult<WorkerState> {
+    let mut tables = inherited_tables;
+    let mut code_lengths = initial_code_lengths.to_vec();
+    let mut diagnostics = WorkerCounters::new();
+    if options.diagnostics_enabled {
+        diagnostics.record_assignment();
+    }
+
+    for (source, items) in blocks[assignment.start..assignment.end]
+        .iter()
+        .zip(items.iter_mut())
+    {
+        let table_started = options.diagnostics_enabled.then(Instant::now);
+        let prepared = prepare_block(
+            input,
+            source,
+            &mut tables,
+            &mut code_lengths,
+            options.extra_dist,
+        )?;
+        if let Some(started) = table_started {
+            diagnostics
+                .add_table_prepare_nanos(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            diagnostics.record_block(source.table_present);
+        }
+        items.clear();
+        let previous_capacity = items.capacity();
+        if items.capacity() < DECODED_ITEMS_CAPACITY {
+            items.reserve(DECODED_ITEMS_CAPACITY);
+        }
+        if options.diagnostics_enabled {
+            diagnostics.record_decoded_buffer_growth(previous_capacity, items.capacity());
+        }
+        let decode_started = options.diagnostics_enabled.then(Instant::now);
+        decode_block_symbols_counted(
+            input,
+            &prepared,
+            tables.as_ref().expect("prepared block has tables"),
+            options.extra_dist,
+            options.diagnostics_enabled,
+            items,
+            &mut diagnostics,
+        )?;
+        if let Some(started) = decode_started {
+            diagnostics
+                .add_symbol_decode_nanos(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+    }
+
+    Ok(WorkerState {
+        tables,
+        code_lengths,
+        diagnostics,
+    })
+}
+
+fn parallel_decode_static(
+    input: &[u8],
+    blocks: &[BlockInfo],
+    range: std::ops::Range<usize>,
+    inherited_tables: Option<&TableSet>,
+    initial_code_lengths: &[u8],
+    extra_dist: bool,
+    items: &mut [Vec<DecodedItem>],
+) -> RarResult<Vec<WorkerState>> {
+    let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
+        detail: "RAR5 parallel controller has no worker pool".into(),
+    })?;
+    let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
+    let assignments = build_assignments(blocks, range.start, range.end, worker_count)?;
+    if items.len() != range.end - range.start {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 parallel controller received mismatched output slots".into(),
+        });
+    }
+    let mut results: Vec<Option<RarResult<WorkerState>>> =
+        (0..assignments.len()).map(|_| None).collect();
+    let mut aggregate = phase_diagnostics::AggregateDiagnostics::new();
+    let diagnostics_enabled = aggregate.is_enabled();
+    let worker_options = WorkerOptions {
+        extra_dist,
+        diagnostics_enabled,
+    };
+    if diagnostics_enabled {
+        aggregate.record_worker_slots(
+            assignments.len(),
+            worker_count.saturating_sub(assignments.len()),
+        );
+    }
+    let pool_started = diagnostics_enabled.then(Instant::now);
+    let mut dispatch_nanos = 0u64;
+
+    pool.install(|| {
+        rayon::scope(|scope| {
+            let dispatch_started = aggregate.is_enabled().then(Instant::now);
+            let mut item_tail = &mut *items;
+            let mut result_tail = results.as_mut_slice();
+            for assignment in assignments.iter().copied() {
+                let count = assignment.end - assignment.start;
+                let (worker_items, remaining_items) = item_tail.split_at_mut(count);
+                let (worker_result, remaining_results) = result_tail.split_at_mut(1);
+                // A table-present block rewrites the complete RAR5 length table;
+                // repeat symbols only refer to entries in that same table read.
+                // Independent assignments can therefore share the initial scratch.
+                let worker_inherited = if blocks[assignment.start].table_present {
+                    None
+                } else {
+                    inherited_tables.cloned()
+                };
+                scope.spawn(move |_| {
+                    worker_result[0] = Some(decode_worker_assignment(
+                        input,
+                        blocks,
+                        assignment,
+                        worker_inherited,
+                        initial_code_lengths,
+                        worker_options,
+                        worker_items,
+                    ));
+                });
+                item_tail = remaining_items;
+                result_tail = remaining_results;
+            }
+            if let Some(started) = dispatch_started {
+                dispatch_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            }
+        });
+    });
+
+    if results.iter().any(Option::is_none) {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 parallel worker did not complete".into(),
+        });
+    }
+    let states: RarResult<Vec<WorkerState>> = results
+        .into_iter()
+        .map(|result| result.expect("parallel worker result checked above"))
+        .collect();
+    if let Some(started) = pool_started {
+        let total_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        aggregate.add_pool_dispatch_nanos(dispatch_nanos);
+        aggregate.add_pool_wait_nanos(total_nanos.saturating_sub(dispatch_nanos));
+        if let Ok(states) = &states {
+            for state in states {
+                aggregate.absorb_worker(state.diagnostics);
+            }
+        }
+        aggregate.emit();
+    }
+    states
 }
 
 // ─── Phase 3: Sequential item application ────────────────────────────────────
@@ -650,7 +1047,7 @@ fn decoded_item_buffers(
 
 /// Dedicated bounded pool for RAR block decode. Keeps decode fan-out off the
 /// shared global pool and bounds wake/park churn.
-fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
+fn rar_decode_pool() -> Option<&'static ThreadPool> {
     use std::sync::OnceLock;
 
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
@@ -659,72 +1056,39 @@ fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
             .map(|n| n.get())
             .unwrap_or(1)
             .min(MAX_PARALLEL_THREADS);
+        if threads <= 1 {
+            return None;
+        }
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|i| format!("weaver-unrar-dec-{i}"))
+            .thread_name(|i| format!("unrar-rs-dec-{i}"))
             .build()
             .ok()
     })
     .as_ref()
 }
 
-/// Decode a batch on whatever rayon context the caller is already in.
-fn decode_batch_direct(
-    input: &[u8],
-    blocks: &[BlockInfo],
-    table_sets: &[TableSet],
-    extra_dist: bool,
-    items: &mut [Vec<DecodedItem>],
-) -> RarResult<()> {
-    debug_assert_eq!(blocks.len(), items.len());
-    blocks
-        .par_iter()
-        .zip(items.par_iter_mut())
-        .try_for_each(|(block, items)| {
-            let tables = &table_sets[block.table_set_index];
-            decode_block_symbols(input, block, tables, extra_dist, items)
-        })
+fn rar_decode_worker_count() -> usize {
+    rar_decode_pool()
+        .map(ThreadPool::current_num_threads)
+        .unwrap_or(0)
+        .min(MAX_PARALLEL_THREADS)
 }
 
-fn parallel_decode_batch_into(
-    input: &[u8],
-    blocks: &[BlockInfo],
-    table_sets: &[TableSet],
-    extra_dist: bool,
-    items: &mut [Vec<DecodedItem>],
-) -> RarResult<()> {
-    match rar_decode_pool() {
-        Some(pool) => {
-            pool.install(|| decode_batch_direct(input, blocks, table_sets, extra_dist, items))
-        }
-        None => decode_batch_direct(input, blocks, table_sets, extra_dist, items),
-    }
+#[cfg(test)]
+thread_local! {
+    static CONTROLLER_DISPATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAST_READER_SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A decoded-item buffer set moving through the decode/apply pipeline.
-enum PipelineMsg {
-    /// A decoded batch, in dispatch order.
-    Decoded {
-        set: Vec<Vec<DecodedItem>>,
-        batch_len: usize,
-        result: RarResult<()>,
-    },
-    /// An unused buffer set returned when the producer shuts down.
-    Leftover { set: Vec<Vec<DecodedItem>> },
+#[cfg(test)]
+fn note_controller_dispatch() {
+    CONTROLLER_DISPATCH_COUNT.set(CONTROLLER_DISPATCH_COUNT.get() + 1);
 }
 
-fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
-    let _ = thread_count;
-    block_count.min(MAX_BATCH_BLOCKS)
-}
-
-fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: usize) -> usize {
-    let max_end = start.saturating_add(batch_size).min(blocks.len());
-    let mut end = start;
-    while end < max_end && !blocks[end].is_large {
-        end += 1;
-    }
-    end
+#[cfg(test)]
+fn note_fast_reader_selection() {
+    FAST_READER_SELECTION_COUNT.set(FAST_READER_SELECTION_COUNT.get() + 1);
 }
 
 // ─── Public entry point ──────────────────────────────────────────────────────
@@ -735,185 +1099,9 @@ impl LzDecoder {
     }
 
     fn recycle_item_buffer_set(&mut self, set: Vec<Vec<DecodedItem>>) {
-        if self.parallel_item_buffer_sets.len() < 2 {
+        if self.parallel_item_buffer_sets.is_empty() {
             self.parallel_item_buffer_sets.push(set);
         }
-    }
-
-    fn decode_and_apply_parallel_batch<W: std::io::Write>(
-        &mut self,
-        input: &[u8],
-        block_batch: &[BlockInfo],
-        table_sets: &[TableSet],
-        unpacked_size: u64,
-        output_size: &mut u64,
-        writer: &mut W,
-    ) -> RarResult<()> {
-        let mut set = self.take_item_buffer_set();
-        let result = {
-            let active_buffers = decoded_item_buffers(&mut set, block_batch.len());
-            parallel_decode_batch_into(
-                input,
-                block_batch,
-                table_sets,
-                self.extra_dist,
-                active_buffers,
-            )
-            .and_then(|()| {
-                self.apply_decoded_items_parallel(
-                    active_buffers,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )
-            })
-        };
-        self.recycle_item_buffer_set(set);
-        result
-    }
-
-    /// Decode and apply a run of consecutive small blocks with the decode and
-    /// apply phases pipelined: a producer task on the decode pool fans each
-    /// batch out via rayon into one of two recycled buffer sets, while this
-    /// (calling) thread applies the previous batch's items to the window.
-    /// Buffer-set ownership moves through channels, so the writer and decoder
-    /// state never leave the calling thread.
-    fn decode_and_apply_small_run<W: std::io::Write>(
-        &mut self,
-        input: &[u8],
-        run: &[BlockInfo],
-        table_sets: &[TableSet],
-        unpacked_size: u64,
-        output_size: &mut u64,
-        writer: &mut W,
-    ) -> RarResult<()> {
-        let batch_size = parallel_batch_size(0, run.len());
-
-        // A single batch has nothing to overlap with.
-        if run.len() <= batch_size {
-            return self.decode_and_apply_parallel_batch(
-                input,
-                run,
-                table_sets,
-                unpacked_size,
-                output_size,
-                writer,
-            );
-        }
-
-        let Some(pool) = rar_decode_pool() else {
-            for batch in run.chunks(batch_size) {
-                self.decode_and_apply_parallel_batch(
-                    input,
-                    batch,
-                    table_sets,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )?;
-                if *output_size >= unpacked_size {
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        };
-
-        let extra_dist = self.extra_dist;
-        let batches: Vec<&[BlockInfo]> = run.chunks(batch_size).collect();
-        let batch_count = batches.len();
-
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<PipelineMsg>();
-        let (free_tx, free_rx) = std::sync::mpsc::channel::<Vec<Vec<DecodedItem>>>();
-        // Prime the pipeline with two buffer sets: one decoding, one applying.
-        for _ in 0..2 {
-            let set = self.take_item_buffer_set();
-            free_tx.send(set).expect("free receiver alive");
-        }
-
-        let mut run_result: RarResult<()> = Ok(());
-        let batches_ref = &batches;
-
-        pool.in_place_scope(|scope| {
-            scope.spawn(move |_| {
-                // Producer: decode batches in dispatch order, blocking on a
-                // free buffer set so at most two batches are in flight.
-                for batch in batches_ref {
-                    let Ok(mut set) = free_rx.recv() else { break };
-                    let active = decoded_item_buffers(&mut set, batch.len());
-                    let result = decode_batch_direct(input, batch, table_sets, extra_dist, active);
-                    let failed = result.is_err();
-                    let sent = done_tx.send(PipelineMsg::Decoded {
-                        set,
-                        batch_len: batch.len(),
-                        result,
-                    });
-                    if sent.is_err() || failed {
-                        break;
-                    }
-                }
-                // Hand any unused sets back for recycling.
-                while let Ok(set) = free_rx.try_recv() {
-                    let _ = done_tx.send(PipelineMsg::Leftover { set });
-                }
-            });
-
-            // Consumer: apply each decoded batch in order on this thread.
-            for _ in 0..batch_count {
-                let msg = match done_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                };
-                let (set, batch_len, result) = match msg {
-                    PipelineMsg::Decoded {
-                        set,
-                        batch_len,
-                        result,
-                    } => (set, batch_len, result),
-                    PipelineMsg::Leftover { set } => {
-                        self.recycle_item_buffer_set(set);
-                        break;
-                    }
-                };
-
-                if let Err(error) = result {
-                    self.recycle_item_buffer_set(set);
-                    run_result = Err(error);
-                    break;
-                }
-
-                let applied = self.apply_decoded_items_parallel(
-                    &set[..batch_len],
-                    unpacked_size,
-                    output_size,
-                    writer,
-                );
-                match free_tx.send(set) {
-                    Ok(()) => {}
-                    Err(returned) => self.recycle_item_buffer_set(returned.0),
-                }
-                if let Err(error) = applied {
-                    run_result = Err(error);
-                    break;
-                }
-                if *output_size >= unpacked_size {
-                    break;
-                }
-            }
-
-            // Shut the producer down and recover in-flight buffer sets. The
-            // scope waits for the producer, whose sends fail once these ends
-            // drop, so this cannot deadlock.
-            drop(free_tx);
-            while let Ok(msg) = done_rx.recv() {
-                match msg {
-                    PipelineMsg::Decoded { set, .. } | PipelineMsg::Leftover { set } => {
-                        self.recycle_item_buffer_set(set);
-                    }
-                }
-            }
-        });
-
-        run_result
     }
 
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
@@ -924,117 +1112,201 @@ impl LzDecoder {
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<usize> {
-        let existing_tables = if let (Some(nc), Some(dc), Some(ldc), Some(rc)) = (
+        let has_inherited_tables = self.has_current_tables();
+        let scanned = phase_diagnostics::measure(Phase::HeaderScan, || {
+            scan_complete_blocks(input, header_limit, has_inherited_tables)
+        })?;
+        if scanned.blocks.is_empty() {
+            return Ok(0);
+        }
+
+        let worker_count = if parallel_enabled() {
+            rar_decode_worker_count()
+        } else {
+            0
+        };
+        let mut block_index = 0usize;
+        while block_index < scanned.blocks.len() && *output_size < unpacked_size {
+            let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
+            let span = &scanned.blocks[block_index..span_end];
+            let batch_end = next_controller_batch_end(
+                &scanned.blocks,
+                block_index,
+                scanned.blocks.len(),
+                worker_count,
+            );
+            if worker_count > 1 && batch_end - block_index >= MIN_PARALLEL_BLOCKS {
+                self.decode_and_apply_static_batch(
+                    input,
+                    &scanned.blocks,
+                    block_index..batch_end,
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )?;
+                block_index = batch_end;
+            } else {
+                let inline_end = if worker_count > 1 && span.len() > 2 {
+                    block_index + 1
+                } else {
+                    span_end
+                };
+                phase_diagnostics::measure(Phase::SerialApply, || {
+                    self.decode_span_inline(
+                        input,
+                        &scanned.blocks[block_index..inline_end],
+                        unpacked_size,
+                        output_size,
+                        writer,
+                    )
+                })?;
+                block_index = inline_end;
+            }
+        }
+
+        self.block_bits_remaining = 0;
+        self.is_last_block = scanned.saw_last_block;
+        self.flush_filters_and_write(writer)?;
+        Ok(scanned.consumed_bytes)
+    }
+
+    fn has_current_tables(&self) -> bool {
+        self.nc_table.is_some()
+            && self.dc_table.is_some()
+            && self.ldc_table.is_some()
+            && self.rc_table.is_some()
+    }
+
+    fn current_tables(&self) -> Option<TableSet> {
+        match (
             &self.nc_table,
             &self.dc_table,
             &self.ldc_table,
             &self.rc_table,
         ) {
-            Some(TableSet {
-                nc: Arc::clone(nc),
-                dc: Arc::clone(dc),
-                ldc: Arc::clone(ldc),
-                rc: Arc::clone(rc),
-            })
-        } else {
-            None
-        };
-
-        let preparsed = preparse_complete_blocks(
-            input,
-            header_limit,
-            &mut self.code_lengths,
-            existing_tables.as_ref(),
-            self.extra_dist,
-        )?;
-        if preparsed.blocks.is_empty() {
-            return Ok(0);
+            (Some(nc), Some(dc), Some(ldc), Some(rc)) => Some(TableSet {
+                nc: (**nc).clone(),
+                dc: (**dc).clone(),
+                ldc: (**ldc).clone(),
+                rc: (**rc).clone(),
+            }),
+            _ => None,
         }
-
-        let mut block_index = 0usize;
-        while block_index < preparsed.blocks.len() {
-            if preparsed.blocks[block_index].is_large {
-                let block = &preparsed.blocks[block_index];
-                let tables = &preparsed.table_sets[block.table_set_index];
-                self.decode_preparsed_block_inline(
-                    input,
-                    block,
-                    tables,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )?;
-                block_index += 1;
-            } else {
-                // Whole run of consecutive small blocks up to the next large
-                // block; the pipelined path batches internally.
-                let run_end = next_small_block_batch_end(
-                    &preparsed.blocks,
-                    block_index,
-                    preparsed.blocks.len(),
-                );
-                let run = &preparsed.blocks[block_index..run_end];
-                if run.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
-                    self.decode_and_apply_small_run(
-                        input,
-                        run,
-                        &preparsed.table_sets,
-                        unpacked_size,
-                        output_size,
-                        writer,
-                    )?;
-                } else {
-                    for block in run {
-                        let tables = &preparsed.table_sets[block.table_set_index];
-                        self.decode_preparsed_block_inline(
-                            input,
-                            block,
-                            tables,
-                            unpacked_size,
-                            output_size,
-                            writer,
-                        )?;
-                    }
-                }
-                block_index = run_end;
-            }
-
-            if *output_size >= unpacked_size {
-                break;
-            }
-        }
-
-        if let Some(last_ts) = preparsed.table_sets.last() {
-            self.nc_table = Some(Arc::clone(&last_ts.nc));
-            self.dc_table = Some(Arc::clone(&last_ts.dc));
-            self.ldc_table = Some(Arc::clone(&last_ts.ldc));
-            self.rc_table = Some(Arc::clone(&last_ts.rc));
-        }
-        self.block_bits_remaining = 0;
-        self.is_last_block = preparsed.saw_last_block;
-        self.flush_filters_and_write(writer)?;
-
-        Ok(preparsed.consumed_bytes)
     }
 
-    fn decode_preparsed_block_inline<W: std::io::Write>(
+    fn set_table_state(&mut self, state: WorkerState) {
+        if let Some(tables) = state.tables {
+            self.nc_table = Some(Arc::new(tables.nc));
+            self.dc_table = Some(Arc::new(tables.dc));
+            self.ldc_table = Some(Arc::new(tables.ldc));
+            self.rc_table = Some(Arc::new(tables.rc));
+        }
+        self.code_lengths = state.code_lengths;
+    }
+
+    fn install_inline_tables(&mut self, tables: &TableSet) {
+        self.nc_table = Some(Arc::new(tables.nc.clone()));
+        self.dc_table = Some(Arc::new(tables.dc.clone()));
+        self.ldc_table = Some(Arc::new(tables.ldc.clone()));
+        self.rc_table = Some(Arc::new(tables.rc.clone()));
+    }
+
+    fn decode_span_inline<W: std::io::Write>(
         &mut self,
         input: &[u8],
-        block: &BlockInfo,
-        tables: &TableSet,
+        span: &[BlockInfo],
         unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
-        self.nc_table = Some(Arc::clone(&tables.nc));
-        self.dc_table = Some(Arc::clone(&tables.dc));
-        self.ldc_table = Some(Arc::clone(&tables.ldc));
-        self.rc_table = Some(Arc::clone(&tables.rc));
-        self.block_bits_remaining = block.data_bits;
+        let mut tables = if span.first().is_some_and(|block| block.table_present) {
+            None
+        } else {
+            self.current_tables()
+        };
+        let mut code_lengths = self.code_lengths.clone();
+        for source in span {
+            let prepared = prepare_block(
+                input,
+                source,
+                &mut tables,
+                &mut code_lengths,
+                self.extra_dist,
+            )?;
+            if source.table_present {
+                self.install_inline_tables(tables.as_ref().expect("prepared block has tables"));
+            }
+            self.code_lengths.copy_from_slice(&code_lengths);
+            self.decode_block_inline(input, &prepared, unpacked_size, output_size, writer)?;
+            if *output_size >= unpacked_size {
+                break;
+            }
+        }
+        Ok(())
+    }
 
-        let byte_offset = block.data_bit_offset / 8;
-        let bit_remainder = block.data_bit_offset % 8;
-        let slice = &input[byte_offset..];
+    fn decode_and_apply_static_batch<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        blocks: &[BlockInfo],
+        range: std::ops::Range<usize>,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let worker_count = rar_decode_worker_count();
+        if worker_count <= 1 || range.end - range.start > worker_count.saturating_mul(2) {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 parallel controller received an invalid dispatch".into(),
+            });
+        }
+        let inherited_tables = self.current_tables();
+        let initial_code_lengths = self.code_lengths.clone();
+        let mut set = self.take_item_buffer_set();
+        #[cfg(test)]
+        note_controller_dispatch();
+        let result = (|| {
+            let active = decoded_item_buffers(&mut set, range.end - range.start);
+            let states = phase_diagnostics::measure(Phase::WorkerDecode, || {
+                parallel_decode_static(
+                    input,
+                    blocks,
+                    range,
+                    inherited_tables.as_ref(),
+                    &initial_code_lengths,
+                    self.extra_dist,
+                    active,
+                )
+            })?;
+            phase_diagnostics::measure(Phase::SerialApply, || {
+                self.apply_decoded_items_parallel(active, unpacked_size, output_size, writer)
+            })?;
+            if let Some(state) = states.into_iter().last() {
+                self.set_table_state(state);
+            }
+            Ok(())
+        })();
+        self.recycle_item_buffer_set(set);
+        result
+    }
+
+    fn decode_block_inline<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        block: &BlockInfo,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        self.block_bits_remaining = block.payload_bits as i64;
+
+        let byte_offset = block.payload_bit_offset / 8;
+        let bit_remainder = block.payload_bit_offset % 8;
+        let slice = input
+            .get(byte_offset..)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5 block data starts beyond the staged input".into(),
+            })?;
         let mut reader = BitReader::new(slice);
         if bit_remainder > 0 {
             reader.skip_bits(bit_remainder as u32)?;
@@ -1185,82 +1457,64 @@ impl LzDecoder {
         if !parallel_enabled() {
             return Ok(None);
         }
+        let worker_count = rar_decode_worker_count();
+        if worker_count <= 1 {
+            return Ok(None);
+        }
 
-        // Phase 1: pre-parse block headers.
-        let existing_tables = if let (Some(nc), Some(dc), Some(ldc), Some(rc)) = (
-            &self.nc_table,
-            &self.dc_table,
-            &self.ldc_table,
-            &self.rc_table,
-        ) {
-            Some(TableSet {
-                nc: Arc::clone(nc),
-                dc: Arc::clone(dc),
-                ldc: Arc::clone(ldc),
-                rc: Arc::clone(rc),
-            })
-        } else {
-            None
-        };
-
-        let (blocks, table_sets) = preparse_blocks(
-            input,
-            &mut self.code_lengths,
-            existing_tables.as_ref(),
-            self.extra_dist,
-        )?;
-
-        if blocks.len() < MIN_PARALLEL_BLOCKS {
-            return Ok(None); // Too few blocks — fall back to single-threaded.
+        let has_inherited_tables = self.has_current_tables();
+        let scanned = phase_diagnostics::measure(Phase::HeaderScan, || {
+            scan_blocks(input, has_inherited_tables)
+        })?;
+        if scanned.blocks.len() < MIN_PARALLEL_BLOCKS {
+            return Ok(None);
         }
 
         let mut output_size = 0u64;
         let mut block_index = 0usize;
-        while block_index < blocks.len() {
-            if blocks[block_index].is_large {
-                let block = &blocks[block_index];
-                let tables = &table_sets[block.table_set_index];
-                self.decode_preparsed_block_inline(
+        while block_index < scanned.blocks.len() && output_size < unpacked_size {
+            let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
+            let span = &scanned.blocks[block_index..span_end];
+            let batch_end = next_controller_batch_end(
+                &scanned.blocks,
+                block_index,
+                scanned.blocks.len(),
+                worker_count,
+            );
+            if batch_end - block_index >= MIN_PARALLEL_BLOCKS {
+                self.decode_and_apply_static_batch(
                     input,
-                    block,
-                    tables,
+                    &scanned.blocks,
+                    block_index..batch_end,
                     unpacked_size,
                     &mut output_size,
                     writer,
                 )?;
-                block_index += 1;
+                block_index = batch_end;
             } else {
-                let run_end = next_small_block_batch_end(&blocks, block_index, blocks.len());
-                let run = &blocks[block_index..run_end];
-                self.decode_and_apply_small_run(
-                    input,
-                    run,
-                    &table_sets,
-                    unpacked_size,
-                    &mut output_size,
-                    writer,
-                )?;
-                block_index = run_end;
+                let inline_end = if span.len() > 2 {
+                    block_index + 1
+                } else {
+                    span_end
+                };
+                phase_diagnostics::measure(Phase::SerialApply, || {
+                    self.decode_span_inline(
+                        input,
+                        &scanned.blocks[block_index..inline_end],
+                        unpacked_size,
+                        &mut output_size,
+                        writer,
+                    )
+                })?;
+                block_index = inline_end;
             }
-
             if output_size >= unpacked_size {
                 break;
             }
         }
 
-        // Update decoder state for solid archive continuity.
-        if let Some(last_ts) = table_sets.last() {
-            self.nc_table = Some(Arc::clone(&last_ts.nc));
-            self.dc_table = Some(Arc::clone(&last_ts.dc));
-            self.ldc_table = Some(Arc::clone(&last_ts.ldc));
-            self.rc_table = Some(Arc::clone(&last_ts.rc));
-        }
         self.block_bits_remaining = 0;
-        // preparse_blocks stops on is_last, so if we consumed all blocks
-        // the last one was the final block.
-        self.is_last_block = true;
-
-        // Apply pending filters and flush.
+        self.is_last_block = scanned.saw_last_block;
         self.flush_filters_and_write(writer)?;
 
         Ok(Some(output_size))
@@ -1269,24 +1523,119 @@ impl LzDecoder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::block_reader::LOOKAHEAD_BYTES;
     use super::*;
 
-    #[test]
-    fn parallel_batch_size_caps_dispatch_at_max_batch_blocks() {
-        assert_eq!(parallel_batch_size(32, 128), MAX_BATCH_BLOCKS);
-        assert_eq!(parallel_batch_size(64, 1024), MAX_BATCH_BLOCKS);
+    fn reset_dispatch_count() {
+        CONTROLLER_DISPATCH_COUNT.set(0);
+    }
+
+    fn dispatch_count() -> usize {
+        CONTROLLER_DISPATCH_COUNT.get()
+    }
+
+    fn reset_fast_reader_selection_count() {
+        FAST_READER_SELECTION_COUNT.set(0);
+    }
+
+    fn fast_reader_selection_count() -> usize {
+        FAST_READER_SELECTION_COUNT.get()
+    }
+
+    fn shifted_payload(payload: &[u8], payload_bits: usize, offset: usize) -> Vec<u8> {
+        let payload_end = offset + payload_bits;
+        let mut shifted = vec![0u8; payload_end.div_ceil(8) + LOOKAHEAD_BYTES];
+        for bit in 0..payload_bits {
+            let value = (payload[bit / 8] >> (7 - bit % 8)) & 1;
+            shifted[(offset + bit) / 8] |= value << (7 - (offset + bit) % 8);
+        }
+        shifted
+    }
+
+    fn rar7_tables() -> TableSet {
+        TableSet {
+            nc: HuffmanTable::build(&[9u8; 306]).unwrap(),
+            dc: HuffmanTable::build(&[7u8; 80]).unwrap(),
+            ldc: HuffmanTable::build(&[4u8; 16]).unwrap(),
+            rc: HuffmanTable::build(&[6u8; 44]).unwrap(),
+        }
+    }
+
+    fn test_block(
+        payload_bit_offset: usize,
+        payload_bits: usize,
+        table_present: bool,
+    ) -> BlockInfo {
+        BlockInfo {
+            payload_bit_offset,
+            payload_bits,
+            table_present,
+            is_large: false,
+        }
     }
 
     #[test]
-    fn parallel_batch_size_is_thread_count_independent() {
-        assert_eq!(parallel_batch_size(1, 8), 8);
-        assert_eq!(parallel_batch_size(0, 8), 8);
+    fn static_assignments_pack_two_independent_blocks() {
+        let blocks = vec![
+            test_block(0, 1, true),
+            test_block(1, 1, true),
+            test_block(2, 1, true),
+            test_block(3, 1, true),
+        ];
+        let assignments = build_assignments(&blocks, 0, 4, 2).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].end, 2);
+        assert_eq!(assignments[1].start, 2);
+        assert!(
+            assignments
+                .iter()
+                .all(|assignment| blocks[assignment.start].table_present)
+        );
     }
 
     #[test]
-    fn parallel_batch_size_never_exceeds_available_blocks() {
-        assert_eq!(parallel_batch_size(8, 3), 3);
-        assert_eq!(parallel_batch_size(2, 2), 2);
+    fn static_assignments_keep_short_tableless_span_together() {
+        let blocks = vec![
+            test_block(0, 1, true),
+            test_block(1, 1, false),
+            test_block(2, 1, true),
+        ];
+        let assignments = build_assignments(&blocks, 0, 3, 2).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!((assignments[0].start, assignments[0].end), (0, 2));
+        assert_eq!((assignments[1].start, assignments[1].end), (2, 3));
+    }
+
+    #[test]
+    fn long_tableless_span_uses_established_tables_in_parallel() {
+        let mut blocks = vec![test_block(0, 1, true)];
+        blocks.extend((1..7).map(|offset| test_block(offset, 1, false)));
+
+        // The table-defining root is decoded first. Once installed, the
+        // inherited-table suffix can be split without reparsing or mutation.
+        assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 4), 0);
+        assert_eq!(next_controller_batch_end(&blocks, 1, blocks.len(), 4), 7);
+
+        let assignments = build_assignments(&blocks, 1, 7, 4).unwrap();
+        assert_eq!(assignments.len(), 3);
+        assert!(assignments.iter().all(|assignment| {
+            blocks[assignment.start..assignment.end]
+                .iter()
+                .all(|block| !block.table_present)
+        }));
+
+        blocks[4].is_large = true;
+        assert_eq!(next_controller_batch_end(&blocks, 1, blocks.len(), 4), 4);
+    }
+
+    #[test]
+    fn controller_batch_end_caps_workers_and_respects_large_fallback() {
+        let mut blocks = vec![test_block(0, 1, true); 20];
+        blocks[4].is_large = true;
+        assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 3), 4);
+        blocks[4].is_large = false;
+        assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 3), 6);
+        assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 1), 0);
     }
 
     #[test]
@@ -1300,12 +1649,7 @@ mod tests {
     fn decode_block_symbols_preserves_rar7_distance_beyond_u32() {
         // Uniform code lengths make canonical codes equal symbol indices:
         // NC len 9 (306 syms), DC len 7 (80 syms, RAR7 DCX), LDC len 4, RC len 6.
-        let tables = TableSet {
-            nc: Arc::new(HuffmanTable::build(&[9u8; 306]).unwrap()),
-            dc: Arc::new(HuffmanTable::build(&[7u8; 80]).unwrap()),
-            ldc: Arc::new(HuffmanTable::build(&[4u8; 16]).unwrap()),
-            rc: Arc::new(HuffmanTable::build(&[6u8; 44]).unwrap()),
-        };
+        let tables = rar7_tables();
 
         // Bitstream: NC sym 262 (9 bits) → length slot 0 (len 2, no extra),
         // DC sym 66 (7 bits) → 32 distance bits: 28 high bits = 0 from the
@@ -1313,14 +1657,22 @@ mod tests {
         // Packed MSB-first: 100000110 1000010 0^28 0011 = 48 bits.
         let input = [0x83u8, 0x42, 0x00, 0x00, 0x00, 0x03, 0, 0, 0, 0];
         let block = BlockInfo {
-            data_bit_offset: 0,
-            data_bits: 48,
-            table_set_index: 0,
+            payload_bit_offset: 0,
+            payload_bits: 48,
+            table_present: false,
             is_large: false,
         };
 
+        reset_fast_reader_selection_count();
+        let mut checked_items = Vec::new();
+        decode_block_symbols(&input, &block, &tables, true, &mut checked_items).unwrap();
+        assert_eq!(fast_reader_selection_count(), 0);
+
+        let mut guarded_input = input[..6].to_vec();
+        guarded_input.resize(6 + LOOKAHEAD_BYTES, 0);
         let mut items = Vec::new();
-        decode_block_symbols(&input, &block, &tables, true, &mut items).unwrap();
+        decode_block_symbols(&guarded_input, &block, &tables, true, &mut items).unwrap();
+        assert_eq!(fast_reader_selection_count(), 1);
 
         assert_eq!(items.len(), 1);
         let DecodedItem::Match { length, distance } = items[0] else {
@@ -1331,6 +1683,55 @@ mod tests {
         assert_eq!(distance, expected);
         // Base length 2, +3 from the distance-based length adjustment.
         assert_eq!(length, 5);
+
+        let DecodedItem::Match {
+            length: checked_length,
+            distance: checked_distance,
+        } = checked_items[0]
+        else {
+            panic!("expected a checked-reader match item");
+        };
+        assert_eq!((length, distance), (checked_length, checked_distance));
+
+        let shifted_input = shifted_payload(&input, 48, 3);
+        let shifted_block = BlockInfo {
+            payload_bit_offset: 3,
+            ..block.clone()
+        };
+        let mut shifted_items = Vec::new();
+        decode_block_symbols(
+            &shifted_input,
+            &shifted_block,
+            &tables,
+            true,
+            &mut shifted_items,
+        )
+        .unwrap();
+        assert_eq!(fast_reader_selection_count(), 2);
+        let DecodedItem::Match {
+            length: shifted_length,
+            distance: shifted_distance,
+        } = shifted_items[0]
+        else {
+            panic!("expected an unaligned fast-reader match item");
+        };
+        assert_eq!((length, distance), (shifted_length, shifted_distance));
+
+        let short_block = BlockInfo {
+            payload_bits: 47,
+            ..block
+        };
+        let mut malformed_items = Vec::new();
+        let error = decode_block_symbols(
+            &guarded_input,
+            &short_block,
+            &tables,
+            true,
+            &mut malformed_items,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RarError::CorruptArchive { .. }));
+        assert_eq!(fast_reader_selection_count(), 3);
     }
 
     #[test]
@@ -1415,35 +1816,162 @@ mod tests {
     }
 
     #[test]
-    fn next_small_block_batch_end_stops_before_large_block() {
+    fn controller_batch_end_stops_before_large_block() {
         let blocks = vec![
             BlockInfo {
-                data_bit_offset: 0,
-                data_bits: 1,
-                table_set_index: 0,
+                payload_bit_offset: 0,
+                payload_bits: 1,
+                table_present: true,
                 is_large: false,
             },
             BlockInfo {
-                data_bit_offset: 1,
-                data_bits: 1,
-                table_set_index: 0,
+                payload_bit_offset: 1,
+                payload_bits: 1,
+                table_present: true,
                 is_large: false,
             },
             BlockInfo {
-                data_bit_offset: 2,
-                data_bits: 1,
-                table_set_index: 0,
+                payload_bit_offset: 2,
+                payload_bits: 1,
+                table_present: true,
                 is_large: true,
             },
             BlockInfo {
-                data_bit_offset: 3,
-                data_bits: 1,
-                table_set_index: 0,
+                payload_bit_offset: 3,
+                payload_bits: 1,
+                table_present: true,
                 is_large: false,
             },
         ];
 
-        assert_eq!(next_small_block_batch_end(&blocks, 0, 4), 2);
-        assert_eq!(next_small_block_batch_end(&blocks, 3, 4), 4);
+        assert_eq!(next_controller_batch_end(&blocks, 0, 4, 4), 2);
+        assert_eq!(next_controller_batch_end(&blocks, 3, 4, 4), 4);
+    }
+
+    #[test]
+    fn tableless_block_inherits_worker_table_state() {
+        let mut tables = Some(rar7_tables());
+        let before = tables.as_ref().map(std::ptr::from_ref);
+        let source = test_block(0, 0, false);
+        let mut code_lengths = vec![0u8; 484];
+        let prepared = prepare_block(&[], &source, &mut tables, &mut code_lengths, false).unwrap();
+        assert!(!prepared.table_present);
+        assert_eq!(prepared.payload_bits, 0);
+        assert_eq!(before, tables.as_ref().map(std::ptr::from_ref));
+    }
+
+    #[test]
+    fn table_present_blocks_are_independent_length_table_roots() {
+        let blocks = vec![test_block(0, 1, true), test_block(1, 1, true)];
+        let assignments = build_assignments(&blocks, 0, blocks.len(), 2).unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!((assignments[0].start, assignments[0].end), (0, 2));
+        assert!(blocks.iter().all(|block| block.table_present));
+    }
+
+    #[test]
+    fn worker_failure_returns_after_all_scoped_jobs_join() {
+        let worker_count = rar_decode_worker_count();
+        if worker_count <= 1 {
+            return;
+        }
+        let blocks = vec![test_block(0, 0, true); 4];
+        let mut items = (0..4)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<DecodedItem>>>();
+        let result = parallel_decode_static(
+            &[],
+            &blocks,
+            0..blocks.len(),
+            None,
+            &[0u8; 484],
+            false,
+            &mut items,
+        );
+        assert!(result.is_err());
+
+        let input = [0x83u8, 0x42, 0x00, 0x00, 0x00, 0x03, 0, 0, 0, 0];
+        let valid_blocks = vec![test_block(0, 48, false); 2];
+        let tables = rar7_tables();
+        let states = parallel_decode_static(
+            &input,
+            &valid_blocks,
+            0..valid_blocks.len(),
+            Some(&tables),
+            &[0u8; 484],
+            true,
+            &mut items[..valid_blocks.len()],
+        )
+        .unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(
+            items[..valid_blocks.len()]
+                .iter()
+                .all(|buffer| !buffer.is_empty())
+        );
+    }
+
+    #[test]
+    fn hydrated_multiblock_extraction_dispatches_controller() {
+        if rar_decode_worker_count() <= 1 {
+            return;
+        }
+        reset_dispatch_count();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        let mut archive = crate::RarArchive::open(std::fs::File::open(fixture).unwrap()).unwrap();
+        let options = crate::ExtractOptions::default();
+        for member_index in 0..archive.metadata().members.len() {
+            archive
+                .extract_member(member_index, &options, None)
+                .unwrap();
+            if dispatch_count() > 0 {
+                break;
+            }
+        }
+        assert!(dispatch_count() > 0);
+    }
+
+    #[test]
+    fn phase_diagnostics_follow_process_opt_in_contract() {
+        if rar_decode_worker_count() <= 1 {
+            return;
+        }
+
+        let run = |enabled: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("hydrated_multiblock_extraction_dispatches_controller")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env_remove("RARPAR_BENCH_PHASES");
+            if enabled {
+                command.env("RARPAR_BENCH_PHASES", "1");
+            }
+            command.output().unwrap()
+        };
+
+        let enabled = run(true);
+        assert!(enabled.status.success());
+        let enabled_log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&enabled.stdout),
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+        for phase in ["staging", "header_scan", "worker_decode", "serial_apply"] {
+            assert!(
+                enabled_log.contains(&format!("RARPAR_BENCH_PHASE {{\"phase\":\"{phase}\"")),
+                "missing {phase} marker from enabled controller run"
+            );
+        }
+
+        let disabled = run(false);
+        assert!(disabled.status.success());
+        let disabled_log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&disabled.stdout),
+            String::from_utf8_lossy(&disabled.stderr)
+        );
+        assert!(!disabled_log.contains("RARPAR_BENCH_PHASE "));
     }
 }

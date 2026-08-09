@@ -51,8 +51,8 @@ func usage() {
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N]
-  rarpar-bench preflight [--docker PATH]
-  rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE]
+  rarpar-bench preflight [--docker PATH] [--perf]
+  rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
   rarpar-bench report --input FILE --out FILE
   rarpar-bench render --input FILE --out DIR
 
@@ -153,8 +153,14 @@ func runPlan(args []string) error {
 func runPreflight(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("preflight", flag.ContinueOnError)
 	docker := flags.String("docker", "docker", "Docker executable")
+	perf := flags.Bool("perf", false, "require the Linux perf stat collector")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *perf {
+		if err := bench.ValidatePerf(ctx); err != nil {
+			return err
+		}
 	}
 	return bench.Preflight(ctx, *docker)
 }
@@ -173,6 +179,7 @@ func runBenchmark(ctx context.Context, args []string) error {
 	docker := flags.String("docker", "docker", "Docker executable")
 	sourceManifest := flags.String("source-manifest", "", "source Cargo manifest; enables source-build audit")
 	sourceTarget := flags.String("source-target", "", "Cargo target for source-build audit")
+	perf := flags.Bool("perf", false, "collect Linux perf stat counters for every subject")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -190,7 +197,7 @@ func runBenchmark(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, err = bench.Run(ctx, bench.RunOptions{CorpusRoot: corpusPath, Plan: plan, CandidatePath: workspacePath(*candidate), CandidateLabel: *candidateLabel, ReferenceRAR: workspacePath(*referenceRAR), ReferencePAR2: workspacePath(*referencePAR2), ReferenceLabel: *referenceLabel, Output: workspacePath(*out), MachineLabel: *machine, Docker: *docker, SourceManifest: workspacePath(*sourceManifest), SourceTarget: *sourceTarget})
+	_, err = bench.Run(ctx, bench.RunOptions{CorpusRoot: corpusPath, Plan: plan, CandidatePath: workspacePath(*candidate), CandidateLabel: *candidateLabel, ReferenceRAR: workspacePath(*referenceRAR), ReferencePAR2: workspacePath(*referencePAR2), ReferenceLabel: *referenceLabel, Output: workspacePath(*out), MachineLabel: *machine, Docker: *docker, SourceManifest: workspacePath(*sourceManifest), SourceTarget: *sourceTarget, Perf: *perf})
 	return err
 }
 
