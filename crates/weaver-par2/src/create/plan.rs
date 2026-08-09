@@ -7,7 +7,8 @@ use crate::error::{Par2Error, Result};
 use crate::types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum};
 
 use super::encode::{ForwardKernel, estimate_forward_memory};
-use super::options::{BlockSizing, Par2CreatorOptions, RecoveryAmount};
+use super::metal::estimate_processing_memory;
+use super::options::{BlockSizing, CreationBackend, Par2CreatorOptions, RecoveryAmount};
 use super::output::{
     TargetSnapshot, capture_target_snapshot, estimate_critical_packet_bytes,
     estimate_packet_build_workspace_bytes, estimate_transaction_workspace_bytes,
@@ -163,6 +164,8 @@ pub struct Par2CreatePlan {
     pub recovery_set_id: RecoverySetId,
     /// Forward arithmetic path selected when this plan was built.
     pub forward_kernel: ForwardKernel,
+    /// Creation backend policy requested for this plan.
+    pub backend: CreationBackend,
     /// Memory accounting for this plan.
     pub memory: Par2MemoryPlan,
     /// Whether the caller requested a write-free operation.
@@ -230,12 +233,22 @@ impl Par2CreatePlan {
                 reason: "creation plan source slice count differs from sources".to_string(),
             });
         }
-        let forward_memory = estimate_forward_memory(
+        let cpu_memory = estimate_forward_memory(
             self.slice_size,
             self.source_slice_count as usize,
             self.recovery_count as usize,
             self.memory.processing_buffer_limit_bytes,
             self.forward_kernel,
+        )?;
+        let forward_memory = estimate_processing_memory(
+            self.backend,
+            usize::try_from(self.slice_size).map_err(|_| Par2Error::ResourceLimitExceeded {
+                reason: "slice size exceeds addressable memory".to_string(),
+            })?,
+            self.source_slice_count as usize,
+            self.recovery_count as usize,
+            self.memory.processing_buffer_limit_bytes,
+            cpu_memory,
         )?;
         let expected_memory = memory_plan_for(
             &self.sources,
@@ -583,12 +596,22 @@ pub(crate) fn build_plan(options: &Par2CreatorOptions) -> Result<Par2CreatePlan>
             reason: "memory limit must be greater than zero".to_string(),
         });
     }
-    let forward_memory = estimate_forward_memory(
+    let cpu_memory = estimate_forward_memory(
         block_size,
         source_slice_count as usize,
         recovery_count as usize,
         forward_memory_limit,
         options.forward_kernel,
+    )?;
+    let forward_memory = estimate_processing_memory(
+        options.backend,
+        usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: "slice size exceeds addressable memory".to_string(),
+        })?,
+        source_slice_count as usize,
+        recovery_count as usize,
+        forward_memory_limit,
+        cpu_memory,
     )?;
     let volumes = allocate_volumes(
         options.first_exponent,
@@ -654,6 +677,7 @@ pub(crate) fn build_plan(options: &Par2CreatorOptions) -> Result<Par2CreatePlan>
         recovery_exponents,
         recovery_set_id,
         forward_kernel: options.forward_kernel,
+        backend: options.backend,
         memory,
         dry_run: options.dry_run,
     })
@@ -748,6 +772,18 @@ pub(crate) fn validate_output_targets(
                 return Err(Par2Error::UnsafeCreationOutput {
                     path: target.display().to_string(),
                     reason: "output path is a directory".to_string(),
+                });
+            }
+            TargetSnapshot::Symlink => {
+                return Err(Par2Error::UnsafeCreationOutput {
+                    path: target.display().to_string(),
+                    reason: "output path is a symlink".to_string(),
+                });
+            }
+            TargetSnapshot::Special => {
+                return Err(Par2Error::UnsafeCreationOutput {
+                    path: target.display().to_string(),
+                    reason: "output path is not a regular file".to_string(),
                 });
             }
             TargetSnapshot::File(_) if !overwrite => {

@@ -258,7 +258,8 @@ impl JitWidth {
 /// Whether the AVX512 XOR-JIT tier should run: AVX512BW+VL present, GFNI
 /// absent (GFNI boxes use the affine kernels, which beat every XOR tier), not
 /// under binary translation. This reports explicit method availability; the
-/// automatic selector does not choose this tier.
+/// repair-side/internal automatic selector does not choose this tier, while
+/// callers such as creation Auto may explicitly prioritize it.
 pub fn supported_512() -> bool {
     // BW+VL is deliberately stricter than the kernel's AVX512F-only needs:
     // it matches the crate's other AVX512 gates and scopes the tier to

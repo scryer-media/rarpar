@@ -100,6 +100,12 @@ pub enum Par2Error {
 
     #[error("staged PAR2 output validation failed for {path}: {reason}")]
     CreationValidation { path: String, reason: String },
+
+    #[error("Metal creation backend is unavailable: {reason}")]
+    MetalUnavailable { reason: String },
+
+    #[error("Metal creation failed after staging began: {reason}")]
+    MetalExecutionFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Par2Error>;

@@ -1,6 +1,6 @@
 use crate::discovery::DiscoveryReport;
 use crate::error::RarparError;
-use par2_rs::{Par2CreateOutcome, Par2CreatePlan};
+use par2_rs::{CreationBackend, Par2CreateOutcome, Par2CreatePlan};
 use rarpar::cli::Cli;
 use serde::Serialize;
 
@@ -33,6 +33,8 @@ struct ParCreatePlanReport {
     first_exponent: u32,
     recovery_exponents: Vec<u32>,
     recovery_set_id: String,
+    backend_requested: &'static str,
+    backend_selected: &'static str,
     memory: ParCreateMemoryReport,
     dry_run: bool,
 }
@@ -59,6 +61,7 @@ struct ParCreateMemoryReport {
     source_hash_workspace_bytes: usize,
     critical_packet_bytes: usize,
     main_file_id_workspace_bytes: usize,
+    packet_build_workspace_bytes: usize,
     transaction_workspace_bytes: usize,
     validation_workspace_bytes: usize,
     processing_buffer_limit_bytes: usize,
@@ -80,10 +83,12 @@ struct ParCreateOutcomeReport {
     recovery_count: u32,
     bytes_written: u64,
     dry_run: bool,
+    backend_requested: &'static str,
+    backend_selected: &'static str,
 }
 
-impl From<&Par2CreatePlan> for ParCreatePlanReport {
-    fn from(plan: &Par2CreatePlan) -> Self {
+impl ParCreatePlanReport {
+    fn from_plan(plan: &Par2CreatePlan, selected_backend: CreationBackend) -> Self {
         Self {
             base_path: plan.base_path.display().to_string(),
             output_stem: plan.output_stem.display().to_string(),
@@ -124,11 +129,14 @@ impl From<&Par2CreatePlan> for ParCreatePlanReport {
             first_exponent: plan.first_exponent,
             recovery_exponents: plan.recovery_exponents.clone(),
             recovery_set_id: plan.recovery_set_id.to_string(),
+            backend_requested: backend_name(plan.backend),
+            backend_selected: backend_name(selected_backend),
             memory: ParCreateMemoryReport {
                 source_metadata_bytes: plan.memory.source_metadata_bytes,
                 source_hash_workspace_bytes: plan.memory.source_hash_workspace_bytes,
                 critical_packet_bytes: plan.memory.critical_packet_bytes,
                 main_file_id_workspace_bytes: plan.memory.main_file_id_workspace_bytes,
+                packet_build_workspace_bytes: plan.memory.packet_build_workspace_bytes,
                 transaction_workspace_bytes: plan.memory.transaction_workspace_bytes,
                 validation_workspace_bytes: plan.memory.validation_workspace_bytes,
                 processing_buffer_limit_bytes: plan.memory.processing_buffer_limit_bytes,
@@ -155,6 +163,8 @@ impl From<&Par2CreateOutcome> for ParCreateOutcomeReport {
             recovery_count: outcome.recovery_count,
             bytes_written: outcome.bytes_written,
             dry_run: outcome.dry_run,
+            backend_requested: backend_name(outcome.requested_backend),
+            backend_selected: backend_name(outcome.selected_backend),
         }
     }
 }
@@ -210,18 +220,7 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
 }
 
 pub fn emit_par_create_plan(cli: &Cli, plan: &Par2CreatePlan) -> Result<(), RarparError> {
-    if cli.json && plan.dry_run {
-        let report = ParCreateReport {
-            schema_version: 1,
-            command: "create",
-            status: "planned",
-            dry_run: plan.dry_run,
-            success: true,
-            plan: plan.into(),
-            outcome: None,
-        };
-        println!("{}", serde_json::to_string(&report)?);
-    } else if !cli.json && !cli.quiet {
+    if !cli.json && !cli.quiet {
         print_plan_summary(plan);
     }
     Ok(())
@@ -236,16 +235,43 @@ pub fn emit_par_create_outcome(
         let report = ParCreateReport {
             schema_version: 1,
             command: "create",
-            status: "created",
+            status: if outcome.dry_run {
+                "planned"
+            } else {
+                "created"
+            },
             dry_run: outcome.dry_run,
             success: true,
-            plan: plan.into(),
+            plan: ParCreatePlanReport::from_plan(plan, outcome.selected_backend),
             outcome: Some(outcome.into()),
         };
         println!("{}", serde_json::to_string(&report)?);
     } else if !cli.quiet {
-        eprintln!("  creation complete");
-        eprintln!("  created outputs: {}", outcome.output_paths.len());
+        eprintln!(
+            "  {}",
+            if outcome.dry_run {
+                "dry-run complete"
+            } else {
+                "creation complete"
+            }
+        );
+        eprintln!(
+            "  backend requested: {}",
+            backend_name(outcome.requested_backend)
+        );
+        eprintln!(
+            "  backend selected: {}",
+            backend_name(outcome.selected_backend)
+        );
+        eprintln!(
+            "  {}: {}",
+            if outcome.dry_run {
+                "outputs planned"
+            } else {
+                "created outputs"
+            },
+            outcome.output_paths.len()
+        );
         eprintln!("  bytes written: {}", outcome.bytes_written);
     }
     Ok(())
@@ -260,7 +286,16 @@ fn print_plan_summary(plan: &Par2CreatePlan) {
     eprintln!("  slice size: {} bytes", plan.slice_size);
     eprintln!("  recovery slices: {}", plan.recovery_count);
     eprintln!("  recovery volumes: {}", plan.volume_count());
+    eprintln!("  backend requested: {}", backend_name(plan.backend));
     if plan.dry_run {
         eprintln!("  dry-run: no files written");
+    }
+}
+
+fn backend_name(backend: par2_rs::CreationBackend) -> &'static str {
+    match backend {
+        par2_rs::CreationBackend::Cpu => "cpu",
+        par2_rs::CreationBackend::Auto => "auto",
+        par2_rs::CreationBackend::Metal => "metal",
     }
 }

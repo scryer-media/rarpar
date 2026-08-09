@@ -5,6 +5,19 @@ use crate::types::{CancellationToken, ProgressCallback};
 
 use super::encode::ForwardKernel;
 
+/// Policy for the recovery-data creation backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CreationBackend {
+    /// Use the CPU/SIMD forward encoder.
+    #[default]
+    Cpu,
+    /// Keep work below 16 GiB on CPU; at or above it, preflight native Metal
+    /// when available and use CPU when Metal cannot be admitted.
+    Auto,
+    /// Require Metal and report an actionable error when it cannot be admitted.
+    Metal,
+}
+
 /// How the creator chooses the source slice size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BlockSizing {
@@ -70,6 +83,8 @@ pub struct Par2CreatorOptions {
     pub memory_limit: Option<usize>,
     /// Arithmetic path requested for forward recovery encoding.
     pub forward_kernel: ForwardKernel,
+    /// Backend policy requested for recovery-data creation.
+    pub backend: CreationBackend,
     /// Permit replacing existing output files after a successful staged write.
     pub overwrite: bool,
     /// Suppress filesystem writes while retaining validation and planning.
@@ -94,6 +109,7 @@ impl fmt::Debug for Par2CreatorOptions {
             .field("volume_count", &self.volume_count)
             .field("memory_limit", &self.memory_limit)
             .field("forward_kernel", &self.forward_kernel)
+            .field("backend", &self.backend)
             .field("overwrite", &self.overwrite)
             .field("dry_run", &self.dry_run)
             .field("cancellation", &self.cancellation.is_cancelled())
@@ -116,6 +132,7 @@ impl Par2CreatorOptions {
             volume_count: None,
             memory_limit: None,
             forward_kernel: ForwardKernel::Auto,
+            backend: CreationBackend::default(),
             overwrite: false,
             dry_run: false,
             cancellation: CancellationToken::new(),

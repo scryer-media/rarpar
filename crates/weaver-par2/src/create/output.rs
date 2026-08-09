@@ -1,8 +1,12 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::mem::MaybeUninit;
 use std::mem::size_of;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +18,8 @@ use crate::packet::{Packet, scan_packets_from_path_with_set_ids_cancellable};
 use crate::types::{CancellationToken, FileId, RecoveryExponent, RecoverySetId};
 
 use super::encode::{ForwardEncoder, ForwardEncoderOptions, ForwardRecoverySink};
-use super::options::Par2CreatorOptions;
+use super::metal::{SelectedBackend, selected_policy};
+use super::options::{CreationBackend, Par2CreatorOptions};
 use super::plan::Par2CreatePlan;
 use super::source::{CreationSource, DiskSourceProvider};
 use super::volume::RecoveryVolumePlan;
@@ -82,9 +87,7 @@ pub(crate) fn estimate_critical_packet_bytes(sources: &[CreationSource]) -> Resu
     Ok(total)
 }
 
-pub(crate) fn estimate_packet_build_workspace_bytes(
-    sources: &[CreationSource],
-) -> Result<usize> {
+pub(crate) fn estimate_packet_build_workspace_bytes(sources: &[CreationSource]) -> Result<usize> {
     let mut largest_body = 0usize;
     for source in sources {
         let description_body = 56usize
@@ -466,6 +469,10 @@ pub struct Par2CreateOutcome {
     pub bytes_written: u64,
     /// True when no output files were written.
     pub dry_run: bool,
+    /// Backend policy requested by the creator.
+    pub requested_backend: CreationBackend,
+    /// Backend selected after preflight.
+    pub selected_backend: CreationBackend,
 }
 
 #[derive(Clone)]
@@ -563,6 +570,8 @@ pub(crate) enum TargetSnapshot {
     Absent,
     File(FileIdentity),
     Directory,
+    Symlink,
+    Special,
 }
 
 #[cfg(windows)]
@@ -784,13 +793,27 @@ impl StagedOutputs {
     }
 
     fn commit_with_publish_hook<F>(
-        mut self,
+        self,
         overwrite: bool,
         cancellation: &CancellationToken,
-        mut before_publish: F,
+        before_publish: F,
     ) -> Result<()>
     where
         F: FnMut(&Path, &Path),
+    {
+        self.commit_with_transaction_hooks(overwrite, cancellation, |_, _| {}, before_publish)
+    }
+
+    fn commit_with_transaction_hooks<F, G>(
+        mut self,
+        overwrite: bool,
+        cancellation: &CancellationToken,
+        mut before_backup_rename: F,
+        mut before_publish: G,
+    ) -> Result<()>
+    where
+        F: FnMut(&Path, &Path),
+        G: FnMut(&Path, &Path),
     {
         for volume in &mut self.volumes {
             volume.file.flush()?;
@@ -838,14 +861,45 @@ impl StagedOutputs {
                     if matches!(planned, TargetSnapshot::Absent) {
                         continue;
                     }
+                    let TargetSnapshot::File(_) = planned else {
+                        return Err(Par2Error::UnsafeCreationOutput {
+                            path: target.display().to_string(),
+                            reason: "output path is not a regular file".to_string(),
+                        });
+                    };
                     let (namespace, backup) = reserve_backup_namespace(target, index)?;
+                    before_backup_rename(target, &backup);
                     if let Err(error) = fs::rename(target, &backup) {
                         let _ = fs::remove_dir(&namespace);
                         return Err(Par2Error::Io(error));
                     }
                     let moved = capture_target_snapshot(&backup).map_err(Par2Error::Io)?;
                     if moved != planned {
-                        preserve_moved_target(&backup, target, moved).map_err(Par2Error::Io)?;
+                        match restore_moved_target(&backup, target, moved) {
+                            Ok(true) => {
+                                fs::remove_dir(&namespace).map_err(|error| {
+                                    backup_recovery_error(
+                                        target,
+                                        &backup,
+                                        format!("output backup cleanup failed: {error}"),
+                                    )
+                                })?;
+                            }
+                            Ok(false) => {
+                                return Err(backup_recovery_error(
+                                    target,
+                                    &backup,
+                                    "output restore found an occupied target".to_string(),
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(backup_recovery_error(
+                                    target,
+                                    &backup,
+                                    format!("output restore failed: {error}"),
+                                ));
+                            }
+                        }
                         return Err(Par2Error::CreationValidation {
                             path: target.display().to_string(),
                             reason: "output target changed while reserving backup".to_string(),
@@ -942,23 +996,28 @@ impl StagedOutputs {
                             }
                             continue;
                         }
-                        match restore_no_replace_preserving_source(
+                        match restore_moved_target(
                             &backup_entry.backup,
                             &backup_entry.target,
+                            TargetSnapshot::File(backup_entry.identity),
                         ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 if rollback_error.is_none() {
-                                    rollback_error = Some(Par2Error::CreationValidation {
-                                        path: backup_entry.target.display().to_string(),
-                                        reason: "output restore lost a replacement race"
-                                            .to_string(),
-                                    });
+                                    rollback_error = Some(backup_recovery_error(
+                                        &backup_entry.target,
+                                        &backup_entry.backup,
+                                        "output restore lost a replacement race".to_string(),
+                                    ));
                                 }
                             }
                             Err(error) => {
                                 if rollback_error.is_none() {
-                                    rollback_error = Some(Par2Error::Io(error));
+                                    rollback_error = Some(backup_recovery_error(
+                                        &backup_entry.target,
+                                        &backup_entry.backup,
+                                        format!("output restore failed: {error}"),
+                                    ));
                                 }
                             }
                         }
@@ -975,12 +1034,50 @@ impl StagedOutputs {
             }
             return Err(rollback_error.unwrap_or(error));
         }
-        self.committed = true;
+        let mut cleanup_error = None;
         for backup_entry in backups {
-            let _ = fs::remove_file(backup_entry.backup);
-            let _ = fs::remove_dir(backup_entry.namespace);
+            match target_file_identity(&backup_entry.backup) {
+                Ok(Some(identity)) if identity == backup_entry.identity => {
+                    if let Err(error) = fs::remove_file(&backup_entry.backup) {
+                        if cleanup_error.is_none() {
+                            cleanup_error = Some(backup_recovery_error(
+                                &backup_entry.target,
+                                &backup_entry.backup,
+                                format!("output backup cleanup failed: {error}"),
+                            ));
+                        }
+                    } else if let Err(error) = fs::remove_dir(&backup_entry.namespace)
+                        && cleanup_error.is_none()
+                    {
+                        cleanup_error = Some(backup_recovery_error(
+                            &backup_entry.target,
+                            &backup_entry.namespace,
+                            format!("output backup namespace cleanup failed: {error}"),
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(backup_recovery_error(
+                            &backup_entry.target,
+                            &backup_entry.backup,
+                            "output backup changed before cleanup".to_string(),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(backup_recovery_error(
+                            &backup_entry.target,
+                            &backup_entry.backup,
+                            format!("output backup cleanup could not be verified: {error}"),
+                        ));
+                    }
+                }
+            }
         }
-        Ok(())
+        self.committed = true;
+        cleanup_error.map_or(Ok(()), Err)
     }
 
     fn bytes_written(&self) -> Result<u64> {
@@ -1024,6 +1121,7 @@ pub(crate) fn write_outputs(
     plan: &Par2CreatePlan,
     sources: &[CreationSource],
     options: &Par2CreatorOptions,
+    mut backend: SelectedBackend,
 ) -> Result<Par2CreateOutcome> {
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
@@ -1044,17 +1142,30 @@ pub(crate) fn write_outputs(
                 cancellation: &options.cancellation,
                 slice_size,
             };
-            let encoder = ForwardEncoder::new(slice_size, plan.recovery_exponents.clone())?;
-            encoder.encode_to(
-                &mut provider,
-                &ForwardEncoderOptions {
-                    memory_limit: options.memory_limit,
-                    cancel: Some(options.cancellation.clone()),
-                    progress: options.progress.clone(),
-                    kernel: options.forward_kernel,
-                },
-                &mut sink,
-            )?;
+            match &mut backend {
+                SelectedBackend::Cpu => {
+                    let encoder = ForwardEncoder::new(slice_size, plan.recovery_exponents.clone())?;
+                    encoder.encode_to(
+                        &mut provider,
+                        &ForwardEncoderOptions {
+                            memory_limit: options.memory_limit,
+                            cancel: Some(options.cancellation.clone()),
+                            progress: options.progress.clone(),
+                            kernel: options.forward_kernel,
+                        },
+                        &mut sink,
+                    )?;
+                }
+                #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+                SelectedBackend::Metal(state) => state.encode(
+                    &mut provider,
+                    &plan.recovery_exponents,
+                    slice_size,
+                    &options.cancellation,
+                    options.progress.clone(),
+                    &mut sink,
+                )?,
+            }
         }
         provider.verify_unchanged()?;
         staged.finish_recovery_headers(slice_size, plan.recovery_set_id, &options.cancellation)?;
@@ -1072,6 +1183,8 @@ pub(crate) fn write_outputs(
         recovery_count: plan.recovery_count,
         bytes_written,
         dry_run: false,
+        requested_backend: options.backend,
+        selected_backend: selected_policy(&backend),
     })
 }
 
@@ -1491,18 +1604,29 @@ fn sync_parent_directories(paths: &[PathBuf]) -> Result<()> {
 }
 
 fn target_file_identity(path: &Path) -> std::io::Result<Option<FileIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
     #[cfg(unix)]
     {
-        match fs::metadata(path) {
-            Ok(metadata) => Ok(FileIdentity::from_metadata(&metadata)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(FileIdentity::from_metadata(&metadata))
     }
     #[cfg(windows)]
     {
         match File::open(path) {
-            Ok(file) => FileIdentity::from_file(&file).map(Some),
+            Ok(file) => match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    FileIdentity::from_file(&file).map(Some)
+                }
+                Ok(_) => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -1515,14 +1639,14 @@ fn target_file_identity(path: &Path) -> std::io::Result<Option<FileIdentity>> {
 }
 
 pub(crate) fn capture_target_snapshot(path: &Path) -> std::io::Result<TargetSnapshot> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(TargetSnapshot::Symlink),
         Ok(metadata) if metadata.is_dir() => Ok(TargetSnapshot::Directory),
-        Ok(_) => target_file_identity(path)?.map(TargetSnapshot::File).ok_or_else(|| {
-            std::io::Error::other("output identity is unavailable")
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(TargetSnapshot::Absent)
-        }
+        Ok(metadata) if metadata.is_file() => target_file_identity(path)?
+            .map(TargetSnapshot::File)
+            .ok_or_else(|| std::io::Error::other("output identity is unavailable")),
+        Ok(_) => Ok(TargetSnapshot::Special),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(TargetSnapshot::Absent),
         Err(error) => Err(error),
     }
 }
@@ -1563,11 +1687,31 @@ fn quarantine_owned_target_with_hook<F: FnOnce()>(
                 // unlink primitive that can safely delete it after a race.
                 Ok(RollbackTarget::OwnedQuarantined(namespace))
             } else {
-                // The pathname may have been replaced at the rollback
-                // boundary. Restore it only by no-replace hard link and keep
-                // the moved object in quarantine if restoration loses a race.
-                restore_no_replace_preserving_source(&quarantine, &target.path)
-                    .map_err(Par2Error::Io)?;
+                let moved = capture_target_snapshot(&quarantine).map_err(Par2Error::Io)?;
+                match restore_moved_target(&quarantine, &target.path, moved) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(backup_recovery_error(
+                            &target.path,
+                            &quarantine,
+                            "installed output restore found an occupied target".to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(backup_recovery_error(
+                            &target.path,
+                            &quarantine,
+                            format!("installed output restore failed: {error}"),
+                        ));
+                    }
+                }
+                fs::remove_dir(&namespace).map_err(|error| {
+                    backup_recovery_error(
+                        &target.path,
+                        &quarantine,
+                        format!("installed output quarantine cleanup failed: {error}"),
+                    )
+                })?;
                 Err(Par2Error::CreationValidation {
                     path: target.path.display().to_string(),
                     reason: "installed output identity changed during rollback".to_string(),
@@ -1585,23 +1729,134 @@ fn quarantine_owned_target_with_hook<F: FnOnce()>(
     }
 }
 
-fn restore_no_replace_preserving_source(source: &Path, target: &Path) -> std::io::Result<bool> {
-    match fs::hard_link(source, target) {
+fn backup_recovery_error(target: &Path, backup: &Path, reason: String) -> Par2Error {
+    Par2Error::CreationValidation {
+        path: target.display().to_string(),
+        reason: format!("{reason}; recovery path: {}", backup.display()),
+    }
+}
+
+fn restore_moved_target(
+    source: &Path,
+    target: &Path,
+    moved: TargetSnapshot,
+) -> std::io::Result<bool> {
+    if matches!(moved, TargetSnapshot::Absent) {
+        return Ok(true);
+    }
+    match rename_no_replace(source, target) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) if no_replace_unavailable(&error) => {
+            if matches!(moved, TargetSnapshot::Directory) {
+                return Err(error);
+            }
+            match fs::hard_link(source, target) {
+                Ok(()) => match fs::remove_file(source) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                    Err(error) => Err(error),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     }
 }
 
-fn preserve_moved_target(
-    source: &Path,
-    target: &Path,
-    moved: TargetSnapshot,
-) -> std::io::Result<()> {
-    if matches!(moved, TargetSnapshot::File(_)) {
-        let _ = restore_no_replace_preserving_source(source, target)?;
+fn no_replace_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result =
+        unsafe { move_file_ex_w(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(source: *const u16, target: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn rename_no_replace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_no_replace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]
@@ -1885,17 +2140,94 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Par2Error::CreationValidation { .. }));
         assert_eq!(fs::read(&target).unwrap(), b"foreign");
-        assert!(fs::read_dir(directory.path()).unwrap().any(|entry| {
-            let path = entry.unwrap().path();
-            path.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .starts_with(".par2-create-quarantine-")
-            }) && fs::read(path.join("set.par2")).is_ok_and(|data| data == b"foreign")
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".par2-create-quarantine-")
+        }));
+    }
+
+    #[test]
+    fn overwrite_backup_boundary_restores_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("set.par2");
+        fs::write(&target, b"planned").unwrap();
+        let staged = test_staged_outputs(&directory, &["set"]);
+
+        let error = staged
+            .commit_with_transaction_hooks(
+                true,
+                &CancellationToken::new(),
+                |target, _| {
+                    fs::remove_file(target).unwrap();
+                    fs::create_dir(target).unwrap();
+                    fs::write(target.join("foreign"), b"foreign directory material").unwrap();
+                },
+                |_, _| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Par2Error::CreationValidation { .. }));
+        assert!(target.is_dir());
+        assert_eq!(
+            fs::read(target.join("foreign")).unwrap(),
+            b"foreign directory material"
+        );
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".par2-create-backup-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_backup_boundary_restores_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("set.par2");
+        let referent = directory.path().join("foreign.bin");
+        fs::write(&target, b"planned").unwrap();
+        fs::write(&referent, b"foreign symlink material").unwrap();
+        let staged = test_staged_outputs(&directory, &["set"]);
+
+        let error = staged
+            .commit_with_transaction_hooks(
+                true,
+                &CancellationToken::new(),
+                |target, _| {
+                    fs::remove_file(target).unwrap();
+                    symlink(&referent, target).unwrap();
+                },
+                |_, _| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Par2Error::CreationValidation { .. }));
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), referent);
+        assert_eq!(fs::read(&target).unwrap(), b"foreign symlink material");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".par2-create-backup-")
         }));
     }
 
     fn test_staged_outputs(directory: &tempfile::TempDir, names: &[&str]) -> StagedOutputs {
-        let volumes = names
+        let volumes: Vec<VolumeState> = names
             .iter()
             .map(|name| {
                 let stage_path = directory.path().join(format!(".{name}.stage"));
@@ -1967,7 +2299,10 @@ mod tests {
         let error = staged.commit(true, &CancellationToken::new()).unwrap_err();
 
         assert!(matches!(error, Par2Error::CreationValidation { .. }));
-        assert_eq!(fs::read(target.join("foreign")).unwrap(), b"foreign directory material");
+        assert_eq!(
+            fs::read(target.join("foreign")).unwrap(),
+            b"foreign directory material"
+        );
     }
 
     #[test]

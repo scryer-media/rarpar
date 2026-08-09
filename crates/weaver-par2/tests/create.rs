@@ -3,12 +3,51 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+use par2_rs::ProgressStage;
 use par2_rs::{
-    BlockSizing, ForwardKernel, Par2CreateOutcome, Par2Creator, Par2CreatorOptions, Par2Error,
-    Par2FileSet, RecoveryAmount, VolumeScheme,
+    BlockSizing, CreationBackend, ForwardKernel, Par2CreateOutcome, Par2Creator,
+    Par2CreatorOptions, Par2Error, Par2FileSet, RecoveryAmount, VolumeScheme,
 };
 use tempfile::tempdir;
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+static NATIVE_METAL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+struct NativeMetalEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl NativeMetalEnvGuard {
+    fn set(value: &str) -> Self {
+        let lock = NATIVE_METAL_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("WEAVER_GF16_METAL");
+        unsafe { std::env::set_var("WEAVER_GF16_METAL", value) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl Drop for NativeMetalEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("WEAVER_GF16_METAL", value) },
+            None => unsafe { std::env::remove_var("WEAVER_GF16_METAL") },
+        }
+    }
+}
 
 #[test]
 fn create_validates_empty_files_and_writes_critical_set() {
@@ -302,6 +341,7 @@ fn creation_uses_bounded_disk_backed_stripes_for_large_sources() {
     assert!(plan.memory.source_hash_workspace_bytes >= 256 * 1024);
     assert!(plan.memory.main_file_id_workspace_bytes > 0);
     assert!(plan.memory.critical_packet_bytes > 0);
+    assert!(plan.memory.packet_build_workspace_bytes > 0);
     assert!(plan.memory.validation_workspace_bytes >= 512 * 1024);
     assert!(plan.memory.processing_peak_bytes <= plan.memory.processing_buffer_limit_bytes);
     assert_eq!(
@@ -314,6 +354,8 @@ fn creation_uses_bounded_disk_backed_stripes_for_large_sources() {
         plan.memory.total_creation_peak_bytes
             >= plan.memory.source_metadata_bytes * 2
                 + plan.memory.critical_packet_bytes
+                + plan.memory.main_file_id_workspace_bytes
+                + plan.memory.packet_build_workspace_bytes
                 + plan.memory.transaction_workspace_bytes
                 + plan.memory.processing_peak_bytes
     );
@@ -322,6 +364,7 @@ fn creation_uses_bounded_disk_backed_stripes_for_large_sources() {
             >= plan.memory.source_metadata_bytes * 2
                 + plan.memory.critical_packet_bytes
                 + plan.memory.main_file_id_workspace_bytes
+                + plan.memory.packet_build_workspace_bytes
                 + plan.memory.transaction_workspace_bytes
                 + plan.memory.validation_workspace_bytes
     );
@@ -376,4 +419,369 @@ fn create_revalidates_targets_that_appear_after_planning() {
         creator.create(&plan),
         Err(Par2Error::CreationOutputExists { .. })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn create_rejects_planned_file_replaced_by_a_symlink_to_the_same_file() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    let referent = directory.path().join("original.bin");
+    let output = directory.path().join("set.par2");
+    fs::write(&source, b"source").unwrap();
+    fs::write(&referent, b"original output material").unwrap();
+    fs::hard_link(&referent, &output).unwrap();
+
+    let mut options = Par2CreatorOptions::with_output(
+        output.clone(),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.overwrite = true;
+    options.recovery_amount = RecoveryAmount::Count(0);
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    fs::remove_file(&output).unwrap();
+    symlink(&referent, &output).unwrap();
+
+    assert!(matches!(
+        creator.create(&plan),
+        Err(Par2Error::UnsafeCreationOutput { .. })
+    ));
+    assert!(
+        fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&output).unwrap(), referent);
+    assert_eq!(fs::read(&referent).unwrap(), b"original output material");
+}
+
+#[test]
+fn create_rejects_coherent_same_length_output_path_mutation() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    fs::write(&source, b"source").unwrap();
+    let original = directory.path().join("set.par2");
+    let redirected = directory.path().join("alt.par2");
+    let mut options = Par2CreatorOptions::with_output(
+        original.clone(),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.recovery_amount = RecoveryAmount::Count(0);
+
+    let creator = Par2Creator::new(options);
+    let mut plan = creator.plan().unwrap();
+    plan.output_stem = directory.path().join("alt");
+    plan.main_path = redirected.clone();
+    plan.output_paths[0] = redirected.clone();
+
+    assert!(matches!(
+        creator.create(&plan),
+        Err(Par2Error::InvalidCreationOptions { .. })
+    ));
+    assert!(!original.exists());
+    assert!(!redirected.exists());
+}
+
+#[test]
+fn create_rejects_mutated_dry_run_policy_before_staging() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    let output = directory.path().join("set.par2");
+    fs::write(&source, b"source").unwrap();
+    let options = Par2CreatorOptions::with_output(
+        output.clone(),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+
+    let creator = Par2Creator::new(options);
+    let mut plan = creator.plan().unwrap();
+    plan.dry_run = true;
+
+    assert!(matches!(
+        creator.create(&plan),
+        Err(Par2Error::InvalidCreationOptions { .. })
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn create_rejects_mutated_volume_policy_and_exponent_allocation() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    fs::write(&source, vec![0x5a; 64]).unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("set"),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(4);
+    options.recovery_amount = RecoveryAmount::Count(3);
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+
+    let mut policy_mutation = plan.clone();
+    policy_mutation.volume_scheme = VolumeScheme::Uniform;
+    assert!(matches!(
+        creator.create(&policy_mutation),
+        Err(Par2Error::InvalidCreationOptions { .. })
+    ));
+
+    let mut exponent_mutation = plan;
+    exponent_mutation.first_exponent += 1;
+    exponent_mutation.recovery_exponents = exponent_mutation
+        .recovery_exponents
+        .iter()
+        .map(|exponent| exponent + 1)
+        .collect();
+    let mut next_exponent = exponent_mutation.first_exponent;
+    for volume in &mut exponent_mutation.volumes {
+        volume.first_exponent = next_exponent;
+        next_exponent += volume.recovery_count;
+    }
+    assert!(matches!(
+        creator.create(&exponent_mutation),
+        Err(Par2Error::InvalidCreationOptions { .. })
+    ));
+}
+
+#[test]
+fn packet_build_workspace_includes_maximum_ifsc_body_and_is_integrity_bound() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("max.bin");
+    fs::write(&source, vec![0x33; 4 * 32_768]).unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("set"),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(4);
+    options.recovery_amount = RecoveryAmount::Count(0);
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    assert!(
+        plan.memory.packet_build_workspace_bytes
+            >= std::mem::size_of::<Vec<u8>>() + 16 + 20 * 32_768
+    );
+
+    let mut invalid = plan;
+    invalid.memory.packet_build_workspace_bytes -= 1;
+    assert!(matches!(
+        creator.create(&invalid),
+        Err(Par2Error::InvalidCreationOptions { .. })
+    ));
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+#[test]
+fn auto_backend_falls_back_before_staging_when_metal_is_not_compiled() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    fs::write(&source, b"backend fallback input").unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("auto-set"),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(8);
+    options.recovery_amount = RecoveryAmount::Count(1);
+    options.backend = CreationBackend::Auto;
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    let outcome = creator.create(&plan).unwrap();
+    assert_eq!(outcome.requested_backend, CreationBackend::Auto);
+    assert_eq!(outcome.selected_backend, CreationBackend::Cpu);
+    assert!(directory.path().join("auto-set.par2").is_file());
+    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".par2-create-")
+    }));
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+#[test]
+fn strict_metal_reports_typed_unavailable_error_without_staging() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    fs::write(&source, b"strict backend input").unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("strict-set"),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(8);
+    options.recovery_amount = RecoveryAmount::Count(1);
+    options.backend = CreationBackend::Metal;
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    assert!(matches!(
+        creator.create(&plan),
+        Err(Par2Error::MetalUnavailable { .. })
+    ));
+    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".par2-create-")
+    }));
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires native Metal hardware"]
+fn native_metal_creation_matches_cpu_with_batching_tiling_and_stripes() {
+    let _env_guard = NativeMetalEnvGuard::set("1");
+    let directory = tempdir().unwrap();
+    let files = (0..67)
+        .map(|index| {
+            let path = directory.path().join(format!("source-{index:03}.bin"));
+            let data = (0..4_999)
+                .map(|offset: usize| (offset.wrapping_mul(13) ^ index) as u8)
+                .collect::<Vec<_>>();
+            fs::write(&path, data).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+
+    let make_options = |stem: &str, backend| {
+        let mut options = Par2CreatorOptions::with_output(
+            directory.path().join(stem),
+            Some(directory.path().to_path_buf()),
+            files.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(5_000);
+        options.recovery_amount = RecoveryAmount::Count(17);
+        options.memory_limit = Some(8 * 1024 * 1024 + 512 * 1024);
+        options.backend = backend;
+        options
+    };
+
+    let cpu_creator = Par2Creator::new(make_options("cpu-set", CreationBackend::Cpu));
+    let cpu_plan = cpu_creator.plan().unwrap();
+    let cpu = cpu_creator.create(&cpu_plan).unwrap();
+
+    let metal_creator = Par2Creator::new(make_options("metal-set", CreationBackend::Metal));
+    let metal_plan = metal_creator.plan().unwrap();
+    let metal = metal_creator.create(&metal_plan).unwrap();
+    assert_eq!(metal.selected_backend, CreationBackend::Metal);
+    assert_eq!(metal.source_slice_count, 67);
+    assert_eq!(metal.recovery_count, 17);
+    assert_eq!(
+        metal_plan.memory.factor_workspace_bytes
+            + metal_plan.memory.jit_workspace_bytes
+            + metal_plan.memory.stripe_buffer_bytes,
+        metal_plan.memory.processing_peak_bytes
+    );
+    assert_eq!(cpu.output_paths.len(), metal.output_paths.len());
+    for (cpu_path, metal_path) in cpu.output_paths.iter().zip(&metal.output_paths) {
+        assert_eq!(fs::read(cpu_path).unwrap(), fs::read(metal_path).unwrap());
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires native Metal hardware"]
+fn native_metal_cancellation_after_encoding_leaves_no_transaction_residue() {
+    let _env_guard = NativeMetalEnvGuard::set("1");
+    let directory = tempdir().unwrap();
+    let files = (0..67)
+        .map(|index| {
+            let path = directory.path().join(format!("source-{index:03}.bin"));
+            let data = (0..4_999)
+                .map(|offset: usize| (offset.wrapping_mul(17) ^ index) as u8)
+                .collect::<Vec<_>>();
+            fs::write(&path, data).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let cancellation = par2_rs::CancellationToken::new();
+    let source_phase_complete = Arc::new(AtomicUsize::new(0));
+    let gpu_started = Arc::new(AtomicUsize::new(0));
+    let phase = Arc::clone(&source_phase_complete);
+    let started = Arc::clone(&gpu_started);
+    let cancel = cancellation.clone();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("metal-cancelled"),
+        Some(directory.path().to_path_buf()),
+        files,
+    );
+    options.block_sizing = BlockSizing::Bytes(5_000);
+    options.recovery_amount = RecoveryAmount::Count(17);
+    options.memory_limit = Some(8 * 1024 * 1024 + 512 * 1024);
+    options.backend = CreationBackend::Metal;
+    options.cancellation = cancellation;
+    options.progress = Some(Arc::new(move |update| {
+        if update.stage != ProgressStage::Creating {
+            return;
+        }
+        if update.total > 10 {
+            if update.current.saturating_add(1) == update.total {
+                phase.store(1, Ordering::Relaxed);
+            }
+        } else if phase.load(Ordering::Relaxed) == 1 {
+            started.fetch_add(1, Ordering::Relaxed);
+            cancel.cancel();
+        }
+    }));
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    let result = creator.create(&plan);
+    assert!(matches!(result, Err(Par2Error::Cancelled)));
+    assert!(gpu_started.load(Ordering::Relaxed) > 0);
+    assert!(plan.output_paths.iter().all(|path| !path.exists()));
+    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".par2-create-")
+    }));
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires native Metal admission"]
+fn native_metal_disabled_policy_reports_unavailable_before_staging() {
+    let _env_guard = NativeMetalEnvGuard::set("0");
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("data.bin");
+    fs::write(&source, b"disabled Metal backend").unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("disabled-set"),
+        Some(directory.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(8);
+    options.recovery_amount = RecoveryAmount::Count(1);
+    options.backend = CreationBackend::Metal;
+
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    assert!(matches!(
+        creator.create(&plan),
+        Err(Par2Error::MetalUnavailable { .. })
+    ));
+    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".par2-create-")
+    }));
 }

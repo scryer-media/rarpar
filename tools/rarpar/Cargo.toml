@@ -26,6 +26,7 @@ runtime = [
     "unrar-rs/native-crypto",
 ]
 wgpu = ["runtime", "par2-rs/wgpu"]
+metal = ["runtime", "par2-rs/metal"]
 
 [dependencies]
 par2-rs = { path = "../../crates/weaver-par2", version = "0.3.0", default-features = false, optional = true }

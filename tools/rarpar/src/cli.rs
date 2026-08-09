@@ -280,6 +280,22 @@ pub struct ParCreateArgs {
         value_parser = clap::value_parser!(usize)
     )]
     pub memory_mib: Option<usize>,
+
+    /// Recovery creation backend: cpu, auto, or metal. Auto keeps work below
+    /// 16 GiB on CPU and preflights native Metal when available at or above it.
+    #[arg(long, value_enum, default_value_t = ParCreationBackend::Cpu)]
+    pub backend: ParCreationBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParCreationBackend {
+    /// Always use the CPU/SIMD creation path.
+    Cpu,
+    /// Keep work below 16 GiB on CPU; at or above it, preflight native Metal
+    /// when available and use CPU if Metal cannot be admitted.
+    Auto,
+    /// Require Metal for recovery-data creation.
+    Metal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -357,6 +373,12 @@ mod tests {
         assert_eq!(args.volume_scheme, ParVolumeScheme::Uniform);
         assert_eq!(args.volume_count, Some(3));
         assert_eq!(args.memory_mib, Some(128));
+    }
+
+    #[test]
+    fn create_accepts_explicit_backend_selection() {
+        let args = create_args(&["set", "a.bin", "--backend", "metal"]);
+        assert_eq!(args.backend, ParCreationBackend::Metal);
     }
 
     #[test]

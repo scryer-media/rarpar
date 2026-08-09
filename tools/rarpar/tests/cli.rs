@@ -241,9 +241,12 @@ fn par_create_dry_run_reports_real_plan_without_outputs() {
     assert!(report["plan"]["memory"]["controller_overhead_blocks"].is_number());
     assert!(report["plan"]["memory"]["critical_packet_bytes"].is_number());
     assert!(report["plan"]["memory"]["main_file_id_workspace_bytes"].is_number());
+    assert!(report["plan"]["memory"]["packet_build_workspace_bytes"].is_number());
     assert!(report["plan"]["memory"]["validation_workspace_bytes"].is_number());
     assert!(report["plan"]["memory"]["total_creation_peak_bytes"].is_number());
-    assert!(report["outcome"].is_null());
+    assert_eq!(report["plan"]["backend_selected"], "cpu");
+    assert_eq!(report["outcome"]["backend_selected"], "cpu");
+    assert_eq!(report["outcome"]["dry_run"], true);
     for path in report["plan"]["output_paths"].as_array().unwrap() {
         assert!(!Path::new(path.as_str().unwrap()).exists());
     }
@@ -284,6 +287,8 @@ fn par_create_json_reports_real_outcome_and_writes_outputs() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "created");
     assert_eq!(report["dry_run"], false);
+    assert_eq!(report["outcome"]["backend_requested"], "cpu");
+    assert_eq!(report["outcome"]["backend_selected"], "cpu");
     assert_eq!(report["outcome"]["dry_run"], false);
     assert_eq!(report["outcome"]["recovery_count"], 1);
     assert!(report["outcome"]["bytes_written"].as_u64().unwrap() > 0);

@@ -32,8 +32,9 @@ pub(crate) struct ForwardMemoryEstimate {
 
 /// Arithmetic path requested for forward encoding.
 ///
-/// `Auto` follows the runtime ladder used by the CPU repair controller.  The
-/// other variants are useful for deterministic validation and controlled
+/// `Auto` follows the creation-specific runtime ladder, which may prioritize
+/// AVX-512 and does not follow the repair controller.  The other variants are
+/// useful for deterministic validation and controlled
 /// benchmarking; an explicitly requested unavailable tier returns an error.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ForwardKernel {
@@ -205,7 +206,7 @@ impl ForwardEncoder {
             if capabilities.avx512_jit {
                 kernels.push(ForwardKernel::XorJitAvx512);
             }
-            return kernels;
+            kernels
         }
         #[cfg(not(target_arch = "x86_64"))]
         kernels
@@ -327,6 +328,7 @@ impl ForwardEncoder {
                         .saturating_sub(source_start)
                         .min(contract.input_grouping),
                     aligned_len,
+                    buffers.aligned_chunk_len,
                     contract,
                     #[cfg(target_arch = "x86_64")]
                     &mut jit_workspace,
@@ -468,11 +470,11 @@ struct KernelCapabilities {
 fn runtime_kernel_capabilities() -> KernelCapabilities {
     #[cfg(target_arch = "x86_64")]
     {
-        return KernelCapabilities {
+        KernelCapabilities {
             avx512_jit: reedsolomon_rs::xor_jit::supported_512(),
             avx2_jit: reedsolomon_rs::xor_jit::JitWidth::detect().is_some(),
             folded: gf_simd::altmap_supported(),
-        };
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     KernelCapabilities {
@@ -1004,6 +1006,7 @@ fn accumulate_batch(
     source_start: usize,
     live_inputs: usize,
     aligned_len: usize,
+    output_stride: usize,
     contract: KernelContract,
     #[cfg(target_arch = "x86_64")]
     jit_workspace: &mut reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
@@ -1019,7 +1022,7 @@ fn accumulate_batch(
         ResolvedKernel::Portable => {
             for (output_index, &exponent) in exponents.iter().enumerate() {
                 factors.fill_row(exponent, source_start, live_inputs, &mut row);
-                let dst_start = output_index * aligned_len;
+                let dst_start = output_index * output_stride;
                 scalar_accumulate(
                     &mut output[dst_start..dst_start + aligned_len],
                     staging_bytes,
@@ -1036,7 +1039,7 @@ fn accumulate_batch(
                     .iter()
                     .map(|&factor| gf_simd::prepare_input_factor(factor))
                     .collect::<Vec<_>>();
-                let dst_start = output_index * aligned_len;
+                let dst_start = output_index * output_stride;
                 let mut inputs = Vec::with_capacity(live_inputs);
                 for (lane, prepared_factor) in prepared.iter().enumerate() {
                     let source_start_bytes = lane * aligned_len;
@@ -1064,7 +1067,7 @@ fn accumulate_batch(
             let mut shuffle2x = Vec::with_capacity(live_inputs);
             for (output_index, &exponent) in exponents.iter().enumerate() {
                 factors.fill_row(exponent, source_start, live_inputs, &mut row);
-                let dst_start = output_index * aligned_len;
+                let dst_start = output_index * output_stride;
                 if gf_simd::folded_uses_gfni() {
                     affine.clear();
                     affine.extend(
@@ -1122,7 +1125,7 @@ fn accumulate_batch(
                 let batch = jit_workspace
                     .build(width, &row_refs, jit_code_budget.max(1))
                     .map_err(|error| jit_build_error(error.to_string()))?;
-                let dst_start = output_index * aligned_len;
+                let dst_start = output_index * output_stride;
                 let code = batch
                     .row(0)
                     .ok_or_else(|| invalid_input("packed XOR-JIT output row missing"))?;
@@ -1642,6 +1645,103 @@ mod tests {
         assert_eq!(sink.chunks.last().unwrap().2, 256);
         assert_eq!(sink.chunks.last().unwrap().3.len(), 4);
         assert_eq!(sink.chunks.len(), 4);
+    }
+
+    #[test]
+    fn tight_memory_preserves_recovery_bytes_for_every_available_kernel() {
+        let slice_size = 1028usize;
+        let source_count = 19;
+        let output_count = 3;
+        let sources = (0..source_count)
+            .map(|source| {
+                (0..slice_size)
+                    .map(|index| (index.wrapping_mul(17) ^ (source * 29)) as u8)
+                    .collect()
+            })
+            .collect::<Vec<Vec<u8>>>();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let exponents = vec![4, 9, 17];
+        assert_eq!(refs.len(), source_count);
+        assert_eq!(exponents.len(), output_count);
+        let encoder = ForwardEncoder::new(slice_size, exponents).unwrap();
+        let (_, reference_plan) = select_kernel_for_memory(
+            slice_size,
+            output_count,
+            source_count,
+            usize::MAX,
+            ForwardKernel::Portable,
+        )
+        .unwrap();
+        assert_eq!(reference_plan.chunk_len, slice_size);
+        let reference = encoder
+            .encode(
+                &refs,
+                &ForwardEncoderOptions {
+                    memory_limit: Some(reference_plan.memory_bytes),
+                    kernel: ForwardKernel::Portable,
+                    ..ForwardEncoderOptions::default()
+                },
+            )
+            .unwrap();
+
+        for kernel in ForwardEncoder::available_kernels() {
+            let (_, full_plan) = select_kernel_for_memory(
+                slice_size,
+                output_count,
+                source_count,
+                usize::MAX,
+                kernel,
+            )
+            .unwrap();
+            let (tight_limit, tight_plan) = if full_plan.chunk_len < slice_size {
+                (full_plan.memory_bytes, full_plan)
+            } else {
+                let mut memory_limit = full_plan.memory_bytes;
+                loop {
+                    memory_limit = memory_limit
+                        .checked_sub(1)
+                        .expect("a full-stripe plan has a smaller admitted plan");
+                    match select_kernel_for_memory(
+                        slice_size,
+                        output_count,
+                        source_count,
+                        memory_limit,
+                        kernel,
+                    ) {
+                        Ok((_, plan))
+                            if plan.chunk_len < slice_size
+                                && !slice_size.is_multiple_of(plan.chunk_len) =>
+                        {
+                            break (memory_limit, plan);
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+                }
+            };
+            assert!(
+                tight_plan.chunk_len < slice_size,
+                "kernel {kernel:?} retained a full-size stripe"
+            );
+            let stripe_count = slice_size.div_ceil(tight_plan.chunk_len);
+            assert!(stripe_count > 1, "kernel {kernel:?} used one stripe");
+            let final_len = slice_size % tight_plan.chunk_len;
+            assert!(
+                final_len > 0 && final_len < tight_plan.chunk_len,
+                "kernel {kernel:?} did not produce a short final stripe"
+            );
+
+            let actual = encoder
+                .encode(
+                    &refs,
+                    &ForwardEncoderOptions {
+                        memory_limit: Some(tight_limit),
+                        kernel,
+                        ..ForwardEncoderOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual, reference, "kernel {kernel:?} differs from portable");
+        }
     }
 
     #[test]

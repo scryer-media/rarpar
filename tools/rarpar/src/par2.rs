@@ -7,10 +7,12 @@ use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use crate::report;
 use par2_rs::{
-    BlockSizing, Par2CreateOutcome, Par2CreatePlan, Par2Creator, Par2CreatorOptions,
-    RecoveryAmount, VolumeScheme,
+    BlockSizing, CreationBackend, Par2CreateOutcome, Par2CreatePlan, Par2Creator,
+    Par2CreatorOptions, RecoveryAmount, VolumeScheme,
 };
-use rarpar::cli::{Cli, ParArgs, ParCommand, ParCreateArgs, ParPlacement, ParVolumeScheme};
+use rarpar::cli::{
+    Cli, ParArgs, ParCommand, ParCreateArgs, ParCreationBackend, ParPlacement, ParVolumeScheme,
+};
 use serde::Serialize;
 use tracing::info;
 
@@ -135,6 +137,11 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
     };
     options.volume_count = args.volume_count;
     options.memory_limit = memory_limit;
+    options.backend = match args.backend {
+        ParCreationBackend::Cpu => CreationBackend::Cpu,
+        ParCreationBackend::Auto => CreationBackend::Auto,
+        ParCreationBackend::Metal => CreationBackend::Metal,
+    };
     options.overwrite = cli.overwrite;
     options.dry_run = cli.dry_run;
 
@@ -145,10 +152,6 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
     let creator = Par2Creator::new(options);
     let plan: Par2CreatePlan = creator.plan()?;
     report::emit_par_create_plan(cli, &plan)?;
-    if cli.dry_run {
-        return Ok(EXIT_SUCCESS);
-    }
-
     let outcome: Par2CreateOutcome = creator.create(&plan)?;
     report::emit_par_create_outcome(cli, &plan, &outcome)?;
     Ok(EXIT_SUCCESS)
