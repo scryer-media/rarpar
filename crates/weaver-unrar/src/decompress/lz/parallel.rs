@@ -12,8 +12,9 @@ use rayon::ThreadPool;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::batch_plan::{self, Batch};
 use super::bitstream::{BitRead, BitReader};
-use super::block_reader::BlockReader;
+use super::block_reader::{BlockReader, LOOKAHEAD_BYTES};
 use super::filter::{FilterType, PendingFilter};
 use super::huffman::{self, HuffmanTable};
 use super::phase_diagnostics::{self, Phase, SymbolKind, WorkerCounters};
@@ -26,9 +27,8 @@ struct ScannedBlocks {
     saw_last_block: bool,
 }
 
-/// Minimum number of blocks to justify parallel dispatch.
-/// Below this, rayon overhead exceeds the benefit.
-const MIN_PARALLEL_BLOCKS: usize = 4;
+/// A single block stays inline; two or more normal blocks use the worker pool.
+const MIN_PARALLEL_BLOCKS: usize = 2;
 
 /// Per-block decoded item buffer size.
 const DECODED_ITEMS_CAPACITY: usize = 0x4100;
@@ -40,8 +40,9 @@ const MAX_PARALLEL_THREADS: usize = 8;
 /// Blocks exceeding this fall back to single-threaded inline decode.
 const LARGE_BLOCK_BITS: i64 = 0x20000 * 8;
 
-/// Maximum number of pending filters to hold at once.
-const MAX_PENDING_FILTERS: usize = 8192;
+/// Upper bound on a block payload copied into the padded-decode scratch.
+/// Matches the non-large block ceiling, so the copy stays bounded.
+const MAX_PADDED_BLOCK_BYTES: usize = (LARGE_BLOCK_BITS as usize) / 8;
 
 /// Maximum accepted filter block size.
 const MAX_FILTER_BLOCK_SIZE: u32 = 0x400000;
@@ -88,12 +89,16 @@ struct BlockInfo {
 }
 
 /// A set of Huffman tables shared by one or more blocks.
+///
+/// Tables are reference-counted: a batch shares one build with every worker
+/// that inherits it, and installing a worker's final state back on the decoder
+/// moves the handles instead of rebuilding four tables.
 #[derive(Clone)]
 struct TableSet {
-    nc: HuffmanTable,
-    dc: HuffmanTable,
-    ldc: HuffmanTable,
-    rc: HuffmanTable,
+    nc: Arc<HuffmanTable>,
+    dc: Arc<HuffmanTable>,
+    ldc: Arc<HuffmanTable>,
+    rc: Arc<HuffmanTable>,
 }
 
 struct WorkerState {
@@ -102,10 +107,38 @@ struct WorkerState {
     diagnostics: WorkerCounters,
 }
 
-#[derive(Clone, Copy)]
-struct BlockAssignment {
-    start: usize,
-    end: usize,
+type BlockAssignment = Batch;
+
+struct DecodeFailure {
+    block_index: usize,
+    error: RarError,
+}
+
+struct AssignmentResult {
+    final_state: WorkerState,
+    failure: Option<DecodeFailure>,
+}
+
+/// Per-batch controller bookkeeping, owned by the decoder and recycled.
+#[derive(Default)]
+pub(super) struct BatchScratch {
+    assignments: Vec<BlockAssignment>,
+    results: Vec<Option<AssignmentResult>>,
+}
+
+impl BatchScratch {
+    /// Move the table state of one completed assignment out of the scratch.
+    fn take_final_state(&mut self, index: Option<usize>) -> Option<WorkerState> {
+        let result = self.results.get_mut(index?)?.take()?;
+        Some(result.final_state)
+    }
+}
+
+struct ParallelDecodeOutcome {
+    /// Assignment whose state may be installed, or `None` when the batch
+    /// failed at its first block and no state is safe to keep.
+    final_state_index: Option<usize>,
+    first_failure: Option<DecodeFailure>,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +147,13 @@ struct WorkerOptions {
     diagnostics_enabled: bool,
 }
 
+/// Whether block-parallel decode is available for this process.
+///
+/// Deliberately *not* memoized in a `OnceLock`: the public differential suite
+/// flips `WEAVER_RAR_DISABLE_PARALLEL` between extractions inside one process
+/// to prove the two engines agree, and a cached value would silently run both
+/// halves in the same mode. The lookup is instead hoisted to once per member —
+/// every per-round caller is already inside a `parallel_enabled()` branch.
 pub(super) fn parallel_enabled() -> bool {
     // `!cfg!(target_family = "wasm")` const-folds to `true` on native (the
     // native branch below is preserved verbatim) and to `false` on wasm, so
@@ -347,6 +387,76 @@ impl DecodeBits for BitReader<'_> {
     }
 }
 
+/// Bounded-reader view of the checked bit interface.
+///
+/// `decode_block` is generic over [`BitRead`], so giving [`BlockReader`] the
+/// same interface lets the inline kernel run the ordinary serial decode over
+/// the branch-free reader. Every accessor reads the same MSB-first bits from
+/// the same slice as [`BitReader`] would — `peek_16_left_aligned` even applies
+/// the identical `0xfffe` mask — so the two paths decode to the same symbols.
+/// Past-the-end reads are prevented by the constructor's lookahead contract,
+/// which is why this is only ever installed for a fully staged block.
+impl BitRead for BlockReader<'_> {
+    #[inline(always)]
+    fn bits_remaining(&mut self) -> usize {
+        self.end().saturating_sub(BlockReader::position(self))
+    }
+
+    #[inline(always)]
+    fn has_bits(&mut self) -> bool {
+        BlockReader::position(self) < self.end()
+    }
+
+    #[inline(always)]
+    fn has_exact_bits(&mut self, bits: usize) -> RarResult<bool> {
+        Ok(BlockReader::position(self).saturating_add(bits) <= self.end())
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        BlockReader::position(self)
+    }
+
+    #[inline(always)]
+    fn read_bits(&mut self, count: u8) -> RarResult<u32> {
+        Ok(BlockReader::read_bits(self, count) as u32)
+    }
+
+    #[inline(always)]
+    fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
+        Ok(BlockReader::read_bits(self, count))
+    }
+
+    #[inline(always)]
+    fn peek_16_raw(&mut self) -> RarResult<u32> {
+        Ok(u32::from(self.peek_u16()))
+    }
+
+    #[inline(always)]
+    fn peek_16_left_aligned(&mut self) -> RarResult<u32> {
+        Ok(u32::from(self.peek_u16()) & 0xfffe)
+    }
+
+    #[inline(always)]
+    fn consume_bits(&mut self, count: u8) -> RarResult<()> {
+        self.advance(count as usize);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn skip_bits(&mut self, count: u32) -> RarResult<()> {
+        self.advance(count as usize);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn align_byte(&mut self) -> RarResult<()> {
+        let padding = (8 - (BlockReader::position(self) & 7)) & 7;
+        self.advance(padding);
+        Ok(())
+    }
+}
+
 impl DecodeBits for BlockReader<'_> {
     #[inline(always)]
     fn position(&self) -> usize {
@@ -393,6 +503,7 @@ fn decode_block_symbols(
     items: &mut Vec<DecodedItem>,
 ) -> RarResult<()> {
     let mut counters = WorkerCounters::new();
+    let mut padded = Vec::new();
     decode_block_symbols_counted(
         input,
         block,
@@ -401,9 +512,32 @@ fn decode_block_symbols(
         false,
         items,
         &mut counters,
+        &mut padded,
     )
 }
 
+/// Copy a tail block into `padded` with a zeroed lookahead guard.
+///
+/// The fast reader needs [`LOOKAHEAD_BYTES`] readable bytes past the logical
+/// block end. In-memory members hand the controller an unpadded slice, so the
+/// final blocks would otherwise fall to the checked reader for the rest of the
+/// member. The copy is bounded by the non-large block ceiling.
+fn stage_padded_block<'a>(
+    padded: &'a mut Vec<u8>,
+    slice: &[u8],
+    block_end_bits: usize,
+) -> Option<&'a [u8]> {
+    let payload_bytes = block_end_bits.div_ceil(8);
+    if payload_bytes > MAX_PADDED_BLOCK_BYTES || payload_bytes > slice.len() {
+        return None;
+    }
+    padded.clear();
+    padded.extend_from_slice(&slice[..payload_bytes]);
+    padded.resize(payload_bytes + LOOKAHEAD_BYTES, 0);
+    Some(padded.as_slice())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_block_symbols_counted(
     input: &[u8],
     block: &BlockInfo,
@@ -412,6 +546,7 @@ fn decode_block_symbols_counted(
     diagnostics: bool,
     items: &mut Vec<DecodedItem>,
     counters: &mut WorkerCounters,
+    padded: &mut Vec<u8>,
 ) -> RarResult<()> {
     let byte_offset = block.payload_bit_offset / 8;
     let bit_remainder = block.payload_bit_offset % 8;
@@ -421,7 +556,19 @@ fn decode_block_symbols_counted(
             detail: "RAR5 block data starts beyond the staged input".into(),
         })?;
     let block_end_bits = bit_remainder + block.payload_bits;
-    if let Ok(mut reader) = BlockReader::new(slice, bit_remainder, block_end_bits) {
+
+    let mut fast_reader = BlockReader::new(slice, bit_remainder, block_end_bits).ok();
+    if fast_reader.is_none() && !block.is_large {
+        // Only the lookahead guard is missing: stage a padded copy rather than
+        // dropping the rest of the member onto the checked reader.
+        if let Some(guarded) = stage_padded_block(padded, slice, block_end_bits) {
+            #[cfg(test)]
+            note_padded_reader_selection();
+            fast_reader = BlockReader::new(guarded, bit_remainder, block_end_bits).ok();
+        }
+    }
+
+    if let Some(mut reader) = fast_reader {
         #[cfg(test)]
         note_fast_reader_selection();
         if diagnostics {
@@ -618,11 +765,10 @@ fn read_filter_data<R: DecodeBits>(reader: &mut R) -> RarResult<u32> {
 // ─── Standalone decode helpers (no &self, usable from parallel context) ──────
 
 fn slot_to_length<R: DecodeBits>(reader: &mut R, slot: usize) -> RarResult<usize> {
-    if slot >= NUM_LENGTH_SLOTS {
-        return Err(RarError::CorruptArchive {
-            detail: format!("length slot out of range: {slot}"),
-        });
-    }
+    // Provable from the table sizes: sym-262 over the 306-symbol NC table is at
+    // most 43, the RC table is built from exactly NUM_LENGTH_SLOTS lengths, and
+    // `HuffmanTable` never decodes a symbol at or past `num_symbols`.
+    debug_assert!(slot < NUM_LENGTH_SLOTS, "length slot out of range: {slot}");
     let (base, extra_bits) = if slot < 8 {
         (2 + slot, 0)
     } else {
@@ -653,12 +799,12 @@ fn decode_distance<R: DecodeBits, const DIAGNOSTICS: bool>(
         }
     }
     let dist_code = dist_code as usize;
-    let max_dist_code = if extra_dist { 79 } else { 63 };
-    if dist_code > max_dist_code {
-        return Err(RarError::CorruptArchive {
-            detail: format!("distance code out of range: {dist_code}"),
-        });
-    }
+    // The DC table is built from exactly 64 (RAR5) or 80 (RAR7) code lengths,
+    // and `HuffmanTable` never decodes a symbol at or past `num_symbols`.
+    debug_assert!(
+        dist_code <= if extra_dist { 79 } else { 63 },
+        "distance code out of range: {dist_code}"
+    );
 
     if dist_code < 4 {
         return Ok(dist_code + 1);
@@ -722,13 +868,20 @@ fn prepare_block(
         reader.skip_bits(bit_remainder as u32)?;
     }
 
-    if source.table_present {
-        let (nc, dc, ldc, rc) =
-            huffman::read_tables_bitreader(&mut reader, code_lengths, extra_dist)?;
-        *tables = Some(TableSet { nc, dc, ldc, rc });
-    }
+    // Parse into locals and validate before publishing: a rejected block must
+    // not leave half-installed tables behind, which is what lets the worker
+    // loop drop its per-block state snapshots.
+    let parsed = if source.table_present {
+        Some(huffman::read_tables_bitreader(
+            &mut reader,
+            code_lengths,
+            extra_dist,
+        )?)
+    } else {
+        None
+    };
 
-    if tables.is_none() {
+    if parsed.is_none() && tables.is_none() {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 block has no Huffman tables".into(),
         });
@@ -737,6 +890,15 @@ fn prepare_block(
     if table_bits > source.payload_bits {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 Huffman tables exceed block payload".into(),
+        });
+    }
+
+    if let Some((nc, dc, ldc, rc)) = parsed {
+        *tables = Some(TableSet {
+            nc: Arc::new(nc),
+            dc: Arc::new(dc),
+            ldc: Arc::new(ldc),
+            rc: Arc::new(rc),
         });
     }
 
@@ -762,25 +924,45 @@ fn next_controller_batch_end(
     limit: usize,
     worker_count: usize,
 ) -> usize {
-    if worker_count <= 1 {
+    if worker_count <= 1 || start >= limit {
         return start;
+    }
+
+    let block_capacity = batch_plan::capacity(worker_count);
+
+    if !blocks[start].table_present {
+        let mut available = 0usize;
+        let mut cursor = start;
+        while cursor < limit
+            && available < block_capacity
+            && !blocks[cursor].table_present
+            && !blocks[cursor].is_large
+        {
+            available += 1;
+            cursor += 1;
+        }
+        return start
+            + batch_plan::plan_batches(available, worker_count)
+                .last()
+                .map_or(0, |batch| batch.end);
+    }
+
+    if next_span_end(blocks, start, limit) == start + 1 {
+        let independent_count = blocks[start..limit]
+            .iter()
+            .take(block_capacity)
+            .take_while(|block| block.table_present && !block.is_large)
+            .count();
+        if independent_count > 0 {
+            return start
+                + batch_plan::plan_batches(independent_count, worker_count)
+                    .last()
+                    .map_or(0, |batch| batch.end);
+        }
     }
 
     let mut cursor = start;
     let mut workers = 0usize;
-    let block_capacity = worker_count.saturating_mul(2);
-
-    if !blocks[start].table_present {
-        while cursor < limit
-            && cursor - start < block_capacity
-            && !blocks[cursor].table_present
-            && !blocks[cursor].is_large
-        {
-            cursor += 1;
-        }
-        return cursor;
-    }
-
     while cursor < limit && workers < worker_count && cursor - start < block_capacity {
         let first_end = next_span_end(blocks, cursor, limit);
         let first_len = first_end - cursor;
@@ -804,19 +986,41 @@ fn next_controller_batch_end(
     cursor
 }
 
+/// Split `blocks[start..end]` into worker assignments, appending to `assignments`.
+///
+/// The caller owns the destination so the controller can recycle it across
+/// batches instead of allocating one plan per dispatch.
 fn build_assignments(
     blocks: &[BlockInfo],
     start: usize,
     end: usize,
     worker_count: usize,
-) -> RarResult<Vec<BlockAssignment>> {
-    if worker_count <= 1 || end - start > worker_count.saturating_mul(2) {
+    assignments: &mut Vec<BlockAssignment>,
+) -> RarResult<()> {
+    if worker_count <= 1 || end - start > batch_plan::capacity(worker_count) {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 parallel controller received an oversized batch".into(),
         });
     }
 
-    let mut assignments = Vec::new();
+    let uniform_span = blocks[start..end]
+        .iter()
+        .all(|block| block.table_present && !block.is_large)
+        || blocks[start..end]
+            .iter()
+            .all(|block| !block.table_present && !block.is_large);
+    if uniform_span {
+        assignments.extend(
+            batch_plan::plan_batches(end - start, worker_count)
+                .into_iter()
+                .map(|batch| Batch {
+                    start: start + batch.start,
+                    end: start + batch.end,
+                }),
+        );
+        return Ok(());
+    }
+
     let mut cursor = start;
     while cursor < end {
         if !blocks[cursor].table_present {
@@ -862,7 +1066,7 @@ fn build_assignments(
             detail: "RAR5 parallel controller exceeded its worker pool".into(),
         });
     }
-    Ok(assignments)
+    Ok(())
 }
 
 fn decode_worker_assignment(
@@ -873,32 +1077,46 @@ fn decode_worker_assignment(
     initial_code_lengths: &[u8],
     options: WorkerOptions,
     items: &mut [Vec<DecodedItem>],
-) -> RarResult<WorkerState> {
+) -> AssignmentResult {
     let mut tables = inherited_tables;
     let mut code_lengths = initial_code_lengths.to_vec();
     let mut diagnostics = WorkerCounters::new();
+    let mut failure = None;
+    let mut padded = Vec::new();
     if options.diagnostics_enabled {
         diagnostics.record_assignment();
     }
 
-    for (source, items) in blocks[assignment.start..assignment.end]
+    // `prepare_block` validates before publishing, so a failed block cannot
+    // leave partial table state behind and no per-block snapshot is needed.
+    // The controller applies nothing at or past the first failure and never
+    // installs this assignment's state, so decoding on would be wasted work.
+    for (offset, (source, items)) in blocks[assignment.start..assignment.end]
         .iter()
         .zip(items.iter_mut())
+        .enumerate()
     {
+        let block_index = assignment.start + offset;
+        items.clear();
         let table_started = options.diagnostics_enabled.then(Instant::now);
-        let prepared = prepare_block(
+        let prepared = match prepare_block(
             input,
             source,
             &mut tables,
             &mut code_lengths,
             options.extra_dist,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                failure = Some(DecodeFailure { block_index, error });
+                break;
+            }
+        };
         if let Some(started) = table_started {
             diagnostics
                 .add_table_prepare_nanos(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             diagnostics.record_block(source.table_present);
         }
-        items.clear();
         let previous_capacity = items.capacity();
         if items.capacity() < DECODED_ITEMS_CAPACITY {
             items.reserve(DECODED_ITEMS_CAPACITY);
@@ -907,7 +1125,7 @@ fn decode_worker_assignment(
             diagnostics.record_decoded_buffer_growth(previous_capacity, items.capacity());
         }
         let decode_started = options.diagnostics_enabled.then(Instant::now);
-        decode_block_symbols_counted(
+        if let Err(error) = decode_block_symbols_counted(
             input,
             &prepared,
             tables.as_ref().expect("prepared block has tables"),
@@ -915,20 +1133,29 @@ fn decode_worker_assignment(
             options.diagnostics_enabled,
             items,
             &mut diagnostics,
-        )?;
+            &mut padded,
+        ) {
+            items.clear();
+            failure = Some(DecodeFailure { block_index, error });
+            break;
+        }
         if let Some(started) = decode_started {
             diagnostics
                 .add_symbol_decode_nanos(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
     }
 
-    Ok(WorkerState {
-        tables,
-        code_lengths,
-        diagnostics,
-    })
+    AssignmentResult {
+        final_state: WorkerState {
+            tables,
+            code_lengths,
+            diagnostics,
+        },
+        failure,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parallel_decode_static(
     input: &[u8],
     blocks: &[BlockInfo],
@@ -937,19 +1164,29 @@ fn parallel_decode_static(
     initial_code_lengths: &[u8],
     extra_dist: bool,
     items: &mut [Vec<DecodedItem>],
-) -> RarResult<Vec<WorkerState>> {
+    scratch: &mut BatchScratch,
+) -> RarResult<ParallelDecodeOutcome> {
     let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
         detail: "RAR5 parallel controller has no worker pool".into(),
     })?;
     let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
-    let assignments = build_assignments(blocks, range.start, range.end, worker_count)?;
+    scratch.assignments.clear();
+    build_assignments(
+        blocks,
+        range.start,
+        range.end,
+        worker_count,
+        &mut scratch.assignments,
+    )?;
     if items.len() != range.end - range.start {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 parallel controller received mismatched output slots".into(),
         });
     }
-    let mut results: Vec<Option<RarResult<WorkerState>>> =
-        (0..assignments.len()).map(|_| None).collect();
+    let assignments = &scratch.assignments;
+    scratch.results.clear();
+    scratch.results.resize_with(assignments.len(), || None);
+    let results = &mut scratch.results;
     let mut aggregate = phase_diagnostics::AggregateDiagnostics::new();
     let diagnostics_enabled = aggregate.is_enabled();
     let worker_options = WorkerOptions {
@@ -965,64 +1202,86 @@ fn parallel_decode_static(
     let pool_started = diagnostics_enabled.then(Instant::now);
     let mut dispatch_nanos = 0u64;
 
-    pool.install(|| {
-        rayon::scope(|scope| {
-            let dispatch_started = aggregate.is_enabled().then(Instant::now);
-            let mut item_tail = &mut *items;
-            let mut result_tail = results.as_mut_slice();
-            for assignment in assignments.iter().copied() {
-                let count = assignment.end - assignment.start;
-                let (worker_items, remaining_items) = item_tail.split_at_mut(count);
-                let (worker_result, remaining_results) = result_tail.split_at_mut(1);
-                // A table-present block rewrites the complete RAR5 length table;
-                // repeat symbols only refer to entries in that same table read.
-                // Independent assignments can therefore share the initial scratch.
-                let worker_inherited = if blocks[assignment.start].table_present {
-                    None
-                } else {
-                    inherited_tables.cloned()
-                };
-                scope.spawn(move |_| {
-                    worker_result[0] = Some(decode_worker_assignment(
-                        input,
-                        blocks,
-                        assignment,
-                        worker_inherited,
-                        initial_code_lengths,
-                        worker_options,
-                        worker_items,
-                    ));
-                });
-                item_tail = remaining_items;
-                result_tail = remaining_results;
-            }
-            if let Some(started) = dispatch_started {
-                dispatch_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            }
-        });
+    // `in_place_scope` drives the batch from the calling thread instead of
+    // injecting the scope itself into the pool and parking here, which removes
+    // one wake/park round-trip per batch.
+    pool.in_place_scope(|scope| {
+        let dispatch_started = diagnostics_enabled.then(Instant::now);
+        let mut item_tail = &mut *items;
+        let mut result_tail = results.as_mut_slice();
+        for assignment in assignments.iter().copied() {
+            let count = assignment.end - assignment.start;
+            let (worker_items, remaining_items) = item_tail.split_at_mut(count);
+            let (worker_result, remaining_results) = result_tail.split_at_mut(1);
+            // A table-present block rewrites the complete RAR5 length table;
+            // repeat symbols only refer to entries in that same table read.
+            // Independent assignments can therefore share the initial scratch.
+            let worker_inherited = if blocks[assignment.start].table_present {
+                None
+            } else {
+                inherited_tables.cloned()
+            };
+            scope.spawn(move |_| {
+                worker_result[0] = Some(decode_worker_assignment(
+                    input,
+                    blocks,
+                    assignment,
+                    worker_inherited,
+                    initial_code_lengths,
+                    worker_options,
+                    worker_items,
+                ));
+            });
+            item_tail = remaining_items;
+            result_tail = remaining_results;
+        }
+        if let Some(started) = dispatch_started {
+            dispatch_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        }
     });
 
-    if results.iter().any(Option::is_none) {
+    if scratch.results.iter().any(Option::is_none) {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 parallel worker did not complete".into(),
         });
     }
-    let states: RarResult<Vec<WorkerState>> = results
-        .into_iter()
-        .map(|result| result.expect("parallel worker result checked above"))
-        .collect();
+    let first_failure_index = scratch
+        .results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            result
+                .as_ref()
+                .and_then(|result| result.failure.as_ref())
+                .map(|failure| (index, failure.block_index))
+        })
+        .min_by_key(|&(_, block_index)| block_index)
+        .map(|(index, _)| index);
+    let first_failure = first_failure_index.and_then(|index| {
+        scratch.results[index]
+            .as_mut()
+            .and_then(|result| result.failure.take())
+    });
+    // Assignments cover the batch in order, so everything before the failing
+    // assignment completed cleanly and everything at or after it is unsafe to
+    // install. With no failure the batch ends on its last assignment.
+    let final_state_index = match first_failure_index {
+        Some(index) => index.checked_sub(1),
+        None => scratch.results.len().checked_sub(1),
+    };
     if let Some(started) = pool_started {
         let total_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         aggregate.add_pool_dispatch_nanos(dispatch_nanos);
         aggregate.add_pool_wait_nanos(total_nanos.saturating_sub(dispatch_nanos));
-        if let Ok(states) = &states {
-            for state in states {
-                aggregate.absorb_worker(state.diagnostics);
-            }
+        for result in scratch.results.iter().flatten() {
+            aggregate.absorb_worker(result.final_state.diagnostics);
         }
         aggregate.emit();
     }
-    states
+    Ok(ParallelDecodeOutcome {
+        final_state_index,
+        first_failure,
+    })
 }
 
 // ─── Phase 3: Sequential item application ────────────────────────────────────
@@ -1079,6 +1338,8 @@ fn rar_decode_worker_count() -> usize {
 thread_local! {
     static CONTROLLER_DISPATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAST_READER_SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PADDED_READER_SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STREAMING_BLOCK_FALLBACK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1086,9 +1347,40 @@ fn note_controller_dispatch() {
     CONTROLLER_DISPATCH_COUNT.set(CONTROLLER_DISPATCH_COUNT.get() + 1);
 }
 
+/// Counts entries into the staged paths' mid-block streaming fallback, which
+/// only a block that cannot be staged whole is supposed to reach.
+#[cfg(test)]
+pub(super) fn note_streaming_block_fallback() {
+    STREAMING_BLOCK_FALLBACK_COUNT.set(STREAMING_BLOCK_FALLBACK_COUNT.get() + 1);
+}
+
+#[cfg(test)]
+pub(super) fn reset_streaming_block_fallback_count() {
+    STREAMING_BLOCK_FALLBACK_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn streaming_block_fallback_count() -> usize {
+    STREAMING_BLOCK_FALLBACK_COUNT.get()
+}
+
+/// Worker decode runs on pool threads, so tests that drive the full controller
+/// observe fast-reader selections through this process-wide counter; the
+/// thread-local above stays for tests that decode on their own thread and
+/// assert exact counts in isolation.
+#[cfg(test)]
+static GLOBAL_FAST_READER_SELECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 fn note_fast_reader_selection() {
     FAST_READER_SELECTION_COUNT.set(FAST_READER_SELECTION_COUNT.get() + 1);
+    GLOBAL_FAST_READER_SELECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn note_padded_reader_selection() {
+    PADDED_READER_SELECTION_COUNT.set(PADDED_READER_SELECTION_COUNT.get() + 1);
 }
 
 // ─── Public entry point ──────────────────────────────────────────────────────
@@ -1104,68 +1396,94 @@ impl LzDecoder {
         }
     }
 
+    fn take_batch_scratch(&mut self) -> BatchScratch {
+        std::mem::take(&mut self.parallel_batch_scratch)
+    }
+
+    fn recycle_batch_scratch(&mut self, scratch: BatchScratch) {
+        self.parallel_batch_scratch = scratch;
+    }
+
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
         &mut self,
         input: &[u8],
+        logical_len: usize,
         header_limit: usize,
         unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<usize> {
+        let logical_input = input
+            .get(..logical_len)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5 logical staged input exceeds its padded buffer".into(),
+            })?;
         let has_inherited_tables = self.has_current_tables();
         let scanned = phase_diagnostics::measure(Phase::HeaderScan, || {
-            scan_complete_blocks(input, header_limit, has_inherited_tables)
+            scan_complete_blocks(logical_input, header_limit, has_inherited_tables)
         })?;
         if scanned.blocks.is_empty() {
             return Ok(0);
         }
 
-        let worker_count = if parallel_enabled() {
-            rar_decode_worker_count()
-        } else {
-            0
-        };
-        let mut block_index = 0usize;
-        while block_index < scanned.blocks.len() && *output_size < unpacked_size {
-            let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
-            let span = &scanned.blocks[block_index..span_end];
-            let batch_end = next_controller_batch_end(
-                &scanned.blocks,
-                block_index,
-                scanned.blocks.len(),
-                worker_count,
-            );
-            if worker_count > 1 && batch_end - block_index >= MIN_PARALLEL_BLOCKS {
-                self.decode_and_apply_static_batch(
-                    input,
+        let processing_result = (|| -> RarResult<()> {
+            // Both callers already gated the whole member on `parallel_enabled`,
+            // so the env lookup does not repeat per staged round.
+            let worker_count = rar_decode_worker_count();
+            let mut block_index = 0usize;
+            while block_index < scanned.blocks.len() && *output_size < unpacked_size {
+                let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
+                let span = &scanned.blocks[block_index..span_end];
+                if scanned.blocks[block_index].is_large {
+                    self.parallel_mode_exhausted = true;
+                }
+                if self.parallel_mode_exhausted {
+                    phase_diagnostics::measure(Phase::SerialApply, || {
+                        self.decode_span_inline(input, span, unpacked_size, output_size, writer)
+                    })?;
+                    block_index = span_end;
+                    continue;
+                }
+                let batch_end = next_controller_batch_end(
                     &scanned.blocks,
-                    block_index..batch_end,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )?;
-                block_index = batch_end;
-            } else {
-                let inline_end = if worker_count > 1 && span.len() > 2 {
-                    block_index + 1
-                } else {
-                    span_end
-                };
-                phase_diagnostics::measure(Phase::SerialApply, || {
-                    self.decode_span_inline(
+                    block_index,
+                    scanned.blocks.len(),
+                    worker_count,
+                );
+                if worker_count > 1 && batch_end - block_index >= MIN_PARALLEL_BLOCKS {
+                    self.decode_and_apply_static_batch(
                         input,
-                        &scanned.blocks[block_index..inline_end],
+                        &scanned.blocks,
+                        block_index..batch_end,
                         unpacked_size,
                         output_size,
                         writer,
-                    )
-                })?;
-                block_index = inline_end;
+                    )?;
+                    block_index = batch_end;
+                } else {
+                    let inline_end = if worker_count > 1 && span.len() > 2 {
+                        block_index + 1
+                    } else {
+                        span_end
+                    };
+                    phase_diagnostics::measure(Phase::SerialApply, || {
+                        self.decode_span_inline(
+                            input,
+                            &scanned.blocks[block_index..inline_end],
+                            unpacked_size,
+                            output_size,
+                            writer,
+                        )
+                    })?;
+                    block_index = inline_end;
+                }
             }
-        }
+            Ok(())
+        })();
 
         self.block_bits_remaining = 0;
         self.is_last_block = scanned.saw_last_block;
+        processing_result?;
         self.flush_filters_and_write(writer)?;
         Ok(scanned.consumed_bytes)
     }
@@ -1177,6 +1495,8 @@ impl LzDecoder {
             && self.rc_table.is_some()
     }
 
+    /// Snapshot the installed tables for a batch: four refcount bumps, not four
+    /// table copies.
     fn current_tables(&self) -> Option<TableSet> {
         match (
             &self.nc_table,
@@ -1185,10 +1505,10 @@ impl LzDecoder {
             &self.rc_table,
         ) {
             (Some(nc), Some(dc), Some(ldc), Some(rc)) => Some(TableSet {
-                nc: (**nc).clone(),
-                dc: (**dc).clone(),
-                ldc: (**ldc).clone(),
-                rc: (**rc).clone(),
+                nc: Arc::clone(nc),
+                dc: Arc::clone(dc),
+                ldc: Arc::clone(ldc),
+                rc: Arc::clone(rc),
             }),
             _ => None,
         }
@@ -1196,19 +1516,19 @@ impl LzDecoder {
 
     fn set_table_state(&mut self, state: WorkerState) {
         if let Some(tables) = state.tables {
-            self.nc_table = Some(Arc::new(tables.nc));
-            self.dc_table = Some(Arc::new(tables.dc));
-            self.ldc_table = Some(Arc::new(tables.ldc));
-            self.rc_table = Some(Arc::new(tables.rc));
+            self.nc_table = Some(tables.nc);
+            self.dc_table = Some(tables.dc);
+            self.ldc_table = Some(tables.ldc);
+            self.rc_table = Some(tables.rc);
         }
         self.code_lengths = state.code_lengths;
     }
 
     fn install_inline_tables(&mut self, tables: &TableSet) {
-        self.nc_table = Some(Arc::new(tables.nc.clone()));
-        self.dc_table = Some(Arc::new(tables.dc.clone()));
-        self.ldc_table = Some(Arc::new(tables.ldc.clone()));
-        self.rc_table = Some(Arc::new(tables.rc.clone()));
+        self.nc_table = Some(Arc::clone(&tables.nc));
+        self.dc_table = Some(Arc::clone(&tables.dc));
+        self.ldc_table = Some(Arc::clone(&tables.ldc));
+        self.rc_table = Some(Arc::clone(&tables.rc));
     }
 
     fn decode_span_inline<W: std::io::Write>(
@@ -1226,6 +1546,9 @@ impl LzDecoder {
         };
         let mut code_lengths = self.code_lengths.clone();
         for source in span {
+            if source.is_large {
+                self.parallel_mode_exhausted = true;
+            }
             let prepared = prepare_block(
                 input,
                 source,
@@ -1255,7 +1578,7 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<()> {
         let worker_count = rar_decode_worker_count();
-        if worker_count <= 1 || range.end - range.start > worker_count.saturating_mul(2) {
+        if worker_count <= 1 || range.end - range.start > batch_plan::capacity(worker_count) {
             return Err(RarError::CorruptArchive {
                 detail: "RAR5 parallel controller received an invalid dispatch".into(),
             });
@@ -1263,33 +1586,60 @@ impl LzDecoder {
         let inherited_tables = self.current_tables();
         let initial_code_lengths = self.code_lengths.clone();
         let mut set = self.take_item_buffer_set();
+        let mut scratch = self.take_batch_scratch();
         #[cfg(test)]
         note_controller_dispatch();
         let result = (|| {
             let active = decoded_item_buffers(&mut set, range.end - range.start);
-            let states = phase_diagnostics::measure(Phase::WorkerDecode, || {
+            let outcome = phase_diagnostics::measure(Phase::WorkerDecode, || {
                 parallel_decode_static(
                     input,
                     blocks,
-                    range,
+                    range.clone(),
                     inherited_tables.as_ref(),
                     &initial_code_lengths,
                     self.extra_dist,
                     active,
+                    &mut scratch,
                 )
             })?;
-            phase_diagnostics::measure(Phase::SerialApply, || {
-                self.apply_decoded_items_parallel(active, unpacked_size, output_size, writer)
-            })?;
-            if let Some(state) = states.into_iter().last() {
+            let apply_end = outcome
+                .first_failure
+                .as_ref()
+                .map_or(range.end, |failure| failure.block_index);
+            // Only state from an assignment that finished ahead of the failing
+            // block is safe to install.
+            let final_state = scratch.take_final_state(outcome.final_state_index);
+            let apply_result = phase_diagnostics::measure(Phase::SerialApply, || {
+                self.apply_decoded_items_parallel(
+                    &active[..apply_end - range.start],
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )
+            });
+            if let Some(state) = final_state {
                 self.set_table_state(state);
+            }
+            apply_result?;
+            if let Some(failure) = outcome.first_failure {
+                return Err(failure.error);
             }
             Ok(())
         })();
         self.recycle_item_buffer_set(set);
+        self.recycle_batch_scratch(scratch);
         result
     }
 
+    /// Decode one block straight into the window.
+    ///
+    /// When the whole payload plus the fast reader's lookahead guard is present
+    /// — always true for the staged padded buffer, and true for every interior
+    /// block of an in-memory member — this uses the bounded [`BlockReader`],
+    /// whose bit accessors are branch-free loads. It reads the same bits as the
+    /// checked reader over the same slice, so the output is identical; the
+    /// checked [`BitReader`] remains the fallback for tail blocks.
     fn decode_block_inline<W: std::io::Write>(
         &mut self,
         input: &[u8],
@@ -1299,7 +1649,6 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<()> {
         self.block_bits_remaining = block.payload_bits as i64;
-
         let byte_offset = block.payload_bit_offset / 8;
         let bit_remainder = block.payload_bit_offset % 8;
         let slice = input
@@ -1307,36 +1656,20 @@ impl LzDecoder {
             .ok_or_else(|| RarError::CorruptArchive {
                 detail: "RAR5 block data starts beyond the staged input".into(),
             })?;
+        let block_end_bits = bit_remainder + block.payload_bits;
+
+        if let Ok(mut reader) = BlockReader::new(slice, bit_remainder, block_end_bits) {
+            #[cfg(test)]
+            note_fast_reader_selection();
+            return self.decode_block(&mut reader, unpacked_size, output_size, writer);
+        }
+
         let mut reader = BitReader::new(slice);
         if bit_remainder > 0 {
             reader.skip_bits(bit_remainder as u32)?;
         }
 
-        let flush_threshold = self.flush_threshold();
-        while *output_size < unpacked_size && self.block_bits_remaining > 0 {
-            *output_size = self.decode_block(
-                &mut reader,
-                unpacked_size,
-                *output_size,
-                Some(flush_threshold),
-            )?;
-
-            if self.pending_filters.is_empty() {
-                if self.window.unflushed_bytes() as usize >= flush_threshold {
-                    self.flush_unfiltered_stream_output(writer)?;
-                }
-            } else {
-                self.flush_filters_and_write(writer)?;
-                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR5 pending filters exceeded dictionary window before flush"
-                            .into(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
+        self.decode_block(&mut reader, unpacked_size, output_size, writer)
     }
 
     fn apply_decoded_items_parallel<W: std::io::Write>(
@@ -1346,24 +1679,23 @@ impl LzDecoder {
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
-        let flush_threshold = self.flush_threshold();
-        let mut bytes_since_flush = 0usize;
-
         for block_items in all_items {
             for item in block_items {
                 if *output_size >= unpacked_size {
                     return Ok(());
                 }
-
-                let mut produced = 0usize;
-                let mut force_sync = false;
+                // One comparison per item against the precomputed border, the
+                // same gate the serial symbol loop uses, so both engines write
+                // at identical output offsets.
+                if self.window.total_written() >= self.flush_at {
+                    self.flush_stream_output(writer)?;
+                }
 
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
                         let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
                         self.window.put_literal_batch(&bytes, n);
                         *output_size += n as u64;
-                        produced = n;
                     }
                     DecodedItem::Match { length, distance } => {
                         let remaining = (unpacked_size - *output_size) as usize;
@@ -1376,17 +1708,15 @@ impl LzDecoder {
                         self.window
                             .copy_with_visible_len(distance as usize, full_len, len)?;
                         *output_size += len as u64;
-                        produced = len;
                     }
                     DecodedItem::RepeatPrev => {
                         if self.last_length != 0 {
                             let distance = self.dist_cache[0];
                             let remaining = (unpacked_size - *output_size) as usize;
-                            let len = self.last_length.min(remaining);
-                            self.window
-                                .copy_with_visible_len(distance, self.last_length, len)?;
+                            let full_len = self.last_length;
+                            let len = full_len.min(remaining);
+                            self.window.copy_with_visible_len(distance, full_len, len)?;
                             *output_size += len as u64;
-                            produced = len;
                         }
                     }
                     DecodedItem::CacheRef { cache_idx, length } => {
@@ -1399,7 +1729,6 @@ impl LzDecoder {
                         self.last_length = full_len;
                         self.window.copy_with_visible_len(distance, full_len, len)?;
                         *output_size += len as u64;
-                        produced = len;
                     }
                     DecodedItem::Filter {
                         filter_type,
@@ -1407,39 +1736,21 @@ impl LzDecoder {
                         block_length,
                         channels,
                     } => {
-                        let ft = FilterType::from_code(filter_type);
-                        super::filter::push_pending_filter(
-                            &mut self.pending_filters,
+                        // Registration is a queue push, exactly as in the serial
+                        // path; only an overflowing queue forces a write.
+                        let block_start =
+                            self.current_file_base_total + *output_size + block_start_delta;
+                        self.register_pending_filter(
                             PendingFilter {
-                                filter_type: ft,
-                                block_start: self.current_file_base_total
-                                    + *output_size
-                                    + block_start_delta,
+                                filter_type: FilterType::from_code(filter_type),
+                                block_start,
                                 block_length: block_length as usize,
                                 channels,
                             },
-                            MAX_PENDING_FILTERS,
-                        );
-
-                        force_sync = true;
+                            writer,
+                        )?;
                     }
                 }
-
-                if force_sync || !self.pending_filters.is_empty() {
-                    self.flush_stream_output(writer)?;
-                    bytes_since_flush = 0;
-                } else if produced != 0 {
-                    bytes_since_flush += produced;
-                    if bytes_since_flush >= flush_threshold {
-                        self.flush_unfiltered_stream_output(writer)?;
-                        bytes_since_flush = 0;
-                    }
-                }
-            }
-
-            if !self.pending_filters.is_empty() {
-                self.flush_stream_output(writer)?;
-                bytes_since_flush = 0;
             }
         }
 
@@ -1471,50 +1782,67 @@ impl LzDecoder {
         }
 
         let mut output_size = 0u64;
-        let mut block_index = 0usize;
-        while block_index < scanned.blocks.len() && output_size < unpacked_size {
-            let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
-            let span = &scanned.blocks[block_index..span_end];
-            let batch_end = next_controller_batch_end(
-                &scanned.blocks,
-                block_index,
-                scanned.blocks.len(),
-                worker_count,
-            );
-            if batch_end - block_index >= MIN_PARALLEL_BLOCKS {
-                self.decode_and_apply_static_batch(
-                    input,
+        let processing_result = (|| -> RarResult<()> {
+            let mut block_index = 0usize;
+            while block_index < scanned.blocks.len() && output_size < unpacked_size {
+                let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
+                let span = &scanned.blocks[block_index..span_end];
+                if scanned.blocks[block_index].is_large {
+                    self.parallel_mode_exhausted = true;
+                }
+                if self.parallel_mode_exhausted {
+                    phase_diagnostics::measure(Phase::SerialApply, || {
+                        self.decode_span_inline(
+                            input,
+                            span,
+                            unpacked_size,
+                            &mut output_size,
+                            writer,
+                        )
+                    })?;
+                    block_index = span_end;
+                    continue;
+                }
+                let batch_end = next_controller_batch_end(
                     &scanned.blocks,
-                    block_index..batch_end,
-                    unpacked_size,
-                    &mut output_size,
-                    writer,
-                )?;
-                block_index = batch_end;
-            } else {
-                let inline_end = if span.len() > 2 {
-                    block_index + 1
-                } else {
-                    span_end
-                };
-                phase_diagnostics::measure(Phase::SerialApply, || {
-                    self.decode_span_inline(
+                    block_index,
+                    scanned.blocks.len(),
+                    worker_count,
+                );
+                if batch_end - block_index >= MIN_PARALLEL_BLOCKS {
+                    self.decode_and_apply_static_batch(
                         input,
-                        &scanned.blocks[block_index..inline_end],
+                        &scanned.blocks,
+                        block_index..batch_end,
                         unpacked_size,
                         &mut output_size,
                         writer,
-                    )
-                })?;
-                block_index = inline_end;
+                    )?;
+                    block_index = batch_end;
+                } else {
+                    let inline_end = if span.len() > 2 {
+                        block_index + 1
+                    } else {
+                        span_end
+                    };
+                    phase_diagnostics::measure(Phase::SerialApply, || {
+                        self.decode_span_inline(
+                            input,
+                            &scanned.blocks[block_index..inline_end],
+                            unpacked_size,
+                            &mut output_size,
+                            writer,
+                        )
+                    })?;
+                    block_index = inline_end;
+                }
             }
-            if output_size >= unpacked_size {
-                break;
-            }
-        }
+            Ok(())
+        })();
 
         self.block_bits_remaining = 0;
         self.is_last_block = scanned.saw_last_block;
+        processing_result?;
         self.flush_filters_and_write(writer)?;
 
         Ok(Some(output_size))
@@ -1523,7 +1851,6 @@ impl LzDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::super::block_reader::LOOKAHEAD_BYTES;
     use super::*;
 
     fn reset_dispatch_count() {
@@ -1536,10 +1863,30 @@ mod tests {
 
     fn reset_fast_reader_selection_count() {
         FAST_READER_SELECTION_COUNT.set(0);
+        PADDED_READER_SELECTION_COUNT.set(0);
     }
 
     fn fast_reader_selection_count() -> usize {
         FAST_READER_SELECTION_COUNT.get()
+    }
+
+    fn padded_reader_selection_count() -> usize {
+        PADDED_READER_SELECTION_COUNT.get()
+    }
+
+    fn global_fast_reader_selections() -> usize {
+        GLOBAL_FAST_READER_SELECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn plan_assignments(
+        blocks: &[BlockInfo],
+        start: usize,
+        end: usize,
+        worker_count: usize,
+    ) -> RarResult<Vec<BlockAssignment>> {
+        let mut assignments = Vec::new();
+        build_assignments(blocks, start, end, worker_count, &mut assignments)?;
+        Ok(assignments)
     }
 
     fn shifted_payload(payload: &[u8], payload_bits: usize, offset: usize) -> Vec<u8> {
@@ -1554,10 +1901,10 @@ mod tests {
 
     fn rar7_tables() -> TableSet {
         TableSet {
-            nc: HuffmanTable::build(&[9u8; 306]).unwrap(),
-            dc: HuffmanTable::build(&[7u8; 80]).unwrap(),
-            ldc: HuffmanTable::build(&[4u8; 16]).unwrap(),
-            rc: HuffmanTable::build(&[6u8; 44]).unwrap(),
+            nc: Arc::new(HuffmanTable::build(&[9u8; 306]).unwrap()),
+            dc: Arc::new(HuffmanTable::build(&[7u8; 80]).unwrap()),
+            ldc: Arc::new(HuffmanTable::build(&[4u8; 16]).unwrap()),
+            rc: Arc::new(HuffmanTable::build(&[6u8; 44]).unwrap()),
         }
     }
 
@@ -1582,7 +1929,7 @@ mod tests {
             test_block(2, 1, true),
             test_block(3, 1, true),
         ];
-        let assignments = build_assignments(&blocks, 0, 4, 2).unwrap();
+        let assignments = plan_assignments(&blocks, 0, 4, 2).unwrap();
         assert_eq!(assignments.len(), 2);
         assert_eq!(assignments[0].end, 2);
         assert_eq!(assignments[1].start, 2);
@@ -1600,7 +1947,7 @@ mod tests {
             test_block(1, 1, false),
             test_block(2, 1, true),
         ];
-        let assignments = build_assignments(&blocks, 0, 3, 2).unwrap();
+        let assignments = plan_assignments(&blocks, 0, 3, 2).unwrap();
         assert_eq!(assignments.len(), 2);
         assert_eq!((assignments[0].start, assignments[0].end), (0, 2));
         assert_eq!((assignments[1].start, assignments[1].end), (2, 3));
@@ -1616,7 +1963,7 @@ mod tests {
         assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 4), 0);
         assert_eq!(next_controller_batch_end(&blocks, 1, blocks.len(), 4), 7);
 
-        let assignments = build_assignments(&blocks, 1, 7, 4).unwrap();
+        let assignments = plan_assignments(&blocks, 1, 7, 4).unwrap();
         assert_eq!(assignments.len(), 3);
         assert!(assignments.iter().all(|assignment| {
             blocks[assignment.start..assignment.end]
@@ -1664,15 +2011,31 @@ mod tests {
         };
 
         reset_fast_reader_selection_count();
+        // A large block never takes the padded fallback, so this is the
+        // checked-reader reference decode.
+        let checked_block = BlockInfo {
+            is_large: true,
+            ..block.clone()
+        };
         let mut checked_items = Vec::new();
-        decode_block_symbols(&input, &block, &tables, true, &mut checked_items).unwrap();
+        decode_block_symbols(&input, &checked_block, &tables, true, &mut checked_items).unwrap();
         assert_eq!(fast_reader_selection_count(), 0);
+        assert_eq!(padded_reader_selection_count(), 0);
+
+        // The same unpadded slice as a normal block: the tail is staged into a
+        // guarded scratch instead of falling back to the checked reader.
+        let mut padded_items = Vec::new();
+        decode_block_symbols(&input, &block, &tables, true, &mut padded_items).unwrap();
+        assert_eq!(padded_reader_selection_count(), 1);
+        assert_eq!(fast_reader_selection_count(), 1);
+        assert_eq!(padded_items.len(), checked_items.len());
 
         let mut guarded_input = input[..6].to_vec();
         guarded_input.resize(6 + LOOKAHEAD_BYTES, 0);
         let mut items = Vec::new();
         decode_block_symbols(&guarded_input, &block, &tables, true, &mut items).unwrap();
-        assert_eq!(fast_reader_selection_count(), 1);
+        assert_eq!(fast_reader_selection_count(), 2);
+        assert_eq!(padded_reader_selection_count(), 1);
 
         assert_eq!(items.len(), 1);
         let DecodedItem::Match { length, distance } = items[0] else {
@@ -1707,7 +2070,7 @@ mod tests {
             &mut shifted_items,
         )
         .unwrap();
-        assert_eq!(fast_reader_selection_count(), 2);
+        assert_eq!(fast_reader_selection_count(), 3);
         let DecodedItem::Match {
             length: shifted_length,
             distance: shifted_distance,
@@ -1731,7 +2094,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, RarError::CorruptArchive { .. }));
-        assert_eq!(fast_reader_selection_count(), 3);
+        assert_eq!(fast_reader_selection_count(), 4);
     }
 
     #[test]
@@ -1784,10 +2147,78 @@ mod tests {
             .apply_decoded_items_parallel(&all_items, 1, &mut output_size, &mut out)
             .unwrap();
 
+        // Registration queues only: the filter is still pending and no byte has
+        // been written, because the write border is far ahead.
         assert_eq!(output_size, 1);
+        assert!(out.is_empty());
+        assert_eq!(decoder.pending_filters.len(), 1);
+
+        // The member-end flush retires it and suppresses its block.
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
         assert!(out.is_empty());
         assert!(decoder.pending_filters.is_empty());
         assert_eq!(decoder.current_file_written_size, 1);
+    }
+
+    #[test]
+    fn parallel_apply_writes_at_the_border_not_per_item_or_per_block() {
+        struct CountingWriter {
+            writes: usize,
+            bytes: usize,
+        }
+
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dict_size = 256 * 1024;
+        let mut decoder = LzDecoder::new(dict_size, 0);
+        let mut writer = CountingWriter {
+            writes: 0,
+            bytes: 0,
+        };
+        let mut output_size = 0u64;
+
+        // 64 "blocks" of 512 literal items each: 8 bytes per item.
+        let blocks: Vec<Vec<DecodedItem>> = (0..64)
+            .map(|_| {
+                vec![
+                    DecodedItem::Literals {
+                        bytes: [0xA5; 8],
+                        count: 7,
+                    };
+                    512
+                ]
+            })
+            .collect();
+        let produced = 64 * 512 * 8;
+
+        decoder
+            .apply_decoded_items_parallel(&blocks, produced, &mut output_size, &mut writer)
+            .unwrap();
+        decoder.flush_filters_and_write(&mut writer).unwrap();
+
+        assert_eq!(output_size, produced);
+        assert_eq!(writer.bytes as u64, produced);
+        let border_span = dict_size as u64 - super::super::MAX_INCREMENTAL_LZ_MATCH;
+        let border_crossings = produced.div_ceil(border_span) as usize + 1;
+        assert!(
+            writer.writes <= border_crossings * 2,
+            "expected at most {} writes, saw {}",
+            border_crossings * 2,
+            writer.writes
+        );
+        // Per-block cadence would have been at least one write per block.
+        assert!(writer.writes < blocks.len(), "saw {} writes", writer.writes);
     }
 
     #[test]
@@ -1813,6 +2244,54 @@ mod tests {
             decoder.pending_filters[0].block_start,
             decoder.current_file_base_total + output_size + 5
         );
+    }
+
+    #[test]
+    fn decoded_match_flushes_before_crossing_write_border() {
+        let mut decoder = LzDecoder::new(8, 0);
+        decoder.window.put_bytes(b"abcdef");
+        let mut output_size = 6;
+        let mut out = Vec::new();
+
+        decoder
+            .apply_decoded_items_parallel(
+                &[vec![DecodedItem::Match {
+                    length: 3,
+                    distance: 1,
+                }]],
+                9,
+                &mut output_size,
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(out, b"abcdef");
+        assert_eq!(decoder.window.total_flushed(), 6);
+        assert_eq!(output_size, 9);
+    }
+
+    #[test]
+    fn inline_match_flushes_before_crossing_write_border() {
+        let mut decoder = LzDecoder::new(8, 0);
+        let tables = rar7_tables();
+        decoder.install_inline_tables(&tables);
+        decoder.window.put_bytes(b"abcdef");
+        let block = BlockInfo {
+            payload_bit_offset: 0,
+            payload_bits: 16,
+            table_present: false,
+            is_large: false,
+        };
+        let mut output_size = 6;
+        let mut out = Vec::new();
+
+        decoder
+            .decode_block_inline(&[0x83, 0x80], &block, 9, &mut output_size, &mut out)
+            .unwrap();
+
+        assert_eq!(out, b"abcdef");
+        assert_eq!(decoder.window.total_flushed(), 6);
+        assert_eq!(output_size, 9);
     }
 
     #[test]
@@ -1849,6 +2328,22 @@ mod tests {
     }
 
     #[test]
+    fn inline_span_makes_a_nonleading_large_block_file_sticky() {
+        let mut decoder = LzDecoder::new(128 * 1024, 1);
+        decoder.install_inline_tables(&rar7_tables());
+        let mut blocks = vec![test_block(0, 0, false), test_block(0, 0, false)];
+        blocks[1].is_large = true;
+        let mut output_size = 0;
+        let mut output = Vec::new();
+
+        decoder
+            .decode_span_inline(&[], &blocks, 1, &mut output_size, &mut output)
+            .unwrap();
+
+        assert!(decoder.parallel_mode_exhausted);
+    }
+
+    #[test]
     fn tableless_block_inherits_worker_table_state() {
         let mut tables = Some(rar7_tables());
         let before = tables.as_ref().map(std::ptr::from_ref);
@@ -1863,10 +2358,89 @@ mod tests {
     #[test]
     fn table_present_blocks_are_independent_length_table_roots() {
         let blocks = vec![test_block(0, 1, true), test_block(1, 1, true)];
-        let assignments = build_assignments(&blocks, 0, blocks.len(), 2).unwrap();
-        assert_eq!(assignments.len(), 1);
-        assert_eq!((assignments[0].start, assignments[0].end), (0, 2));
+        let assignments = plan_assignments(&blocks, 0, blocks.len(), 2).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!((assignments[0].start, assignments[0].end), (0, 1));
+        assert_eq!((assignments[1].start, assignments[1].end), (1, 2));
         assert!(blocks.iter().all(|block| block.table_present));
+    }
+
+    #[test]
+    fn worker_stops_its_assignment_at_the_first_failure() {
+        let input = [0x83u8, 0x42, 0x00, 0x00, 0x00, 0x03, 0, 0, 0, 0];
+        let blocks = vec![
+            test_block((input.len() + 1) * 8, 1, true),
+            test_block(0, 48, false),
+        ];
+        let mut items = vec![Vec::new(), Vec::new()];
+        let result = decode_worker_assignment(
+            &input,
+            &blocks,
+            Batch { start: 0, end: 2 },
+            Some(rar7_tables()),
+            &[0u8; 484],
+            WorkerOptions {
+                extra_dist: true,
+                diagnostics_enabled: false,
+            },
+            &mut items,
+        );
+
+        // The controller applies nothing at or past the failing block and never
+        // installs this assignment's state, so decoding on is wasted work.
+        assert_eq!(result.failure.unwrap().block_index, 0);
+        assert!(items[1].is_empty());
+    }
+
+    #[test]
+    fn worker_leaves_no_partial_table_state_behind_a_rejected_block() {
+        // Tables parse cleanly but claim more bits than the payload holds, so
+        // `prepare_block` must reject before publishing them.
+        let mut code_lengths = vec![0u8; 484];
+        let mut tables = Some(rar7_tables());
+        let before = tables.as_ref().map(|set| Arc::as_ptr(&set.nc));
+        let source = test_block(0, 1, true);
+
+        // 2 KiB of zeros is enough for a full (degenerate) table read; the
+        // block then claims only one payload bit.
+        let result = prepare_block(&[0u8; 2048], &source, &mut tables, &mut code_lengths, true);
+
+        assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
+        assert_eq!(before, tables.as_ref().map(|set| Arc::as_ptr(&set.nc)));
+    }
+
+    #[test]
+    fn controller_applies_only_the_successful_prefix_before_failure() {
+        if rar_decode_worker_count() <= 1 {
+            return;
+        }
+
+        let mut input = vec![0x20, 0x80];
+        input.resize(input.len() + LOOKAHEAD_BYTES, 0);
+        let blocks = vec![
+            test_block(0, 9, false),
+            test_block((input.len() + 1) * 8, 9, false),
+        ];
+        let mut decoder = LzDecoder::new(128 * 1024, 1);
+        decoder.install_inline_tables(&rar7_tables());
+        let mut output_size = 0;
+        let mut output = Vec::new();
+
+        let error = decoder
+            .decode_and_apply_static_batch(
+                &input,
+                &blocks,
+                0..blocks.len(),
+                2,
+                &mut output_size,
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, RarError::CorruptArchive { .. }));
+        assert_eq!(output_size, 1);
+        decoder.flush_filters_and_write(&mut output).unwrap();
+        assert_eq!(output, b"A");
     }
 
     #[test]
@@ -1879,6 +2453,7 @@ mod tests {
         let mut items = (0..4)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<DecodedItem>>>();
+        let mut scratch = BatchScratch::default();
         let result = parallel_decode_static(
             &[],
             &blocks,
@@ -1887,13 +2462,18 @@ mod tests {
             &[0u8; 484],
             false,
             &mut items,
+            &mut scratch,
         );
-        assert!(result.is_err());
+        let outcome = result.unwrap();
+        assert_eq!(scratch.results.len(), 4);
+        assert_eq!(outcome.first_failure.unwrap().block_index, 0);
+        // Failing at the first block leaves no assignment safe to install.
+        assert_eq!(outcome.final_state_index, None);
 
         let input = [0x83u8, 0x42, 0x00, 0x00, 0x00, 0x03, 0, 0, 0, 0];
         let valid_blocks = vec![test_block(0, 48, false); 2];
         let tables = rar7_tables();
-        let states = parallel_decode_static(
+        let outcome = parallel_decode_static(
             &input,
             &valid_blocks,
             0..valid_blocks.len(),
@@ -1901,14 +2481,19 @@ mod tests {
             &[0u8; 484],
             true,
             &mut items[..valid_blocks.len()],
+            &mut scratch,
         )
         .unwrap();
-        assert_eq!(states.len(), 1);
+        assert_eq!(scratch.results.len(), 2);
+        assert!(outcome.first_failure.is_none());
+        assert_eq!(outcome.final_state_index, Some(1));
         assert!(
             items[..valid_blocks.len()]
                 .iter()
                 .all(|buffer| !buffer.is_empty())
         );
+        // The scratch is reusable: both batches ran through the same buffers.
+        assert!(scratch.assignments.capacity() >= 2);
     }
 
     #[test]
@@ -1930,6 +2515,47 @@ mod tests {
             }
         }
         assert!(dispatch_count() > 0);
+    }
+
+    #[test]
+    fn staged_straddles_stay_on_the_fast_block_path() {
+        // 83 MB of compressed data against a 4 MiB stage: every refill leaves a
+        // block straddling the staging edge, and none of this member's blocks
+        // is anywhere near large enough to need the mid-block streaming reader.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        if !fixture.exists() {
+            eprintln!("skipping test: rar5_solid.rar fixture not present");
+            return;
+        }
+
+        reset_streaming_block_fallback_count();
+        // Worker decode happens on pool threads, so the thread-local counter on
+        // this thread stays 0; observe the process-wide counter as a delta
+        // instead (monotonic, so concurrent tests can only add to it).
+        let fast_before = global_fast_reader_selections();
+
+        let mut archive = crate::RarArchive::open(std::fs::File::open(fixture).unwrap()).unwrap();
+        let unpacked_size = archive.metadata().members[0]
+            .unpacked_size
+            .expect("member declares its size");
+        assert!(unpacked_size > crate::decompress::lz::staged_input::LOGICAL_CAPACITY as u64);
+
+        // `verify` checks CRC32 and BLAKE2sp against the stored hashes, so a
+        // clean extraction is the byte-identical assertion.
+        let options = crate::ExtractOptions {
+            verify: true,
+            ..crate::ExtractOptions::default()
+        };
+        let extracted = archive.extract_member(0, &options, None).unwrap();
+        assert_eq!(extracted.to_bytes().unwrap().len() as u64, unpacked_size);
+
+        // Straddling blocks are deferred to the next staged round, so the
+        // checked mid-block reader is never reached for this member.
+        assert_eq!(streaming_block_fallback_count(), 0);
+        // ...and block decode — on whichever pool thread it landed — took the
+        // bounded fast reader over the padded stage.
+        assert!(global_fast_reader_selections() > fast_before);
     }
 
     #[test]

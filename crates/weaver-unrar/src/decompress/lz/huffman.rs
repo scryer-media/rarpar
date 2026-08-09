@@ -99,10 +99,12 @@ impl HuffmanTable {
         let mut length_count = [0u32; 16];
         let mut max_length: u8 = 0;
         for &bl in bit_lengths {
-            if bl > 0 {
-                if bl as usize > MAX_CODE_LENGTH {
-                    return Err(RarError::InvalidHuffmanTable);
-                }
+            // MakeDecodeTables counts and fills with the same 4-bit mask
+            // (unpack.cpp:255 and :301). Every reader in this crate produces
+            // 0..=15, so the mask is an identity here; the assert pins that.
+            debug_assert!(bl as usize <= MAX_CODE_LENGTH);
+            let bl = bl & 0xF;
+            if bl != 0 {
                 length_count[bl as usize] += 1;
                 if bl > max_length {
                     max_length = bl;
@@ -195,31 +197,55 @@ impl HuffmanTable {
 
     #[inline(always)]
     fn symbol_for_bits(&self, bit_field: u32, bits: usize) -> u16 {
+        debug_assert!((1..=MAX_CODE_LENGTH).contains(&bits));
         let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
         let dist = dist >> (16 - bits);
         let pos = (self.decode_pos[bits] + dist) as usize;
+        // DecodeNumber's damaged-archive clamp (unpackinline.cpp).
         let pos = if pos >= self.num_symbols { 0 } else { pos };
+        // `num_symbols <= MAX_NUM_SYMBOLS` is checked in `build`, so this is a
+        // no-op; it makes the bound const so the array index check is elided.
+        let pos = pos.min(MAX_NUM_SYMBOLS - 1);
         self.decode_num[pos]
+    }
+
+    /// Quick-table index for a left-aligned bit field.
+    ///
+    /// Masked with the const table size so the index bound is provable and the
+    /// array checks disappear from the hot path.
+    #[inline(always)]
+    fn quick_index(&self, bit_field: u32) -> usize {
+        ((bit_field >> (16 - self.quick_bits)) as usize) & (MAX_QUICK_ENTRIES - 1)
+    }
+
+    /// `DecodeLen[QuickBits]` — the quick-path threshold.
+    ///
+    /// `quick_bits` is only ever 6 or 9, but the mask makes that bound
+    /// provable so this indexed load carries no check either.
+    #[inline(always)]
+    fn quick_threshold(&self) -> u32 {
+        self.decode_len[(self.quick_bits as usize) & 0xF]
     }
 
     /// Decode the next symbol from the bitstream.
     ///
     /// DecodeNumber-style path: peek 16 left-aligned bits, try quick
     /// table, fall back to linear threshold scan.
+    ///
+    /// `build` seeds `cur_bit_length` at 1, so every quick entry reachable
+    /// through the `decode_len[quick_bits]` test has a non-zero length; the
+    /// all-zero table leaves `decode_len[quick_bits]` at 0 and can never pass
+    /// that test. The quick path therefore needs no length re-check.
     #[inline(always)]
     pub fn decode<R: BitRead>(&self, reader: &mut R) -> RarResult<u16> {
         // Peek 16 left-aligned bits, or fewer if near end of stream.
         let bit_field = reader.peek_16_left_aligned()?;
 
         // Quick path: if bit_field is below the threshold for quick_bits length.
-        let quick_bits = self.quick_bits as usize;
-        if bit_field < self.decode_len[quick_bits] {
-            let code = (bit_field >> (16 - self.quick_bits)) as usize;
-            let len = self.quick_len[code];
-            if len != 0 {
-                reader.consume_bits(len)?;
-                return Ok(self.quick_num[code]);
-            }
+        if bit_field < self.quick_threshold() {
+            let code = self.quick_index(bit_field);
+            reader.consume_bits(self.quick_len[code])?;
+            return Ok(self.quick_num[code]);
         }
 
         let bits = self.slow_path_bits(bit_field);
@@ -230,16 +256,15 @@ impl HuffmanTable {
     /// Slice-reader specialization of `DecodeNumber`.
     #[inline(always)]
     pub fn decode_bitreader(&self, reader: &mut BitReader<'_>) -> RarResult<u16> {
+        // One refill per symbol; the peek and the addbits below then run
+        // entirely out of the accumulator register.
+        reader.ensure_bits(16);
         let bit_field = reader.getbits()?;
-        let quick_bits = self.quick_bits as usize;
 
-        if bit_field < self.decode_len[quick_bits] {
-            let code = (bit_field >> (16 - self.quick_bits)) as usize;
-            let bits = self.quick_len[code];
-            if bits != 0 {
-                reader.addbits(bits)?;
-                return Ok(self.quick_num[code]);
-            }
+        if bit_field < self.quick_threshold() {
+            let code = self.quick_index(bit_field);
+            reader.addbits(self.quick_len[code])?;
+            return Ok(self.quick_num[code]);
         }
 
         let bits = self.slow_path_bits(bit_field);
@@ -247,28 +272,23 @@ impl HuffmanTable {
         Ok(self.symbol_for_bits(bit_field, bits))
     }
 
+    /// Whether `bit_field` would take the quick path (diagnostics only).
+    ///
+    /// Equivalent to the quick-path test in the decoders: a reachable quick
+    /// entry always has a non-zero length, so the threshold test alone decides.
     #[inline(always)]
     pub(super) fn is_quick_code(&self, bit_field: u32) -> bool {
-        let quick_bits = self.quick_bits as usize;
-        if bit_field >= self.decode_len[quick_bits] {
-            return false;
-        }
-        let code = (bit_field >> (16 - self.quick_bits)) as usize;
-        self.quick_len[code] != 0
+        bit_field < self.quick_threshold()
     }
 
     #[inline(always)]
     pub(super) fn decode_block_reader(&self, reader: &mut BlockReader<'_>) -> (u16, bool) {
         let bit_field = u32::from(reader.peek_u16()) & 0xfffe;
-        let quick_bits = self.quick_bits as usize;
 
-        if bit_field < self.decode_len[quick_bits] {
-            let code = (bit_field >> (16 - self.quick_bits)) as usize;
-            let bits = self.quick_len[code];
-            if bits != 0 {
-                reader.advance(bits as usize);
-                return (self.quick_num[code], true);
-            }
+        if bit_field < self.quick_threshold() {
+            let code = self.quick_index(bit_field);
+            reader.advance(self.quick_len[code] as usize);
+            return (self.quick_num[code], true);
         }
 
         let bits = self.slow_path_bits(bit_field);
@@ -418,10 +438,14 @@ pub fn read_tables_bitreader(
     let mut bc_lengths = [0u8; HUFF_BC];
     let mut i = 0usize;
     while i < HUFF_BC {
-        let length = (reader.getbits()? >> 12) as u8;
+        // `getbits()` clears the LSB (the DecodeNumber shape); these are raw
+        // fixed-width fields, so use the faithful `fgetbits` analogue instead.
+        reader.ensure_bits(16);
+        let length = (reader.peek_16_raw()? >> 12) as u8;
         reader.addbits(4)?;
         if length == 15 {
-            let mut zero_count = (reader.getbits()? >> 12) as usize;
+            reader.ensure_bits(16);
+            let mut zero_count = (reader.peek_16_raw()? >> 12) as usize;
             reader.addbits(4)?;
             if zero_count == 0 {
                 bc_lengths[i] = 15;
@@ -457,10 +481,11 @@ pub fn read_tables_bitreader(
             all_lengths[i] = number as u8;
             i += 1;
         } else if number < 18 {
+            reader.ensure_bits(16);
             let count = if number == 16 {
-                ((reader.getbits()? >> 13) as usize) + 3
+                ((reader.peek_16_raw()? >> 13) as usize) + 3
             } else {
-                ((reader.getbits()? >> 9) as usize) + 11
+                ((reader.peek_16_raw()? >> 9) as usize) + 11
             };
             reader.addbits(if number == 16 { 3 } else { 7 })?;
             if i == 0 {
@@ -477,10 +502,11 @@ pub fn read_tables_bitreader(
                 i += 1;
             }
         } else {
+            reader.ensure_bits(16);
             let count = if number == 18 {
-                ((reader.getbits()? >> 13) as usize) + 3
+                ((reader.peek_16_raw()? >> 13) as usize) + 3
             } else {
-                ((reader.getbits()? >> 9) as usize) + 11
+                ((reader.peek_16_raw()? >> 9) as usize) + 11
             };
             reader.addbits(if number == 18 { 3 } else { 7 })?;
             for _ in 0..count {
@@ -632,10 +658,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_invalid_length() {
+    fn test_build_accepts_maximum_code_length() {
+        // MakeDecodeTables masks bit lengths to 4 bits and has no reject path
+        // for them; the only hard error left is an oversized alphabet.
         let mut lengths = [0u8; 4];
-        lengths[0] = 20; // too long
-        assert!(HuffmanTable::build(&lengths).is_err());
+        lengths[0] = 15;
+        lengths[1] = 15;
+        let table = HuffmanTable::build(&lengths).unwrap();
+        assert_eq!(table.max_length, 15);
+    }
+
+    #[test]
+    fn test_build_rejects_oversized_alphabet() {
+        let lengths = vec![1u8; MAX_NUM_SYMBOLS + 1];
+        assert!(matches!(
+            HuffmanTable::build(&lengths),
+            Err(RarError::InvalidHuffmanTable)
+        ));
     }
 
     #[test]
@@ -826,5 +865,64 @@ mod tests {
         assert_eq!(generic_dc.max_length(), specialized_dc.max_length());
         assert_eq!(generic_ldc.max_length(), specialized_ldc.max_length());
         assert_eq!(generic_rc.max_length(), specialized_rc.max_length());
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn all_decode_paths_agree_on_randomized_tables_and_streams() {
+        use super::super::block_reader::LOOKAHEAD_BYTES;
+
+        for trial in 0..8u64 {
+            let mut state = 0x9e37_79b9_7f4a_7c15 ^ trial.wrapping_mul(0x1234_5678_9abc_def1);
+            // Alternate the alphabet size to exercise both quick_bits regimes
+            // (9 bits for NC, 6 bits for the small tables).
+            let num_symbols = if trial % 2 == 0 { HUFF_NC } else { HUFF_RC };
+            let mut lengths = vec![0u8; num_symbols];
+            for slot in lengths.iter_mut() {
+                let value = xorshift(&mut state);
+                *slot = if value % 8 < 2 {
+                    0
+                } else {
+                    ((value >> 8) % (MAX_CODE_LENGTH as u64)) as u8 + 1
+                };
+            }
+            let table = HuffmanTable::build(&lengths).unwrap();
+
+            let mut data = vec![0u8; 384];
+            for byte in data.iter_mut() {
+                *byte = (xorshift(&mut state) >> 24) as u8;
+            }
+            let mut staged = data.clone();
+            staged.resize(data.len() + LOOKAHEAD_BYTES, 0);
+
+            let end_bit = data.len() * 8;
+            let mut generic = BitReader::new(&data);
+            let mut specialized = BitReader::new(&data);
+            let mut block = BlockReader::new(&staged, 0, end_bit).unwrap();
+
+            let mut symbols = 0usize;
+            // Stop well before the end so no reader sees a short final peek.
+            while generic.position() + 64 <= end_bit {
+                let expected = table.decode(&mut generic).unwrap();
+                assert_eq!(
+                    table.decode_bitreader(&mut specialized).unwrap(),
+                    expected,
+                    "trial {trial} symbol {symbols}"
+                );
+                let (block_symbol, _) = table.decode_block_reader(&mut block);
+                assert_eq!(block_symbol, expected, "trial {trial} symbol {symbols}");
+                assert_eq!(specialized.position(), generic.position());
+                assert_eq!(block.position(), generic.position());
+                symbols += 1;
+            }
+            assert!(symbols > 32, "trial {trial} decoded only {symbols} symbols");
+            block.validate_end().unwrap();
+        }
     }
 }

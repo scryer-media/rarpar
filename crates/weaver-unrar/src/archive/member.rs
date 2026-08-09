@@ -15,6 +15,14 @@ use crate::hash_pipeline::SharedHashStream;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Output buffer for member extraction, deliberately smaller than the spans the
+/// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
+/// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
+/// a single write at or above capacity, so a capacity above the flush span
+/// would memcpy every output byte for no reduction in syscalls; below it, large
+/// spans go straight to `write` and only the small ones (per-filter subranges)
+/// are coalesced.
+const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
 #[cfg(any(windows, test))]
@@ -4157,6 +4165,11 @@ impl RarArchive {
 
             let (actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
+                let decoder = Self::prepare_rar5_member_decoder(
+                    &mut self.solid_decoder,
+                    &fh,
+                    self.limits.max_dict_size,
+                )?;
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
@@ -4166,32 +4179,21 @@ impl RarArchive {
                     expected_blake.is_some(),
                 );
 
-                if let Some(crypto) = rar5_crypto.as_ref() {
+                let written = if let Some(crypto) = rar5_crypto.as_ref() {
                     let reader = crate::crypto::DecryptingReader::new_rar5(
                         base_reader,
                         &crypto.key,
                         &crypto.iv,
                     );
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
+                    decoder.decompress_reader_to_writer(reader, unpacked_size, &mut hash_writer)?
                 } else {
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            base_reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                }
+                    decoder.decompress_reader_to_writer(
+                        base_reader,
+                        unpacked_size,
+                        &mut hash_writer,
+                    )?
+                };
+                self.enforce_unknown_lz_output_limit(&fh, written)?;
 
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
@@ -4463,7 +4465,7 @@ impl RarArchive {
     /// This is the memory-efficient alternative to `extract_member()`. Instead of
     /// returning the full decompressed content as a `Vec<u8>`, it writes directly
     /// to disk via a `BufWriter`. Memory usage is bounded to dict_size (max 256 MB)
-    /// for LZ-compressed files, or ~8 MB for Store (uncompressed) files.
+    /// for LZ-compressed files, or a few MB for Store (uncompressed) files.
     ///
     /// For Store method without encryption: reads segments directly from volumes
     /// and writes to disk without buffering the full file.
@@ -4554,7 +4556,7 @@ impl RarArchive {
             Self::create_regular_output_file_for_member(&member_name, out_path)?;
         let out_path = resolved_out_path.as_path();
         Self::preallocate_output_file(&file, self.target_unpacked_size(&fh));
-        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
 
         if fh.compression.method == CompressionMethod::Store {
             let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -4697,48 +4699,48 @@ impl RarArchive {
             };
 
             let segments = self.members[index].segments.clone();
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                &fh,
+                self.limits.max_dict_size,
+            )?;
             let base_reader =
                 ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                     .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
-            let (actual_crc, actual_blake) = {
-                let mut hash_writer = HashingWriter::new(
-                    &mut writer,
-                    expected_crc.is_some(),
-                    expected_blake.is_some(),
-                );
-                if let Some(crypto) = rar5_crypto.as_ref() {
+            // BLAKE2sp runs off-thread for large members (see hash_pipeline).
+            // CRC32 stays inline on purpose: hardware CRC keeps up with the
+            // decoder without paying for the channel hop.
+            let blake_stream = expected_blake
+                .is_some()
+                .then(|| SharedHashStream::new(false, false, true, unpacked_size));
+
+            let (actual_crc, written) = {
+                let mut blake_writer = HashTrackingWriter {
+                    inner: &mut writer,
+                    hash: blake_stream.clone(),
+                };
+                let mut hash_writer =
+                    HashingWriter::new(&mut blake_writer, expected_crc.is_some(), false);
+                let written = if let Some(crypto) = rar5_crypto.as_ref() {
                     let reader = crate::crypto::DecryptingReader::new_rar5(
                         base_reader,
                         &crypto.key,
                         &crypto.iv,
                     );
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
+                    decoder.decompress_reader_to_writer(reader, unpacked_size, &mut hash_writer)?
                 } else {
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            base_reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                }
+                    decoder.decompress_reader_to_writer(
+                        base_reader,
+                        unpacked_size,
+                        &mut hash_writer,
+                    )?
+                };
                 hash_writer.flush().map_err(RarError::Io)?;
-                (
-                    expected_crc.map(|_| hash_writer.finalize_crc()),
-                    expected_blake.map(|_| hash_writer.finalize_blake2()),
-                )
+                (expected_crc.map(|_| hash_writer.finalize_crc()), written)
             };
+            self.enforce_unknown_lz_output_limit(&fh, written)?;
+            let (_, actual_blake) = finalize_shared_hash(blake_stream)?;
 
             Self::verify_member_crc32(
                 &fh.name,
@@ -4873,12 +4875,20 @@ impl RarArchive {
                 None
             };
 
-            let (written, actual_crc, actual_blake) = {
-                let mut hash_writer = HashingWriter::new(
-                    &mut writer,
-                    expected_crc.is_some(),
-                    expected_blake.is_some(),
-                );
+            // BLAKE2sp runs off-thread for large members (see hash_pipeline).
+            // CRC32 stays inline on purpose: hardware CRC keeps up with the
+            // decoder without paying for the channel hop.
+            let blake_stream = expected_blake
+                .is_some()
+                .then(|| SharedHashStream::new(false, false, true, unpacked_size));
+
+            let (written, actual_crc) = {
+                let mut blake_writer = HashTrackingWriter {
+                    inner: &mut writer,
+                    hash: blake_stream.clone(),
+                };
+                let mut hash_writer =
+                    HashingWriter::new(&mut blake_writer, expected_crc.is_some(), false);
                 self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
@@ -4940,12 +4950,9 @@ impl RarArchive {
                 };
                 self.enforce_unknown_lz_output_limit(&fh, written)?;
                 hash_writer.flush().map_err(RarError::Io)?;
-                (
-                    written,
-                    expected_crc.map(|_| hash_writer.finalize_crc()),
-                    expected_blake.map(|_| hash_writer.finalize_blake2()),
-                )
+                (written, expected_crc.map(|_| hash_writer.finalize_crc()))
             };
+            let (_, actual_blake) = finalize_shared_hash(blake_stream)?;
 
             Self::verify_member_crc32(
                 &fh.name,
@@ -5268,6 +5275,30 @@ impl RarArchive {
 
         Ok(chunks)
     }
+    /// Prepare the archive-wide RAR5 decoder for the next **non-solid** member.
+    ///
+    /// RAR runs one `Unpack` object per command and re-inits it per file, so a
+    /// non-solid member reuses the existing window and input staging instead of
+    /// allocating a fresh decoder. This is the same slot the solid path uses:
+    /// whatever state a member leaves behind stays available to a following
+    /// solid member, exactly as it would in the oracle.
+    fn prepare_rar5_member_decoder<'a>(
+        solid_decoder: &'a mut Option<LzDecoder>,
+        fh: &FileHeader,
+        max_dict_size: u64,
+    ) -> RarResult<&'a mut LzDecoder> {
+        let dict_size =
+            crate::decompress::lz::checked_lz_dict_size(&fh.compression, max_dict_size)?;
+        let version = fh.compression.version;
+        match solid_decoder {
+            // A non-solid member starts from an empty history, so a dictionary
+            // change in either direction is fine here.
+            Some(decoder) => decoder.prepare_reuse(dict_size, version)?,
+            None => *solid_decoder = Some(LzDecoder::try_new(dict_size, version)?),
+        }
+        Ok(solid_decoder.as_mut().expect("RAR5 decoder prepared above"))
+    }
+
     fn solid_decode_reader_to_sink<R: Read>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
@@ -5882,7 +5913,7 @@ impl RarArchive {
     /// data. For encrypted members, wraps in `DecryptingReader`.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz<W: Write>(
-        &self,
+        &mut self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
         options: &ExtractOptions,
@@ -5969,13 +6000,12 @@ impl RarArchive {
 
         let written = if self.format == ArchiveFormat::Rar5 {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
-            crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                &mut buf_reader,
-                unpacked_size,
-                &fh.compression,
-                &mut hash_writer,
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                fh,
                 self.limits.max_dict_size,
-            )?
+            )?;
+            decoder.decompress_reader_to_writer(&mut buf_reader, unpacked_size, &mut hash_writer)?
         } else {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
             crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
@@ -6471,7 +6501,7 @@ impl RarArchive {
     /// then splits decompressed output at those boundaries.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz_chunked<F>(
-        &self,
+        &mut self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
         options: &ExtractOptions,
@@ -6564,10 +6594,14 @@ impl RarArchive {
             .with_shared_transitions(Arc::clone(&shared_transitions));
 
             let hash_clone = shared_hash.clone();
-            crate::decompress::lz::decompress_lz_reader_to_writer_chunked_with_max_dict_size(
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                fh,
+                self.limits.max_dict_size,
+            )?;
+            decoder.decompress_reader_to_writer_chunked(
                 tracking_reader,
                 unpacked_size,
-                &fh.compression,
                 first_vol,
                 shared_transitions,
                 |vol_idx| {
@@ -6581,7 +6615,6 @@ impl RarArchive {
                         Ok(writer)
                     }
                 },
-                self.limits.max_dict_size,
             )?
         } else {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));

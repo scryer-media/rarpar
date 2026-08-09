@@ -98,12 +98,14 @@ pub fn extract_set(
 
     std::fs::create_dir_all(output_dir)?;
     with_password_retry(set, passwords, |mut archive| {
-        preflight_outputs(&archive, output_dir, cli.overwrite)?;
-        let options = extract_options(archive_password(&archive));
+        // One metadata build per extraction: it walks every member and
+        // allocates a name per entry, so the preflight reuses this list.
         let members = archive.metadata().members;
+        preflight_outputs(&members, output_dir, cli.overwrite)?;
+        let options = extract_options(archive_password(&archive));
         for (index, member) in members.iter().enumerate() {
             let out_path = output_dir.join(&member.name);
-            if !cli.json {
+            if !cli.json && !cli.quiet {
                 println!(
                     "{}  {}",
                     if member.is_directory {
@@ -185,6 +187,7 @@ fn open_paths_with_password(
     } else {
         unrar_rs::RarArchive::open(first)?
     };
+    archive.set_limits(cli_extraction_limits());
     if let Some(password) = password {
         archive.set_password(password.to_string());
     }
@@ -304,14 +307,14 @@ fn restore_volume_paths_inner(
 }
 
 fn preflight_outputs(
-    archive: &unrar_rs::RarArchive,
+    members: &[unrar_rs::MemberInfo],
     output_dir: &Path,
     overwrite: bool,
 ) -> Result<(), RarparError> {
     if overwrite {
         return Ok(());
     }
-    for member in archive.metadata().members {
+    for member in members {
         let path = output_dir.join(&member.name);
         if member.is_directory {
             if path.exists() && !path.is_dir() {
@@ -355,6 +358,21 @@ fn single_archive_set(archive: &Path) -> Result<RarSet, RarparError> {
         }],
         recovery_volumes: Vec::new(),
     })
+}
+
+/// Resource limits the CLI applies to every archive it opens.
+///
+/// The library default caps dictionaries at 256 MiB, which is the right
+/// conservative ceiling for an embedder that has not thought about memory. As a
+/// tool, rarpar has to match what `unrar 7.20` extracts, and unrar accepts any
+/// dictionary the format allows (`UNPACK_MAX_DICT`) unless `-md` narrows it —
+/// so the CLI raises the cap to the format ceiling and leaves the library
+/// default alone.
+pub fn cli_extraction_limits() -> unrar_rs::Limits {
+    unrar_rs::Limits {
+        max_dict_size: unrar_rs::limits::RAR_UNPACK_MAX_DICT_SIZE,
+        ..unrar_rs::Limits::default()
+    }
 }
 
 fn extract_options(password: Option<String>) -> unrar_rs::ExtractOptions {

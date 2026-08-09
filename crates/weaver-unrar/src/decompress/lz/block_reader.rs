@@ -11,6 +11,12 @@ use std::fmt;
 /// Readable bytes required after the logical block for one complete symbol.
 pub const LOOKAHEAD_BYTES: usize = 32;
 
+/// Widest peek served by a single unaligned 32-bit load.
+///
+/// A load at `position >> 3` covers `32 - (position & 7)` valid bits, so 24
+/// is the widest request that is always satisfied by one load.
+const NARROW_PEEK_BITS: u8 = 24;
+
 /// Failure returned while establishing or validating a bounded reader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockReaderError {
@@ -26,7 +32,7 @@ pub enum BlockReaderError {
         required_end: usize,
         available: usize,
     },
-    EndMismatch {
+    EndOvershoot {
         position: usize,
         end_bit: usize,
     },
@@ -52,8 +58,8 @@ impl fmt::Display for BlockReaderError {
                 f,
                 "block input needs {required_end} readable bytes, only {available} available"
             ),
-            Self::EndMismatch { position, end_bit } => {
-                write!(f, "block ended at bit {position}, expected {end_bit}")
+            Self::EndOvershoot { position, end_bit } => {
+                write!(f, "block ended at bit {position}, past its end {end_bit}")
             }
         }
     }
@@ -116,6 +122,39 @@ impl<'a> BlockReader<'a> {
         self.position
     }
 
+    /// Debug-only proof that a `width`-byte load at `byte` stays inside the
+    /// staged source.
+    ///
+    /// Release builds carry no length compare: the constructor already proved
+    /// `ceil(end_bit / 8) + LOOKAHEAD_BYTES <= data.len()`, and the decode loop
+    /// re-tests `position < end` before every symbol while a single symbol
+    /// consumes at most ~150 bits, so no load reaches past the staged guard.
+    #[inline(always)]
+    fn debug_check_load(&self, byte: usize, width: usize) {
+        debug_assert!(
+            byte + width <= self.data.len(),
+            "block reader load of {width} bytes at byte {byte} exceeds {} staged bytes",
+            self.data.len()
+        );
+    }
+
+    /// Load the 32-bit window that starts at the current bit position.
+    ///
+    /// Mirrors UnRAR `getbits()` (getbits.hpp:34-46): one unaligned big-endian
+    /// 32-bit load shifted so the current bit becomes the MSB. The top
+    /// `32 - (position & 7)` bits are valid, hence [`NARROW_PEEK_BITS`].
+    #[inline(always)]
+    fn peek_window_u32(&self) -> u32 {
+        let byte = self.position >> 3;
+        let offset = (self.position & 7) as u32;
+        self.debug_check_load(byte, 4);
+        // SAFETY: `debug_check_load` documents the constructor contract that
+        // keeps `byte + 4` inside `data`; the guard bytes after the logical
+        // block are caller-supplied and readable.
+        let raw = unsafe { load_be_u32(self.data, byte) };
+        raw << offset
+    }
+
     /// Peek at up to 64 MSB-first bits without advancing.
     ///
     /// This operation is intentionally not a logical-range check.  A decoder
@@ -126,6 +165,10 @@ impl<'a> BlockReader<'a> {
         debug_assert!(count <= 64);
         if count == 0 {
             return 0;
+        }
+        if count <= NARROW_PEEK_BITS {
+            // One load covers the request; skip the wider two-load path.
+            return u64::from(self.peek_window_u32() >> (32 - count as u32));
         }
         let value = self.peek_u64();
         if count == 64 {
@@ -138,25 +181,13 @@ impl<'a> BlockReader<'a> {
     /// Peek at the next 16 MSB-first bits as a big-endian value.
     #[inline(always)]
     pub fn peek_u16(&self) -> u16 {
-        if self.position & 7 == 0 {
-            if (self.position >> 3).saturating_add(2) > self.data.len() {
-                return 0;
-            }
-            return unsafe { load_be_u16(self.data, self.position >> 3) };
-        }
-        self.peek_bits(16) as u16
+        (self.peek_window_u32() >> 16) as u16
     }
 
     /// Peek at the next 32 MSB-first bits as a big-endian value.
     #[cfg(test)]
     #[inline(always)]
     pub fn peek_u32(&self) -> u32 {
-        if self.position & 7 == 0 {
-            if (self.position >> 3).saturating_add(4) > self.data.len() {
-                return 0;
-            }
-            return unsafe { load_be_u32(self.data, self.position >> 3) };
-        }
         self.peek_bits(32) as u32
     }
 
@@ -165,15 +196,17 @@ impl<'a> BlockReader<'a> {
     pub fn peek_u64(&self) -> u64 {
         let byte = self.position >> 3;
         let offset = self.position & 7;
-        let required = byte.saturating_add(if offset == 0 { 8 } else { 9 });
-        if required > self.data.len() {
-            return 0;
-        }
-        let high = unsafe { load_be_u64(self.data, byte) };
         if offset == 0 {
-            return high;
+            self.debug_check_load(byte, 8);
+            // SAFETY: see `debug_check_load`; the constructor contract keeps
+            // `byte + 8` inside the staged source.
+            return unsafe { load_be_u64(self.data, byte) };
         }
 
+        self.debug_check_load(byte, 9);
+        // SAFETY: see `debug_check_load`; the constructor contract keeps
+        // `byte + 9` inside the staged source for an unaligned window.
+        let high = unsafe { load_be_u64(self.data, byte) };
         let low = unsafe { load_be_u64(self.data, byte + 1) };
         (high << offset) | (low >> (8 - offset))
     }
@@ -211,13 +244,17 @@ impl<'a> BlockReader<'a> {
         self.position = self.position.saturating_add(count);
     }
 
-    /// Validate that decoding consumed exactly the logical block range.
+    /// Validate that decoding stayed inside the logical block range.
+    ///
+    /// UnRAR ends a block as soon as the cursor reaches the block border and
+    /// simply leaves whatever padding bits follow (unpack50mt.cpp:318-322), so
+    /// only overshoot is a real failure. Undershoot is tolerated.
     #[inline]
     pub fn validate_end(&self) -> Result<(), BlockReaderError> {
-        if self.position == self.end_bit {
+        if self.position <= self.end_bit {
             Ok(())
         } else {
-            Err(BlockReaderError::EndMismatch {
+            Err(BlockReaderError::EndOvershoot {
                 position: self.position,
                 end_bit: self.end_bit,
             })
@@ -235,17 +272,12 @@ impl<'a> BlockReader<'a> {
 // The constructor proves that every load for one complete symbol remains in
 // the supplied source. Unaligned reads avoid constructing temporary slices in
 // the decode loop and are valid on every supported target.
+//
+// SAFETY (both helpers): callers must keep `byte + size_of::<T>() <=
+// data.len()`. Every call site goes through `BlockReader::debug_check_load`,
+// which asserts that in debug builds and documents why the constructor
+// contract makes it hold in release builds.
 #[inline(always)]
-unsafe fn load_be_u16(data: &[u8], byte: usize) -> u16 {
-    unsafe {
-        u16::from_be(std::ptr::read_unaligned(
-            data.as_ptr().add(byte) as *const u16
-        ))
-    }
-}
-
-#[inline(always)]
-#[cfg(test)]
 unsafe fn load_be_u32(data: &[u8], byte: usize) -> u32 {
     unsafe {
         u32::from_be(std::ptr::read_unaligned(
@@ -348,18 +380,25 @@ mod tests {
     }
 
     #[test]
-    fn final_boundary_must_be_exact() {
+    fn final_boundary_rejects_only_overshoot() {
+        // UnRAR stops at the block border and tolerates trailing padding, so
+        // an undershoot is valid and only passing the border is an error.
         let data = with_guard(vec![0xff, 0x00]);
         let mut reader = BlockReader::new(&data, 0, 12).unwrap();
         reader.advance(8);
+        reader.validate_end().unwrap();
+        reader.advance(4);
+        reader.validate_end().unwrap();
+        reader.advance(1);
         assert_eq!(
             reader.validate_end(),
-            Err(BlockReaderError::EndMismatch {
-                position: 8,
+            Err(BlockReaderError::EndOvershoot {
+                position: 13,
                 end_bit: 12
             })
         );
-        reader.advance(4);
+
+        let reader = BlockReader::new(&data, 0, 12).unwrap();
         reader.finish().unwrap();
     }
 
@@ -396,6 +435,68 @@ mod tests {
             }
             reader.advance(end - position);
             reader.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn narrow_peeks_match_checked_model_at_every_offset() {
+        // The single-load path serves peek_u16 and every peek_bits/read_bits
+        // request up to NARROW_PEEK_BITS. Walk every bit offset in a whole
+        // byte-aligned run and compare against the bit-by-bit model.
+        let source: Vec<u8> = (0..24)
+            .map(|index| (index as u8).wrapping_mul(151).wrapping_add(7))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+
+        for start in 0..end {
+            let reader = BlockReader::new(&data, start, end).unwrap();
+            assert_eq!(
+                u64::from(reader.peek_u16()),
+                model_peek(&data, start, 16),
+                "peek_u16 at {start}"
+            );
+            for count in 0..=super::NARROW_PEEK_BITS {
+                assert_eq!(
+                    reader.peek_bits(count),
+                    model_peek(&data, start, count as usize),
+                    "peek_bits({count}) at {start}"
+                );
+            }
+            // The wide path must agree with the narrow one where they overlap.
+            for count in super::NARROW_PEEK_BITS..=64 {
+                assert_eq!(
+                    reader.peek_bits(count),
+                    model_peek(&data, start, count as usize),
+                    "wide peek_bits({count}) at {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_reads_advance_and_match_model() {
+        let source: Vec<u8> = (0..24)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(211))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+
+        for count in 1..=super::NARROW_PEEK_BITS {
+            let mut reader = BlockReader::new(&data, 0, end).unwrap();
+            let mut position = 0usize;
+            while position + count as usize <= end {
+                assert_eq!(
+                    reader.read_bits(count),
+                    model_peek(&data, position, count as usize),
+                    "read_bits({count}) at {position}"
+                );
+                position += count as usize;
+                assert_eq!(reader.position(), position);
+            }
+            reader.validate_end().unwrap();
         }
     }
 }

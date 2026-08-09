@@ -1887,30 +1887,30 @@ impl CbcDecryptorAny {
     }
 }
 
-/// Decryption buffer size.
-/// Keep this modest because encrypted extraction already pays for the dictionary
-/// window and output sink; a very large decrypt staging buffer does not buy much
-/// once compressed input is streamed.
-const DECRYPT_BUF_SIZE: usize = 64 * 1024;
-
 /// A `Read` adapter that decrypts AES-CBC on-the-fly.
 ///
 /// Wraps an inner `Read` source (e.g. `ChainedSegmentReader`) and decrypts
-/// data as it flows through. Handles partial AES blocks at read boundaries
-/// by buffering internally.
+/// data as it flows through. Ciphertext is read straight into the caller's
+/// buffer and decrypted in place, matching unrar's `UnpRead` (rdwrfn.cpp),
+/// which decrypts the read buffer where it lands. The caller therefore sets
+/// the read granularity; nothing here caps it.
+///
+/// Only two things are carried between calls: ciphertext that does not
+/// complete an AES block (a volume boundary can split one), and — for callers
+/// whose buffer is smaller than a single block — one staged plaintext block.
 ///
 /// The total data from the inner reader MUST be a multiple of 16 bytes
 /// (guaranteed by RAR's archive format for encrypted members).
 pub struct DecryptingReader<R: Read> {
     inner: R,
     decryptor: CbcDecryptorAny,
-    /// Bytes read from inner but not yet forming a complete AES block.
+    /// Ciphertext read from inner but not yet forming a complete AES block.
     pending: [u8; AES_BLOCK],
     pending_len: usize,
-    /// Heap-allocated decryption buffer (too large for stack).
-    out_buf: Box<[u8]>,
-    out_pos: usize,
-    out_len: usize,
+    /// Plaintext staged for callers whose buffer cannot hold a whole block.
+    plain: [u8; AES_BLOCK],
+    plain_pos: usize,
+    plain_len: usize,
     /// Inner reader hit EOF.
     inner_eof: bool,
 }
@@ -1918,7 +1918,7 @@ pub struct DecryptingReader<R: Read> {
 impl<R: Read> Drop for DecryptingReader<R> {
     fn drop(&mut self) {
         self.pending.zeroize();
-        self.out_buf.zeroize();
+        self.plain.zeroize();
     }
 }
 
@@ -1929,11 +1929,53 @@ impl<R: Read> DecryptingReader<R> {
             decryptor,
             pending: [0u8; AES_BLOCK],
             pending_len: 0,
-            out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
-            out_pos: 0,
-            out_len: 0,
+            plain: [0u8; AES_BLOCK],
+            plain_pos: 0,
+            plain_len: 0,
             inner_eof: false,
         }
+    }
+
+    /// Stage one decrypted block in `plain`, for callers whose buffer is too
+    /// small to decrypt in place. Returns 0 at a clean end of stream.
+    fn stage_block(&mut self) -> std::io::Result<usize> {
+        let mut total = self.pending_len;
+        if total > 0 {
+            self.plain[..total].copy_from_slice(&self.pending[..total]);
+        }
+        while total < AES_BLOCK && !self.inner_eof {
+            match self.inner.read(&mut self.plain[total..AES_BLOCK]) {
+                Ok(0) => {
+                    self.inner_eof = true;
+                    break;
+                }
+                Ok(read) => total += read,
+                Err(error) => {
+                    // Keep what was staged so a retry resumes where it stopped.
+                    self.pending[..total].copy_from_slice(&self.plain[..total]);
+                    self.pending_len = total;
+                    return Err(error);
+                }
+            }
+        }
+        self.pending_len = 0;
+
+        if total == 0 {
+            return Ok(0);
+        }
+        if total < AES_BLOCK {
+            self.pending[..total].copy_from_slice(&self.plain[..total]);
+            self.pending_len = total;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encrypted data not aligned to AES block size",
+            ));
+        }
+
+        self.decryptor.decrypt(&mut self.plain[..]);
+        self.plain_pos = 0;
+        self.plain_len = AES_BLOCK;
+        Ok(AES_BLOCK)
     }
 
     /// Create a new decrypting reader for RAR5 (AES-256-CBC).
@@ -1998,84 +2040,84 @@ impl<R: Read> Read for DecryptingReader<R> {
             return Ok(read);
         }
 
-        // Return any buffered decrypted data first.
-        if self.out_pos < self.out_len {
-            let n = (self.out_len - self.out_pos).min(buf.len());
-            buf[..n].copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + n]);
-            self.out_pos += n;
+        // Serve plaintext held back from a sub-block-sized read.
+        if self.plain_pos < self.plain_len {
+            let n = (self.plain_len - self.plain_pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.plain[self.plain_pos..self.plain_pos + n]);
+            self.plain_pos += n;
             return Ok(n);
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
         }
 
         if self.inner_eof && self.pending_len == 0 {
             return Ok(0);
         }
 
-        // Read directly into out_buf, prepending any pending partial block.
-        let raw_start;
-        if self.pending_len > 0 {
-            self.out_buf[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
-            raw_start = self.pending_len;
-            self.pending_len = 0;
-        } else {
-            raw_start = 0;
+        // A buffer shorter than one AES block cannot be decrypted in place.
+        if buf.len() < AES_BLOCK {
+            if self.stage_block()? == 0 {
+                return Ok(0);
+            }
+            let n = self.plain_len.min(buf.len());
+            buf[..n].copy_from_slice(&self.plain[..n]);
+            self.plain_pos = n;
+            return Ok(n);
         }
 
-        // Fill out_buf as much as possible from inner.
-        // Loop to fill the buffer since a single read() may return short.
-        let mut total = raw_start;
-        if !self.inner_eof {
-            // Read at least enough to make progress, ideally fill the buffer.
-            while total < DECRYPT_BUF_SIZE {
-                let n = self
-                    .inner
-                    .read(&mut self.out_buf[total..DECRYPT_BUF_SIZE])?;
-                if n == 0 {
+        // Read ciphertext straight into the caller's buffer, prefixed by any
+        // partial block carried over from the previous call.
+        let mut total = self.pending_len;
+        if total > 0 {
+            buf[..total].copy_from_slice(&self.pending[..total]);
+        }
+        while total < buf.len() && !self.inner_eof {
+            debug_assert!(total < AES_BLOCK, "fill loop runs only until one block");
+            match self.inner.read(&mut buf[total..]) {
+                Ok(0) => {
                     self.inner_eof = true;
                     break;
                 }
-                total += n;
-                // Don't loop forever on small reads — one good read is enough
-                // to make progress. But try to fill the buffer for pipeline efficiency.
-                if total >= DECRYPT_BUF_SIZE / 2 {
-                    break;
+                Ok(read) => {
+                    total += read;
+                    // One whole block is enough to hand back; keep reading only
+                    // while a short read has not yet produced one.
+                    if total >= AES_BLOCK {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    // Carry the staged ciphertext so a retry resumes cleanly.
+                    self.pending[..total].copy_from_slice(&buf[..total]);
+                    self.pending_len = total;
+                    return Err(error);
                 }
             }
         }
+        self.pending_len = 0;
 
-        if total == 0 {
-            return Ok(0);
-        }
-
-        // How many complete AES blocks do we have?
-        let complete = (total / AES_BLOCK) * AES_BLOCK;
+        let complete = total - (total % AES_BLOCK);
         let leftover = total - complete;
-
-        // Save leftover for next call.
         if leftover > 0 {
-            self.pending[..leftover].copy_from_slice(&self.out_buf[complete..total]);
+            self.pending[..leftover].copy_from_slice(&buf[complete..total]);
             self.pending_len = leftover;
         }
 
         if complete == 0 {
-            if self.inner_eof {
+            // The fill loop stops below one block only at end of stream.
+            if leftover > 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "encrypted data not aligned to AES block size",
                 ));
             }
-            return self.read(buf);
+            return Ok(0);
         }
 
-        // Decrypt complete blocks in-place (no extra copy).
-        self.decryptor.decrypt(&mut self.out_buf[..complete]);
-        self.out_pos = 0;
-        self.out_len = complete;
-
-        // Copy to caller.
-        let n = complete.min(buf.len());
-        buf[..n].copy_from_slice(&self.out_buf[..n]);
-        self.out_pos = n;
-        Ok(n)
+        self.decryptor.decrypt(&mut buf[..complete]);
+        Ok(complete)
     }
 }
 
@@ -2554,6 +2596,169 @@ mod tests {
         }
 
         assert_eq!(actual, plaintext);
+    }
+
+    /// Inner reader that returns a scripted (cycling) number of bytes per
+    /// call, so an AES block can be split across inner reads the way a volume
+    /// boundary splits one.
+    struct ScriptedCursor {
+        data: Vec<u8>,
+        pos: usize,
+        sizes: Vec<usize>,
+        next: usize,
+    }
+
+    impl ScriptedCursor {
+        fn new(data: Vec<u8>, sizes: Vec<usize>) -> Self {
+            Self {
+                data,
+                pos: 0,
+                sizes,
+                next: 0,
+            }
+        }
+    }
+
+    impl Read for ScriptedCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let want = self.sizes[self.next % self.sizes.len()].max(1);
+            self.next += 1;
+            let take = want.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    fn decrypt_test_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 27) as u8
+            })
+            .collect()
+    }
+
+    fn read_all_in_steps<R: Read>(reader: &mut R, step: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; step];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..read]);
+        }
+    }
+
+    /// In-place decryption must reproduce the plaintext byte for byte no matter
+    /// how the inner stream is split or how large the caller's reads are —
+    /// including reads shorter than one AES block, which cannot decrypt in
+    /// place and take the staged-block path instead.
+    #[test]
+    fn decrypting_reader_is_byte_identical_across_read_and_split_sizes() {
+        let key256 = [0x9au8; 32];
+        let key128 = [0x4eu8; 16];
+        let iv = [0x1cu8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 512, 0xfeed);
+        let cipher256 = encrypt_aes256_cbc_for_test(&key256, &iv, &plaintext);
+        let cipher128 = encrypt_aes128_cbc_for_test(&key128, &iv, &plaintext);
+
+        for &split in &[1usize, 3, 15, 16, 17, 64, 1000, 4096, 65_536] {
+            for &step in &[1usize, 2, 15, 16, 17, 31, 97, 1024, 4095, 8192] {
+                let inner = ChunkedCursor::new(cipher256.clone(), split);
+                let mut reader = DecryptingReader::new_rar5(inner, &key256, &iv);
+                assert_eq!(
+                    read_all_in_steps(&mut reader, step).unwrap(),
+                    plaintext,
+                    "rar5 split {split} step {step}"
+                );
+
+                let inner = ChunkedCursor::new(cipher128.clone(), split);
+                let mut reader = DecryptingReader::new_rar4(inner, &key128, &iv);
+                assert_eq!(
+                    read_all_in_steps(&mut reader, step).unwrap(),
+                    plaintext,
+                    "rar4 split {split} step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decrypting_reader_matches_plaintext_under_randomized_read_sizes() {
+        let key = [0x5du8; 32];
+        let iv = [0xa7u8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 2048, 0xc0ffee);
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize + 1
+        };
+
+        for round in 0..8 {
+            let inner_sizes: Vec<usize> = (0..64).map(|_| next(9_001)).collect();
+            let read_sizes: Vec<usize> = (0..64).map(|_| next(8_192)).collect();
+            let inner = ScriptedCursor::new(ciphertext.clone(), inner_sizes);
+            let mut reader = DecryptingReader::new_rar5(inner, &key, &iv);
+
+            let mut actual = Vec::new();
+            let mut buf = vec![0u8; 8_192];
+            let mut index = 0usize;
+            loop {
+                let want = read_sizes[index % read_sizes.len()];
+                index += 1;
+                let read = reader.read(&mut buf[..want]).unwrap();
+                if read == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buf[..read]);
+            }
+            assert_eq!(actual, plaintext, "round {round}");
+        }
+    }
+
+    /// The reader must not impose a staging cap of its own: a caller asking for
+    /// a megabyte from a source that can supply it gets a megabyte.
+    #[test]
+    fn decrypting_reader_fills_large_buffers_in_one_call() {
+        let key = [0x11u8; 32];
+        let iv = [0x22u8; 16];
+        let plaintext = decrypt_test_bytes(1 << 20, 7);
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut reader = DecryptingReader::new_rar5(std::io::Cursor::new(ciphertext), &key, &iv);
+        let mut buf = vec![0u8; 1 << 20];
+        let read = reader.read(&mut buf).unwrap();
+        assert_eq!(read, 1 << 20);
+        assert_eq!(buf, plaintext);
+    }
+
+    #[test]
+    fn decrypting_reader_rejects_a_stream_that_is_not_block_aligned() {
+        let key = [0x77u8; 32];
+        let iv = [0x88u8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 3, 5);
+        let mut ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+        ciphertext.truncate(AES_BLOCK * 2 + 5);
+
+        // Both the in-place path (step >= block) and the staged path.
+        for step in [4usize, 64] {
+            let inner = std::io::Cursor::new(ciphertext.clone());
+            let mut reader = DecryptingReader::new_rar5(inner, &key, &iv);
+            let error = read_all_in_steps(&mut reader, step).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "step {step}");
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -7,20 +7,22 @@
 //! - CRC32 runs on one worker, fed whole chunks in stream order (an mpsc
 //!   channel preserves FIFO order, so a single sequential hasher suffices).
 //! - BLAKE2sp is parallelized by construction: the format defines 8
-//!   independent BLAKE2s leaf streams, interleaved in 64-byte blocks. A
-//!   splitter thread deinterleaves incoming chunks and 8 lane workers advance
-//!   their leaf states; the root node combines the leaf digests at finalize.
-//!   The output is bit-identical to a serial BLAKE2sp (verified against
-//!   `blake2s_simd::blake2sp` in tests).
+//!   independent BLAKE2s leaf streams, interleaved in 64-byte blocks. Each
+//!   incoming chunk is shared with all 8 lane workers, and every worker walks
+//!   only the blocks it owns straight out of that shared buffer (the same
+//!   strided split unrar's `blake2sp.cpp` hands to its threads); the root node
+//!   combines the leaf digests at finalize. The output is bit-identical to a
+//!   serial BLAKE2sp (verified against `blake2s_simd::blake2sp` in tests).
 //!
 //! Pipelines spawn threads per instance, so callers should only use them for
 //! members large enough to amortize spawn cost (see [`PIPELINE_MIN_BYTES`]).
 
+use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use blake2s_simd::Params as Blake2sParams;
+use blake2s_simd::{Params as Blake2sParams, State as Blake2sState};
 
 /// Chunk buffers cycled between the submitter and the hash workers.
 const CHUNK_CAPACITY: usize = 4 * 1024 * 1024;
@@ -31,6 +33,8 @@ const MAX_IN_FLIGHT: usize = 4;
 const BLAKE_BLOCK: usize = 64;
 /// Number of BLAKE2sp leaf lanes, fixed by the format.
 const LANES: usize = 8;
+/// Distance between two consecutive blocks owned by the same lane.
+const LANE_STRIDE: u64 = (LANES * BLAKE_BLOCK) as u64;
 /// Below this size the thread spawn + channel overhead outweighs the win;
 /// callers should stay on the inline hashing path.
 pub(crate) const PIPELINE_MIN_BYTES: u64 = 8 * 1024 * 1024;
@@ -44,8 +48,18 @@ enum ChunkMsg {
     Data(Vec<u8>),
 }
 
+/// A stream chunk shared by every hash lane. The coordinator keeps the last
+/// reference and returns the buffer to the submitter's free pool once all
+/// lanes have dropped theirs.
+type SharedChunk = Arc<Vec<u8>>;
+
 enum LaneMsg {
-    Data(Vec<u8>),
+    /// `stream_offset` is the absolute stream position of `chunk`'s first
+    /// byte, which is all a lane needs to locate the blocks it owns.
+    Data {
+        chunk: SharedChunk,
+        stream_offset: u64,
+    },
 }
 
 /// Off-thread hasher accepting in-order stream chunks.
@@ -87,7 +101,6 @@ impl HashPipeline {
 
     /// Fetch a recycled chunk buffer (or allocate one). The returned buffer is
     /// empty with at least [`CHUNK_CAPACITY`] capacity.
-    #[cfg(test)]
     pub(crate) fn take_buffer(&self) -> Vec<u8> {
         let mut buf = self.take_buffer_raw();
         buf.clear();
@@ -165,23 +178,40 @@ fn coordinator_loop(
 ) -> CoordinatorResult {
     let mut crc_lanes = compute_crc.then(CrcLanes::spawn);
     let mut blake = compute_blake.then(BlakeLanes::spawn);
+    // Chunks handed to the lanes, oldest first. Every lane reads the chunk in
+    // place, so a buffer only becomes recyclable once they have all let go.
+    let mut in_flight: VecDeque<SharedChunk> = VecDeque::new();
 
     while let Ok(ChunkMsg::Data(chunk)) = chunk_rx.recv() {
+        let shared: SharedChunk = Arc::new(chunk);
         if let Some(ref mut lanes) = blake {
-            lanes.split_chunk(&chunk);
+            lanes.dispatch(&shared);
         }
-        match crc_lanes {
-            // The CRC lanes own the buffer and recycle it when done.
-            Some(ref mut lanes) => lanes.submit(chunk),
-            None => {
-                let _ = free_tx.send(chunk);
-            }
+        if let Some(ref mut lanes) = crc_lanes {
+            lanes.submit(Arc::clone(&shared));
         }
+        in_flight.push_back(shared);
+        recycle_spent_chunks(&mut in_flight, &free_tx);
     }
 
-    let crc32 = crc_lanes.take().map(|lanes| lanes.finalize(&free_tx));
+    let crc32 = crc_lanes.take().map(CrcLanes::finalize);
     let blake2sp = blake.take().map(BlakeLanes::finalize);
     CoordinatorResult { crc32, blake2sp }
+}
+
+/// Return buffers whose lanes have all finished to the submitter's free pool.
+/// Chunks leave the lanes in roughly submission order, so popping from the
+/// front until one is still referenced drains everything that is ready.
+fn recycle_spent_chunks(in_flight: &mut VecDeque<SharedChunk>, free_tx: &mpsc::Sender<Vec<u8>>) {
+    while in_flight
+        .front()
+        .is_some_and(|chunk| Arc::strong_count(chunk) == 1)
+    {
+        let chunk = in_flight.pop_front().expect("front was just observed");
+        if let Ok(buf) = Arc::try_unwrap(chunk) {
+            let _ = free_tx.send(buf);
+        }
+    }
 }
 
 /// CRC32 of a whole stream, computed as independent per-chunk CRCs on two
@@ -189,12 +219,9 @@ fn coordinator_loop(
 /// standard GF(2) length-shift operator: crc(A ++ B) =
 /// shift(crc(A), len(B)) ^ crc(B). Two lanes keep CRC off the read loop's
 /// critical path even when a single lane cannot match the read rate.
-/// Per-lane results: chunk CRCs in submission order plus recycled buffers.
-type CrcLaneOutput = (Vec<ChunkCrc>, Vec<Vec<u8>>);
-
 struct CrcLanes {
-    txs: Vec<mpsc::SyncSender<(u64, Vec<u8>)>>,
-    handles: Vec<JoinHandle<CrcLaneOutput>>,
+    txs: Vec<mpsc::SyncSender<(u64, SharedChunk)>>,
+    handles: Vec<JoinHandle<Vec<ChunkCrc>>>,
     next_seq: u64,
 }
 
@@ -211,23 +238,19 @@ impl CrcLanes {
         let mut txs = Vec::with_capacity(CRC_LANE_COUNT);
         let mut handles = Vec::with_capacity(CRC_LANE_COUNT);
         for lane in 0..CRC_LANE_COUNT {
-            let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(MAX_IN_FLIGHT);
+            let (tx, rx) = mpsc::sync_channel::<(u64, SharedChunk)>(MAX_IN_FLIGHT);
             let handle = std::thread::Builder::new()
                 .name(format!("weaver-rar-crc-{lane}"))
                 .spawn(move || {
                     let mut results: Vec<ChunkCrc> = Vec::new();
-                    let mut spare: Vec<Vec<u8>> = Vec::new();
                     while let Ok((seq, chunk)) = rx.recv() {
                         results.push(ChunkCrc {
                             seq,
                             crc: crc32fast::hash(&chunk),
                             len: chunk.len() as u64,
                         });
-                        if spare.len() < MAX_IN_FLIGHT {
-                            spare.push(chunk);
-                        }
                     }
-                    (results, spare)
+                    results
                 })
                 .expect("spawn CRC lane");
             txs.push(tx);
@@ -240,22 +263,18 @@ impl CrcLanes {
         }
     }
 
-    fn submit(&mut self, chunk: Vec<u8>) {
+    fn submit(&mut self, chunk: SharedChunk) {
         let seq = self.next_seq;
         self.next_seq += 1;
         let lane = (seq as usize) % self.txs.len();
         let _ = self.txs[lane].send((seq, chunk));
     }
 
-    fn finalize(mut self, free_tx: &mpsc::Sender<Vec<u8>>) -> u32 {
+    fn finalize(mut self) -> u32 {
         self.txs.clear();
         let mut results: Vec<ChunkCrc> = Vec::new();
         for handle in self.handles.drain(..) {
-            let (lane_results, spare) = handle.join().unwrap_or((Vec::new(), Vec::new()));
-            results.extend(lane_results);
-            for buf in spare {
-                let _ = free_tx.send(buf);
-            }
+            results.extend(handle.join().unwrap_or_default());
         }
         results.sort_unstable_by_key(|entry| entry.seq);
 
@@ -363,29 +382,26 @@ impl CrcShiftOp {
 struct BlakeLanes {
     lane_tx: Vec<mpsc::SyncSender<LaneMsg>>,
     lane_handles: Vec<JoinHandle<[u8; 32]>>,
-    lane_free_rx: mpsc::Receiver<Vec<u8>>,
-    lane_free_tx: mpsc::Sender<Vec<u8>>,
     /// Absolute stream offset of the next incoming byte.
     stream_offset: u64,
-    /// Per-lane pending output buffers being filled for the current batch.
-    pending: Vec<Vec<u8>>,
 }
 
 impl BlakeLanes {
     fn spawn() -> Self {
-        let (lane_free_tx, lane_free_rx) = mpsc::channel::<Vec<u8>>();
         let mut lane_tx = Vec::with_capacity(LANES);
         let mut lane_handles = Vec::with_capacity(LANES);
         for lane in 0..LANES {
             let (tx, rx) = mpsc::sync_channel::<LaneMsg>(MAX_IN_FLIGHT);
-            let free_tx = lane_free_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("weaver-rar-b2-{lane}"))
                 .spawn(move || {
                     let mut state = blake2sp_leaf_params(lane).to_state();
-                    while let Ok(LaneMsg::Data(segment)) = rx.recv() {
-                        state.update(&segment);
-                        let _ = free_tx.send(segment);
+                    while let Ok(LaneMsg::Data {
+                        chunk,
+                        stream_offset,
+                    }) = rx.recv()
+                    {
+                        update_lane(&mut state, lane, stream_offset, &chunk);
                     }
                     let mut digest = [0u8; 32];
                     digest.copy_from_slice(state.finalize().as_bytes());
@@ -398,55 +414,33 @@ impl BlakeLanes {
         Self {
             lane_tx,
             lane_handles,
-            lane_free_rx,
-            lane_free_tx,
             stream_offset: 0,
-            pending: (0..LANES).map(|_| Vec::new()).collect(),
         }
     }
 
-    fn lane_buffer(&mut self) -> Vec<u8> {
-        match self.lane_free_rx.try_recv() {
-            Ok(mut buf) => {
-                buf.clear();
-                buf
+    /// Hand the chunk to every lane that owns a block inside it. Nothing is
+    /// deinterleaved here: each worker walks its own 64-byte blocks straight
+    /// out of the shared buffer, exactly as unrar's blake2sp threads do.
+    fn dispatch(&mut self, chunk: &SharedChunk) {
+        if chunk.is_empty() {
+            return;
+        }
+        let stream_offset = self.stream_offset;
+        self.stream_offset += chunk.len() as u64;
+        for (lane, tx) in self.lane_tx.iter().enumerate() {
+            if lane_block_start(lane, stream_offset) >= stream_offset + chunk.len() as u64 {
+                // Short chunk that stops before this lane's next block.
+                continue;
             }
-            Err(_) => Vec::with_capacity(CHUNK_CAPACITY / LANES + BLAKE_BLOCK),
+            let _ = tx.send(LaneMsg::Data {
+                chunk: Arc::clone(chunk),
+                stream_offset,
+            });
         }
     }
 
-    /// Deinterleave a stream chunk into the 8 lane substreams and dispatch
-    /// full batches. BLAKE2sp assigns 64-byte block `b` to lane `b % 8`.
-    fn split_chunk(&mut self, mut data: &[u8]) {
-        while !data.is_empty() {
-            let block_index = self.stream_offset / BLAKE_BLOCK as u64;
-            let lane = (block_index % LANES as u64) as usize;
-            let block_used = (self.stream_offset % BLAKE_BLOCK as u64) as usize;
-            let take = (BLAKE_BLOCK - block_used).min(data.len());
-
-            if self.pending[lane].is_empty() && self.pending[lane].capacity() == 0 {
-                self.pending[lane] = self.lane_buffer();
-            }
-            self.pending[lane].extend_from_slice(&data[..take]);
-            self.stream_offset += take as u64;
-            data = &data[take..];
-
-            if self.pending[lane].len() >= CHUNK_CAPACITY / LANES {
-                let segment = std::mem::take(&mut self.pending[lane]);
-                let _ = self.lane_tx[lane].send(LaneMsg::Data(segment));
-            }
-        }
-    }
-
-    fn finalize(mut self) -> [u8; 32] {
-        for lane in 0..LANES {
-            let segment = std::mem::take(&mut self.pending[lane]);
-            if !segment.is_empty() {
-                let _ = self.lane_tx[lane].send(LaneMsg::Data(segment));
-            }
-        }
+    fn finalize(self) -> [u8; 32] {
         drop(self.lane_tx);
-        drop(self.lane_free_tx);
 
         let mut root = blake2sp_root_params().to_state();
         for handle in self.lane_handles {
@@ -456,6 +450,33 @@ impl BlakeLanes {
         let mut out = [0u8; 32];
         out.copy_from_slice(root.finalize().as_bytes());
         out
+    }
+}
+
+/// First absolute offset at or after `from` that starts, or lies inside, a
+/// 64-byte block owned by `lane`. BLAKE2sp assigns block `b` to lane `b % 8`.
+fn lane_block_start(lane: usize, from: u64) -> u64 {
+    let cycle = from / LANE_STRIDE;
+    let start = cycle * LANE_STRIDE + (lane * BLAKE_BLOCK) as u64;
+    if start + BLAKE_BLOCK as u64 <= from {
+        // This lane's block in the current cycle already went by.
+        start + LANE_STRIDE
+    } else {
+        start
+    }
+}
+
+/// Feed `lane` the parts of `chunk` it owns. `chunk` starts at absolute
+/// `stream_offset`; chunk edges may split a block, but the pieces still reach
+/// the leaf state in order, so it sees exactly its interleaved substream.
+fn update_lane(state: &mut Blake2sState, lane: usize, stream_offset: u64, chunk: &[u8]) {
+    let end = stream_offset + chunk.len() as u64;
+    let mut block_start = lane_block_start(lane, stream_offset);
+    while block_start < end {
+        let from = block_start.max(stream_offset);
+        let to = (block_start + BLAKE_BLOCK as u64).min(end);
+        state.update(&chunk[(from - stream_offset) as usize..(to - stream_offset) as usize]);
+        block_start += LANE_STRIDE;
     }
 }
 
@@ -588,9 +609,17 @@ impl SharedHashStream {
                 Ok(())
             }
             StreamState::Pipelined { pipeline, pending } => {
+                if pending.capacity() == 0 {
+                    // Start from a pooled buffer rather than growing a fresh
+                    // Vec from zero on the way to the flush threshold.
+                    *pending = pipeline.take_buffer();
+                }
                 pending.extend_from_slice(data);
                 if pending.len() >= PENDING_FLUSH_BYTES {
-                    let chunk = std::mem::take(pending);
+                    // Hand the filled buffer over and take a recycled one back,
+                    // so successive chunks cycle pool memory instead of
+                    // reallocating multiple MiB per chunk.
+                    let chunk = std::mem::replace(pending, pipeline.take_buffer());
                     pipeline.submit(chunk)?;
                 }
                 Ok(())
@@ -782,6 +811,82 @@ mod tests {
             let mut out = [0u8; 32];
             out.copy_from_slice(root.finalize().as_bytes());
             assert_eq!(out, reference_blake2sp(&data), "len {len}");
+        }
+    }
+
+    #[test]
+    fn lane_block_start_walks_the_interleave_schedule() {
+        // Lane L owns blocks L, L+8, L+16, ... Starting inside one of a lane's
+        // own blocks must return that block, not the next one.
+        for lane in 0..LANES {
+            let own = (lane * BLAKE_BLOCK) as u64;
+            assert_eq!(lane_block_start(lane, 0), own);
+            assert_eq!(lane_block_start(lane, own), own);
+            assert_eq!(lane_block_start(lane, own + 1), own);
+            assert_eq!(lane_block_start(lane, own + BLAKE_BLOCK as u64 - 1), own);
+            assert_eq!(
+                lane_block_start(lane, own + BLAKE_BLOCK as u64),
+                own + LANE_STRIDE
+            );
+            // Deep into the stream the schedule is still stride-periodic.
+            let base = 97 * LANE_STRIDE;
+            assert_eq!(lane_block_start(lane, base), base + own);
+        }
+    }
+
+    #[test]
+    fn strided_lane_walk_matches_deinterleaved_lanes() {
+        // The strided walk must feed each leaf exactly the bytes a copying
+        // deinterleave would have handed it, no matter where chunks split.
+        for &chunk_len in &[1usize, 7, 63, 64, 65, 200, 512, 513, 4096, 100_000] {
+            let data = deterministic_bytes(300_000, chunk_len as u64);
+            let mut strided: Vec<_> = (0..LANES)
+                .map(|lane| blake2sp_leaf_params(lane).to_state())
+                .collect();
+            let mut offset = 0u64;
+            for chunk in data.chunks(chunk_len) {
+                for (lane, state) in strided.iter_mut().enumerate() {
+                    update_lane(state, lane, offset, chunk);
+                }
+                offset += chunk.len() as u64;
+            }
+
+            let mut copied: Vec<_> = (0..LANES)
+                .map(|lane| blake2sp_leaf_params(lane).to_state())
+                .collect();
+            for (index, block) in data.chunks(BLAKE_BLOCK).enumerate() {
+                copied[index % LANES].update(block);
+            }
+
+            for lane in 0..LANES {
+                assert_eq!(
+                    strided[lane].finalize().as_bytes(),
+                    copied[lane].finalize().as_bytes(),
+                    "lane {lane} diverged at chunk length {chunk_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blake_lanes_share_chunks_without_deinterleaving() {
+        // End-to-end through the shared-chunk dispatch, with chunk lengths that
+        // are not block multiples so lanes see split blocks across messages.
+        for &len in &[0usize, 63, 500, 4096, 5_000_000] {
+            let data = deterministic_bytes(len, 11 + len as u64);
+            let pipeline = HashPipeline::new(false, true);
+            for chunk in data.chunks(333_331) {
+                let mut buf = pipeline.take_buffer();
+                buf.extend_from_slice(chunk);
+                pipeline.submit(buf).unwrap();
+            }
+            let outputs = pipeline.finalize().unwrap();
+            assert_eq!(
+                outputs.blake2sp.unwrap(),
+                reference_blake2sp(&data),
+                "blake2sp mismatch at len {len}"
+            );
+            assert!(outputs.crc32.is_none());
         }
     }
 
