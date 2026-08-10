@@ -7,6 +7,13 @@
 //! The parallelism is in the Huffman decode phase only — window writes,
 //! distance cache updates, and filter application remain sequential because
 //! they depend on running output state.
+//!
+//! Those two phases are, however, *software pipelined* across batches: batch
+//! K+1's workers are dispatched while batch K's items are being applied on the
+//! controller thread, so the serial apply hides under the next batch's decode
+//! instead of adding to it. The only cross-batch dependency in the decode
+//! direction is Huffman-table state, and that is resolved before the next
+//! dispatch — see [`LzDecoder::run_block_controller`] for the full argument.
 
 use rayon::ThreadPool;
 use std::sync::Arc;
@@ -29,6 +36,11 @@ struct ScannedBlocks {
 
 /// A single block stays inline; two or more normal blocks use the worker pool.
 const MIN_PARALLEL_BLOCKS: usize = 2;
+
+/// Batches the controller can hold at once: one being applied on this thread,
+/// one being decoded by the pool. Each needs its own item-buffer set and batch
+/// scratch, so both recycling caches keep two entries.
+const PIPELINE_DEPTH: usize = 2;
 
 /// Per-block decoded item buffer size.
 const DECODED_ITEMS_CAPACITY: usize = 0x4100;
@@ -941,10 +953,7 @@ fn next_controller_batch_end(
             available += 1;
             cursor += 1;
         }
-        return start
-            + batch_plan::plan_batches(available, worker_count)
-                .last()
-                .map_or(0, |batch| batch.end);
+        return start + batch_plan::planned_block_count(available, worker_count);
     }
 
     if next_span_end(blocks, start, limit) == start + 1 {
@@ -954,10 +963,7 @@ fn next_controller_batch_end(
             .take_while(|block| block.table_present && !block.is_large)
             .count();
         if independent_count > 0 {
-            return start
-                + batch_plan::plan_batches(independent_count, worker_count)
-                    .last()
-                    .map_or(0, |batch| batch.end);
+            return start + batch_plan::planned_block_count(independent_count, worker_count);
         }
     }
 
@@ -990,6 +996,13 @@ fn next_controller_batch_end(
 ///
 /// The caller owns the destination so the controller can recycle it across
 /// batches instead of allocating one plan per dispatch.
+///
+/// A span in which every block is independent — all table-present, or all
+/// table-less and therefore all inheriting the same already-installed set — is
+/// spawned one job per block, so rayon can steal the tail of the round onto
+/// whichever core finishes first. Mixed spans keep their grouped assignments:
+/// a table-less block has to decode in the same assignment, after its table
+/// root, because that root is what produces the tables it reads.
 fn build_assignments(
     blocks: &[BlockInfo],
     start: usize,
@@ -1010,14 +1023,7 @@ fn build_assignments(
             .iter()
             .all(|block| !block.table_present && !block.is_large);
     if uniform_span {
-        assignments.extend(
-            batch_plan::plan_batches(end - start, worker_count)
-                .into_iter()
-                .map(|batch| Batch {
-                    start: start + batch.start,
-                    end: start + batch.end,
-                }),
-        );
+        batch_plan::plan_batches_into(start, end - start, worker_count, assignments);
         return Ok(());
     }
 
@@ -1061,9 +1067,11 @@ fn build_assignments(
         });
         cursor = assignment_end;
     }
-    if assignments.len() > worker_count {
+    // One job per block is the densest plan any path produces, so the round's
+    // block capacity — not the worker count — is the bound on job count.
+    if assignments.len() > batch_plan::capacity(worker_count) {
         return Err(RarError::CorruptArchive {
-            detail: "RAR5 parallel controller exceeded its worker pool".into(),
+            detail: "RAR5 parallel controller exceeded its round capacity".into(),
         });
     }
     Ok(())
@@ -1155,21 +1163,78 @@ fn decode_worker_assignment(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn parallel_decode_static(
-    input: &[u8],
+/// Aggregate-diagnostics bookkeeping for one dispatched batch.
+///
+/// Factored out of [`parallel_decode_static`] so the pipelined controller —
+/// whose scope also runs a serial apply on the calling thread — records the
+/// same worker counters as the single-batch path.
+struct BatchDiagnostics {
+    aggregate: phase_diagnostics::AggregateDiagnostics,
+    started: Option<Instant>,
+    dispatch_nanos: u64,
+}
+
+impl BatchDiagnostics {
+    fn start(assignment_count: usize, worker_count: usize) -> Self {
+        let mut aggregate = phase_diagnostics::AggregateDiagnostics::new();
+        let started = aggregate.is_enabled().then(Instant::now);
+        if aggregate.is_enabled() {
+            // Jobs, not workers: an independent round spawns one per block, so
+            // it can hand the pool more jobs than it has threads. Slot counts
+            // stay a statement about the pool — every thread has work and none
+            // is idle — while the job count is reported by the per-assignment
+            // `assignments` counter each worker records.
+            let busy = assignment_count.min(worker_count);
+            aggregate.record_worker_slots(busy, worker_count - busy);
+        }
+        Self {
+            aggregate,
+            started,
+            dispatch_nanos: 0,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.aggregate.is_enabled()
+    }
+
+    fn record_dispatch(&mut self, nanos: u64) {
+        self.dispatch_nanos = self.dispatch_nanos.saturating_add(nanos);
+    }
+
+    /// Absorb the joined workers' counters and emit the batch marker.
+    ///
+    /// In the pipelined controller the "wait" span also covers this thread's
+    /// serial apply, because the two deliberately overlap; see
+    /// [`LzDecoder::decode_next_batch_while_applying`].
+    fn finish(mut self, results: &[Option<AssignmentResult>]) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let total_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.aggregate.add_pool_dispatch_nanos(self.dispatch_nanos);
+        self.aggregate
+            .add_pool_wait_nanos(total_nanos.saturating_sub(self.dispatch_nanos));
+        for result in results.iter().flatten() {
+            self.aggregate.absorb_worker(result.final_state.diagnostics);
+        }
+        self.aggregate.emit();
+    }
+}
+
+/// Validate one batch and fill `scratch` with its assignments and result slots.
+///
+/// Split out of [`parallel_decode_static`] so the pipelined controller can run
+/// every fallible planning step *before* it opens the rayon scope in which the
+/// previous batch's apply runs — a planning error there must still let that
+/// apply happen first, in batch order.
+fn plan_batch_dispatch(
     blocks: &[BlockInfo],
     range: std::ops::Range<usize>,
-    inherited_tables: Option<&TableSet>,
-    initial_code_lengths: &[u8],
-    extra_dist: bool,
-    items: &mut [Vec<DecodedItem>],
+    item_slots: usize,
+    worker_count: usize,
     scratch: &mut BatchScratch,
-) -> RarResult<ParallelDecodeOutcome> {
-    let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
-        detail: "RAR5 parallel controller has no worker pool".into(),
-    })?;
-    let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
+) -> RarResult<()> {
     scratch.assignments.clear();
     build_assignments(
         blocks,
@@ -1178,68 +1243,83 @@ fn parallel_decode_static(
         worker_count,
         &mut scratch.assignments,
     )?;
-    if items.len() != range.end - range.start {
+    if item_slots != range.end - range.start {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 parallel controller received mismatched output slots".into(),
         });
     }
-    let assignments = &scratch.assignments;
+    let assignment_count = scratch.assignments.len();
     scratch.results.clear();
-    scratch.results.resize_with(assignments.len(), || None);
-    let results = &mut scratch.results;
-    let mut aggregate = phase_diagnostics::AggregateDiagnostics::new();
-    let diagnostics_enabled = aggregate.is_enabled();
-    let worker_options = WorkerOptions {
-        extra_dist,
-        diagnostics_enabled,
-    };
-    if diagnostics_enabled {
-        aggregate.record_worker_slots(
-            assignments.len(),
-            worker_count.saturating_sub(assignments.len()),
-        );
+    scratch.results.resize_with(assignment_count, || None);
+    Ok(())
+}
+
+/// Spawn one batch's worker assignments into an already-open rayon scope.
+///
+/// A round of independent blocks spawns one job per block, so there are
+/// routinely more jobs here than pool threads. That is the point: the extra
+/// jobs sit in the deques for whichever thread frees up first, which is what
+/// keeps a fast core from finishing its share and then waiting on a slow one.
+/// The cost is one boxed closure per block.
+///
+/// Deliberately borrows no decoder state: the pipelined controller calls this
+/// from inside a scope whose calling thread immediately goes on to run
+/// [`LzDecoder::apply_decoded_items_parallel`] against `&mut self`, so every
+/// worker input has to come from somewhere the apply phase cannot reach.
+///
+/// Returns the nanoseconds spent issuing the spawns (zero unless diagnostics
+/// are enabled).
+#[allow(clippy::too_many_arguments)]
+fn spawn_batch_assignments<'scope>(
+    scope: &rayon::Scope<'scope>,
+    input: &'scope [u8],
+    blocks: &'scope [BlockInfo],
+    assignments: &[BlockAssignment],
+    inherited_tables: Option<&TableSet>,
+    initial_code_lengths: &'scope [u8],
+    options: WorkerOptions,
+    items: &'scope mut [Vec<DecodedItem>],
+    results: &'scope mut [Option<AssignmentResult>],
+) -> u64 {
+    let dispatch_started = options.diagnostics_enabled.then(Instant::now);
+    let mut item_tail = items;
+    let mut result_tail = results;
+    for assignment in assignments.iter().copied() {
+        let count = assignment.end - assignment.start;
+        let (worker_items, remaining_items) = item_tail.split_at_mut(count);
+        let (worker_result, remaining_results) = result_tail.split_at_mut(1);
+        // A table-present block rewrites the complete RAR5 length table;
+        // repeat symbols only refer to entries in that same table read.
+        // Independent assignments can therefore share the initial scratch.
+        let worker_inherited = if blocks[assignment.start].table_present {
+            None
+        } else {
+            inherited_tables.cloned()
+        };
+        scope.spawn(move |_| {
+            worker_result[0] = Some(decode_worker_assignment(
+                input,
+                blocks,
+                assignment,
+                worker_inherited,
+                initial_code_lengths,
+                options,
+                worker_items,
+            ));
+        });
+        item_tail = remaining_items;
+        result_tail = remaining_results;
     }
-    let pool_started = diagnostics_enabled.then(Instant::now);
-    let mut dispatch_nanos = 0u64;
+    dispatch_started.map_or(0, |started| {
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    })
+}
 
-    // `in_place_scope` drives the batch from the calling thread instead of
-    // injecting the scope itself into the pool and parking here, which removes
-    // one wake/park round-trip per batch.
-    pool.in_place_scope(|scope| {
-        let dispatch_started = diagnostics_enabled.then(Instant::now);
-        let mut item_tail = &mut *items;
-        let mut result_tail = results.as_mut_slice();
-        for assignment in assignments.iter().copied() {
-            let count = assignment.end - assignment.start;
-            let (worker_items, remaining_items) = item_tail.split_at_mut(count);
-            let (worker_result, remaining_results) = result_tail.split_at_mut(1);
-            // A table-present block rewrites the complete RAR5 length table;
-            // repeat symbols only refer to entries in that same table read.
-            // Independent assignments can therefore share the initial scratch.
-            let worker_inherited = if blocks[assignment.start].table_present {
-                None
-            } else {
-                inherited_tables.cloned()
-            };
-            scope.spawn(move |_| {
-                worker_result[0] = Some(decode_worker_assignment(
-                    input,
-                    blocks,
-                    assignment,
-                    worker_inherited,
-                    initial_code_lengths,
-                    worker_options,
-                    worker_items,
-                ));
-            });
-            item_tail = remaining_items;
-            result_tail = remaining_results;
-        }
-        if let Some(started) = dispatch_started {
-            dispatch_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        }
-    });
-
+/// Reduce one batch's joined worker results into a controller outcome.
+///
+/// Only valid once the batch's scope has ended: every result slot must be
+/// filled, which is exactly what the scope's join guarantees.
+fn collect_batch_outcome(scratch: &mut BatchScratch) -> RarResult<ParallelDecodeOutcome> {
     if scratch.results.iter().any(Option::is_none) {
         return Err(RarError::CorruptArchive {
             detail: "RAR5 parallel worker did not complete".into(),
@@ -1269,19 +1349,59 @@ fn parallel_decode_static(
         Some(index) => index.checked_sub(1),
         None => scratch.results.len().checked_sub(1),
     };
-    if let Some(started) = pool_started {
-        let total_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        aggregate.add_pool_dispatch_nanos(dispatch_nanos);
-        aggregate.add_pool_wait_nanos(total_nanos.saturating_sub(dispatch_nanos));
-        for result in scratch.results.iter().flatten() {
-            aggregate.absorb_worker(result.final_state.diagnostics);
-        }
-        aggregate.emit();
-    }
     Ok(ParallelDecodeOutcome {
         final_state_index,
         first_failure,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parallel_decode_static(
+    input: &[u8],
+    blocks: &[BlockInfo],
+    range: std::ops::Range<usize>,
+    inherited_tables: Option<&TableSet>,
+    initial_code_lengths: &[u8],
+    extra_dist: bool,
+    items: &mut [Vec<DecodedItem>],
+    scratch: &mut BatchScratch,
+) -> RarResult<ParallelDecodeOutcome> {
+    let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
+        detail: "RAR5 parallel controller has no worker pool".into(),
+    })?;
+    let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
+    plan_batch_dispatch(blocks, range, items.len(), worker_count, scratch)?;
+    let mut diagnostics = BatchDiagnostics::start(scratch.assignments.len(), worker_count);
+    let worker_options = WorkerOptions {
+        extra_dist,
+        diagnostics_enabled: diagnostics.is_enabled(),
+    };
+    let BatchScratch {
+        assignments,
+        results,
+    } = &mut *scratch;
+
+    // `in_place_scope` drives the batch from the calling thread instead of
+    // injecting the scope itself into the pool and parking here, which removes
+    // one wake/park round-trip per batch.
+    pool.in_place_scope(|scope| {
+        let dispatch_nanos = spawn_batch_assignments(
+            scope,
+            input,
+            blocks,
+            assignments.as_slice(),
+            inherited_tables,
+            initial_code_lengths,
+            worker_options,
+            items,
+            results.as_mut_slice(),
+        );
+        diagnostics.record_dispatch(dispatch_nanos);
+    });
+
+    let outcome = collect_batch_outcome(scratch);
+    diagnostics.finish(&scratch.results);
+    outcome
 }
 
 // ─── Phase 3: Sequential item application ────────────────────────────────────
@@ -1378,6 +1498,21 @@ fn note_fast_reader_selection() {
     GLOBAL_FAST_READER_SELECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Batches dispatched while the previous batch's apply ran on this thread —
+/// the round-pipelining overlap actually happening, not merely being possible.
+///
+/// Process-wide for the same reason as [`GLOBAL_FAST_READER_SELECTIONS`]: the
+/// controller can be driven from any thread, and a `thread_local!` would read
+/// zero from a test thread that did not happen to own the controller.
+#[cfg(test)]
+static GLOBAL_PIPELINED_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn note_pipelined_dispatch() {
+    GLOBAL_PIPELINED_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 fn note_padded_reader_selection() {
     PADDED_READER_SELECTION_COUNT.set(PADDED_READER_SELECTION_COUNT.get() + 1);
@@ -1385,25 +1520,43 @@ fn note_padded_reader_selection() {
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
+/// A batch whose workers have joined but whose items have not been applied.
+///
+/// The pipelined controller carries at most one of these across a step: batch
+/// K's items stay in the front buffer set while batch K+1's workers fill the
+/// back set, and K's apply runs on the scope's calling thread.
+struct PendingBatch {
+    /// Leading item buffers that are safe to apply — the prefix ahead of the
+    /// batch's first failing block, or the whole batch when it succeeded.
+    apply_len: usize,
+    /// First decode failure, propagated once its prefix has been applied.
+    failure: Option<DecodeFailure>,
+}
+
 impl LzDecoder {
     fn take_item_buffer_set(&mut self) -> Vec<Vec<DecodedItem>> {
         self.parallel_item_buffer_sets.pop().unwrap_or_default()
     }
 
+    /// The pipelined controller holds [`PIPELINE_DEPTH`] sets at once — one
+    /// being applied, one being filled — so the cache keeps both.
     fn recycle_item_buffer_set(&mut self, set: Vec<Vec<DecodedItem>>) {
-        if self.parallel_item_buffer_sets.is_empty() {
+        if self.parallel_item_buffer_sets.len() < PIPELINE_DEPTH {
             self.parallel_item_buffer_sets.push(set);
         }
     }
 
     fn take_batch_scratch(&mut self) -> BatchScratch {
-        std::mem::take(&mut self.parallel_batch_scratch)
+        self.parallel_batch_scratch.pop().unwrap_or_default()
     }
 
     fn recycle_batch_scratch(&mut self, scratch: BatchScratch) {
-        self.parallel_batch_scratch = scratch;
+        if self.parallel_batch_scratch.len() < PIPELINE_DEPTH {
+            self.parallel_batch_scratch.push(scratch);
+        }
     }
 
+    /// Staged (single-writer) entry point: batches are round-pipelined.
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
         &mut self,
         input: &[u8],
@@ -1412,6 +1565,54 @@ impl LzDecoder {
         unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
+    ) -> RarResult<usize> {
+        self.process_buffered_blocks_with(
+            input,
+            logical_len,
+            header_limit,
+            unpacked_size,
+            output_size,
+            writer,
+            true,
+        )
+    }
+
+    /// Chunked volume-driver entry point: batches stay strictly sequential.
+    ///
+    /// The chunked drivers swap `current_writer` and tally per-volume byte
+    /// counts as apply progresses, so a batch decoded ahead of the boundary
+    /// check would be attributed to the wrong volume. Overlap buys nothing
+    /// there either — the drivers stop at every boundary anyway.
+    pub(super) fn process_buffered_blocks_sequential<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        logical_len: usize,
+        header_limit: usize,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<usize> {
+        self.process_buffered_blocks_with(
+            input,
+            logical_len,
+            header_limit,
+            unpacked_size,
+            output_size,
+            writer,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_buffered_blocks_with<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        logical_len: usize,
+        header_limit: usize,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+        pipelined: bool,
     ) -> RarResult<usize> {
         let logical_input = input
             .get(..logical_len)
@@ -1426,42 +1627,192 @@ impl LzDecoder {
             return Ok(0);
         }
 
-        let processing_result = (|| -> RarResult<()> {
-            // Both callers already gated the whole member on `parallel_enabled`,
-            // so the env lookup does not repeat per staged round.
-            let worker_count = rar_decode_worker_count();
-            let mut block_index = 0usize;
-            while block_index < scanned.blocks.len() && *output_size < unpacked_size {
-                let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
-                let span = &scanned.blocks[block_index..span_end];
-                if scanned.blocks[block_index].is_large {
+        let processing_result = self.run_block_controller(
+            input,
+            &scanned.blocks,
+            unpacked_size,
+            output_size,
+            writer,
+            pipelined,
+        );
+
+        self.block_bits_remaining = 0;
+        self.is_last_block = scanned.saw_last_block;
+        processing_result?;
+        self.flush_filters_and_write(writer)?;
+        Ok(scanned.consumed_bytes)
+    }
+
+    /// Walk `blocks`, dispatching parallel batches and applying them in order.
+    ///
+    /// # Round pipelining
+    ///
+    /// With `pipelined` set, batch K+1's workers are dispatched *while* batch
+    /// K's decoded items are applied on this thread, inside a single rayon
+    /// scope. That is sound because the only cross-batch dependency in the
+    /// decode direction is Huffman-table state: a worker either reads the
+    /// tables its own block carries or inherits the set the previous batch's
+    /// final assignment produced, and the controller installs that state
+    /// before it opens the next scope. Nothing the apply phase touches —
+    /// window bytes, `dist_cache`, `last_length`, pending filters, writer
+    /// flushes — is ever read back by a worker: [`decode_worker_assignment`]
+    /// sees only the immutable staged input, the scanned block table, its
+    /// inherited tables, and its own output slots. The staged input is neither
+    /// refilled nor compacted until this call returns, so the slice the
+    /// in-flight workers hold stays valid for the whole round.
+    ///
+    /// Apply still happens strictly in batch order, tables are still installed
+    /// in decode order, and the two in-flight batches never share an item
+    /// buffer set — `front_set` holds the pending batch, `back_set` receives
+    /// the batch being decoded, and the two swap once the scope joins.
+    #[allow(clippy::too_many_arguments)]
+    fn run_block_controller<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        blocks: &[BlockInfo],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+        pipelined: bool,
+    ) -> RarResult<()> {
+        // Both callers already gated the whole member on `parallel_enabled`,
+        // so the env lookup does not repeat per staged round.
+        let worker_count = rar_decode_worker_count();
+        // The sequential path lets `decode_and_apply_static_batch` own its
+        // buffers, so it keeps hitting the same recycled set.
+        let mut front_set = if pipelined {
+            self.take_item_buffer_set()
+        } else {
+            Vec::new()
+        };
+        let mut back_set = if pipelined {
+            self.take_item_buffer_set()
+        } else {
+            Vec::new()
+        };
+        let mut front_scratch = if pipelined {
+            self.take_batch_scratch()
+        } else {
+            BatchScratch::default()
+        };
+        let mut back_scratch = if pipelined {
+            self.take_batch_scratch()
+        } else {
+            BatchScratch::default()
+        };
+        let mut pending: Option<PendingBatch> = None;
+        let mut block_index = 0usize;
+
+        let result = (|| -> RarResult<()> {
+            while block_index < blocks.len() {
+                // A pending batch is only ever carried forward while the member
+                // is unfinished (`decode_next_batch_while_applying` drops its
+                // successor the moment its apply completes the output), so this
+                // is the same guard the strictly sequential loop used. The tail
+                // drain below still covers a pending batch on any exit path.
+                if *output_size >= unpacked_size {
+                    break;
+                }
+                let span_end = next_span_end(blocks, block_index, blocks.len());
+                if blocks[block_index].is_large {
                     self.parallel_mode_exhausted = true;
                 }
                 if self.parallel_mode_exhausted {
-                    phase_diagnostics::measure(Phase::SerialApply, || {
-                        self.decode_span_inline(input, span, unpacked_size, output_size, writer)
-                    })?;
-                    block_index = span_end;
-                    continue;
-                }
-                let batch_end = next_controller_batch_end(
-                    &scanned.blocks,
-                    block_index,
-                    scanned.blocks.len(),
-                    worker_count,
-                );
-                if worker_count > 1 && batch_end - block_index >= MIN_PARALLEL_BLOCKS {
-                    self.decode_and_apply_static_batch(
-                        input,
-                        &scanned.blocks,
-                        block_index..batch_end,
+                    // Inline decode writes straight into the window, so the
+                    // pending batch has to land first.
+                    self.drain_pending_batch(
+                        &mut pending,
+                        &front_set,
                         unpacked_size,
                         output_size,
                         writer,
                     )?;
+                    if *output_size >= unpacked_size {
+                        break;
+                    }
+                    phase_diagnostics::measure(Phase::SerialApply, || {
+                        self.decode_span_inline(
+                            input,
+                            &blocks[block_index..span_end],
+                            unpacked_size,
+                            output_size,
+                            writer,
+                        )
+                    })?;
+                    block_index = span_end;
+                    continue;
+                }
+                let batch_end =
+                    next_controller_batch_end(blocks, block_index, blocks.len(), worker_count);
+                if worker_count > 1 && batch_end - block_index >= MIN_PARALLEL_BLOCKS {
+                    if !pipelined {
+                        self.decode_and_apply_static_batch(
+                            input,
+                            blocks,
+                            block_index..batch_end,
+                            unpacked_size,
+                            output_size,
+                            writer,
+                        )?;
+                        block_index = batch_end;
+                        continue;
+                    }
+                    // A failed batch never gets a successor: its error surfaces
+                    // as soon as its successful prefix has been applied.
+                    if pending
+                        .as_ref()
+                        .is_some_and(|batch| batch.failure.is_some())
+                    {
+                        self.drain_pending_batch(
+                            &mut pending,
+                            &front_set,
+                            unpacked_size,
+                            output_size,
+                            writer,
+                        )?;
+                    }
+                    match pending.take() {
+                        Some(batch) => {
+                            pending = self.decode_next_batch_while_applying(
+                                input,
+                                blocks,
+                                block_index..batch_end,
+                                batch,
+                                &front_set,
+                                &mut back_set,
+                                &mut back_scratch,
+                                unpacked_size,
+                                output_size,
+                                writer,
+                            )?;
+                            // The freshly decoded batch now owns the back set;
+                            // make it the pending (front) one for the next step.
+                            std::mem::swap(&mut front_set, &mut back_set);
+                            std::mem::swap(&mut front_scratch, &mut back_scratch);
+                        }
+                        None => {
+                            pending = Some(self.decode_static_batch_into(
+                                input,
+                                blocks,
+                                block_index..batch_end,
+                                &mut front_set,
+                                &mut front_scratch,
+                            )?);
+                        }
+                    }
                     block_index = batch_end;
                 } else {
-                    let inline_end = if worker_count > 1 && span.len() > 2 {
+                    self.drain_pending_batch(
+                        &mut pending,
+                        &front_set,
+                        unpacked_size,
+                        output_size,
+                        writer,
+                    )?;
+                    if *output_size >= unpacked_size {
+                        break;
+                    }
+                    let inline_end = if worker_count > 1 && span_end - block_index > 2 {
                         block_index + 1
                     } else {
                         span_end
@@ -1469,7 +1820,7 @@ impl LzDecoder {
                     phase_diagnostics::measure(Phase::SerialApply, || {
                         self.decode_span_inline(
                             input,
-                            &scanned.blocks[block_index..inline_end],
+                            &blocks[block_index..inline_end],
                             unpacked_size,
                             output_size,
                             writer,
@@ -1478,14 +1829,241 @@ impl LzDecoder {
                     block_index = inline_end;
                 }
             }
-            Ok(())
+            // The last batch of the round has no successor to hide behind.
+            self.drain_pending_batch(&mut pending, &front_set, unpacked_size, output_size, writer)
         })();
 
-        self.block_bits_remaining = 0;
-        self.is_last_block = scanned.saw_last_block;
-        processing_result?;
-        self.flush_filters_and_write(writer)?;
-        Ok(scanned.consumed_bytes)
+        if pipelined {
+            // Back first so the front slot — the one the next round's priming
+            // batch takes — is the one most recently grown to size.
+            self.recycle_item_buffer_set(back_set);
+            self.recycle_item_buffer_set(front_set);
+            self.recycle_batch_scratch(back_scratch);
+            self.recycle_batch_scratch(front_scratch);
+        }
+        result
+    }
+
+    /// Apply a decoded-but-unapplied batch, then surface its decode failure.
+    ///
+    /// A no-op when nothing is pending, which is every call on the sequential
+    /// path and the drains that bracket inline spans.
+    fn drain_pending_batch<W: std::io::Write>(
+        &mut self,
+        pending: &mut Option<PendingBatch>,
+        items: &[Vec<DecodedItem>],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let Some(batch) = pending.take() else {
+            return Ok(());
+        };
+        phase_diagnostics::measure(Phase::SerialApply, || {
+            self.apply_decoded_items_parallel(
+                &items[..batch.apply_len],
+                unpacked_size,
+                output_size,
+                writer,
+            )
+        })?;
+        match batch.failure {
+            Some(failure) => Err(failure.error),
+            None => Ok(()),
+        }
+    }
+
+    /// Decode one batch into `items` and install its final table state.
+    ///
+    /// This is the pipeline's prime step: it barriers on worker decode exactly
+    /// as the sequential path does, but leaves the apply to a later drain (or
+    /// to the calling thread of the next batch's scope).
+    fn decode_static_batch_into(
+        &mut self,
+        input: &[u8],
+        blocks: &[BlockInfo],
+        range: std::ops::Range<usize>,
+        items: &mut Vec<Vec<DecodedItem>>,
+        scratch: &mut BatchScratch,
+    ) -> RarResult<PendingBatch> {
+        let worker_count = rar_decode_worker_count();
+        if worker_count <= 1 || range.end - range.start > batch_plan::capacity(worker_count) {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 parallel controller received an invalid dispatch".into(),
+            });
+        }
+        let inherited_tables = self.current_tables();
+        let initial_code_lengths = self.code_lengths.clone();
+        let extra_dist = self.extra_dist;
+        #[cfg(test)]
+        note_controller_dispatch();
+        let active = decoded_item_buffers(items, range.end - range.start);
+        let outcome = phase_diagnostics::measure(Phase::WorkerDecode, || {
+            parallel_decode_static(
+                input,
+                blocks,
+                range.clone(),
+                inherited_tables.as_ref(),
+                &initial_code_lengths,
+                extra_dist,
+                active,
+                scratch,
+            )
+        })?;
+        Ok(self.finish_decoded_batch(range, outcome, scratch))
+    }
+
+    /// Install a joined batch's table state and describe what is left to apply.
+    ///
+    /// Installing before the apply — the sequential path installs after — is
+    /// safe because the two touch disjoint decoder state, and it is required
+    /// by the pipeline: the successor batch snapshots its inherited tables
+    /// from here before its scope opens.
+    fn finish_decoded_batch(
+        &mut self,
+        range: std::ops::Range<usize>,
+        outcome: ParallelDecodeOutcome,
+        scratch: &mut BatchScratch,
+    ) -> PendingBatch {
+        let apply_end = outcome
+            .first_failure
+            .as_ref()
+            .map_or(range.end, |failure| failure.block_index);
+        // Only state from an assignment that finished ahead of the failing
+        // block is safe to install.
+        if let Some(state) = scratch.take_final_state(outcome.final_state_index) {
+            self.set_table_state(state);
+        }
+        PendingBatch {
+            apply_len: apply_end - range.start,
+            failure: outcome.first_failure,
+        }
+    }
+
+    /// Dispatch `range`'s workers and apply the pending batch on this thread.
+    ///
+    /// One `in_place_scope`: the assignments go to the pool, then the calling
+    /// thread — this one — runs the serial apply of the batch decoded last
+    /// step. The scope only returns once every spawned assignment has joined,
+    /// so the collected outcome is complete.
+    ///
+    /// Returns the freshly decoded batch as the new pending batch, or `None`
+    /// when the pending apply completed the member: the sequential controller
+    /// would have stopped before dispatching this batch at all, so its items,
+    /// its table state and any decode failure it produced are discarded.
+    ///
+    /// Diagnostics: the scope wall is attributed to [`Phase::WorkerDecode`] and
+    /// the inline apply to [`Phase::SerialApply`]. Those two spans now overlap
+    /// by construction, so for a pipelined round their sum exceeds the wall
+    /// clock; neither is inflated, but they can no longer be added up.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_next_batch_while_applying<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        blocks: &[BlockInfo],
+        range: std::ops::Range<usize>,
+        pending: PendingBatch,
+        pending_items: &[Vec<DecodedItem>],
+        next_items: &mut Vec<Vec<DecodedItem>>,
+        next_scratch: &mut BatchScratch,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<Option<PendingBatch>> {
+        let batch_len = range.end - range.start;
+        // Everything fallible that has to happen before the scope opens. A
+        // rejected successor must not cost the pending batch its place in apply
+        // order, so the pending apply still runs before the error escapes.
+        let planned = (|| -> RarResult<&'static ThreadPool> {
+            let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5 parallel controller has no worker pool".into(),
+            })?;
+            let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
+            if worker_count <= 1 || batch_len > batch_plan::capacity(worker_count) {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 parallel controller received an invalid dispatch".into(),
+                });
+            }
+            plan_batch_dispatch(blocks, range.clone(), batch_len, worker_count, next_scratch)?;
+            Ok(pool)
+        })();
+        let pool = match planned {
+            Ok(pool) => pool,
+            Err(error) => {
+                let mut pending = Some(pending);
+                self.drain_pending_batch(
+                    &mut pending,
+                    pending_items,
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )?;
+                return Err(error);
+            }
+        };
+        let worker_count = pool.current_num_threads().min(MAX_PARALLEL_THREADS);
+        let active_next = decoded_item_buffers(next_items, batch_len);
+
+        // Snapshot after the previous batch's tables are installed: this is the
+        // whole cross-batch dependency, and it is already resolved here.
+        let inherited_tables = self.current_tables();
+        let initial_code_lengths = self.code_lengths.clone();
+        let mut diagnostics = BatchDiagnostics::start(next_scratch.assignments.len(), worker_count);
+        let worker_options = WorkerOptions {
+            extra_dist: self.extra_dist,
+            diagnostics_enabled: diagnostics.is_enabled(),
+        };
+        let apply_items = &pending_items[..pending.apply_len];
+        let mut apply_result: RarResult<()> = Ok(());
+        #[cfg(test)]
+        {
+            note_controller_dispatch();
+            note_pipelined_dispatch();
+        }
+
+        let BatchScratch {
+            assignments,
+            results,
+        } = &mut *next_scratch;
+        let scope_timer = phase_diagnostics::Timer::new(Phase::WorkerDecode);
+        pool.in_place_scope(|scope| {
+            let dispatch_nanos = spawn_batch_assignments(
+                scope,
+                input,
+                blocks,
+                assignments.as_slice(),
+                inherited_tables.as_ref(),
+                &initial_code_lengths,
+                worker_options,
+                active_next,
+                results.as_mut_slice(),
+            );
+            diagnostics.record_dispatch(dispatch_nanos);
+            // The overlap: workers are already running on the pool while this
+            // thread walks the previous batch's items into the window.
+            apply_result = phase_diagnostics::measure(Phase::SerialApply, || {
+                self.apply_decoded_items_parallel(apply_items, unpacked_size, output_size, writer)
+            });
+        });
+        scope_timer.finish();
+
+        let outcome = collect_batch_outcome(next_scratch);
+        diagnostics.finish(&next_scratch.results);
+        // The pending batch's apply error wins, exactly as it does when the two
+        // phases run one after the other.
+        apply_result?;
+        let outcome = outcome?;
+        if *output_size >= unpacked_size {
+            // The member finished inside the apply above. The sequential
+            // controller would never have dispatched this batch, so nothing it
+            // produced may be installed or reported.
+            return Ok(None);
+        }
+        Ok(Some(self.finish_decoded_batch(
+            range,
+            outcome,
+            next_scratch,
+        )))
     }
 
     fn has_current_tables(&self) -> bool {
@@ -1568,6 +2146,12 @@ impl LzDecoder {
         Ok(())
     }
 
+    /// Decode one batch and apply it, with a barrier in between.
+    ///
+    /// The non-pipelined controller path — the chunked volume drivers, and the
+    /// failure-semantics tests that pin its exact ordering. The pipelined path
+    /// splits the same work across [`Self::decode_static_batch_into`] and
+    /// [`Self::decode_next_batch_while_applying`] instead.
     fn decode_and_apply_static_batch<W: std::io::Write>(
         &mut self,
         input: &[u8],
@@ -1782,63 +2366,16 @@ impl LzDecoder {
         }
 
         let mut output_size = 0u64;
-        let processing_result = (|| -> RarResult<()> {
-            let mut block_index = 0usize;
-            while block_index < scanned.blocks.len() && output_size < unpacked_size {
-                let span_end = next_span_end(&scanned.blocks, block_index, scanned.blocks.len());
-                let span = &scanned.blocks[block_index..span_end];
-                if scanned.blocks[block_index].is_large {
-                    self.parallel_mode_exhausted = true;
-                }
-                if self.parallel_mode_exhausted {
-                    phase_diagnostics::measure(Phase::SerialApply, || {
-                        self.decode_span_inline(
-                            input,
-                            span,
-                            unpacked_size,
-                            &mut output_size,
-                            writer,
-                        )
-                    })?;
-                    block_index = span_end;
-                    continue;
-                }
-                let batch_end = next_controller_batch_end(
-                    &scanned.blocks,
-                    block_index,
-                    scanned.blocks.len(),
-                    worker_count,
-                );
-                if batch_end - block_index >= MIN_PARALLEL_BLOCKS {
-                    self.decode_and_apply_static_batch(
-                        input,
-                        &scanned.blocks,
-                        block_index..batch_end,
-                        unpacked_size,
-                        &mut output_size,
-                        writer,
-                    )?;
-                    block_index = batch_end;
-                } else {
-                    let inline_end = if span.len() > 2 {
-                        block_index + 1
-                    } else {
-                        span_end
-                    };
-                    phase_diagnostics::measure(Phase::SerialApply, || {
-                        self.decode_span_inline(
-                            input,
-                            &scanned.blocks[block_index..inline_end],
-                            unpacked_size,
-                            &mut output_size,
-                            writer,
-                        )
-                    })?;
-                    block_index = inline_end;
-                }
-            }
-            Ok(())
-        })();
+        // Single writer, one immutable input slice for the whole member: the
+        // in-memory path pipelines its batches just like the staged loop.
+        let processing_result = self.run_block_controller(
+            input,
+            &scanned.blocks,
+            unpacked_size,
+            &mut output_size,
+            writer,
+            true,
+        );
 
         self.block_bits_remaining = 0;
         self.is_last_block = scanned.saw_last_block;
@@ -1876,6 +2413,77 @@ mod tests {
 
     fn global_fast_reader_selections() -> usize {
         GLOBAL_FAST_READER_SELECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Monotonic, so a concurrently running test can only add to it: every
+    /// assertion below is on a delta.
+    fn global_pipelined_dispatches() -> usize {
+        GLOBAL_PIPELINED_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pack `symbols` MSB-first as fixed-width codes, guarded for the fast
+    /// reader. With uniform code lengths the canonical Huffman code of a symbol
+    /// is its own index, so a 9-bit code over [`rar7_tables`]'s NC table
+    /// decodes back to the symbol that was written.
+    fn packed_symbols(symbols: &[u16], code_bits: usize) -> Vec<u8> {
+        let total_bits = symbols.len() * code_bits;
+        let mut packed = vec![0u8; total_bits.div_ceil(8) + LOOKAHEAD_BYTES];
+        let mut cursor = 0usize;
+        for &symbol in symbols {
+            for offset in (0..code_bits).rev() {
+                packed[cursor / 8] |= (((symbol >> offset) & 1) as u8) << (7 - cursor % 8);
+                cursor += 1;
+            }
+        }
+        packed
+    }
+
+    /// Literal-only blocks wide enough to fill several controller batches at
+    /// any pool size, plus the bytes they decode to.
+    ///
+    /// Every block carries the same number of 9-bit literal codes, so the
+    /// blocks are byte aligned and their offsets are exact.
+    fn literal_block_stream(block_count: usize) -> (Vec<u8>, Vec<BlockInfo>, Vec<u8>) {
+        const SYMBOLS_PER_BLOCK: usize = 8;
+        const CODE_BITS: usize = 9;
+
+        let symbols: Vec<u16> = (0..block_count * SYMBOLS_PER_BLOCK)
+            .map(|index| (index % 251) as u16)
+            .collect();
+        let input = packed_symbols(&symbols, CODE_BITS);
+        let blocks = (0..block_count)
+            .map(|index| {
+                test_block(
+                    index * SYMBOLS_PER_BLOCK * CODE_BITS,
+                    SYMBOLS_PER_BLOCK * CODE_BITS,
+                    false,
+                )
+            })
+            .collect();
+        let expected = symbols.iter().map(|&symbol| symbol as u8).collect();
+        (input, blocks, expected)
+    }
+
+    fn run_controller(
+        input: &[u8],
+        blocks: &[BlockInfo],
+        unpacked_size: u64,
+        pipelined: bool,
+    ) -> (RarResult<()>, u64, Vec<u8>) {
+        let mut decoder = LzDecoder::new(128 * 1024, 1);
+        decoder.install_inline_tables(&rar7_tables());
+        let mut output_size = 0u64;
+        let mut output = Vec::new();
+        let result = decoder.run_block_controller(
+            input,
+            blocks,
+            unpacked_size,
+            &mut output_size,
+            &mut output,
+            pipelined,
+        );
+        decoder.flush_filters_and_write(&mut output).unwrap();
+        (result, output_size, output)
     }
 
     fn plan_assignments(
@@ -1922,22 +2530,63 @@ mod tests {
     }
 
     #[test]
-    fn static_assignments_pack_two_independent_blocks() {
+    fn static_assignments_spawn_one_job_per_independent_block() {
         let blocks = vec![
             test_block(0, 1, true),
             test_block(1, 1, true),
             test_block(2, 1, true),
             test_block(3, 1, true),
         ];
+        // Two workers, four independent blocks: four jobs, not two pairs, so a
+        // worker that finishes first takes the next block instead of idling.
         let assignments = plan_assignments(&blocks, 0, 4, 2).unwrap();
-        assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments[0].end, 2);
-        assert_eq!(assignments[1].start, 2);
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|assignment| (assignment.start, assignment.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+        );
         assert!(
             assignments
                 .iter()
                 .all(|assignment| blocks[assignment.start].table_present)
         );
+    }
+
+    /// The independent fast path spawns per block, and a round still never
+    /// covers more than [`batch_plan::capacity`] blocks.
+    #[test]
+    fn independent_assignments_are_single_blocks_capped_at_round_capacity() {
+        for worker_count in 2..=MAX_PARALLEL_THREADS {
+            let capacity = batch_plan::capacity(worker_count);
+            for table_present in [true, false] {
+                let blocks = vec![test_block(0, 1, table_present); capacity];
+
+                let assignments = plan_assignments(&blocks, 0, capacity, worker_count).unwrap();
+                assert_eq!(assignments.len(), capacity, "workers {worker_count}");
+                assert!(
+                    assignments
+                        .iter()
+                        .all(|assignment| assignment.end - assignment.start == 1)
+                );
+                assert!(
+                    assignments
+                        .windows(2)
+                        .all(|pair| pair[0].end == pair[1].start)
+                );
+                assert_eq!(assignments.first().unwrap().start, 0);
+                assert_eq!(assignments.last().unwrap().end, capacity);
+
+                // The controller never hands over more than a round's worth,
+                // and one block past capacity is rejected rather than split.
+                let oversized = vec![test_block(0, 1, table_present); capacity + 1];
+                assert!(
+                    plan_assignments(&oversized, 0, capacity + 1, worker_count).is_err(),
+                    "workers {worker_count}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1963,8 +2612,15 @@ mod tests {
         assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 4), 0);
         assert_eq!(next_controller_batch_end(&blocks, 1, blocks.len(), 4), 7);
 
+        // Every block in the suffix inherits the same installed set, so each
+        // one is its own job.
         let assignments = plan_assignments(&blocks, 1, 7, 4).unwrap();
-        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments.len(), 6);
+        assert!(
+            assignments
+                .iter()
+                .all(|assignment| assignment.end - assignment.start == 1)
+        );
         assert!(assignments.iter().all(|assignment| {
             blocks[assignment.start..assignment.end]
                 .iter()
@@ -2497,6 +3153,109 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_batches_match_the_sequential_batch_order_byte_for_byte() {
+        if rar_decode_worker_count() <= 1 {
+            return;
+        }
+
+        // Four full batches at the widest pool, more at a narrower one: a batch
+        // holds at most two blocks per worker.
+        let (input, blocks, expected) =
+            literal_block_stream(batch_plan::capacity(MAX_PARALLEL_THREADS) * 4);
+        let unpacked_size = expected.len() as u64;
+
+        let overlaps_before = global_pipelined_dispatches();
+        let (pipelined_result, pipelined_size, pipelined_output) =
+            run_controller(&input, &blocks, unpacked_size, true);
+        let overlaps = global_pipelined_dispatches() - overlaps_before;
+        let (sequential_result, sequential_size, sequential_output) =
+            run_controller(&input, &blocks, unpacked_size, false);
+
+        pipelined_result.unwrap();
+        sequential_result.unwrap();
+        assert_eq!(pipelined_size, unpacked_size);
+        assert_eq!(pipelined_size, sequential_size);
+        assert_eq!(pipelined_output, sequential_output);
+        assert_eq!(pipelined_output, expected);
+        // ...and the overlap really happened: at least one batch was dispatched
+        // while the previous batch's apply was running on this thread.
+        assert!(overlaps > 0, "no batch overlapped a serial apply");
+    }
+
+    #[test]
+    fn pipelined_failure_applies_every_batch_before_the_failing_block() {
+        let worker_count = rar_decode_worker_count();
+        if worker_count <= 1 {
+            return;
+        }
+
+        // Three full batches; the second block of the last one reads past the
+        // end of the input, so its assignment fails there.
+        let batch_blocks = batch_plan::capacity(worker_count);
+        let (input, mut blocks, expected) = literal_block_stream(batch_blocks * 3);
+        let failing_index = batch_blocks * 2 + 1;
+        blocks[failing_index].payload_bit_offset = (input.len() + 1) * 8;
+        let applied = failing_index * 8;
+
+        let overlaps_before = global_pipelined_dispatches();
+        let (pipelined_result, pipelined_size, pipelined_output) =
+            run_controller(&input, &blocks, expected.len() as u64, true);
+        assert!(global_pipelined_dispatches() > overlaps_before);
+        let (sequential_result, sequential_size, sequential_output) =
+            run_controller(&input, &blocks, expected.len() as u64, false);
+
+        assert!(matches!(
+            pipelined_result.unwrap_err(),
+            RarError::CorruptArchive { .. }
+        ));
+        assert!(matches!(
+            sequential_result.unwrap_err(),
+            RarError::CorruptArchive { .. }
+        ));
+        // Every block ahead of the failure applied, and nothing at or past it.
+        assert_eq!(pipelined_size, applied as u64);
+        assert_eq!(pipelined_size, sequential_size);
+        assert_eq!(pipelined_output, sequential_output);
+        assert_eq!(pipelined_output, expected[..applied]);
+    }
+
+    #[test]
+    fn pipelined_controller_recycles_both_buffer_sets() {
+        if rar_decode_worker_count() <= 1 {
+            return;
+        }
+
+        let (input, blocks, expected) =
+            literal_block_stream(batch_plan::capacity(MAX_PARALLEL_THREADS) * 2);
+        let mut decoder = LzDecoder::new(128 * 1024, 1);
+        decoder.install_inline_tables(&rar7_tables());
+        let mut output_size = 0u64;
+        let mut output = Vec::new();
+
+        decoder
+            .run_block_controller(
+                &input,
+                &blocks,
+                expected.len() as u64,
+                &mut output_size,
+                &mut output,
+                true,
+            )
+            .unwrap();
+
+        // Both in-flight slots come back, so the next round reuses allocations
+        // instead of building a second pair.
+        assert_eq!(decoder.parallel_item_buffer_sets.len(), PIPELINE_DEPTH);
+        assert_eq!(decoder.parallel_batch_scratch.len(), PIPELINE_DEPTH);
+        assert!(
+            decoder
+                .parallel_item_buffer_sets
+                .iter()
+                .all(|set| !set.is_empty())
+        );
+    }
+
+    #[test]
     fn hydrated_multiblock_extraction_dispatches_controller() {
         if rar_decode_worker_count() <= 1 {
             return;
@@ -2534,6 +3293,7 @@ mod tests {
         // this thread stays 0; observe the process-wide counter as a delta
         // instead (monotonic, so concurrent tests can only add to it).
         let fast_before = global_fast_reader_selections();
+        let overlaps_before = global_pipelined_dispatches();
 
         let mut archive = crate::RarArchive::open(std::fs::File::open(fixture).unwrap()).unwrap();
         let unpacked_size = archive.metadata().members[0]
@@ -2556,6 +3316,15 @@ mod tests {
         // ...and block decode — on whichever pool thread it landed — took the
         // bounded fast reader over the padded stage.
         assert!(global_fast_reader_selections() > fast_before);
+        // A member this wide runs many batches per staged round, so the staged
+        // controller must have hidden applies under worker decode. `verify`
+        // above is the byte-identical assertion for that pipelined output.
+        if rar_decode_worker_count() > 1 {
+            assert!(
+                global_pipelined_dispatches() > overlaps_before,
+                "staged rounds never overlapped a batch with an apply"
+            );
+        }
     }
 
     #[test]

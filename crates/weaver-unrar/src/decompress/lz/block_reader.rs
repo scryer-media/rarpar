@@ -5,6 +5,14 @@
 //! exposes small infallible operations for the decode loop.  Operations may
 //! inspect bytes after the logical block when peeking ahead. The caller validates
 //! the final logical position after decoding.
+//!
+//! Reads are served from a cached 64-bit window rather than one load per bit
+//! field. Decoding a single match touches five bit fields — the length/literal
+//! code, its length extra, the distance code, its distance extra and the
+//! low-distance code — which used to be five unaligned loads of the same one or
+//! two cache lines. The window is rebuilt by [`BlockReader::advance`] whenever
+//! it falls below [`MIN_WINDOW_BITS`], so those five fields cost one or two
+//! loads between them and every peek in between is a register shift.
 
 use std::fmt;
 
@@ -16,6 +24,15 @@ pub const LOOKAHEAD_BYTES: usize = 32;
 /// A load at `position >> 3` covers `32 - (position & 7)` valid bits, so 24
 /// is the widest request that is always satisfied by one load.
 const NARROW_PEEK_BITS: u8 = 24;
+
+/// Bits the cached window is kept at or above.
+///
+/// A refill yields `64 - (position & 7)` bits, i.e. at least 57, so the window
+/// is rebuilt at most once per 25 consumed bits. Any request up to this width —
+/// every Huffman peek and every length or distance extra a RAR5 stream can
+/// ask for — is therefore always answered from the register. Wider requests
+/// fall through to the same direct loads this reader has always used.
+const MIN_WINDOW_BITS: u8 = 32;
 
 /// Failure returned while establishing or validating a bounded reader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +90,15 @@ pub struct BlockReader<'a> {
     data: &'a [u8],
     end_bit: usize,
     position: usize,
+    /// The bits at `position`, left-aligned: bit 63 is the bit at `position`.
+    ///
+    /// Only the top `acc_bits` are data; everything below is shifted-in zero
+    /// padding and is never served.
+    acc: u64,
+    /// Valid high bits of [`Self::acc`]. Zero means "no window": every read
+    /// then takes the direct-load path, exactly as it did before the window
+    /// existed.
+    acc_bits: u8,
 }
 
 impl<'a> BlockReader<'a> {
@@ -103,11 +129,15 @@ impl<'a> BlockReader<'a> {
             });
         }
 
-        Ok(Self {
+        let mut reader = Self {
             data,
             end_bit,
             position: start_bit,
-        })
+            acc: 0,
+            acc_bits: 0,
+        };
+        reader.refill();
+        Ok(reader)
     }
 
     /// Return the logical end position supplied to the constructor.
@@ -129,6 +159,8 @@ impl<'a> BlockReader<'a> {
     /// `ceil(end_bit / 8) + LOOKAHEAD_BYTES <= data.len()`, and the decode loop
     /// re-tests `position < end` before every symbol while a single symbol
     /// consumes at most ~150 bits, so no load reaches past the staged guard.
+    /// [`Self::refill`] is bounded more tightly still — it never loads past
+    /// `end_bit`, which the constructor contract alone puts inside `data`.
     #[inline(always)]
     fn debug_check_load(&self, byte: usize, width: usize) {
         debug_assert!(
@@ -155,6 +187,39 @@ impl<'a> BlockReader<'a> {
         raw << offset
     }
 
+    /// Rebuild the cached window at the current position.
+    ///
+    /// One unaligned 64-bit load at the byte holding `position`, shifted so
+    /// that bit becomes the MSB — the same primitive and the same MSB-first
+    /// order as [`Self::peek_window_u32`], one size up. Discarding the partial
+    /// leading byte leaves `64 - (position & 7)` valid bits, so a refill never
+    /// needs the second load the unaligned [`Self::peek_u64`] path takes.
+    ///
+    /// Refills stop at the logical end. Within the block the load is covered by
+    /// the constructor's proof — `ceil(end_bit / 8) + LOOKAHEAD_BYTES <=
+    /// data.len()` puts `(position >> 3) + 8` at least 24 bytes inside `data`
+    /// for every `position <= end_bit`. Past the end the window is dropped
+    /// instead, which leaves the lookahead region reachable only through the
+    /// direct loads below, whose bounds argument is unchanged: the decode loop
+    /// re-tests `position < end` before every symbol and one symbol consumes at
+    /// most ~150 bits, so no load reaches past the staged guard.
+    #[inline(always)]
+    fn refill(&mut self) {
+        if self.position > self.end_bit {
+            self.acc = 0;
+            self.acc_bits = 0;
+            return;
+        }
+        let byte = self.position >> 3;
+        let offset = (self.position & 7) as u32;
+        self.debug_check_load(byte, 8);
+        // SAFETY: see the doc comment; `position <= end_bit` plus the
+        // constructor contract keeps `byte + 8` inside the staged source.
+        let raw = unsafe { load_be_u64(self.data, byte) };
+        self.acc = raw << offset;
+        self.acc_bits = 64 - offset as u8;
+    }
+
     /// Peek at up to 64 MSB-first bits without advancing.
     ///
     /// This operation is intentionally not a logical-range check.  A decoder
@@ -166,10 +231,21 @@ impl<'a> BlockReader<'a> {
         if count == 0 {
             return 0;
         }
+        if count <= self.acc_bits {
+            // Served from the register. `count == 64` only reaches here with a
+            // full window, where no shift is needed.
+            return if count == 64 {
+                self.acc
+            } else {
+                self.acc >> (64 - count)
+            };
+        }
         if count <= NARROW_PEEK_BITS {
             // One load covers the request; skip the wider two-load path.
             return u64::from(self.peek_window_u32() >> (32 - count as u32));
         }
+        // Reaching here means `acc_bits < count <= 64`, so the window is never
+        // wide enough to serve this and `peek_u64` goes straight to the loads.
         let value = self.peek_u64();
         if count == 64 {
             value
@@ -181,6 +257,9 @@ impl<'a> BlockReader<'a> {
     /// Peek at the next 16 MSB-first bits as a big-endian value.
     #[inline(always)]
     pub fn peek_u16(&self) -> u16 {
+        if self.acc_bits >= 16 {
+            return (self.acc >> 48) as u16;
+        }
         (self.peek_window_u32() >> 16) as u16
     }
 
@@ -194,6 +273,15 @@ impl<'a> BlockReader<'a> {
     /// Peek at the next 64 MSB-first bits as a big-endian value.
     #[inline(always)]
     pub fn peek_u64(&self) -> u64 {
+        if self.acc_bits == 64 {
+            return self.acc;
+        }
+        self.peek_u64_direct()
+    }
+
+    /// The pre-window 64-bit peek: one aligned load, or two unaligned ones.
+    #[inline(always)]
+    fn peek_u64_direct(&self) -> u64 {
         let byte = self.position >> 3;
         let offset = self.position & 7;
         if offset == 0 {
@@ -239,9 +327,27 @@ impl<'a> BlockReader<'a> {
     }
 
     /// Advance by a number of bits. Final validation rejects logical overrun.
+    ///
+    /// Consuming from the window is a shift; an advance that would leave fewer
+    /// than [`MIN_WINDOW_BITS`] behind rebuilds it, and one wider than the
+    /// window holds — a byte alignment, a skip over a whole payload — drops it
+    /// and recomputes from `data`. `count` is unrestricted either way: the
+    /// position arithmetic is still saturating and still the only thing
+    /// [`Self::validate_end`] judges.
     #[inline(always)]
     pub fn advance(&mut self, count: usize) {
         self.position = self.position.saturating_add(count);
+        if count < usize::from(self.acc_bits) {
+            // `count < acc_bits <= 64` keeps the shift in range.
+            self.acc <<= count;
+            self.acc_bits -= count as u8;
+            if self.acc_bits >= MIN_WINDOW_BITS {
+                return;
+            }
+        } else {
+            self.acc_bits = 0;
+        }
+        self.refill();
     }
 
     /// Validate that decoding stayed inside the logical block range.
@@ -420,6 +526,13 @@ mod tests {
                     model_peek(&data, position, 64),
                     "offset {position}"
                 );
+                // The cached window has to agree with the wide peek above at
+                // whatever fill level the previous reads left it in.
+                assert_eq!(
+                    u64::from(reader.peek_u16()),
+                    model_peek(&data, position, 16),
+                    "peek_u16 at offset {position}"
+                );
                 assert_eq!(reader.read_bits(1), model_peek(&data, position, 1));
                 position += 1;
                 let count = position % 31 + 1;
@@ -488,6 +601,14 @@ mod tests {
             let mut reader = BlockReader::new(&data, 0, end).unwrap();
             let mut position = 0usize;
             while position + count as usize <= end {
+                // Every narrow width is served from the cached window, at every
+                // fill level a run of `count`-bit reads can produce.
+                assert!(reader.acc_bits >= super::MIN_WINDOW_BITS);
+                assert_eq!(
+                    u64::from(reader.peek_u16()),
+                    model_peek(&data, position, 16),
+                    "peek_u16 before read_bits({count}) at {position}"
+                );
                 assert_eq!(
                     reader.read_bits(count),
                     model_peek(&data, position, count as usize),
@@ -498,5 +619,140 @@ mod tests {
             }
             reader.validate_end().unwrap();
         }
+    }
+
+    /// The window is rebuilt by `advance`, so what a peek reads depends on how
+    /// much was consumed since the last refill. Walk every advance width and
+    /// compare each peek against the bit-by-bit model.
+    #[test]
+    fn windowed_peeks_match_the_model_across_refill_boundaries() {
+        let source: Vec<u8> = (0..96)
+            .map(|index| (index as u8).wrapping_mul(97).wrapping_add(53))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+
+        for step in 1..=64usize {
+            let mut reader = BlockReader::new(&data, 0, end).unwrap();
+            let mut position = 0usize;
+            while position + 64 <= end {
+                // Inside the block the window always covers a narrow request,
+                // whatever the advance pattern was.
+                assert!(
+                    reader.acc_bits >= super::MIN_WINDOW_BITS,
+                    "window collapsed at {position} with step {step}"
+                );
+                assert_eq!(
+                    u64::from(reader.peek_u16()),
+                    model_peek(&data, position, 16),
+                    "peek_u16 at {position}, step {step}"
+                );
+                for count in [1u8, 7, 15, 16, 23, 24, 25, 31, 32, 33, 47, 57, 64] {
+                    assert_eq!(
+                        reader.peek_bits(count),
+                        model_peek(&data, position, count as usize),
+                        "peek_bits({count}) at {position}, step {step}"
+                    );
+                }
+                assert_eq!(
+                    reader.peek_u64(),
+                    model_peek(&data, position, 64),
+                    "peek_u64 at {position}, step {step}"
+                );
+                reader.advance(step);
+                position += step;
+                assert_eq!(reader.position(), position);
+            }
+            reader.advance(end - position);
+            reader.finish().unwrap();
+        }
+    }
+
+    /// One match reads five bit fields in a row — the length/literal code, its
+    /// length extra, the distance code, its distance extra and the low-distance
+    /// code. Refills land in the middle of that group, so walk the whole shape
+    /// at every bit offset with a peek before each read.
+    #[test]
+    fn interleaved_reads_and_peeks_match_the_model() {
+        let source: Vec<u8> = (0..64)
+            .map(|index| (index as u8).wrapping_mul(29).wrapping_add(131))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+        let widths = [9u8, 5, 7, 34, 4];
+
+        for start in 0..64 {
+            let mut reader = BlockReader::new(&data, start, end).unwrap();
+            let mut position = start;
+            'block: while position + 64 <= end {
+                for width in widths {
+                    assert_eq!(
+                        u64::from(reader.peek_u16()),
+                        model_peek(&data, position, 16),
+                        "peek_u16 before read_bits({width}) at {position}"
+                    );
+                    assert_eq!(
+                        reader.read_bits(width),
+                        model_peek(&data, position, width as usize),
+                        "read_bits({width}) at {position}"
+                    );
+                    position += width as usize;
+                    assert_eq!(reader.position(), position);
+                    if position + 64 > end {
+                        break 'block;
+                    }
+                }
+            }
+            reader.advance(end - position);
+            reader.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn oversized_advance_rebuilds_the_window_from_data() {
+        let source: Vec<u8> = (0..40)
+            .map(|index| (index as u8).wrapping_mul(83).wrapping_add(11))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+        let mut reader = BlockReader::new(&data, 0, end).unwrap();
+
+        // Wider than the window holds: it is dropped and rebuilt at the new
+        // position rather than shifted.
+        reader.advance(64);
+        assert_eq!(reader.position(), 64);
+        assert_eq!(u64::from(reader.peek_u16()), model_peek(&data, 64, 16));
+        assert_eq!(reader.peek_u64(), model_peek(&data, 64, 64));
+
+        reader.advance(100);
+        assert_eq!(reader.read_bits(24), model_peek(&data, 164, 24));
+        assert_eq!(reader.position(), 188);
+
+        reader.advance(end - 188);
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn peeks_past_the_logical_end_still_read_the_guard() {
+        let data = with_guard(vec![0xff, 0xff]);
+        let mut reader = BlockReader::new(&data, 0, 16).unwrap();
+
+        // Consuming the whole block leaves the window sitting on guard bytes.
+        reader.advance(16);
+        assert_eq!(reader.peek_u16(), 0);
+        assert_eq!(reader.peek_bits(24), 0);
+        assert_eq!(reader.peek_u64(), 0);
+        reader.validate_end().unwrap();
+
+        // Overshooting drops the window; the direct loads still see the guard.
+        reader.advance(40);
+        assert_eq!(reader.acc_bits, 0);
+        assert_eq!(reader.peek_u16(), 0);
+        assert_eq!(reader.peek_bits(24), 0);
+        assert_eq!(reader.peek_u64(), 0);
+        assert!(reader.validate_end().is_err());
     }
 }

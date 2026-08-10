@@ -116,7 +116,10 @@ pub struct LzDecoder {
     /// Workers fill these slots before the caller applies them in archive order.
     parallel_item_buffer_sets: Vec<Vec<Vec<parallel::DecodedItem>>>,
     /// Recycled per-batch controller bookkeeping (assignments, worker results).
-    parallel_batch_scratch: parallel::BatchScratch,
+    ///
+    /// More than one is cached: the pipelined controller keeps one batch in
+    /// flight on the pool while the previous batch is applied on its thread.
+    parallel_batch_scratch: Vec<parallel::BatchScratch>,
     /// A large compressed block switches the remainder of the current file
     /// to inline decoding so decoded-item memory remains bounded.
     parallel_mode_exhausted: bool,
@@ -169,7 +172,7 @@ impl LzDecoder {
             current_file_base_total: 0,
             current_file_written_size: 0,
             parallel_item_buffer_sets: Vec::new(),
-            parallel_batch_scratch: parallel::BatchScratch::default(),
+            parallel_batch_scratch: Vec::new(),
             parallel_mode_exhausted: false,
             staged_input: None,
         };
@@ -1461,7 +1464,11 @@ impl LzDecoder {
                 .unwrap_or(header_limit);
             if span > 0 {
                 let prev_output = output_size;
-                let consumed = self.process_buffered_blocks(
+                // Sequential batches, deliberately: this driver switches
+                // `current_writer` and tallies per-volume bytes as apply
+                // progresses, so decoding a batch ahead of the boundary check
+                // would attribute output to the wrong volume.
+                let consumed = self.process_buffered_blocks_sequential(
                     staged.padded_input(),
                     staged.logical_len(),
                     span,

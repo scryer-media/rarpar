@@ -1,7 +1,9 @@
 #![cfg(not(target_family = "wasm"))]
 
+use std::env;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,6 +12,7 @@ use unrar_rs::{ExtractOptions, RarArchive, ReadSeek};
 
 const RAR5_DIR: &str = "rar5";
 const LARGE_PASSWORD: &str = "e2e-test-password";
+const DISABLE_PARALLEL: &str = "WEAVER_RAR_DISABLE_PARALLEL";
 
 fn fixture(name: &str) -> Option<Arc<Vec<u8>>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -99,6 +102,59 @@ fn options() -> ExtractOptions {
         password: None,
         restore_owners: false,
     }
+}
+
+/// Run `operation` with the block-parallel controller turned off.
+///
+/// The switch is a process-wide environment variable, so it is restored before
+/// returning (and on unwind). Flipping it can only send a concurrently running
+/// test down the single-threaded engine, which is a correct decode of the same
+/// bytes, so this cannot make another test in this binary fail.
+fn with_parallel_disabled<T>(operation: impl FnOnce() -> T) -> T {
+    let previous = env::var_os(DISABLE_PARALLEL);
+    unsafe {
+        env::set_var(DISABLE_PARALLEL, "1");
+    }
+    let result = catch_unwind(AssertUnwindSafe(operation));
+    unsafe {
+        match previous {
+            Some(value) => env::set_var(DISABLE_PARALLEL, value),
+            None => env::remove_var(DISABLE_PARALLEL),
+        }
+    }
+    match result {
+        Ok(value) => value,
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+/// The controller dispatches batch K+1 while batch K is being applied, so the
+/// one thing that must not move is the output. Compare the pipelined engine
+/// against the single-threaded one over the same member.
+#[test]
+fn rar5_pipelined_controller_matches_the_single_threaded_engine() {
+    let Some(bytes) = fixture("rar5_lz.rar") else {
+        return;
+    };
+
+    let extract = || {
+        let mut archive = RarArchive::open(Cursor::new(bytes.as_ref().clone())).unwrap();
+        archive
+            .extract_member(0, &options(), None)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+    };
+
+    let pipelined = extract();
+    let single_threaded = with_parallel_disabled(extract);
+
+    assert!(!pipelined.is_empty(), "fixture member decoded to nothing");
+    assert_eq!(pipelined.len(), single_threaded.len());
+    assert!(
+        pipelined == single_threaded,
+        "pipelined controller output differs from the single-threaded engine"
+    );
 }
 
 #[test]
