@@ -296,6 +296,40 @@ impl HuffmanTable {
         (self.symbol_for_bits(bit_field, bits), false)
     }
 
+    /// Register-cursor specialization of [`Self::decode_block_reader`].
+    ///
+    /// Keep in lockstep with `decode_block_reader`: identical peek mask,
+    /// identical quick-path threshold test, identical slow-path scan and
+    /// identical advance widths. The only difference is where the bit cursor
+    /// lives — a caller-owned [`BitCursor`](super::block_reader::BitCursor)
+    /// copy plus its slice and logical end, instead of the reader's in-memory
+    /// fields. It exists here, rather than in the decode loop, only because
+    /// this table's lookup state is private to this module.
+    #[inline(always)]
+    pub(super) fn decode_cursor(
+        &self,
+        cursor: &mut super::block_reader::BitCursor,
+        data: &[u8],
+        end_bit: usize,
+    ) -> (u16, bool) {
+        let bit_field = u32::from(super::block_reader::cursor_peek_u16(cursor, data)) & 0xfffe;
+
+        if bit_field < self.quick_threshold() {
+            let code = self.quick_index(bit_field);
+            super::block_reader::cursor_advance(
+                cursor,
+                data,
+                end_bit,
+                self.quick_len[code] as usize,
+            );
+            return (self.quick_num[code], true);
+        }
+
+        let bits = self.slow_path_bits(bit_field);
+        super::block_reader::cursor_advance(cursor, data, end_bit, bits);
+        (self.symbol_for_bits(bit_field, bits), false)
+    }
+
     /// Returns the number of symbols this table can decode.
     pub fn num_symbols(&self) -> usize {
         self.num_symbols
@@ -905,6 +939,10 @@ mod tests {
             let mut generic = BitReader::new(&data);
             let mut specialized = BitReader::new(&data);
             let mut block = BlockReader::new(&staged, 0, end_bit).unwrap();
+            // The fourth path: the same table driven off a detached register
+            // cursor, which is what the parallel worker's fast loop runs.
+            let mut cursor_block = BlockReader::new(&staged, 0, end_bit).unwrap();
+            let mut cursor = cursor_block.export_cursor();
 
             let mut symbols = 0usize;
             // Stop well before the end so no reader sees a short final peek.
@@ -915,14 +953,24 @@ mod tests {
                     expected,
                     "trial {trial} symbol {symbols}"
                 );
-                let (block_symbol, _) = table.decode_block_reader(&mut block);
+                let (block_symbol, block_quick) = table.decode_block_reader(&mut block);
                 assert_eq!(block_symbol, expected, "trial {trial} symbol {symbols}");
+                let (cursor_symbol, cursor_quick) =
+                    table.decode_cursor(&mut cursor, &staged, end_bit);
+                assert_eq!(cursor_symbol, expected, "trial {trial} symbol {symbols}");
+                // The quick/slow classification feeds the diagnostics counters,
+                // so the two block paths have to agree on it as well.
+                assert_eq!(cursor_quick, block_quick, "trial {trial} symbol {symbols}");
                 assert_eq!(specialized.position(), generic.position());
                 assert_eq!(block.position(), generic.position());
+                assert_eq!(cursor.pos, generic.position());
                 symbols += 1;
             }
             assert!(symbols > 32, "trial {trial} decoded only {symbols} symbols");
             block.validate_end().unwrap();
+            cursor_block.import_cursor(cursor);
+            assert_eq!(cursor_block, block);
+            cursor_block.validate_end().unwrap();
         }
     }
 }

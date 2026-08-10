@@ -1,9 +1,12 @@
 //! Contiguous work ranges for a bounded worker batch.
 //!
-//! A round is bounded by blocks, not by jobs: it covers at most [`capacity`]
-//! blocks and hands each of them to the pool as its own range, so the pool has
-//! more jobs than threads and its work stealing — not this planner — decides
-//! which thread runs which block.
+//! A round covers at most [`capacity`] blocks split into at most one
+//! contiguous chunk per worker. Chunking is deliberate: one worker decoding a
+//! contiguous run reuses its warm table/scratch state and walks the staged
+//! input sequentially. The one-job-per-block alternative was measured to
+//! inflate per-block symbol-decode time ~35-42% for identical work while the
+//! pool showed no idle slots at chunk granularity, so finer stealing bought
+//! nothing and cost locality.
 
 /// An inclusive-exclusive range of block indices assigned together.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,13 +46,14 @@ pub const fn planned_block_count(block_count: usize, worker_count: usize) -> usi
     }
 }
 
-/// Append one single-block range per planned block to `out`.
+/// Append the round's contiguous, balanced ranges to `out`.
 ///
-/// Ranges are absolute: the first planned block is `first_block`. The round
-/// still spans at most [`capacity`] blocks, but it is spawned as one job per
-/// block rather than one job per worker, so a core that finishes early steals
-/// the next block instead of idling behind a pre-bound pair. On a hybrid
-/// machine that is what keeps a fast core from waiting on a slow one.
+/// Ranges are absolute: the first planned block is `first_block`. At most two
+/// blocks are considered per worker and at most one range is produced per
+/// worker, so each worker decodes one contiguous run — the shape UnRAR uses,
+/// and the one that keeps per-worker table scratch and staged input reads
+/// sequential. When fewer blocks are available than workers, each range holds
+/// one block.
 ///
 /// The caller owns `out` so a controller can recycle one plan buffer across
 /// dispatches.
@@ -60,13 +64,21 @@ pub fn plan_batches_into(
     out: &mut Vec<Batch>,
 ) {
     let planned_count = planned_block_count(block_count, worker_count);
-    out.reserve(planned_count);
-    for offset in 0..planned_count {
-        let start = first_block + offset;
+    if planned_count == 0 {
+        return;
+    }
+    // `planned_count > 0` implies `worker_count > 0` (capacity(0) is zero).
+    let batch_size =
+        planned_count / worker_count + usize::from(!planned_count.is_multiple_of(worker_count));
+
+    let mut start = 0;
+    while start < planned_count {
+        let end = start.saturating_add(batch_size).min(planned_count);
         out.push(Batch {
-            start,
-            end: start + 1,
+            start: first_block + start,
+            end: first_block + end,
         });
+        start = end;
     }
 }
 
@@ -108,40 +120,37 @@ mod tests {
     }
 
     #[test]
-    fn exact_worker_count_is_one_job_per_block() {
+    fn exact_worker_count_is_balanced() {
         let batches = plan(4, 4);
         assert_eq!(ranges(&batches), vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
         assert_eq!(batches.len(), 4);
     }
 
     #[test]
-    fn partial_round_is_contiguous_without_empty_ranges() {
+    fn partial_round_is_balanced_without_empty_ranges() {
         let batches = plan(5, 4);
-        assert_eq!(
-            ranges(&batches),
-            vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
-        );
+        assert_eq!(ranges(&batches), vec![(0, 2), (2, 4), (4, 5)]);
         assert!(batches.windows(2).all(|pair| pair[0].end == pair[1].start));
         assert!(batches.iter().all(|batch| batch.start < batch.end));
     }
 
     #[test]
-    fn exact_capacity_spawns_two_jobs_per_worker() {
+    fn exact_capacity_uses_one_chunk_per_worker() {
         let batches = plan(capacity(4), 4);
-        assert_eq!(batches.len(), capacity(4));
-        assert!(batches.iter().all(|batch| batch.is_single_block()));
+        assert_eq!(ranges(&batches), vec![(0, 2), (2, 4), (4, 6), (6, 8)]);
+        assert_eq!(batches.len(), 4);
         assert_eq!(batches.last().unwrap().end, capacity(4));
     }
 
     #[test]
     fn over_capacity_is_limited_to_two_blocks_per_worker() {
         let batches = plan(capacity(4) + 3, 4);
+        assert_eq!(ranges(&batches), vec![(0, 2), (2, 4), (4, 6), (6, 8)]);
         assert_eq!(
             batches.iter().map(|batch| batch.len()).sum::<usize>(),
             capacity(4)
         );
-        assert!(batches.iter().all(|batch| batch.is_single_block()));
-        assert_eq!(batches.len(), capacity(4));
+        assert!(batches.len() <= 4);
     }
 
     #[test]
@@ -160,17 +169,20 @@ mod tests {
     }
 
     #[test]
-    fn planner_never_exceeds_round_capacity() {
+    fn planner_never_exceeds_worker_count() {
         for worker_count in 1..=8 {
             for block_count in 0..=capacity(worker_count) + 3 {
                 let batches = plan(block_count, worker_count);
                 let planned = planned_block_count(block_count, worker_count);
-                // One job per block, capped at two blocks per worker.
-                assert_eq!(batches.len(), planned);
-                assert!(batches.len() <= capacity(worker_count));
-                assert!(batches.iter().all(|batch| batch.is_single_block()));
+                // One contiguous chunk per worker, two blocks per worker max.
+                assert!(batches.len() <= worker_count);
+                assert!(batches.iter().all(|batch| batch.len() <= 2));
                 assert!(batches.windows(2).all(|pair| pair[0].end == pair[1].start));
                 assert_eq!(batches.last().map_or(0, |batch| batch.end), planned);
+                assert_eq!(
+                    batches.iter().map(|batch| batch.len()).sum::<usize>(),
+                    planned
+                );
             }
         }
     }

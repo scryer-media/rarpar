@@ -373,6 +373,207 @@ impl<'a> BlockReader<'a> {
     pub fn finish(self) -> Result<(), BlockReaderError> {
         self.validate_end()
     }
+
+    /// The staged source this reader was built over.
+    ///
+    /// Returned with the source lifetime, not the borrow's, so a decode loop
+    /// can hold the slice while it hands the reader back its cursor.
+    #[inline(always)]
+    pub(super) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Copy the bit cursor out for a register-resident decode loop.
+    ///
+    /// See [`BitCursor`]: the loop drives the copy and writes it back once, so
+    /// the three fields live in registers instead of being re-stored and
+    /// re-loaded around every symbol.
+    #[inline(always)]
+    pub(super) fn export_cursor(&self) -> BitCursor {
+        BitCursor {
+            acc: self.acc,
+            acc_bits: u32::from(self.acc_bits),
+            pos: self.position,
+        }
+    }
+
+    /// Install a cursor a decode loop advanced.
+    ///
+    /// A plain field write: the cursor operations maintain exactly the
+    /// invariants [`Self::advance`] does, and logical-range judgement is still
+    /// [`Self::validate_end`]'s alone — the caller's loop guard is what keeps
+    /// `pos` monotonic.
+    #[inline(always)]
+    pub(super) fn import_cursor(&mut self, cursor: BitCursor) {
+        debug_assert!(cursor.acc_bits <= 64);
+        self.acc = cursor.acc;
+        self.acc_bits = cursor.acc_bits as u8;
+        self.position = cursor.pos;
+    }
+}
+
+/// The mutable half of a [`BlockReader`], detached so it can live in registers.
+///
+/// A worker decode loop reaches its reader through a `&mut` its caller owns, so
+/// LLVM has to treat `acc`/`acc_bits`/`position` as memory: every symbol stores
+/// the shifted accumulator back and reloads it, and on x86-64 the narrow
+/// `acc_bits` reload from the middle of the 8-byte accumulator slot adds a
+/// store-forwarding stall on top. Measured on the RAR5 decode loop, that
+/// round-trip was 42.6% of loop samples.
+///
+/// The loop instead exports this copy once, runs entirely on it through the
+/// `cursor_*` functions below, and imports it back at every exit. The
+/// operations are the [`BlockReader`] methods verbatim — same refill threshold,
+/// same narrow/wide split, same drop-window-past-the-end rule, same
+/// constructor-proven bounds contract — with the reader's fields replaced by
+/// this struct plus the `data`/`end_bit` the caller passes in. `acc_bits` is
+/// widened to `u32` purely to keep it a register-width field; every value it
+/// takes is still `0..=64`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BitCursor {
+    /// The bits at `pos`, left-aligned — [`BlockReader::acc`].
+    pub acc: u64,
+    /// Valid high bits of `acc` — [`BlockReader::acc_bits`], widened.
+    pub acc_bits: u32,
+    /// Absolute bit position — [`BlockReader::position`].
+    pub pos: usize,
+}
+
+/// Debug-only proof that a `width`-byte load at `byte` stays inside `data`.
+///
+/// The cursor half of [`BlockReader::debug_check_load`], and the same argument:
+/// release builds carry no length compare because the reader's constructor
+/// already proved `ceil(end_bit / 8) + LOOKAHEAD_BYTES <= data.len()`, and a
+/// cursor is only ever created from a constructed reader.
+#[inline(always)]
+fn debug_check_cursor_load(data: &[u8], byte: usize, width: usize) {
+    debug_assert!(
+        byte + width <= data.len(),
+        "block cursor load of {width} bytes at byte {byte} exceeds {} staged bytes",
+        data.len()
+    );
+}
+
+/// Cursor form of [`BlockReader::peek_window_u32`].
+#[inline(always)]
+fn cursor_peek_window_u32(cursor: &BitCursor, data: &[u8]) -> u32 {
+    let byte = cursor.pos >> 3;
+    let offset = (cursor.pos & 7) as u32;
+    debug_check_cursor_load(data, byte, 4);
+    // SAFETY: as `BlockReader::peek_window_u32` — the constructor contract that
+    // built this cursor's reader keeps `byte + 4` inside `data`.
+    let raw = unsafe { load_be_u32(data, byte) };
+    raw << offset
+}
+
+/// Cursor form of [`BlockReader::refill`].
+#[inline(always)]
+pub(super) fn cursor_refill(cursor: &mut BitCursor, data: &[u8], end_bit: usize) {
+    if cursor.pos > end_bit {
+        cursor.acc = 0;
+        cursor.acc_bits = 0;
+        return;
+    }
+    let byte = cursor.pos >> 3;
+    let offset = (cursor.pos & 7) as u32;
+    debug_check_cursor_load(data, byte, 8);
+    // SAFETY: as `BlockReader::refill` — `pos <= end_bit` plus the constructor
+    // contract keeps `byte + 8` inside the staged source.
+    let raw = unsafe { load_be_u64(data, byte) };
+    cursor.acc = raw << offset;
+    cursor.acc_bits = 64 - offset;
+}
+
+/// Cursor form of [`BlockReader::peek_u64_direct`].
+#[inline(always)]
+fn cursor_peek_u64_direct(cursor: &BitCursor, data: &[u8]) -> u64 {
+    let byte = cursor.pos >> 3;
+    let offset = cursor.pos & 7;
+    if offset == 0 {
+        debug_check_cursor_load(data, byte, 8);
+        // SAFETY: as `BlockReader::peek_u64_direct`.
+        return unsafe { load_be_u64(data, byte) };
+    }
+
+    debug_check_cursor_load(data, byte, 9);
+    // SAFETY: as `BlockReader::peek_u64_direct`.
+    let high = unsafe { load_be_u64(data, byte) };
+    let low = unsafe { load_be_u64(data, byte + 1) };
+    (high << offset) | (low >> (8 - offset))
+}
+
+/// Cursor form of [`BlockReader::peek_u64`].
+#[inline(always)]
+pub(super) fn cursor_peek_u64(cursor: &BitCursor, data: &[u8]) -> u64 {
+    if cursor.acc_bits == 64 {
+        return cursor.acc;
+    }
+    cursor_peek_u64_direct(cursor, data)
+}
+
+/// Cursor form of [`BlockReader::peek_u16`].
+#[inline(always)]
+pub(super) fn cursor_peek_u16(cursor: &BitCursor, data: &[u8]) -> u16 {
+    if cursor.acc_bits >= 16 {
+        return (cursor.acc >> 48) as u16;
+    }
+    (cursor_peek_window_u32(cursor, data) >> 16) as u16
+}
+
+/// Cursor form of [`BlockReader::peek_bits`].
+#[inline(always)]
+pub(super) fn cursor_peek_bits(cursor: &BitCursor, data: &[u8], count: u8) -> u64 {
+    debug_assert!(count <= 64);
+    if count == 0 {
+        return 0;
+    }
+    if u32::from(count) <= cursor.acc_bits {
+        return if count == 64 {
+            cursor.acc
+        } else {
+            cursor.acc >> (64 - count)
+        };
+    }
+    if count <= NARROW_PEEK_BITS {
+        return u64::from(cursor_peek_window_u32(cursor, data) >> (32 - u32::from(count)));
+    }
+    let value = cursor_peek_u64(cursor, data);
+    if count == 64 {
+        value
+    } else {
+        value >> (64 - count)
+    }
+}
+
+/// Cursor form of [`BlockReader::advance`].
+#[inline(always)]
+pub(super) fn cursor_advance(cursor: &mut BitCursor, data: &[u8], end_bit: usize, count: usize) {
+    cursor.pos = cursor.pos.saturating_add(count);
+    if count < cursor.acc_bits as usize {
+        // `count < acc_bits <= 64` keeps the shift in range.
+        cursor.acc <<= count;
+        cursor.acc_bits -= count as u32;
+        if cursor.acc_bits >= u32::from(MIN_WINDOW_BITS) {
+            return;
+        }
+    } else {
+        cursor.acc_bits = 0;
+    }
+    cursor_refill(cursor, data, end_bit);
+}
+
+/// Cursor form of [`BlockReader::read_bits`].
+#[inline(always)]
+pub(super) fn cursor_read_bits(
+    cursor: &mut BitCursor,
+    data: &[u8],
+    end_bit: usize,
+    count: u8,
+) -> u64 {
+    debug_assert!(count <= 64);
+    let value = cursor_peek_bits(cursor, data, count);
+    cursor_advance(cursor, data, end_bit, count as usize);
+    value
 }
 
 // The constructor proves that every load for one complete symbol remains in
@@ -733,6 +934,88 @@ mod tests {
 
         reader.advance(end - 188);
         reader.finish().unwrap();
+    }
+
+    /// The cursor operations are the reader's, so every one of them has to
+    /// return the same bits *and* leave the same window state — otherwise the
+    /// fast decode loop would diverge from the checked one mid-block.
+    #[test]
+    fn cursor_operations_mirror_the_reader_state_for_state() {
+        let source: Vec<u8> = (0..96)
+            .map(|index| (index as u8).wrapping_mul(61).wrapping_add(17))
+            .collect();
+        let mut data = source.clone();
+        data.resize(source.len() + LOOKAHEAD_BYTES, 0);
+        let end = source.len() * 8;
+        // Widths spanning the register path, the single-load narrow path and
+        // the two-load wide path, plus the refill boundary in between.
+        let widths = [1u8, 5, 9, 16, 23, 24, 25, 31, 32, 33, 47, 57, 64];
+
+        for start in 0..16 {
+            let mut reader = BlockReader::new(&data, start, end).unwrap();
+            let mut cursor = reader.export_cursor();
+            assert_eq!(
+                (cursor.acc, cursor.acc_bits, cursor.pos),
+                (reader.acc, u32::from(reader.acc_bits), reader.position())
+            );
+
+            let mut step = 0usize;
+            // Run past the logical end so the drop-window rule and the guard
+            // reads are compared too. The bound keeps the widest peek from the
+            // last admitted position inside the staged guard.
+            while cursor.pos <= end + 64 {
+                assert_eq!(
+                    super::cursor_peek_u16(&cursor, &data),
+                    reader.peek_u16(),
+                    "peek_u16 at {} (start {start})",
+                    cursor.pos
+                );
+                assert_eq!(
+                    super::cursor_peek_u64(&cursor, &data),
+                    reader.peek_u64(),
+                    "peek_u64 at {} (start {start})",
+                    cursor.pos
+                );
+                for count in 0..=64u8 {
+                    assert_eq!(
+                        super::cursor_peek_bits(&cursor, &data, count),
+                        reader.peek_bits(count),
+                        "peek_bits({count}) at {} (start {start})",
+                        cursor.pos
+                    );
+                }
+
+                let width = widths[step % widths.len()];
+                let cursor_value = super::cursor_read_bits(&mut cursor, &data, end, width);
+                let reader_value = reader.read_bits(width);
+                assert_eq!(
+                    cursor_value, reader_value,
+                    "read_bits({width}) (start {start})"
+                );
+                assert_eq!(
+                    (cursor.acc, cursor.acc_bits, cursor.pos),
+                    (reader.acc, u32::from(reader.acc_bits), reader.position()),
+                    "state after read_bits({width}) (start {start})"
+                );
+
+                // An oversized advance drops the window on both sides.
+                let skip = (step % 5) * 21;
+                super::cursor_advance(&mut cursor, &data, end, skip);
+                reader.advance(skip);
+                assert_eq!(
+                    (cursor.acc, cursor.acc_bits, cursor.pos),
+                    (reader.acc, u32::from(reader.acc_bits), reader.position()),
+                    "state after advance({skip}) (start {start})"
+                );
+                step += 1;
+            }
+
+            // Importing the cursor reproduces the reader it was exported from.
+            let mut imported = BlockReader::new(&data, start, end).unwrap();
+            imported.import_cursor(cursor);
+            assert_eq!(imported, reader);
+            assert_eq!(imported.validate_end(), reader.validate_end());
+        }
     }
 
     #[test]

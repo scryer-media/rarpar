@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use super::batch_plan::{self, Batch};
 use super::bitstream::{BitRead, BitReader};
-use super::block_reader::{BlockReader, LOOKAHEAD_BYTES};
+use super::block_reader::{self, BitCursor, BlockReader, LOOKAHEAD_BYTES};
 use super::filter::{FilterType, PendingFilter};
 use super::huffman::{self, HuffmanTable};
 use super::phase_diagnostics::{self, Phase, SymbolKind, WorkerCounters};
@@ -584,7 +584,7 @@ fn decode_block_symbols_counted(
         #[cfg(test)]
         note_fast_reader_selection();
         if diagnostics {
-            decode_block_symbols_inner::<_, true>(
+            decode_block_symbols_fast::<true>(
                 &mut reader,
                 block_end_bits,
                 tables,
@@ -593,7 +593,7 @@ fn decode_block_symbols_counted(
                 counters,
             )
         } else {
-            decode_block_symbols_inner::<_, false>(
+            decode_block_symbols_fast::<false>(
                 &mut reader,
                 block_end_bits,
                 tables,
@@ -743,6 +743,287 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
     }
 
     reader.validate_end(block_end_bits)
+}
+
+/// [`BlockReader`] specialization of [`decode_block_symbols_inner`].
+///
+/// Same symbols, same items, same exit conditions — what differs is where the
+/// bit cursor lives. The generic loop reaches its reader through a `&mut` the
+/// caller owns, so `acc`/`acc_bits`/`position` are memory: every symbol stores
+/// the shifted accumulator back and reloads it (and on x86-64 reloads
+/// `acc_bits` narrowly out of the middle of that same 8-byte slot, adding a
+/// store-forwarding stall). Measured on the RAR5 worker loop, that round-trip
+/// was 42.6% of loop samples against the reference decoder's 4.9%.
+///
+/// Here the cursor is a local [`BitCursor`] the loop owns outright, so it stays
+/// in registers, and the reader is touched exactly twice: once to export it and
+/// once — on every exit path — to import it back before [`DecodeBits`]'s
+/// `validate_end` judges the final position. Two further shapes fall out of
+/// owning the loop:
+///
+/// * the guard is a single `pos < end` compare, because for a [`BlockReader`]
+///   built over this block `has_bits()` *is* that compare;
+/// * literals accumulate into a `u64` rather than an indexed `[u8; 8]`, which
+///   drops a bounds check and a panic branch per literal and turns the batch
+///   flush from eight byte stores plus a reload into one register move.
+fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
+    reader: &mut BlockReader<'a>,
+    block_end_bits: usize,
+    tables: &TableSet,
+    extra_dist: bool,
+    items: &mut Vec<DecodedItem>,
+    counters: &mut WorkerCounters,
+) -> RarResult<()> {
+    let data: &'a [u8] = reader.data();
+    let end = block_end_bits;
+    // The reader was constructed with this exact logical end, so the generic
+    // loop's `position() < block_end_bits && has_bits()` is one compare twice.
+    debug_assert_eq!(reader.end(), block_end_bits);
+    let mut cur = reader.export_cursor();
+
+    // Literal byte `i` of the batch sits at bits `8 * i`, so `to_le_bytes` at
+    // the flush reproduces the `[u8; 8]` the generic loop fills index 0..n —
+    // `to_le_bytes` is defined on the value, not on the target, so byte `i` of
+    // the result is bits `8 * i` on every target. Both consumers of that array
+    // agree with the array order: `put_literal_batch` byte-indexes `bytes[..n]`
+    // for a short batch and passes the full array to `u64::from_ne_bytes` for a
+    // complete one, exactly as before.
+    let mut lit_acc: u64 = 0;
+    let mut lit_count: u32 = 0;
+
+    while cur.pos < end {
+        let (sym, quick) = tables.nc.decode_cursor(&mut cur, data, end);
+        let sym = u32::from(sym);
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
+        }
+
+        if sym < 256 {
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Literal);
+            }
+            lit_acc |= u64::from(sym as u8) << (lit_count * 8);
+            lit_count += 1;
+            if lit_count == 8 {
+                items.push(DecodedItem::Literals {
+                    bytes: lit_acc.to_le_bytes(),
+                    count: 7,
+                });
+                lit_acc = 0;
+                lit_count = 0;
+            }
+            continue;
+        }
+
+        if lit_count > 0 {
+            items.push(DecodedItem::Literals {
+                bytes: lit_acc.to_le_bytes(),
+                count: (lit_count - 1) as u8,
+            });
+            lit_acc = 0;
+            lit_count = 0;
+        }
+
+        if sym >= 262 {
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Match);
+            }
+            let length_idx = (sym - 262) as usize;
+            let length = slot_to_length_cursor(&mut cur, data, end, length_idx);
+            let distance = match decode_distance_cursor::<DIAGNOSTICS>(
+                &mut cur,
+                data,
+                end,
+                &tables.dc,
+                &tables.ldc,
+                extra_dist,
+                counters,
+            ) {
+                Ok(distance) => distance,
+                Err(error) => {
+                    reader.import_cursor(cur);
+                    return Err(error);
+                }
+            };
+            let length = adjust_length_for_distance(length, distance);
+            items.push(DecodedItem::Match {
+                length: length as u32,
+                distance: distance as u64,
+            });
+            continue;
+        }
+
+        if sym == 256 {
+            if DIAGNOSTICS {
+                counters.record_symbol(SymbolKind::Filter);
+            }
+            let (filter_type, block_start_delta, block_length, channels) =
+                read_filter_descriptor_cursor(&mut cur, data, end);
+            items.push(DecodedItem::Filter {
+                filter_type,
+                block_start_delta,
+                block_length,
+                channels,
+            });
+            continue;
+        }
+
+        if DIAGNOSTICS {
+            counters.record_symbol(SymbolKind::Repeat);
+        }
+        if sym == 257 {
+            items.push(DecodedItem::RepeatPrev);
+            continue;
+        }
+
+        let cache_idx = (sym - 258) as u8;
+        let (slot, quick) = tables.rc.decode_cursor(&mut cur, data, end);
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
+        }
+        let length = slot_to_length_cursor(&mut cur, data, end, slot as usize);
+        items.push(DecodedItem::CacheRef {
+            cache_idx,
+            length: length as u32,
+        });
+    }
+
+    if lit_count > 0 {
+        items.push(DecodedItem::Literals {
+            bytes: lit_acc.to_le_bytes(),
+            count: (lit_count - 1) as u8,
+        });
+    }
+
+    reader.import_cursor(cur);
+    DecodeBits::validate_end(reader, block_end_bits)
+}
+
+// ─── Cursor forms of the decode helpers ──────────────────────────────────────
+//
+// One per `R: DecodeBits` helper the fast loop needs, `#[inline(always)]` so
+// the cursor never has to take an address the compiler must respect. Each is
+// the generic body verbatim with `reader.read_bits(n)?` replaced by the
+// infallible `block_reader::cursor_read_bits` — a bounded reader's reads cannot
+// fail, which is why only `decode_distance_cursor` still returns a result.
+// Keep each in lockstep with the generic function it names.
+
+/// Cursor form of [`slot_to_length`].
+#[inline(always)]
+fn slot_to_length_cursor(cur: &mut BitCursor, data: &[u8], end: usize, slot: usize) -> usize {
+    debug_assert!(slot < NUM_LENGTH_SLOTS, "length slot out of range: {slot}");
+    let (base, extra_bits) = if slot < 8 {
+        (2 + slot, 0)
+    } else {
+        let lbits = slot / 4 - 1;
+        (2 + ((4 | (slot & 3)) << lbits), lbits)
+    };
+    let extra_val = if extra_bits > 0 {
+        // `slot < NUM_LENGTH_SLOTS` bounds `extra_bits` at 9, so the generic
+        // helper's `as u32` narrowing of the read is a no-op here.
+        block_reader::cursor_read_bits(cur, data, end, extra_bits as u8) as usize
+    } else {
+        0
+    };
+    base + extra_val
+}
+
+/// Cursor form of [`decode_distance`].
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_distance_cursor<const DIAGNOSTICS: bool>(
+    cur: &mut BitCursor,
+    data: &[u8],
+    end: usize,
+    dc: &HuffmanTable,
+    ldc: &HuffmanTable,
+    extra_dist: bool,
+    counters: &mut WorkerCounters,
+) -> RarResult<usize> {
+    let (dist_code, quick) = dc.decode_cursor(cur, data, end);
+    if DIAGNOSTICS {
+        if quick {
+            counters.record_quick_huffman_hit();
+        } else {
+            counters.record_slow_huffman_hit();
+        }
+    }
+    let dist_code = dist_code as usize;
+    debug_assert!(
+        dist_code <= if extra_dist { 79 } else { 63 },
+        "distance code out of range: {dist_code}"
+    );
+
+    if dist_code < 4 {
+        return Ok(dist_code + 1);
+    }
+
+    let num_bits = (dist_code >> 1) - 1;
+    let distance = if num_bits >= 4 {
+        let high = if num_bits > 4 {
+            block_reader::cursor_read_bits(cur, data, end, (num_bits - 4) as u8) << 4
+        } else {
+            0
+        };
+        let (low, quick) = ldc.decode_cursor(cur, data, end);
+        if DIAGNOSTICS {
+            if quick {
+                counters.record_quick_huffman_hit();
+            } else {
+                counters.record_slow_huffman_hit();
+            }
+        }
+        let low = u64::from(low);
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, high, low)?
+    } else {
+        let extra = block_reader::cursor_read_bits(cur, data, end, num_bits as u8);
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, extra, 0)?
+    };
+
+    Ok(distance)
+}
+
+/// Cursor form of [`read_filter_descriptor`].
+#[inline(always)]
+fn read_filter_descriptor_cursor(
+    cur: &mut BitCursor,
+    data: &[u8],
+    end: usize,
+) -> (u8, u64, u32, u8) {
+    let block_start_delta = read_filter_data_cursor(cur, data, end) as u64;
+    let mut block_length = read_filter_data_cursor(cur, data, end);
+    let filter_code = block_reader::cursor_read_bits(cur, data, end, 3) as u8;
+
+    if block_length > MAX_FILTER_BLOCK_SIZE {
+        block_length = 0;
+    }
+
+    let channels = if filter_code == 0 {
+        (block_reader::cursor_read_bits(cur, data, end, 5) as u32 + 1) as u8
+    } else {
+        0
+    };
+
+    (filter_code, block_start_delta, block_length, channels)
+}
+
+/// Cursor form of [`read_filter_data`].
+#[inline(always)]
+fn read_filter_data_cursor(cur: &mut BitCursor, data: &[u8], end: usize) -> u32 {
+    let byte_count = block_reader::cursor_read_bits(cur, data, end, 2) as usize + 1;
+    let mut value = 0u32;
+    for index in 0..byte_count {
+        value |= (block_reader::cursor_read_bits(cur, data, end, 8) as u32) << (index * 8);
+    }
+    value
 }
 
 /// Read a filter descriptor from the bitstream (sym 256 handler).
@@ -1067,11 +1348,10 @@ fn build_assignments(
         });
         cursor = assignment_end;
     }
-    // One job per block is the densest plan any path produces, so the round's
-    // block capacity — not the worker count — is the bound on job count.
-    if assignments.len() > batch_plan::capacity(worker_count) {
+    // Every path chunks contiguous runs, at most one assignment per worker.
+    if assignments.len() > worker_count {
         return Err(RarError::CorruptArchive {
-            detail: "RAR5 parallel controller exceeded its round capacity".into(),
+            detail: "RAR5 parallel controller exceeded its worker pool".into(),
         });
     }
     Ok(())
@@ -1256,11 +1536,11 @@ fn plan_batch_dispatch(
 
 /// Spawn one batch's worker assignments into an already-open rayon scope.
 ///
-/// A round of independent blocks spawns one job per block, so there are
-/// routinely more jobs here than pool threads. That is the point: the extra
-/// jobs sit in the deques for whichever thread frees up first, which is what
-/// keeps a fast core from finishing its share and then waiting on a slow one.
-/// The cost is one boxed closure per block.
+/// A round spawns at most one job per worker, each covering a contiguous
+/// ≤2-block run. Chunked runs keep per-worker table scratch warm and staged
+/// input reads sequential; the finer one-job-per-block plan was measured to
+/// inflate per-block decode time ~35-42% for identical work with no idle-slot
+/// benefit.
 ///
 /// Deliberately borrows no decoder state: the pipelined controller calls this
 /// from inside a scope whose calling thread immediately goes on to run
@@ -2530,22 +2810,23 @@ mod tests {
     }
 
     #[test]
-    fn static_assignments_spawn_one_job_per_independent_block() {
+    fn static_assignments_pack_two_independent_blocks() {
         let blocks = vec![
             test_block(0, 1, true),
             test_block(1, 1, true),
             test_block(2, 1, true),
             test_block(3, 1, true),
         ];
-        // Two workers, four independent blocks: four jobs, not two pairs, so a
-        // worker that finishes first takes the next block instead of idling.
+        // Two workers, four independent blocks: two contiguous pairs. Each
+        // worker decodes a warm sequential run; measured, that locality beats
+        // finer-grained stealing on every profiled workload.
         let assignments = plan_assignments(&blocks, 0, 4, 2).unwrap();
         assert_eq!(
             assignments
                 .iter()
                 .map(|assignment| (assignment.start, assignment.end))
                 .collect::<Vec<_>>(),
-            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+            vec![(0, 2), (2, 4)]
         );
         assert!(
             assignments
@@ -2554,21 +2835,22 @@ mod tests {
         );
     }
 
-    /// The independent fast path spawns per block, and a round still never
-    /// covers more than [`batch_plan::capacity`] blocks.
+    /// The uniform fast paths chunk a full round into one contiguous run per
+    /// worker, and a round never covers more than [`batch_plan::capacity`]
+    /// blocks.
     #[test]
-    fn independent_assignments_are_single_blocks_capped_at_round_capacity() {
+    fn independent_assignments_are_chunked_runs_capped_at_round_capacity() {
         for worker_count in 2..=MAX_PARALLEL_THREADS {
             let capacity = batch_plan::capacity(worker_count);
             for table_present in [true, false] {
                 let blocks = vec![test_block(0, 1, table_present); capacity];
 
                 let assignments = plan_assignments(&blocks, 0, capacity, worker_count).unwrap();
-                assert_eq!(assignments.len(), capacity, "workers {worker_count}");
+                assert_eq!(assignments.len(), worker_count, "workers {worker_count}");
                 assert!(
                     assignments
                         .iter()
-                        .all(|assignment| assignment.end - assignment.start == 1)
+                        .all(|assignment| assignment.end - assignment.start <= 2)
                 );
                 assert!(
                     assignments
@@ -2612,14 +2894,14 @@ mod tests {
         assert_eq!(next_controller_batch_end(&blocks, 0, blocks.len(), 4), 0);
         assert_eq!(next_controller_batch_end(&blocks, 1, blocks.len(), 4), 7);
 
-        // Every block in the suffix inherits the same installed set, so each
-        // one is its own job.
+        // The six-block suffix shares the installed set and splits into
+        // contiguous ≤2-block runs, one per worker at most.
         let assignments = plan_assignments(&blocks, 1, 7, 4).unwrap();
-        assert_eq!(assignments.len(), 6);
+        assert_eq!(assignments.len(), 3);
         assert!(
             assignments
                 .iter()
-                .all(|assignment| assignment.end - assignment.start == 1)
+                .all(|assignment| assignment.end - assignment.start <= 2)
         );
         assert!(assignments.iter().all(|assignment| {
             blocks[assignment.start..assignment.end]
@@ -2751,6 +3033,184 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, RarError::CorruptArchive { .. }));
         assert_eq!(fast_reader_selection_count(), 4);
+    }
+
+    fn differential_xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ItemShape {
+        Literals(Vec<u8>),
+        Match(u32, u64),
+        RepeatPrev,
+        CacheRef(u8, u32),
+        Filter(u8, u64, u32, u8),
+    }
+
+    /// A decoded item reduced to everything the apply phase can observe.
+    ///
+    /// Only `count + 1` of a `Literals` item's eight bytes are ever consumed:
+    /// `put_literal_batch` byte-indexes `bytes[..n]` with `n <= count + 1`, and
+    /// hands the whole array to `from_ne_bytes` only for a full batch, where
+    /// all eight are live. The generic loop's `[u8; 8]` staging leaves the
+    /// bytes above that live prefix holding whatever the previous full batch
+    /// wrote; the fast loop's accumulator zeroes them. Comparing the live
+    /// prefix compares the item's entire observable content.
+    fn item_shape(item: &DecodedItem) -> ItemShape {
+        match *item {
+            DecodedItem::Literals { bytes, count } => {
+                ItemShape::Literals(bytes[..=count as usize].to_vec())
+            }
+            DecodedItem::Match { length, distance } => ItemShape::Match(length, distance),
+            DecodedItem::RepeatPrev => ItemShape::RepeatPrev,
+            DecodedItem::CacheRef { cache_idx, length } => ItemShape::CacheRef(cache_idx, length),
+            DecodedItem::Filter {
+                filter_type,
+                block_start_delta,
+                block_length,
+                channels,
+            } => ItemShape::Filter(filter_type, block_start_delta, block_length, channels),
+        }
+    }
+
+    /// The register-cursor fast loop and the checked `BitReader` fallback must
+    /// decode the same bits into the same items.
+    ///
+    /// Randomized payloads over the uniform RAR7 tables give a realistic mix:
+    /// mostly literals — so batches flush both at eight and at a run break —
+    /// plus matches with length and distance extra bits, low-distance codes,
+    /// cache references, repeats and the occasional filter descriptor.
+    #[test]
+    fn fast_cursor_and_checked_paths_decode_identical_items() {
+        const BLOCKS: usize = 8;
+        const BLOCK_BYTES: usize = 256;
+        /// Block payload plus a zeroed gap wide enough to be a full guard.
+        const STRIDE: usize = BLOCK_BYTES + LOOKAHEAD_BYTES;
+
+        let tables = rar7_tables();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        // Random block payloads separated by zeroed gaps, so everything either
+        // engine can reach past a block's logical end is the same zero run
+        // whichever guard it was given.
+        let mut stream = vec![0u8; BLOCKS * STRIDE + LOOKAHEAD_BYTES];
+        for block in 0..BLOCKS {
+            for byte in 0..BLOCK_BYTES {
+                stream[block * STRIDE + byte] = (differential_xorshift(&mut state) >> 29) as u8;
+            }
+        }
+
+        let mut total_items = 0usize;
+        let mut matches = 0usize;
+        let mut non_literals = 0usize;
+
+        for index in 0..BLOCKS {
+            let bit_remainder = index % 8;
+            let payload_bit_offset = index * STRIDE * 8 + bit_remainder;
+
+            // Walk the logical end down to the largest symbol boundary these
+            // bits actually produce. Any other end leaves the final symbol
+            // straddling the border, which both engines reject — and then they
+            // agree only on failing, which proves much less.
+            let mut payload_bits = BLOCK_BYTES * 8 - bit_remainder;
+            let mut block = test_block(payload_bit_offset, payload_bits, false);
+            let mut items = Vec::new();
+            while decode_block_symbols(&stream, &block, &tables, true, &mut items).is_err() {
+                assert!(
+                    payload_bits > BLOCK_BYTES * 4,
+                    "block {index} never landed on a symbol boundary"
+                );
+                payload_bits -= 1;
+                block = test_block(payload_bit_offset, payload_bits, false);
+                items.clear();
+            }
+
+            reset_fast_reader_selection_count();
+            let mut fast = Vec::new();
+            decode_block_symbols(&stream, &block, &tables, true, &mut fast).unwrap();
+            assert_eq!(
+                fast_reader_selection_count(),
+                1,
+                "block {index} never reached the fast reader"
+            );
+            assert_eq!(padded_reader_selection_count(), 0);
+
+            // One byte short of the fast reader's lookahead contract, so its
+            // constructor refuses the block; `is_large` then suppresses the
+            // padded restage, which is the only route to the checked reader.
+            // The checked reader still has 31 readable bytes past the block —
+            // far more than the ~100 bits a single symbol can span — and they
+            // hold the same content as the fast reader's guard.
+            let block_end_bits = bit_remainder + payload_bits;
+            let byte_offset = payload_bit_offset / 8;
+            let guard_start = block_end_bits.div_ceil(8);
+            let truncated = &stream[..byte_offset + guard_start + LOOKAHEAD_BYTES - 1];
+            let checked_block = BlockInfo {
+                is_large: true,
+                ..block.clone()
+            };
+            reset_fast_reader_selection_count();
+            let mut checked = Vec::new();
+            decode_block_symbols(truncated, &checked_block, &tables, true, &mut checked).unwrap();
+            assert_eq!(
+                fast_reader_selection_count(),
+                0,
+                "block {index} stayed on the fast reader"
+            );
+            assert_eq!(padded_reader_selection_count(), 0);
+
+            let fast_shapes: Vec<ItemShape> = fast.iter().map(item_shape).collect();
+            let checked_shapes: Vec<ItemShape> = checked.iter().map(item_shape).collect();
+            assert_eq!(fast_shapes, checked_shapes, "block {index}");
+
+            // The diagnostics instantiation of the fast loop decodes the same
+            // items and counts one Huffman classification per decoded symbol.
+            let mut counters = WorkerCounters::new();
+            let mut padded = Vec::new();
+            let mut diagnostic = Vec::new();
+            decode_block_symbols_counted(
+                &stream,
+                &block,
+                &tables,
+                true,
+                true,
+                &mut diagnostic,
+                &mut counters,
+                &mut padded,
+            )
+            .unwrap();
+            assert_eq!(
+                diagnostic
+                    .iter()
+                    .map(item_shape)
+                    .collect::<Vec<ItemShape>>(),
+                fast_shapes,
+                "block {index} under diagnostics"
+            );
+
+            assert!(!fast.is_empty(), "block {index} decoded nothing");
+            total_items += fast.len();
+            for item in &fast {
+                match item {
+                    DecodedItem::Literals { .. } => {}
+                    DecodedItem::Match { .. } => {
+                        matches += 1;
+                        non_literals += 1;
+                    }
+                    _ => non_literals += 1,
+                }
+            }
+        }
+
+        assert!(total_items > 200, "only {total_items} items decoded");
+        assert!(matches > 0, "randomized stream produced no matches");
+        assert!(
+            non_literals > matches,
+            "randomized stream produced no repeats or cache references"
+        );
     }
 
     #[test]
