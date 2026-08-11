@@ -33,7 +33,7 @@
 
 #![cfg(not(target_family = "wasm"))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store};
@@ -72,14 +72,69 @@ fn reference_cbc_decrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     }
 }
 
-/// Is the wasm32-wasip1 target installed? If not, the harness self-skips.
-fn wasip1_target_installed() -> bool {
-    Command::new("rustc")
-        .args(["--print", "target-list"])
+/// Does this `rustc` actually have the `wasm32-wasip1` standard library?
+///
+/// `--print target-list` is NOT a usable probe: it lists every target rustc can
+/// name, installed or not, so it answers `true` even for a toolchain that
+/// cannot build a single wasm crate. The target libdir existing is the real
+/// signal.
+fn has_wasip1_std(rustc: &Path) -> bool {
+    Command::new(rustc)
+        .args(["--print", "target-libdir", "--target", "wasm32-wasip1"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-wasip1"))
-        .unwrap_or(false)
+        .filter(|out| out.status.success())
+        .is_some_and(|out| Path::new(String::from_utf8_lossy(&out.stdout).trim()).is_dir())
+}
+
+/// Resolve a `(cargo, rustc)` pair that can actually build `wasm32-wasip1`.
+///
+/// The ambient `cargo`/`rustc` are not necessarily the toolchain pinned by
+/// `rust-toolchain.toml`. A Homebrew `rust` install, for instance, puts real
+/// `cargo`/`rustc` binaries on PATH ahead of rustup's proxies; those carry no
+/// wasm std, and they are a *different build* of the same version number, so
+/// their artifacts cannot be mixed with rustup's (E0514). Candidates are tried
+/// in order: an explicit `RUSTC` override, the `rustc` beside the outer
+/// `CARGO`, whatever `rustup which rustc` resolves for this manifest (which
+/// honours `rust-toolchain.toml`), then PATH. The first one with a real wasm
+/// std wins, and the nested build is pinned to it via `RUSTC`/`RUSTDOC` plus
+/// its sibling `cargo`, so the harness passes regardless of PATH ordering.
+fn wasm_toolchain() -> Option<(PathBuf, PathBuf)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(rustc) = std::env::var_os("RUSTC") {
+        candidates.push(PathBuf::from(rustc));
+    }
+    if let Some(dir) = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .and_then(|cargo| cargo.parent().map(Path::to_path_buf))
+    {
+        candidates.push(dir.join("rustc"));
+    }
+    if let Some(out) = Command::new("rustup")
+        .args(["which", "rustc"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+    {
+        candidates.push(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+    }
+    candidates.push(PathBuf::from("rustc"));
+
+    let rustc = candidates.into_iter().find(|rustc| has_wasip1_std(rustc))?;
+    let cargo = rustc
+        .parent()
+        .map(|dir| dir.join("cargo"))
+        .filter(|cargo| cargo.is_file())
+        .or_else(|| std::env::var_os("CARGO").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("cargo"));
+    Some((cargo, rustc))
+}
+
+/// Is a wasm32-wasip1-capable toolchain reachable? If not, the harness
+/// self-skips.
+fn wasip1_target_installed() -> bool {
+    wasm_toolchain().is_some()
 }
 
 /// Build the conformance example for wasm32-wasip1 with `crypto-host,crc-host`
@@ -89,16 +144,22 @@ fn build_conformance_wasm() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let target_dir =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm-host-conformance-target");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let (cargo, rustc) =
+        wasm_toolchain().expect("no toolchain with a wasm32-wasip1 std (checked by the caller)");
 
     let status = Command::new(&cargo)
         .current_dir(&manifest_dir)
         .env("CARGO_TARGET_DIR", &target_dir)
+        // Pin the nested build to the resolved wasm-capable toolchain instead of
+        // letting cargo pick whichever `rustc` happens to be first on PATH.
+        .env("RUSTC", &rustc)
+        .env("RUSTDOC", rustc.with_file_name("rustdoc"))
         // Do not inherit the outer test's RUSTFLAGS; set the simd128 feature the
         // wasm crypto/BLAKE2sp paths expect (matches the example's build docs).
         .env("RUSTFLAGS", "-C target-feature=+simd128")
         .args([
             "build",
+            "--locked",
             "--release",
             "-p",
             "unrar-rs",
