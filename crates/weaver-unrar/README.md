@@ -72,7 +72,7 @@ than adding it.
 
 ## Performance
 
-### rarpar 0.3.0 release validation
+### rarpar release validation
 
 These deterministic end-to-end runs use the synthetic `rarpar-bench` corpus,
 one warmup, seven measured runs, CPU-only release builds, and SHA-256 output
@@ -80,11 +80,11 @@ validation. They include CLI discovery and output handling as well as archive
 extraction, so they are release-workflow measurements rather than isolated
 decoder microbenchmarks.
 
-![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
+![RAR workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/rarpar-v0.3.0/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
+![RAR workloads on Apple M5 Max with macOS arm64](docs/rarpar-rar-benchmark-macos-arm64.svg)
 
 ### Broader library workloads
 
@@ -94,9 +94,7 @@ byte-compared against the source payload. Warm-cache medians from release builds
 with shipped flags. Test machines: Apple M5 Max (macOS), Intel Core Ultra 9 285H
 (Ubuntu 24.04, P-core pinned), AMD Ryzen 5 3600 (Windows, Zen 2).
 
-![unrar-rs relative speed against unrar 7.20, by workload and machine](https://raw.githubusercontent.com/scryer-media/rarpar/948edda929dcb4b4d48af91ff58eeefb099afc4d/docs/img/unrar-benchmark.svg)
-
-Absolute times behind the chart:
+Absolute times for the broader workload set:
 
 | Machine | Workload | unrar 7.20 | unrar-rs | |
 |---|---|---:|---:|---|

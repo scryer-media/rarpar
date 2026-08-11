@@ -27,28 +27,25 @@
 //! # The kernels
 //!
 //! [`gf_simd`] holds the multiply-accumulate routines that do the actual work —
-//! [`mul_acc_region`](gf_simd::mul_acc_region) for a single region, and
-//! [`mul_acc_multi_region`](gf_simd::mul_acc_multi_region) for the many-input
-//! shape a repair pass generates.
+//! [`mul_acc_region`](gf_simd::mul_acc_region) for one source and destination,
+//! [`mul_acc_multi_region`](gf_simd::mul_acc_multi_region) for one source and
+//! multiple destinations, and [`mul_acc_input_batch`](gf_simd::mul_acc_input_batch)
+//! for multiple sources and one destination.
 //!
-//! Tier selection happens at **runtime**, from the CPU's actual features rather
-//! than from compile-time targets. One binary therefore runs the best kernel
-//! available on whatever machine it lands on, instead of being pinned to the
-//! machine that built it — which matters when the same artifact ships to a NAS
-//! and to a modern server.
+//! CPU dispatch is target-specific. x86-64 builds detect supported instructions
+//! at runtime and select among the implemented kernels. AArch64 builds use NEON,
+//! while WebAssembly SIMD is selected through compile-time target features.
 //!
 //! RAR-specific coders live in their own modules, deliberately kept apart so
 //! PAR2 matrix semantics stay unchanged.
 //!
 //! # Feature flags
 //!
-//! - `metal`: opt-in native Apple-GPU kernels for repair and PAR2 creation
-//!   adapters on Apple Silicon.
-//! - `wgpu`: cross-platform GPU repair.
+//! - `metal`: opt-in native Apple-GPU GF(2¹⁶) sessions on Apple Silicon macOS.
+//! - `wgpu`: opt-in GF(2¹⁶) sessions on suitable `wgpu` adapters.
 //!
-//! Native repair selection falls back to CPU whenever a suitable device or
-//! driver is unavailable. PAR2 creation adapters surface Metal admission to
-//! their caller, which applies the requested creation policy.
+//! Session admission can fail because of workload size, configuration, device,
+//! shape, or allocation constraints. Callers decide whether to remain on CPU.
 //!
 pub mod gf;
 pub mod gf_pmul;

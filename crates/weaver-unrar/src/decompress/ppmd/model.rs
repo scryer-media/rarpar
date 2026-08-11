@@ -24,6 +24,10 @@ fn ppmd_debug_enabled() -> bool {
 
 const MAX_ORDER: usize = 64;
 const MAX_FREQ: u8 = 124;
+
+/// `StartSubAllocator(1)` in `ModelPPM::CleanUp` (model.cpp:565) — one
+/// megabyte, the smallest arena the RAR PPMd allocator is started with.
+const CLEANUP_ALLOC_SIZE: usize = 1024 * 1024;
 const BIN_SCALE: u32 = 1 << 14; // 16384
 const INTERVAL: u16 = 1 << 7; // 128
 
@@ -75,54 +79,6 @@ const fn unmasked_state_symbol(packed: u32) -> u8 {
 #[inline(always)]
 const fn unmasked_state_frequency(packed: u32) -> u8 {
     (packed >> 16) as u8
-}
-
-#[cfg(all(target_arch = "x86_64", not(miri)))]
-#[target_feature(enable = "ssse3")]
-#[inline]
-unsafe fn collect_unmasked_states_ssse3(
-    alloc: &SubAllocator,
-    states_span: ValidatedArenaSpan,
-    ns: usize,
-    char_mask: &[u8; 256],
-    esc_count: u8,
-    scratch: &mut [u32],
-) -> Option<u32> {
-    let mut hi_cnt = 0u32;
-    let mut state_index = 0usize;
-    let mut scratch_index = 0usize;
-    while state_index + 8 <= ns && scratch_index < scratch.len() {
-        // SAFETY: this function requires SSSE3 and the validated state span
-        // covers the complete batch.
-        let heads =
-            unsafe { alloc.span_read_state_heads8_ssse3(states_span, state_index * STATE_SIZE) };
-        for (lane, head) in heads.into_iter().enumerate() {
-            let sym = head as u8;
-            if char_mask[sym as usize] != esc_count {
-                hi_cnt += (head >> 8) as u32;
-                scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
-                scratch_index += 1;
-                if scratch_index == scratch.len() {
-                    break;
-                }
-            }
-        }
-        state_index += 8;
-    }
-    while scratch_index < scratch.len() {
-        if state_index >= ns {
-            return None;
-        }
-        let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-        let sym = head as u8;
-        if char_mask[sym as usize] != esc_count {
-            hi_cnt += (head >> 8) as u32;
-            scratch[scratch_index] = pack_unmasked_state(state_index, head);
-            scratch_index += 1;
-        }
-        state_index += 1;
-    }
-    Some(hi_cnt)
 }
 
 /// PPMd variant H model.
@@ -254,6 +210,18 @@ impl Model {
         model
     }
 
+    /// Address of the model arena; see [`SubAllocator::arena_addr`].
+    #[cfg(test)]
+    pub fn arena_addr(&self) -> usize {
+        self.alloc.arena_addr()
+    }
+
+    /// Byte size the arena was last started with.
+    #[cfg(test)]
+    pub fn arena_size(&self) -> usize {
+        self.alloc.allocated_size()
+    }
+
     pub fn start(&mut self, max_order: usize, alloc_size: usize) {
         let max_order = max_order.clamp(2, MAX_ORDER);
         let alloc_size = alloc_size.max(UNIT_SIZE * 8);
@@ -265,6 +233,17 @@ impl Model {
         self.model_fault = false;
         self.restart();
         self.build_lookup_tables();
+    }
+
+    /// Reset possibly corrupt PPM structures so processing can safely resume.
+    ///
+    /// Mirrors `ModelPPM::CleanUp` (model.cpp:563-568): stop the sub-allocator,
+    /// re-start it at 1 MB and restart the model at order 2. [`Self::start`]
+    /// reuses an arena that is already the requested size, but
+    /// `SubAllocator::reset` re-initializes all of its bookkeeping, so the
+    /// resulting state matches the oracle's freshly allocated heap.
+    pub fn cleanup(&mut self) {
+        self.start(2, CLEANUP_ALLOC_SIZE);
     }
 
     fn build_lookup_tables(&mut self) {
@@ -957,12 +936,17 @@ impl Model {
             self.found_state = stats;
             *found_span = Some(states_span.subspan(0, STATE_SIZE));
 
-            let new_freq = (p0_freq + 4) as u8;
+            // model.cpp:420-423 stores the wrapped byte into `Freq` but keeps
+            // comparing the un-truncated `int HiCnt` against MAX_FREQ, so a
+            // corrupt state with `Freq >= 252` still rescales.
+            let raised_freq = p0_freq + 4;
+            let new_freq = raised_freq as u8;
+            let needs_rescale = raised_freq > MAX_FREQ as u32;
             self.span_set_state_freq(states_span, 0, new_freq);
             self.span_set_ctx_summ_freq(context_span, (sum_freq + 4) as u16);
 
-            let model_valid = new_freq <= MAX_FREQ || self.rescale(ctx);
-            if new_freq > MAX_FREQ {
+            let model_valid = !needs_rescale || self.rescale(ctx);
+            if needs_rescale {
                 *found_span = self.validated_state(self.found_state);
             }
             rc.decode(0, p0_freq, sum_freq);
@@ -1171,7 +1155,11 @@ impl Model {
 
         // makeEscFreq2
         let suffix_ns = suffix_data.map_or(0, |(_, head)| (head >> 32) as u16 as u32);
-        if ns != 256 && (suffix_ns < ns || suffix_ns > 256) {
+        // `Suffix->NumStats-NumStats` in model.cpp:474 is signed int arithmetic:
+        // a suffix with fewer stats than this context is not a fault, it just
+        // makes `Diff < Suffix->NumStats-NumStats` false. Only an out-of-range
+        // stat count is rejected.
+        if ns != 256 && suffix_ns > 256 {
             self.model_fault = true;
             return false;
         }
@@ -1184,8 +1172,6 @@ impl Model {
         // every escape decode.
         let mut hi_cnt = 0u32;
         let esc_count = self.esc_count;
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
-        let use_ssse3_state_batches = self.use_ssse3_state_batches;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
         let scratch = &mut self.unmasked_scratch[..n];
@@ -1224,44 +1210,11 @@ impl Model {
             }
         }
 
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
-        if use_ssse3_state_batches {
-            // SAFETY: SSSE3 support was detected once when the model was created.
-            let Some(total) = (unsafe {
-                collect_unmasked_states_ssse3(
-                    alloc,
-                    states_span,
-                    ns as usize,
-                    char_mask,
-                    esc_count,
-                    scratch,
-                )
-            }) else {
-                return false;
-            };
-            hi_cnt = total;
-        } else {
-            let mut state_index = 0usize;
-            for slot in scratch.iter_mut() {
-                let head = loop {
-                    if state_index >= ns as usize {
-                        return false;
-                    }
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        break head;
-                    }
-                    state_index += 1;
-                };
-
-                hi_cnt += (head >> 8) as u32;
-                *slot = pack_unmasked_state(state_index, head);
-                state_index += 1;
-            }
-        }
-
-        #[cfg(any(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")), miri))]
+        // Every target except NEON aarch64 walks the states one at a time. A
+        // pshufb gather feeding a scalar per-lane test measured as pure
+        // instruction bloat on x86-64 (more work per state than this loop),
+        // so x86-64 shares the plain scalar shape the oracle uses.
+        #[cfg(any(not(target_arch = "aarch64"), miri))]
         {
             let mut state_index = 0usize;
             for slot in scratch.iter_mut() {
@@ -1377,11 +1330,16 @@ impl Model {
         let ns = (context_head >> 32) as u16 as u32;
         if ns != 256 {
             debug_assert!((1..=256).contains(&diff));
-            debug_assert!(suffix_ns >= ns);
             let sf = (context_head >> 48) as u16 as u32;
             let idx0 = self.ns2_indx[diff as usize - 1] as usize;
-            let idx1 = (if diff < suffix_ns - ns { 1 } else { 0 })
-                + (if sf < 11 * ns { 2 } else { 0 })
+            // Signed, like model.cpp:474 — `suffix_ns < ns` yields a negative
+            // right-hand side and the comparison is simply false.
+            let suffix_excess = i64::from(suffix_ns) - i64::from(ns);
+            let idx1 = (if i64::from(diff) < suffix_excess {
+                1
+            } else {
+                0
+            }) + (if sf < 11 * ns { 2 } else { 0 })
                 + (if self.num_masked > diff { 4 } else { 0 })
                 + self.hi_bits_flag as usize;
             let see_ctx = self.see.get(idx0, idx1);
@@ -2208,6 +2166,21 @@ impl Model {
         (index..ns).find(|&state_index| self.span_state_sym(states_span, state_index) == sym)
     }
 
+    /// Vector symbol search over whole eight-state batches.
+    ///
+    /// `span_read_state_syms8_ssse3` puts the batch's symbols in lanes 0..8 in
+    /// state order and zeroes lanes 8..16, so comparing against a broadcast of
+    /// the wanted symbol and taking the byte mask gives one bit per state, in
+    /// scan order, in bits 0..8. Bits 8..16 can only be set when `sym == 0`
+    /// (the zeroed upper lanes match), and masking with `0xff` drops them, so
+    /// the lowest set bit is always the first matching state — the same state
+    /// the scalar scan below would return.
+    ///
+    /// The batch threshold stays at "eight states remaining": the broadcast and
+    /// the three shuffle constants hoist out of the loop, leaving about twelve
+    /// instructions per eight states against roughly four per state (and eight
+    /// unpredictable branches) in the scalar scan, so a single full batch
+    /// already pays for the setup.
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     #[target_feature(enable = "ssse3")]
     #[inline]
@@ -2218,15 +2191,20 @@ impl Model {
         ns: usize,
         sym: u8,
     ) -> Option<usize> {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_movemask_epi8, _mm_set1_epi8};
+
+        let wanted = _mm_set1_epi8(sym as i8);
         while index + 8 <= ns {
             // SAFETY: this function requires SSSE3 and the validated span covers
             // the complete state batch.
-            let heads = unsafe {
-                self.alloc
-                    .span_read_state_heads8_ssse3(states_span, index * STATE_SIZE)
-            };
-            if let Some(lane) = heads.iter().position(|&head| head as u8 == sym) {
-                return Some(index + lane);
+            let matches = unsafe {
+                let syms = self
+                    .alloc
+                    .span_read_state_syms8_ssse3(states_span, index * STATE_SIZE);
+                _mm_movemask_epi8(_mm_cmpeq_epi8(syms, wanted))
+            } & 0xff;
+            if matches != 0 {
+                return Some(index + matches.trailing_zeros() as usize);
             }
             index += 8;
         }
@@ -2256,6 +2234,44 @@ mod tests {
         let mut model = Model::new(6, 1024 * 1024);
         model.restart();
         assert_ne!(model.min_context, 0);
+    }
+
+    #[test]
+    fn cleanup_restarts_at_the_oracle_minimum_allocation_and_order() {
+        let mut model = Model::new(16, 4 * 1024 * 1024);
+        assert_eq!(model.alloc.allocated_size(), 4 * 1024 * 1024);
+        model.model_fault = true;
+        model.esc_count = 7;
+
+        model.cleanup();
+
+        // ModelPPM::CleanUp — StartSubAllocator(1) + StartModelRare(2).
+        assert_eq!(model.alloc.allocated_size(), CLEANUP_ALLOC_SIZE);
+        assert_eq!(model.max_order, 2);
+        assert_eq!(model.esc_count, 1);
+        assert!(!model.model_fault);
+        assert_ne!(model.min_context, 0);
+        assert_ne!(model.max_context, 0);
+    }
+
+    #[test]
+    fn see_index_tolerates_a_suffix_with_fewer_stats_like_rar_behavior() {
+        let mut model = Model::new(6, 1024 * 1024);
+        model.num_masked = 0;
+        model.hi_bits_flag = 0;
+        // ns is packed in bits 32..48 of the context head, SummFreq in 48..64.
+        let context_head = (4u64 << 32) | (1u64 << 48);
+        let diff = 2u32;
+
+        // `Suffix->NumStats-NumStats` is signed in model.cpp:474, so a suffix
+        // with fewer stats makes the comparison false instead of underflowing.
+        let (_, small_suffix) = model.make_esc_freq2(context_head, 1, diff);
+        let (_, large_suffix) = model.make_esc_freq2(context_head, 200, diff);
+
+        let idx0 = model.ns2_indx[diff as usize - 1] as usize;
+        // sf(1) < 11*ns(4) contributes 2 in both cases; only the first term moves.
+        assert_eq!(small_suffix, Some((idx0, 2)));
+        assert_eq!(large_suffix, Some((idx0, 3)));
     }
 
     #[test]
@@ -2347,6 +2363,90 @@ mod tests {
         assert_eq!(unmasked_state_index(last), 255);
         assert_eq!(unmasked_state_symbol(last), 255);
         assert_eq!(unmasked_state_frequency(last), 1);
+    }
+
+    #[test]
+    fn span_find_state_from_matches_the_scalar_scan_for_every_batch_shape() {
+        // The vector searches compare eight states at a time, so the shapes
+        // that matter are every `ns` across the batch boundary, every start
+        // offset within a batch, a match at every index, and duplicate symbols
+        // (first match must win). Symbol zero is called out separately: it is
+        // the only value that can alias the zeroed upper lanes of the x86-64
+        // symbol gather.
+        fn assert_find_agrees_with_scan(model: &Model, span: ValidatedArenaSpan, syms: &[u8]) {
+            let ns = syms.len();
+            for start in 0..=ns {
+                for target in [0u8, 1, 7, 200, 255] {
+                    let expected = (start..ns).find(|&index| syms[index] == target);
+                    assert_eq!(
+                        model.span_find_state_from(span, start, ns, target),
+                        expected,
+                        "ns={ns} start={start} target={target} syms={syms:?}"
+                    );
+                }
+            }
+        }
+
+        fn assert_find_agrees_on_every_path(
+            model: &mut Model,
+            span: ValidatedArenaSpan,
+            syms: &[u8],
+        ) {
+            for (index, &sym) in syms.iter().enumerate() {
+                model.span_write_state(span, index, sym, 1, 0);
+            }
+            assert_find_agrees_with_scan(model, span, syms);
+
+            // Re-run the same oracle with the batch search disabled so the
+            // vector path and the scalar path are checked against each other.
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            {
+                let detected = std::mem::replace(&mut model.use_ssse3_state_batches, false);
+                assert_find_agrees_with_scan(model, span, syms);
+                model.use_ssse3_state_batches = detected;
+            }
+        }
+
+        let mut model = Model::new(6, 1024 * 1024);
+        let context_span = model.validated_context(model.min_context).unwrap();
+        let stats = model.span_ctx_stats(context_span);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+
+        for ns in 1..=24usize {
+            let span = model
+                .alloc
+                .validated_tail_span(stats, ns * STATE_SIZE)
+                .expect("the root stats block covers every tested state count");
+
+            // A single match walked across every index, for a normal symbol and
+            // for symbol zero.
+            for target in [0u8, 200] {
+                for hit in 0..ns {
+                    let syms = (0..ns)
+                        .map(|index| {
+                            if index == hit {
+                                target
+                            } else {
+                                100 + index as u8
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_find_agrees_on_every_path(&mut model, span, &syms);
+                }
+            }
+
+            // Randomized symbols over a four-value alphabet, so every array has
+            // duplicates and usually several matches per target.
+            for _ in 0..8 {
+                let syms = (0..ns)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        ((seed >> 33) % 4) as u8
+                    })
+                    .collect::<Vec<_>>();
+                assert_find_agrees_on_every_path(&mut model, span, &syms);
+            }
+        }
     }
 
     #[test]

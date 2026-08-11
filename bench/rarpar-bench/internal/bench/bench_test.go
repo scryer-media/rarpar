@@ -81,6 +81,47 @@ func TestCandidateArgumentsCarryPAR2PlacementPolicy(t *testing.T) {
 	}
 }
 
+func TestPAR2GenerationArgumentsUseMatchedInputs(t *testing.T) {
+	stage := t.TempDir()
+	for _, name := range []string{"release.part01.rar", "release.part02.rar"} {
+		if err := os.WriteFile(filepath.Join(stage, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := CorpusCaseManifest{Config: CaseConfig{
+		Family:              "par2",
+		PAR2Operation:       "create",
+		PAR2SliceSize:       65_536,
+		PAR2RecoveryPercent: 20,
+	}}
+	candidate, err := candidateArguments(manifest, stage, "canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCandidate := []string{
+		"--quiet", "par", "create",
+		"--base-path", stage,
+		"--block-size", "65536",
+		"--recovery-percent", "20",
+		par2GenerationOutput,
+		"release.part01.rar", "release.part02.rar",
+	}
+	if got := strings.Join(candidate, "\x00"); got != strings.Join(wantCandidate, "\x00") {
+		t.Fatalf("candidate generation arguments = %q, want %q", candidate, wantCandidate)
+	}
+	reference, err := referencePAR2Arguments(manifest, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReference := []string{
+		"c", "-q", "-r20", "-s65536", par2GenerationOutput,
+		"release.part01.rar", "release.part02.rar",
+	}
+	if got := strings.Join(reference, "\x00"); got != strings.Join(wantReference, "\x00") {
+		t.Fatalf("reference generation arguments = %q, want %q", reference, wantReference)
+	}
+}
+
 func TestPayloadGenerationIsDeterministic(t *testing.T) {
 	first := filepath.Join(t.TempDir(), "first.bin")
 	second := filepath.Join(t.TempDir(), "second.bin")
@@ -124,11 +165,50 @@ func TestCorpusConfigRejectsMutatedCaseWithoutRecovery(t *testing.T) {
 	}
 }
 
+func TestCorpusConfigAllowsCleanPAR2GenerationWithoutParity(t *testing.T) {
+	config := validCorpusConfig()
+	config.Cases[0] = CaseConfig{
+		ID:                  "create",
+		Family:              "par2",
+		Writer:              "rarlab-5.00",
+		Format:              5,
+		PAR2Operation:       "create",
+		PAR2SliceSize:       65_536,
+		PAR2RecoveryPercent: 20,
+		Mutation:            "none",
+		Workload:            "PAR2 generation",
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("clean PAR2 generation was rejected: %v", err)
+	}
+	config.Cases[0].PAR2RecoveryPercent = 0
+	if err := config.Validate(); err == nil {
+		t.Fatal("PAR2 generation without an explicit recovery percent was accepted")
+	}
+	config.Cases[0].PAR2RecoveryPercent = 20
+	config.Cases[0].PAR2 = true
+	if err := config.Validate(); err == nil {
+		t.Fatal("PAR2 generation with pre-existing parity was accepted")
+	}
+}
+
 func TestCorpusConfigRejectsPPMdOutsideRAR4(t *testing.T) {
 	config := validCorpusConfig()
 	config.Cases[0].PPMd = true
 	if err := config.Validate(); err == nil {
 		t.Fatal("PPMd outside RAR4 was accepted")
+	}
+}
+
+func TestCorpusConfigRequiresEncryptionForEncryptedHeaders(t *testing.T) {
+	config := validCorpusConfig()
+	config.Cases[0].HeaderEncrypted = true
+	if err := config.Validate(); err == nil {
+		t.Fatal("header encryption without file encryption was accepted")
+	}
+	config.Cases[0].Encrypted = true
+	if err := config.Validate(); err != nil {
+		t.Fatalf("header encryption was rejected: %v", err)
 	}
 }
 
@@ -700,6 +780,8 @@ func validToolchainLock() ToolchainLock {
 			{ID: "rarlab-3.93", Image: "rar3", Platform: "linux/amd64", URL: "https://example.test/rar3", SHA256: digest, Binary: "rar_static"},
 			{ID: "rarlab-4.20", Image: "rar4", Platform: "linux/amd64", URL: "https://example.test/rar4", SHA256: digest, Binary: "rar_static"},
 			{ID: "rarlab-5.00", Image: "rar5", Platform: "linux/amd64", URL: "https://example.test/rar5", SHA256: digest, Binary: "rar"},
+			{ID: "rarlab-6.24", Image: "rar6", Platform: "linux/amd64", URL: "https://example.test/rar6", SHA256: digest, Binary: "rar"},
+			{ID: "rarlab-7.23", Image: "rar7", Platform: "linux/amd64", URL: "https://example.test/rar7", SHA256: digest, Binary: "rar"},
 		},
 		PAR2Generator: PAR2Generator{ID: "par2", Image: "par2", Platform: "linux/amd64", URL: "https://example.test/par2", SHA256: digest},
 	}

@@ -31,39 +31,29 @@ assert_eq!(gf::mul(0x89ab, gf::inv(0x89ab)), 1);
 ## Contents
 
 - `gf`: scalar GF(2¹⁶) arithmetic shared by PAR2 and RAR5.
-- `gf_simd`: multiply-accumulate kernels, `mul_acc_region` for one region and
-  `mul_acc_multi_region` for the many-input shape a repair pass generates.
+- `gf_simd`: multiply-accumulate kernels, including `mul_acc_region` for one
+  source and destination, `mul_acc_multi_region` for one source and multiple
+  destinations, and `mul_acc_input_batch` for multiple sources and one
+  destination.
 - RAR-specific coders in separate modules, kept apart so PAR2 matrix semantics
   stay unchanged.
 
-Kernel tier is selected at runtime from the host CPU's features rather than at
-compile time, so one binary runs the best available path on whatever machine it
-lands on.
+CPU dispatch is target-specific. x86-64 builds detect supported instructions at
+runtime and select among the implemented kernels. AArch64 builds use NEON,
+while WebAssembly SIMD is selected through compile-time target features.
 
 ## GPU backends
 
-Optional `metal` and `wgpu` features add GPU-accelerated repair. Both fall back
-to CPU when no suitable device or driver is available, so enabling a feature
-never prevents a build from running.
+Optional `metal` and `wgpu` features expose GPU GF(2¹⁶) session backends; this
+crate does not choose a repair workflow. The Metal backend is available only on
+Apple Silicon macOS. The `wgpu` backend uses a suitable adapter exposed by
+`wgpu`.
 
-Raw GF(2¹⁶) throughput on an Apple M5 Max is roughly **1.26 TB/s** on Metal
-against **62 GB/s** for the all-core NEON path, about 20×. At that rate PAR2
-repair on Apple Silicon becomes I/O-bound rather than compute-bound. The Metal
-path engages when `outputs × sources × region_bytes` reaches 256 MiB; below that
-the CPU path avoids GPU setup and upload overhead.
-
-Through [`par2-rs`], that translates into end-to-end repair of a 512 MB set with
-1,400 of 8,192 blocks missing in 4.10 s, against 8.96 s on the CPU path and
-78.1 s for `par2cmdline-turbo 1.4.0`.
-
-## Provenance
-
-The GF(2¹⁶) approach and much of the kernel design are heavily informed by
-[par2cmdline-turbo](https://github.com/animetosho/par2cmdline-turbo) and the
-[ParPar](https://github.com/animetosho/parpar) work it draws on, both by Anime
-Tosho, and by their ancestor
-[par2cmdline](https://github.com/Parchive/par2cmdline). par2cmdline-turbo is
-GPL-2.0-or-later.
+Automatic admission rejects workloads below 256 MiB of effective work and may
+also reject a session because of configuration, adapter, shape, or allocation
+constraints. Higher-level callers such as [`par2-rs`] can use that result to
+stay on CPU. The admission threshold is an implementation policy, not a
+performance guarantee.
 
 Versioned API and migration notes are in [CHANGELOG.md](CHANGELOG.md).
 

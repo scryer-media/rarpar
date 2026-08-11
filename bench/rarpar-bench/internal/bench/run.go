@@ -73,6 +73,15 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 		reference = &identity
 		referencePAR2 = &par2Identity
 	}
+	for _, planCase := range options.Plan.Cases {
+		manifest, loadErr := loadCase(options.CorpusRoot, planCase.ID, options.Plan.CorpusDigest)
+		if loadErr != nil {
+			return RunRecord{}, loadErr
+		}
+		if isPAR2Generation(manifest) && referencePAR2 == nil {
+			return RunRecord{}, fmt.Errorf("PAR2 generation benchmarking requires a reference PAR2 binary for output validation")
+		}
+	}
 	if err := ensureEmptyDir(options.Output); err != nil {
 		return RunRecord{}, err
 	}
@@ -209,7 +218,11 @@ func executeSubject(ctx context.Context, role, label, binary string, manifest Co
 	backend, fallback := backendFromLogs(options.Plan.Lane, string(stdout)+string(stderr))
 	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
-		err = validateBenchmarkOutput(stage, manifest)
+		if isPAR2Generation(manifest) {
+			err = validateGeneratedPAR2(ctx, options.ReferencePAR2, stage)
+		} else {
+			err = validateBenchmarkOutput(stage, manifest)
+		}
 		measurement.ValidationNanos = DurationNanos(time.Since(validationStart))
 	}
 	if err != nil {
@@ -245,7 +258,11 @@ func executeReference(ctx context.Context, reference BinaryIdentity, manifest Co
 	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, false, false, options.Perf)
 	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
-		err = validateBenchmarkOutput(stage, manifest)
+		if isPAR2Generation(manifest) {
+			err = validateGeneratedPAR2(ctx, options.ReferencePAR2, stage)
+		} else {
+			err = validateBenchmarkOutput(stage, manifest)
+		}
 		measurement.ValidationNanos = DurationNanos(time.Since(validationStart))
 	}
 	if err != nil {
@@ -341,6 +358,20 @@ func candidateArguments(manifest CorpusCaseManifest, stage, par2Placement string
 		}
 		return append(args, archive, filepath.Join(stage, "out")), nil
 	}
+	if isPAR2Generation(manifest) {
+		inputs, err := par2GenerationInputs(stage)
+		if err != nil {
+			return nil, err
+		}
+		return append([]string{
+			"--quiet",
+			"par", "create",
+			"--base-path", stage,
+			"--block-size", strconv.FormatInt(par2SliceSize(manifest.Config), 10),
+			"--recovery-percent", strconv.Itoa(manifest.Config.PAR2RecoveryPercent),
+			par2GenerationOutput,
+		}, inputs...), nil
+	}
 	if manifest.Config.Family == "par2" && manifest.Config.Mutation == "none" {
 		main, err := mainPAR2(stage)
 		if err != nil {
@@ -369,6 +400,19 @@ func referenceRARArguments(manifest CorpusCaseManifest, stage string) ([]string,
 }
 
 func referencePAR2Arguments(manifest CorpusCaseManifest, stage string) ([]string, error) {
+	if isPAR2Generation(manifest) {
+		inputs, err := par2GenerationInputs(stage)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{
+			"c", "-q",
+			fmt.Sprintf("-r%d", manifest.Config.PAR2RecoveryPercent),
+			fmt.Sprintf("-s%d", par2SliceSize(manifest.Config)),
+			par2GenerationOutput,
+		}
+		return append(args, inputs...), nil
+	}
 	main, err := mainPAR2(stage)
 	if err != nil {
 		return nil, err
@@ -446,7 +490,46 @@ func rarVolumes(stage string) ([]string, error) {
 }
 
 func requiresValidation(manifest CorpusCaseManifest) bool {
-	return manifest.Config.Family == "rar" || manifest.Config.Mutation != "none"
+	return manifest.Config.Family == "rar" || manifest.Config.Mutation != "none" || isPAR2Generation(manifest)
+}
+
+const par2GenerationOutput = "benchmark.par2"
+
+func isPAR2Generation(manifest CorpusCaseManifest) bool {
+	return manifest.Config.Family == "par2" && manifest.Config.PAR2Operation == "create"
+}
+
+func par2GenerationInputs(stage string) ([]string, error) {
+	archives, err := rarVolumes(stage)
+	if err != nil {
+		return nil, err
+	}
+	if len(archives) == 0 {
+		return nil, fmt.Errorf("PAR2 generation source contains no RAR volumes")
+	}
+	inputs := make([]string, len(archives))
+	for index, archive := range archives {
+		inputs[index] = filepath.Base(archive)
+	}
+	return inputs, nil
+}
+
+func validateGeneratedPAR2(ctx context.Context, referencePAR2, stage string) error {
+	output := filepath.Join(stage, par2GenerationOutput)
+	info, err := os.Stat(output)
+	if err != nil {
+		return fmt.Errorf("generated PAR2 file is missing: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return fmt.Errorf("generated PAR2 file is not a non-empty regular file")
+	}
+	command := exec.CommandContext(ctx, referencePAR2, "v", par2GenerationOutput)
+	command.Dir = stage
+	outputLog, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("oracle validation of generated PAR2 failed: %w\n%s", err, outputLog)
+	}
+	return nil
 }
 
 func validateBenchmarkOutput(stage string, manifest CorpusCaseManifest) error {

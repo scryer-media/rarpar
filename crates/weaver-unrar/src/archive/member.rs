@@ -23,6 +23,17 @@ const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// spans go straight to `write` and only the small ones (per-filter subranges)
 /// are coalesced.
 const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
+/// Input buffer for the volume-chained decode streams, the read-side twin of
+/// [`OUTPUT_WRITE_BUFFER_BYTES`] and deliberately smaller than the spans the
+/// decoders ask for (`StreamingBitReader` fills 512 KiB at a time on the RAR4
+/// and RAR5 single-thread paths; the RAR5 staged path reads up to 4 MiB).
+/// `BufReader` bypasses its buffer only when its buffer is empty *and* the
+/// request is at or above capacity, so the previous 1 MiB capacity memcpy'd
+/// every compressed byte of a 512 KiB request instead of reading straight into
+/// the decoder's buffer. At 256 KiB every decoder-sized request passes through,
+/// while short reads — notably the shrinking tail of the RAR5 staged refill
+/// loop — stay buffered.
+const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
 #[cfg(any(windows, test))]
@@ -3555,6 +3566,25 @@ impl RarArchive {
         Ok(())
     }
 
+    /// The effective solid flag for one member.
+    ///
+    /// RAR4 headers already carry the **per-file** value: `parse.rs`'s
+    /// `rar4_effective_solid` folds the archive-level flag in only for the
+    /// RAR 1.3-1.5 versions that need it, exactly like extract.cpp:917-922.
+    /// OR-ing the archive flag back in here would make every member of a solid
+    /// RAR4 archive inherit the previous member's window, tables and filters,
+    /// which unrar does only when the member's own header asks for it.
+    ///
+    /// RAR5 keeps the existing behavior: the first compressed member of a solid
+    /// archive has no per-file SOLID flag but still seeds the following ones.
+    fn member_is_solid(&self, fh: &FileHeader) -> bool {
+        if fh.compression.format.is_rar4_family() {
+            fh.compression.solid
+        } else {
+            self.is_solid || fh.compression.solid
+        }
+    }
+
     fn effective_member_dict_size(fh: &FileHeader) -> u64 {
         if fh.compression.method == CompressionMethod::Store {
             0
@@ -3990,9 +4020,7 @@ impl RarArchive {
         let fh = entry.file_header.clone();
         let hash = entry.hash.clone();
         let mi = self.member_info(index);
-        // The first compressed member of a solid archive has no per-file
-        // SOLID flag, but its decoder state seeds every following member.
-        let is_solid = self.is_solid || fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let archive_format = self.format;
         if !allow_link_payload {
             self.reject_link_member_without_file_target(entry, &fh)?;
@@ -4274,22 +4302,24 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    let written = crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
                 } else {
-                    let written = crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         base_reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
@@ -4504,9 +4534,7 @@ impl RarArchive {
         let owner = entry.owner.clone();
         let rar4_salt = entry.rar4_salt;
         let mi = self.member_info(index);
-        // Preserve the first member's decoder state for archive-level solid
-        // continuation even though that member cannot reference a predecessor.
-        let is_solid = self.is_solid || fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let archive_format = self.format;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
@@ -4809,21 +4837,23 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?
                 } else {
-                    crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         base_reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?
                 };
@@ -5338,22 +5368,16 @@ impl RarArchive {
 
         let dict_size = dict_size as usize;
         if fh.compression.format.is_rar4_family() {
-            if solid_decoder_rar4
-                .as_ref()
-                .is_some_and(|decoder| !decoder.supports_version(fh.compression.version))
-            {
-                *solid_decoder_rar4 = None;
-            }
-            let decoder = if let Some(decoder) = solid_decoder_rar4 {
-                decoder.prepare_solid_continuation();
-                decoder
-            } else {
-                solid_decoder_rar4.insert(Rar4Decoder::new(
-                    fh.compression.version,
-                    dict_size,
-                    fh.compression.method.code(),
-                )?)
-            };
+            // Per-file dispatch: `fh.compression.solid` is already the
+            // effective RAR4 value, so a non-solid member gets the full
+            // `UnpInitData*(false)` reset even mid-solid-archive.
+            let decoder = Rar4Decoder::prepare_slot(
+                solid_decoder_rar4,
+                fh.compression.solid,
+                dict_size,
+                fh.compression.version,
+                fh.compression.method.code(),
+            )?;
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
             let decoder = if let Some(decoder) = solid_decoder {
@@ -5395,22 +5419,14 @@ impl RarArchive {
         let mut writer_factory = writer_factory;
 
         let chunks = if fh.compression.format.is_rar4_family() {
-            if solid_decoder_rar4
-                .as_ref()
-                .is_some_and(|decoder| !decoder.supports_version(fh.compression.version))
-            {
-                *solid_decoder_rar4 = None;
-            }
-            let decoder = if let Some(decoder) = solid_decoder_rar4 {
-                decoder.prepare_solid_continuation();
-                decoder
-            } else {
-                solid_decoder_rar4.insert(Rar4Decoder::new(
-                    fh.compression.version,
-                    dict_size,
-                    fh.compression.method.code(),
-                )?)
-            };
+            // Per-file dispatch; see `solid_decode_reader_to_writer`.
+            let decoder = Rar4Decoder::prepare_slot(
+                solid_decoder_rar4,
+                fh.compression.solid,
+                dict_size,
+                fh.compression.version,
+                fh.compression.method.code(),
+            )?;
             let hash_clone = shared_hash.clone();
             decoder.decompress_reader_to_writer_chunked(
                 compressed,
@@ -5513,7 +5529,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = self.is_solid || fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -5999,7 +6015,7 @@ impl RarArchive {
         };
 
         let written = if self.format == ArchiveFormat::Rar5 {
-            let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
+            let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
             let decoder = Self::prepare_rar5_member_decoder(
                 &mut self.solid_decoder,
                 fh,
@@ -6007,13 +6023,14 @@ impl RarArchive {
             )?;
             decoder.decompress_reader_to_writer(&mut buf_reader, unpacked_size, &mut hash_writer)?
         } else {
-            let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
-            crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+            let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
+            Self::solid_decode_reader_to_writer(
+                &mut self.solid_decoder_rar4,
+                &mut self.solid_decoder,
+                self.limits.max_dict_size,
                 &mut buf_reader,
                 unpacked_size,
-                fh.compression.version,
-                fh.compression.method.code(),
-                fh.compression.dict_size,
+                fh,
                 &mut hash_writer,
             )?
         };
@@ -6083,7 +6100,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = self.is_solid || fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -6588,7 +6605,7 @@ impl RarArchive {
         let chunks = if self.format == ArchiveFormat::Rar5 {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tracking_reader = VolumeTrackingReader::new(
-                BufReader::with_capacity(1024 * 1024, inner),
+                BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner),
                 volume_tracker,
             )
             .with_shared_transitions(Arc::clone(&shared_transitions));
@@ -6619,18 +6636,19 @@ impl RarArchive {
         } else {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tracking_reader = VolumeTrackingReader::new(
-                BufReader::with_capacity(1024 * 1024, inner),
+                BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner),
                 volume_tracker,
             )
             .with_shared_transitions(Arc::clone(&shared_transitions));
 
             let hash_clone = shared_hash.clone();
-            crate::decompress::rar4_old::decompress_rar4_reader_to_writer_chunked(
+            Self::solid_decode_reader_to_writer_chunked(
+                &mut self.solid_decoder_rar4,
+                &mut self.solid_decoder,
+                self.limits.max_dict_size,
                 tracking_reader,
+                fh,
                 unpacked_size,
-                fh.compression.version,
-                fh.compression.method.code(),
-                fh.compression.dict_size,
                 first_vol,
                 shared_transitions,
                 |vol_idx| {
@@ -6644,6 +6662,9 @@ impl RarArchive {
                         Ok(writer)
                     }
                 },
+                // The writer factory above already wraps each volume writer in
+                // a HashTrackingWriter, so the helper must not wrap it again.
+                None,
             )?
         };
         self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
@@ -8181,6 +8202,40 @@ mod tests {
             reader: Box::new(Cursor::new(data.to_vec())),
         })];
         archive
+    }
+
+    #[test]
+    fn rar4_member_solid_dispatch_is_per_file_like_rar_behavior() {
+        let mut archive = empty_rar5_archive();
+        archive.is_solid = true;
+
+        let mut rar4 = test_rar5_service("m", 0, 0).file_header;
+        rar4.compression.format = ArchiveFormat::Rar4;
+        rar4.compression.version = 29;
+        rar4.compression.method = CompressionMethod::Normal;
+
+        // extract.cpp:922 dispatches on FileHead.Solid for RAR 2.0+ members, and
+        // parse.rs has already folded the archive flag into that value for the
+        // RAR 1.3-1.5 versions that need it. A non-solid member inside a solid
+        // RAR4 archive therefore decodes non-solid.
+        rar4.compression.solid = false;
+        assert!(!archive.member_is_solid(&rar4));
+        rar4.compression.solid = true;
+        assert!(archive.member_is_solid(&rar4));
+
+        let mut rar14 = rar4.clone();
+        rar14.compression.format = ArchiveFormat::Rar14;
+        rar14.compression.solid = false;
+        assert!(!archive.member_is_solid(&rar14));
+
+        // RAR5 keeps folding the archive-level flag in: the first compressed
+        // member of a solid archive carries no per-file SOLID flag.
+        let rar5 = test_rar5_service("m", 0, 0).file_header;
+        assert!(!rar5.compression.solid);
+        assert!(archive.member_is_solid(&rar5));
+
+        archive.is_solid = false;
+        assert!(!archive.member_is_solid(&rar5));
     }
 
     #[test]

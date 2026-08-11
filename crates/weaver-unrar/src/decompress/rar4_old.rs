@@ -14,6 +14,17 @@ use super::lz::window::Window;
 use super::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
 
+/// Borrow a recycled `StreamingBitReader` input buffer, allocating on first use.
+///
+/// Both legacy decoders build a fresh reader per member (each member's data
+/// area is an independent bitstream) but park the 512 KiB backing allocation
+/// in `self.input_buffer` between members. Reuse needs no zeroing; see
+/// `StreamingBitReader::with_buffer`.
+fn take_input_buffer(slot: &mut Option<Box<[u8]>>) -> Box<[u8]> {
+    slot.take()
+        .unwrap_or_else(StreamingBitReader::<std::io::Empty>::alloc_buffer)
+}
+
 const MAX_DICT_SIZE: u64 = 256 * 1024 * 1024;
 const MIN_RAR4_UNPACK_WINDOW: u64 = 0x40000;
 const UNPACK_MAX_WRITE: usize = 0x400000;
@@ -100,10 +111,50 @@ impl Rar4Decoder {
         }
     }
 
-    pub(crate) fn prepare_solid_continuation(&mut self) {
-        if let Self::V29(decoder) = self {
-            decoder.prepare_solid_continuation();
+    /// Prepare this decoder for the next member of the archive.
+    ///
+    /// `solid` is the **per-file** effective flag, not the archive flag: unrar
+    /// dispatches on `FileHead.Solid` for RAR 2.0+ members (extract.cpp:917-922)
+    /// and re-runs the full `UnpInitData*(false)` reset for a non-solid member
+    /// even inside a solid archive.
+    pub(crate) fn prepare_member(&mut self, solid: bool, dict_size: usize) -> RarResult<()> {
+        let dict_size = old_rar_window_size(dict_size);
+        match self {
+            Self::V15(decoder) => decoder.prepare_member(solid, dict_size),
+            Self::V20(decoder) => decoder.prepare_member(solid, dict_size),
+            Self::V29(decoder) => decoder.prepare_member(solid, dict_size),
         }
+    }
+
+    /// Prepare a cached decoder slot for the next member, building the decoder
+    /// on first use.
+    ///
+    /// An unpack-version switch (15 ↔ 20 ↔ 29) still drops and rebuilds the
+    /// decoder: the enum wraps a boxed per-version decoder, so changing variant
+    /// necessarily reallocates that variant's state and there is nothing to
+    /// reuse. Version switches inside one archive are rare; every same-version
+    /// member — solid or not — takes the reuse path through
+    /// [`Self::prepare_member`] and keeps its window, tables and PPMd arena.
+    pub(crate) fn prepare_slot(
+        slot: &mut Option<Self>,
+        solid: bool,
+        dict_size: usize,
+        version: u8,
+        method: u8,
+    ) -> RarResult<&mut Self> {
+        if slot
+            .as_ref()
+            .is_some_and(|decoder| !decoder.supports_version(version))
+        {
+            *slot = None;
+        }
+
+        match slot.as_mut() {
+            Some(decoder) => decoder.prepare_member(solid, dict_size)?,
+            None => *slot = Some(Self::new(version, dict_size, method)?),
+        }
+
+        Ok(slot.as_mut().expect("RAR4 decoder prepared above"))
     }
 
     pub(crate) fn supports_version(&self, version: u8) -> bool {
@@ -196,6 +247,12 @@ pub(crate) fn decompress_rar4_to_writer<W: Write>(
     decoder.decompress_to_writer(input, unpacked_size, writer)
 }
 
+/// One-shot RAR4 decode of a reader into a writer.
+///
+/// The member extraction paths all go through `RarArchive`'s cached decoder
+/// slot now; this remains for the service/subdata path, which is not part of
+/// the solid stream and must never disturb the cached decoder.
+#[cfg(any(windows, test))]
 pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
     input: R,
     unpacked_size: u64,
@@ -207,31 +264,6 @@ pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
     check_dict_size(dict_size)?;
     let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn decompress_rar4_reader_to_writer_chunked<R: Read, F>(
-    input: R,
-    unpacked_size: u64,
-    version: u8,
-    method: u8,
-    dict_size: u64,
-    first_volume_index: usize,
-    shared_transitions: Arc<Mutex<Vec<super::VolumeTransition>>>,
-    writer_factory: F,
-) -> RarResult<Vec<(usize, u64)>>
-where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
-{
-    check_dict_size(dict_size)?;
-    let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
-    decoder.decompress_reader_to_writer_chunked(
-        input,
-        unpacked_size,
-        first_volume_index,
-        shared_transitions,
-        writer_factory,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +385,8 @@ pub(crate) struct Rar20Decoder {
     channel_delta: i32,
     audio_vars: [AudioVariables; 4],
     tables_read: bool,
-    started: bool,
+    /// Recycled `StreamingBitReader` input buffer (see `take_input_buffer`).
+    input_buffer: Option<Box<[u8]>>,
 }
 
 impl Rar20Decoder {
@@ -375,26 +408,47 @@ impl Rar20Decoder {
             channel_delta: 0,
             audio_vars: [AudioVariables::default(); 4],
             tables_read: false,
-            started: false,
+            input_buffer: None,
         })
     }
 
-    fn begin_file_decode(&mut self) {
-        if !self.started {
-            self.started = true;
-            self.old_dist = [usize::MAX; 4];
-            self.old_dist_ptr = 0;
-            self.last_dist = usize::MAX;
-            self.last_length = 0;
-            self.tables_read = false;
-            self.audio_block = false;
-            self.channel_delta = 0;
-            self.cur_channel = 0;
-            self.channels = 1;
-            self.audio_vars = [AudioVariables::default(); 4];
-            self.old_table.fill(0);
-            self.md_tables = std::array::from_fn(|_| None);
+    /// Per-member preparation for the RAR 2.x decoder.
+    ///
+    /// `solid == false` performs `UnpInitData(false)` + `UnpInitData20(false)`
+    /// (unpack.cpp:208-219, unpack20.cpp:279-293): distance history, the
+    /// `BlockTables` decode tables, the audio state, `UnpOldTable20` and the
+    /// per-channel `MD` tables all restart, and the window is re-pointed
+    /// without a memset. `solid == true` keeps every one of them.
+    pub(crate) fn prepare_member(&mut self, solid: bool, dict_size: usize) -> RarResult<()> {
+        if solid {
+            return super::rar4::ensure_solid_window_dict(self.window.dict_size(), dict_size);
         }
+
+        self.window.reset_for_reuse(dict_size)?;
+
+        // UnpInitData(false).
+        self.old_dist = [usize::MAX; 4];
+        self.old_dist_ptr = 0;
+        self.last_dist = usize::MAX;
+        self.last_length = 0;
+        // memset(&BlockTables,0,sizeof(BlockTables)) — the live decode tables.
+        self.ld_table = None;
+        self.dd_table = None;
+        self.rd_table = None;
+
+        // UnpInitData20(false).
+        self.tables_read = false;
+        self.audio_block = false;
+        self.channel_delta = 0;
+        self.cur_channel = 0;
+        self.channels = 1;
+        self.audio_vars = [AudioVariables::default(); 4];
+        self.old_table.fill(0);
+        self.md_tables = std::array::from_fn(|_| None);
+        Ok(())
+    }
+
+    fn begin_file_decode(&mut self) {
         self.window.mark_flushed(self.window.total_written());
     }
 
@@ -414,8 +468,12 @@ impl Rar20Decoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_with_reader(&mut reader, unpacked_size, writer)
+        // Recycled 512 KiB input buffer, handed back on every exit path.
+        let buf = take_input_buffer(&mut self.input_buffer);
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_with_reader(&mut reader, unpacked_size, writer);
+        self.input_buffer = Some(reader.into_buffer());
+        result
     }
 
     fn decompress_with_reader<R: BitRead, W: Write>(
@@ -486,8 +544,10 @@ impl Rar20Decoder {
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_chunked_with_reader(
+        // Recycled 512 KiB input buffer, handed back on every exit path.
+        let buf = take_input_buffer(&mut self.input_buffer);
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_chunked_with_reader(
             &mut reader,
             unpacked_size,
             first_volume_index,
@@ -500,7 +560,9 @@ impl Rar20Decoder {
                     .map(|guard| guard.get(idx).cloned())
             },
             writer_factory,
-        )
+        );
+        self.input_buffer = Some(reader.into_buffer());
+        result
     }
 
     fn decompress_chunked_with_reader<R: BitRead, F, G>(
@@ -540,6 +602,12 @@ impl Rar20Decoder {
             let prev = output_size;
             output_size = self.decode_symbol(reader, output_size, unpacked_size)?;
             chunk_bytes += output_size - prev;
+            // Same stall guard as the non-chunked loop: a table-read symbol
+            // produces no output, so without this a drained reader that still
+            // reports a byte would spin forever.
+            if output_size == prev && !reader.has_bits() {
+                break;
+            }
 
             if pending_boundary_volume.is_none()
                 && let Some(boundary) = boundary_at(boundary_idx)?
@@ -596,8 +664,15 @@ impl Rar20Decoder {
 
             let byte = self.decode_audio(audio_number as i32);
             self.window.put_byte(byte);
+            // `if (++CurChannel == UnpAudioBlock) CurChannel=0;`
+            // (unpack20.cpp:63): a compare-and-reset, not a division. The
+            // channel count is not a compile-time constant, so `%` here costs a
+            // real integer divide on every decoded audio byte.
             if self.channels != 0 {
-                self.cur_channel = (self.cur_channel + 1) % self.channels;
+                self.cur_channel += 1;
+                if self.cur_channel >= self.channels {
+                    self.cur_channel = 0;
+                }
             }
             return Ok(output_size + 1);
         }
@@ -740,6 +815,9 @@ impl Rar20Decoder {
 
         let mut bit_length = [0u8; BC20];
         for length in &mut bit_length {
+            if reader.bits_remaining() < 4 {
+                return self.keep_tables_on_truncation();
+            }
             *length = reader.read_bits(4)? as u8;
         }
         let bd_table =
@@ -750,6 +828,9 @@ impl Rar20Decoder {
         let mut table = [0u8; TABLE20_SIZE];
         let mut i = 0usize;
         while i < table_size {
+            if reader.bits_remaining() < 1 {
+                return self.keep_tables_on_truncation();
+            }
             let number = bd_table.decode(reader)? as usize;
             if number < 16 {
                 table[i] = ((number as u8).wrapping_add(self.old_table[i])) & 0x0f;
@@ -817,6 +898,18 @@ impl Rar20Decoder {
         }
 
         self.old_table[..table_size].copy_from_slice(&table[..table_size]);
+        self.tables_read = true;
+        Ok(())
+    }
+
+    /// Handle a table read that ran out of input part-way through.
+    ///
+    /// `ReadTables20` sets `TablesRead2` *before* checking whether the read
+    /// overran the buffer, and on overrun returns success without calling
+    /// `MakeDecodeTables` or refreshing `UnpOldTable20` (unpack20.cpp:248-250):
+    /// the previously built tables stay live and decoding continues against
+    /// them until the loop's own exhaustion check stops it.
+    fn keep_tables_on_truncation(&mut self) -> RarResult<()> {
         self.tables_read = true;
         Ok(())
     }
@@ -925,7 +1018,7 @@ pub(crate) struct Rar15Decoder {
     ch_set: [u16; 256],
     ch_set_b: [u16; 256],
     ch_set_a: [u16; 256],
-    ch_set_c: [u16; 257],
+    ch_set_c: [u16; 256],
     n_to_pl: [u8; 256],
     n_to_pl_b: [u8; 256],
     n_to_pl_c: [u8; 256],
@@ -943,7 +1036,8 @@ pub(crate) struct Rar15Decoder {
     flag_buf: u16,
     st_mode: bool,
     l_count: u32,
-    started: bool,
+    /// Recycled `StreamingBitReader` input buffer (see `take_input_buffer`).
+    input_buffer: Option<Box<[u8]>>,
 }
 
 impl Rar15Decoder {
@@ -957,7 +1051,7 @@ impl Rar15Decoder {
             ch_set: [0; 256],
             ch_set_b: [0; 256],
             ch_set_a: [0; 256],
-            ch_set_c: [0; 257],
+            ch_set_c: [0; 256],
             n_to_pl: [0; 256],
             n_to_pl_b: [0; 256],
             n_to_pl_c: [0; 256],
@@ -975,11 +1069,28 @@ impl Rar15Decoder {
             flag_buf: 0,
             st_mode: false,
             l_count: 0,
-            started: false,
+            input_buffer: None,
         };
         decoder.init_non_solid_state();
         decoder.init_huff();
         Ok(decoder)
+    }
+
+    /// Per-member preparation for the RAR 1.5 decoder.
+    ///
+    /// `solid == false` performs `UnpInitData(false)` + `UnpInitData15(false)`
+    /// plus the `InitHuff()`/`UnpPtr=0` pair that `Unpack15` itself runs for a
+    /// non-solid file (unpack15.cpp:43-49, unpack15.cpp:428-442). `solid ==
+    /// true` keeps the adaptive predictors and the shuffled Huffman sets.
+    pub(crate) fn prepare_member(&mut self, solid: bool, dict_size: usize) -> RarResult<()> {
+        if solid {
+            return super::rar4::ensure_solid_window_dict(self.window.dict_size(), dict_size);
+        }
+
+        self.window.reset_for_reuse(dict_size)?;
+        self.init_non_solid_state();
+        self.init_huff();
+        Ok(())
     }
 
     fn init_non_solid_state(&mut self) {
@@ -1000,11 +1111,8 @@ impl Rar15Decoder {
     }
 
     fn begin_file_decode(&mut self) {
-        if !self.started {
-            self.init_non_solid_state();
-            self.init_huff();
-            self.started = true;
-        }
+        // UnpInitData15 clears these for every file, solid or not
+        // (unpack15.cpp:438-441).
         self.flags_cnt = 0;
         self.flag_buf = 0;
         self.st_mode = false;
@@ -1028,8 +1136,12 @@ impl Rar15Decoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_with_reader(&mut reader, unpacked_size, writer)
+        // Recycled 512 KiB input buffer, handed back on every exit path.
+        let buf = take_input_buffer(&mut self.input_buffer);
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_with_reader(&mut reader, unpacked_size, writer);
+        self.input_buffer = Some(reader.into_buffer());
+        result
     }
 
     fn decompress_with_reader<R: BitRead, W: Write>(
@@ -1097,8 +1209,10 @@ impl Rar15Decoder {
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_chunked_with_reader(
+        // Recycled 512 KiB input buffer, handed back on every exit path.
+        let buf = take_input_buffer(&mut self.input_buffer);
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_chunked_with_reader(
             &mut reader,
             unpacked_size,
             first_volume_index,
@@ -1111,7 +1225,9 @@ impl Rar15Decoder {
                     .map(|guard| guard.get(idx).cloned())
             },
             writer_factory,
-        )
+        );
+        self.input_buffer = Some(reader.into_buffer());
+        result
     }
 
     fn decompress_chunked_with_reader<R: BitRead, F, G>(
@@ -1520,7 +1636,10 @@ impl Rar15Decoder {
 
     fn get_flags_buf<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
         let flags_place = decode_num(reader, STARTHF2, &DECHF2, &POSHF2)?;
-        if flags_place >= self.ch_set_c.len() {
+        // `ChSetC` is 256 wide (unpack.hpp), and `DecodeNum` on the HF2 table
+        // can return 256. The oracle bails out before touching any state
+        // (unpack15.cpp:412), leaving FlagBuf, ChSetC and NToPlC untouched.
+        if flags_place >= 256 {
             return Ok(());
         }
 
@@ -1530,7 +1649,7 @@ impl Rar15Decoder {
             let new_flags_place = self.bump_place_c(flags & 0xff);
             flags = flags.wrapping_add(1);
             if (flags & 0xff) == 0 {
-                Self::corr_huff_257(&mut self.ch_set_c, &mut self.n_to_pl_c);
+                Self::corr_huff(&mut self.ch_set_c, &mut self.n_to_pl_c);
             } else {
                 self.ch_set_c[flags_place] = self.ch_set_c[new_flags_place];
                 self.ch_set_c[new_flags_place] = flags as u16;
@@ -1547,7 +1666,6 @@ impl Rar15Decoder {
             self.ch_set_a[i] = i as u16;
             self.ch_set_c[i] = ((((!i).wrapping_add(1)) & 0xff) << 8) as u16;
         }
-        self.ch_set_c[256] = 0;
         self.n_to_pl.fill(0);
         self.n_to_pl_b.fill(0);
         self.n_to_pl_c.fill(0);
@@ -1566,13 +1684,6 @@ impl Rar15Decoder {
         for i in (0..=6usize).rev() {
             num_to_place[i] = ((7 - i) * 32) as u8;
         }
-    }
-
-    fn corr_huff_257(char_set: &mut [u16; 257], num_to_place: &mut [u8; 256]) {
-        let mut tmp = [0u16; 256];
-        tmp.copy_from_slice(&char_set[..256]);
-        Self::corr_huff(&mut tmp, num_to_place);
-        char_set[..256].copy_from_slice(&tmp);
     }
 
     fn copy_string15(
@@ -1733,6 +1844,195 @@ mod tests {
                 max: MAX_DICT_SIZE
             }) if size == MAX_DICT_SIZE + 1
         ));
+    }
+
+    #[test]
+    fn rar15_get_flags_buf_ignores_out_of_range_place_like_rar_behavior() {
+        // DecodeNum on the HF2 table yields 256 for this bit field, one past
+        // the end of ChSetC (unpack15.cpp:412 guards exactly this).
+        let data = [0xff, 0xc0];
+        assert_eq!(
+            decode_num(&mut BitReader::new(&data), STARTHF2, &DECHF2, &POSHF2).unwrap(),
+            256
+        );
+
+        let mut decoder = Rar15Decoder::try_new(0x40000).unwrap();
+        decoder.flag_buf = 0x5a;
+        let expected_ch_set_c = decoder.ch_set_c;
+        let expected_n_to_pl_c = decoder.n_to_pl_c;
+
+        let mut reader = BitReader::new(&data);
+        decoder.get_flags_buf(&mut reader).unwrap();
+
+        assert_eq!(decoder.flag_buf, 0x5a);
+        assert_eq!(decoder.ch_set_c, expected_ch_set_c);
+        assert_eq!(decoder.n_to_pl_c, expected_n_to_pl_c);
+    }
+
+    #[test]
+    fn rar15_non_solid_member_restarts_adaptive_state_like_rar_behavior() {
+        let mut decoder = Rar15Decoder::try_new(0x40000).unwrap();
+        decoder.window.put_bytes(b"FIRST");
+        decoder.avr_plc = 0x1234;
+        decoder.avr_ln1 = 40;
+        decoder.max_dist3 = 0x7f00;
+        decoder.nhfb = 0x11;
+        decoder.nlzb = 0x22;
+        decoder.old_dist = [1, 2, 3, 4];
+        decoder.last_dist = 7;
+        decoder.last_length = 9;
+        decoder.ch_set[0] = 0xdead;
+
+        decoder.prepare_member(false, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 0);
+        assert_eq!(decoder.avr_plc, 0x3500);
+        assert_eq!(decoder.avr_ln1, 0);
+        assert_eq!(decoder.max_dist3, 0x2001);
+        assert_eq!(decoder.nhfb, 0x80);
+        assert_eq!(decoder.nlzb, 0x80);
+        assert_eq!(decoder.old_dist, [usize::MAX; 4]);
+        assert_eq!(decoder.last_dist, usize::MAX);
+        assert_eq!(decoder.last_length, 0);
+        // InitHuff rebuilds ChSet as `i << 8`.
+        assert_eq!(decoder.ch_set[0], 0);
+    }
+
+    #[test]
+    fn rar15_solid_member_keeps_adaptive_state_like_rar_behavior() {
+        let mut decoder = Rar15Decoder::try_new(0x40000).unwrap();
+        decoder.window.put_bytes(b"FIRST");
+        decoder.avr_plc = 0x1234;
+        decoder.ch_set[0] = 0xdead;
+
+        decoder.prepare_member(true, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 5);
+        assert_eq!(decoder.avr_plc, 0x1234);
+        assert_eq!(decoder.ch_set[0], 0xdead);
+    }
+
+    #[test]
+    fn rar20_non_solid_member_restarts_tables_like_rar_behavior() {
+        let mut decoder = Rar20Decoder::try_new(0x40000).unwrap();
+        let mut lengths = vec![0u8; NC20];
+        lengths[0] = 1;
+        lengths[1] = 1;
+
+        decoder.window.put_bytes(b"FIRST");
+        decoder.tables_read = true;
+        decoder.audio_block = true;
+        decoder.channels = 3;
+        decoder.cur_channel = 2;
+        decoder.channel_delta = 5;
+        decoder.old_table[0] = 9;
+        decoder.old_dist = [1, 2, 3, 4];
+        decoder.old_dist_ptr = 2;
+        decoder.last_dist = 7;
+        decoder.last_length = 11;
+        decoder.audio_vars[0].k1 = 4;
+        decoder.ld_table = Some(HuffmanTable::build(&lengths).unwrap());
+        decoder.dd_table = Some(HuffmanTable::build(&lengths).unwrap());
+        decoder.rd_table = Some(HuffmanTable::build(&lengths).unwrap());
+        decoder.md_tables[0] = Some(HuffmanTable::build(&lengths).unwrap());
+
+        decoder.prepare_member(false, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 0);
+        assert!(!decoder.tables_read);
+        assert!(!decoder.audio_block);
+        assert_eq!(decoder.channels, 1);
+        assert_eq!(decoder.cur_channel, 0);
+        assert_eq!(decoder.channel_delta, 0);
+        assert_eq!(decoder.old_table[0], 0);
+        assert_eq!(decoder.old_dist, [usize::MAX; 4]);
+        assert_eq!(decoder.old_dist_ptr, 0);
+        assert_eq!(decoder.last_dist, usize::MAX);
+        assert_eq!(decoder.last_length, 0);
+        assert_eq!(decoder.audio_vars[0].k1, 0);
+        // memset(&BlockTables,0,sizeof(BlockTables)) plus memset(MD,...).
+        assert!(decoder.ld_table.is_none());
+        assert!(decoder.dd_table.is_none());
+        assert!(decoder.rd_table.is_none());
+        assert!(decoder.md_tables.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn rar20_solid_member_keeps_tables_like_rar_behavior() {
+        let mut decoder = Rar20Decoder::try_new(0x40000).unwrap();
+        let mut lengths = vec![0u8; NC20];
+        lengths[0] = 1;
+        lengths[1] = 1;
+        decoder.window.put_bytes(b"FIRST");
+        decoder.tables_read = true;
+        decoder.old_table[0] = 9;
+        decoder.ld_table = Some(HuffmanTable::build(&lengths).unwrap());
+
+        decoder.prepare_member(true, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 5);
+        assert!(decoder.tables_read);
+        assert_eq!(decoder.old_table[0], 9);
+        assert!(decoder.ld_table.is_some());
+    }
+
+    #[test]
+    fn solid_member_cannot_grow_the_old_format_dictionary_like_rar_behavior() {
+        let mut v15 = Rar15Decoder::try_new(0x40000).unwrap();
+        assert!(v15.prepare_member(true, 0x80000).is_err());
+        v15.prepare_member(false, 0x80000).unwrap();
+        assert_eq!(v15.window.dict_size(), 0x80000);
+
+        let mut v20 = Rar20Decoder::try_new(0x40000).unwrap();
+        assert!(v20.prepare_member(true, 0x80000).is_err());
+        v20.prepare_member(false, 0x80000).unwrap();
+        assert_eq!(v20.window.dict_size(), 0x80000);
+    }
+
+    #[test]
+    fn rar20_truncated_table_read_keeps_the_previous_tables_like_rar_behavior() {
+        let mut decoder = Rar20Decoder::try_new(0x40000).unwrap();
+        let mut lengths = vec![0u8; NC20];
+        lengths[0] = 1;
+        lengths[1] = 1;
+        decoder.ld_table = Some(HuffmanTable::build(&lengths).unwrap());
+        decoder.tables_read = false;
+
+        // Two bytes cover the flag bits and three bit-length nibbles; the input
+        // then stops part-way through the remaining sixteen.
+        let data = [0x00u8, 0x00];
+        let mut reader = BitReader::new(&data);
+
+        decoder.read_tables(&mut reader).unwrap();
+
+        // unpack20.cpp:248-250 sets TablesRead2 before the overrun check and
+        // returns success without rebuilding, so the live tables stay.
+        assert!(decoder.tables_read);
+        assert!(decoder.ld_table.is_some());
+    }
+
+    #[test]
+    fn rar4_decoder_slot_rebuilds_only_on_a_version_switch() {
+        let mut slot: Option<Rar4Decoder> = None;
+
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
+        if let Some(Rar4Decoder::V29(decoder)) = slot.as_mut() {
+            decoder
+                .decompress_to_writer(&[], 0, &mut Vec::new())
+                .unwrap();
+        }
+
+        // Same version: reused in place.
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
+
+        // Version switch: the boxed variant has to be rebuilt.
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 20, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V20(_))));
+
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 15, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V15(_))));
     }
 
     #[test]

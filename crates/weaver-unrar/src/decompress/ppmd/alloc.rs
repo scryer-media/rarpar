@@ -61,13 +61,21 @@ pub struct NodeRef(pub u32);
 impl NodeRef {
     pub const NULL: NodeRef = NodeRef(0);
 
-    #[inline]
+    #[inline(always)]
     pub fn is_null(self) -> bool {
         self.0 == 0
     }
 
     /// Byte offset into the arena.
-    #[inline]
+    ///
+    /// Both accessors are one instruction and sit under every node-relative
+    /// arena read and write, so they are always inlined: an outlined copy shows
+    /// up as its own call-bound frame in the decode profile. The saturating
+    /// multiply stays — it cannot trigger on a 64-bit target (a `u32` index
+    /// times `UNIT_SIZE` never leaves `usize` range, so the check folds away),
+    /// and where it can, saturating past the arena is what makes the callers'
+    /// bounds checks reject the offset instead of aliasing another node.
+    #[inline(always)]
     pub fn offset(self) -> usize {
         (self.0 as usize).saturating_mul(UNIT_SIZE)
     }
@@ -247,6 +255,17 @@ impl SubAllocator {
         self.sub_allocator_size
     }
 
+    /// Address of the arena allocation.
+    ///
+    /// Tests use this to prove that a same-size restart reuses the existing
+    /// arena instead of faulting in a fresh one; a replacement allocation is
+    /// made while the old arena is still live, so the address always moves.
+    #[cfg(test)]
+    #[inline]
+    pub fn arena_addr(&self) -> usize {
+        self.arena.as_ptr() as usize
+    }
+
     // ---- Text region methods ----
 
     /// Write a byte to the text region and advance the text pointer.
@@ -386,17 +405,33 @@ impl SubAllocator {
         heads.map(u16::from_le)
     }
 
+    /// Gather the symbol bytes of eight consecutive states into one vector,
+    /// lane `i` holding the symbol of state `i` of the batch and lanes 8..16
+    /// zeroed.
+    ///
+    /// States are six bytes wide and the symbol is field 0, so the eight
+    /// symbols of a batch sit at byte offsets 0, 6, 12, 18, 24, 30, 36 and 42.
+    /// `pshufb` only selects within its own 16-byte operand, so the batch is
+    /// covered by three loads and the symbol offsets split across them as:
+    ///
+    /// * `chunk0` (bytes 0..16): states 0, 1, 2 at chunk offsets 0, 6, 12
+    /// * `chunk1` (bytes 16..32): states 3, 4, 5 at chunk offsets 2, 8, 14
+    /// * `chunk2` (bytes 32..48): states 6, 7 at chunk offsets 4, 10
+    ///
+    /// Each mask writes its symbols into the lanes matching those state
+    /// positions and sets the high bit (`-128`) in every other lane, which
+    /// makes `pshufb` zero that lane. The three shuffles therefore have
+    /// disjoint non-zero lanes and their `OR` is exactly the batch in state
+    /// order, with lanes 8..16 zero because no mask claims them.
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     #[target_feature(enable = "ssse3")]
     #[inline]
-    pub(super) unsafe fn span_read_state_heads8_ssse3(
+    pub(super) unsafe fn span_read_state_syms8_ssse3(
         &self,
         span: ValidatedArenaSpan,
         relative: usize,
-    ) -> [u16; 8] {
-        use std::arch::x86_64::{
-            _mm_loadu_si128, _mm_or_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
-        };
+    ) -> std::arch::x86_64::__m128i {
+        use std::arch::x86_64::{_mm_loadu_si128, _mm_or_si128, _mm_setr_epi8, _mm_shuffle_epi8};
 
         const STATE_BATCH_BYTES: usize = 8 * 6;
         debug_assert!(
@@ -405,10 +440,9 @@ impl SubAllocator {
                 .is_some_and(|end| end <= span.len())
         );
 
-        let mut heads = [0u16; 8];
         // SAFETY: the validated span covers the three contiguous 16-byte loads.
         // SSSE3 availability is checked once by `Model`, and the shuffle masks
-        // select only the two-byte head at the start of each six-byte state.
+        // select only the one-byte symbol at the start of each six-byte state.
         unsafe {
             let ptr = self.arena.as_ptr().add(span.offset() + relative);
             let chunk0 = _mm_loadu_si128(ptr.cast());
@@ -416,25 +450,25 @@ impl SubAllocator {
             let chunk2 = _mm_loadu_si128(ptr.add(32).cast());
 
             let mask0 = _mm_setr_epi8(
-                0, 1, 6, 7, 12, 13, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128,
+                0, 6, 12, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128,
+                -128,
             );
             let mask1 = _mm_setr_epi8(
-                -128, -128, -128, -128, -128, -128, 2, 3, 8, 9, 14, 15, -128, -128, -128, -128,
+                -128, -128, -128, 2, 8, 14, -128, -128, -128, -128, -128, -128, -128, -128, -128,
+                -128,
             );
             let mask2 = _mm_setr_epi8(
-                -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 4, 5, 10,
-                11,
+                -128, -128, -128, -128, -128, -128, 4, 10, -128, -128, -128, -128, -128, -128,
+                -128, -128,
             );
-            let packed = _mm_or_si128(
+            _mm_or_si128(
                 _mm_or_si128(
                     _mm_shuffle_epi8(chunk0, mask0),
                     _mm_shuffle_epi8(chunk1, mask1),
                 ),
                 _mm_shuffle_epi8(chunk2, mask2),
-            );
-            _mm_storeu_si128(heads.as_mut_ptr().cast(), packed);
+            )
         }
-        heads.map(u16::from_le)
     }
 
     #[inline(always)]
@@ -1243,7 +1277,7 @@ mod tests {
 
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(miri)))]
     #[test]
-    fn state_head_batch_matches_scalar_across_arena_alignments() {
+    fn state_batch_gather_matches_scalar_across_arena_alignments() {
         const STATE_SIZE: usize = 6;
         const STATE_COUNT: usize = 8;
         const BATCH_BYTES: usize = STATE_SIZE * STATE_COUNT;
@@ -1261,18 +1295,30 @@ mod tests {
             let span = alloc
                 .validated_model_span(states.offset() as u32, BATCH_BYTES)
                 .expect("allocated state batch is a valid model span");
-            let expected = std::array::from_fn(|lane| alloc.span_read_u16(span, lane * STATE_SIZE));
 
             #[cfg(target_arch = "aarch64")]
-            let actual = alloc.span_read_state_heads8(span, 0);
-            #[cfg(target_arch = "x86_64")]
-            let actual = {
-                assert!(std::arch::is_x86_feature_detected!("ssse3"));
-                // SAFETY: SSSE3 was detected and the validated span covers the batch.
-                unsafe { alloc.span_read_state_heads8_ssse3(span, 0) }
-            };
+            {
+                let expected: [u16; 8] =
+                    std::array::from_fn(|lane| alloc.span_read_u16(span, lane * STATE_SIZE));
+                assert_eq!(alloc.span_read_state_heads8(span, 0), expected);
+            }
 
-            assert_eq!(actual, expected);
+            #[cfg(target_arch = "x86_64")]
+            {
+                let expected: [u8; 8] =
+                    std::array::from_fn(|lane| alloc.span_read_u8(span, lane * STATE_SIZE));
+                assert!(std::arch::is_x86_feature_detected!("ssse3"));
+                let mut lanes = [0u8; 16];
+                // SAFETY: SSSE3 was detected and the validated span covers the
+                // batch; the store target is exactly one 16-byte vector wide.
+                unsafe {
+                    let gathered = alloc.span_read_state_syms8_ssse3(span, 0);
+                    std::arch::x86_64::_mm_storeu_si128(lanes.as_mut_ptr().cast(), gathered);
+                }
+                assert_eq!(&lanes[..8], &expected[..], "lane order must be state order");
+                assert_eq!(&lanes[8..], &[0u8; 8], "upper lanes must gather as zero");
+            }
+
             assert!(!alloc.alloc_one().is_null());
         }
     }

@@ -892,6 +892,65 @@ impl Window {
         Ok(result)
     }
 
+    /// Copy output bytes from the window into a caller-owned buffer.
+    ///
+    /// Same range validation and ring-wrap semantics as
+    /// [`Window::try_copy_output`], but reuses `out`'s allocation instead of
+    /// returning a fresh `Vec`: `out` is cleared and refilled with exactly
+    /// `len` bytes. RAR4 stages every VM filter block through this, so the
+    /// staging allocation is paid once per member rather than once per block.
+    pub fn copy_output_into(
+        &self,
+        start_total: u64,
+        len: usize,
+        out: &mut Vec<u8>,
+    ) -> RarResult<()> {
+        let end_total =
+            start_total
+                .checked_add(len as u64)
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "window output range overflows u64".to_string(),
+                })?;
+        if start_total > self.total_written || end_total > self.total_written {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "window output range [{start_total}, {end_total}) exceeds written output {}",
+                    self.total_written
+                ),
+            });
+        }
+
+        let dict_size = self.dict_size;
+        let distance = (self.total_written - start_total) as usize;
+        if distance > dict_size {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "window output start {start_total} is outside the {} byte dictionary history",
+                    dict_size
+                ),
+            });
+        }
+
+        out.clear();
+        out.reserve(len);
+
+        let mut idx = if distance <= self.pos {
+            self.pos - distance
+        } else {
+            dict_size - (distance - self.pos)
+        };
+
+        let mut remaining = len;
+        while remaining > 0 {
+            let contig = (dict_size - idx).min(remaining);
+            self.buf.extend_from_range(idx, contig, out);
+            idx = (idx + contig) % dict_size;
+            remaining -= contig;
+        }
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn copy_output(&self, start_total: u64, len: usize) -> Vec<u8> {
         self.try_copy_output(start_total, len)

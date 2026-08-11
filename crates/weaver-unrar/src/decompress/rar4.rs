@@ -64,6 +64,10 @@ const LOW_DIST_REP_COUNT: usize = 16;
 /// Maximum dictionary size (256 MB).
 const MAX_DICT_SIZE: u64 = 256 * 1024 * 1024;
 const VM_MEM_SIZE: usize = 0x40000;
+/// `VM_MEMMASK` (rarvm.hpp:5). The VM reports `FilteredDataSize` as
+/// `InitR[4] & VM_MEMMASK` (rarvm.cpp:29-30), so a filter covering exactly
+/// `VM_MEM_SIZE` bytes emits nothing at all.
+const VM_MEM_MASK: usize = VM_MEM_SIZE - 1;
 const MAX3_UNPACK_FILTERS: usize = 8192;
 const MAX3_UNPACK_CHANNELS: u32 = 1024;
 const MAX3_INC_LZ_MATCH: usize = 0x104;
@@ -168,6 +172,37 @@ pub struct Rar4LzDecoder {
     /// PPMd block headers re-initialize it, so the next member must resume
     /// with these registers instead of consuming init bytes.
     ppm_rc_state: Option<RangeCoderState>,
+    /// Set when the LZ loop hit a stop condition that ends this member.
+    ///
+    /// Symbol 256 signalling "new file" and a truncated VM code packet both
+    /// `break` out of `Unpack29`'s main loop (unpack30.cpp:204-215), which
+    /// flushes what was decoded and returns. Without this the outer loop would
+    /// re-enter `decode_lz_symbols` and keep decoding against stale tables.
+    member_decode_done: bool,
+    /// Staging buffer holding the VM filter's input block, reused for every
+    /// filtered block instead of being allocated per block.
+    filter_scratch: Vec<u8>,
+    /// Destination buffer for the media filters (DELTA/RGB/AUDIO). It is
+    /// swapped with `filter_scratch` when a filter completes, so a chain of
+    /// filters over one block ping-pongs between two long-lived allocations.
+    media_scratch: Vec<u8>,
+    /// Highest `base + output_size` a pending filter has been queued at, used
+    /// only to assert that the decoder-owned half of a filter start never moves
+    /// backwards (see the push site in `add_vm_code`).
+    #[cfg(debug_assertions)]
+    last_pending_filter_base: u64,
+    /// Entries into `decode_lz_symbols`, so the border-pin test can show the
+    /// loop is not re-entered once per symbol.
+    #[cfg(test)]
+    decode_lz_calls: usize,
+    /// Recycled `StreamingBitReader` input buffer (512 KiB).
+    ///
+    /// Every streaming decode entry point builds a fresh `StreamingBitReader`
+    /// (each member's data area is an independent byte-aligned bitstream), but
+    /// the 512 KiB backing allocation has no per-member state, so it is parked
+    /// here between members instead of being allocated and zeroed again. See
+    /// `StreamingBitReader::with_buffer` for why reuse needs no zeroing.
+    input_buffer: Option<Box<[u8]>>,
 }
 
 impl Rar4LzDecoder {
@@ -202,12 +237,37 @@ impl Rar4LzDecoder {
             current_file_base_total: 0,
             current_file_written_size: 0,
             ppm_rc_state: None,
+            member_decode_done: false,
+            filter_scratch: Vec::new(),
+            media_scratch: Vec::new(),
+            #[cfg(debug_assertions)]
+            last_pending_filter_base: 0,
+            #[cfg(test)]
+            decode_lz_calls: 0,
+            input_buffer: None,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn window_size(&self) -> usize {
         self.window.dict_size()
+    }
+
+    /// Borrow the recycled streaming input buffer, allocating on first use.
+    fn take_input_buffer(&mut self) -> Box<[u8]> {
+        self.input_buffer
+            .take()
+            .unwrap_or_else(StreamingBitReader::<std::io::Empty>::alloc_buffer)
+    }
+
+    fn recycle_input_buffer(&mut self, buf: Box<[u8]>) {
+        self.input_buffer = Some(buf);
+    }
+
+    /// The parked input buffer, for the buffer-reuse test.
+    #[cfg(test)]
+    pub(crate) fn input_buffer_for_test(&self) -> Option<&[u8]> {
+        self.input_buffer.as_deref()
     }
 
     fn flush_threshold(&self) -> usize {
@@ -219,8 +279,16 @@ impl Rar4LzDecoder {
 
     fn begin_file_decode(&mut self) {
         self.pending_vm_filters.clear();
+        // Filter starts are only monotonic within one filter scope: a
+        // non-solid member restarts both the window and the base, so the
+        // push-side baseline restarts with it.
+        #[cfg(debug_assertions)]
+        {
+            self.last_pending_filter_base = 0;
+        }
         self.current_file_base_total = self.window.total_written();
         self.current_file_written_size = 0;
+        self.member_decode_done = false;
         self.window.mark_flushed(self.current_file_base_total);
     }
 
@@ -441,6 +509,18 @@ impl Rar4LzDecoder {
             self.vm_filters[filter_pos].filter_type
         };
 
+        // `PrgStack` is bounded the same way `Filters30` is (unpack30.cpp:
+        // 426-430). The oracle answers an overflow with `return false`, which
+        // ends the member decode; rarpar is stricter and surfaces it, matching
+        // how every other RAR4 resource bound in this decoder behaves.
+        if self.pending_vm_filters.len() > MAX3_UNPACK_FILTERS {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR4: queued VM filter blocks exceed maximum {MAX3_UNPACK_FILTERS}"
+                ),
+            });
+        }
+
         self.last_vm_filter = filter_pos;
         if rar4_debug_filters_enabled() {
             eprintln!(
@@ -448,6 +528,33 @@ impl Rar4LzDecoder {
                 block_start, block_length, filter_type, self.current_file_base_total
             );
         }
+        // Why `flush_ready_output_to_writer` may look at the queue head alone:
+        // a filter's start is `base + output_size + block_start`, where `base`
+        // only advances between members, `output_size` only grows inside the
+        // decode loop, and the stream-supplied `block_start` is a non-negative
+        // delta from that point. A stream written by RAR therefore queues
+        // filters in non-decreasing start order, so the head is the earliest
+        // block and the drain can stop as soon as the head is not flushable.
+        //
+        // Only the `base + output_size` half of that is an invariant this
+        // decoder can enforce, and it is what the assert below pins. The
+        // `block_start` delta comes from the archive and a corrupt stream can
+        // make it jump backwards, so out-of-order arrival stays *handled*
+        // rather than assumed: the drain drops a head that already sits behind
+        // the write border (see the `next_start < written_border` arm).
+        // Asserting the composed total here would turn that hostile-input path
+        // into a debug-build panic.
+        #[cfg(debug_assertions)]
+        {
+            let base = self.current_file_base_total + output_size;
+            debug_assert!(
+                base >= self.last_pending_filter_base,
+                "RAR4 filter base moved backwards: {base} < {}",
+                self.last_pending_filter_base
+            );
+            self.last_pending_filter_base = base;
+        }
+
         self.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type,
             block_start_total: self.current_file_base_total + output_size + block_start as u64,
@@ -457,34 +564,92 @@ impl Rar4LzDecoder {
         Ok(())
     }
 
-    fn itanium_get_bits(data: &[u8], bit_pos: u32, bit_count: u32) -> u32 {
+    /// The oracle addresses an Itanium bundle through a flat `byte *Data`
+    /// (rarvm.cpp:335-364), so neither of its bit helpers pays for a bounds
+    /// check. This port keeps the safety but pays the check once per bundle by
+    /// viewing the bundle as a fixed-size array: the widest reach is slot 2's
+    /// opcode read at bit 124, i.e. byte 15, and both helpers touch 4 bytes
+    /// from there, so byte 18 is the highest index either can reach. 22 is what
+    /// the loop condition `cur_pos + 21 < data_size` already proves addressable,
+    /// so forming the view can never fail and the inner accesses are all
+    /// statically in range.
+    const ITANIUM_BUNDLE_WINDOW: usize = 22;
+
+    /// The 4 bytes `bit_pos` addresses, as one bounds-checked window.
+    ///
+    /// `in_addr` is at most 15 (bit 124), so `in_addr + 4 <= 19` is always
+    /// within [`Self::ITANIUM_BUNDLE_WINDOW`] and this slice cannot panic.
+    #[inline(always)]
+    fn itanium_word_range(bit_pos: u32) -> std::ops::Range<usize> {
         let in_addr = (bit_pos / 8) as usize;
+        in_addr..in_addr + 4
+    }
+
+    #[inline(always)]
+    fn itanium_get_bits(
+        data: &[u8; Self::ITANIUM_BUNDLE_WINDOW],
+        bit_pos: u32,
+        bit_count: u32,
+    ) -> u32 {
         let in_bit = bit_pos & 7;
-        let mut bit_field = data[in_addr] as u32;
-        bit_field |= (data[in_addr + 1] as u32) << 8;
-        bit_field |= (data[in_addr + 2] as u32) << 16;
-        bit_field |= (data[in_addr + 3] as u32) << 24;
+        let word: [u8; 4] = data[Self::itanium_word_range(bit_pos)]
+            .try_into()
+            .expect("4-byte itanium window");
+        // Little-endian assembly of the four bytes, matching the oracle's
+        // byte-at-a-time `BitField |= Data[InAddr++] << N`.
+        let bit_field = u32::from_le_bytes(word);
         (bit_field >> in_bit) & (0xFFFF_FFFFu32 >> (32 - bit_count))
     }
 
-    fn itanium_set_bits(data: &mut [u8], bit_field: u32, bit_pos: u32, bit_count: u32) {
-        let in_addr = (bit_pos / 8) as usize;
+    #[inline(always)]
+    fn itanium_set_bits(
+        data: &mut [u8; Self::ITANIUM_BUNDLE_WINDOW],
+        bit_field: u32,
+        bit_pos: u32,
+        bit_count: u32,
+    ) {
         let in_bit = bit_pos & 7;
         let mut and_mask = !(0xFFFF_FFFFu32 >> (32 - bit_count) << in_bit);
         let mut bit_field = bit_field << in_bit;
 
-        for offset in 0..4 {
-            data[in_addr + offset] &= and_mask as u8;
-            data[in_addr + offset] |= bit_field as u8;
+        let word: &mut [u8; 4] = (&mut data[Self::itanium_word_range(bit_pos)])
+            .try_into()
+            .expect("4-byte itanium window");
+        for byte in word.iter_mut() {
+            *byte &= and_mask as u8;
+            *byte |= bit_field as u8;
             and_mask = (and_mask >> 8) | 0xFF00_0000;
             bit_field >>= 8;
         }
+    }
+
+    /// Stage a media filter's destination buffer inside `scratch`.
+    ///
+    /// The returned slice is deliberately **not** zeroed. Every media filter
+    /// below writes `dest[channel], dest[channel + channels], ...` for each
+    /// channel, which partitions `0..data_size` exactly, so no byte of the
+    /// returned slice is read before it is written. `scratch` only ever grows,
+    /// so the `resize` zero-fill is paid once per high-water mark rather than
+    /// once per filtered block.
+    fn media_scratch(scratch: &mut Vec<u8>, data_size: usize) -> &mut [u8] {
+        if scratch.len() < data_size {
+            scratch.resize(data_size, 0);
+        }
+        &mut scratch[..data_size]
+    }
+
+    /// Publish a media filter's result: swap the staged destination into
+    /// `data` and hand the now-stale input buffer back as the scratch.
+    fn commit_media_scratch(data: &mut Vec<u8>, scratch: &mut Vec<u8>, data_size: usize) {
+        std::mem::swap(data, scratch);
+        data.truncate(data_size);
     }
 
     fn execute_standard_filter(
         filter: &Rar4PendingVmFilter,
         written_file_size: u64,
         data: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
     ) -> RarResult<()> {
         let data_size = data.len();
         let file_offset = written_file_size as u32;
@@ -515,7 +680,12 @@ impl Rar4LzDecoder {
                     if byte >= 0 {
                         let cmd_mask = masks[byte as usize];
                         if cmd_mask != 0 {
-                            let bundle = &mut data[cur_pos..];
+                            // One bounds check for the whole bundle. The loop
+                            // condition above proves `cur_pos + 22 <= data_size`.
+                            let bundle: &mut [u8; Self::ITANIUM_BUNDLE_WINDOW] = (&mut data
+                                [cur_pos..cur_pos + Self::ITANIUM_BUNDLE_WINDOW])
+                                .try_into()
+                                .expect("itanium bundle window");
                             for slot in 0..=2u32 {
                                 if (cmd_mask & (1 << slot)) != 0 {
                                     let start_pos = slot * 41 + 5;
@@ -544,19 +714,28 @@ impl Rar4LzDecoder {
                     return Ok(());
                 }
 
-                let mut dest = vec![0u8; data_size];
-                let mut src_pos = 0usize;
-                for channel in 0..channels as usize {
+                let channels = channels as usize;
+                let dest = Self::media_scratch(scratch, data_size);
+
+                // Each channel consumes a contiguous run of the source and
+                // writes one strided lane of the destination. Splitting the
+                // source per channel and zipping the two exact-size iterators
+                // keeps the per-byte load and store out of bounds-check
+                // territory: neither side can outrun the other.
+                let mut src = &data[..data_size];
+                for channel in 0..channels {
+                    let lane_len = data_size.saturating_sub(channel).div_ceil(channels);
+                    let (lane, rest) = src.split_at(lane_len.min(src.len()));
+                    src = rest;
+
                     let mut prev_byte = 0u8;
-                    let mut dest_pos = channel;
-                    while dest_pos < data_size {
-                        prev_byte = prev_byte.wrapping_sub(data[src_pos]);
-                        dest[dest_pos] = prev_byte;
-                        src_pos += 1;
-                        dest_pos += channels as usize;
+                    for (out, &cur) in dest.iter_mut().skip(channel).step_by(channels).zip(lane) {
+                        prev_byte = prev_byte.wrapping_sub(cur);
+                        *out = prev_byte;
                     }
                 }
-                *data = dest;
+
+                Self::commit_media_scratch(data, scratch, data_size);
             }
             Rar4StandardFilter::Rgb => {
                 let width = filter.init_regs[0].wrapping_sub(3) as usize;
@@ -565,13 +744,31 @@ impl Rar4LzDecoder {
                     return Ok(());
                 }
 
-                let mut dest = vec![0u8; data_size];
-                let channels = 3usize;
-                let mut src_pos = 0usize;
-                for channel in 0..channels {
+                const CHANNELS: usize = 3;
+                let dest = Self::media_scratch(scratch, data_size);
+                // Unlike DELTA and AUDIO this filter reads `dest` back, at
+                // `index - width` and `index - width - 3`. Both are congruent
+                // to `index` modulo 3 exactly when the row stride is a whole
+                // number of RGB pixels, and are then earlier entries of the
+                // lane currently being written, i.e. already initialized. A
+                // stride that is not a multiple of 3 only occurs in malformed
+                // streams — the oracle reads whatever its VM memory happens to
+                // hold there — so zero the staging buffer in that case to keep
+                // rarpar's output deterministic rather than dependent on the
+                // previous block's leftovers.
+                if !width.is_multiple_of(CHANNELS) {
+                    dest.fill(0);
+                }
+
+                let mut src = &data[..data_size];
+                for channel in 0..CHANNELS {
+                    let lane_len = data_size.saturating_sub(channel).div_ceil(CHANNELS);
+                    let (lane, rest) = src.split_at(lane_len.min(src.len()));
+                    src = rest;
+
                     let mut prev_byte = 0u8;
                     let mut index = channel;
-                    while index < data_size {
+                    for &cur in lane {
                         let predicted = if index >= width + 3 {
                             let prev = u32::from(prev_byte);
                             let upper = u32::from(dest[index - width]);
@@ -592,11 +789,10 @@ impl Rar4LzDecoder {
                             u32::from(prev_byte)
                         };
 
-                        let value = (predicted as u8).wrapping_sub(data[src_pos]);
+                        let value = (predicted as u8).wrapping_sub(cur);
                         dest[index] = value;
                         prev_byte = value;
-                        src_pos += 1;
-                        index += channels;
+                        index += CHANNELS;
                     }
                 }
 
@@ -606,10 +802,10 @@ impl Rar4LzDecoder {
                     let g = dest[index + 1];
                     dest[index] = dest[index].wrapping_add(g);
                     dest[index + 2] = dest[index + 2].wrapping_add(g);
-                    index += 3;
+                    index += CHANNELS;
                 }
 
-                *data = dest;
+                Self::commit_media_scratch(data, scratch, data_size);
             }
             Rar4StandardFilter::Audio => {
                 let channels = filter.init_regs[0] as usize;
@@ -617,7 +813,7 @@ impl Rar4LzDecoder {
                     return Ok(());
                 }
 
-                let mut dest = vec![0u8; data_size];
+                let dest = Self::media_scratch(scratch, data_size);
                 let mut src_pos = 0usize;
                 for channel in 0..channels {
                     let mut prev_byte = 0u32;
@@ -660,15 +856,21 @@ impl Rar4LzDecoder {
                         dif[6] += (d + d3).abs();
 
                         if (byte_count & 0x1F) == 0 {
+                            // A constant-trip indexed loop over the fixed-size
+                            // array, not an iterator chain: LLVM unrolls this
+                            // and keeps `dif` scalarized in registers across
+                            // the whole channel instead of spilling it to a
+                            // stack slot for `iter_mut` to walk.
                             let mut min_dif = dif[0];
                             let mut min_index = 0usize;
                             dif[0] = 0;
-                            for (candidate, value) in dif.iter_mut().enumerate().skip(1) {
-                                if *value < min_dif {
-                                    min_dif = *value;
+                            #[allow(clippy::needless_range_loop)]
+                            for candidate in 1..dif.len() {
+                                if dif[candidate] < min_dif {
+                                    min_dif = dif[candidate];
                                     min_index = candidate;
                                 }
-                                *value = 0;
+                                dif[candidate] = 0;
                             }
                             match min_index {
                                 1 if k1 >= -16 => k1 -= 1,
@@ -686,7 +888,7 @@ impl Rar4LzDecoder {
                     }
                 }
 
-                *data = dest;
+                Self::commit_media_scratch(data, scratch, data_size);
             }
         }
 
@@ -755,6 +957,10 @@ impl Rar4LzDecoder {
             }
 
             let filter_block_length = self.pending_vm_filters[0].block_length;
+            // `VM_MEM_SIZE` itself is in range: the VM copies the block into
+            // its memory unmasked and only the *reported* filtered size is
+            // masked, so a `0x40000` block is staged, transformed and then
+            // emitted as zero bytes.
             if filter_block_length > VM_MEM_SIZE {
                 return Err(RarError::CorruptArchive {
                     detail: format!(
@@ -763,23 +969,38 @@ impl Rar4LzDecoder {
                 });
             }
 
-            let mut data = self
-                .window
-                .try_copy_output(next_start, filter_block_length)?;
+            // Staged through the decoder's own scratch: a filtered block is
+            // copied out of the window, transformed and written without any
+            // per-block allocation.
+            self.window.copy_output_into(
+                next_start,
+                filter_block_length,
+                &mut self.filter_scratch,
+            )?;
             let mut chain_len = 0usize;
             while chain_len < self.pending_vm_filters.len() {
                 let filter = &self.pending_vm_filters[chain_len];
-                if filter.block_start_total != next_start || filter.block_length != data.len() {
+                if filter.block_start_total != next_start
+                    || filter.block_length != self.filter_scratch.len()
+                {
                     break;
                 }
                 if filter.filter_type == Rar4StandardFilter::None {
-                    data.clear();
+                    self.filter_scratch.clear();
                 } else {
                     Self::execute_standard_filter(
                         filter,
                         self.current_file_written_size,
-                        &mut data,
+                        &mut self.filter_scratch,
+                        &mut self.media_scratch,
                     )?;
+                    // `RarVM::Execute` reports `InitR[4] & VM_MEMMASK` as the
+                    // filtered size (rarvm.cpp:29-30). The transform above ran
+                    // over the whole block just as the oracle's does; only the
+                    // emitted span is masked, and the next filter in the chain
+                    // is matched against this masked size.
+                    self.filter_scratch
+                        .truncate(filter.block_length & VM_MEM_MASK);
                 }
                 chain_len += 1;
             }
@@ -787,10 +1008,12 @@ impl Rar4LzDecoder {
             if rar4_debug_filters_enabled() {
                 eprintln!("RAR4 flush filter: [{next_start}, {block_end}) chain_len={chain_len}");
             }
-            writer.write_all(&data).map_err(RarError::Io)?;
+            writer
+                .write_all(&self.filter_scratch)
+                .map_err(RarError::Io)?;
             self.current_file_written_size = self
                 .current_file_written_size
-                .saturating_add(data.len() as u64);
+                .saturating_add(self.filter_scratch.len() as u64);
             self.window.mark_flushed(block_end);
             self.pending_vm_filters.drain(..chain_len);
         }
@@ -867,8 +1090,14 @@ impl Rar4LzDecoder {
         // discard any leftover from the previous area.
         // Only decoder state (window, tables, block type, PPM model and its
         // range coder registers) persists.
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
+        //
+        // The reader is new per member but its 512 KiB buffer is recycled: it
+        // is taken here and handed back on every exit path, error included.
+        let buf = self.take_input_buffer();
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer);
+        self.recycle_input_buffer(reader.into_buffer());
+        result
     }
 
     fn decompress_to_writer_with_reader<R: BitRead, W: Write>(
@@ -916,6 +1145,10 @@ impl Rar4LzDecoder {
 
             if self.window.unflushed_bytes() as usize >= flush_threshold {
                 self.flush_ready_output_to_writer(writer, false)?;
+            }
+
+            if self.member_decode_done {
+                break;
             }
         }
 
@@ -971,14 +1204,19 @@ impl Rar4LzDecoder {
             return Ok(Vec::new());
         }
 
-        let mut reader = StreamingBitReader::new(input);
-        self.decompress_to_writer_chunked_with_shared_transitions(
+        // Recycled input buffer, handed back on every exit path (see
+        // `decompress_reader_to_writer`).
+        let buf = self.take_input_buffer();
+        let mut reader = StreamingBitReader::with_buffer(input, buf);
+        let result = self.decompress_to_writer_chunked_with_shared_transitions(
             &mut reader,
             unpacked_size,
             first_volume_index,
             shared_transitions,
             writer_factory,
-        )
+        );
+        self.recycle_input_buffer(reader.into_buffer());
+        result
     }
 
     fn decompress_to_writer_chunked_with_reader<R: BitRead, F>(
@@ -1071,6 +1309,10 @@ impl Rar4LzDecoder {
                 current_writer = writer_factory(current_vol)?;
                 chunk_bytes = 0;
                 pending_boundary_volume = None;
+            }
+
+            if self.member_decode_done {
+                break;
             }
         }
 
@@ -1181,6 +1423,10 @@ impl Rar4LzDecoder {
                 current_writer = writer_factory(current_vol)?;
                 chunk_bytes = 0;
                 pending_boundary_volume = None;
+            }
+
+            if self.member_decode_done {
+                break;
             }
         }
 
@@ -1301,7 +1547,15 @@ impl Rar4LzDecoder {
         let mut i = 0;
         while i < HUFF_TABLE_SIZE {
             if reader.bits_remaining() < 1 {
-                break;
+                // Fail the whole table read when input runs out mid-table;
+                // building from a partial array would leak stale lengths from
+                // the previous block's tables (same hardening as the RAR5
+                // reader in huffman.rs).
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4: truncated main code length table: {i} of {HUFF_TABLE_SIZE} lengths"
+                    ),
+                });
             }
             let number = bc_table
                 .decode(reader)
@@ -1421,6 +1675,10 @@ impl Rar4LzDecoder {
         mut output_size: u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<u64> {
+        #[cfg(test)]
+        {
+            self.decode_lz_calls += 1;
+        }
         while output_size < unpacked_size {
             if !reader.has_bits() {
                 break;
@@ -1446,11 +1704,13 @@ impl Rar4LzDecoder {
             } else if number >= 271 {
                 // Regular match: decode length then distance.
                 let length_idx = number - 271;
-                if length_idx >= LDECODE.len() {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("RAR4: length index out of range: {length_idx}"),
-                    });
-                }
+                // The LD table is built from exactly `NC` (299) code lengths and
+                // `HuffmanTable::decode` cannot return a symbol at or past
+                // `num_symbols`, so `number - 271` is always below LDECODE's 28.
+                debug_assert!(
+                    length_idx < LDECODE.len(),
+                    "length index out of range: {length_idx}"
+                );
                 let mut length = LDECODE[length_idx] as usize + 3;
                 let lbits = LBITS[length_idx];
                 if lbits > 0 {
@@ -1485,13 +1745,21 @@ impl Rar4LzDecoder {
                 }
                 let continue_decompressing = self.read_end_of_block(reader)?;
                 if !continue_decompressing {
+                    // "New file" ends this member's decode; re-entering would
+                    // decode LZ symbols against the next member's stream.
+                    self.member_decode_done = true;
                     break;
                 }
                 if self.block_type != BlockType::Lz {
                     break;
                 }
             } else if number == 257 {
-                self.read_vm_code(reader, output_size)?;
+                if !self.read_vm_code(reader, output_size)? {
+                    // Truncated VM code packet: unpack30.cpp:210-215 breaks out
+                    // of the main loop and returns the partial output.
+                    self.member_decode_done = true;
+                    break;
+                }
             } else if number == 258 {
                 // Repeat previous match.
                 if self.last_length != 0 {
@@ -1527,11 +1795,13 @@ impl Rar4LzDecoder {
                             "RAR4: RD decode failed at output_size={output_size}: {err}"
                         ),
                     })? as usize;
-                if length_number >= LDECODE.len() {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("RAR4: RD length index out of range: {length_number}"),
-                    });
-                }
+                // The RD table is built from exactly `RC` (28) code lengths,
+                // which is LDECODE's length, and `HuffmanTable::decode` cannot
+                // return a symbol at or past `num_symbols`.
+                debug_assert!(
+                    length_number < LDECODE.len(),
+                    "RD length index out of range: {length_number}"
+                );
                 let mut length = LDECODE[length_number] as usize + 2; // +2 for cache refs
                 let lbits = LBITS[length_number];
                 if lbits > 0 {
@@ -1563,20 +1833,56 @@ impl Rar4LzDecoder {
                 output_size += visible_len as u64;
                 should_check_yield = true;
             } else {
-                return Err(RarError::CorruptArchive {
-                    detail: format!("RAR4: invalid symbol: {number}"),
-                });
+                // Unreachable: `number` is below the LD table's 299 symbols,
+                // 271..299 is taken by the match arm above, 256/257/258 are
+                // explicit, and the two arms before this one cover 259..271.
+                debug_assert!(false, "invalid symbol: {number}");
             }
 
             if should_check_yield
                 && let Some(threshold) = yield_threshold
                 && self.window.unflushed_bytes() as usize >= threshold
             {
+                // Yielding here asks the caller to flush. While the queue head
+                // pins the write border there is nothing for it to flush, and
+                // the border can only move once this loop has decoded the rest
+                // of the head's block — so the caller would flush nothing and
+                // immediately re-enter, once per symbol. Keep decoding in
+                // place instead; every other exit from this loop (end of
+                // block, new file, truncated VM code, input exhaustion) is
+                // untouched, and the yield fires as soon as a flush could
+                // actually make progress.
+                if self.flush_is_pinned_by_pending_head() {
+                    continue;
+                }
                 break;
             }
         }
 
         Ok(output_size)
+    }
+
+    /// True exactly when a flush attempt right now would move nothing.
+    ///
+    /// Mirrors the three conditions under which
+    /// [`Self::flush_ready_output_to_writer`] returns without writing: the
+    /// queue is non-empty, its head starts precisely at the write border (a
+    /// head *past* the border lets the prefix flush make progress, and one
+    /// *behind* it is dropped), and the head's block is not fully decoded yet.
+    ///
+    /// The overrun bound keeps the corrupt-stream guard in the chunked caller
+    /// (`unflushed > dict_size`) reachable at the same point it is today: past
+    /// that size the loop yields normally and the caller raises the error.
+    fn flush_is_pinned_by_pending_head(&self) -> bool {
+        let Some(head) = self.pending_vm_filters.first() else {
+            return false;
+        };
+        head.block_start_total == self.window.total_flushed()
+            && head
+                .block_start_total
+                .saturating_add(head.block_length as u64)
+                > self.window.total_written()
+            && self.window.unflushed_bytes() <= self.window.dict_size() as u64
     }
 
     /// Decode a full distance value from DD and LDD tables.
@@ -1591,11 +1897,13 @@ impl Rar4LzDecoder {
             .map_err(|err| RarError::CorruptArchive {
                 detail: format!("RAR4: DD decode failed: {err}"),
             })? as usize;
-        if dist_number >= DC {
-            return Err(RarError::CorruptArchive {
-                detail: format!("RAR4: distance code out of range: {dist_number}"),
-            });
-        }
+        // The DD table is built from exactly `DC` (60) code lengths — the size
+        // of `ddecode`/`dbits` — and `HuffmanTable::decode` cannot return a
+        // symbol at or past `num_symbols`.
+        debug_assert!(
+            dist_number < DC,
+            "distance code out of range: {dist_number}"
+        );
 
         let mut distance = self.ddecode[dist_number] as usize + 1;
         let bits = self.dbits[dist_number];
@@ -1691,25 +1999,44 @@ impl Rar4LzDecoder {
     }
 
     /// Read VM filter code (symbol 257) and queue a standard filter block.
-    fn read_vm_code<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<()> {
+    ///
+    /// Returns `false` when the packet is truncated. `ReadVMCode` answers input
+    /// exhaustion with `return false`, which breaks the unpack loop and ends the
+    /// member with whatever was already decoded (unpack30.cpp:210-215) — no
+    /// error. Malformed VM *data* that `add_vm_code` rejects still errors:
+    /// rarpar is deliberately stricter than the oracle there.
+    fn read_vm_code<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<bool> {
         if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 read_vm_code: output_size={output_size} bits_remaining={}",
                 reader.bits_remaining()
             );
         }
+        if !reader.has_exact_bits(8)? {
+            return Ok(false);
+        }
         let first_byte = reader.read_bits(8)? as u8;
+        // `decode_vm_code_length` consumes one further byte for the 7 form and
+        // two for the 8 form; check them here so a short packet stops the
+        // member instead of being mistaken for a malformed length.
+        let extra_length_bytes: usize = match (first_byte & 7) + 1 {
+            7 => 1,
+            8 => 2,
+            _ => 0,
+        };
+        if !reader.has_exact_bits(extra_length_bytes * 8)? {
+            return Ok(false);
+        }
         let length = Self::decode_vm_code_length(first_byte, || Ok(reader.read_bits(8)? as u8))?;
         let mut code = Vec::with_capacity(length);
         for _ in 0..length {
             if !reader.has_exact_bits(8)? {
-                return Err(RarError::CorruptArchive {
-                    detail: "RAR4: truncated VM code".into(),
-                });
+                return Ok(false);
             }
             code.push(reader.read_bits(8)? as u8);
         }
-        self.add_vm_code(first_byte, &code, output_size)
+        self.add_vm_code(first_byte, &code, output_size)?;
+        Ok(true)
     }
 
     /// Initialize a PPMd block from the RAR3 DecodeInit header.
@@ -1799,6 +2126,7 @@ impl Rar4LzDecoder {
 
         let mut switch_to_lz_tables = false;
         let mut end_marker_seen = false;
+        let mut ppm_corrupt = false;
 
         {
             // A solid member boundary can fall inside a PPMd block; one range
@@ -1854,9 +2182,9 @@ impl Rar4LzDecoder {
                             );
                         }
                     }
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR4: corrupt PPMd symbol stream".into(),
-                    });
+                    trace!("RAR4 PPMd corruption at output_size={output_size}: cleaning up");
+                    ppm_corrupt = true;
+                    break;
                 };
 
                 if ch == self.ppm_esc_char {
@@ -1887,9 +2215,11 @@ impl Rar4LzDecoder {
                                 );
                             }
                         }
-                        return Err(RarError::CorruptArchive {
-                            detail: "RAR4: corrupt PPMd command stream".into(),
-                        });
+                        trace!(
+                            "RAR4 PPMd command corruption at output_size={output_size}: cleaning up"
+                        );
+                        ppm_corrupt = true;
+                        break;
                     };
 
                     match next_ch {
@@ -1908,7 +2238,13 @@ impl Rar4LzDecoder {
                             break;
                         }
                         3 => {
-                            self.read_vm_code_ppm(&mut ppm_model, &mut rc, output_size)?;
+                            if !self.read_vm_code_ppm(&mut ppm_model, &mut rc, output_size)? {
+                                trace!(
+                                    "RAR4 PPMd VM-code corruption at output_size={output_size}: cleaning up"
+                                );
+                                ppm_corrupt = true;
+                                break;
+                            }
                         }
                         4 => {
                             let mut distance: u32 = 0;
@@ -1926,9 +2262,11 @@ impl Rar4LzDecoder {
                                 }
                             }
                             if failed {
-                                return Err(RarError::CorruptArchive {
-                                    detail: "RAR4: corrupt PPMd match command".into(),
-                                });
+                                trace!(
+                                    "RAR4 PPMd match-command corruption at output_size={output_size}: cleaning up"
+                                );
+                                ppm_corrupt = true;
+                                break;
                             }
                             if rar4_debug_filters_enabled() {
                                 eprintln!(
@@ -1947,9 +2285,11 @@ impl Rar4LzDecoder {
                         }
                         5 => {
                             let Some(len_byte) = ppm_model.decode_char_result(&mut rc)? else {
-                                return Err(RarError::CorruptArchive {
-                                    detail: "RAR4: corrupt PPMd run-length command".into(),
-                                });
+                                trace!(
+                                    "RAR4 PPMd run-length corruption at output_size={output_size}: cleaning up"
+                                );
+                                ppm_corrupt = true;
+                                break;
                             };
                             if rar4_debug_filters_enabled() {
                                 eprintln!(
@@ -1985,7 +2325,18 @@ impl Rar4LzDecoder {
                 self.window.put_bytes(&literals[..literal_len]);
             }
 
-            if !switch_to_lz_tables && matches!(self.block_type, BlockType::Ppm) {
+            if ppm_corrupt {
+                // SafePPMDecodeChar (unpack30.cpp:1-13, and the inlined copy at
+                // unpack30.cpp:77-83): reset the possibly corrupt PPM structures
+                // and fall back to the more fail-proof LZ mode. The oracle's
+                // caller then breaks out of the unpack loop, so the member ends
+                // with the output decoded so far instead of an error.
+                ppm_model.cleanup();
+                self.block_type = BlockType::Lz;
+                self.member_decode_done = true;
+            }
+
+            if !ppm_corrupt && !switch_to_lz_tables && matches!(self.block_type, BlockType::Ppm) {
                 // The output check is strictly `Written > DestSize`, so
                 // the esc,2 end-of-file marker following a member's last
                 // output byte is consumed before its decode ends. Consume it
@@ -2024,41 +2375,117 @@ impl Rar4LzDecoder {
     }
 
     /// Read VM filter code in PPM mode and queue a standard filter block.
+    ///
+    /// Returns `false` when the model reported corruption. `ReadVMCodePPM`
+    /// reads every byte through `SafePPMDecodeChar` and answers its `-1` with
+    /// `return false` (unpack30.cpp:104-131), which the caller turns into the
+    /// same CleanUp + `BLOCK_LZ` + end-of-member handling a corrupt literal
+    /// gets — not an archive error. Malformed VM *data* that `add_vm_code`
+    /// rejects still errors: rarpar is deliberately stricter there, matching
+    /// [`Self::read_vm_code`].
     fn read_vm_code_ppm<R: RangeCode>(
         &mut self,
         model: &mut Model,
         rc: &mut R,
         output_size: u64,
-    ) -> RarResult<()> {
+    ) -> RarResult<bool> {
+        let corrupt = std::cell::Cell::new(false);
         let read_model_byte = |model: &mut Model, rc: &mut R| -> RarResult<u8> {
-            let Some(byte) = model.decode_char_result(rc)? else {
-                return Err(RarError::CorruptArchive {
-                    detail: "RAR4: PPMd corrupt during VM filter read".into(),
-                });
-            };
-            Ok(byte)
+            match model.decode_char_result(rc)? {
+                Some(byte) => Ok(byte),
+                None => {
+                    corrupt.set(true);
+                    Ok(0)
+                }
+            }
         };
 
         let first_byte = read_model_byte(model, rc)?;
-        let length = Self::decode_vm_code_length(first_byte, || read_model_byte(model, rc))?;
+        if corrupt.get() {
+            return Ok(false);
+        }
+
+        // A corrupt length byte reads back as 0, which can make the length
+        // decode itself fail; that failure belongs to the corruption, not to
+        // the stream, so it degrades rather than erroring.
+        let length = match Self::decode_vm_code_length(first_byte, || read_model_byte(model, rc)) {
+            Ok(length) => length,
+            Err(_) if corrupt.get() => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        if corrupt.get() {
+            return Ok(false);
+        }
+
         let mut code = Vec::with_capacity(length);
         for _ in 0..length {
             code.push(read_model_byte(model, rc)?);
+            if corrupt.get() {
+                return Ok(false);
+            }
         }
 
-        self.add_vm_code(first_byte, &code, output_size)
+        self.add_vm_code(first_byte, &code, output_size)?;
+        Ok(true)
     }
 
     /// Prepare for solid continuation (keep window state, reset block state).
+    ///
+    /// `LowDistRepCount`/`PrevLowDist` are deliberately **not** cleared here:
+    /// the oracle resets them only in the LZ branch of `ReadTables30`
+    /// (unpack30.cpp:647-648), which [`Self::read_tables`] already mirrors. A
+    /// solid member that inherits its tables also inherits this state.
     pub fn prepare_solid_continuation(&mut self) {
         // Tables are kept across solid continuation.
         // Window state is preserved.
-        // Reset low distance state.
-        self.low_dist_rep_count = 0;
-        self.prev_low_dist = 0;
         self.pending_vm_filters.clear();
         self.current_file_base_total = self.window.total_written();
         self.current_file_written_size = 0;
+    }
+
+    /// Prepare this cached decoder for the next member of the archive.
+    ///
+    /// Mirrors `Unpack::DoUnpack` dispatching on the per-file solid flag plus
+    /// `UnpInitData(Solid)`/`UnpInitData30(Solid)` (unpack.cpp:192-228,
+    /// unpack30.cpp:741-768). A non-solid member restarts every adaptive
+    /// structure **without** giving up an allocation: the window is re-pointed
+    /// through [`Window::reset_for_reuse`] (no memset), and the PPMd model is
+    /// kept so its arena survives — the oracle likewise keeps `ModelPPM`
+    /// across files, with `DecodeInit` restarting it and `StartSubAllocator`
+    /// early-outing on an unchanged size (suballoc.cpp:79-83).
+    pub fn prepare_member(&mut self, solid: bool, dict_size: usize) -> RarResult<()> {
+        if solid {
+            self.ensure_solid_dict_compat(dict_size)?;
+            self.prepare_solid_continuation();
+            return Ok(());
+        }
+
+        // No memset: `reset_for_reuse` documents why the window's own
+        // first-window guard makes leftover bytes unreachable.
+        self.window.reset_for_reuse(dict_size)?;
+
+        self.dist_cache = [usize::MAX; 4];
+        self.last_length = 0;
+        self.ld_table = None;
+        self.dd_table = None;
+        self.ldd_table = None;
+        self.rd_table = None;
+        self.code_lengths.fill(0);
+        self.tables_read = false;
+        self.block_type = BlockType::Lz;
+        self.ppm_esc_char = 2;
+        // InitFilters30(false): filter definitions, their memos and the queued
+        // blocks all go away for a non-solid member.
+        self.reset_vm_filter_state();
+        self.ppm_rc_state = None;
+        // `ppm_model` is intentionally retained; see the doc comment.
+        self.current_file_base_total = 0;
+        self.current_file_written_size = 0;
+        Ok(())
+    }
+
+    fn ensure_solid_dict_compat(&mut self, dict_size: usize) -> RarResult<()> {
+        ensure_solid_window_dict(self.window.dict_size(), dict_size)
     }
 
     /// Reset the decoder for a new non-solid file.
@@ -2081,8 +2508,28 @@ impl Rar4LzDecoder {
         self.current_file_base_total = 0;
         self.current_file_written_size = 0;
         self.ppm_rc_state = None;
+        self.member_decode_done = false;
         self.window.reset();
     }
+}
+
+/// Reject a solid member that declares a dictionary larger than the live
+/// window.
+///
+/// The window cannot grow mid-solid-stream without discarding the history the
+/// member is entitled to reference — the oracle throws `bad_alloc` for exactly
+/// this case (unpack.cpp:110-123) — so this mirrors
+/// `LzDecoder::ensure_solid_member_compat`. A non-solid member is free to grow
+/// through `Window::ensure_capacity`; it starts from an empty history.
+pub(crate) fn ensure_solid_window_dict(live_dict_size: usize, dict_size: usize) -> RarResult<()> {
+    if dict_size > live_dict_size {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "solid member declares {dict_size} byte dictionary but the solid stream window is {live_dict_size} bytes"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Decompress RAR4 LZ data.
@@ -2194,6 +2641,72 @@ mod tests {
         }
     }
 
+    /// D1: the 512 KiB streaming input buffer is allocated once and handed
+    /// from member to member, and its stale contents never reach a decode.
+    #[test]
+    fn streaming_input_buffer_is_recycled_across_members_without_leaking_stale_bytes() {
+        use std::io::Cursor;
+
+        // 0x55 keeps the leading PPM flag bit clear, so this stays on the LZ
+        // path (no PPMd arena allocation), and is non-zero so the recycled
+        // buffer is visibly dirty for the next member.
+        let member1 = vec![0x55u8; 600 * 1024];
+        let member2: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+
+        let mut recycling = Rar4LzDecoder::new(0x40000);
+        recycling.prepare_member(false, 0x40000).unwrap();
+        let mut out1 = Vec::new();
+        let _ = recycling.decompress_reader_to_writer(Cursor::new(&member1), 4096, &mut out1);
+
+        let parked = recycling
+            .input_buffer_for_test()
+            .expect("buffer parked after member 1");
+        let addr_after_first = parked.as_ptr() as usize;
+        // The buffer really is dirty: this is the state the next member starts
+        // from, and it is deliberately not zeroed.
+        assert!(
+            parked.contains(&0x55),
+            "member 1 should have left bytes in the recycled buffer"
+        );
+
+        recycling.prepare_member(false, 0x40000).unwrap();
+        let mut out2 = Vec::new();
+        let recycled_result =
+            recycling.decompress_reader_to_writer(Cursor::new(&member2), 4096, &mut out2);
+        let addr_after_second = recycling
+            .input_buffer_for_test()
+            .expect("buffer parked after member 2")
+            .as_ptr() as usize;
+
+        // One allocation for both members, returned on every exit path
+        // (member 1 above may well have ended in an error).
+        assert_eq!(
+            addr_after_first, addr_after_second,
+            "streaming input buffer was reallocated between members"
+        );
+
+        // A fresh decoder starts from a zeroed buffer. Identical answers prove
+        // no byte above `buf_len` is observable, i.e. reuse needs no zeroing.
+        let mut fresh = Rar4LzDecoder::new(0x40000);
+        fresh.prepare_member(false, 0x40000).unwrap();
+        let mut fresh_out = Vec::new();
+        let fresh_result =
+            fresh.decompress_reader_to_writer(Cursor::new(&member2), 4096, &mut fresh_out);
+
+        assert_eq!(
+            out2, fresh_out,
+            "recycled buffer changed the decoded output"
+        );
+        assert_eq!(
+            recycled_result.is_ok(),
+            fresh_result.is_ok(),
+            "recycled buffer changed the decode outcome"
+        );
+        if let (Ok(a), Ok(b)) = (&recycled_result, &fresh_result) {
+            assert_eq!(a, b);
+        }
+    }
+
     #[test]
     fn test_decoder_creation() {
         let decoder = Rar4LzDecoder::new(4 * 1024 * 1024);
@@ -2215,10 +2728,14 @@ mod tests {
         assert!(decoder.ppm_rc_state.is_none());
     }
 
+    /// Previously pinned as `Err(CorruptArchive)`. The oracle answers a `-1`
+    /// from `DecodeChar` with `PPM.CleanUp()` + `UnpBlockType=BLOCK_LZ` and
+    /// breaks the unpack loop (unpack30.cpp:1-13 and 77-83), so the member ends
+    /// with the output decoded so far instead of failing.
     #[test]
-    fn corrupt_ppmd_symbol_stops_the_unpack_loop() {
+    fn corrupt_ppmd_symbol_cleans_up_and_falls_back_to_lz_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024 * 1024);
-        decoder.ppm_model = Some(Model::new(16, 1024 * 1024));
+        decoder.ppm_model = Some(Model::new(16, 4 * 1024 * 1024));
         decoder.block_type = BlockType::Ppm;
         let input = [0xff; 4];
         let mut reader = BitReader::new(&input);
@@ -2226,8 +2743,281 @@ mod tests {
 
         let result = decoder.decode_ppm_symbols(&mut reader, 1, 0, None, &mut output);
 
-        assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
-        assert!(matches!(decoder.block_type, BlockType::Ppm));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(decoder.block_type, BlockType::Lz));
+        assert!(decoder.member_decode_done);
+        assert!(decoder.ppm_rc_state.is_none());
+        // The model survives, shrunk to the CleanUp allocation.
+        assert!(decoder.ppm_model.is_some());
+        assert!(output.is_empty());
+    }
+
+    /// The escape-3 (VM filter code) command reads every byte through
+    /// `SafePPMDecodeChar` too, and `ReadVMCodePPM` answers a `-1` with
+    /// `return false` (unpack30.cpp:104-131) — the member ends through the
+    /// same CleanUp path rather than failing the archive.
+    ///
+    /// This reuses the exact model/stream pair pinned by
+    /// `corrupt_ppmd_symbol_cleans_up_and_falls_back_to_lz_like_rar_behavior`:
+    /// a freshly restarted order-16 model reports corruption on its very first
+    /// symbol, because the initial 256-symbol root context has `SummFreq` 257
+    /// and an all-ones code decodes to a count of exactly 257, which is out of
+    /// range.
+    #[test]
+    fn corrupt_ppmd_vm_code_ends_the_member_instead_of_failing_the_archive() {
+        let mut decoder = Rar4LzDecoder::new(1024 * 1024);
+        let mut model = Model::new(16, 4 * 1024 * 1024);
+        let input = [0xff; 4];
+        let mut reader = BitReader::new(&input);
+        let mut rc = BitReadRangeDecoder::new(&mut reader).unwrap();
+
+        let result = decoder.read_vm_code_ppm(&mut model, &mut rc, 0);
+
+        assert!(
+            matches!(result, Ok(false)),
+            "corrupt VM filter code must degrade, not error: {result:?}"
+        );
+    }
+
+    /// The PPMd arena must survive a member boundary: [`Model::start`]
+    /// early-outs when the declared allocation size is unchanged, exactly as
+    /// `StartSubAllocator` does (suballoc.cpp:79-83), so the second member of a
+    /// multi-member PPMd archive reuses the pages the first one faulted in. A
+    /// *different* declared size must still reallocate.
+    #[test]
+    fn ppmd_arena_is_reused_across_members_with_the_same_declared_size() {
+        // `init_ppm` runs with the PPM flag bit already consumed: 7 bits of the
+        // MaxOrder byte, then the allocator size in MB when the reset flag is
+        // set. 0x2F = reset (0x20) + order 16 (0x1F), new-escape flag clear.
+        fn init_bits(max_mb: u8) -> Vec<u8> {
+            let mut bits: Vec<u8> = (0..7).rev().map(|i| (0x2Fu8 >> i) & 1).collect();
+            bits.extend((0..8).rev().map(|i| (max_mb >> i) & 1));
+            bits
+        }
+
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+
+        let one_mb = pack_bits(&init_bits(0));
+        decoder.init_ppm(&mut BitReader::new(&one_mb)).unwrap();
+        let model = decoder.ppm_model.as_ref().unwrap();
+        let arena = model.arena_addr();
+        assert_eq!(model.arena_size(), 1024 * 1024);
+
+        // Member 2 declares the same size. `prepare_member` keeps the model.
+        decoder.prepare_member(false, 0x40000).unwrap();
+        decoder.init_ppm(&mut BitReader::new(&one_mb)).unwrap();
+        let model = decoder.ppm_model.as_ref().unwrap();
+        assert_eq!(
+            model.arena_addr(),
+            arena,
+            "a same-size PPMd restart must reuse the arena, not fault in a fresh one"
+        );
+        assert_eq!(model.arena_size(), 1024 * 1024);
+
+        // Member 3 declares a different size, which must still reallocate.
+        let two_mb = pack_bits(&init_bits(1));
+        decoder.prepare_member(false, 0x40000).unwrap();
+        decoder.init_ppm(&mut BitReader::new(&two_mb)).unwrap();
+        let model = decoder.ppm_model.as_ref().unwrap();
+        assert_eq!(model.arena_size(), 2 * 1024 * 1024);
+        assert_ne!(
+            model.arena_addr(),
+            arena,
+            "a changed PPMd allocation size must replace the arena"
+        );
+    }
+
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (index, &bit) in bits.iter().enumerate() {
+            if bit != 0 {
+                out[index / 8] |= 0x80 >> (index % 8);
+            }
+        }
+        out
+    }
+
+    fn nibble_bits(value: u8) -> [u8; 4] {
+        [
+            (value >> 3) & 1,
+            (value >> 2) & 1,
+            (value >> 1) & 1,
+            value & 1,
+        ]
+    }
+
+    #[test]
+    fn truncated_main_code_length_table_is_rejected() {
+        let mut bits = vec![0u8, 0u8]; // LZ block, do not inherit code lengths.
+        // BC table: symbols 0 and 1 each get a one-bit code (a complete tree).
+        bits.extend_from_slice(&nibble_bits(1));
+        bits.extend_from_slice(&nibble_bits(1));
+        for _ in 2..BC {
+            bits.extend_from_slice(&nibble_bits(0));
+        }
+        // A few "delta 0" symbols, then the stream simply stops part-way
+        // through the 404 main code lengths.
+        bits.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let data = pack_bits(&bits);
+
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        let mut reader = BitReader::new(&data);
+        let err = decoder.read_tables(&mut reader).unwrap_err();
+
+        assert!(
+            matches!(&err, RarError::CorruptArchive { detail } if detail.contains("truncated")),
+            "{err:?}"
+        );
+        assert!(!decoder.tables_read);
+        assert!(decoder.ld_table.is_none());
+    }
+
+    #[test]
+    fn non_solid_member_restarts_the_window_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"FIRST-MEMBER-DATA");
+        decoder.tables_read = true;
+        decoder.dist_cache = [7, 8, 9, 10];
+        decoder.last_length = 5;
+        decoder.ppm_esc_char = 9;
+        decoder.block_type = BlockType::Ppm;
+        decoder.last_vm_filter = 3;
+        decoder.vm_filters.push(Rar4VmFilterDefinition {
+            filter_type: Rar4StandardFilter::Delta,
+            last_block_length: 8,
+        });
+        decoder.ppm_model = Some(Model::new(6, 1024 * 1024));
+
+        decoder.prepare_member(false, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 0);
+        assert!(!decoder.tables_read);
+        assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
+        assert_eq!(decoder.last_length, 0);
+        assert_eq!(decoder.ppm_esc_char, 2);
+        assert!(matches!(decoder.block_type, BlockType::Lz));
+        assert!(decoder.vm_filters.is_empty());
+        assert_eq!(decoder.last_vm_filter, 0);
+        // The PPMd arena persists across files exactly as ModelPPM does.
+        assert!(decoder.ppm_model.is_some());
+
+        // The decisive check: a back-reference into the previous member's bytes
+        // must zero-fill rather than resurrect them.
+        decoder.begin_file_decode();
+        decoder.window.copy_with_visible_len(4, 4, 4).unwrap();
+        assert_eq!(decoder.window.try_copy_output(0, 4).unwrap(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn solid_member_keeps_the_window_and_low_dist_state_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"ABCD");
+        decoder.tables_read = true;
+        decoder.low_dist_rep_count = 5;
+        decoder.prev_low_dist = 9;
+        decoder.dist_cache = [7, 8, 9, 10];
+
+        decoder.prepare_member(true, 0x40000).unwrap();
+
+        assert_eq!(decoder.window.total_written(), 4);
+        assert!(decoder.tables_read);
+        assert_eq!(decoder.dist_cache, [7, 8, 9, 10]);
+        // ReadTables30 owns these (unpack30.cpp:647-648), not UnpInitData30.
+        assert_eq!(decoder.low_dist_rep_count, 5);
+        assert_eq!(decoder.prev_low_dist, 9);
+
+        // The window history is still reachable from the next member.
+        decoder.begin_file_decode();
+        decoder.window.copy_with_visible_len(4, 4, 4).unwrap();
+        assert_eq!(decoder.window.try_copy_output(4, 4).unwrap(), b"ABCD");
+    }
+
+    #[test]
+    fn solid_member_cannot_grow_the_dictionary_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+
+        let err = decoder.prepare_member(true, 0x80000).unwrap_err();
+        assert!(
+            matches!(&err, RarError::CorruptArchive { detail } if detail.contains("solid stream window")),
+            "{err:?}"
+        );
+        assert_eq!(decoder.window.dict_size(), 0x40000);
+
+        // A non-solid member starts from an empty history, so it may grow.
+        decoder.prepare_member(false, 0x80000).unwrap();
+        assert_eq!(decoder.window.dict_size(), 0x80000);
+    }
+
+    #[test]
+    fn vm_filter_block_of_exactly_vm_mem_size_emits_nothing_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(VM_MEM_SIZE * 2);
+        decoder.begin_file_decode();
+        let chunk = vec![0xE8u8; 4096];
+        for _ in 0..(VM_MEM_SIZE / chunk.len()) {
+            decoder.window.put_bytes(&chunk);
+        }
+        decoder.window.put_bytes(b"TAIL");
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 0,
+            block_length: VM_MEM_SIZE,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        // FilteredDataSize is InitR[4] & VM_MEMMASK, which is 0 here, but the
+        // written border still jumps past the whole block.
+        assert_eq!(out, b"TAIL");
+        assert!(decoder.pending_vm_filters.is_empty());
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    #[test]
+    fn queued_vm_filter_blocks_are_bounded_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.vm_filters.push(Rar4VmFilterDefinition {
+            filter_type: Rar4StandardFilter::None,
+            last_block_length: 1,
+        });
+        decoder.pending_vm_filters = vec![
+            Rar4PendingVmFilter {
+                filter_type: Rar4StandardFilter::None,
+                block_start_total: 0,
+                block_length: 1,
+                init_regs: [0; 7],
+            };
+            MAX3_UNPACK_FILTERS + 1
+        ];
+
+        // first_byte 0x00: reuse the last slot, inherit its block length.
+        let err = decoder.add_vm_code(0x00, &[0x00], 0).unwrap_err();
+
+        assert!(
+            matches!(&err, RarError::CorruptArchive { detail } if detail.contains("8192")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_vm_code_ends_the_member_without_an_error_like_rar_behavior() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        let data = [0x00u8];
+        let mut reader = BitReader::new(&data);
+        reader.read_bits(4).unwrap();
+
+        // Fewer than eight bits left: ReadVMCode returns false, which breaks
+        // the unpack loop rather than failing the member.
+        assert!(!decoder.read_vm_code(&mut reader, 0).unwrap());
     }
 
     #[test]
@@ -2321,7 +3111,7 @@ mod tests {
             init_regs: [1, 0, 0, 0, 4, 0, 0],
         };
         let mut data = vec![1u8, 2, 3, 4];
-        Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut data).unwrap();
+        Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut data, &mut Vec::new()).unwrap();
         assert_eq!(data, vec![255, 253, 250, 246]);
     }
 
@@ -2347,7 +3137,8 @@ mod tests {
             let expected = data.clone();
             let mut actual = data;
 
-            Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut actual).unwrap();
+            Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut actual, &mut Vec::new())
+                .unwrap();
 
             assert_eq!(actual, expected, "filter {filter_type:?}");
         }
@@ -2355,10 +3146,15 @@ mod tests {
 
     #[test]
     fn test_vm_itanium_filter_advances_per_bundle_like_rar_behavior() {
+        const W: usize = Rar4LzDecoder::ITANIUM_BUNDLE_WINDOW;
+        fn window(data: &mut [u8], at: usize) -> &mut [u8; W] {
+            (&mut data[at..at + W]).try_into().unwrap()
+        }
+
         let mut data = vec![0u8; 48];
         data[16] = 0x10; // selects mask 4, which probes slot 2 in this bundle.
-        Rar4LzDecoder::itanium_set_bits(&mut data[16..], 0x12345, 100, 20);
-        Rar4LzDecoder::itanium_set_bits(&mut data[16..], 5, 124, 4);
+        Rar4LzDecoder::itanium_set_bits(window(&mut data, 16), 0x12345, 100, 20);
+        Rar4LzDecoder::itanium_set_bits(window(&mut data, 16), 5, 124, 4);
 
         Rar4LzDecoder::execute_standard_filter(
             &Rar4PendingVmFilter {
@@ -2369,12 +3165,16 @@ mod tests {
             },
             0,
             &mut data,
+            &mut Vec::new(),
         )
         .unwrap();
 
-        assert_eq!(Rar4LzDecoder::itanium_get_bits(&data[..], 100, 20), 0);
         assert_eq!(
-            Rar4LzDecoder::itanium_get_bits(&data[16..], 100, 20),
+            Rar4LzDecoder::itanium_get_bits(window(&mut data, 0), 100, 20),
+            0
+        );
+        assert_eq!(
+            Rar4LzDecoder::itanium_get_bits(window(&mut data, 16), 100, 20),
             0x12344
         );
     }
@@ -2492,6 +3292,121 @@ mod tests {
             .unwrap();
 
         assert_eq!(out, b"prefixsuffix");
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    /// D5: a filter block spanning nearly the whole dictionary pins the write
+    /// border for its entire length. The decode loop must ride that out in
+    /// place instead of yielding to a caller that has nothing to flush.
+    #[test]
+    fn border_pinned_filter_block_does_not_re_enter_the_lz_loop_per_symbol() {
+        const DICT: usize = 1024;
+        const BLOCK: usize = 1000;
+
+        let mut decoder = Rar4LzDecoder::new(DICT);
+        // A single 1-bit code for symbol 0, so every zero bit decodes to one
+        // literal byte and the stream below is a pure literal run.
+        let mut ld_lengths = vec![0u8; NC];
+        ld_lengths[0] = 1;
+        decoder.ld_table = Some(HuffmanTable::build(&ld_lengths).unwrap());
+        decoder.begin_file_decode();
+
+        // The block starts exactly at the write border and ends past anything
+        // this round can produce: the flush border cannot move until the whole
+        // block is decoded.
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 0,
+            block_length: BLOCK,
+            init_regs: [0; 7],
+        });
+        assert!(
+            decoder.flush_is_pinned_by_pending_head(),
+            "an undecoded head block starting at the border must pin the flush"
+        );
+
+        let input = vec![0u8; BLOCK.div_ceil(8) + 32];
+        let mut reader = BitReader::new(&input);
+        let mut out = Vec::new();
+
+        // The shape of the real decode loop, with a deliberately tiny flush
+        // threshold so every symbol would have yielded before this fix.
+        let mut output_size = 0u64;
+        while output_size < BLOCK as u64 {
+            let before = output_size;
+            output_size = decoder
+                .decode_lz_symbols(&mut reader, BLOCK as u64, output_size, Some(64))
+                .expect("border-pinned decode must not fail");
+            decoder
+                .flush_ready_output_to_writer(&mut out, false)
+                .expect("flush during a pinned border must not fail");
+            assert!(
+                output_size > before,
+                "decode made no progress: {output_size} bytes after {} calls",
+                decoder.decode_lz_calls
+            );
+        }
+
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .expect("final flush must not fail");
+
+        // The whole block decoded, and the E8 filter over an all-zero block is
+        // a no-op, so every byte comes back.
+        assert_eq!(output_size, BLOCK as u64);
+        assert_eq!(out.len(), BLOCK);
+        assert!(out.iter().all(|&b| b == 0));
+
+        // The point of the fix: the pinned stretch is decoded in place. Per
+        // symbol re-entry would be BLOCK (1000) calls.
+        assert!(
+            decoder.decode_lz_calls <= 4,
+            "border-pinned decode re-entered {} times for {BLOCK} symbols",
+            decoder.decode_lz_calls
+        );
+
+        // Once the block is fully decoded the pin releases, so ordinary
+        // threshold yielding is restored.
+        assert!(!decoder.flush_is_pinned_by_pending_head());
+    }
+
+    /// D4: the drain reads only the queue head, which is sound because valid
+    /// streams queue filters in non-decreasing start order. A corrupt stream
+    /// can still queue a start that moves backwards; it must be dropped by the
+    /// `next_start < written_border` arm rather than panic or corrupt output.
+    #[test]
+    fn out_of_order_filter_start_is_dropped_instead_of_panicking() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"prefixBLOCKsuffix");
+
+        // Queued directly: `add_vm_code` cannot produce this order from a
+        // well-formed stream, so this stands in for a corrupt archive.
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::None,
+            block_start_total: 6,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 2, // behind the filter already queued.
+            block_length: 4,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .expect("out-of-order filter start must not fail the member");
+
+        // The first filter still suppresses its block; the stale one is
+        // dropped once the border has passed it, and everything drains.
+        assert_eq!(out, b"prefixsuffix");
+        assert!(decoder.pending_vm_filters.is_empty());
         assert_eq!(
             decoder.window.total_flushed(),
             decoder.window.total_written()
@@ -2629,6 +3544,7 @@ mod tests {
             },
             0,
             &mut data,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2722,6 +3638,7 @@ mod tests {
             },
             0,
             &mut data,
+            &mut Vec::new(),
         )
         .unwrap();
 

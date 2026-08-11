@@ -26,11 +26,23 @@ only its archive/parity source material, a manifest, and expected extracted
 file hashes. The temporary original payload is independently extracted and
 verified before it is discarded.
 
-The default RAR extraction suite covers legacy RAR3 volumes, RAR4 LZ, and RAR5
-normal, solid, and encrypted archives. The in-progress RAR4 PPMd multi-volume
-cases are retained separately in `bench/rarpar-bench/config/corpus-ppmd.json`.
-They use deterministic text payloads and are intentionally opt-in until the
-decoder work settles.
+The default RAR extraction suite covers archives produced by locked RAR 3.93,
+4.20, 5.00, 6.24, and 7.23 writers. It includes stored and compressed data,
+single and multi-volume layouts, solid streams, data-only and header
+encryption, recovery volumes, and four RAR4 PPMd workloads. RAR 7.x still
+writes the RAR5 container format; the workload labels preserve the writer
+version so results do not imply a distinct RAR7 container format.
+
+RAR 7's compression algorithm version 1 requires dictionaries above 4 GiB and
+is not part of the routine performance corpus. Large-dictionary compatibility
+fixtures belong in a separate corpus with explicit memory and disk
+requirements.
+
+The PAR2 suite covers generation, verification, and repair. Generation stages
+a 256 MiB RAR5 multi-volume input set, creates a fresh recovery set with the
+declared slice size and recovery percentage, and validates the result with the
+reference verifier outside the timed operation. This keeps generation results
+comparable while ensuring each generated set protects the intended inputs.
 
 ## Runs
 

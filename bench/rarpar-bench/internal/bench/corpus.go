@@ -59,17 +59,38 @@ func (config CorpusConfig) Validate() error {
 		if item.PPMd && profile != "text" {
 			return fmt.Errorf("PPMd case %q must use the text payload profile", item.ID)
 		}
+		if item.HeaderEncrypted && !item.Encrypted {
+			return fmt.Errorf("case %q encrypts headers without enabling encryption", item.ID)
+		}
 		if item.PayloadBytes < 0 {
 			return fmt.Errorf("case %q has a negative payload size", item.ID)
 		}
 		if item.Mutation != "none" && item.Mutation != "damage" && item.Mutation != "heavy-damage" && item.Mutation != "remove-volume" {
 			return fmt.Errorf("case %q has unsupported mutation %q", item.ID, item.Mutation)
 		}
+		if item.PAR2Operation != "" && item.PAR2Operation != "create" {
+			return fmt.Errorf("case %q has unsupported PAR2 operation %q", item.ID, item.PAR2Operation)
+		}
+		if item.PAR2Operation != "" && item.Family != "par2" {
+			return fmt.Errorf("non-PAR2 case %q has a PAR2 operation", item.ID)
+		}
+		if item.PAR2Operation == "create" && (item.PAR2 || item.Mutation != "none") {
+			return fmt.Errorf("PAR2 generation case %q must start from clean source files without parity", item.ID)
+		}
+		if item.PAR2Operation == "create" && item.PAR2RecoveryPercent == 0 {
+			return fmt.Errorf("PAR2 generation case %q requires an explicit recovery percent", item.ID)
+		}
 		if item.Mutation == "heavy-damage" && (item.DamageCount < 1 || item.DamageBytesPerSite < 1 || item.PAR2SliceSize < 1) {
 			return fmt.Errorf("heavy-damage case %q requires damage count, bytes per site, and PAR2 slice size", item.ID)
 		}
-		if item.Mutation != "heavy-damage" && (item.DamageCount != 0 || item.DamageBytesPerSite != 0 || item.PAR2SliceSize != 0) {
+		if item.Mutation != "heavy-damage" && (item.DamageCount != 0 || item.DamageBytesPerSite != 0) {
 			return fmt.Errorf("case %q has heavy-damage settings without the heavy-damage mutation", item.ID)
+		}
+		if item.PAR2SliceSize < 0 || (item.PAR2SliceSize != 0 && item.Family != "par2") {
+			return fmt.Errorf("case %q has invalid PAR2 slice size", item.ID)
+		}
+		if item.PAR2RecoveryPercent < 0 || item.PAR2RecoveryPercent > 100 || (item.PAR2RecoveryPercent != 0 && item.Family != "par2") {
+			return fmt.Errorf("case %q has invalid PAR2 recovery percent", item.ID)
 		}
 		if item.FixtureDir != "" {
 			if item.FixturePrefix == "" || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(item.FixtureSHA256) {
@@ -78,7 +99,7 @@ func (config CorpusConfig) Validate() error {
 		} else if item.FixturePrefix != "" || item.FixtureSHA256 != "" {
 			return fmt.Errorf("case %q has incomplete fixture provenance", item.ID)
 		}
-		if item.Family == "par2" && !item.PAR2 {
+		if item.Family == "par2" && !item.PAR2 && item.PAR2Operation != "create" {
 			return fmt.Errorf("PAR2 case %q must generate parity", item.ID)
 		}
 		if item.Mutation != "none" && !item.PAR2 && !item.RecoveryVolumes {
@@ -186,7 +207,11 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 			archiveArgs = append(archiveArgs, "-s-")
 		}
 		if item.Encrypted {
-			archiveArgs = append(archiveArgs, "-hp"+benchmarkPassword)
+			passwordSwitch := "-p"
+			if item.HeaderEncrypted {
+				passwordSwitch = "-hp"
+			}
+			archiveArgs = append(archiveArgs, passwordSwitch+benchmarkPassword)
 		}
 		if item.RecoveryVolumes {
 			archiveArgs = append(archiveArgs, "-rv2")
@@ -199,7 +224,7 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 	if item.PAR2 && item.FixtureDir == "" {
 		par2 := lock.PAR2Generator
 		par2Args := []string{"run", "--rm", "--platform", par2.Platform, "-v", workRoot + ":/work", "-w", "/work", par2.Image,
-			"c", "-q", fmt.Sprintf("-r%d", config.PAR2RedundancyPercent), "-s65536", "release.par2"}
+			"c", "-q", fmt.Sprintf("-r%d", par2RecoveryPercent(config, item)), fmt.Sprintf("-s%d", par2SliceSize(item)), "release.par2"}
 		archiveFiles, err := archiveFilesIn(workRoot)
 		if err != nil {
 			return err
@@ -251,6 +276,20 @@ func payloadBytesForCase(config CorpusConfig, item CaseConfig) int64 {
 		return item.PayloadBytes
 	}
 	return config.PayloadBytes
+}
+
+func par2SliceSize(item CaseConfig) int64 {
+	if item.PAR2SliceSize > 0 {
+		return item.PAR2SliceSize
+	}
+	return 64 * 1024
+}
+
+func par2RecoveryPercent(config CorpusConfig, item CaseConfig) int {
+	if item.PAR2RecoveryPercent > 0 {
+		return item.PAR2RecoveryPercent
+	}
+	return config.PAR2RedundancyPercent
 }
 
 func writeDeterministicPayload(root, seed, caseID string, total int64, profile string) ([]ExpectedFile, error) {

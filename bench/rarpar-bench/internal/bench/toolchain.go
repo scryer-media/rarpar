@@ -43,7 +43,7 @@ func (lock ToolchainLock) Validate() error {
 		seen[writer.ID] = true
 		formats[writer.ID] = true
 	}
-	for _, required := range []string{"rarlab-3.93", "rarlab-4.20", "rarlab-5.00"} {
+	for _, required := range []string{"rarlab-3.93", "rarlab-4.20", "rarlab-5.00", "rarlab-6.24", "rarlab-7.23"} {
 		if !formats[required] {
 			return fmt.Errorf("missing required RAR writer %q", required)
 		}

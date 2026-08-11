@@ -571,9 +571,45 @@ pub struct StreamingBitReader<R: Read> {
 
 impl<R: Read> StreamingBitReader<R> {
     pub fn new(inner: R) -> Self {
+        Self::with_buffer(inner, Self::alloc_buffer())
+    }
+
+    /// Allocate an input buffer sized for [`StreamingBitReader`].
+    ///
+    /// Exposed so callers that recycle buffers across members (RAR4 decoders)
+    /// can pre-size a slot without going through a full reader construction.
+    pub fn alloc_buffer() -> Box<[u8]> {
+        vec![0u8; STREAMING_INPUT_BUFFER_SIZE].into_boxed_slice()
+    }
+
+    /// Build a reader on top of a recycled input buffer.
+    ///
+    /// The buffer contents are deliberately **not** zeroed. Every read of
+    /// `self.buf` in this type is gated on the `buf_pos < buf_len` invariant
+    /// established by `fill_buffer` (which resets `buf_pos = 0` and sets
+    /// `buf_len` to the byte count actually written by `inner.read`):
+    ///   * `refill` touches `buf[buf_pos..buf_pos + 8]` only under
+    ///     `buf_pos + 8 <= buf_len`,
+    ///   * `refill_slow` reads `buf[buf_pos]` only after checking
+    ///     `buf_pos < buf_len`,
+    ///   * `peek_bits`' byte loop breaks/errors at `pos >= buf_len`.
+    ///
+    /// No path can therefore observe a byte above `buf_len`, i.e. stale data
+    /// left over from a previous member is unreachable and re-zeroing a
+    /// 512 KiB buffer per member would be pure overhead.
+    ///
+    /// A short buffer (only possible if a caller hands back something it did
+    /// not obtain from [`Self::alloc_buffer`]/[`Self::into_buffer`]) is
+    /// replaced with a correctly sized allocation.
+    pub fn with_buffer(inner: R, buf: Box<[u8]>) -> Self {
+        let buf = if buf.len() >= STREAMING_INPUT_BUFFER_SIZE {
+            buf
+        } else {
+            Self::alloc_buffer()
+        };
         Self {
             inner,
-            buf: vec![0u8; STREAMING_INPUT_BUFFER_SIZE].into_boxed_slice(),
+            buf,
             buf_pos: 0,
             buf_len: 0,
             acc: 0,
@@ -581,6 +617,11 @@ impl<R: Read> StreamingBitReader<R> {
             eof: false,
             bit_pos: 0,
         }
+    }
+
+    /// Reclaim the input buffer so the caller can hand it to the next member.
+    pub fn into_buffer(self) -> Box<[u8]> {
+        self.buf
     }
 
     #[inline]

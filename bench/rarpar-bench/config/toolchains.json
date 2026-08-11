@@ -25,6 +25,22 @@
       "url": "https://www.rarlab.com/rar/rarlinux-5.0.0.tar.gz",
       "sha256": "4f942d79bb16dc1981ccb52893e4a24dbee908089d783d766ac45cd4f2c78610",
       "binary": "rar_static"
+    },
+    {
+      "id": "rarlab-6.24",
+      "image": "rarpar-bench-rarlab:6.24",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+      "sha256": "88e22a8e84125c947637bbf28c746e338a0a63279d80f9f9d7373603875db1eb",
+      "binary": "rar"
+    },
+    {
+      "id": "rarlab-7.23",
+      "image": "rarpar-bench-rarlab:7.23",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
+      "sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
+      "binary": "rar"
     }
   ],
   "par2_generator": {
