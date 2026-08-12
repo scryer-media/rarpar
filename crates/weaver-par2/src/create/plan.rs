@@ -120,6 +120,9 @@ pub struct Par2MemoryPlan {
     /// Conservative peak bound for the complete creation operation.
     pub total_creation_peak_bytes: usize,
     /// Source constants and one active kernel's factor preparation storage.
+    /// Each accumulation band holds its own ~2 KiB of transient kernel
+    /// temporaries; those are deliberately excluded so this value never
+    /// scales with recovery-row or thread count.
     pub factor_workspace_bytes: usize,
     /// Peak executable-code and JIT build bookkeeping storage.
     pub jit_workspace_bytes: usize,

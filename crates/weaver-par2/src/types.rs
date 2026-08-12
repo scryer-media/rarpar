@@ -121,6 +121,11 @@ impl Default for CancellationToken {
 }
 
 /// Progress update from a long-running PAR2 operation.
+///
+/// Phases that hash concurrently (creation's source scan) deliver updates
+/// from multiple threads: values are individually accurate but arrive
+/// unordered, so consumers should latch maxima rather than assume each
+/// update supersedes the previous one.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
     /// What stage the operation is in.

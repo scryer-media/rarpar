@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rayon::prelude::*;
 
 use crate::checksum::{FileHashState, Md5State, SliceChecksumState};
 use crate::error::{Par2Error, Result};
@@ -135,21 +138,20 @@ pub(crate) fn collect_sources(
     }
     validate_main_file_count(active_inputs.len())?;
 
-    let mut sources = Vec::with_capacity(active_inputs.len());
     let mut names = HashSet::with_capacity(active_inputs.len());
     let mut ids = HashSet::with_capacity(active_inputs.len());
-    let mut bytes_processed = 0u64;
+    let bytes_processed = AtomicU64::new(0);
     let file_total =
         u32::try_from(active_inputs.len()).map_err(|_| Par2Error::ResourceLimitExceeded {
             reason: "source file count exceeds the supported progress range".to_string(),
         })?;
     let mut total_slices = 0usize;
 
-    for (index, input) in active_inputs.iter().enumerate() {
+    let hash_one = |(index, input): (usize, &&PathBuf)| -> Result<CreationSource> {
         if cancellation.is_cancelled() {
             return Err(Par2Error::Cancelled);
         }
-        let source = resolve_and_hash_source(
+        resolve_and_hash_source(
             &base,
             input,
             block_size,
@@ -157,9 +159,46 @@ pub(crate) fn collect_sources(
             progress,
             index as u32,
             file_total,
-            &mut bytes_processed,
+            &bytes_processed,
             total_bytes,
-        )?;
+        )
+    };
+    // Hash one file per rayon task; each file's scan is independent. The
+    // shared byte counter is monotonic, but callbacks fire concurrently, so
+    // DELIVERY to the progress callback is not ordered. The sequential arm
+    // is the wasm path (no worker pool, matching the crate's other guards)
+    // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
+    let scan_parallel = !cfg!(target_family = "wasm")
+        && active_inputs.len() > 1
+        && super::encode::configured_create_threads() != 1;
+    let scanned: Vec<CreationSource> = if scan_parallel {
+        // Collect every per-file Result, then surface the FIRST error by
+        // input order: rayon's Result collection reports an arbitrary
+        // racer's error, which would let a concurrent I/O error mask
+        // `Cancelled` (or make the reported path vary run to run).
+        active_inputs
+            .par_iter()
+            .enumerate()
+            .map(hash_one)
+            .collect::<Vec<Result<_>>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        active_inputs
+            .iter()
+            .enumerate()
+            .map(hash_one)
+            .collect::<Result<Vec<_>>>()?
+    };
+    // The creation memory plan accounts this vector by ALLOCATION CAPACITY
+    // (plan.rs validate_integrity passes `sources.capacity()` into
+    // `estimate_source_metadata_bytes`), and collecting through a Result
+    // adapter is not TrustedLen, so its capacity can exceed the length.
+    // Rebuild at exact capacity so the plan cross-check stays byte-stable.
+    let mut sources = Vec::with_capacity(active_inputs.len());
+    sources.extend(scanned);
+
+    for (source, input) in sources.iter().zip(active_inputs.iter()) {
         if !names.insert(source.par2_name.clone()) {
             return Err(Par2Error::UnsafeCreationSource {
                 path: input.display().to_string(),
@@ -184,7 +223,6 @@ pub(crate) fn collect_sources(
                 ),
             });
         }
-        sources.push(source);
     }
     Ok(sources)
 }
@@ -420,7 +458,7 @@ fn resolve_and_hash_source(
     progress: Option<&ProgressCallback>,
     file_index: u32,
     file_total: u32,
-    bytes_processed: &mut u64,
+    bytes_processed: &AtomicU64,
     total_bytes: u64,
 ) -> Result<CreationSource> {
     if block_size == 0 || !block_size.is_multiple_of(4) {
@@ -529,12 +567,14 @@ fn resolve_and_hash_source(
                 first_bytes += first_take as u64;
             }
             remaining -= take;
-            *bytes_processed = bytes_processed.saturating_add(take as u64);
+            let processed_total = bytes_processed
+                .fetch_add(take as u64, Ordering::Relaxed)
+                .saturating_add(take as u64);
             report_progress(
                 progress,
                 file_index,
                 file_total,
-                *bytes_processed,
+                processed_total,
                 total_bytes,
             );
         }

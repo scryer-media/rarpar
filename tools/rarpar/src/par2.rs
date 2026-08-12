@@ -158,23 +158,44 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
 }
 
 fn create_progress_callback() -> par2_rs::ProgressCallback {
-    let last = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
-    let last_update = Arc::clone(&last);
+    struct ProgressLatch {
+        last: Instant,
+        total: u32,
+        current: u32,
+        bytes: u64,
+    }
+    let state = Arc::new(Mutex::new(ProgressLatch {
+        last: Instant::now() - Duration::from_secs(1),
+        total: 0,
+        current: 0,
+        bytes: 0,
+    }));
     Arc::new(move |update| {
         let now = Instant::now();
-        let mut last = last_update.lock().expect("creation progress mutex");
-        if now.duration_since(*last) < Duration::from_millis(250)
-            && update.current.saturating_add(1) < update.total
+        let mut latch = state.lock().expect("creation progress mutex");
+        // The source scan delivers updates from concurrent hashers, so raw
+        // updates are not monotonic. Latch to the maximum seen, and reset the
+        // latch when the phase changes (each phase carries its own total:
+        // file count while scanning, stripe count while encoding).
+        if update.total != latch.total {
+            latch.total = update.total;
+            latch.current = 0;
+            latch.bytes = 0;
+        }
+        latch.current = latch.current.max(update.current);
+        latch.bytes = latch.bytes.max(update.bytes_processed);
+        if now.duration_since(latch.last) < Duration::from_millis(250)
+            && latch.current.saturating_add(1) < latch.total
         {
             return;
         }
-        *last = now;
+        latch.last = now;
         eprintln!(
             "create {:?}: {}/{} ({} bytes)",
             update.stage,
-            update.current.saturating_add(1).min(update.total),
-            update.total,
-            update.bytes_processed
+            latch.current.saturating_add(1).min(latch.total),
+            latch.total,
+            latch.bytes
         );
     })
 }
@@ -346,6 +367,11 @@ fn run_flow(
     for dir in &resolved.search_dirs {
         validate_directory_path(dir, "search directory")?;
     }
+    // A repair flow reads the same payload in its verify, accumulate, and
+    // re-verify passes; hold one cache-eviction deferral across all of them
+    // so intermediate passes are served from page cache. Verify-only flows
+    // keep the immediate-eviction discipline.
+    let _cache_retention = repair.then(par2_rs::CacheEvictionDeferral::acquire);
 
     let load_started = std::time::Instant::now();
     let par2_set = par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?;

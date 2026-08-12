@@ -4735,6 +4735,10 @@ pub fn execute_repair_with_options(
         return Ok(());
     }
 
+    // Repair re-reads payload it already verified; evicting between those
+    // passes forces physical re-reads (dominant on network block storage).
+    let _cache_retention = crate::file_cache::CacheEvictionDeferral::acquire();
+
     let slice_size = plan.slice_size as usize;
     assert!(
         slice_size.is_multiple_of(2),

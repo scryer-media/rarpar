@@ -4,8 +4,15 @@
 //! each input slice in bounded, stride-aligned stripes.  Input batches rotate
 //! through two staging areas, so the arithmetic path can accumulate a complete
 //! output stripe without requiring a source-sized working allocation.
+//!
+//! Accumulation and output finishing split the recovery outputs into
+//! contiguous bands, one rayon task per band.  Bands write disjoint
+//! output-major regions and never share mutable state, so the produced
+//! recovery bytes are identical at every band count.
 
 use std::mem::size_of;
+
+use rayon::prelude::*;
 
 use crate::error::{Par2Error, Result};
 use crate::gf;
@@ -20,6 +27,48 @@ use super::plan::default_memory_limit;
 const DEFAULT_INPUT_GROUPING: usize = 12;
 const STAGING_AREA_COUNT: usize = 2;
 const TRANSFER_BUFFER_COUNT: usize = 2;
+
+/// Worker bands used by forward accumulation. `WEAVER_PAR2_CREATE_THREADS=N`
+/// pins the band count (1 = the sequential pre-banding behavior) so the two
+/// shapes can be A/B'd without a rebuild (same escape-hatch pattern as
+/// `WEAVER_GF16_FOLDED_AVX512`); unset or `0` follows the host CPU count.
+///
+/// The resolved value is process-stable by construction: it must not read
+/// `rayon::current_num_threads()`, whose answer is pool-relative and would
+/// make the plan's memory accounting differ between a caller's rayon worker
+/// and the main thread (breaking `Par2CreatePlan` equality), and whose first
+/// call would eagerly spawn the global pool from plan-only paths. Bands
+/// therefore follow `available_parallelism`; execution still lands on
+/// whatever rayon pool is current, which is correct at any width.
+pub(crate) fn configured_create_threads() -> usize {
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        // wasm never has a worker pool; keep rayon machinery untouched there
+        // (same convention as the matrix/repairer guards).
+        if cfg!(target_family = "wasm") {
+            return 1;
+        }
+        std::env::var("WEAVER_PAR2_CREATE_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&threads| threads != 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(1)
+            })
+    })
+}
+
+/// Band shape for one encoding pass: `(band_size, band_count)` with
+/// `band_count = ceil(output_count / band_size)` exactly, so chunked splits,
+/// workspace counts, and memory admission all agree. Never zero-sized.
+fn create_band_shape(output_count: usize) -> (usize, usize) {
+    let outputs = output_count.max(1);
+    let target = configured_create_threads().clamp(1, outputs);
+    let band_size = outputs.div_ceil(target);
+    (band_size, outputs.div_ceil(band_size))
+}
 
 /// Forward working-set quantities used by both planning and encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,8 +329,12 @@ impl ForwardEncoder {
         ];
         let mut output = AlignedBuffer::new(buffers.output_bytes);
 
+        let (band_size, band_count) = create_band_shape(self.recovery_exponents.len());
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = band_count;
         #[cfg(target_arch = "x86_64")]
-        let mut jit_workspace = reedsolomon_rs::xor_jit::packed::PackedJitWorkspace::default();
+        let mut jit_workspaces: Vec<reedsolomon_rs::xor_jit::packed::PackedJitWorkspace> =
+            (0..band_count).map(|_| Default::default()).collect();
 
         let stripe_count = self.slice_size.div_ceil(buffers.chunk_len);
         let stripe_count_u32 = u32::try_from(stripe_count)
@@ -330,8 +383,9 @@ impl ForwardEncoder {
                     aligned_len,
                     buffers.aligned_chunk_len,
                     contract,
+                    band_size,
                     #[cfg(target_arch = "x86_64")]
-                    &mut jit_workspace,
+                    &mut jit_workspaces,
                     jit_code_budget,
                 )?;
             }
@@ -342,6 +396,7 @@ impl ForwardEncoder {
                 buffers.aligned_chunk_len,
                 aligned_len,
                 self.recovery_exponents.len(),
+                band_size,
             )?;
 
             for (output_index, &exponent) in self.recovery_exponents.iter().enumerate() {
@@ -599,6 +654,9 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
         #[cfg(target_arch = "x86_64")]
         ResolvedKernel::XorJit(_) => row,
     };
+    // Per-band kernel temporaries (~2 KiB each) are deliberately excluded:
+    // this value feeds Par2MemoryPlan.factor_workspace_bytes, which must not
+    // scale with recovery-row or band count.
     checked_add(constants, active, "factor workspace allocation overflow")
 }
 
@@ -758,11 +816,19 @@ fn select_kernel_for_memory_with_capabilities(
         ForwardKernel::Auto => auto_kernel_candidates(capabilities),
         requested => vec![resolve_kernel_with_capabilities(requested, capabilities)?],
     };
+    let (_, bands) = create_band_shape(output_count);
     let mut last_error = None;
     for kernel in candidates {
         let contract = KernelContract::for_kernel(kernel);
         let factor_bytes = factor_workspace_bytes(kernel, source_count)?;
-        let (jit_bytes, jit_arena_bytes) = jit_workspace_bytes(kernel)?;
+        let (jit_bytes_per_band, jit_arena_bytes) = jit_workspace_bytes(kernel)?;
+        // Each accumulation band owns a JIT workspace, so admission reserves
+        // all of them; the build limit stays per-workspace.
+        let jit_bytes = checked_mul(
+            jit_bytes_per_band,
+            bands,
+            "banded JIT workspace accounting overflow",
+        )?;
         match BufferPlan::new_with_reserved(
             slice_size,
             output_count,
@@ -865,8 +931,14 @@ pub(crate) fn estimate_forward_memory(
         memory_limit,
         requested_kernel,
     )?;
+    let (_, bands) = create_band_shape(output_count);
     let factor_workspace_bytes = factor_workspace_bytes(kernel, source_count)?;
-    let (jit_workspace_bytes, _) = jit_workspace_bytes(kernel)?;
+    let (jit_bytes_per_band, _) = jit_workspace_bytes(kernel)?;
+    let jit_workspace_bytes = checked_mul(
+        jit_bytes_per_band,
+        bands,
+        "banded JIT workspace accounting overflow",
+    )?;
     Ok(ForwardMemoryEstimate {
         factor_workspace_bytes,
         jit_workspace_bytes,
@@ -998,6 +1070,101 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
 
 #[allow(clippy::too_many_arguments)]
 fn accumulate_batch(
+    kernel: ResolvedKernel,
+    output: &mut [u8],
+    staging: &AlignedBuffer,
+    factors: &FactorSource,
+    exponents: &[RecoveryExponent],
+    source_start: usize,
+    live_inputs: usize,
+    aligned_len: usize,
+    output_stride: usize,
+    contract: KernelContract,
+    band_size: usize,
+    #[cfg(target_arch = "x86_64")]
+    jit_workspaces: &mut [reedsolomon_rs::xor_jit::packed::PackedJitWorkspace],
+    jit_code_budget: usize,
+) -> Result<()> {
+    let output_count = exponents.len();
+    // The chunked splits below are exact only over a whole-output slice, and
+    // the workspace zip silently truncates if the caller's band shape ever
+    // disagrees with the workspace count.
+    debug_assert_eq!(output.len(), output_count * output_stride);
+    #[cfg(target_arch = "x86_64")]
+    debug_assert_eq!(
+        jit_workspaces.len(),
+        output_count.max(1).div_ceil(band_size)
+    );
+    if band_size >= output_count || output_count <= 1 {
+        return accumulate_band(
+            kernel,
+            output,
+            staging,
+            factors,
+            exponents,
+            source_start,
+            live_inputs,
+            aligned_len,
+            output_stride,
+            contract,
+            #[cfg(target_arch = "x86_64")]
+            &mut jit_workspaces[0],
+            jit_code_budget,
+        );
+    }
+
+    // Contiguous exponent bands map to contiguous output-major byte ranges,
+    // so the chunked splits below hand each task a disjoint destination.
+    let band_bytes = checked_mul(band_size, output_stride, "band byte range overflow")?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        output
+            .par_chunks_mut(band_bytes)
+            .zip(exponents.par_chunks(band_size))
+            .zip(jit_workspaces.par_iter_mut())
+            .try_for_each(|((band_output, band_exponents), jit_workspace)| {
+                accumulate_band(
+                    kernel,
+                    band_output,
+                    staging,
+                    factors,
+                    band_exponents,
+                    source_start,
+                    live_inputs,
+                    aligned_len,
+                    output_stride,
+                    contract,
+                    jit_workspace,
+                    jit_code_budget,
+                )
+            })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        output
+            .par_chunks_mut(band_bytes)
+            .zip(exponents.par_chunks(band_size))
+            .try_for_each(|(band_output, band_exponents)| {
+                accumulate_band(
+                    kernel,
+                    band_output,
+                    staging,
+                    factors,
+                    band_exponents,
+                    source_start,
+                    live_inputs,
+                    aligned_len,
+                    output_stride,
+                    contract,
+                    jit_code_budget,
+                )
+            })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_band(
     kernel: ResolvedKernel,
     output: &mut [u8],
     staging: &AlignedBuffer,
@@ -1173,33 +1340,76 @@ fn finish_output(
     output_stride: usize,
     aligned_len: usize,
     output_count: usize,
+    band_size: usize,
 ) -> Result<()> {
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (kernel, output, output_stride, aligned_len, output_count);
+        let _ = (
+            kernel,
+            output,
+            output_stride,
+            aligned_len,
+            output_count,
+            band_size,
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        for output_index in 0..output_count {
-            let start = output_index
-                .checked_mul(output_stride)
-                .ok_or_else(|| resource_limit("output finish offset overflow"))?;
-            let end = start
-                .checked_add(aligned_len)
-                .ok_or_else(|| resource_limit("output finish end overflow"))?;
-            let dst = &mut output[start..end];
+        // Whole-number-of-outputs chunking below relies on an exact slice.
+        debug_assert_eq!(output.len(), output_count * output_stride);
+        if matches!(kernel, ResolvedKernel::Portable | ResolvedKernel::Simd) {
+            return Ok(());
+        }
+        if band_size >= output_count || output_count <= 1 {
+            return finish_band(kernel, output, output_stride, aligned_len, output_count);
+        }
+        let band_bytes = checked_mul(band_size, output_stride, "band byte range overflow")?;
+        return output
+            .par_chunks_mut(band_bytes)
+            .try_for_each(|band_output| {
+                // The output buffer is exactly output_count * output_stride
+                // bytes, so every chunk holds a whole number of outputs.
+                let band_outputs = band_output.len() / output_stride;
+                finish_band(
+                    kernel,
+                    band_output,
+                    output_stride,
+                    aligned_len,
+                    band_outputs,
+                )
+            });
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
 
-            match kernel {
-                ResolvedKernel::Portable | ResolvedKernel::Simd => {}
-                ResolvedKernel::Folded => {
-                    gf_simd::altmap_decode(dst);
-                }
-                ResolvedKernel::XorJit(width) => {
-                    let block = width.block_bytes();
-                    for offset in (0..aligned_len).step_by(block) {
-                        unsafe { width.finish_block(&mut dst[offset..offset + block]) };
-                    }
+#[cfg(target_arch = "x86_64")]
+fn finish_band(
+    kernel: ResolvedKernel,
+    output: &mut [u8],
+    output_stride: usize,
+    aligned_len: usize,
+    output_count: usize,
+) -> Result<()> {
+    for output_index in 0..output_count {
+        let start = output_index
+            .checked_mul(output_stride)
+            .ok_or_else(|| resource_limit("output finish offset overflow"))?;
+        let end = start
+            .checked_add(aligned_len)
+            .ok_or_else(|| resource_limit("output finish end overflow"))?;
+        let dst = &mut output[start..end];
+
+        match kernel {
+            ResolvedKernel::Portable | ResolvedKernel::Simd => {}
+            ResolvedKernel::Folded => {
+                gf_simd::altmap_decode(dst);
+            }
+            ResolvedKernel::XorJit(width) => {
+                let block = width.block_bytes();
+                for offset in (0..aligned_len).step_by(block) {
+                    unsafe { width.finish_block(&mut dst[offset..offset + block]) };
                 }
             }
         }
@@ -1405,6 +1615,85 @@ mod tests {
         let selected = encoder.selected_kernel(ForwardKernel::Auto).unwrap();
         let explicit = encode_with_kernel(&sources, selected).unwrap();
         assert_eq!(auto, explicit, "automatic kernel {selected:?} differs");
+    }
+
+    /// The banded accumulate/finish split must be byte-identical to the
+    /// sequential pass for every runtime kernel, including an uneven trailing
+    /// band (seven outputs over three bands).
+    #[test]
+    fn banded_accumulation_matches_sequential() {
+        let sources = test_sources();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let exponents: Vec<RecoveryExponent> = vec![0, 1, 2, 7, 31, 64, 100];
+        for requested in ForwardEncoder::available_kernels() {
+            let resolved =
+                resolve_kernel_with_capabilities(requested, runtime_kernel_capabilities())
+                    .expect("advertised kernels resolve");
+            let contract = KernelContract::for_kernel(resolved);
+            let aligned_len = round_up(256, contract.stride).unwrap();
+            let (_, jit_build_limit) = jit_workspace_bytes(resolved).unwrap();
+
+            let mut passes = Vec::new();
+            // band_size = 7 covers the sequential path; 3 exercises uneven
+            // banding (bands of 3, 3, 1 outputs).
+            for band_size in [7usize, 3] {
+                let band_count = exponents.len().div_ceil(band_size);
+                let mut provider = InMemorySourceProvider { sources: &refs };
+                let mut staging = AlignedBuffer::new(contract.input_grouping * aligned_len);
+                let mut transfer = AlignedBuffer::new(aligned_len);
+                fill_staging(
+                    resolved,
+                    &mut staging,
+                    &mut transfer,
+                    &mut provider,
+                    0,
+                    0,
+                    256,
+                    aligned_len,
+                    contract,
+                )
+                .unwrap();
+                let factors = FactorSource::new(refs.len());
+                let mut output = AlignedBuffer::new(exponents.len() * aligned_len);
+                #[cfg(target_arch = "x86_64")]
+                let mut jit_workspaces: Vec<
+                    reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+                > = (0..band_count).map(|_| Default::default()).collect();
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = band_count;
+                accumulate_batch(
+                    resolved,
+                    output.as_bytes_mut(),
+                    &staging,
+                    &factors,
+                    &exponents,
+                    0,
+                    contract.input_grouping.min(refs.len()),
+                    aligned_len,
+                    aligned_len,
+                    contract,
+                    band_size,
+                    #[cfg(target_arch = "x86_64")]
+                    &mut jit_workspaces,
+                    jit_build_limit.max(1),
+                )
+                .unwrap();
+                finish_output(
+                    resolved,
+                    output.as_bytes_mut(),
+                    aligned_len,
+                    aligned_len,
+                    exponents.len(),
+                    band_size,
+                )
+                .unwrap();
+                passes.push(output.as_bytes().to_vec());
+            }
+            assert_eq!(
+                passes[0], passes[1],
+                "kernel {requested:?} banded output differs from sequential"
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
