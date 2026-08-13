@@ -1942,6 +1942,7 @@ version = "0.3.0"
 dependencies = [
  "aws-lc-sys",
  "bytes",
+ "cap-std",
  "crc-fast",
  "criterion",
  "libc",

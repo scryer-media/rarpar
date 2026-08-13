@@ -287,16 +287,16 @@ pub fn apply_placement_plan(dir: &Path, plan: &PlacementPlan) -> io::Result<u32>
         let temp = dir.join(format!(".swap.{}.tmp", entry_a.current_name));
 
         // Atomic-ish three-step swap.
-        fs::rename(&path_a, &temp).map_err(|e| {
+        crate::disk::rename_within_base(dir, &path_a, &temp).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("swap step 1 failed ({} → temp): {e}", entry_a.current_name),
             )
         })?;
 
-        if let Err(e) = fs::rename(&path_b, &path_a) {
+        if let Err(e) = crate::disk::rename_within_base(dir, &path_b, &path_a) {
             // Rollback: restore A from temp.
-            let _ = fs::rename(&temp, &path_a);
+            let _ = crate::disk::rename_within_base(dir, &temp, &path_a);
             return Err(io::Error::new(
                 e.kind(),
                 format!(
@@ -306,15 +306,15 @@ pub fn apply_placement_plan(dir: &Path, plan: &PlacementPlan) -> io::Result<u32>
             ));
         }
 
-        if let Err(e) = fs::rename(&temp, &path_b) {
+        if let Err(e) = crate::disk::rename_within_base(dir, &temp, &path_b) {
             // Partial state: A has B's data, temp has A's data. Try to restore.
             warn!(
                 "swap step 3 failed (temp → {}): {e} — attempting recovery",
                 entry_b.current_name
             );
             // Best-effort: move A back to B, temp back to A.
-            let _ = fs::rename(&path_a, &path_b);
-            let _ = fs::rename(&temp, &path_a);
+            let _ = crate::disk::rename_within_base(dir, &path_a, &path_b);
+            let _ = crate::disk::rename_within_base(dir, &temp, &path_a);
             return Err(io::Error::new(
                 e.kind(),
                 format!("swap step 3 failed (temp → {}): {e}", entry_b.current_name),
@@ -344,7 +344,7 @@ pub fn apply_placement_plan(dir: &Path, plan: &PlacementPlan) -> io::Result<u32>
             continue;
         }
 
-        fs::rename(&src, &dst).map_err(|e| {
+        crate::disk::rename_within_base(dir, &src, &dst).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(

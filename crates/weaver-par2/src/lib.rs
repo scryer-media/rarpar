@@ -87,6 +87,22 @@
 //!   slice count) on CPU; on supported native Apple Silicon at or above that
 //!   threshold it preflights Metal and falls back to CPU when unavailable.
 //!
+//! # Benchmarks
+//!
+//! Relative-speed charts against `par2cmdline-turbo 1.4.0` from the
+//! deterministic `rarpar-bench` corpus (methodology in the crate README).
+//! Click any chart to open it full size.
+//!
+//! [![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
+//!
+//! [![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+//!
+//! [![PAR2 workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)
+//!
+//! [![PAR2 CPU workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
+//!
+//! [![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+//!
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
 #[cfg(all(

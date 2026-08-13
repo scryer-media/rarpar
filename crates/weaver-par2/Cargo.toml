@@ -49,6 +49,12 @@ libc = { workspace = true }
 memmap2 = { workspace = true, default-features = false }
 aws-lc-sys = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Capability-relative path resolution prevents repair destinations from
+# escaping the caller-selected working directory through Windows reparse
+# points while preserving support for a caller-selected symlinked root.
+cap-std = "3.4.5"
+
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 

@@ -80,13 +80,13 @@ validation. They include CLI discovery and output handling as well as archive
 extraction, so they are release-workflow measurements rather than isolated
 decoder microbenchmarks.
 
-![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](docs/rarpar-rar-benchmark-windows-x86_64.svg)
+[![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-![RAR workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-rar-benchmark-linux-x86_64.svg)
+[![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
+[![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
 
-![RAR workloads on Apple M5 Max with macOS arm64](docs/rarpar-rar-benchmark-macos-arm64.svg)
+[![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
 
 ### Broader library workloads
 
@@ -133,7 +133,7 @@ cross-volume layout assembly that the reference implementation does not provide.
 The RAR format is documented in RARLAB's
 [technical note](https://www.rarlab.com/technote.htm).
 
-Versioned API and behavior notes are in [CHANGELOG.md](CHANGELOG.md).
+Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/CHANGELOG.md).
 
 ## License
 
@@ -149,4 +149,4 @@ GPL-3.0-or-later, with the additional UnRAR source-code restriction:
 > resulting package.
 
 This restriction is why the crate provides no compression or archive-writing
-API, and it applies to anything that links this crate. See [LICENSE](LICENSE).
+API, and it applies to anything that links this crate. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-unrar/LICENSE).

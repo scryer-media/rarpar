@@ -1,14 +1,418 @@
 //! Filesystem-backed implementation of [`FileAccess`].
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::ffi::{CString, OsStr};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
 
 use crate::par2_set::Par2FileSet;
 use crate::placement::PlacementPlan;
 use crate::types::FileId;
 use crate::verify::{FileAccess, FileRangeReader};
+
+fn repair_path_components(path: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => components.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "repair destination must remain relative to the working directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair destination has no filename",
+        ));
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn c_component(component: &OsStr) -> io::Result<CString> {
+    CString::new(component.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair destination contains a NUL byte",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, component: &OsStr, create: bool) -> io::Result<File> {
+    let component = c_component(component)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let open = || {
+        // SAFETY: `parent` and `component` stay alive for the call, and the
+        // returned descriptor is immediately adopted by `File` on success.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), flags) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `openat` returned a new, owned descriptor.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    };
+
+    match open() {
+        Ok(directory) => Ok(directory),
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+            // SAFETY: the directory descriptor and C string are valid for the
+            // call. The process umask restricts the requested mode as usual.
+            let result = unsafe {
+                libc::mkdirat(
+                    parent.as_raw_fd(),
+                    component.as_ptr(),
+                    0o777 as libc::mode_t,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            open()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn open_repair_output(base_dir: &Path, destination: &Path) -> io::Result<File> {
+    let relative = destination.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair destination is outside the working directory",
+        )
+    })?;
+    let components = repair_path_components(relative)?;
+    let (filename, parent_components) = components.split_last().expect("checked non-empty");
+
+    // Following a symlink supplied as the base directory is intentional: the
+    // caller chooses that root. Every PAR2-controlled component below it is
+    // opened relative to the resulting descriptor without following links.
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(base_dir)?;
+    for component in parent_components {
+        directory = open_directory_at(&directory, component, true)?;
+    }
+
+    let filename = c_component(filename)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // SAFETY: the directory descriptor and C string are valid for the call,
+    // and the returned descriptor is immediately adopted by `File`.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            filename.as_ptr(),
+            flags,
+            0o666 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `openat` returned a new, owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn unix_repair_parent(
+    mut directory: File,
+    components: &[&OsStr],
+    create: bool,
+) -> io::Result<(File, CString)> {
+    let (filename, parent_components) = components.split_last().expect("checked non-empty");
+    for component in parent_components {
+        directory = open_directory_at(&directory, component, create)?;
+    }
+    Ok((directory, c_component(filename)?))
+}
+
+#[cfg(unix)]
+pub(crate) fn rename_within_base(base_dir: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    let from_relative = from.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename source is outside the working directory",
+        )
+    })?;
+    let to_relative = to.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename destination is outside the working directory",
+        )
+    })?;
+    let from_components = repair_path_components(from_relative)?;
+    let to_components = repair_path_components(to_relative)?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(base_dir)?;
+    let (from_parent, from_name) = unix_repair_parent(root.try_clone()?, &from_components, false)?;
+    let (to_parent, to_name) = unix_repair_parent(root, &to_components, true)?;
+
+    // SAFETY: both directory descriptors and C strings remain valid for the
+    // call. `renameat` operates on the link entries themselves and therefore
+    // does not follow either final path component.
+    let result = unsafe {
+        libc::renameat(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_file_within_base(base_dir: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair removal target is outside the working directory",
+        )
+    })?;
+    let components = repair_path_components(relative)?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(base_dir)?;
+    let (parent, filename) = unix_repair_parent(root, &components, false)?;
+
+    // SAFETY: the directory descriptor and C string remain valid for the
+    // call. With no removal flags, `unlinkat` removes a file or symlink entry
+    // without following the final component.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), filename.as_ptr(), 0) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_repair_output(base_dir: &Path, destination: &Path) -> io::Result<File> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+
+    let relative = destination.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair destination is outside the working directory",
+        )
+    })?;
+    let components = repair_path_components(relative)?;
+    let (filename, parent_components) = components.split_last().expect("checked non-empty");
+    let mut directory = Dir::open_ambient_dir(base_dir, ambient_authority())?;
+
+    for component in parent_components {
+        match directory.symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "repair destination traverses a link: {}",
+                        destination.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "repair destination parent is not a directory: {}",
+                        destination.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                directory.create_dir(component)?;
+            }
+            Err(error) => return Err(error),
+        }
+        // cap-std resolves each component relative to the held directory
+        // handle and refuses any link traversal that would escape the root.
+        directory = directory.open_dir(component)?;
+    }
+
+    match directory.symlink_metadata(filename) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("repair destination is a link: {}", destination.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = CapOpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    directory
+        .open_with(filename, &options)
+        .map(cap_std::fs::File::into_std)
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_within_base(base_dir: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    let from_relative = from.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename source is outside the working directory",
+        )
+    })?;
+    let to_relative = to.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename destination is outside the working directory",
+        )
+    })?;
+    repair_path_components(from_relative)?;
+    repair_path_components(to_relative)?;
+    let directory = Dir::open_ambient_dir(base_dir, ambient_authority())?;
+    if let Some(parent) = to_relative.parent() {
+        directory.create_dir_all(parent)?;
+    }
+    directory.rename(from_relative, &directory, to_relative)
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_file_within_base(base_dir: &Path, path: &Path) -> io::Result<()> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    let relative = path.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair removal target is outside the working directory",
+        )
+    })?;
+    repair_path_components(relative)?;
+    Dir::open_ambient_dir(base_dir, ambient_authority())?.remove_file(relative)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_repair_output(base_dir: &Path, destination: &Path) -> io::Result<File> {
+    let relative = destination.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair destination is outside the working directory",
+        )
+    })?;
+    let components = repair_path_components(relative)?;
+    let mut current = base_dir.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("repair destination traverses a link: {}", current.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "repair destination parent is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+                let metadata = fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("repair destination parent changed: {}", current.display()),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("repair destination is a link: {}", destination.display()),
+        )),
+        Ok(_) | Err(_) => OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(destination),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn rename_within_base(base_dir: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    let from_relative = from.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename source is outside the working directory",
+        )
+    })?;
+    let to_relative = to.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair rename destination is outside the working directory",
+        )
+    })?;
+    repair_path_components(from_relative)?;
+    repair_path_components(to_relative)?;
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(from, to)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn remove_file_within_base(base_dir: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(base_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repair removal target is outside the working directory",
+        )
+    })?;
+    repair_path_components(relative)?;
+    fs::remove_file(path)
+}
 
 /// A [`FileAccess`] implementation that reads and writes files on disk.
 ///
@@ -115,14 +519,7 @@ impl FileAccess for DiskFileAccess {
         let file = if let Some(file) = self.write_files.get_mut(file_id) {
             file
         } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
+            let file = open_repair_output(&self.base_dir, &path)?;
             self.write_files.entry(*file_id).or_insert(file)
         };
         file.seek(SeekFrom::Start(offset))?;
@@ -249,14 +646,7 @@ impl FileAccess for PlacementFileAccess {
         let file = if let Some(file) = self.write_files.get_mut(file_id) {
             file
         } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
+            let file = open_repair_output(&self.base_dir, &path)?;
             self.write_files.entry(*file_id).or_insert(file)
         };
         file.seek(SeekFrom::Start(offset))?;
@@ -635,6 +1025,105 @@ mod tests {
 
         let content = access.read_file(&file_id).unwrap();
         assert_eq!(&content, b"created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_access_rejects_symlink_destination() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join("outside.dat");
+        std::fs::write(&outside_path, b"outside stays unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside_path, dir.path().join("victim.dat")).unwrap();
+
+        let (par2_set, file_id) = setup_par2_set(b"repaired data", 1024, "victim.dat");
+        let mut access = DiskFileAccess::new(dir.path().to_path_buf(), &par2_set);
+
+        assert!(
+            access
+                .write_file_range(&file_id, 0, b"repaired data")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&outside_path).unwrap(),
+            b"outside stays unchanged"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("victim.dat"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_access_rejects_symlink_parent() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join("victim.dat");
+        std::fs::write(&outside_path, b"outside stays unchanged").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("nested")).unwrap();
+
+        let (par2_set, file_id) = setup_par2_set(b"repaired data", 1024, "nested/victim.dat");
+        let mut access = DiskFileAccess::new(dir.path().to_path_buf(), &par2_set);
+
+        assert!(
+            access
+                .write_file_range(&file_id, 0, b"repaired data")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&outside_path).unwrap(),
+            b"outside stays unchanged"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("nested"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_within_base_rejects_symlink_parent() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let source = dir.path().join("source.dat");
+        let outside_target = outside.path().join("victim.dat");
+        std::fs::write(&source, b"repaired data").unwrap();
+        std::fs::write(&outside_target, b"outside stays unchanged").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("nested")).unwrap();
+
+        assert!(
+            rename_within_base(dir.path(), &source, &dir.path().join("nested/victim.dat")).is_err()
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"repaired data");
+        assert_eq!(
+            std::fs::read(&outside_target).unwrap(),
+            b"outside stays unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_access_allows_caller_selected_symlink_base() {
+        let parent = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        let base_link = parent.path().join("base-link");
+        std::os::unix::fs::symlink(base.path(), &base_link).unwrap();
+
+        let (par2_set, file_id) = setup_par2_set(b"repaired data", 1024, "created.dat");
+        let mut access = DiskFileAccess::new(base_link, &par2_set);
+
+        access
+            .write_file_range(&file_id, 0, b"repaired data")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(base.path().join("created.dat")).unwrap(),
+            b"repaired data"
+        );
     }
 
     #[test]

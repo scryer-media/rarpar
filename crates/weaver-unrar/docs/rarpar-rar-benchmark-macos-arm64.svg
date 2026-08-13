@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="792" viewBox="0 0 1200 792" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1548" viewBox="0 0 1200 1548" role="img" aria-labelledby="title desc">
   <title id="title">rarpar RAR relative speed benchmark</title>
-  <desc id="desc">Measured RAR workloads on Apple M5 Max (macOS) across 1 execution lane(s). Relative speed is reference elapsed time divided by rarpar elapsed time.</desc>
+  <desc id="desc">Measured RAR workloads on macos-m5-max across 1 execution lane(s). Relative speed is reference elapsed time divided by rarpar elapsed time.</desc>
   <style>
     .bg { fill: #ffffff; } text { font-family: Arial, sans-serif; fill: #172033; }
     .title { font-size: 28px; font-weight: 600; } .subtitle { font-size: 14px; fill: #667085; }
@@ -11,80 +11,150 @@
     .cpu { fill: #2563eb; } .gpu { fill: #7c3aed; } .slower { fill: #d97706; }
     @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .column, .timing, .tick { fill: #9ca7b5; } .grid { stroke: #30363d; } .parity { stroke: #e6edf3; } .rule { stroke: #21262d; } .cpu { fill: #58a6ff; } .gpu { fill: #bc8cff; } .slower { fill: #f2a65a; } }
   </style>
-  <metadata>schema=1; report_sha256=15e5b50b36916bc09f230ab4dd5148bb0c0602f4bc35fe3a91ac8e729888f38a; corpus_digest=b268ee53e7398cff35b31f6f645106d8f53f943c4889cfd191b0d8712892bf37; plan_id=plan-070f1a38b80a6a30; candidate_sha256=4271ba1ed2afc590778ffdc157f56c113d2e213f470f97c96cfe55a5443fe35d; reference_sha256=99720d63484b8db77db43477db095f198d52b34515938d4ee7b165c59fa1cbe9; lane=cpu; par2_placement=canonical</metadata>
-  <rect class="bg" width="1200" height="792"/>
+  <metadata>schema=1; report_sha256=00fb623fef241d4644e7d37dddaf8421cd096d591c312b9213a803bb45784160; corpus_digest=2b16d61efcc1b11a4ef9ccf6a3f49219585c44996df6ad18d354817877f97e87; plan_id=plan-1df5e6f9473422f7; candidate_sha256=909c6d584e1e3fcfcbb0d97d910d986c89d5f3746dfcf58484e2cb8f3f04041a; reference_sha256=99720d63484b8db77db43477db095f198d52b34515938d4ee7b165c59fa1cbe9; lane=cpu; collector=wall-clock; par2_placement=canonical</metadata>
+  <rect class="bg" width="1200" height="1548"/>
   <text class="title" x="48" y="48">rarpar RAR relative speed benchmark</text>
   <text class="subtitle" x="48" y="75">Lower elapsed time is better. Bars show the faster side's multiplier on a symmetric log scale.</text>
-  <g aria-label="Legend"><rect class="cpu" x="570" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="592" y="96">rarpar / CPU</text><rect class="slower" x="890" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="912" y="96">UnRAR faster</text></g>
+  <g aria-label="Legend"><rect class="slower" x="570" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="592" y="96">UnRAR faster</text><rect class="cpu" x="890" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="912" y="96">rarpar / CPU</text></g>
   <text class="column" x="48" y="112">Workload / elapsed time</text>
   <text class="column" x="620" y="112">Relative speed</text>
   <g aria-label="Relative speed axis">
-    <line class="grid" x1="620.0" y1="121" x2="620.0" y2="734"/><text class="tick" x="620.0" y="752" text-anchor="middle">8x</text>
-    <line class="grid" x1="708.3" y1="121" x2="708.3" y2="734"/><text class="tick" x="708.3" y="752" text-anchor="middle">4x</text>
-    <line class="grid" x1="796.7" y1="121" x2="796.7" y2="734"/><text class="tick" x="796.7" y="752" text-anchor="middle">2x</text>
-    <line class="parity" x1="885.0" y1="121" x2="885.0" y2="734"/><text class="tick" x="885.0" y="752" text-anchor="middle">1x parity</text>
-    <line class="grid" x1="973.3" y1="121" x2="973.3" y2="734"/><text class="tick" x="973.3" y="752" text-anchor="middle">2x</text>
-    <line class="grid" x1="1061.7" y1="121" x2="1061.7" y2="734"/><text class="tick" x="1061.7" y="752" text-anchor="middle">4x</text>
-    <line class="grid" x1="1150.0" y1="121" x2="1150.0" y2="734"/><text class="tick" x="1150.0" y="752" text-anchor="middle">8x</text>
-    <text class="tick" x="752.5" y="772" text-anchor="middle">UnRAR faster</text>
-    <text class="tick" x="1017.5" y="772" text-anchor="middle">rarpar faster</text>
+    <line class="grid" x1="620.0" y1="121" x2="620.0" y2="1490"/><text class="tick" x="620.0" y="1508" text-anchor="middle">8x</text>
+    <line class="grid" x1="708.3" y1="121" x2="708.3" y2="1490"/><text class="tick" x="708.3" y="1508" text-anchor="middle">4x</text>
+    <line class="grid" x1="796.7" y1="121" x2="796.7" y2="1490"/><text class="tick" x="796.7" y="1508" text-anchor="middle">2x</text>
+    <line class="parity" x1="885.0" y1="121" x2="885.0" y2="1490"/><text class="tick" x="885.0" y="1508" text-anchor="middle">1x parity</text>
+    <line class="grid" x1="973.3" y1="121" x2="973.3" y2="1490"/><text class="tick" x="973.3" y="1508" text-anchor="middle">2x</text>
+    <line class="grid" x1="1061.7" y1="121" x2="1061.7" y2="1490"/><text class="tick" x="1061.7" y="1508" text-anchor="middle">4x</text>
+    <line class="grid" x1="1150.0" y1="121" x2="1150.0" y2="1490"/><text class="tick" x="1150.0" y="1508" text-anchor="middle">8x</text>
+    <text class="tick" x="752.5" y="1528" text-anchor="middle">UnRAR faster</text>
+    <text class="tick" x="1017.5" y="1528" text-anchor="middle">rarpar faster</text>
   </g>
   <g aria-label="RAR benchmarks">
-    <text class="machine" x="48" y="140">Apple M5 Max (macOS) / arm64 / cpu</text>
-    <text class="workload" x="48" y="168">RAR5 normal extraction</text>
-    <text class="timing" x="48" y="184">20.3 ms -> 20.1 ms</text>
-    <rect class="cpu" x="885.0" y="160" width="1.6" height="14" rx="2"/>
-    <text class="ratio" x="894.6" y="172">1.0x</text>
+    <text class="machine" x="48" y="140">macos-m5-max / arm64 / cpu</text>
+    <text class="workload" x="48" y="168">RAR5 (5.00 writer) header-encrypted extraction</text>
+    <text class="timing" x="48" y="184">43.9 ms -> 13.4 ms</text>
+    <rect class="cpu" x="885.0" y="160" width="150.9" height="14" rx="2"/>
+    <text class="ratio" x="1043.9" y="172">3.3x</text>
     <line class="rule" x1="48" y1="194" x2="1150" y2="194"/>
-    <text class="workload" x="48" y="222">RAR5 encrypted extraction</text>
-    <text class="timing" x="48" y="238">55.0 ms -> 24.1 ms</text>
-    <rect class="cpu" x="885.0" y="214" width="105.2" height="14" rx="2"/>
-    <text class="ratio" x="998.2" y="226">2.3x</text>
+    <text class="workload" x="48" y="222">RAR5 (7.23 writer) header-encrypted extraction</text>
+    <text class="timing" x="48" y="238">43.0 ms -> 13.3 ms</text>
+    <rect class="cpu" x="885.0" y="214" width="149.6" height="14" rx="2"/>
+    <text class="ratio" x="1042.6" y="226">3.2x</text>
     <line class="rule" x1="48" y1="248" x2="1150" y2="248"/>
-    <text class="workload" x="48" y="276">RAR4 PPMd model-restart text extraction</text>
-    <text class="timing" x="48" y="292">211.5 ms -> 210.2 ms</text>
-    <rect class="cpu" x="885.0" y="268" width="0.8" height="14" rx="2"/>
-    <text class="ratio" x="893.8" y="280">1.0x</text>
+    <text class="workload" x="48" y="276">RAR5 (5.00 writer) recovery-volume restore and extraction</text>
+    <text class="timing" x="48" y="292">36.4 ms -> 16.5 ms</text>
+    <rect class="cpu" x="885.0" y="268" width="100.3" height="14" rx="2"/>
+    <text class="ratio" x="993.3" y="280">2.2x</text>
     <line class="rule" x1="48" y1="302" x2="1150" y2="302"/>
-    <text class="workload" x="48" y="330">RAR4 solid extraction</text>
-    <text class="timing" x="48" y="346">57.5 ms -> 35.2 ms</text>
-    <rect class="cpu" x="885.0" y="322" width="62.7" height="14" rx="2"/>
-    <text class="ratio" x="955.7" y="334">1.6x</text>
+    <text class="workload" x="48" y="330">RAR5 (7.23 writer) recovery-volume restore and extraction</text>
+    <text class="timing" x="48" y="346">35.6 ms -> 16.7 ms</text>
+    <rect class="cpu" x="885.0" y="322" width="96.7" height="14" rx="2"/>
+    <text class="ratio" x="989.7" y="334">2.1x</text>
     <line class="rule" x1="48" y1="356" x2="1150" y2="356"/>
-    <text class="workload" x="48" y="384">RAR4 normal extraction</text>
-    <text class="timing" x="48" y="400">55.7 ms -> 33.4 ms</text>
-    <rect class="cpu" x="885.0" y="376" width="65.2" height="14" rx="2"/>
-    <text class="ratio" x="958.2" y="388">1.7x</text>
+    <text class="workload" x="48" y="384">RAR3 header-encrypted multi-volume extraction</text>
+    <text class="timing" x="48" y="400">52.1 ms -> 27.1 ms</text>
+    <rect class="cpu" x="885.0" y="376" width="83.4" height="14" rx="2"/>
+    <text class="ratio" x="976.4" y="388">1.9x</text>
     <line class="rule" x1="48" y1="410" x2="1150" y2="410"/>
-    <text class="workload" x="48" y="438">RAR recovery-volume restore and extraction</text>
-    <text class="timing" x="48" y="454">37.5 ms -> 21.3 ms</text>
-    <rect class="cpu" x="885.0" y="430" width="72.0" height="14" rx="2"/>
-    <text class="ratio" x="965.0" y="442">1.8x</text>
+    <text class="workload" x="48" y="438">RAR4 header-encrypted multi-volume extraction</text>
+    <text class="timing" x="48" y="454">52.4 ms -> 27.6 ms</text>
+    <rect class="cpu" x="885.0" y="430" width="81.8" height="14" rx="2"/>
+    <text class="ratio" x="974.8" y="442">1.9x</text>
     <line class="rule" x1="48" y1="464" x2="1150" y2="464"/>
-    <text class="workload" x="48" y="492">RAR4 PPMd order-16 32 MiB text extraction</text>
-    <text class="timing" x="48" y="508">5.95 s -> 4.90 s</text>
-    <rect class="cpu" x="885.0" y="484" width="24.7" height="14" rx="2"/>
-    <text class="ratio" x="917.7" y="496">1.2x</text>
+    <text class="workload" x="48" y="492">RAR3 data-encrypted multi-volume extraction</text>
+    <text class="timing" x="48" y="508">33.0 ms -> 20.4 ms</text>
+    <rect class="cpu" x="885.0" y="484" width="61.1" height="14" rx="2"/>
+    <text class="ratio" x="954.1" y="496">1.6x</text>
     <line class="rule" x1="48" y1="518" x2="1150" y2="518"/>
-    <text class="workload" x="48" y="546">RAR4 PPMd classic multi-volume text extraction</text>
-    <text class="timing" x="48" y="562">44.1 ms -> 42.0 ms</text>
-    <rect class="cpu" x="885.0" y="538" width="6.2" height="14" rx="2"/>
-    <text class="ratio" x="899.2" y="550">1.1x</text>
+    <text class="workload" x="48" y="546">RAR5 (5.00 writer) data-encrypted extraction</text>
+    <text class="timing" x="48" y="562">21.3 ms -> 13.2 ms</text>
+    <rect class="cpu" x="885.0" y="538" width="60.6" height="14" rx="2"/>
+    <text class="ratio" x="953.6" y="550">1.6x</text>
     <line class="rule" x1="48" y1="572" x2="1150" y2="572"/>
-    <text class="workload" x="48" y="600">RAR4 PPMd solid multi-member text extraction</text>
-    <text class="timing" x="48" y="616">149.0 ms -> 148.3 ms</text>
-    <rect class="cpu" x="885.0" y="592" width="0.6" height="14" rx="2"/>
-    <text class="ratio" x="893.6" y="604">1.0x</text>
+    <text class="workload" x="48" y="600">RAR4 data-encrypted multi-volume extraction</text>
+    <text class="timing" x="48" y="616">33.1 ms -> 20.6 ms</text>
+    <rect class="cpu" x="885.0" y="592" width="60.1" height="14" rx="2"/>
+    <text class="ratio" x="953.1" y="604">1.6x</text>
     <line class="rule" x1="48" y1="626" x2="1150" y2="626"/>
-    <text class="workload" x="48" y="654">RAR3 multi-volume store extraction</text>
-    <text class="timing" x="48" y="670">7.2 ms -> 6.2 ms</text>
-    <rect class="cpu" x="885.0" y="646" width="19.1" height="14" rx="2"/>
-    <text class="ratio" x="912.1" y="658">1.2x</text>
+    <text class="workload" x="48" y="654">RAR5 (7.23 writer) data-encrypted extraction</text>
+    <text class="timing" x="48" y="670">22.3 ms -> 15.6 ms</text>
+    <rect class="cpu" x="885.0" y="646" width="45.0" height="14" rx="2"/>
+    <text class="ratio" x="938.0" y="658">1.4x</text>
     <line class="rule" x1="48" y1="680" x2="1150" y2="680"/>
-    <text class="workload" x="48" y="708">RAR5 solid extraction</text>
-    <text class="timing" x="48" y="724">18.3 ms -> 18.5 ms</text>
-    <rect class="slower" x="883.6" y="700" width="1.4" height="14" rx="2"/>
-    <text class="ratio" x="875.6" y="712" text-anchor="end">1.0x</text>
+    <text class="workload" x="48" y="708">RAR3 store multi-volume extraction</text>
+    <text class="timing" x="48" y="724">7.4 ms -> 5.9 ms</text>
+    <rect class="cpu" x="885.0" y="700" width="29.6" height="14" rx="2"/>
+    <text class="ratio" x="922.6" y="712">1.3x</text>
     <line class="rule" x1="48" y1="734" x2="1150" y2="734"/>
+    <text class="workload" x="48" y="762">RAR5 (7.23 writer) store single-volume extraction</text>
+    <text class="timing" x="48" y="778">5.8 ms -> 5.0 ms</text>
+    <rect class="cpu" x="885.0" y="754" width="20.4" height="14" rx="2"/>
+    <text class="ratio" x="913.4" y="766">1.2x</text>
+    <line class="rule" x1="48" y1="788" x2="1150" y2="788"/>
+    <text class="workload" x="48" y="816">RAR4 PPMd order-16 32 MiB text extraction</text>
+    <text class="timing" x="48" y="832">6.74 s -> 5.91 s</text>
+    <rect class="cpu" x="885.0" y="808" width="16.8" height="14" rx="2"/>
+    <text class="ratio" x="909.8" y="820">1.1x</text>
+    <line class="rule" x1="48" y1="842" x2="1150" y2="842"/>
+    <text class="workload" x="48" y="870">RAR4 PPMd classic multi-volume text extraction</text>
+    <text class="timing" x="48" y="886">48.4 ms -> 44.3 ms</text>
+    <rect class="cpu" x="885.0" y="862" width="11.2" height="14" rx="2"/>
+    <text class="ratio" x="904.2" y="874">1.1x</text>
+    <line class="rule" x1="48" y1="896" x2="1150" y2="896"/>
+    <text class="workload" x="48" y="924">RAR4 solid multi-volume text extraction</text>
+    <text class="timing" x="48" y="940">15.8 ms -> 14.7 ms</text>
+    <rect class="cpu" x="885.0" y="916" width="9.8" height="14" rx="2"/>
+    <text class="ratio" x="902.8" y="928">1.1x</text>
+    <line class="rule" x1="48" y1="950" x2="1150" y2="950"/>
+    <text class="workload" x="48" y="978">RAR5 (5.00 writer) normal single-volume text extraction</text>
+    <text class="timing" x="48" y="994">10.2 ms -> 9.5 ms</text>
+    <rect class="cpu" x="885.0" y="970" width="9.3" height="14" rx="2"/>
+    <text class="ratio" x="902.3" y="982">1.1x</text>
+    <line class="rule" x1="48" y1="1004" x2="1150" y2="1004"/>
+    <text class="workload" x="48" y="1032">RAR5 (7.23 writer) normal single-volume text extraction</text>
+    <text class="timing" x="48" y="1048">10.5 ms -> 9.9 ms</text>
+    <rect class="cpu" x="885.0" y="1024" width="8.2" height="14" rx="2"/>
+    <text class="ratio" x="901.2" y="1036">1.1x</text>
+    <line class="rule" x1="48" y1="1058" x2="1150" y2="1058"/>
+    <text class="workload" x="48" y="1086">RAR5 (5.00 writer) solid multi-volume text extraction</text>
+    <text class="timing" x="48" y="1102">10.1 ms -> 9.6 ms</text>
+    <rect class="cpu" x="885.0" y="1078" width="6.5" height="14" rx="2"/>
+    <text class="ratio" x="899.5" y="1090">1.1x</text>
+    <line class="rule" x1="48" y1="1112" x2="1150" y2="1112"/>
+    <text class="workload" x="48" y="1140">RAR5 (7.23 writer) solid multi-volume text extraction</text>
+    <text class="timing" x="48" y="1156">10.9 ms -> 10.6 ms</text>
+    <rect class="cpu" x="885.0" y="1132" width="3.0" height="14" rx="2"/>
+    <text class="ratio" x="896.0" y="1144">1.0x</text>
+    <line class="rule" x1="48" y1="1166" x2="1150" y2="1166"/>
+    <text class="workload" x="48" y="1194">RAR3 solid multi-volume text extraction</text>
+    <text class="timing" x="48" y="1210">14.1 ms -> 13.8 ms</text>
+    <rect class="cpu" x="885.0" y="1186" width="2.8" height="14" rx="2"/>
+    <text class="ratio" x="895.8" y="1198">1.0x</text>
+    <line class="rule" x1="48" y1="1220" x2="1150" y2="1220"/>
+    <text class="workload" x="48" y="1248">RAR4 normal single-volume text extraction</text>
+    <text class="timing" x="48" y="1264">14.4 ms -> 14.1 ms</text>
+    <rect class="cpu" x="885.0" y="1240" width="2.7" height="14" rx="2"/>
+    <text class="ratio" x="895.7" y="1252">1.0x</text>
+    <line class="rule" x1="48" y1="1274" x2="1150" y2="1274"/>
+    <text class="workload" x="48" y="1302">RAR5 (6.24 writer) solid multi-volume text extraction</text>
+    <text class="timing" x="48" y="1318">10.2 ms -> 10.0 ms</text>
+    <rect class="cpu" x="885.0" y="1294" width="2.6" height="14" rx="2"/>
+    <text class="ratio" x="895.6" y="1306">1.0x</text>
+    <line class="rule" x1="48" y1="1328" x2="1150" y2="1328"/>
+    <text class="workload" x="48" y="1356">RAR3 normal single-volume text extraction</text>
+    <text class="timing" x="48" y="1372">14.3 ms -> 14.1 ms</text>
+    <rect class="cpu" x="885.0" y="1348" width="2.1" height="14" rx="2"/>
+    <text class="ratio" x="895.1" y="1360">1.0x</text>
+    <line class="rule" x1="48" y1="1382" x2="1150" y2="1382"/>
+    <text class="workload" x="48" y="1410">RAR4 PPMd model-restart text extraction</text>
+    <text class="timing" x="48" y="1426">213.1 ms -> 212.8 ms</text>
+    <rect class="cpu" x="885.0" y="1402" width="0.2" height="14" rx="2"/>
+    <text class="ratio" x="893.2" y="1414">1.0x</text>
+    <line class="rule" x1="48" y1="1436" x2="1150" y2="1436"/>
+    <text class="workload" x="48" y="1464">RAR4 PPMd solid multi-member text extraction</text>
+    <text class="timing" x="48" y="1480">152.5 ms -> 204.2 ms</text>
+    <rect class="slower" x="847.8" y="1456" width="37.2" height="14" rx="2"/>
+    <text class="ratio" x="839.8" y="1468" text-anchor="end">1.3x</text>
+    <line class="rule" x1="48" y1="1490" x2="1150" y2="1490"/>
   </g>
 </svg>

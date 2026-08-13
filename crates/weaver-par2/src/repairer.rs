@@ -3336,9 +3336,6 @@ impl RepairState {
             {
                 let src = repair.install_dir.join(&file.safe_name);
                 let dst = &file.safe_path;
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 match fs::symlink_metadata(dst) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         let target_metadata = fs::metadata(dst).map_err(|error| {
@@ -3360,13 +3357,13 @@ impl RepairState {
                             )));
                         }
                         let backup = unique_backup_path(dst)?;
-                        fs::rename(dst, &backup)?;
+                        crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
                     }
                     Ok(metadata) if metadata.file_type().is_file() => {
                         let backup = unique_backup_path(dst)?;
-                        fs::rename(dst, &backup)?;
+                        crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
                     }
@@ -3382,7 +3379,7 @@ impl RepairState {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
-                fs::rename(src, dst)?;
+                crate::disk::rename_within_base(&options.base_dir, &src, dst)?;
                 crate::file_cache::drop_path_cache(dst);
                 installed_targets.push(dst.clone());
             }
@@ -3391,7 +3388,7 @@ impl RepairState {
         })();
 
         if install_result.is_err() {
-            rollback_installed_files(&installed_targets, &backups);
+            rollback_installed_files(&options.base_dir, &installed_targets, &backups);
         } else {
             // The repaired targets are now accepted. Removing duplicate extra
             // sources is cleanup, not part of the rollback transaction: a
@@ -6079,15 +6076,19 @@ fn unique_backup_path(path: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-fn rollback_installed_files(installed_targets: &[PathBuf], backups: &[(PathBuf, PathBuf)]) {
+fn rollback_installed_files(
+    base_dir: &Path,
+    installed_targets: &[PathBuf],
+    backups: &[(PathBuf, PathBuf)],
+) {
     for target in installed_targets.iter().rev() {
-        let _ = fs::remove_file(target);
+        let _ = crate::disk::remove_file_within_base(base_dir, target);
         crate::file_cache::drop_path_cache(target);
     }
 
     for (target, backup) in backups.iter().rev() {
-        let _ = fs::remove_file(target);
-        if fs::rename(backup, target).is_ok() {
+        let _ = crate::disk::remove_file_within_base(base_dir, target);
+        if crate::disk::rename_within_base(base_dir, backup, target).is_ok() {
             crate::file_cache::drop_path_cache(backup);
             crate::file_cache::drop_path_cache(target);
         }
