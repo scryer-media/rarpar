@@ -27,6 +27,10 @@ use super::plan::default_memory_limit;
 const DEFAULT_INPUT_GROUPING: usize = 12;
 const STAGING_AREA_COUNT: usize = 2;
 const TRANSFER_BUFFER_COUNT: usize = 2;
+// The stripe pipeline's split_at_mut parity selection and the per-stripe
+// prefill of staging[0] are written for exactly two areas; a wider pipeline
+// would silently accumulate from the wrong area.
+const _: () = assert!(STAGING_AREA_COUNT == 2);
 
 /// Worker bands used by forward accumulation. `WEAVER_PAR2_CREATE_THREADS=N`
 /// pins the band count (1 = the sequential pre-banding behavior) so the two
@@ -344,6 +348,19 @@ impl ForwardEncoder {
             .ok_or_else(|| resource_limit("progress byte count overflow"))?;
         let jit_code_budget = buffers.jit_build_limit_bytes;
 
+        // The two staging areas run as a two-stage pipeline: while the
+        // rayon bands accumulate batch N from one area, this thread fills
+        // batch N+1 into the other, hiding source reads and split-layout
+        // conversion behind the GF16 math. `overlap` is false exactly when
+        // banding is off (wasm and the WEAVER_PAR2_CREATE_THREADS=1 escape
+        // hatch), and the sequential arm performs the identical operation
+        // order without rayon, so the produced bytes cannot differ between
+        // the arms.
+        let batch_starts: Vec<usize> = (0..provider.source_count())
+            .step_by(contract.input_grouping)
+            .collect();
+        let overlap = band_size < self.recovery_exponents.len();
+
         let mut stripe_offset = 0usize;
         let mut stripe_index = 0usize;
         while stripe_offset < self.slice_size {
@@ -351,43 +368,107 @@ impl ForwardEncoder {
             let actual_len = (self.slice_size - stripe_offset).min(buffers.chunk_len);
             let aligned_len = round_up(actual_len, contract.stride)?;
             output.as_bytes_mut()[..buffers.output_bytes].fill(0);
-
-            for (batch_index, source_start) in (0..provider.source_count())
-                .step_by(contract.input_grouping)
-                .enumerate()
-            {
-                check_cancel(options)?;
-                let transfer_index = batch_index % TRANSFER_BUFFER_COUNT;
+            if let Some(&first_start) = batch_starts.first() {
                 fill_staging(
                     kernel,
-                    &mut staging[batch_index % STAGING_AREA_COUNT],
-                    &mut transfers[transfer_index],
+                    &mut staging[0],
+                    &mut transfers[0],
                     provider,
-                    source_start,
+                    first_start,
                     stripe_offset,
                     actual_len,
                     aligned_len,
                     contract,
                 )?;
-                accumulate_batch(
-                    kernel,
-                    &mut output.as_bytes_mut()[..buffers.output_bytes],
-                    &staging[batch_index % STAGING_AREA_COUNT],
-                    &factors,
-                    &self.recovery_exponents,
-                    source_start,
-                    provider
-                        .source_count()
-                        .saturating_sub(source_start)
-                        .min(contract.input_grouping),
-                    aligned_len,
-                    buffers.aligned_chunk_len,
-                    contract,
-                    band_size,
+            }
+            for (batch_index, &source_start) in batch_starts.iter().enumerate() {
+                check_cancel(options)?;
+                let live_inputs = provider
+                    .source_count()
+                    .saturating_sub(source_start)
+                    .min(contract.input_grouping);
+                let next_start = batch_starts.get(batch_index + 1).copied();
+                let (left, right) = staging.split_at_mut(1);
+                let (current_staging, next_staging) = if batch_index % STAGING_AREA_COUNT == 0 {
+                    (&left[0], &mut right[0])
+                } else {
+                    (&right[0], &mut left[0])
+                };
+                let output_bytes = &mut output.as_bytes_mut()[..buffers.output_bytes];
+                let mut accumulate_result: Result<()> = Ok(());
+                let mut fill_result: Result<()> = Ok(());
+                if overlap {
+                    let accumulate_slot = &mut accumulate_result;
                     #[cfg(target_arch = "x86_64")]
-                    &mut jit_workspaces,
-                    jit_code_budget,
-                )?;
+                    let jit_workspaces = &mut jit_workspaces;
+                    let exponents = &self.recovery_exponents;
+                    let factors = &factors;
+                    rayon::in_place_scope(|scope| {
+                        scope.spawn(move |_| {
+                            *accumulate_slot = accumulate_batch(
+                                kernel,
+                                output_bytes,
+                                current_staging,
+                                factors,
+                                exponents,
+                                source_start,
+                                live_inputs,
+                                aligned_len,
+                                buffers.aligned_chunk_len,
+                                contract,
+                                band_size,
+                                #[cfg(target_arch = "x86_64")]
+                                jit_workspaces,
+                                jit_code_budget,
+                            );
+                        });
+                        if let Some(next_start) = next_start {
+                            fill_result = fill_staging(
+                                kernel,
+                                next_staging,
+                                &mut transfers[(batch_index + 1) % TRANSFER_BUFFER_COUNT],
+                                provider,
+                                next_start,
+                                stripe_offset,
+                                actual_len,
+                                aligned_len,
+                                contract,
+                            );
+                        }
+                    });
+                } else {
+                    accumulate_result = accumulate_batch(
+                        kernel,
+                        output_bytes,
+                        current_staging,
+                        &factors,
+                        &self.recovery_exponents,
+                        source_start,
+                        live_inputs,
+                        aligned_len,
+                        buffers.aligned_chunk_len,
+                        contract,
+                        band_size,
+                        #[cfg(target_arch = "x86_64")]
+                        &mut jit_workspaces,
+                        jit_code_budget,
+                    );
+                    if let Some(next_start) = next_start {
+                        fill_result = fill_staging(
+                            kernel,
+                            next_staging,
+                            &mut transfers[(batch_index + 1) % TRANSFER_BUFFER_COUNT],
+                            provider,
+                            next_start,
+                            stripe_offset,
+                            actual_len,
+                            aligned_len,
+                            contract,
+                        );
+                    }
+                }
+                accumulate_result?;
+                fill_result?;
             }
 
             finish_output(

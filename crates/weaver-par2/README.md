@@ -65,6 +65,8 @@ and post-repair verification rather than measuring only the repair kernel.
 
 ![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-par2-benchmark-linux-x86_64.svg)
 
+![PAR2 workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)
+
 ![PAR2 CPU workloads on Apple M5 Max with macOS arm64](docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
 
 ![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](docs/rarpar-par2-benchmark-macos-arm64-metal.svg)

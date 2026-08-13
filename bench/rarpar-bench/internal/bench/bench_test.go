@@ -334,7 +334,7 @@ func TestRenderSVGIsDeterministicAndEscapesInput(t *testing.T) {
 	if !bytes.Equal(first, second) {
 		t.Fatal("SVG output is not byte deterministic")
 	}
-	const goldenRARSVG = "ff611fd5c2f9e2ec3942f5254baf7a5f4e74bb01fdea78c8b2f41312388e16c4"
+	const goldenRARSVG = "2310e543c37b6238a5b8b541e50e525b424a63e6bcdbdd3094dc3191cff0b8e6"
 	if got := bytesSHA256(first); got != goldenRARSVG {
 		t.Fatalf("RAR SVG changed: got %s, want %s", got, goldenRARSVG)
 	}
@@ -356,7 +356,7 @@ func TestRenderPAR2SVGGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const goldenPAR2SVG = "ec2af08e88b561b396701a1ebd75a6c463d9675479b3aeeed324ac10f2d7193c"
+	const goldenPAR2SVG = "48aaff49972f585f4fb80d78c0c9dc9b2a25c430bbd881aa3e56c9cdfa36f045"
 	if got := bytesSHA256(chart); got != goldenPAR2SVG {
 		t.Fatalf("PAR2 SVG changed: got %s, want %s", got, goldenPAR2SVG)
 	}
@@ -367,8 +367,15 @@ func TestRenderSVGLegendIsFamilySpecific(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(rar), "rarpar / GPU") || !strings.Contains(string(rar), "UnRAR faster") {
-		t.Fatalf("unexpected RAR legend: %s", rar)
+	for _, required := range []string{
+		`<text class="tick" x="752.5" y="310" text-anchor="middle">UnRAR faster</text>`,
+		`<text class="tick" x="1017.5" y="310" text-anchor="middle">rarpar faster</text>`,
+		`<rect class="slower" x="570" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="592" y="96">UnRAR faster</text>`,
+		`<rect class="cpu" x="890" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="912" y="96">rarpar / CPU</text>`,
+	} {
+		if strings.Contains(string(rar), "rarpar / GPU") || !strings.Contains(string(rar), required) {
+			t.Fatalf("RAR direction labels are incorrect: %s", rar)
+		}
 	}
 	report := fixtureReport()
 	report.Comparisons[0].Family = "par2"
@@ -380,10 +387,26 @@ func TestRenderSVGLegendIsFamilySpecific(t *testing.T) {
 	if strings.Contains(string(par2), "rarpar / GPU") {
 		t.Fatalf("unexpected GPU legend: %s", par2)
 	}
-	for _, required := range []string{"par2cmdline-turbo faster", "<rect class=\"cpu\" x=\"570\"", "<rect class=\"slower\" x=\"890\""} {
+	for _, required := range []string{`<text class="tick" x="752.5" y="310" text-anchor="middle">par2cmdline-turbo faster</text>`, `<text class="tick" x="1017.5" y="310" text-anchor="middle">rarpar faster</text>`, "<rect class=\"slower\" x=\"570\"", "<rect class=\"cpu\" x=\"890\""} {
 		if !strings.Contains(string(par2), required) {
 			t.Fatalf("PAR2 legend does not contain %q", required)
 		}
+	}
+}
+
+func TestRenderSVGOrdersFastestRarparWorkloadsFirst(t *testing.T) {
+	report := fixtureReport()
+	report.Plan.Cases = []PlanCase{{ID: "unrar-fast", Order: 1}, {ID: "rarpar-fast", Order: 2}}
+	report.Comparisons = []Comparison{
+		{CaseID: "unrar-fast", Family: "rar", Workload: "UnRAR fastest", Ratio: 0.5},
+		{CaseID: "rarpar-fast", Family: "rar", Workload: "rarpar fastest", Ratio: 2},
+	}
+	chart, err := renderSVG(report, "rar", report.Comparisons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Index(string(chart), "rarpar fastest") > strings.Index(string(chart), "UnRAR fastest") {
+		t.Fatalf("workloads were not ordered by rarpar relative speed: %s", chart)
 	}
 }
 

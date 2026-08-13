@@ -77,7 +77,9 @@ fn evict_path_now(path: &Path) {
     // The drain runs from a Drop over paths recorded much earlier; a path
     // replaced by a FIFO would block a plain open forever, and following a
     // symlink swap would advise the wrong file. Advisory-only, so refuse
-    // both rather than risk hanging after a successful operation.
+    // both rather than risk hanging after a successful operation — at the
+    // cost of never draining sources whose final component is a symlink
+    // (the immediate, fd-based eviction path does cover those).
     #[cfg(unix)]
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -279,12 +281,24 @@ mod tests {
             assert!(EVICTION_DEFERRAL_DEPTH.load(Ordering::SeqCst) >= 2);
             // Above the size gate so the deferral path records the file.
             drop_file_cache(&file, temp.path(), 0, LARGE_FILE_CACHE_ADVICE_MIN_BYTES + 1);
-            assert!(deferred_evictions().lock().unwrap().contains(temp.path()));
+            assert!(
+                deferred_evictions()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(temp.path())
+            );
         }
-        // Both scopes dropped: this test's entry drained without panicking.
-        // (Assert on OUR path only — other tests in this binary may hold
-        // their own scopes concurrently, keeping unrelated entries alive.)
-        assert!(!deferred_evictions().lock().unwrap().contains(temp.path()));
+        // The drain only runs when the depth reaches zero; another test in
+        // this binary may hold its own scope right now, so the post-scope
+        // state is only assertable when no scope remains.
+        if EVICTION_DEFERRAL_DEPTH.load(Ordering::SeqCst) == 0 {
+            assert!(
+                !deferred_evictions()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(temp.path())
+            );
+        }
     }
 
     #[test]
@@ -297,7 +311,12 @@ mod tests {
         let _scope = CacheEvictionDeferral::acquire();
         drop_file_cache(&file, temp.path(), 0, 1024);
         drop_touched_file_cache(&file, temp.path(), 1024, 0, 1024);
-        assert!(!deferred_evictions().lock().unwrap().contains(temp.path()));
+        assert!(
+            !deferred_evictions()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(temp.path())
+        );
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

@@ -346,7 +346,7 @@ pub(crate) fn estimate_validation_workspace_bytes(
         recovery_path_bytes,
         "validation recovery path estimate overflows",
     )?;
-    [
+    let per_volume = [
         parsed_critical_bytes,
         parsed_packet_slots,
         parsed_recovery_paths,
@@ -362,7 +362,27 @@ pub(crate) fn estimate_validation_workspace_bytes(
     .into_iter()
     .try_fold(0usize, |total, bytes| {
         checked_memory_add(total, bytes, "validation workspace estimate overflows")
-    })
+    })?;
+    // Validation runs volumes concurrently (StagedOutputs::validate), each
+    // holding its own full workspace, so the peak scales with the concurrent
+    // volume count. StagedOutputs holds one staged volume per OUTPUT PATH
+    // (the index .par2 plus the recovery volumes; `volumes` counts recovery
+    // volumes only), so the gate mirrors validate()'s parallel/sequential
+    // split over that collection, and the +1 covers the calling thread
+    // participating in the pool. Uses the process-stable thread count, never
+    // rayon's pool-relative view.
+    let staged_volumes = output_paths.len();
+    let threads = super::encode::configured_create_threads();
+    let concurrent_volumes = if threads == 1 || staged_volumes <= 1 {
+        1
+    } else {
+        staged_volumes.min(threads.saturating_add(1))
+    };
+    checked_memory_product(
+        per_volume,
+        concurrent_volumes,
+        "concurrent validation workspace estimate overflows",
+    )
 }
 
 fn expected_packet_count(recovery_count: u32, critical_count: usize) -> Result<usize> {
@@ -779,13 +799,36 @@ impl StagedOutputs {
         sources: &[CreationSource],
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        for volume in &mut self.volumes {
-            check_cancel(cancellation)?;
-            volume.file.flush()?;
-            volume.file.sync_all()?;
-            validate_staged_volume(volume, plan, sources, cancellation)?;
+        // Volumes validate independently; running them in parallel overlaps
+        // their fsyncs and re-read hashing, which dominates on network
+        // storage. The sequential arm keeps the wasm / pinned-single-thread
+        // behavior, and errors surface first-by-volume-order in both arms
+        // (rayon's own Result collection would report an arbitrary racer).
+        let validate_parallel = !cfg!(target_family = "wasm")
+            && self.volumes.len() > 1
+            && super::encode::configured_create_threads() != 1;
+        if !validate_parallel {
+            for volume in &mut self.volumes {
+                check_cancel(cancellation)?;
+                volume.file.flush()?;
+                volume.file.sync_all()?;
+                validate_staged_volume(volume, plan, sources, cancellation)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        use rayon::prelude::*;
+        self.volumes
+            .par_iter_mut()
+            .map(|volume| {
+                check_cancel(cancellation)?;
+                volume.file.flush()?;
+                volume.file.sync_all()?;
+                validate_staged_volume(volume, plan, sources, cancellation)
+            })
+            .collect::<Vec<Result<()>>>()
+            .into_iter()
+            .collect::<Result<Vec<()>>>()
+            .map(|_| ())
     }
 
     fn commit(self, overwrite: bool, cancellation: &CancellationToken) -> Result<()> {

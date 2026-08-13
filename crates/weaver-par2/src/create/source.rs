@@ -175,7 +175,9 @@ pub(crate) fn collect_sources(
         // Collect every per-file Result, then surface the FIRST error by
         // input order: rayon's Result collection reports an arbitrary
         // racer's error, which would let a concurrent I/O error mask
-        // `Cancelled` (or make the reported path vary run to run).
+        // `Cancelled` (or make the reported path vary run to run). The
+        // deliberate cost is losing error short-circuiting — in-flight
+        // files hash to completion before the error surfaces.
         active_inputs
             .par_iter()
             .enumerate()

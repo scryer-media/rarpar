@@ -84,6 +84,8 @@ decoder microbenchmarks.
 
 ![RAR workloads on Intel Core i5-1240P with Linux x86-64](docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
+![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
+
 ![RAR workloads on Apple M5 Max with macOS arm64](docs/rarpar-rar-benchmark-macos-arm64.svg)
 
 ### Broader library workloads

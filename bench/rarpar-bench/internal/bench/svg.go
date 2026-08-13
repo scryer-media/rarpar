@@ -161,7 +161,7 @@ func renderSVG(report Report, family string, comparisons []Comparison) ([]byte, 
 func renderSVGGroups(family string, groups []chartGroup) ([]byte, error) {
 	rowCount := 0
 	for index := range groups {
-		comparisonCaseIDs(groups[index].report.Plan, groups[index].comparisons)
+		orderComparisonsByRelativeSpeed(groups[index].report.Plan, groups[index].comparisons)
 		rowCount += len(groups[index].comparisons)
 	}
 	height := 198 + rowCount*54 + (len(groups)-1)*30
@@ -235,6 +235,15 @@ func renderSVGGroups(family string, groups []chartGroup) ([]byte, error) {
 	return document.Bytes(), nil
 }
 
+func orderComparisonsByRelativeSpeed(plan Plan, comparisons []Comparison) {
+	sort.SliceStable(comparisons, func(left, right int) bool {
+		if comparisons[left].Ratio != comparisons[right].Ratio {
+			return comparisons[left].Ratio > comparisons[right].Ratio
+		}
+		return caseOrder(plan, comparisons[left].CaseID) < caseOrder(plan, comparisons[right].CaseID)
+	})
+}
+
 func ratioX(ratio, start, parity, end float64) float64 {
 	clamped := math.Max(0.125, math.Min(8, ratio))
 	return parity + math.Log2(clamped)*(end-parity)/3
@@ -263,11 +272,13 @@ func chartHasGPU(groups []chartGroup) bool {
 
 func legendSVG(reference string, hasGPU bool) string {
 	var legend strings.Builder
-	legend.WriteString("  <g aria-label=\"Legend\"><rect class=\"cpu\" x=\"570\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"592\" y=\"96\">rarpar / CPU</text>")
+	fmt.Fprintf(&legend, "  <g aria-label=\"Legend\"><rect class=\"slower\" x=\"570\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"592\" y=\"96\">%s faster</text>", escapeXML(reference))
 	if hasGPU {
-		legend.WriteString("<rect class=\"gpu\" x=\"720\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"742\" y=\"96\">rarpar / GPU</text>")
+		legend.WriteString("<rect class=\"cpu\" x=\"720\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"742\" y=\"96\">rarpar / CPU</text><rect class=\"gpu\" x=\"890\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"912\" y=\"96\">rarpar / GPU</text>")
+	} else {
+		legend.WriteString("<rect class=\"cpu\" x=\"890\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"912\" y=\"96\">rarpar / CPU</text>")
 	}
-	fmt.Fprintf(&legend, "<rect class=\"slower\" x=\"890\" y=\"84\" width=\"14\" height=\"14\" rx=\"2\"/><text class=\"subtitle\" x=\"912\" y=\"96\">%s faster</text></g>\n", escapeXML(reference))
+	legend.WriteString("</g>\n")
 	return legend.String()
 }
 

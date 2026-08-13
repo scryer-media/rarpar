@@ -302,6 +302,68 @@ fn par_create_json_reports_real_outcome_and_writes_outputs() {
 }
 
 #[test]
+fn par_create_progress_reports_true_scan_totals_without_flooding() {
+    let temp = tempfile::tempdir().unwrap();
+    let sizes = [100_000usize, 50_000, 25_000];
+    for (index, size) in sizes.iter().enumerate() {
+        std::fs::write(
+            temp.path().join(format!("input{index}.bin")),
+            vec![index as u8 + 1; *size],
+        )
+        .unwrap();
+    }
+    let total_bytes: usize = sizes.iter().sum();
+    let output_path = temp.path().join("set");
+
+    // No --json/--quiet: progress goes to stderr. The source scan hashes
+    // files concurrently; the callback must still end the scan phase on the
+    // true cumulative byte count (a flush line, not a racy sample), and the
+    // 250 ms throttle must hold (three progress-callback regressions in a
+    // row shipped because nothing asserted on this output).
+    let output = run_in_dir(
+        temp.path(),
+        &[
+            OsStr::new("par"),
+            OsStr::new("create"),
+            output_path.as_os_str(),
+            OsStr::new("--block-size"),
+            OsStr::new("4096"),
+            OsStr::new("--recovery-count"),
+            OsStr::new("1"),
+            OsStr::new("--volume-count"),
+            OsStr::new("1"),
+            OsStr::new("--volume-scheme"),
+            OsStr::new("uniform"),
+            OsStr::new("input0.bin"),
+            OsStr::new("input1.bin"),
+            OsStr::new("input2.bin"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let progress_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("create "))
+        .collect();
+    assert!(
+        progress_lines
+            .iter()
+            .any(|line| line.contains(&format!("({total_bytes} bytes)"))),
+        "no progress line reports the true scan total of {total_bytes} bytes: {progress_lines:?}"
+    );
+    assert!(
+        progress_lines.len() <= 40,
+        "progress flooded: {} lines",
+        progress_lines.len()
+    );
+}
+
+#[test]
 fn par_create_rejects_existing_outputs_without_overwrite() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("input.bin"), b"123456789").unwrap();

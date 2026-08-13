@@ -145,59 +145,92 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
     options.overwrite = cli.overwrite;
     options.dry_run = cli.dry_run;
 
-    if !cli.json && !cli.quiet {
-        options.progress = Some(create_progress_callback());
-    }
+    let progress_latch = if !cli.json && !cli.quiet {
+        let (callback, latch) = create_progress_callback();
+        options.progress = Some(callback);
+        Some(latch)
+    } else {
+        None
+    };
 
     let creator = Par2Creator::new(options);
     let plan: Par2CreatePlan = creator.plan()?;
     report::emit_par_create_plan(cli, &plan)?;
     let outcome: Par2CreateOutcome = creator.create(&plan)?;
+    // The throttled callback never claims a phase is finished (no update is
+    // identifiable as final); flush the latched truth once create returns.
+    if let Some(latch) = progress_latch {
+        latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .print();
+    }
     report::emit_par_create_outcome(cli, &plan, &outcome)?;
     Ok(EXIT_SUCCESS)
 }
 
-fn create_progress_callback() -> par2_rs::ProgressCallback {
-    struct ProgressLatch {
-        last: Instant,
-        total: u32,
-        current: u32,
-        bytes: u64,
+struct ProgressLatch {
+    last: Instant,
+    stage: Option<par2_rs::ProgressStage>,
+    total: u32,
+    current: u32,
+    bytes: u64,
+}
+
+impl ProgressLatch {
+    fn print(&self) {
+        let Some(stage) = self.stage else {
+            return;
+        };
+        eprintln!(
+            "create {stage:?}: {}/{} ({} bytes)",
+            self.current.saturating_add(1).min(self.total),
+            self.total,
+            self.bytes
+        );
     }
+}
+
+fn create_progress_callback() -> (par2_rs::ProgressCallback, Arc<Mutex<ProgressLatch>>) {
     let state = Arc::new(Mutex::new(ProgressLatch {
         last: Instant::now() - Duration::from_secs(1),
+        stage: None,
         total: 0,
         current: 0,
         bytes: 0,
     }));
-    Arc::new(move |update| {
+    let latch_handle = Arc::clone(&state);
+    let callback: par2_rs::ProgressCallback = Arc::new(move |update| {
         let now = Instant::now();
-        let mut latch = state.lock().expect("creation progress mutex");
+        let mut latch = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The source scan delivers updates from concurrent hashers, so raw
-        // updates are not monotonic. Latch to the maximum seen, and reset the
-        // latch when the phase changes (each phase carries its own total:
-        // file count while scanning, stripe count while encoding).
+        // updates are not monotonic. Latch to the maximum seen, and reset
+        // the latch when the phase changes (each phase carries its own
+        // total: file count while scanning, stripe count while encoding).
+        // No update is identifiable as a phase's last, so the outgoing
+        // phase's true final values are flushed at the transition and the
+        // operation's final values are flushed by the caller after create
+        // returns; in between, prints are purely throttle-sampled.
         if update.total != latch.total {
+            if latch.total != 0 {
+                latch.print();
+            }
             latch.total = update.total;
             latch.current = 0;
             latch.bytes = 0;
         }
+        latch.stage = Some(update.stage);
         latch.current = latch.current.max(update.current);
         latch.bytes = latch.bytes.max(update.bytes_processed);
-        if now.duration_since(latch.last) < Duration::from_millis(250)
-            && latch.current.saturating_add(1) < latch.total
-        {
+        if now.duration_since(latch.last) < Duration::from_millis(250) {
             return;
         }
         latch.last = now;
-        eprintln!(
-            "create {:?}: {}/{} ({} bytes)",
-            update.stage,
-            latch.current.saturating_add(1).min(latch.total),
-            latch.total,
-            latch.bytes
-        );
-    })
+        latch.print();
+    });
+    (callback, latch_handle)
 }
 
 fn emit_command_outcome(

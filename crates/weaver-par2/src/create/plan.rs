@@ -505,7 +505,21 @@ fn estimate_source_hash_workspace(input_count: usize) -> Result<usize> {
         2,
         "source index estimate overflows",
     )?;
-    [READ_BUFFER_BYTES, input_lengths, hash_sets]
+    // Source hashing runs one file per rayon task, each with its own read
+    // buffer; the gate mirrors the parallel scan's split in source.rs and
+    // the +1 covers the calling thread. Process-stable thread count only.
+    let threads = super::encode::configured_create_threads();
+    let concurrent_reads = if threads == 1 || input_count <= 1 {
+        1
+    } else {
+        input_count.min(threads.saturating_add(1))
+    };
+    let read_buffers = checked_memory_mul(
+        READ_BUFFER_BYTES,
+        concurrent_reads,
+        "concurrent source read buffer estimate overflows",
+    )?;
+    [read_buffers, input_lengths, hash_sets]
         .into_iter()
         .try_fold(0usize, |total, bytes| {
             checked_memory_add(total, bytes, "source hashing estimate overflows")
