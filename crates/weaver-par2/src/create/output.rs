@@ -580,7 +580,17 @@ impl RollbackTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileIdentity {
     #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
+    Unix {
+        device: u64,
+        inode: u64,
+        // (device, inode) alone is forgeable by immediate inode reuse: ext4
+        // hands a just-freed inode to the next creation, so a foreign file
+        // written over a removed target can collide. Birth time
+        // disambiguates recreation while surviving the transaction's own
+        // renames (ctime would not). None where the filesystem cannot
+        // report it, which degrades to the previous (device, inode) check.
+        birth: Option<std::time::SystemTime>,
+    },
     #[cfg(windows)]
     Windows { volume: u32, index: u64 },
 }
@@ -635,6 +645,7 @@ impl FileIdentity {
         Some(Self::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
+            birth: metadata.created().ok(),
         })
     }
 
