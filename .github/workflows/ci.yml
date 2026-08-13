@@ -19,6 +19,10 @@ env:
   GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
   SCCACHE_CACHE_VERSION: v1
+  WASM_CACHE_VERSION: v2
+  # Pinned: the wasm harness lanes are only comparable with each other if they
+  # all executed on the same runtime. Bump deliberately, not incidentally.
+  WASMTIME_VERSION: 47.0.3
   WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
   WEAVER_LFS_PAR2_FIXTURES: crates/weaver-par2/tests/fixtures/**
   WEAVER_LFS_UNIT_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_hp_large.rar
@@ -34,9 +38,10 @@ jobs:
       rarpar: ${{ steps.detect.outputs.rarpar }}
       rust: ${{ steps.detect.outputs.rust }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: detect
         name: Detect changed areas
         env:
@@ -87,7 +92,7 @@ jobs:
 
           while IFS= read -r path; do
             case "$path" in
-              crates/*|.github/workflows/publish-crates.yml|.gitattributes|.gitleaks.toml|.githooks/*)
+              crates/*|.github/workflows/publish-crates.yml|.gitattributes|.gitleaks.toml|.githooks/*|.github/scripts/*)
                 crates_direct=true
                 ;;
               tools/rarpar/*|xtask/*|bench/rarpar-bench/*|.github/workflows/release.yml|README.md|docs/*)
@@ -140,7 +145,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check repository hygiene
         run: |
           set -euo pipefail
@@ -182,8 +189,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -205,8 +214,10 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -216,7 +227,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-${{ github.run_id }}
@@ -224,7 +235,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -236,7 +247,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -256,7 +267,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate unit-test fixtures
         run: |
           set -euo pipefail
@@ -271,7 +284,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -280,7 +293,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-${{ github.run_id }}
@@ -288,7 +301,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -300,7 +313,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -320,7 +333,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate regular fixture corpus
         run: |
           set -euo pipefail
@@ -335,7 +350,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -345,7 +360,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-${{ github.run_id }}
@@ -353,7 +368,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -365,7 +380,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -385,7 +400,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate PAR2 fixtures
         run: |
           set -euo pipefail
@@ -400,7 +417,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -409,7 +426,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-${{ github.run_id }}
@@ -417,7 +434,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -429,7 +446,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -449,7 +466,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate UnRAR fixtures
         run: |
           set -euo pipefail
@@ -464,7 +483,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -505,7 +524,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-${{ github.run_id }}
@@ -513,7 +532,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -525,7 +544,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -556,7 +575,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate unit-test fixtures
         shell: bash
         run: |
@@ -572,7 +593,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies (Linux)
@@ -600,7 +621,7 @@ jobs:
           $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
@@ -608,7 +629,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Configure compiler flags (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -641,7 +662,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -694,8 +715,10 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -734,7 +757,7 @@ jobs:
           $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
@@ -742,7 +765,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Configure compiler flags (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -794,7 +817,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -814,8 +837,10 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -824,7 +849,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-${{ github.run_id }}
@@ -832,7 +857,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1006,7 +1031,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1026,8 +1051,10 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -1036,7 +1063,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm mandoc
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-${{ github.run_id }}
@@ -1044,7 +1071,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1080,7 +1107,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1092,8 +1119,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: bench/rarpar-bench/go.mod
           cache-dependency-path: bench/rarpar-bench/go.mod
@@ -1120,7 +1149,9 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Hydrate smoke fixtures
         run: |
           set -euo pipefail
@@ -1136,7 +1167,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -1145,7 +1176,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-${{ github.run_id }}
@@ -1153,7 +1184,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1180,10 +1211,376 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  # The wasm correctness harnesses. Both crates ship an example that runs the
+  # real code over the real fixtures and prints a digest per case; until now
+  # only the wasm *targets* were installed in CI and nothing ever executed
+  # them. Each job runs the harness natively first and treats that run's
+  # digests as the expectation for every wasm lane in the same job, so no
+  # digest is ever hardcoded here: a fixture change moves the reference and the
+  # lanes together, while a lane that decodes different bytes still fails.
+  wasm-par2-harness:
+    name: wasm-par2-harness
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # One CARGO_TARGET_DIR per (target, RUSTFLAGS) pair: cargo fingerprints
+      # do not separate builds by RUSTFLAGS, so sharing a directory between the
+      # portable and +simd128 lanes would rebuild the world on every switch.
+      WASM_LANES: ${{ github.workspace }}/target-wasm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Hydrate PAR2 fixtures
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_PAR2_FIXTURES" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$WEAVER_LFS_PAR2_FIXTURES" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+      - name: Install native build dependencies
+        run: |
+          # Only the native reference build needs these: building an example
+          # compiles the crate's dev-dependencies, and par2-rs depends (for
+          # non-wasm targets only) on unrar-rs with its AWS-LC backend, which
+          # brings in aws-lc-sys. The wasm lanes compile none of it -- those
+          # dev-dependencies are target-gated off wasm.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
+      - name: Restore wasm lane target directories
+        id: wasm-cache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          # Only the wasm lanes are cached. The native reference build pulls in
+          # this crate's native-only dev-dependencies and is an order of
+          # magnitude larger for no reuse benefit.
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+            ${{ github.workspace }}/target-wasm/threads-portable
+            ${{ github.workspace }}/target-wasm/threads-simd128
+          key: gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par2-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par2-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par2-${{ env.RUST_TOOLCHAIN }}-
+      - name: Set up wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          # The lanes are only comparable against each other if they all ran on
+          # the same runtime, so assert the pin rather than trusting that the
+          # setup action resolved the requested version.
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Build the PAR2 harness for every lane
+        run: |
+          set -euo pipefail
+          build_lane() {
+            local lane="$1" target="$2" flags="$3"
+            # Empty for the native build. The `${a[@]+...}` form is what keeps
+            # expanding an empty array legal under `set -u`.
+            local -a target_arg=()
+            if [ -n "$target" ]; then
+              target_arg=(--target "$target")
+            fi
+            echo "::group::build $lane (${target:-native}) RUSTFLAGS=\"$flags\""
+            CARGO_TARGET_DIR="$WASM_LANES/$lane" RUSTFLAGS="$flags" \
+              cargo build --release --locked -p par2-rs --no-default-features \
+                ${target_arg[@]+"${target_arg[@]}"} --example wasm_par2_check
+            echo "::endgroup::"
+          }
+          # --no-default-features throughout: it drops the aws-lc-sys MD5
+          # backend, which cannot build for wasm at all, and keeps the native
+          # reference feature-identical to the lanes it is the control for.
+          build_lane native           ""                    ""
+          build_lane wasip1-portable  wasm32-wasip1         ""
+          build_lane wasip1-simd128   wasm32-wasip1         "-C target-feature=+simd128"
+      - name: Run the PAR2 harness natively, then on every wasm lane
+        run: |
+          set -euo pipefail
+          fixtures="$PWD/crates/weaver-par2/tests/fixtures"
+          check="$PWD/.github/scripts/wasm-harness-check.sh"
+          reports="$RUNNER_TEMP/par2-reports"
+          mkdir -p "$reports"
+
+          # The native reference. `wasm-harness-check.sh` fails the job here if
+          # the report is missing any case, if a reconstruction case did not
+          # actually reconstruct, or if a readback came back short -- so a
+          # broken or silently-empty reference can never become the standard
+          # the wasm lanes are then trivially "equal" to.
+          echo "::group::lane native (reference)"
+          rm -rf "$RUNNER_TEMP/scratch-native"
+          mkdir -p "$RUNNER_TEMP/scratch-native"
+          "$WASM_LANES/native/release/examples/wasm_par2_check" \
+            "$fixtures" "$RUNNER_TEMP/scratch-native" | tee "$reports/native.txt"
+          "$check" par2 "$reports/native.txt" "$reports/native.canon"
+          rm -rf "$RUNNER_TEMP/scratch-native"
+          echo "::endgroup::"
+
+          results=()
+          failures=0
+          run_lane() {
+            local name="$1" wasm="$2"
+            shift 2
+            local scratch="$RUNNER_TEMP/scratch-$name"
+            rm -rf "$scratch"
+            mkdir -p "$scratch"
+            echo "::group::lane $name"
+            local status=PASS
+            # Each lane must (1) exit clean, (2) pass the same non-vacuous case
+            # assertions as native, and (3) produce a byte-identical canonical
+            # report -- which is where the digests are actually compared.
+            if wasmtime run "$@" \
+                 --dir "$fixtures::/fixtures" --dir "$scratch::/scratch" \
+                 "$wasm" /fixtures /scratch | tee "$reports/$name.txt" \
+               && "$check" par2 "$reports/$name.txt" "$reports/$name.canon" \
+               && diff -u "$reports/native.canon" "$reports/$name.canon"; then
+              echo "lane $name: canonical report is identical to native"
+            else
+              status=FAIL
+              failures=$((failures + 1))
+              echo "::error::wasm lane $name diverged from the native reference run"
+            fi
+            # Each lane's scratch peaks around 600 MiB of fixture copies.
+            rm -rf "$scratch"
+            results+=("$name|$status")
+            echo "::endgroup::"
+          }
+
+          w1="$WASM_LANES/wasip1-portable/wasm32-wasip1/release/examples/wasm_par2_check.wasm"
+          w1s="$WASM_LANES/wasip1-simd128/wasm32-wasip1/release/examples/wasm_par2_check.wasm"
+
+          run_lane wasip1-portable "$w1"
+          run_lane wasip1-simd128 "$w1s"
+          # No wasm32-wasip1-threads lanes, by decision (2026-08-13): the
+          # production host runs wasmtime 47, which removed wasi-threads and
+          # wasi-common outright (RELEASES.md 47.0.0), so threads-target
+          # modules fail to instantiate there ("unknown import: `env::memory`")
+          # and no flag restores them. The MT wasm code stays in-tree behind
+          # its runtime thread-capability probe (inert on wasip1) with native
+          # test coverage; revisit these lanes when a runtime ships
+          # shared-everything-threads or an equivalent ABI.
+
+          {
+            echo "### wasm PAR2 harness"
+            echo
+            echo "wasmtime $WASMTIME_VERSION; digests compared against the native run in this job."
+            echo
+            echo "| lane | result |"
+            echo "| --- | --- |"
+            for entry in "${results[@]}"; do
+              echo "| ${entry%%|*} | ${entry##*|} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures wasm PAR2 lane(s) failed"
+            exit 1
+          fi
+      - name: Save wasm lane target directories
+        if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+            ${{ github.workspace }}/target-wasm/threads-portable
+            ${{ github.workspace }}/target-wasm/threads-simd128
+          key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
+
+  wasm-unrar-harness:
+    name: wasm-unrar-harness
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      WASM_LANES: ${{ github.workspace }}/target-wasm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Hydrate the UnRAR fixtures the wasm harness opens
+        run: |
+          set -euo pipefail
+          # Only the fixture families `wasm_extract_check` names (~169 MiB),
+          # not the whole ~836 MiB corpus `unrar-slow-tests` hydrates. These
+          # globs expand to exactly the harness's fixture set; if the harness
+          # gains a case that is not covered here the missing file stays an LFS
+          # pointer and the harness fails loudly on it.
+          include="$(paste -sd, - <<'GLOBS'
+          crates/weaver-unrar/tests/fixtures/rar4/generated_matrix_rar4_lz_enc.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar4/generated_matrix_rar4_lz_plain.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_lz.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_mv_store.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_store.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_lz.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_lz_solid_mv.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_mv_store.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_mv.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_restart.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_solid.rar
+          crates/weaver-unrar/tests/fixtures/rar4/rar4_store.rar
+          crates/weaver-unrar/tests/fixtures/rar5/generated_matrix_rar5_lz_enc.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar5/generated_matrix_rar5_lz_plain.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_lz.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_lz.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_mv_store.part*.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_solid.rar
+          crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar
+          GLOBS
+          )"
+          git lfs install --local
+          git lfs pull --include="$include" --exclude=""
+          git lfs fsck --pointers
+          git lfs ls-files --name-only --include="$include" > .ci-lfs-hydrated.txt
+          test -s .ci-lfs-hydrated.txt
+          while IFS= read -r path; do
+            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+              echo "::error::LFS file was not hydrated: $path"
+              exit 1
+            fi
+          done < .ci-lfs-hydrated.txt
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+      - name: Restore wasm lane target directories
+        id: wasm-cache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+          key: gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-unrar-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-unrar-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-unrar-${{ env.RUST_TOOLCHAIN }}-
+      - name: Set up wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Build the UnRAR harness for every lane
+        run: |
+          set -euo pipefail
+          build_lane() {
+            local lane="$1" target="$2" flags="$3"
+            # Empty for the native build. The `${a[@]+...}` form is what keeps
+            # expanding an empty array legal under `set -u`.
+            local -a target_arg=()
+            if [ -n "$target" ]; then
+              target_arg=(--target "$target")
+            fi
+            echo "::group::build $lane (${target:-native}) RUSTFLAGS=\"$flags\""
+            CARGO_TARGET_DIR="$WASM_LANES/$lane" RUSTFLAGS="$flags" \
+              cargo build --release --locked -p unrar-rs --no-default-features \
+                --features crypto-rust ${target_arg[@]+"${target_arg[@]}"} --example wasm_extract_check
+            echo "::endgroup::"
+          }
+          # crypto-rust is the only backend that builds for wasm (the default
+          # aws-lc backend does not), so the native reference is built with it
+          # too: the point of that run is to be a like-for-like control.
+          build_lane native          ""            ""
+          build_lane wasip1-portable wasm32-wasip1 ""
+          build_lane wasip1-simd128  wasm32-wasip1 "-C target-feature=+simd128"
+      - name: Run the UnRAR harness natively, then on every wasm lane
+        run: |
+          set -euo pipefail
+          fixtures="$PWD/crates/weaver-unrar/tests/fixtures"
+          check="$PWD/.github/scripts/wasm-harness-check.sh"
+          reports="$RUNNER_TEMP/unrar-reports"
+          mkdir -p "$reports"
+
+          echo "::group::lane native (reference)"
+          "$WASM_LANES/native/release/examples/wasm_extract_check" "$fixtures" \
+            | tee "$reports/native.txt"
+          "$check" unrar "$reports/native.txt" "$reports/native.canon"
+          echo "::endgroup::"
+
+          results=()
+          failures=0
+          run_lane() {
+            local name="$1" wasm="$2"
+            local guest_tmp="$RUNNER_TEMP/tmp-$name"
+            rm -rf "$guest_tmp"
+            mkdir -p "$guest_tmp"
+            echo "::group::lane $name"
+            local status=PASS
+            # The /tmp preopen matches the invocation documented on the
+            # harness; the spool never reaches it on wasm (WASI preview1 has no
+            # usable temp dir), which `wasm-harness-check.sh` asserts.
+            if wasmtime run --dir "$fixtures::/fixtures" --dir "$guest_tmp::/tmp" \
+                 --env TMPDIR=/tmp "$wasm" /fixtures | tee "$reports/$name.txt" \
+               && "$check" unrar "$reports/$name.txt" "$reports/$name.canon" \
+               && diff -u "$reports/native.canon" "$reports/$name.canon"; then
+              echo "lane $name: canonical report is identical to native"
+            else
+              status=FAIL
+              failures=$((failures + 1))
+              echo "::error::wasm lane $name diverged from the native reference run"
+            fi
+            rm -rf "$guest_tmp"
+            results+=("$name|$status")
+            echo "::endgroup::"
+          }
+
+          run_lane wasip1-portable \
+            "$WASM_LANES/wasip1-portable/wasm32-wasip1/release/examples/wasm_extract_check.wasm"
+          run_lane wasip1-simd128 \
+            "$WASM_LANES/wasip1-simd128/wasm32-wasip1/release/examples/wasm_extract_check.wasm"
+
+          {
+            echo "### wasm UnRAR harness"
+            echo
+            echo "wasmtime $WASMTIME_VERSION; digests compared against the native run in this job."
+            echo
+            echo "| lane | result |"
+            echo "| --- | --- |"
+            for entry in "${results[@]}"; do
+              echo "| ${entry%%|*} | ${entry##*|} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures wasm UnRAR lane(s) failed"
+            exit 1
+          fi
+      - name: Save wasm lane target directories
+        if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+          key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
 
   ci-complete:
     name: ci-complete
@@ -1204,6 +1601,8 @@ jobs:
       - package
       - docs-package
       - cli-smoke
+      - wasm-par2-harness
+      - wasm-unrar-harness
     steps:
       - name: Check CI result
         run: |

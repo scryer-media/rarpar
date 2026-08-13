@@ -166,9 +166,11 @@ pub(crate) fn collect_sources(
     // Hash one file per rayon task; each file's scan is independent. The
     // shared byte counter is monotonic, but callbacks fire concurrently, so
     // DELIVERY to the progress callback is not ordered. The sequential arm
-    // is the wasm path (no worker pool, matching the crate's other guards)
+    // is the single-threaded-wasm path (no worker pool, matching the crate's
+    // other guards; `wasm32-wasip1-threads` probes `true` and hashes in
+    // parallel like native)
     // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
-    let scan_parallel = !cfg!(target_family = "wasm")
+    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
         && active_inputs.len() > 1
         && super::encode::configured_create_threads() != 1;
     let scanned: Vec<CreationSource> = if scan_parallel {

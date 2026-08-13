@@ -11,10 +11,20 @@ const (
 )
 
 type ToolchainLock struct {
-	SchemaVersion int           `json:"schema_version"`
-	DockerBase    string        `json:"docker_base"`
-	RARWriters    []RARWriter   `json:"rar_writers"`
+	SchemaVersion int         `json:"schema_version"`
+	DockerBase    string      `json:"docker_base"`
+	RARWriters    []RARWriter `json:"rar_writers"`
+	// VideoEncoder produces the real muxed A/V payloads. Unlike the writers it
+	// is pulled rather than built, so it is pinned the way docker_base is: by
+	// image digest.
+	VideoEncoder  VideoEncoder  `json:"video_encoder"`
 	PAR2Generator PAR2Generator `json:"par2_generator"`
+}
+
+type VideoEncoder struct {
+	ID       string `json:"id"`
+	Image    string `json:"image"`
+	Platform string `json:"platform"`
 }
 
 type RARWriter struct {
@@ -35,9 +45,16 @@ type PAR2Generator struct {
 }
 
 type CorpusConfig struct {
-	SchemaVersion         int          `json:"schema_version"`
-	ID                    string       `json:"id"`
-	Seed                  string       `json:"seed"`
+	SchemaVersion int    `json:"schema_version"`
+	ID            string `json:"id"`
+	Seed          string `json:"seed"`
+	// SourceRev pins the git revision the source-text payload profile reads.
+	// A revision's tree is immutable, so the class stays reproducible no matter
+	// what the working tree looks like when the corpus is regenerated.
+	SourceRev string `json:"source_rev,omitempty"`
+	// Notes carries the rationale for the case mix. JSON has no comments and the
+	// weighting behind this corpus is not self-evident from the case list.
+	Notes                 []string     `json:"notes,omitempty"`
 	PayloadBytes          int64        `json:"payload_bytes"`
 	VolumeSize            string       `json:"volume_size"`
 	PAR2RedundancyPercent int          `json:"par2_redundancy_percent"`
@@ -45,18 +62,21 @@ type CorpusConfig struct {
 }
 
 type CaseConfig struct {
-	ID                  string `json:"id"`
-	Family              string `json:"family"`
-	Writer              string `json:"writer"`
-	Format              int    `json:"format"`
-	Store               bool   `json:"store"`
-	PPMd                bool   `json:"ppmd"`
-	PayloadProfile      string `json:"payload_profile"`
-	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
-	VolumeSize          string `json:"volume_size"`
-	Solid               bool   `json:"solid"`
-	Encrypted           bool   `json:"encrypted"`
-	HeaderEncrypted     bool   `json:"header_encrypted,omitempty"`
+	ID              string `json:"id"`
+	Family          string `json:"family"`
+	Writer          string `json:"writer"`
+	Format          int    `json:"format"`
+	Store           bool   `json:"store"`
+	PPMd            bool   `json:"ppmd"`
+	PayloadProfile  string `json:"payload_profile"`
+	PayloadBytes    int64  `json:"payload_bytes,omitempty"`
+	VolumeSize      string `json:"volume_size"`
+	Solid           bool   `json:"solid"`
+	Encrypted       bool   `json:"encrypted"`
+	HeaderEncrypted bool   `json:"header_encrypted,omitempty"`
+	// Blake2 selects RAR5 BLAKE2sp member checksums (`-htb`) instead of the
+	// default CRC32. RAR4 and earlier have no such hash.
+	Blake2              bool   `json:"blake2,omitempty"`
 	PAR2                bool   `json:"par2"`
 	RecoveryVolumes     bool   `json:"recovery_volumes"`
 	Mutation            string `json:"mutation"`

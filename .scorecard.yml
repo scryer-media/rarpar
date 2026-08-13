@@ -1,0 +1,9 @@
+annotations:
+  - checks:
+      - binary-artifacts
+    reasons:
+      - reason: test-data
+        value: >-
+          RAR, PAR2, and self-extracting archive samples are versioned parser
+          regression fixtures. They are hydrated only for the tests that need
+          them and are not shipped in published packages.

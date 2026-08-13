@@ -7,6 +7,13 @@ import (
 )
 
 func CreatePlan(corpusRoot, seed, lane, family, par2Placement string, warmups, repeats int) (Plan, error) {
+	return CreatePlanWithCases(corpusRoot, seed, lane, family, par2Placement, warmups, repeats, nil)
+}
+
+// CreatePlanWithCases restricts the plan to an explicit case subset. A filtered
+// plan is a different plan: the case list feeds the plan id, so a subset can
+// never be mistaken for the full suite when reports are compared.
+func CreatePlanWithCases(corpusRoot, seed, lane, family, par2Placement string, warmups, repeats int, caseFilter []string) (Plan, error) {
 	if warmups < 0 || repeats < 1 {
 		return Plan{}, fmt.Errorf("warmups must be non-negative and repeats must be positive")
 	}
@@ -47,6 +54,26 @@ func CreatePlan(corpusRoot, seed, lane, family, par2Placement string, warmups, r
 		ids = append(ids, manifest.ID)
 	}
 	sort.Strings(ids)
+	if len(caseFilter) > 0 {
+		available := map[string]bool{}
+		for _, id := range ids {
+			available[id] = true
+		}
+		var wanted []string
+		for _, id := range caseFilter {
+			if available[id] {
+				wanted = append(wanted, id)
+				continue
+			}
+			// With a family filter the case may simply belong to the other
+			// family; without one, an unknown id is an operator error.
+			if family == "" {
+				return Plan{}, fmt.Errorf("case %q is not in this corpus", id)
+			}
+		}
+		sort.Strings(wanted)
+		ids = wanted
+	}
 	if len(ids) == 0 {
 		return Plan{}, fmt.Errorf("no corpus cases found")
 	}

@@ -43,6 +43,11 @@
       "binary": "rar"
     }
   ],
+  "video_encoder": {
+    "id": "ffmpeg-7.1-ubuntu2404",
+    "image": "jrottenberg/ffmpeg@sha256:292a972c60356abd651d9a4f9c808c13e7473f65ad400b7eb99215f4e571931d",
+    "platform": "linux/amd64"
+  },
   "par2_generator": {
     "id": "par2cmdline-turbo-1.4.0",
     "image": "rarpar-bench-par2:1.4.0",

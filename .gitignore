@@ -6,6 +6,9 @@
 /bench/rarpar-bench/.cache/
 # Operator-specific benchmark host inventory; it may reference private SSH keys.
 /bench/rarpar-bench/config/hosts.local.json
+# Operator-private benchmark fleet configuration; it names private hosts, SSH
+# key paths, and askpass helper locations. Start from bench/fleet.example.toml.
+/bench/fleet.toml
 
 # Local CI/release artifacts
 /.ci/
@@ -32,3 +35,10 @@
 .DS_Store
 **/.DS_Store
 ._*
+
+# Cargo-fuzz build state and generated crash artifacts.  Tracked corpus seeds
+# live under each fuzz/corpus directory and are intentionally not ignored.
+**/fuzz/target/
+**/fuzz/artifacts/
+**/fuzz/coverage/
+**/fuzz/Cargo.lock

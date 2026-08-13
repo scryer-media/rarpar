@@ -20,7 +20,7 @@
 //!     -p unrar-rs --no-default-features --features crypto-rust \
 //!     --target wasm32-wasip1 --example wasm_extract_check
 //!
-//! Run (wasmtime 46; host::guest preopens):
+//! Run (wasmtime 47; host::guest preopens):
 //!   wasmtime run --dir <fixtures>::/fixtures --dir <tmp>::/tmp --env TMPDIR=/tmp \
 //!     target/wasm32-wasip1/release/examples/wasm_extract_check.wasm /fixtures
 //!
@@ -231,6 +231,46 @@ struct Outcome {
     members_extracted: usize,
     total_bytes: u64,
     spilled_members: usize,
+    /// Rolling digest over every extracted member's name and bytes, in member
+    /// order. The extractor already verifies each member's CRC32/BLAKE2sp
+    /// internally, so this is not a second correctness check — it is the
+    /// cross-lane identity gate: native and every wasm lane must agree on the
+    /// exact decoded bytes, which a per-member CRC verified independently on
+    /// each side cannot demonstrate on its own.
+    digest: u64,
+}
+
+/// FNV-1a-64 with a final avalanche, length-folded so truncation cannot alias.
+fn digest64(state: u64, bytes: &[u8]) -> u64 {
+    let mut hash = state;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= bytes.len() as u64;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^ (hash >> 33)
+}
+
+/// Which arithmetic build this binary is, for the report header.
+fn lane_label() -> &'static str {
+    if cfg!(all(target_arch = "wasm32", target_feature = "relaxed-simd")) {
+        "wasm32 +simd128 +relaxed-simd"
+    } else if cfg!(all(target_arch = "wasm32", target_feature = "simd128")) {
+        "wasm32 +simd128"
+    } else if cfg!(target_arch = "wasm32") {
+        "wasm32 portable (no simd128)"
+    } else {
+        "native"
+    }
+}
+
+/// Timing-mode iteration count; `0` (the default) means PASS/FAIL mode.
+fn bench_iters() -> usize {
+    std::env::var("WEAVER_WASM_BENCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// A `Write` that appends into a shared in-memory buffer. Single-threaded only,
@@ -295,6 +335,7 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
         members_extracted: 0,
         total_bytes: 0,
         spilled_members: 0,
+        digest: 0xcbf2_9ce4_8422_2325,
     };
 
     for (idx, member) in members.iter().enumerate().take(member_count) {
@@ -320,6 +361,8 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
                 })?;
             out.members_extracted += 1;
             out.total_bytes += buf.borrow().len() as u64;
+            out.digest = digest64(out.digest, member.name.as_bytes());
+            out.digest = digest64(out.digest, &buf.borrow());
         } else {
             let extracted = archive.extract_member(idx, &options, None).map_err(|e| {
                 format!(
@@ -332,6 +375,14 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
             if matches!(extracted, ExtractedMember::TempFile { .. }) {
                 out.spilled_members += 1;
             }
+            let bytes = extracted.to_bytes().map_err(|e| {
+                format!(
+                    "[{}] materialize member {idx} ({}): {e:?}",
+                    case.label, member.name
+                )
+            })?;
+            out.digest = digest64(out.digest, member.name.as_bytes());
+            out.digest = digest64(out.digest, &bytes);
         }
     }
 
@@ -352,6 +403,11 @@ fn main() {
 
     eprintln!("wasm_extract_check: fixtures root = {}", root.display());
 
+    if bench_iters() > 0 {
+        run_bench(&root);
+        return;
+    }
+
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut total_spilled = 0usize;
@@ -363,8 +419,8 @@ fn main() {
                 passed += 1;
                 total_spilled += o.spilled_members;
                 rows.push(format!(
-                    "PASS | {:<24} | {:>3} members | {:>11} bytes | spill={}",
-                    case.label, o.members_extracted, o.total_bytes, o.spilled_members
+                    "PASS | {:<24} | {:>3} members | {:>11} bytes | spill={} | digest={:016x}",
+                    case.label, o.members_extracted, o.total_bytes, o.spilled_members, o.digest
                 ));
             }
             Err(e) => {
@@ -375,6 +431,7 @@ fn main() {
     }
 
     let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "lane={}", lane_label());
     let _ = writeln!(stdout, "==== wasm extraction PASS/FAIL ====");
     for r in &rows {
         let _ = writeln!(stdout, "{r}");
@@ -391,4 +448,62 @@ fn main() {
     if failed != 0 {
         std::process::exit(1);
     }
+}
+
+/// Timing mode: min-of-N decode wall time per fixture for this lane.
+///
+/// Min-of-N rather than mean, because this machine may be running other work:
+/// the minimum is the least contaminated estimate. Absolute values are only
+/// meaningful relative to the other lanes measured in the same session.
+fn run_bench(root: &Path) {
+    let iters = bench_iters();
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "lane={}", lane_label());
+    let _ = writeln!(
+        stdout,
+        "==== RAR extraction timing, min of {iters} (seconds; lower is better) ===="
+    );
+    let _ = writeln!(
+        stdout,
+        "{:<26} | {:>10} | {:>12} | {:>10}",
+        "fixture", "best_s", "bytes", "MiB/s"
+    );
+
+    for case in CASES {
+        let mut best = f64::MAX;
+        let mut bytes = 0u64;
+        let mut error: Option<String> = None;
+        for _ in 0..iters {
+            let start = std::time::Instant::now();
+            match extract_case(root, case) {
+                Ok(o) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    bytes = o.total_bytes;
+                    if elapsed < best {
+                        best = elapsed;
+                    }
+                }
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        match error {
+            Some(e) => {
+                let _ = writeln!(stdout, "{:<26} | ERR {e}", case.label);
+            }
+            None => {
+                let throughput = (bytes as f64) / best / (1024.0 * 1024.0);
+                let _ = writeln!(
+                    stdout,
+                    "{:<26} | {:>10.4} | {:>12} | {:>10.1}",
+                    case.label, best, bytes, throughput
+                );
+            }
+        }
+        let _ = stdout.flush();
+    }
+    let _ = writeln!(stdout, "===================================");
+    let _ = stdout.flush();
 }

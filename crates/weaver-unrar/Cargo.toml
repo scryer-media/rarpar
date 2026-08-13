@@ -6,7 +6,7 @@ version = "0.5.0"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
-exclude = ["tests/fixtures/**"]
+exclude = ["tests/fixtures/**", "fuzz/**"]
 
 # Crypto backend selection.
 #
@@ -102,8 +102,8 @@ tracing-subscriber.workspace = true
 # MUST stay off the wasm example build — hence this same non-wasm target gate.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.5"
-wasmtime = "46"
-wasmtime-wasi = "46"
+wasmtime = "47"
+wasmtime-wasi = "47"
 aes = { workspace = true }
 cbc = { workspace = true }
 sha2 = { workspace = true }

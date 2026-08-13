@@ -236,10 +236,12 @@ fn apply_rank_k(
         }
     };
 
-    // `!cfg!(target_family = "wasm")` const-folds to `true` natively and
-    // `false` on wasm, so wasm always takes the serial branch and never
-    // evaluates `rayon::current_num_threads` (wasip1 has no worker pool).
-    let row_group = if !cfg!(target_family = "wasm")
+    // `parallel_enabled()` const-folds to `true` natively (identical codegen to
+    // the `!cfg!(target_family = "wasm")` guard it replaces) and is a cached
+    // runtime probe on wasm: `false` on single-threaded `wasm32-wasip1`, which
+    // keeps the serial branch and never evaluates `rayon::current_num_threads`,
+    // and `true` on `wasm32-wasip1-threads`, where rayon has a real pool.
+    let row_group = if crate::threading::parallel_enabled()
         && n >= PARALLEL_ELIMINATION_THRESHOLD
         && rayon::current_num_threads() > 1
     {

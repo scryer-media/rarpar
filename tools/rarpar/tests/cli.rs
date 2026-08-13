@@ -1315,3 +1315,351 @@ fn compat_unrar_incremental_vp_quit_exits_fatal() {
     assert!(stdout.contains("User break"));
     assert!(!stdout.contains("All OK"));
 }
+
+#[test]
+fn default_path_invocation_runs_auto_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_store.rar",
+    ]);
+    let archive = temp.path().join("release.rar");
+    std::fs::copy(source, &archive).unwrap();
+
+    let output = run(&[archive.as_os_str()]);
+    assert!(
+        output.status.success(),
+        "default auto invocation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(temp.path().join("small.txt").is_file());
+}
+
+#[test]
+fn rar_list_and_test_validate_a_real_archive() {
+    let archive = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_store.rar",
+    ]);
+
+    let list = run(&[OsStr::new("rar"), OsStr::new("list"), archive.as_os_str()]);
+    assert!(
+        list.status.success(),
+        "rar list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&list.stdout), "small.txt\n");
+
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), archive.as_os_str()]);
+    assert!(
+        test.status.success(),
+        "rar test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&test.stdout),
+        String::from_utf8_lossy(&test.stderr)
+    );
+}
+
+#[test]
+fn rar_restore_volumes_restores_a_missing_volume_explicitly() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let download_dir = temp.path().join("download");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    for name in [
+        "rar5_recovery_volumes.part01.rar",
+        "rar5_recovery_volumes.part02.rar",
+        "rar5_recovery_volumes.part03.rar",
+        "rar5_recovery_volumes.part04.rar",
+        "rar5_recovery_volumes.part06.rar",
+        "rar5_recovery_volumes.part07.rar",
+        "rar5_recovery_volumes.part08.rar",
+        "rar5_recovery_volumes.part09.rar",
+        "rar5_recovery_volumes.part10.rar",
+        "rar5_recovery_volumes.part01.rev",
+        "rar5_recovery_volumes.part02.rev",
+    ] {
+        std::fs::copy(fixture_dir.join(name), download_dir.join(name)).unwrap();
+    }
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let restored = download_dir.join("rar5_recovery_volumes.part05.rar");
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        first.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "explicit volume restore failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(restored.is_file());
+}
+
+#[test]
+fn cleanup_deletes_validated_sources_after_explicit_extraction() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_store.rar",
+    ]);
+    let archive = temp.path().join("release.rar");
+    std::fs::copy(source, &archive).unwrap();
+
+    let extract = run(&[
+        OsStr::new("rar"),
+        OsStr::new("extract"),
+        archive.as_os_str(),
+        temp.path().as_os_str(),
+    ]);
+    assert!(extract.status.success());
+
+    let cleanup = run(&[
+        OsStr::new("cleanup"),
+        OsStr::new("--permanent-delete"),
+        archive.as_os_str(),
+    ]);
+    assert!(
+        cleanup.status.success(),
+        "cleanup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(!archive.exists());
+}
+
+#[test]
+fn compat_unrar_e_flattens_member_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_dirs.rar",
+    ]);
+    let out_dir = temp.path().join("out");
+
+    let output = run(&[
+        OsStr::new("e"),
+        OsStr::new("-o+"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "compat flat extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("a.txt").is_file());
+    assert!(out_dir.join("b.txt").is_file());
+    assert!(!out_dir.join("dir1").exists());
+}
+
+#[test]
+fn compat_unrar_test_and_list_cover_operational_commands() {
+    let archive = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_multifile_store.rar",
+    ]);
+
+    let test = run(&[OsStr::new("t"), archive.as_os_str()]);
+    assert!(
+        test.status.success(),
+        "compat test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&test.stdout),
+        String::from_utf8_lossy(&test.stderr)
+    );
+    assert!(String::from_utf8_lossy(&test.stdout).contains("Testing from "));
+    assert!(String::from_utf8_lossy(&test.stdout).contains("All OK"));
+
+    let list = run(&[OsStr::new("l"), archive.as_os_str()]);
+    assert!(
+        list.status.success(),
+        "compat list failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    for name in ["hello.txt", "second.txt", "random_512.bin"] {
+        assert!(stdout.contains(name), "missing {name} from {stdout}");
+    }
+}
+
+#[test]
+fn compat_unrar_auto_rename_and_suppression_switches_are_honored() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_store.rar",
+    ]);
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("small.txt"), b"original").unwrap();
+
+    let renamed = run(&[
+        OsStr::new("x"),
+        OsStr::new("-or"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        renamed.status.success(),
+        "compat auto-rename failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&renamed.stdout),
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("small.txt")).unwrap(),
+        b"original"
+    );
+    assert!(out_dir.join("small(1).txt").is_file());
+
+    let quiet = run(&[
+        OsStr::new("x"),
+        OsStr::new("-idq"),
+        OsStr::new("-y"),
+        OsStr::new("-ai"),
+        OsStr::new("-scf"),
+        OsStr::new("-tsm-"),
+        OsStr::new("-mlp"),
+        OsStr::new("-om"),
+        OsStr::new("-om1"),
+        OsStr::new("-om-"),
+        OsStr::new("-ri6:10"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        quiet.status.success(),
+        "compat accepted switches failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&quiet.stdout),
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(quiet.stdout.is_empty());
+
+    let names_hidden = run(&[
+        OsStr::new("x"),
+        OsStr::new("-idn"),
+        archive.as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        names_hidden.status.success(),
+        "compat name suppression failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&names_hidden.stdout),
+        String::from_utf8_lossy(&names_hidden.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&names_hidden.stdout);
+    assert!(stdout.contains("All OK"));
+    assert!(!stdout.contains("small.txt"));
+}
+
+#[test]
+fn compat_unrar_password_disabled_returns_password_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = fixture(&[
+        "crates",
+        "weaver-unrar",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_hp_store.rar",
+    ]);
+
+    let output = run(&[
+        OsStr::new("x"),
+        OsStr::new("-p-"),
+        archive.as_os_str(),
+        temp.path().as_os_str(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "disabled password should use the password exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("password is incorrect"));
+}
+
+#[test]
+fn compat_unrar_rejects_every_unsupported_modifying_command() {
+    for command in [
+        "a", "c", "cf", "ch", "cw", "d", "f", "i", "k", "m", "r", "rc", "rn", "rr", "rv", "s", "u",
+        "v",
+    ] {
+        let output = run(&[OsStr::new(command), OsStr::new("ignored.rar")]);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{command} should return the command-line exit: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Unsupported command"),
+            "{command} did not identify the unsupported command"
+        );
+    }
+}
+
+#[test]
+fn compat_par2_repair_honors_base_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_dir = fixture(&[
+        "crates",
+        "weaver-par2",
+        "tests",
+        "fixtures",
+        "rar5_lz_plain",
+    ]);
+    let work_dir = temp.path().join("rar5_lz_plain");
+    copy_dir_recursive(&fixture_dir, &work_dir);
+    let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");
+
+    let output = run_in_dir(
+        temp.path(),
+        &[
+            OsStr::new("r"),
+            OsStr::new("-B"),
+            work_dir.as_os_str(),
+            par2_path.as_os_str(),
+            work_dir.join("fixture_rar5_lz_plain*").as_os_str(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "compat PAR2 base-directory repair failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "All files are correct"
+    );
+}

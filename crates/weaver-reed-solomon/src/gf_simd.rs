@@ -483,14 +483,47 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 /// converted to a per-register lo/hi plane layout so the folded kernels run
 /// without any per-iteration deinterleave/interleave shuffles.
 ///
-/// This is the AVX2 split *layout* gate. Both the GFNI folded kernel
-/// ([`mul_acc_folded_group`]) and the non-GFNI shuffle2x kernel
-/// (`mul_acc_shuffle2x_group_avx2`) consume the identical layout; which kernel
-/// runs is chosen per group by [`folded_uses_gfni`].
+/// This is the split *layout* gate. The GFNI folded kernel
+/// ([`mul_acc_folded_group`]), the non-GFNI shuffle2x kernel
+/// (`mul_acc_shuffle2x_group_avx2`) and the 128-bit SSSE3 shuffle kernel
+/// (`mul_acc_shuffle_group_ssse3`) all consume the identical layout; which
+/// kernel runs is chosen per group by [`folded_uses_gfni`] and
+/// [`altmap_uses_avx2`].
+///
+/// The layout is defined by its *bytes*, not by the register width that
+/// produces them: a 32-byte block is `[16 low bytes | 16 high bytes]` whether
+/// it was written by one `vpshufb`+`vpermq` pair or by two `pshufb` plus two
+/// `punpckq`. Widening this gate to SSSE3 therefore admits no-AVX x86 to the
+/// existing folded controller without changing anything an AVX2+ host does.
 pub fn altmap_supported() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        return is_x86_feature_detected!("avx2");
+        return is_x86_feature_detected!("avx2") || is_x86_feature_detected!("ssse3");
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether the split-layout helpers and kernels should take their 256-bit AVX2
+/// form rather than the 128-bit SSSE3 form. Only meaningful when
+/// [`altmap_supported`] is true.
+///
+/// `WEAVER_GF16_ALTMAP_SSE=1` forces the 128-bit form on an AVX2 host so the
+/// SSSE3 tier can be exercised and A/B'd without no-AVX hardware. The variable
+/// is read once and cached; it never *enables* a kernel whose features are
+/// absent.
+pub fn altmap_uses_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *AVX2.get_or_init(|| {
+            if std::env::var_os("WEAVER_GF16_ALTMAP_SSE").is_some_and(|v| v == "1")
+                && is_x86_feature_detected!("ssse3")
+            {
+                return false;
+            }
+            is_x86_feature_detected!("avx2")
+        });
     }
     #[allow(unreachable_code)]
     false
@@ -502,7 +535,9 @@ pub fn altmap_supported() -> bool {
 pub fn folded_uses_gfni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        return is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2");
+        return is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx2")
+            && altmap_uses_avx2();
     }
     #[allow(unreachable_code)]
     false
@@ -540,7 +575,11 @@ pub const FOLDED_GROUP: usize = 6;
 pub fn altmap_encode(buf: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     if altmap_supported() {
-        unsafe { split_encode_avx2(buf) };
+        if altmap_uses_avx2() {
+            unsafe { split_encode_avx2(buf) };
+        } else {
+            unsafe { split_encode_ssse3(buf) };
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = buf;
@@ -550,7 +589,11 @@ pub fn altmap_encode(buf: &mut [u8]) {
 pub fn altmap_decode(buf: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     if altmap_supported() {
-        unsafe { split_decode_avx2(buf) };
+        if altmap_uses_avx2() {
+            unsafe { split_decode_avx2(buf) };
+        } else {
+            unsafe { split_decode_ssse3(buf) };
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = buf;
@@ -568,7 +611,11 @@ pub fn split_encode_scatter(src: &[u8], staging: &mut [u8], lane: usize) {
     debug_assert!(staging.len() >= vec_len * FOLDED_GROUP);
     #[cfg(target_arch = "x86_64")]
     if altmap_supported() {
-        unsafe { split_encode_scatter_avx2(src, staging, lane, vec_len) };
+        if altmap_uses_avx2() {
+            unsafe { split_encode_scatter_avx2(src, staging, lane, vec_len) };
+        } else {
+            unsafe { split_encode_scatter_ssse3(src, staging, lane, vec_len) };
+        }
         return;
     }
     let _ = (src, staging, lane, vec_len);
@@ -644,6 +691,123 @@ unsafe fn split_encode_scatter_avx2(src: &[u8], staging: &mut [u8], lane: usize,
             let data = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
             let split = split_block_avx2(data);
             _mm256_storeu_si256(staging.as_mut_ptr().add(out) as *mut __m256i, split);
+            offset += SPLIT_BLOCK_BYTES;
+            out += stride;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 128-bit (SSSE3) split-layout helpers.
+//
+// Faithful port of ParPar's `gf16_shuffle_prepare_block` / `finish_block`
+// (par2cmdline-turbo `parpar/gf16/gf16_shuffle_x86_prepare.h:5-50`, instantiated
+// at MWORD_SIZE=16 by `gf16_shuffle_ssse3.c`). The oracle's block is the same
+// 32 bytes and the same two `pshufb` + two 64-bit unpacks; the one deliberate
+// deviation is plane *order*: ParPar stores `[16 high | 16 low]`
+// (`unpackhi_epi64` first), rarpar's layout is `[16 low | 16 high]`. Swapping
+// which unpack is stored first costs nothing and keeps the bytes bit-identical
+// to `split_block_avx2`, so one staging area feeds every altmap kernel.
+// ---------------------------------------------------------------------------
+
+/// Deinterleave one 128-bit vector into `[8 low bytes | 8 high bytes]` — the
+/// oracle's `separate_low_high` (`gf16_shuffle_x86_common.h:69-81`) at
+/// MWORD_SIZE=16, whose shuffle constant is the same byte order rarpar already
+/// uses in `split_block_avx2` and `mul_acc_region_ssse3`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn separate_low_high_ssse3(data: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let deint = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
+    _mm_shuffle_epi8(data, deint)
+}
+
+/// Split one 32-byte block (two 128-bit loads) into `[16 low | 16 high]`.
+/// Byte-for-byte identical to `split_block_avx2` on the same input.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn split_block_ssse3(
+    s0: std::arch::x86_64::__m128i,
+    s1: std::arch::x86_64::__m128i,
+) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let a = separate_low_high_ssse3(s0);
+        let b = separate_low_high_ssse3(s1);
+        // low plane = both vectors' low halves, high plane = both high halves.
+        (_mm_unpacklo_epi64(a, b), _mm_unpackhi_epi64(a, b))
+    }
+}
+
+/// Inverse of [`split_block_ssse3`] — the oracle's `gf16_shuffle_finish_block`
+/// (`gf16_shuffle_x86_prepare.h:44-50`) with the plane roles swapped to match
+/// rarpar's `[low | high]` order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn unsplit_block_ssse3(
+    lo: std::arch::x86_64::__m128i,
+    hi: std::arch::x86_64::__m128i,
+) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
+    use std::arch::x86_64::*;
+    (_mm_unpacklo_epi8(lo, hi), _mm_unpackhi_epi8(lo, hi))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn split_encode_ssse3(buf: &mut [u8]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let vec_len = buf.len() & !(SPLIT_BLOCK_BYTES - 1);
+        let mut offset = 0usize;
+        while offset < vec_len {
+            let p = buf.as_ptr().add(offset);
+            let s0 = _mm_loadu_si128(p as *const __m128i);
+            let s1 = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let (lo, hi) = split_block_ssse3(s0, s1);
+            let q = buf.as_mut_ptr().add(offset);
+            _mm_storeu_si128(q as *mut __m128i, lo);
+            _mm_storeu_si128(q.add(16) as *mut __m128i, hi);
+            offset += SPLIT_BLOCK_BYTES;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn split_decode_ssse3(buf: &mut [u8]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let vec_len = buf.len() & !(SPLIT_BLOCK_BYTES - 1);
+        let mut offset = 0usize;
+        while offset < vec_len {
+            let p = buf.as_ptr().add(offset);
+            let lo = _mm_loadu_si128(p as *const __m128i);
+            let hi = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let (w0, w1) = unsplit_block_ssse3(lo, hi);
+            let q = buf.as_mut_ptr().add(offset);
+            _mm_storeu_si128(q as *mut __m128i, w0);
+            _mm_storeu_si128(q.add(16) as *mut __m128i, w1);
+            offset += SPLIT_BLOCK_BYTES;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn split_encode_scatter_ssse3(src: &[u8], staging: &mut [u8], lane: usize, vec_len: usize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut offset = 0usize;
+        let mut out = lane * SPLIT_BLOCK_BYTES;
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        while offset < vec_len {
+            let p = src.as_ptr().add(offset);
+            let s0 = _mm_loadu_si128(p as *const __m128i);
+            let s1 = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let (lo, hi) = split_block_ssse3(s0, s1);
+            let q = staging.as_mut_ptr().add(out);
+            _mm_storeu_si128(q as *mut __m128i, lo);
+            _mm_storeu_si128(q.add(16) as *mut __m128i, hi);
             offset += SPLIT_BLOCK_BYTES;
             out += stride;
         }
@@ -789,8 +953,14 @@ pub fn mul_acc_shuffle2x_batch(
             );
         }
         debug_assert!(altmap_supported());
-        for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
-            unsafe { mul_acc_shuffle2x_group_avx2(dst, staging, group_tables) };
+        if altmap_uses_avx2() {
+            for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                unsafe { mul_acc_shuffle2x_group_avx2(dst, staging, group_tables) };
+            }
+        } else {
+            for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                unsafe { mul_acc_shuffle_group_ssse3(dst, staging, group_tables) };
+            }
         }
         return;
     }
@@ -986,6 +1156,169 @@ unsafe fn mul_acc_shuffle2x_group_avx2(
             let crossed = _mm256_permute2x128_si256::<0x01>(swapped, swapped);
             result = _mm256_xor_si256(result, crossed);
             _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
+
+            offset += SPLIT_BLOCK_BYTES;
+            src += stride;
+        }
+    }
+}
+
+/// The eight 128-bit nibble tables a single source needs, recovered from its
+/// [`Shuffle2xTables`].
+///
+/// `precompute_shuffle2x_tables` stores the eight byte-tables of
+/// [`precompute_mul_tables`] pairwise inside four 32-byte fields — `norm_lo =
+/// [t0|t5]`, `swap_lo = [t1|t4]`, `norm_hi = [t2|t7]`, `swap_hi = [t3|t6]` —
+/// so every table the 128-bit kernel wants is already present and merely needs
+/// addressing by half. Reading them back costs no new GF arithmetic and lets
+/// the SSSE3 tier reuse the controller's existing table cache untouched.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct ShuffleTables128 {
+    /// `[n0lo, n0hi, n1lo, n1hi, n2lo, n2hi, n3lo, n3hi]` — the `t[0..8]`
+    /// order of [`MulTables`].
+    t: [std::arch::x86_64::__m128i; 8],
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn load_shuffle_tables_128(tables: &Shuffle2xTables) -> ShuffleTables128 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let half = |src: &[u8; 32], upper: bool| {
+            _mm_loadu_si128(src.as_ptr().add(if upper { 16 } else { 0 }) as *const __m128i)
+        };
+        ShuffleTables128 {
+            t: [
+                half(&tables.norm_lo, false), // t0 = n0lo
+                half(&tables.swap_lo, false), // t1 = n0hi
+                half(&tables.norm_hi, false), // t2 = n1lo
+                half(&tables.swap_hi, false), // t3 = n1hi
+                half(&tables.swap_lo, true),  // t4 = n2lo
+                half(&tables.norm_lo, true),  // t5 = n2hi
+                half(&tables.swap_hi, true),  // t6 = n3lo
+                half(&tables.norm_hi, true),  // t7 = n3hi
+            ],
+        }
+    }
+}
+
+/// Multiply one interleaved six-source group into a split-layout destination
+/// with the 128-bit SSSE3 shuffle kernel.
+///
+/// **Oracle port.** This is ParPar's `gf16_shuffle_muladd_ssse3` —
+/// `parpar/gf16/gf16_shuffle_x86.h:236-252` (the `muladd` driver) around
+/// `gf16_shuffle_muladd_round` at `:149-186`, instantiated at MWORD_SIZE=16 by
+/// `parpar/gf16/gf16_shuffle_ssse3.c`. par2cmdline-turbo selects exactly this
+/// kernel for the matrix-inversion `Galois16Mul` on an SSSE3-without-AVX CPU
+/// (`gf16mul.cpp:1584-1585`, reached because `forInvert` skips the XOR-JIT arm
+/// at `:1575-1581`).
+///
+/// The inner round is instruction-for-instruction the oracle's, at the same
+/// 32 bytes per iteration with the same eight `pshufb`, the same eight `pxor`,
+/// the same `and`/`srli`+`and` nibble extraction, and the same placement of
+/// the destination XOR *between* the second and third table lookups so the two
+/// accumulator chains stay independent. Two deliberate deviations, both
+/// forced by the surrounding crate and neither changing the instruction mix:
+///
+/// 1. **Plane order.** ParPar's block is `[high | low]`, so its `ta` is the
+///    high plane; rarpar's is `[low | high]`. The two source loads and the two
+///    destination stores swap roles accordingly — `tpl`/`tph` are still built
+///    by the identical lookups, they just live at the other offset.
+/// 2. **Loop nest — block-major, not source-major.** ParPar drives one source
+///    across the whole region per call, because SSE's sixteen registers cannot
+///    hold a second source's eight tables; that is also why `gf16mul.cpp` sets
+///    no `_mul_add_multi_packed` for this method, unlike its AVX-512 sibling.
+///    That shape is tied to ParPar's *contiguous* per-source regions. rarpar
+///    stages six lanes interleaved at 32-byte granularity, and a source-major
+///    walk over that layout strides 192 bytes to consume 32 — half of every
+///    64-byte line fetched is discarded, and the destination is re-streamed
+///    once per lane. Measured on real SSSE3 silicon, the source-major port
+///    lost to the interleaved-layout kernel it replaces at 1 MiB
+///    (0.72x); block-major restores sequential staging reads and touches each
+///    destination block once per six sources.
+///
+///    The arithmetic is untouched by this: per 32-byte block per source it is
+///    still the oracle's eight `pshufb`, eight `pxor` and the same
+///    `and`/`srli`+`and` nibble extraction. Only the order in which blocks and
+///    sources are visited differs, and the tables — 768 bytes for the whole
+///    group — stay L1-resident across the sweep instead of register-resident
+///    for one lane.
+///
+/// The oracle's half-rate `prefetch` variant is not ported; the destination
+/// prefetch here matches `mul_acc_shuffle2x_group_avx2`, whose access pattern
+/// this kernel now shares. Zero-factor padding lanes carry
+/// [`ZERO_SHUFFLE2X`], whose all-zero tables contribute nothing.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn mul_acc_shuffle_group_ssse3(
+    dst: &mut [u8],
+    staging: &[u8],
+    tables: &[&Shuffle2xTables; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mask = _mm_set1_epi8(0x0f);
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let t: [ShuffleTables128; FOLDED_GROUP] = [
+            load_shuffle_tables_128(tables[0]),
+            load_shuffle_tables_128(tables[1]),
+            load_shuffle_tables_128(tables[2]),
+            load_shuffle_tables_128(tables[3]),
+            load_shuffle_tables_128(tables[4]),
+            load_shuffle_tables_128(tables[5]),
+        ];
+
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
+            let dp = dst.as_mut_ptr().add(offset);
+            let mut acc_lo = _mm_loadu_si128(dp as *const __m128i);
+            let mut acc_hi = _mm_loadu_si128(dp.add(16) as *const __m128i);
+
+            macro_rules! lane {
+                ($idx:literal) => {
+                    let sp = staging.as_ptr().add(src + $idx * SPLIT_BLOCK_BYTES);
+                    // rarpar layout: low plane first, high plane second.
+                    // ParPar reads `ta` (high) then `tb` (low); the roles are
+                    // swapped here and nowhere else.
+                    let lo = _mm_loadu_si128(sp as *const __m128i);
+                    let hi = _mm_loadu_si128(sp.add(16) as *const __m128i);
+                    let tb = &t[$idx].t;
+
+                    // Nibble 0 (bits 0-3 of the low byte).
+                    let mut ti = _mm_and_si128(mask, lo);
+                    acc_lo = _mm_xor_si128(acc_lo, _mm_shuffle_epi8(tb[0], ti));
+                    acc_hi = _mm_xor_si128(acc_hi, _mm_shuffle_epi8(tb[1], ti));
+
+                    // Nibble 1 (bits 4-7 of the low byte).
+                    ti = _mm_and_si128(_mm_srli_epi16(lo, 4), mask);
+                    acc_lo = _mm_xor_si128(acc_lo, _mm_shuffle_epi8(tb[2], ti));
+                    acc_hi = _mm_xor_si128(acc_hi, _mm_shuffle_epi8(tb[3], ti));
+
+                    // Nibble 2 (bits 0-3 of the high byte).
+                    ti = _mm_and_si128(mask, hi);
+                    acc_lo = _mm_xor_si128(acc_lo, _mm_shuffle_epi8(tb[4], ti));
+                    acc_hi = _mm_xor_si128(acc_hi, _mm_shuffle_epi8(tb[5], ti));
+
+                    // Nibble 3 (bits 4-7 of the high byte).
+                    ti = _mm_and_si128(_mm_srli_epi16(hi, 4), mask);
+                    acc_lo = _mm_xor_si128(acc_lo, _mm_shuffle_epi8(tb[6], ti));
+                    acc_hi = _mm_xor_si128(acc_hi, _mm_shuffle_epi8(tb[7], ti));
+                };
+            }
+            lane!(0);
+            lane!(1);
+            lane!(2);
+            lane!(3);
+            lane!(4);
+            lane!(5);
+
+            _mm_storeu_si128(dp as *mut __m128i, acc_lo);
+            _mm_storeu_si128(dp.add(16) as *mut __m128i, acc_hi);
 
             offset += SPLIT_BLOCK_BYTES;
             src += stride;
@@ -4818,6 +5151,208 @@ mod tests {
                     dst, reference,
                     "shuffle2x batch mismatch groups={groups} len={len}"
                 );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SSSE3 altmap tier (ParPar `gf16_shuffle_ssse3` port).
+    //
+    // These call the 128-bit functions directly behind an
+    // `is_x86_feature_detected!("ssse3")` guard, the established
+    // force-a-backend idiom in this module, so they exercise the tier on AVX2
+    // and GFNI hosts too rather than only on no-AVX silicon.
+    // -----------------------------------------------------------------------
+
+    /// The 128-bit split layout must be *byte-identical* to the 256-bit one:
+    /// one staging area has to feed either kernel, and the par2 controller
+    /// mixes `altmap_encode` with `split_encode_scatter` freely.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ssse3_split_layout_matches_avx2_bytes() {
+        if !is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        for len in [0usize, 32, 64, 1024, 1026, 4096, 21826, 65536] {
+            let original: Vec<u8> = (0..len).map(|i| (i * 31 % 256) as u8).collect();
+
+            // Roundtrip through the 128-bit pair.
+            let mut sse = original.clone();
+            unsafe { split_encode_ssse3(&mut sse) };
+            if len >= 32 {
+                assert_ne!(sse, original, "encode must change aligned data (len {len})");
+            }
+
+            // Byte-identity against the 256-bit encoder on hosts that have it.
+            if is_x86_feature_detected!("avx2") {
+                let mut avx = original.clone();
+                unsafe { split_encode_avx2(&mut avx) };
+                assert_eq!(sse, avx, "split encode layout differs at len {len}");
+            }
+
+            unsafe { split_decode_ssse3(&mut sse) };
+            assert_eq!(sse, original, "roundtrip mismatch at len {len}");
+        }
+
+        // Scatter must land blocks at the same offsets with the same bytes.
+        for len in [32usize, 4096, 21824] {
+            let src: Vec<u8> = (0..len).map(|i| ((i * 17 + 5) % 256) as u8).collect();
+            for lane in 0..FOLDED_GROUP {
+                let mut sse = vec![0u8; len * FOLDED_GROUP];
+                unsafe { split_encode_scatter_ssse3(&src, &mut sse, lane, len) };
+                if is_x86_feature_detected!("avx2") {
+                    let mut avx = vec![0u8; len * FOLDED_GROUP];
+                    unsafe { split_encode_scatter_avx2(&src, &mut avx, lane, len) };
+                    assert_eq!(sse, avx, "scatter layout differs len={len} lane={lane}");
+                }
+            }
+        }
+    }
+
+    /// The ported kernel against the scalar reference, over the same matrix the
+    /// AVX2 shuffle2x kernel is held to.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ssse3_shuffle_group_matches_scalar() {
+        if !is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        let factor_sets: [[u16; FOLDED_GROUP]; 4] = [
+            [0x0001, 0x1234, 0x0000, 0xABCD, 0x8000, 0x00FF],
+            [0x7F7F, 0x0002, 0xFFFF, 0x0001, 0x4321, 0x0000],
+            [0x1111, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000],
+            [0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000],
+        ];
+        for factors in factor_sets {
+            for len in [32usize, 1024, 4096, 21824, 65536] {
+                let inputs: Vec<Vec<u8>> = (0..FOLDED_GROUP)
+                    .map(|idx| {
+                        (0..len)
+                            .map(|i| ((i * (idx + 7) + 13) % 256) as u8)
+                            .collect()
+                    })
+                    .collect();
+
+                let mut reference = vec![0x5Au8; len];
+                for (factor, input) in factors.iter().zip(inputs.iter()) {
+                    mul_acc_region(*factor, input, &mut reference);
+                }
+
+                let mut staging = vec![0u8; len * FOLDED_GROUP];
+                for (lane, input) in inputs.iter().enumerate() {
+                    unsafe { split_encode_scatter_ssse3(input, &mut staging, lane, len) };
+                }
+                let tables: Vec<Shuffle2xTables> = factors
+                    .iter()
+                    .map(|&f| precompute_shuffle2x_tables(f))
+                    .collect();
+                let table_refs: [&Shuffle2xTables; FOLDED_GROUP] = [
+                    &tables[0], &tables[1], &tables[2], &tables[3], &tables[4], &tables[5],
+                ];
+
+                let mut dst = vec![0x5Au8; len];
+                unsafe { split_encode_ssse3(&mut dst) };
+                unsafe { mul_acc_shuffle_group_ssse3(&mut dst, &staging, &table_refs) };
+                unsafe { split_decode_ssse3(&mut dst) };
+
+                assert_eq!(dst, reference, "ssse3 kernel mismatch at len {len}");
+            }
+        }
+    }
+
+    /// Byte-identity against the AVX2 shuffle2x kernel it stands in for: same
+    /// staging, same tables, same destination — the two must agree bit for bit,
+    /// not merely both agree with scalar.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ssse3_shuffle_group_matches_avx2_kernel() {
+        if !is_x86_feature_detected!("ssse3") || !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for groups in [1usize, 2, 3, 5] {
+            for len in [32usize, 4096, 21824] {
+                let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
+                    .map(|g| {
+                        let mut set = [0u16; FOLDED_GROUP];
+                        for (l, slot) in set.iter_mut().enumerate() {
+                            *slot = match (g + l) % 5 {
+                                0 => 0x0000,
+                                1 => 0x0001,
+                                _ => (0x2F1Du16)
+                                    .wrapping_mul((g * FOLDED_GROUP + l + 1) as u16)
+                                    .wrapping_add(0x0101),
+                            };
+                        }
+                        set
+                    })
+                    .collect();
+
+                let stagings: Vec<Vec<u8>> = (0..groups)
+                    .map(|g| {
+                        let mut staging = vec![0u8; len * FOLDED_GROUP];
+                        for l in 0..FOLDED_GROUP {
+                            let input: Vec<u8> = (0..len)
+                                .map(|i| ((i * (g * 7 + l + 3) + 29) % 256) as u8)
+                                .collect();
+                            unsafe { split_encode_scatter_ssse3(&input, &mut staging, l, len) };
+                        }
+                        staging
+                    })
+                    .collect();
+                let tables: Vec<Vec<Shuffle2xTables>> = factor_sets
+                    .iter()
+                    .map(|set| {
+                        set.iter()
+                            .map(|&f| precompute_shuffle2x_tables(f))
+                            .collect()
+                    })
+                    .collect();
+
+                let mut sse = vec![0xA5u8; len];
+                let mut avx = vec![0xA5u8; len];
+                unsafe { split_encode_ssse3(&mut sse) };
+                unsafe { split_encode_avx2(&mut avx) };
+                for group in 0..groups {
+                    let refs: [&Shuffle2xTables; FOLDED_GROUP] = [
+                        &tables[group][0],
+                        &tables[group][1],
+                        &tables[group][2],
+                        &tables[group][3],
+                        &tables[group][4],
+                        &tables[group][5],
+                    ];
+                    unsafe { mul_acc_shuffle_group_ssse3(&mut sse, &stagings[group], &refs) };
+                    unsafe { mul_acc_shuffle2x_group_avx2(&mut avx, &stagings[group], &refs) };
+                }
+                assert_eq!(
+                    sse, avx,
+                    "ssse3 vs avx2 kernel differ groups={groups} len={len}"
+                );
+            }
+        }
+    }
+
+    /// The eight tables the 128-bit kernel reads back out of `Shuffle2xTables`
+    /// must be exactly `precompute_mul_tables`' `t[0..8]`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ssse3_table_recovery_matches_nibble_tables() {
+        if !is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        for factor in (0..=0xFFFFu32).step_by(1021).map(|f| f as u16) {
+            let expected = precompute_mul_tables(factor).tables;
+            let packed = precompute_shuffle2x_tables(factor);
+            let loaded = unsafe { load_shuffle_tables_128(&packed) };
+            for (idx, want) in expected.iter().enumerate() {
+                let mut got = [0u8; 16];
+                unsafe {
+                    std::arch::x86_64::_mm_storeu_si128(
+                        got.as_mut_ptr() as *mut std::arch::x86_64::__m128i,
+                        loaded.t[idx],
+                    )
+                };
+                assert_eq!(&got, want, "table {idx} mismatch for factor {factor:#06x}");
             }
         }
     }

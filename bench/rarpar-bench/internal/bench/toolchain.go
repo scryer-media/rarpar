@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -52,7 +53,19 @@ func (lock ToolchainLock) Validate() error {
 	if par2.ID == "" || par2.Image == "" || par2.URL == "" || par2.Platform != "linux/amd64" || !sha256Pattern.MatchString(par2.SHA256) {
 		return fmt.Errorf("PAR2 generator is not source locked for linux/amd64")
 	}
+	if encoder := lock.VideoEncoder; encoder.ID != "" || encoder.Image != "" {
+		// The encoder is consumed as a published image, so the digest is the
+		// only thing that makes its output reproducible; a floating tag would
+		// silently re-encode the media payloads on some later pull.
+		if encoder.ID == "" || encoder.Platform != "linux/amd64" || !digestPinnedImage(encoder.Image) {
+			return fmt.Errorf("video encoder is not digest pinned for linux/amd64")
+		}
+	}
 	return nil
+}
+
+func digestPinnedImage(image string) bool {
+	return regexp.MustCompile(`@sha256:[a-f0-9]{64}$`).MatchString(image)
 }
 
 func (lock ToolchainLock) Writer(id string) (RARWriter, bool) {
@@ -115,10 +128,28 @@ func runCommand(ctx context.Context, program string, args ...string) error {
 	return nil
 }
 
+// runCommandStdout runs a command that streams payload bytes on stdout. Stderr
+// is captured separately so diagnostics can never contaminate the byte stream.
+func runCommandStdout(ctx context.Context, program string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, program, args...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return nil, fmt.Errorf("%s %v: %w\n%s", program, args, err, stderr.Bytes())
+	}
+	return stdout.Bytes(), nil
+}
+
 func ToolchainIDs(lock ToolchainLock, caseConfig CaseConfig) []string {
 	ids := []string{caseConfig.Writer}
 	if caseConfig.PAR2 {
 		ids = append(ids, lock.PAR2Generator.ID)
+	}
+	// A video payload's bytes come from the encoder, so the encoder belongs in
+	// the case's recorded provenance alongside the archive writer.
+	if videoProfiles[caseConfig.PayloadProfile] {
+		ids = append(ids, lock.VideoEncoder.ID)
 	}
 	sort.Strings(ids)
 	return ids

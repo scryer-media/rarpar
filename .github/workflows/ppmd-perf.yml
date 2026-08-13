@@ -34,7 +34,9 @@ jobs:
         crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_mv.rar,
         crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_order16_32m.rar
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Hydrate PPMd fixtures
         shell: bash
@@ -51,7 +53,7 @@ jobs:
             fi
           done
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
 
@@ -74,7 +76,7 @@ jobs:
           printf '%s  %s\n' "$UNRAR_SHA256" "$archive" | shasum -a 256 --check
           tar -xzf "$archive" -C "$RUNNER_TEMP"
           chmod +x "$RUNNER_TEMP/rar/unrar"
-          banner="$($RUNNER_TEMP/rar/unrar 2>&1 | head -n 5 || true)"
+          banner="$("$RUNNER_TEMP/rar/unrar" 2>&1 | head -n 5 || true)"
           printf '%s\n' "$banner"
           printf '%s\n' "$banner" | grep -q '^UNRAR 7\.23 freeware'
           echo "bin=$RUNNER_TEMP/rar/unrar" >> "$GITHUB_OUTPUT"
@@ -92,7 +94,7 @@ jobs:
 
       - name: Upload timing report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ppmd-perf-${{ matrix.platform }}
           path: ${{ runner.temp }}/ppmd-perf-${{ matrix.platform }}.json

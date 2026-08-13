@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -37,6 +39,8 @@ func run(ctx context.Context, args []string) error {
 		return runReport(args[1:])
 	case "render":
 		return runRender(args[1:])
+	case "fleet":
+		return runFleet(ctx, args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -50,11 +54,12 @@ func usage() {
   rarpar-bench toolchains validate|build [--config PATH] [--docker PATH]
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
-  rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N]
+  rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
   rarpar-bench report --input FILE --out FILE
   rarpar-bench render --input FILE --out DIR
+  rarpar-bench fleet plan|run|collect|teardown --config PATH
 
 LANE is cpu, metal, or docker-cpu. PAR2 placement is canonical or smart; canonical
 matches conventional expected-path verification for direct comparisons. Corpus data and run evidence are
@@ -137,13 +142,21 @@ func runPlan(args []string) error {
 	par2Placement := flags.String("par2-placement", "canonical", "PAR2 placement policy: canonical or smart")
 	warmups := flags.Int("warmups", 1, "warmup count")
 	repeats := flags.Int("repeats", 5, "measurement count")
+	var cases []string
+	flags.Func("case", "restrict the plan to this case id; repeat for more", func(value string) error {
+		if value == "" {
+			return fmt.Errorf("--case cannot be empty")
+		}
+		cases = append(cases, value)
+		return nil
+	})
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *corpus == "" || *out == "" {
 		return fmt.Errorf("--corpus and --out are required")
 	}
-	plan, err := bench.CreatePlan(workspacePath(*corpus), *seed, *lane, *family, *par2Placement, *warmups, *repeats)
+	plan, err := bench.CreatePlanWithCases(workspacePath(*corpus), *seed, *lane, *family, *par2Placement, *warmups, *repeats, cases)
 	if err != nil {
 		return err
 	}
@@ -264,4 +277,10 @@ func readCorpusIndex(root string, destination any) error {
 
 func readReport(path string, destination any) error {
 	return bench.ReadJSONFile(path, destination)
+}
+
+func writeJSONTo(writer io.Writer, value any) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
 }

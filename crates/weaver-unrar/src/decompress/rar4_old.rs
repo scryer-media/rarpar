@@ -318,7 +318,43 @@ fn check_dict_size(dict_size: u64) -> RarResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only RAR4 window size, see [`with_rar4_window_size`].
+    static WINDOW_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with every RAR4/RAR3 member decoding against a `bytes`-sized
+/// dictionary.
+///
+/// No real archive declares a window below `MIN_RAR4_UNPACK_WINDOW` (256 KiB),
+/// which is larger than every fixture member, so the ring never wraps in-suite
+/// and the batched literal store's wrap handling would otherwise go untested.
+/// Forcing a small window makes it wrap continuously; a size that is not a
+/// multiple of eight also puts the ring boundary at every phase relative to the
+/// eight-literal batch.
+///
+/// Output decoded this way does not match the archive's checksum — callers must
+/// extract with verification off and compare the bytes themselves.
+#[cfg(test)]
+pub(crate) fn with_rar4_window_size<T>(bytes: u64, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WINDOW_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+
+    let _restore = Restore(WINDOW_OVERRIDE.with(std::cell::Cell::get));
+    WINDOW_OVERRIDE.with(|cell| cell.set(Some(bytes)));
+    body()
+}
+
 pub(crate) fn effective_rar4_window_size(dict_size: u64) -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
+    }
     dict_size.max(MIN_RAR4_UNPACK_WINDOW)
 }
 

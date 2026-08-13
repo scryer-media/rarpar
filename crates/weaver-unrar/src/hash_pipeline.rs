@@ -8,11 +8,17 @@
 //!   channel preserves FIFO order, so a single sequential hasher suffices).
 //! - BLAKE2sp is parallelized by construction: the format defines 8
 //!   independent BLAKE2s leaf streams, interleaved in 64-byte blocks. Each
-//!   incoming chunk is shared with all 8 lane workers, and every worker walks
-//!   only the blocks it owns straight out of that shared buffer (the same
+//!   incoming chunk is shared with the lane workers, and every worker walks
+//!   only the bytes it owns straight out of that shared buffer (the same
 //!   strided split unrar's `blake2sp.cpp` hands to its threads); the root node
 //!   combines the leaf digests at finalize. The output is bit-identical to a
 //!   serial BLAKE2sp (verified against `blake2s_simd::blake2sp` in tests).
+//!
+//!   How many leaves one worker owns is a policy choice — see
+//!   [`LEAVES_PER_WORKER`]. Today it is one scalar leaf per worker on every
+//!   arch; the 4-leaf NEON group arrangement exists (see
+//!   `crate::crypto::Blake2spLeafGroup`) but is deliberately unwired pending
+//!   group-kernel scaling work — the constant's comment carries the numbers.
 //!
 //! Pipelines spawn threads per instance, so callers should only use them for
 //! members large enough to amortize spawn cost (see [`PIPELINE_MIN_BYTES`]).
@@ -22,7 +28,8 @@ use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use blake2s_simd::{Params as Blake2sParams, State as Blake2sState};
+use blake2s_simd::Params as Blake2sParams;
+use blake2s_simd::State as Blake2sState;
 
 /// Chunk buffers cycled between the submitter and the hash workers.
 const CHUNK_CAPACITY: usize = 4 * 1024 * 1024;
@@ -379,33 +386,87 @@ impl CrcShiftOp {
     }
 }
 
+/// How many BLAKE2sp leaves one worker thread owns.
+///
+/// The eight leaves are independent until the root combine, so any split of
+/// them across threads is correct; the choice is vector width versus thread
+/// count, and it is decided per target by which BLAKE2s implementation is
+/// actually vectorized there.
+///
+/// * Off `aarch64`, the upstream `blake2s_simd` leaf state has real SSE4.1 /
+///   AVX2 backends, so one leaf per thread is both wide and parallel: eight
+///   workers, each walking its own 64-byte blocks.
+/// * On `aarch64`, `blake2s_simd` ships **no** vector backend — every leaf
+///   there runs its portable scalar path — while this crate's own
+///   [`crate::crypto::Blake2spLeafGroup`] kernel is 4-wide NEON. So a worker
+///   owns a whole 4-leaf group and drives that kernel over the group's
+///   contiguous 256-byte half of each super-block: two vector workers instead
+///   of eight scalar ones, for the same digest.
+// One leaf per worker on EVERY arch for now — including aarch64, where the
+// 4-leaf NEON group arrangement exists but is deliberately not wired: it
+// saves 2.2x CPU (1.25 -> 0.56 cpu-s/GB) yet measures a 1.75x WALL
+// regression on the hash lane (6.22 -> 3.56 GB/s, 256 MiB, min-of-9)
+// because the group kernel reaches only ~55% of ideal 4-wide scaling, and
+// two vector workers cannot match eight scalar ones. Wall is the
+// user-visible metric on store-mode extraction, the dominant archive class.
+// Re-wire the aarch64 arms to `crate::crypto::Blake2spLeafGroup` (see git
+// history of this file for the exact shape) once the group kernel
+// approaches ~4x scaling — two vector workers then win BOTH axes
+// (~7.4 GB/s projected). The group kernel and its digest-equivalence tests
+// stay live regardless.
+const LEAVES_PER_WORKER: usize = 1;
+
+/// Number of BLAKE2sp worker threads (8 leaf workers, or 2 group workers).
+const BLAKE_WORKERS: usize = LANES / LEAVES_PER_WORKER;
+/// Contiguous bytes a worker owns each time the round robin comes back to it.
+/// The leaves a worker owns are adjacent, so its share of every `LANE_STRIDE`
+/// cycle is one contiguous run.
+const BLAKE_WORKER_SPAN: usize = LEAVES_PER_WORKER * BLAKE_BLOCK;
+
+/// The hash state one worker drives: a single BLAKE2s leaf, or this crate's
+/// 4-leaf NEON group. See [`LEAVES_PER_WORKER`].
+type BlakeWorkerState = Blake2sState;
+
+/// Build worker `worker`'s state, covering the `LEAVES_PER_WORKER` leaves that
+/// start at `worker * LEAVES_PER_WORKER`.
+fn new_worker_state(worker: usize) -> BlakeWorkerState {
+    blake2sp_leaf_params(worker).to_state()
+}
+
+/// Worker `worker`'s finished leaf digests, in leaf order.
+fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(state.finalize().as_bytes());
+    [digest]
+}
+
 struct BlakeLanes {
     lane_tx: Vec<mpsc::SyncSender<LaneMsg>>,
-    lane_handles: Vec<JoinHandle<[u8; 32]>>,
+    lane_handles: Vec<JoinHandle<[[u8; 32]; LEAVES_PER_WORKER]>>,
     /// Absolute stream offset of the next incoming byte.
     stream_offset: u64,
 }
 
 impl BlakeLanes {
     fn spawn() -> Self {
-        let mut lane_tx = Vec::with_capacity(LANES);
-        let mut lane_handles = Vec::with_capacity(LANES);
-        for lane in 0..LANES {
+        let mut lane_tx = Vec::with_capacity(BLAKE_WORKERS);
+        let mut lane_handles = Vec::with_capacity(BLAKE_WORKERS);
+        for worker in 0..BLAKE_WORKERS {
             let (tx, rx) = mpsc::sync_channel::<LaneMsg>(MAX_IN_FLIGHT);
             let handle = std::thread::Builder::new()
-                .name(format!("weaver-rar-b2-{lane}"))
+                .name(format!("weaver-rar-b2-{worker}"))
                 .spawn(move || {
-                    let mut state = blake2sp_leaf_params(lane).to_state();
+                    let mut state = new_worker_state(worker);
                     while let Ok(LaneMsg::Data {
                         chunk,
                         stream_offset,
                     }) = rx.recv()
                     {
-                        update_lane(&mut state, lane, stream_offset, &chunk);
+                        walk_owned_spans(worker, stream_offset, &chunk, |bytes| {
+                            state.update(bytes);
+                        });
                     }
-                    let mut digest = [0u8; 32];
-                    digest.copy_from_slice(state.finalize().as_bytes());
-                    digest
+                    finish_worker_state(&state)
                 })
                 .expect("spawn BLAKE2sp lane worker");
             lane_tx.push(tx);
@@ -418,18 +479,20 @@ impl BlakeLanes {
         }
     }
 
-    /// Hand the chunk to every lane that owns a block inside it. Nothing is
-    /// deinterleaved here: each worker walks its own 64-byte blocks straight
-    /// out of the shared buffer, exactly as unrar's blake2sp threads do.
+    /// Hand the chunk to every worker that owns bytes inside it. Nothing is
+    /// deinterleaved here: each worker walks its own spans straight out of the
+    /// shared buffer, exactly as unrar's blake2sp threads do.
     fn dispatch(&mut self, chunk: &SharedChunk) {
         if chunk.is_empty() {
             return;
         }
         let stream_offset = self.stream_offset;
         self.stream_offset += chunk.len() as u64;
-        for (lane, tx) in self.lane_tx.iter().enumerate() {
-            if lane_block_start(lane, stream_offset) >= stream_offset + chunk.len() as u64 {
-                // Short chunk that stops before this lane's next block.
+        for (worker, tx) in self.lane_tx.iter().enumerate() {
+            if owned_span_start(worker, BLAKE_WORKER_SPAN, stream_offset)
+                >= stream_offset + chunk.len() as u64
+            {
+                // Short chunk that stops before this worker's next span.
                 continue;
             }
             let _ = tx.send(LaneMsg::Data {
@@ -442,10 +505,14 @@ impl BlakeLanes {
     fn finalize(self) -> [u8; 32] {
         drop(self.lane_tx);
 
+        // Workers are ordered by first leaf, and each yields its leaves in
+        // order, so joining in worker order visits leaves 0..8 in order.
         let mut root = blake2sp_root_params().to_state();
         for handle in self.lane_handles {
-            let digest = handle.join().unwrap_or([0u8; 32]);
-            root.update(&digest);
+            let digests = handle.join().unwrap_or([[0u8; 32]; LEAVES_PER_WORKER]);
+            for digest in digests {
+                root.update(&digest);
+            }
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(root.finalize().as_bytes());
@@ -453,34 +520,67 @@ impl BlakeLanes {
     }
 }
 
-/// First absolute offset at or after `from` that starts, or lies inside, a
-/// 64-byte block owned by `lane`. BLAKE2sp assigns block `b` to lane `b % 8`.
-fn lane_block_start(lane: usize, from: u64) -> u64 {
+/// First absolute offset at or after `from` that starts, or lies inside, the
+/// `span`-byte run owned by `index` in the stream's `LANE_STRIDE`-periodic
+/// round robin. With `span == BLAKE_BLOCK` this is the leaf schedule (BLAKE2sp
+/// assigns block `b` to leaf `b % 8`); with `span == BLAKE_WORKER_SPAN` it is
+/// the worker schedule, which is the same schedule coarsened to the run of
+/// adjacent leaves a worker owns.
+fn owned_span_start(index: usize, span: usize, from: u64) -> u64 {
     let cycle = from / LANE_STRIDE;
-    let start = cycle * LANE_STRIDE + (lane * BLAKE_BLOCK) as u64;
-    if start + BLAKE_BLOCK as u64 <= from {
-        // This lane's block in the current cycle already went by.
+    let start = cycle * LANE_STRIDE + (index * span) as u64;
+    if start + span as u64 <= from {
+        // This index's run in the current cycle already went by.
         start + LANE_STRIDE
     } else {
         start
     }
 }
 
-/// Feed `lane` the parts of `chunk` it owns. `chunk` starts at absolute
-/// `stream_offset`; chunk edges may split a block, but the pieces still reach
-/// the leaf state in order, so it sees exactly its interleaved substream.
-fn update_lane(state: &mut Blake2sState, lane: usize, stream_offset: u64, chunk: &[u8]) {
+/// Hand `consume` the parts of `chunk` that `worker` owns, in order. `chunk`
+/// starts at absolute `stream_offset`; chunk edges may split a span, but the
+/// pieces still arrive in order, so the worker's state sees exactly its
+/// interleaved substream.
+fn walk_owned_spans(
+    worker: usize,
+    stream_offset: u64,
+    chunk: &[u8],
+    mut consume: impl FnMut(&[u8]),
+) {
+    walk_spans(
+        worker,
+        BLAKE_WORKER_SPAN,
+        stream_offset,
+        chunk,
+        &mut consume,
+    );
+}
+
+/// [`walk_owned_spans`] with an explicit span, so the tests can drive the same
+/// walker at leaf granularity as well as worker granularity.
+fn walk_spans(
+    index: usize,
+    span: usize,
+    stream_offset: u64,
+    chunk: &[u8],
+    consume: &mut impl FnMut(&[u8]),
+) {
     let end = stream_offset + chunk.len() as u64;
-    let mut block_start = lane_block_start(lane, stream_offset);
-    while block_start < end {
-        let from = block_start.max(stream_offset);
-        let to = (block_start + BLAKE_BLOCK as u64).min(end);
-        state.update(&chunk[(from - stream_offset) as usize..(to - stream_offset) as usize]);
-        block_start += LANE_STRIDE;
+    let mut span_start = owned_span_start(index, span, stream_offset);
+    while span_start < end {
+        let from = span_start.max(stream_offset);
+        let to = (span_start + span as u64).min(end);
+        consume(&chunk[(from - stream_offset) as usize..(to - stream_offset) as usize]);
+        span_start += LANE_STRIDE;
     }
 }
 
 /// BLAKE2sp leaf parameters per the BLAKE2 tree spec (fanout 8, depth 2).
+///
+/// The leaf-per-worker arrangement builds its worker states from these. On
+/// aarch64 the workers are 4-leaf NEON groups that carry the same parameters
+/// internally, so there this is only the tests' independent statement of the
+/// tree parameters.
 fn blake2sp_leaf_params(lane: usize) -> Blake2sParams {
     let mut params = Blake2sParams::new();
     params
@@ -815,22 +915,26 @@ mod tests {
     }
 
     #[test]
-    fn lane_block_start_walks_the_interleave_schedule() {
-        // Lane L owns blocks L, L+8, L+16, ... Starting inside one of a lane's
-        // own blocks must return that block, not the next one.
-        for lane in 0..LANES {
-            let own = (lane * BLAKE_BLOCK) as u64;
-            assert_eq!(lane_block_start(lane, 0), own);
-            assert_eq!(lane_block_start(lane, own), own);
-            assert_eq!(lane_block_start(lane, own + 1), own);
-            assert_eq!(lane_block_start(lane, own + BLAKE_BLOCK as u64 - 1), own);
-            assert_eq!(
-                lane_block_start(lane, own + BLAKE_BLOCK as u64),
-                own + LANE_STRIDE
-            );
-            // Deep into the stream the schedule is still stride-periodic.
-            let base = 97 * LANE_STRIDE;
-            assert_eq!(lane_block_start(lane, base), base + own);
+    fn owned_span_start_walks_the_interleave_schedule() {
+        // Index I owns the `span`-byte run at I*span in every LANE_STRIDE
+        // cycle. Starting inside one of its own runs must return that run, not
+        // the next one. Checked at both granularities the walker is used at:
+        // the leaf schedule (64) and the worker schedule.
+        for &span in &[BLAKE_BLOCK, BLAKE_WORKER_SPAN] {
+            for index in 0..(LANE_STRIDE as usize / span) {
+                let own = (index * span) as u64;
+                assert_eq!(owned_span_start(index, span, 0), own);
+                assert_eq!(owned_span_start(index, span, own), own);
+                assert_eq!(owned_span_start(index, span, own + 1), own);
+                assert_eq!(owned_span_start(index, span, own + span as u64 - 1), own);
+                assert_eq!(
+                    owned_span_start(index, span, own + span as u64),
+                    own + LANE_STRIDE
+                );
+                // Deep into the stream the schedule is still stride-periodic.
+                let base = 97 * LANE_STRIDE;
+                assert_eq!(owned_span_start(index, span, base), base + own);
+            }
         }
     }
 
@@ -846,7 +950,9 @@ mod tests {
             let mut offset = 0u64;
             for chunk in data.chunks(chunk_len) {
                 for (lane, state) in strided.iter_mut().enumerate() {
-                    update_lane(state, lane, offset, chunk);
+                    walk_spans(lane, BLAKE_BLOCK, offset, chunk, &mut |bytes: &[u8]| {
+                        state.update(bytes);
+                    });
                 }
                 offset += chunk.len() as u64;
             }
@@ -864,6 +970,107 @@ mod tests {
                     copied[lane].finalize().as_bytes(),
                     "lane {lane} diverged at chunk length {chunk_len}"
                 );
+            }
+        }
+    }
+
+    /// The worker walk must hand each worker exactly the bytes its leaves own:
+    /// worker W's substream, concatenated in order, has to equal the
+    /// concatenation of leaves `W*LEAVES_PER_WORKER..` blocks in leaf order.
+    /// This is what lets a multi-leaf worker treat its input as one contiguous
+    /// round-robin substream.
+    #[test]
+    fn worker_walk_delivers_exactly_its_leaves_bytes() {
+        for &chunk_len in &[1usize, 7, 63, 64, 65, 200, 255, 256, 257, 512, 513, 4096] {
+            let data = deterministic_bytes(300_000, 3 + chunk_len as u64);
+
+            let mut walked: Vec<Vec<u8>> = vec![Vec::new(); BLAKE_WORKERS];
+            let mut offset = 0u64;
+            for chunk in data.chunks(chunk_len) {
+                for (worker, sink) in walked.iter_mut().enumerate() {
+                    walk_owned_spans(worker, offset, chunk, |bytes| {
+                        sink.extend_from_slice(bytes);
+                    });
+                }
+                offset += chunk.len() as u64;
+            }
+
+            // Independent construction straight from the BLAKE2sp schedule:
+            // 64-byte block `b` belongs to leaf `b % 8`, hence to the worker
+            // that owns that leaf. Blocks keep their stream order, which is the
+            // round-robin order a multi-leaf worker's state expects.
+            let mut expected: Vec<Vec<u8>> = vec![Vec::new(); BLAKE_WORKERS];
+            for (index, block) in data.chunks(BLAKE_BLOCK).enumerate() {
+                let leaf = index % LANES;
+                expected[leaf / LEAVES_PER_WORKER].extend_from_slice(block);
+            }
+            for worker in 0..BLAKE_WORKERS {
+                assert_eq!(
+                    walked[worker], expected[worker],
+                    "worker {worker} substream diverged at chunk length {chunk_len}"
+                );
+            }
+        }
+    }
+
+    /// The in-crate 4-leaf NEON group must produce exactly the leaf digests the
+    /// external `blake2s_simd` leaf states produce for the same leaves — the
+    /// equality the aarch64 worker arrangement rests on. Driven directly, with
+    /// no threads, over lengths that put 0, 1 and 2 blocks in each lane and
+    /// straddle the group super-block boundary, and with randomized update
+    /// splits so the group's buffering is exercised too.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_leaf_group_digests_match_external_leaf_states() {
+        use crate::crypto::{Blake2spLeafGroup, GROUP_LEAVES};
+
+        let lengths = [
+            0usize, 1, 63, 64, 65, 127, 128, 192, 255, 256, 257, 448, 449, 511, 512, 513, 1024,
+            4095, 4096, 65_537, 1_000_000,
+        ];
+        for &len in &lengths {
+            let data = deterministic_bytes(len, 999 + len as u64);
+
+            // Reference: the eight external leaf states, deinterleaved.
+            let mut leaves: Vec<_> = (0..LANES)
+                .map(|lane| blake2sp_leaf_params(lane).to_state())
+                .collect();
+            for (index, block) in data.chunks(BLAKE_BLOCK).enumerate() {
+                leaves[index % LANES].update(block);
+            }
+
+            for group in 0..(LANES / GROUP_LEAVES) {
+                // The group's own substream, in stream order.
+                let mut substream = Vec::new();
+                for (index, block) in data.chunks(BLAKE_BLOCK).enumerate() {
+                    if (index % LANES) / GROUP_LEAVES == group {
+                        substream.extend_from_slice(block);
+                    }
+                }
+
+                // Feed it in one shot and in uneven splits; both must agree.
+                for &split in &[usize::MAX, 1, 63, 64, 193, 256, 449, 1000] {
+                    let mut state = Blake2spLeafGroup::new(group);
+                    if split == usize::MAX {
+                        state.update(&substream);
+                    } else {
+                        for piece in substream.chunks(split.max(1)) {
+                            state.update(piece);
+                        }
+                    }
+                    let digests = state.finalize_leaves();
+                    // Idempotent, like the whole-tree state.
+                    assert_eq!(digests, state.finalize_leaves(), "finalize not idempotent");
+
+                    for (lane, digest) in digests.iter().enumerate() {
+                        let leaf = group * GROUP_LEAVES + lane;
+                        assert_eq!(
+                            digest.as_slice(),
+                            leaves[leaf].finalize().as_bytes(),
+                            "leaf {leaf} diverged at len {len}, split {split}"
+                        );
+                    }
+                }
             }
         }
     }

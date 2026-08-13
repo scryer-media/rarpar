@@ -430,7 +430,7 @@ impl<'a> BlockReader<'a> {
 /// widened to `u32` purely to keep it a register-width field; every value it
 /// takes is still `0..=64`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct BitCursor {
+pub(crate) struct BitCursor {
     /// The bits at `pos`, left-aligned — [`BlockReader::acc`].
     pub acc: u64,
     /// Valid high bits of `acc` — [`BlockReader::acc_bits`], widened.
@@ -468,7 +468,7 @@ fn cursor_peek_window_u32(cursor: &BitCursor, data: &[u8]) -> u32 {
 
 /// Cursor form of [`BlockReader::refill`].
 #[inline(always)]
-pub(super) fn cursor_refill(cursor: &mut BitCursor, data: &[u8], end_bit: usize) {
+pub(crate) fn cursor_refill(cursor: &mut BitCursor, data: &[u8], end_bit: usize) {
     if cursor.pos > end_bit {
         cursor.acc = 0;
         cursor.acc_bits = 0;
@@ -504,7 +504,7 @@ fn cursor_peek_u64_direct(cursor: &BitCursor, data: &[u8]) -> u64 {
 
 /// Cursor form of [`BlockReader::peek_u64`].
 #[inline(always)]
-pub(super) fn cursor_peek_u64(cursor: &BitCursor, data: &[u8]) -> u64 {
+pub(crate) fn cursor_peek_u64(cursor: &BitCursor, data: &[u8]) -> u64 {
     if cursor.acc_bits == 64 {
         return cursor.acc;
     }
@@ -513,7 +513,7 @@ pub(super) fn cursor_peek_u64(cursor: &BitCursor, data: &[u8]) -> u64 {
 
 /// Cursor form of [`BlockReader::peek_u16`].
 #[inline(always)]
-pub(super) fn cursor_peek_u16(cursor: &BitCursor, data: &[u8]) -> u16 {
+pub(crate) fn cursor_peek_u16(cursor: &BitCursor, data: &[u8]) -> u16 {
     if cursor.acc_bits >= 16 {
         return (cursor.acc >> 48) as u16;
     }
@@ -522,7 +522,7 @@ pub(super) fn cursor_peek_u16(cursor: &BitCursor, data: &[u8]) -> u16 {
 
 /// Cursor form of [`BlockReader::peek_bits`].
 #[inline(always)]
-pub(super) fn cursor_peek_bits(cursor: &BitCursor, data: &[u8], count: u8) -> u64 {
+pub(crate) fn cursor_peek_bits(cursor: &BitCursor, data: &[u8], count: u8) -> u64 {
     debug_assert!(count <= 64);
     if count == 0 {
         return 0;
@@ -547,7 +547,7 @@ pub(super) fn cursor_peek_bits(cursor: &BitCursor, data: &[u8], count: u8) -> u6
 
 /// Cursor form of [`BlockReader::advance`].
 #[inline(always)]
-pub(super) fn cursor_advance(cursor: &mut BitCursor, data: &[u8], end_bit: usize, count: usize) {
+pub(crate) fn cursor_advance(cursor: &mut BitCursor, data: &[u8], end_bit: usize, count: usize) {
     cursor.pos = cursor.pos.saturating_add(count);
     if count < cursor.acc_bits as usize {
         // `count < acc_bits <= 64` keeps the shift in range.
@@ -564,7 +564,7 @@ pub(super) fn cursor_advance(cursor: &mut BitCursor, data: &[u8], end_bit: usize
 
 /// Cursor form of [`BlockReader::read_bits`].
 #[inline(always)]
-pub(super) fn cursor_read_bits(
+pub(crate) fn cursor_read_bits(
     cursor: &mut BitCursor,
     data: &[u8],
     end_bit: usize,

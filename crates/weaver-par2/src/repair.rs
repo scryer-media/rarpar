@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -605,6 +606,28 @@ fn grouped_input_factors(coefficients: &matrix::Matrix) -> Vec<Vec<FactorIndex>>
 // Cache-tile preferences are scheduling capabilities, not correctness limits.
 const PLAIN_IDEAL_CHUNK_BYTES: usize = 32 * 1024;
 const FOLDED_IDEAL_CHUNK_BYTES: usize = 8 * 1024;
+
+/// ParPar's aarch64 staging block: `sizeof(uint8x16x2_t)`, the `blockLen`
+/// argument every aarch64 `GF_PREPARE_PACKED_FUNCS` invocation passes
+/// (`parpar/gf16/gf16_clmul_neon.c:27`, `gf16_shuffle_neon.c`'s matching call).
+#[cfg(target_arch = "aarch64")]
+const NEON_PACKED_BLOCK_BYTES: usize = 32;
+
+/// ParPar's aarch64 checksum width: `sizeof(uint8x16_t)`, the final
+/// `GF_PREPARE_PACKED_FUNCS` argument, and the width
+/// `gf16_checksum_block_neon` (`parpar/gf16/gf16_checksum_arm.h:35-45`)
+/// accumulates into.
+#[cfg(target_arch = "aarch64")]
+const NEON_PACKED_CHECKSUM_BYTES: usize = 16;
+
+/// Selection gate for [`CpuKernelKind::NeonPacked`]. `WEAVER_PAR2_NEON_PACKED=0`
+/// pins the previous [`CpuKernelKind::Plain`] contract so the two staging
+/// shapes can be A/B'd in one binary; the default is the oracle's shape.
+#[cfg(target_arch = "aarch64")]
+fn neon_packed_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_PAR2_NEON_PACKED").is_none_or(|v| v != "0"))
+}
 #[cfg(target_arch = "x86_64")]
 const XORJIT_AVX2_IDEAL_CHUNK_BYTES: usize = 128 * 1024;
 #[cfg(target_arch = "x86_64")]
@@ -869,6 +892,43 @@ impl JitMemo {
 enum CpuKernelKind {
     Plain,
     Folded,
+    /// ParPar's aarch64 packed-prepare contract: 32-byte staging blocks with
+    /// an *identity* block transform and a 16-byte checksum accumulator.
+    ///
+    /// This is not a different arithmetic kernel — the multiply is the same
+    /// CLMUL/NEON ladder [`CpuKernelKind::Plain`] already dispatches to
+    /// (`gf_simd::mul_acc_input_batch`'s aarch64 arm). It is the *staging*
+    /// contract, and it exists because ParPar's aarch64 methods stage exactly
+    /// this way:
+    ///
+    /// ```text
+    /// GF_PREPARE_PACKED_FUNCS(gf16_clmul, _neon,
+    ///     sizeof(uint8x16x2_t),        // blockLen == 32
+    ///     gf16_prepare_block_neon,     // the block transform: a plain copy
+    ///     ...,
+    ///     gf16_checksum_block_neon,
+    ///     ...,
+    ///     sizeof(uint8x16_t))          // checksum width == 16
+    /// ```
+    ///
+    /// `parpar/gf16/gf16_clmul_neon.c:27`, with `gf16_prepare_block_neon`
+    /// defined at `parpar/gf16/gf16_neon_common.h:110-117` under the comment
+    /// "copying prepare block for both shuffle/clmul" — i.e. on aarch64 the
+    /// oracle does **no** altmap/deinterleave in memory. Its NEON kernels take
+    /// linear bytes and deinterleave in-register with `LD2`/`ST2`, which is
+    /// what rarpar's `clmul_load_planes` already does.
+    ///
+    /// So the faithful aarch64 staging is [`Self::Plain`]'s (identity) data
+    /// path carrying [`Self::Folded`]'s block granularity. Adopting `Folded`
+    /// itself would be *anti*-faithful twice over: it would impose a byte
+    /// deinterleave the oracle does not perform, and its compute branch routes
+    /// through the VTBL shuffle kernels, whereas ParPar's aarch64
+    /// `default_method()` prefers CLMUL over `GF16_SHUFFLE_NEON` for every
+    /// input count this controller batches (`parpar/gf16/gf16mul.cpp:1606-1624`;
+    /// under `PARPAR_SLIM_GF16`, which par2cmdline-turbo's own build defines at
+    /// `Makefile.am:330`, CLMUL is unconditional).
+    #[cfg(target_arch = "aarch64")]
+    NeonPacked,
     #[cfg(target_arch = "x86_64")]
     XorJit(reedsolomon_rs::xor_jit::JitWidth),
 }
@@ -899,6 +959,28 @@ impl CpuKernelKind {
                 staging_multiple: crate::gf_simd::FOLDED_GROUP,
                 ideal_chunk_size: FOLDED_IDEAL_CHUNK_BYTES,
                 checksum_width: crate::gf_simd::SPLIT_BLOCK_BYTES,
+                prefetch: CpuPrefetch {
+                    inputs_per_invoke: 0,
+                    input_distance_shift: 0,
+                    output: false,
+                },
+                strict_wx_available: false,
+            },
+            // Identical to `Plain` except for the two fields ParPar's aarch64
+            // packed staging actually fixes: the block granularity and the
+            // checksum width. `ideal_input_multiple`/`staging_multiple` stay 1
+            // because the oracle's region interleave (`CLMUL_NUM_REGIONS == 8`,
+            // `parpar/gf16/gf16_clmul_neon_base.h:49-51`) lives *inside* the
+            // muladd kernel — rarpar already carries it as
+            // `gf_simd::CLMUL_SRC_GROUP` — not in the controller's batch shape.
+            #[cfg(target_arch = "aarch64")]
+            Self::NeonPacked => CpuMethodContract {
+                stride: NEON_PACKED_BLOCK_BYTES,
+                alignment: 64,
+                ideal_input_multiple: 1,
+                staging_multiple: 1,
+                ideal_chunk_size: PLAIN_IDEAL_CHUNK_BYTES,
+                checksum_width: NEON_PACKED_CHECKSUM_BYTES,
                 prefetch: CpuPrefetch {
                     inputs_per_invoke: 0,
                     input_distance_shift: 0,
@@ -1129,6 +1211,11 @@ fn prepare_stream_source(
                 group_lane,
             );
         }
+        // `gf16_prepare_block_neon` is a plain 32-byte copy
+        // (`parpar/gf16/gf16_neon_common.h:110-117`), and the copy into
+        // `set.bufs` below already is that copy. Nothing further to stage.
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelKind::NeonPacked => {}
         CpuKernelKind::Plain => {}
     }
     if !set.bufs.is_empty() {
@@ -1141,18 +1228,422 @@ fn gf16_mul2(value: u16) -> u16 {
     (value << 1) ^ if value & 0x8000 != 0 { 0x100b } else { 0 }
 }
 
+/// Four packed little-endian GF(2^16) lanes multiplied by 2 at once.
+///
+/// Per lane this is exactly [`gf16_mul2`]: shift left, and reduce by 0x100b
+/// when the lane's top bit was set. Masking with `LANE_LO` before the shift
+/// stops a lane's high bit from bleeding into its neighbour, and the reduction
+/// term is built by a single multiply — safe across lanes because each lane's
+/// carry bit is 0 or 1 and `0x100b` fits in 16 bits, so no product crosses a
+/// lane boundary.
+#[inline]
+fn gf16_mul2_x4(v: u64) -> u64 {
+    const LANE_HI: u64 = 0x8000_8000_8000_8000;
+    const LANE_LO: u64 = 0x7fff_7fff_7fff_7fff;
+    let carry = (v & LANE_HI) >> 15;
+    ((v & LANE_LO) << 1) ^ carry.wrapping_mul(0x100b)
+}
+
+/// ParPar's NEON packed-checksum kernel, ported for aarch64.
+///
+/// # Which oracle routine this is
+///
+/// Every aarch64 method in par2cmdline-turbo's dispatch ladder points
+/// `prepare_packed_cksum` at a `_neon` entry point:
+///
+/// * `parpar/gf16/gf16mul.cpp:1607-1624` — the aarch64 leg of
+///   `GF16Mul::default_method()` returns only `GF16_CLMUL_SHA3`,
+///   `GF16_SHUFFLE_NEON` or `GF16_CLMUL_NEON` once SVE/SVE2 are ruled out
+///   (Apple silicon has neither).
+/// * `parpar/gf16/gf16mul.cpp:771` — `GF16_SHUFFLE_NEON` sets
+///   `prepare_packed_cksum = &gf16_shuffle_prepare_packed_cksum_neon`.
+/// * `parpar/gf16/gf16mul.cpp:804` — `GF16_CLMUL_NEON` sets
+///   `prepare_packed_cksum = &gf16_clmul_prepare_packed_cksum_neon`.
+/// * `parpar/gf16/gf16mul.cpp:834` — `GF16_CLMUL_SHA3` reuses that same
+///   `gf16_clmul_prepare_packed_cksum_neon`.
+///
+/// Those two symbols come from `GF_PREPARE_PACKED_FUNCS`, whose two
+/// definitions (`parpar/gf16/gf16_global.h:376` and `:420`, the arms of
+/// `#ifdef PARPAR_INCLUDE_BASIC_OPS` at `:374`) both expand the checksum
+/// entry point through `GF_PREPARE_PACKED_CKSUM_FUNCS` (`:347`, body
+/// `:348-350` feeding `gf16_prepare_packed`, `:85-219`). There are exactly two
+/// NEON instantiations — `parpar/gf16/gf16_shuffle_neon.c:322` and
+/// `parpar/gf16/gf16_clmul_neon.c:25` — and both pass the same checksum
+/// quadruple: `gf16_checksum_block_neon, gf16_checksum_blocku_neon,
+/// gf16_checksum_exp_neon, gf16_checksum_prepare_neon` with
+/// `align = sizeof(uint8x16_t)`. So the block-level NEON mechanism is
+/// `parpar/gf16/gf16_checksum_arm.h`, and nothing else on aarch64.
+///
+/// # The mechanism
+///
+/// * Accumulator arrangement: a single `uint8x16_t` held in a register across
+///   the whole block loop (`gf16_checksum_arm.h:38-44`); `gf16_checksum_load` /
+///   `gf16_checksum_store` are plain typed loads/stores on little-endian
+///   (`:27-32`) precisely so the value stays in a register.
+/// * mul2 idiom (`gf16_vec_mul2_neon`, `:6-15`): reinterpret as `int16x8_t`,
+///   `vaddq_s16(v, v)` for the per-lane shift-left, `vshrq_n_s16(v, 15)` to
+///   broadcast each lane's top bit into an all-ones mask, `vandq_s16` that mask
+///   with a splat of `GF16_POLYNOMIAL & 0xffff` (`gf16_global.h:9` →
+///   `0x100b`), and `veorq_s16` the two together.
+/// * XOR reduction (`:41-42`): the block is walked in ascending
+///   `sizeof(uint8x16_t)` steps, each `vld1q_u8` folded into the accumulator
+///   with `veorq_u8`. One `mul2` per block, then pure XOR.
+///
+/// The generated code is the oracle's, checked on the `PLANES == 2` arm
+/// (`--emit asm`, rustc 1.97.1, release): `dup.8h v2, #4107` hoisted out of
+/// both loops, then per block `add.8h v3, v0, v0` / `cmlt.8h v0, v0, #0` /
+/// `and.16b v0, v0, v2` / `eor.16b v0, v0, v3`, and per region
+/// `ldp q3, q4, [x11]` + two `eor.16b`. Two LLVM canonicalizations, neither
+/// semantic: `sshr #15` becomes the equivalent `cmlt #0` sign mask, and the
+/// two `vld1q_u8` become one `ldp`. Accumulators stay in `v0`/`v1` across the
+/// whole sweep, never spilling — the register residency the oracle relies on.
+///
+/// # Adaptation to rarpar's contract (deviations, called out)
+///
+/// * **Accumulator width.** ParPar's checksum is *always* one `uint8x16_t`;
+///   rarpar's `CpuMethodContract::checksum_width` varies (2 for `Plain`, 32 for
+///   `Folded`, 2/4 for x86 XOR-JIT). This port keeps one `uint8x16_t` per 16
+///   bytes of contract width — `PLANES = checksum_width / 16` independent
+///   accumulators, each running the oracle's exact instruction sequence over
+///   its own 16-byte plane of every region. At `PLANES == 1` it is the oracle
+///   instruction-for-instruction; at `PLANES > 1` it is the oracle replicated
+///   per plane, which is the plane-permutation class of adaptation (zero
+///   instruction changes, just more registers). `Folded`'s width 32 is
+///   `PLANES == 2` — but see "Reachability" below for which widths aarch64
+///   actually produces today.
+/// * **Widths below 16 bytes have no oracle NEON form at all.** ParPar never
+///   produces a sub-vector checksum, so `Plain`'s width 2 (and the x86-only
+///   XOR-JIT widths) cannot be served faithfully and are left on the portable
+///   arm. `fold` returns `None` for them rather than inventing a mechanism.
+/// * **Driver, not kernel.** ParPar fuses the checksum into
+///   `gf16_prepare_packed`'s block loop (`gf16_global.h:126`, `:153`) with the
+///   accumulator as an always-inlined local; rarpar stages separately and calls
+///   [`fold_packed_checksum`] over a whole buffer. Holding the accumulator in
+///   registers for the entire sweep here is what the oracle's
+///   `HEDLEY_ALWAYS_INLINE` + local `uint8x16_t checksum = vdupq_n_u8(0)`
+///   (`gf16_shuffle_neon.c:322`, `cksumInit`) compiles to. No arithmetic
+///   changes.
+/// * **Not ported:** `gf16_checksum_blocku_neon` (`:47-62`),
+///   `gf16_checksum_exp_neon` (`:64-77`) and `gf16_checksum_prepare_neon`
+///   (`:79-94`). rarpar's staging is block-aligned and zero-padded before the
+///   checksum runs, so the unaligned-tail and exponentiate-over-zero-fill paths
+///   have no call site; there is nothing for them to be faithful *to*.
+///
+/// # Reachability on aarch64 — RESOLVED, read this before optimizing here
+///
+/// This arm used to be **inert in production on aarch64**. It is now live, and
+/// the history is worth keeping because it records what the gap actually was.
+///
+/// Previously: [`CpuKernelKind::Folded`] was the only contract with a
+/// 16-byte-multiple checksum width, and it is gated on
+/// `gf_simd::altmap_supported()`, which is `#[cfg(target_arch = "x86_64")]`-only
+/// (`gf_simd.rs:498-505`) because the split/altmap staging kernels exist only
+/// for SSSE3/AVX2 (`gf_simd.rs:589-620`). aarch64 therefore selected
+/// [`CpuKernelKind::Plain`] (`stride == 2`, `checksum_width == 2`), and tracing
+/// every `fold_packed_checksum` call through the four par2 repair corpus cases
+/// on an M5 confirmed 100% of swept bytes arrived as `(block_len 2, width 2)`.
+///
+/// The fix was *not* to build an aarch64 altmap tier. ParPar does not altmap on
+/// aarch64 at all: `gf16_prepare_block_neon` is a plain 32-byte copy
+/// (`parpar/gf16/gf16_neon_common.h:110-117`, comment "copying prepare block
+/// for both shuffle/clmul"), and its NEON kernels deinterleave in-register with
+/// `LD2`/`ST2`. What the oracle *does* stage on aarch64 is a 32-byte block with
+/// a 16-byte checksum (`GF_PREPARE_PACKED_FUNCS(gf16_clmul, _neon,
+/// sizeof(uint8x16x2_t), gf16_prepare_block_neon, …, sizeof(uint8x16_t))`,
+/// `parpar/gf16/gf16_clmul_neon.c:27`). [`CpuKernelKind::NeonPacked`] is
+/// exactly that contract, so this arm now runs at `PLANES == 1` — which is
+/// [`checksum_block`] reduced to `gf16_checksum_block_neon` verbatim.
+///
+/// (measured 5.05-6.61x over the portable arm at widths 16/32/64)
+#[cfg(target_arch = "aarch64")]
+mod parpar_neon_checksum {
+    use std::arch::aarch64::*;
+
+    /// `GF16_POLYNOMIAL & 0xffff` — `parpar/gf16/gf16_global.h:9` gives
+    /// `0x1100b`, and `gf16_checksum_arm.h:11` masks it to 16 bits.
+    const POLY: i16 = 0x100b;
+
+    /// Verbatim `gf16_vec_mul2_neon`, `parpar/gf16/gf16_checksum_arm.h:6-15`.
+    ///
+    /// # Safety
+    /// NEON is baseline on aarch64; no further preconditions.
+    #[inline(always)]
+    unsafe fn gf16_vec_mul2_neon(v: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            // `_v` in the oracle; renamed only because a leading underscore
+            // reads as "unused" in Rust.
+            let vs = vreinterpretq_s16_u8(v);
+            vreinterpretq_u8_s16(veorq_s16(
+                vaddq_s16(vs, vs),
+                vandq_s16(vdupq_n_s16(POLY), vshrq_n_s16::<15>(vs)),
+            ))
+        }
+    }
+
+    /// `gf16_checksum_block_neon`, `parpar/gf16/gf16_checksum_arm.h:35-45`,
+    /// with the accumulator widened to `PLANES` vectors (see the module note).
+    ///
+    /// # Safety
+    /// `src` must be readable for `block_len` bytes, and `block_len` must be a
+    /// non-zero multiple of `PLANES * 16`.
+    #[inline(always)]
+    unsafe fn checksum_block<const PLANES: usize>(
+        acc: &mut [uint8x16_t; PLANES],
+        src: *const u8,
+        block_len: usize,
+    ) {
+        unsafe {
+            for lane in acc.iter_mut() {
+                *lane = gf16_vec_mul2_neon(*lane);
+            }
+            let mut i = 0usize;
+            while i < block_len {
+                for (plane, lane) in acc.iter_mut().enumerate() {
+                    *lane = veorq_u8(*lane, vld1q_u8(src.add(i + plane * 16)));
+                }
+                i += PLANES * 16;
+            }
+        }
+    }
+
+    /// The oracle's block loop with the accumulator register-resident across
+    /// every block, which is what `gf16_prepare_packed` inlines to.
+    ///
+    /// # Safety
+    /// `out` must be writable for `PLANES * 16` bytes, and `block_len` must be
+    /// a non-zero multiple of `PLANES * 16`.
+    #[inline(always)]
+    unsafe fn fold_planes<const PLANES: usize>(data: &[u8], block_len: usize, out: &mut [u8]) {
+        unsafe {
+            let mut acc = [vdupq_n_u8(0); PLANES];
+            let mut src = data.as_ptr();
+            for _ in 0..(data.len() / block_len) {
+                checksum_block::<PLANES>(&mut acc, src, block_len);
+                src = src.add(block_len);
+            }
+            for (plane, lane) in acc.iter().enumerate() {
+                vst1q_u8(out.as_mut_ptr().add(plane * 16), *lane);
+            }
+        }
+    }
+
+    /// Whole-buffer sweep. `None` when the shape has no oracle NEON form —
+    /// the caller then uses the portable arm.
+    pub(super) fn fold(data: &[u8], block_len: usize, checksum_width: usize) -> Option<[u8; 64]> {
+        if checksum_width == 0
+            || !checksum_width.is_multiple_of(16)
+            || checksum_width > 64
+            || block_len == 0
+            || !block_len.is_multiple_of(checksum_width)
+        {
+            return None;
+        }
+        let mut out = [0u8; 64];
+        // SAFETY: `out` is 64 bytes and `checksum_width <= 64`, so each arm
+        // writes within bounds; `block_len` is a non-zero multiple of
+        // `checksum_width == PLANES * 16`; the loop reads
+        // `data.len() / block_len` whole blocks.
+        unsafe {
+            match checksum_width / 16 {
+                1 => fold_planes::<1>(data, block_len, &mut out),
+                2 => fold_planes::<2>(data, block_len, &mut out),
+                3 => fold_planes::<3>(data, block_len, &mut out),
+                4 => fold_planes::<4>(data, block_len, &mut out),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Single-block form matching `gf16_checksum_block_neon`'s own signature
+    /// (load accumulator, fold one block, store it back). Used by the fidelity
+    /// tests, which drive the oracle contract block by block.
+    ///
+    /// `false` when the shape has no oracle NEON form.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn update_block(checksum: &mut [u8], block: &[u8]) -> bool {
+        let width = checksum.len();
+        if width == 0
+            || !width.is_multiple_of(16)
+            || width > 64
+            || block.is_empty()
+            || !block.len().is_multiple_of(width)
+        {
+            return false;
+        }
+        // SAFETY: `checksum` is `width == PLANES * 16` bytes and `block` is a
+        // non-zero multiple of it, matching every arm's requirement.
+        unsafe {
+            match width / 16 {
+                1 => update_planes::<1>(checksum, block),
+                2 => update_planes::<2>(checksum, block),
+                3 => update_planes::<3>(checksum, block),
+                4 => update_planes::<4>(checksum, block),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// # Safety
+    /// `checksum` must be exactly `PLANES * 16` bytes and `block.len()` a
+    /// non-zero multiple of it.
+    #[inline(always)]
+    unsafe fn update_planes<const PLANES: usize>(checksum: &mut [u8], block: &[u8]) {
+        unsafe {
+            let mut acc = [vdupq_n_u8(0); PLANES];
+            for (plane, lane) in acc.iter_mut().enumerate() {
+                *lane = vld1q_u8(checksum.as_ptr().add(plane * 16));
+            }
+            checksum_block::<PLANES>(&mut acc, block.as_ptr(), block.len());
+            for (plane, lane) in acc.iter().enumerate() {
+                vst1q_u8(checksum.as_mut_ptr().add(plane * 16), *lane);
+            }
+        }
+    }
+
+    /// Selection gate. `WEAVER_PAR2_CKSUM_NEON=0` forces the portable arm,
+    /// `=1` forces this port; the default is the measured winner.
+    pub(super) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("WEAVER_PAR2_CKSUM_NEON").is_none_or(|v| v != "0"))
+    }
+}
+
+/// `checksum = gf16_mul2(checksum) XOR (XOR of every `width`-sized region of
+/// `block`)`, per little-endian u16 lane.
+///
+/// Contract-identical to the scalar form it replaces, and to ParPar's
+/// `gf16_checksum_block` (`parpar/gf16/gf16_checksum_x86.h:24-56`), which is
+/// likewise "multiply the accumulator by two, then XOR the block in".
+///
+/// The previous shape walked one u16 lane at a time and re-strode the whole
+/// block per lane — `width`/2 passes with a `width`-byte stride, which is both
+/// unvectorizable and cache-hostile. XOR is associative and commutative, so
+/// folding the regions in linear order and then applying the per-lane
+/// multiply-by-two yields the same bytes while touching each input byte once
+/// in ascending order.
 fn update_packed_checksum(checksum: &mut [u8], block: &[u8]) {
     debug_assert_eq!(checksum.len() % 2, 0);
     debug_assert_eq!(block.len() % checksum.len(), 0);
     let width = checksum.len();
-    for lane in (0..width).step_by(2) {
-        let mut folded = 0u16;
-        for region in block.chunks_exact(width) {
-            folded ^= u16::from_le_bytes([region[lane], region[lane + 1]]);
+
+    // Narrow accumulators (Plain's width 2, XOR-JIT's 2 and 4) fold entirely
+    // inside one register; going through the slice per region instead — as the
+    // wide path below does — costs more than the vectorization saves.
+    if width == 2 {
+        let mut acc = gf16_mul2(u16::from_le_bytes([checksum[0], checksum[1]]));
+        for region in block.chunks_exact(2) {
+            acc ^= u16::from_le_bytes([region[0], region[1]]);
         }
-        let previous = u16::from_le_bytes([checksum[lane], checksum[lane + 1]]);
-        checksum[lane..lane + 2].copy_from_slice(&(gf16_mul2(previous) ^ folded).to_le_bytes());
+        checksum.copy_from_slice(&acc.to_le_bytes());
+        return;
     }
+    if width <= 8 {
+        let mut buf = [0u8; 8];
+        buf[..width].copy_from_slice(checksum);
+        let mut acc = gf16_mul2_x4(u64::from_le_bytes(buf));
+        for region in block.chunks_exact(width) {
+            let mut r = [0u8; 8];
+            r[..width].copy_from_slice(region);
+            acc ^= u64::from_le_bytes(r);
+        }
+        checksum.copy_from_slice(&acc.to_le_bytes()[..width]);
+        return;
+    }
+
+    // Multiply the accumulator by two, eight bytes at a time.
+    let mut lane = 0usize;
+    while lane + 8 <= width {
+        let v = u64::from_le_bytes(checksum[lane..lane + 8].try_into().unwrap());
+        checksum[lane..lane + 8].copy_from_slice(&gf16_mul2_x4(v).to_le_bytes());
+        lane += 8;
+    }
+    while lane < width {
+        let v = u16::from_le_bytes([checksum[lane], checksum[lane + 1]]);
+        checksum[lane..lane + 2].copy_from_slice(&gf16_mul2(v).to_le_bytes());
+        lane += 2;
+    }
+
+    // Fold every region of the block into the accumulator in linear order.
+    for region in block.chunks_exact(width) {
+        let mut i = 0usize;
+        while i + 8 <= width {
+            let a = u64::from_le_bytes(checksum[i..i + 8].try_into().unwrap());
+            let b = u64::from_le_bytes(region[i..i + 8].try_into().unwrap());
+            checksum[i..i + 8].copy_from_slice(&(a ^ b).to_le_bytes());
+            i += 8;
+        }
+        while i < width {
+            checksum[i] ^= region[i];
+            i += 1;
+        }
+    }
+}
+
+/// Fold `data` into a zero-initialized `checksum_width`-byte accumulator,
+/// block by block. Shared by the writer and the verifier so the two can never
+/// drift.
+///
+/// The narrow widths keep their accumulator in a register for the whole sweep
+/// rather than storing it back after every block — at `checksum_width == 2`
+/// with `block_len == 2` that store/reload is the entire cost of the loop.
+fn fold_packed_checksum(data: &[u8], block_len: usize, checksum_width: usize) -> [u8; 64] {
+    // 16-byte-multiple widths have a faithful ParPar NEON form; see
+    // [`parpar_neon_checksum`]. Shapes it declines fall through. NOTE: aarch64
+    // currently only ever reaches width 2 — see that module's "Reachability".
+    #[cfg(target_arch = "aarch64")]
+    if parpar_neon_checksum::enabled()
+        && let Some(out) = parpar_neon_checksum::fold(data, block_len, checksum_width)
+    {
+        return out;
+    }
+    let mut out = [0u8; 64];
+    // Each block folds its regions into a fresh register before touching the
+    // accumulator. That keeps the wide XOR reduction independent of the
+    // serial multiply-by-two chain, which is what lets a block's lookups issue
+    // in parallel; accumulating straight into `acc` instead would serialize
+    // every region behind the previous block's multiply.
+    if checksum_width == 2 {
+        let mut acc = 0u16;
+        for block in data.chunks_exact(block_len) {
+            let mut folded = 0u16;
+            for region in block.chunks_exact(2) {
+                folded ^= u16::from_le_bytes([region[0], region[1]]);
+            }
+            acc = gf16_mul2(acc) ^ folded;
+        }
+        out[..2].copy_from_slice(&acc.to_le_bytes());
+        return out;
+    }
+    if checksum_width == 4 {
+        let mut acc = 0u64;
+        for block in data.chunks_exact(block_len) {
+            let mut folded = 0u64;
+            for region in block.chunks_exact(4) {
+                folded ^= u32::from_le_bytes(region.try_into().unwrap()) as u64;
+            }
+            acc = gf16_mul2_x4(acc) ^ folded;
+        }
+        out[..4].copy_from_slice(&acc.to_le_bytes()[..4]);
+        return out;
+    }
+    if checksum_width == 8 {
+        let mut acc = 0u64;
+        for block in data.chunks_exact(block_len) {
+            let mut folded = 0u64;
+            for region in block.chunks_exact(8) {
+                folded ^= u64::from_le_bytes(region.try_into().unwrap());
+            }
+            acc = gf16_mul2_x4(acc) ^ folded;
+        }
+        out[..8].copy_from_slice(&acc.to_le_bytes());
+        return out;
+    }
+    for block in data.chunks_exact(block_len) {
+        update_packed_checksum(&mut out[..checksum_width], block);
+    }
+    out
 }
 
 fn write_packed_checksum(
@@ -1162,14 +1653,14 @@ fn write_packed_checksum(
     checksum_width: usize,
 ) {
     debug_assert_eq!(data_len % block_len, 0);
+    debug_assert!(checksum_width <= 64);
     debug_assert!(checksum_width <= block_len);
     debug_assert_eq!(block_len % checksum_width, 0);
     let (data, checksum_block) = buffer.split_at_mut(data_len);
     let checksum_block = &mut checksum_block[..block_len];
     checksum_block.fill(0);
-    for block in data.chunks_exact(block_len) {
-        update_packed_checksum(&mut checksum_block[..checksum_width], block);
-    }
+    let folded = fold_packed_checksum(data, block_len, checksum_width);
+    checksum_block[..checksum_width].copy_from_slice(&folded[..checksum_width]);
 }
 
 fn packed_checksum_matches(
@@ -1183,10 +1674,7 @@ fn packed_checksum_matches(
     debug_assert!(checksum_width <= block_len);
     let (data, checksum_block) = buffer.split_at(data_len);
     let checksum_block = &checksum_block[..block_len];
-    let mut expected = [0u8; 64];
-    for block in data.chunks_exact(block_len) {
-        update_packed_checksum(&mut expected[..checksum_width], block);
-    }
+    let expected = fold_packed_checksum(data, block_len, checksum_width);
     checksum_block[..checksum_width] == expected[..checksum_width]
         && checksum_block[checksum_width..]
             .iter()
@@ -1319,9 +1807,56 @@ struct CpuInputPreparer<'a> {
     finished_rx: std::sync::mpsc::Receiver<FinishedOutput>,
     transfer_buffers: [Option<TransferBuffer>; 2],
     transfer_buffer_len: usize,
+    /// The preparation and compute worker loops, when this target cannot spawn
+    /// them (see [`InlineControllerWorkers`]). Absent on native — the field
+    /// itself does not exist there — and `None` on wasm targets that can spawn.
+    #[cfg(target_family = "wasm")]
+    inline: Option<std::cell::RefCell<InlineControllerWorkers<'a>>>,
 }
 
-impl CpuInputPreparer<'_> {
+impl<'a> CpuInputPreparer<'a> {
+    /// Give the inline worker loops a turn.
+    ///
+    /// Compiles to nothing at all off wasm: the field it reads does not exist
+    /// there, so every call site keeps the shape it had when the workers were
+    /// unconditionally spawned.
+    #[inline(always)]
+    fn pump(&self) {
+        #[cfg(target_family = "wasm")]
+        if let Some(inline) = self.inline.as_ref() {
+            inline.borrow_mut().run();
+        }
+    }
+
+    /// Send one command to the preparation worker.
+    ///
+    /// Off the inline path this is `command_tx.send`. On it, the pump is what
+    /// keeps the command queue at depth one, which is what makes the existing
+    /// channel capacities sufficient for single-threaded execution.
+    // The signature deliberately mirrors `SyncSender::send`, which this replaced
+    // at every call site: each caller discards the undelivered message with
+    // `.map_err(|_| ...)` exactly as it did before, so the large `Err` never
+    // outlives the call and the generated code is unchanged.
+    #[allow(clippy::result_large_err)]
+    fn send_command(
+        &self,
+        message: PreparationMessage,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<PreparationMessage>> {
+        let result = self.command_tx.send(message);
+        self.pump();
+        result
+    }
+
+    /// Whether the inline preparation worker unwound — the inline counterpart of
+    /// the spawned worker's `join().is_err()`. Always `false` when it was
+    /// spawned, because that case is reported by the join itself.
+    #[cfg(target_family = "wasm")]
+    fn inline_preparation_panicked(&self) -> bool {
+        self.inline
+            .as_ref()
+            .is_some_and(|inline| inline.borrow().preparation_panicked)
+    }
+
     fn take_transfer_buffer(
         &mut self,
         cancel: Option<&CancellationToken>,
@@ -1330,6 +1865,7 @@ impl CpuInputPreparer<'_> {
             return Ok(buffer);
         }
 
+        self.pump();
         let buffer = recv_with_cancel(
             &self.complete_rx,
             cancel,
@@ -1358,6 +1894,7 @@ impl CpuInputPreparer<'_> {
 
     fn restore_transfer_buffers(&mut self, cancel: Option<&CancellationToken>) -> Result<()> {
         while self.transfer_buffers.iter().any(Option::is_none) {
+            self.pump();
             let buffer = recv_with_cancel(
                 &self.complete_rx,
                 cancel,
@@ -1414,6 +1951,9 @@ fn finalize_output_bytes(
             }
         }
         CpuKernelKind::Folded => crate::gf_simd::altmap_decode(buffer),
+        // Identity staging has no inverse to apply — see the variant's note.
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelKind::NeonPacked => {}
         CpuKernelKind::Plain => {}
     }
 
@@ -1425,36 +1965,81 @@ fn finalize_output_bytes(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_preparation_worker<'a>(
-    command_rx: std::sync::mpsc::Receiver<PreparationMessage>,
+/// The preparation worker's loop *body* and the state it carries across
+/// messages, factored out of [`run_preparation_worker`] so the identical body
+/// can also run inline on the controller thread where no worker thread can be
+/// spawned (see [`InlineControllerWorkers`]).
+struct PreparationWorker<'a> {
     complete_tx: std::sync::mpsc::SyncSender<TransferBuffer>,
     prepared_tx: std::sync::mpsc::SyncSender<PreparedControllerBatch>,
-    submitted_tx: std::sync::mpsc::SyncSender<
-        std::result::Result<SubmittedControllerBatch<'a>, String>,
-    >,
+    submitted_tx:
+        std::sync::mpsc::SyncSender<std::result::Result<SubmittedControllerBatch<'a>, String>>,
     finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
     kernel: CpuKernelKind,
     method: CpuMethodContract,
     output_base: usize,
     output_count: usize,
     memo: &'a PreparedFactorMemo,
-    #[cfg(target_arch = "x86_64")] jit_memo: Option<&'a JitMemo>,
-    timings: &'a CpuControllerTimings,
-    mut compute_submitter: CpuComputeSubmitter<'a>,
-    trace: ControllerExecutionTrace,
-) {
-    let mut active: Option<PrepareBatch> = None;
     #[cfg(target_arch = "x86_64")]
-    let mut jit_workspaces = [
-        reedsolomon_rs::xor_jit::packed::PackedJitWorkspace::default(),
-        reedsolomon_rs::xor_jit::packed::PackedJitWorkspace::default(),
-    ];
-    while let Ok(message) = command_rx.recv() {
+    jit_memo: Option<&'a JitMemo>,
+    timings: &'a CpuControllerTimings,
+    compute_submitter: CpuComputeSubmitter<'a>,
+    trace: ControllerExecutionTrace,
+    active: Option<PrepareBatch>,
+    #[cfg(target_arch = "x86_64")]
+    jit_workspaces: [reedsolomon_rs::xor_jit::packed::PackedJitWorkspace; 2],
+}
+
+impl<'a> PreparationWorker<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        complete_tx: std::sync::mpsc::SyncSender<TransferBuffer>,
+        prepared_tx: std::sync::mpsc::SyncSender<PreparedControllerBatch>,
+        submitted_tx: std::sync::mpsc::SyncSender<
+            std::result::Result<SubmittedControllerBatch<'a>, String>,
+        >,
+        finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
+        kernel: CpuKernelKind,
+        method: CpuMethodContract,
+        output_base: usize,
+        output_count: usize,
+        memo: &'a PreparedFactorMemo,
+        #[cfg(target_arch = "x86_64")] jit_memo: Option<&'a JitMemo>,
+        timings: &'a CpuControllerTimings,
+        compute_submitter: CpuComputeSubmitter<'a>,
+        trace: ControllerExecutionTrace,
+    ) -> Self {
+        Self {
+            complete_tx,
+            prepared_tx,
+            submitted_tx,
+            finished_tx,
+            kernel,
+            method,
+            output_base,
+            output_count,
+            memo,
+            #[cfg(target_arch = "x86_64")]
+            jit_memo,
+            timings,
+            compute_submitter,
+            trace,
+            active: None,
+            #[cfg(target_arch = "x86_64")]
+            jit_workspaces: [
+                reedsolomon_rs::xor_jit::packed::PackedJitWorkspace::default(),
+                reedsolomon_rs::xor_jit::packed::PackedJitWorkspace::default(),
+            ],
+        }
+    }
+
+    /// Handle one command. `Break` reproduces every `break` arm of the original
+    /// loop; the worker is finished and must release its channel endpoints.
+    fn step(&mut self, message: PreparationMessage) -> ControlFlow<()> {
         match message {
             PreparationMessage::Begin(batch) => {
-                debug_assert!(active.is_none());
-                active = Some(batch);
+                debug_assert!(self.active.is_none());
+                self.active = Some(batch);
             }
             PreparationMessage::Input {
                 lane,
@@ -1462,27 +2047,27 @@ fn run_preparation_worker<'a>(
                 mut buffer,
                 submitted,
             } => {
-                let Some(batch) = active.as_mut() else {
-                    trace.record(ControllerExecutionEvent::Failed {
+                let Some(batch) = self.active.as_mut() else {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 };
                 if coefficients.len() != batch.set.coefficients.len() / batch.set.input_grouping {
-                    trace.record(ControllerExecutionEvent::Failed {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 }
                 for (output, coefficient) in coefficients.into_iter().enumerate() {
                     batch.set.coefficients[output * batch.set.input_grouping + lane] = coefficient;
                 }
-                let checksum_block_len = method.stride;
+                let checksum_block_len = self.method.stride;
                 write_packed_checksum(
                     &mut buffer.bytes[..batch.aligned_len],
                     batch.aligned_len - checksum_block_len,
                     checksum_block_len,
-                    method.checksum_width,
+                    self.method.checksum_width,
                 );
                 prepare_stream_source(
                     &mut batch.set,
@@ -1490,19 +2075,19 @@ fn run_preparation_worker<'a>(
                     &buffer.bytes,
                     batch.aligned_len,
                     batch.chunk_len,
-                    kernel,
+                    self.kernel,
                 );
                 let mut stop_after_buffer = false;
                 if let Some(submitted) = submitted {
-                    let mut batch = active.take().expect("active preparation batch");
+                    let mut batch = self.active.take().expect("active preparation batch");
                     if submitted.input_len != lane + 1
                         || submitted.staging_area >= 2
                         || submitted.input_start != batch.set.start
                     {
-                        trace.record(ControllerExecutionEvent::Failed {
+                        self.trace.record(ControllerExecutionEvent::Failed {
                             phase: ControllerFailurePhase::Prepare,
                         });
-                        break;
+                        return ControlFlow::Break(());
                     }
                     batch.set.len = submitted.input_len;
                     let submitted_info = submitted;
@@ -1510,114 +2095,117 @@ fn run_preparation_worker<'a>(
                         let submitted = submit_prepared_controller_batch(
                             submitted,
                             batch,
-                            output_base,
-                            output_count,
-                            memo,
+                            self.output_base,
+                            self.output_count,
+                            self.memo,
                             #[cfg(target_arch = "x86_64")]
-                            jit_memo,
+                            self.jit_memo,
                             #[cfg(target_arch = "x86_64")]
-                            &mut jit_workspaces,
-                            method,
-                            timings,
-                            &trace,
-                            &mut compute_submitter,
+                            &mut self.jit_workspaces,
+                            self.method,
+                            self.timings,
+                            &self.trace,
+                            &mut self.compute_submitter,
                         );
                         stop_after_buffer = submitted.is_err();
-                        if submitted_tx.send(submitted).is_err() {
-                            trace.record(ControllerExecutionEvent::Failed {
+                        if self.submitted_tx.send(submitted).is_err() {
+                            self.trace.record(ControllerExecutionEvent::Failed {
                                 phase: ControllerFailurePhase::Prepare,
                             });
-                            break;
+                            return ControlFlow::Break(());
                         }
-                    } else if prepared_tx
+                    } else if self
+                        .prepared_tx
                         .send(PreparedControllerBatch { set: batch.set })
                         .is_err()
                     {
-                        trace.record(ControllerExecutionEvent::Failed {
+                        self.trace.record(ControllerExecutionEvent::Failed {
                             phase: ControllerFailurePhase::Prepare,
                         });
-                        break;
+                        return ControlFlow::Break(());
                     }
                     if !stop_after_buffer {
-                        trace.record(ControllerExecutionEvent::PreparationCompleted {
-                            staging_area: submitted_info.staging_area,
-                            input_len: submitted_info.input_len,
-                        });
+                        self.trace
+                            .record(ControllerExecutionEvent::PreparationCompleted {
+                                staging_area: submitted_info.staging_area,
+                                input_len: submitted_info.input_len,
+                            });
                     }
                 }
                 // Launch the completed group before resolving the input future;
                 // compute is already queued when this buffer is returned.
-                if complete_tx.send(buffer).is_err() {
-                    trace.record(ControllerExecutionEvent::Failed {
+                if self.complete_tx.send(buffer).is_err() {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 }
                 if stop_after_buffer {
-                    break;
+                    return ControlFlow::Break(());
                 }
             }
             PreparationMessage::Flush { batch: submitted } => {
-                let Some(mut batch) = active.take() else {
-                    trace.record(ControllerExecutionEvent::Failed {
+                let Some(mut batch) = self.active.take() else {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 };
                 if submitted.input_len == 0
                     || submitted.input_len > batch.set.input_grouping
                     || submitted.staging_area >= 2
                     || submitted.input_start != batch.set.start
                 {
-                    trace.record(ControllerExecutionEvent::Failed {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 }
                 batch.set.len = submitted.input_len;
                 let submitted_info = submitted;
                 let submitted = submit_prepared_controller_batch(
                     submitted,
                     batch,
-                    output_base,
-                    output_count,
-                    memo,
+                    self.output_base,
+                    self.output_count,
+                    self.memo,
                     #[cfg(target_arch = "x86_64")]
-                    jit_memo,
+                    self.jit_memo,
                     #[cfg(target_arch = "x86_64")]
-                    &mut jit_workspaces,
-                    method,
-                    timings,
-                    &trace,
-                    &mut compute_submitter,
+                    &mut self.jit_workspaces,
+                    self.method,
+                    self.timings,
+                    &self.trace,
+                    &mut self.compute_submitter,
                 );
                 let submit_failed = submitted.is_err();
-                if submitted_tx.send(submitted).is_err() {
-                    trace.record(ControllerExecutionEvent::Failed {
+                if self.submitted_tx.send(submitted).is_err() {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Prepare,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 }
                 if submit_failed {
-                    break;
+                    return ControlFlow::Break(());
                 }
-                trace.record(ControllerExecutionEvent::PreparationCompleted {
-                    staging_area: submitted_info.staging_area,
-                    input_len: submitted_info.input_len,
-                });
+                self.trace
+                    .record(ControllerExecutionEvent::PreparationCompleted {
+                        staging_area: submitted_info.staging_area,
+                        input_len: submitted_info.input_len,
+                    });
             }
             #[cfg(target_arch = "x86_64")]
             PreparationMessage::RecycleJit {
                 staging_area,
                 batch,
             } => {
-                if staging_area >= jit_workspaces.len()
-                    || jit_workspaces[staging_area].recycle(batch).is_err()
+                if staging_area >= self.jit_workspaces.len()
+                    || self.jit_workspaces[staging_area].recycle(batch).is_err()
                 {
-                    trace.record(ControllerExecutionEvent::Failed {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::Compute,
                     });
-                    break;
+                    return ControlFlow::Break(());
                 }
             }
             PreparationMessage::FinishOutput {
@@ -1627,7 +2215,7 @@ fn run_preparation_worker<'a>(
                 mut buffer,
             } => {
                 let started = Instant::now();
-                debug_assert!(active.is_none());
+                debug_assert!(self.active.is_none());
                 let encoding = source.encoding();
                 // SAFETY: output storage stays fixed until every queued finish
                 // operation has completed and the transfer worker is joined.
@@ -1658,12 +2246,13 @@ fn run_preparation_worker<'a>(
                     }
                 }
                 let checksum_valid = finalize_output_bytes(
-                    kernel,
-                    method,
+                    self.kernel,
+                    self.method,
                     encoding,
                     &mut buffer.bytes[..aligned_len],
                 );
-                if finished_tx
+                if self
+                    .finished_tx
                     .send(FinishedOutput {
                         index,
                         buffer,
@@ -1672,13 +2261,251 @@ fn run_preparation_worker<'a>(
                     })
                     .is_err()
                 {
-                    trace.record(ControllerExecutionEvent::Failed {
+                    self.trace.record(ControllerExecutionEvent::Failed {
                         phase: ControllerFailurePhase::OutputTransfer,
                     });
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_preparation_worker<'a>(
+    command_rx: std::sync::mpsc::Receiver<PreparationMessage>,
+    complete_tx: std::sync::mpsc::SyncSender<TransferBuffer>,
+    prepared_tx: std::sync::mpsc::SyncSender<PreparedControllerBatch>,
+    submitted_tx: std::sync::mpsc::SyncSender<
+        std::result::Result<SubmittedControllerBatch<'a>, String>,
+    >,
+    finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
+    kernel: CpuKernelKind,
+    method: CpuMethodContract,
+    output_base: usize,
+    output_count: usize,
+    memo: &'a PreparedFactorMemo,
+    #[cfg(target_arch = "x86_64")] jit_memo: Option<&'a JitMemo>,
+    timings: &'a CpuControllerTimings,
+    compute_submitter: CpuComputeSubmitter<'a>,
+    trace: ControllerExecutionTrace,
+) {
+    let mut worker = PreparationWorker::new(
+        complete_tx,
+        prepared_tx,
+        submitted_tx,
+        finished_tx,
+        kernel,
+        method,
+        output_base,
+        output_count,
+        memo,
+        #[cfg(target_arch = "x86_64")]
+        jit_memo,
+        timings,
+        compute_submitter,
+        trace,
+    );
+    while let Ok(message) = command_rx.recv() {
+        if worker.step(message).is_break() {
+            break;
+        }
+    }
+}
+
+/// Run the preparation worker and report whether it panicked — the value the
+/// controller's `join()` interprets. Factored out of the `scope.spawn` closure
+/// only so the two spawning arms below can share one definition.
+#[allow(clippy::too_many_arguments)]
+fn run_guarded_preparation_worker<'a>(
+    command_rx: std::sync::mpsc::Receiver<PreparationMessage>,
+    complete_tx: std::sync::mpsc::SyncSender<TransferBuffer>,
+    prepared_tx: std::sync::mpsc::SyncSender<PreparedControllerBatch>,
+    submitted_tx: std::sync::mpsc::SyncSender<
+        std::result::Result<SubmittedControllerBatch<'a>, String>,
+    >,
+    finished_tx: std::sync::mpsc::SyncSender<FinishedOutput>,
+    kernel: CpuKernelKind,
+    method: CpuMethodContract,
+    output_base: usize,
+    output_count: usize,
+    memo: &'a PreparedFactorMemo,
+    #[cfg(target_arch = "x86_64")] jit_memo: Option<&'a JitMemo>,
+    timings: &'a CpuControllerTimings,
+    compute_submitter: CpuComputeSubmitter<'a>,
+    trace: ControllerExecutionTrace,
+) -> bool {
+    let panic_trace = trace.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_preparation_worker(
+            command_rx,
+            complete_tx,
+            prepared_tx,
+            submitted_tx,
+            finished_tx,
+            kernel,
+            method,
+            output_base,
+            output_count,
+            memo,
+            #[cfg(target_arch = "x86_64")]
+            jit_memo,
+            timings,
+            compute_submitter,
+            trace,
+        );
+    }))
+    .is_err()
+    {
+        panic_trace.record(ControllerExecutionEvent::Failed {
+            phase: ControllerFailurePhase::Prepare,
+        });
+        true
+    } else {
+        false
+    }
+}
+
+// ── Inline (spawn-less) controller execution ───────────────────────────────
+//
+// `wasm32-wasip1` cannot spawn a thread at all: `std::thread::Builder::spawn`
+// returns `Unsupported` (errno 58), so the `std::thread::scope` the streamed
+// controller is built on aborts the process before any repair arithmetic runs.
+// There, the controller keeps its exact shape — same staging areas, same
+// channels, same backpressure accounting, same cancellation checks — and runs
+// the preparation and compute worker *loop bodies* (`PreparationWorker::step`
+// and `ComputeWorker::step`, the very ones the spawned workers run) on the
+// controller thread, pumped from every point where the controller touches a
+// worker channel. It is the same repair path at width one, not a second one.
+//
+// Why the existing bounded channels cannot deadlock when both ends are on one
+// thread:
+//
+//  * Every controller-thread send goes through `CpuInputPreparer::send_command`,
+//    which pumps immediately afterwards, and every controller-thread receive is
+//    preceded by a pump. At most one command is therefore queued when the pump
+//    runs, so one pump produces at most one item per preparation→controller
+//    channel — within the capacity of even the tightest of them (`submitted`,
+//    capacity 1).
+//  * `run_ready_compute` empties every compute worker's job queue *before* the
+//    preparation worker is handed its next command, so a submission of one job
+//    per worker always fits the per-worker capacity of 1.
+//  * The pumped graph is acyclic — commands feed preparation, preparation feeds
+//    compute, compute feeds completions, and only the controller thread
+//    consumes what comes back — so a pump always runs out of work and returns.
+//
+// A worker that stops drops its channel endpoints, exactly as a worker thread
+// returning from its loop does, so the controller sees the same `Disconnected`
+// failures it already handles instead of waiting forever.
+#[cfg(target_family = "wasm")]
+struct InlineComputeWorker<'a> {
+    receiver: std::sync::mpsc::Receiver<CpuComputeJob<'a>>,
+    completion_tx: std::sync::mpsc::SyncSender<CpuComputeCompletion>,
+    state: ComputeWorker,
+}
+
+#[cfg(target_family = "wasm")]
+impl<'a> InlineComputeWorker<'a> {
+    fn new(
+        worker: usize,
+        receiver: std::sync::mpsc::Receiver<CpuComputeJob<'a>>,
+        completion_tx: std::sync::mpsc::SyncSender<CpuComputeCompletion>,
+    ) -> Self {
+        Self {
+            receiver,
+            completion_tx,
+            state: ComputeWorker::new(worker),
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+struct InlineControllerWorkers<'a> {
+    /// Dropped together with `preparation` when the preparation worker stops,
+    /// so the controller's next `command_tx.send` fails just as it would if the
+    /// worker thread had returned.
+    command_rx: Option<std::sync::mpsc::Receiver<PreparationMessage>>,
+    /// `None` once stopped; dropping it releases every preparation-side sender.
+    preparation: Option<PreparationWorker<'a>>,
+    /// One slot per compute worker; `None` once that worker has stopped.
+    compute: Vec<Option<InlineComputeWorker<'a>>>,
+    /// The inline equivalent of the preparation worker's `join().is_err()`.
+    preparation_panicked: bool,
+}
+
+#[cfg(target_family = "wasm")]
+impl<'a> InlineControllerWorkers<'a> {
+    fn new(
+        command_rx: std::sync::mpsc::Receiver<PreparationMessage>,
+        preparation: PreparationWorker<'a>,
+        compute: Vec<InlineComputeWorker<'a>>,
+    ) -> Self {
+        Self {
+            command_rx: Some(command_rx),
+            preparation: Some(preparation),
+            compute: compute.into_iter().map(Some).collect(),
+            preparation_panicked: false,
+        }
+    }
+
+    /// Give every worker loop a turn, until none of them can make progress.
+    fn run(&mut self) {
+        loop {
+            self.run_ready_compute();
+            let message = match self.command_rx.as_ref() {
+                Some(command_rx) => match command_rx.try_recv() {
+                    Ok(message) => message,
+                    Err(_) => break,
+                },
+                None => return,
+            };
+            let Some(preparation) = self.preparation.as_mut() else {
+                return;
+            };
+            let panic_trace = preparation.trace.clone();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                preparation.step(message)
+            })) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => {
+                    self.stop_preparation();
+                    break;
+                }
+                Err(_) => {
+                    // Identical to what `run_guarded_preparation_worker` records
+                    // when the spawned worker unwinds.
+                    panic_trace.record(ControllerExecutionEvent::Failed {
+                        phase: ControllerFailurePhase::Prepare,
+                    });
+                    self.preparation_panicked = true;
+                    self.stop_preparation();
                     break;
                 }
             }
         }
+        self.run_ready_compute();
+    }
+
+    /// Run every queued compute job. Emptying the queues here is what keeps the
+    /// per-worker channel capacity of 1 sufficient for the next submission.
+    fn run_ready_compute(&mut self) {
+        for slot in &mut self.compute {
+            let Some(worker) = slot.as_mut() else {
+                continue;
+            };
+            while let Ok(job) = worker.receiver.try_recv() {
+                if worker.state.step(job, &worker.completion_tx).is_break() {
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn stop_preparation(&mut self) {
+        self.preparation = None;
+        self.command_rx = None;
     }
 }
 
@@ -1691,8 +2518,7 @@ fn queue_output_finish(
     trace: &ControllerExecutionTrace,
 ) -> Result<()> {
     preparer
-        .command_tx
-        .send(PreparationMessage::FinishOutput {
+        .send_command(PreparationMessage::FinishOutput {
             index,
             source,
             aligned_len,
@@ -1739,6 +2565,7 @@ fn finish_and_write_stream_outputs(
 
     let mut next_to_queue = initially_queued;
     for expected in 0..outputs.len() {
+        preparer.pump();
         let FinishedOutput {
             index,
             buffer,
@@ -1845,8 +2672,7 @@ fn fill_gpu_stream_batch(
 
     let started = Instant::now();
     preparer
-        .command_tx
-        .send(PreparationMessage::Begin(PrepareBatch {
+        .send_command(PreparationMessage::Begin(PrepareBatch {
             set,
             aligned_len,
             chunk_len,
@@ -1874,8 +2700,7 @@ fn fill_gpu_stream_batch(
             .map(|output| plan.input_factors.get(output, batch_start + lane))
             .collect();
         preparer
-            .command_tx
-            .send(PreparationMessage::Input {
+            .send_command(PreparationMessage::Input {
                 lane,
                 coefficients,
                 buffer,
@@ -1894,6 +2719,7 @@ fn fill_gpu_stream_batch(
             })?;
     }
     preparer.restore_transfer_buffers(options.cancel.as_ref())?;
+    preparer.pump();
     let result = recv_with_cancel(
         &preparer.prepared_rx,
         options.cancel.as_ref(),
@@ -1920,8 +2746,7 @@ fn begin_live_stream_batch(
     set.packed_stride = chunk_len;
     set.coefficients.fill(0);
     preparer
-        .command_tx
-        .send(PreparationMessage::Begin(PrepareBatch {
+        .send_command(PreparationMessage::Begin(PrepareBatch {
             set,
             aligned_len,
             chunk_len,
@@ -2018,8 +2843,7 @@ fn queue_live_stream_input(
         .map(|output| plan.input_factors.get(output, source_index))
         .collect();
     preparer
-        .command_tx
-        .send(PreparationMessage::Input {
+        .send_command(PreparationMessage::Input {
             lane: slot,
             coefficients,
             buffer,
@@ -2047,8 +2871,7 @@ fn flush_live_stream_batch(
     trace: &ControllerExecutionTrace,
 ) -> Result<()> {
     preparer
-        .command_tx
-        .send(PreparationMessage::Flush { batch })
+        .send_command(PreparationMessage::Flush { batch })
         .map_err(|_| {
             trace.record(ControllerExecutionEvent::Failed {
                 phase: ControllerFailurePhase::Prepare,
@@ -2666,6 +3489,7 @@ fn receive_submitted_controller_batch<'a>(
     trace: &ControllerExecutionTrace,
     active: &mut [Option<CpuComputeTicket<'a>>; 2],
 ) -> Result<bool> {
+    preparer.pump();
     let submitted = match mode {
         SubmittedReceiveMode::ReadyOnly => match preparer.submitted_rx.try_recv() {
             Ok(submitted) => submitted,
@@ -2721,7 +3545,7 @@ fn receive_submitted_controller_batch<'a>(
 #[allow(clippy::too_many_arguments)]
 fn complete_active_controller_batch<'a>(
     staging_area: usize,
-    _preparer: &CpuInputPreparer<'a>,
+    preparer: &CpuInputPreparer<'a>,
     compute_pool: &mut CpuComputePool<'a>,
     active: &mut [Option<CpuComputeTicket<'a>>; 2],
     batch_sets: &mut [Option<StreamBatchSet>; 2],
@@ -2730,6 +3554,10 @@ fn complete_active_controller_batch<'a>(
     timings: &CpuControllerTimings,
     trace: &ControllerExecutionTrace,
 ) -> Result<()> {
+    // Inline execution runs the queued compute jobs here; the wait below then
+    // finds their completions already delivered, exactly as it would with
+    // worker threads that had finished first.
+    preparer.pump();
     #[allow(unused_mut)]
     let mut finished = compute_pool.wait(
         active[staging_area]
@@ -2742,9 +3570,8 @@ fn complete_active_controller_batch<'a>(
     if let Some(jit_batch) = finished.jit_batch.take()
         && jit_batch.requires_workspace_recycle()
     {
-        _preparer
-            .command_tx
-            .send(PreparationMessage::RecycleJit {
+        preparer
+            .send_command(PreparationMessage::RecycleJit {
                 staging_area,
                 batch: jit_batch,
             })
@@ -2759,17 +3586,33 @@ fn complete_active_controller_batch<'a>(
     Ok(())
 }
 
-fn run_compute_worker<'a>(
+/// One compute worker's loop *body*, factored out of [`run_compute_worker`] so
+/// the identical body can also run inline on the controller thread where no
+/// worker thread can be spawned (see [`InlineControllerWorkers`]).
+struct ComputeWorker {
     worker: usize,
-    receiver: std::sync::mpsc::Receiver<CpuComputeJob<'a>>,
-    completion_tx: std::sync::mpsc::SyncSender<CpuComputeCompletion>,
-) {
-    let mut scratch = CpuWorkerScratch::default();
-    while let Ok(job) = receiver.recv() {
+    scratch: CpuWorkerScratch,
+}
+
+impl ComputeWorker {
+    fn new(worker: usize) -> Self {
+        Self {
+            worker,
+            scratch: CpuWorkerScratch::default(),
+        }
+    }
+
+    /// Run one job and report its completion. `Break` reproduces the two `break`
+    /// arms of the original loop: a closed completion channel, or a failed job.
+    fn step(
+        &mut self,
+        job: CpuComputeJob<'_>,
+        completion_tx: &std::sync::mpsc::SyncSender<CpuComputeCompletion>,
+    ) -> ControlFlow<()> {
         let CpuComputeJob { id, context } = job;
         let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_cpu_worker(worker, &context, &mut scratch)
+            run_cpu_worker(self.worker, &context, &mut self.scratch)
         }));
         let failure = match result {
             Ok(Ok(())) => None,
@@ -2781,23 +3624,37 @@ fn run_compute_worker<'a>(
                 phase: ControllerFailurePhase::Compute,
             });
         }
-        scratch.plain_sources.clear();
-        scratch.folded_stagings.clear();
+        self.scratch.plain_sources.clear();
+        self.scratch.folded_stagings.clear();
         // The completion means this worker has released every reference to
         // the staging area, so the controller may safely reuse it.
         drop(context);
         if completion_tx
             .send(CpuComputeCompletion {
                 id,
-                worker,
+                worker: self.worker,
                 elapsed: started.elapsed(),
                 failure: failure.clone(),
             })
             .is_err()
         {
-            break;
+            return ControlFlow::Break(());
         }
         if failure.is_some() {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn run_compute_worker<'a>(
+    worker: usize,
+    receiver: std::sync::mpsc::Receiver<CpuComputeJob<'a>>,
+    completion_tx: std::sync::mpsc::SyncSender<CpuComputeCompletion>,
+) {
+    let mut state = ComputeWorker::new(worker);
+    while let Ok(job) = receiver.recv() {
+        if state.step(job, &completion_tx).is_break() {
             break;
         }
     }
@@ -3744,6 +4601,17 @@ fn execute_repair_streaming_with_trace(
     } else {
         CpuKernelKind::Plain
     };
+    // aarch64 can never reach `Folded` (`altmap_supported()` is x86-only), and
+    // `Plain`'s 2-byte contract is not what the oracle stages on ARM. Take the
+    // oracle's own packed contract instead. NEON is baseline on aarch64, so
+    // there is no feature to detect; `WEAVER_PAR2_NEON_PACKED=0` pins the old
+    // 2-byte contract for A/B.
+    #[cfg(target_arch = "aarch64")]
+    let cpu_kernel = if neon_packed_enabled() {
+        CpuKernelKind::NeonPacked
+    } else {
+        cpu_kernel
+    };
     #[cfg(target_arch = "x86_64")]
     let cpu_kernel = jit_memo
         .as_ref()
@@ -3894,10 +4762,28 @@ fn execute_repair_streaming_with_trace(
             std::sync::mpsc::sync_channel(workers.saturating_mul(2).max(1));
         let mut compute_senders = Vec::with_capacity(workers);
         let mut compute_workers = Vec::with_capacity(workers);
+        // `parallel_enabled()` const-folds to `true` off wasm, so this decision
+        // — and every statement guarded by it below — exists only on wasm. On
+        // `wasm32-wasip1` it is `false` and the worker loops run inline on this
+        // thread; on `wasm32-wasip1-threads` it is `true` and everything below
+        // is the spawning path, unchanged.
+        #[cfg(target_family = "wasm")]
+        let inline_execution = !reedsolomon_rs::threading::parallel_enabled();
+        #[cfg(target_family = "wasm")]
+        let mut inline_compute = Vec::with_capacity(workers);
         for worker_index in 0..workers {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let completion_tx = compute_completion_tx.clone();
             compute_senders.push(sender);
+            #[cfg(target_family = "wasm")]
+            if inline_execution {
+                inline_compute.push(InlineComputeWorker::new(
+                    worker_index,
+                    receiver,
+                    completion_tx,
+                ));
+                continue;
+            }
             compute_workers.push(scope.spawn(move || {
                 run_compute_worker(worker_index, receiver, completion_tx);
             }));
@@ -3917,37 +4803,72 @@ fn execute_repair_streaming_with_trace(
         let preparation_timings = &timings;
         #[cfg(target_arch = "x86_64")]
         let preparation_jit_memo = jit_memo.as_ref();
+        #[cfg(not(target_family = "wasm"))]
         let preparation_worker = scope.spawn(move || {
-            let panic_trace = preparation_trace.clone();
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_preparation_worker(
-                    command_rx,
-                    complete_tx,
-                    prepared_tx,
-                    submitted_tx,
-                    finished_tx,
-                    cpu_kernel,
-                    method,
-                    output_base,
-                    n,
-                    preparation_memo,
-                    #[cfg(target_arch = "x86_64")]
-                    preparation_jit_memo,
-                    preparation_timings,
-                    compute_submitter,
-                    preparation_trace,
-                );
-            }))
-            .is_err()
-            {
-                panic_trace.record(ControllerExecutionEvent::Failed {
-                    phase: ControllerFailurePhase::Prepare,
-                });
-                true
-            } else {
-                false
-            }
+            run_guarded_preparation_worker(
+                command_rx,
+                complete_tx,
+                prepared_tx,
+                submitted_tx,
+                finished_tx,
+                cpu_kernel,
+                method,
+                output_base,
+                n,
+                preparation_memo,
+                #[cfg(target_arch = "x86_64")]
+                preparation_jit_memo,
+                preparation_timings,
+                compute_submitter,
+                preparation_trace,
+            )
         });
+        // Same worker, same arguments; the only difference is who runs its loop.
+        #[cfg(target_family = "wasm")]
+        let (preparation_worker, inline_workers) = if inline_execution {
+            (
+                None,
+                Some(std::cell::RefCell::new(InlineControllerWorkers::new(
+                    command_rx,
+                    PreparationWorker::new(
+                        complete_tx,
+                        prepared_tx,
+                        submitted_tx,
+                        finished_tx,
+                        cpu_kernel,
+                        method,
+                        output_base,
+                        n,
+                        preparation_memo,
+                        preparation_timings,
+                        compute_submitter,
+                        preparation_trace,
+                    ),
+                    inline_compute,
+                ))),
+            )
+        } else {
+            (
+                Some(scope.spawn(move || {
+                    run_guarded_preparation_worker(
+                        command_rx,
+                        complete_tx,
+                        prepared_tx,
+                        submitted_tx,
+                        finished_tx,
+                        cpu_kernel,
+                        method,
+                        output_base,
+                        n,
+                        preparation_memo,
+                        preparation_timings,
+                        compute_submitter,
+                        preparation_trace,
+                    )
+                })),
+                None,
+            )
+        };
         let mut preparer = CpuInputPreparer {
             command_tx,
             complete_rx,
@@ -3961,6 +4882,8 @@ fn execute_repair_streaming_with_trace(
                 })
             }),
             transfer_buffer_len: physical_row_len,
+            #[cfg(target_family = "wasm")]
+            inline: inline_workers,
         };
 
         let repair_result = (|| -> Result<()> {
@@ -4279,6 +5202,9 @@ fn execute_repair_streaming_with_trace(
             }
             Ok(())
         })();
+        // Read before the preparer — which owns the inline workers — is dropped.
+        #[cfg(target_family = "wasm")]
+        let inline_preparation_panicked = preparer.inline_preparation_panicked();
         drop(compute_pool);
         drop(preparer);
         let mut compute_panicked = false;
@@ -4290,7 +5216,17 @@ fn execute_repair_streaming_with_trace(
                 reason: "CPU repair compute worker panicked".to_string(),
             });
         }
-        if preparation_worker.join().unwrap_or(true) && repair_result.is_ok() {
+        #[cfg(not(target_family = "wasm"))]
+        let preparation_panicked = preparation_worker.join().unwrap_or(true);
+        // Inline compute panics need no equivalent: `ComputeWorker::step`
+        // catches them itself and reports them as a job failure on both paths,
+        // so the empty `compute_workers` join above is the whole answer.
+        #[cfg(target_family = "wasm")]
+        let preparation_panicked = preparation_worker
+            .map_or(inline_preparation_panicked, |worker| {
+                worker.join().unwrap_or(true)
+            });
+        if preparation_panicked && repair_result.is_ok() {
             return Err(Par2Error::ReedSolomonError {
                 reason: "CPU repair preparation worker panicked".to_string(),
             });
@@ -6120,6 +7056,261 @@ mod tests {
             BLOCK_LEN,
             BLOCK_LEN
         ));
+    }
+
+    /// The packed checksum feeds verification, so the accelerated kernel must
+    /// be byte-identical to the lane-strided form it replaced — not merely
+    /// "also a valid checksum". This holds the current implementation against
+    /// a literal transcription of the original algorithm across every width
+    /// and block shape the method contracts produce.
+    #[test]
+    fn packed_checksum_matches_original_scalar_algorithm() {
+        /// Verbatim the pre-optimization kernel.
+        fn reference(checksum: &mut [u8], block: &[u8]) {
+            let width = checksum.len();
+            for lane in (0..width).step_by(2) {
+                let mut folded = 0u16;
+                for region in block.chunks_exact(width) {
+                    folded ^= u16::from_le_bytes([region[lane], region[lane + 1]]);
+                }
+                let previous = u16::from_le_bytes([checksum[lane], checksum[lane + 1]]);
+                checksum[lane..lane + 2]
+                    .copy_from_slice(&(gf16_mul2(previous) ^ folded).to_le_bytes());
+            }
+        }
+
+        // (checksum_width, block_len) pairs: Plain (2,2), Folded (32,32),
+        // NeonPacked (16,32) — the aarch64 production shape, and ParPar's own
+        // `sizeof(uint8x16_t)` over `sizeof(uint8x16x2_t)` — XOR-JIT AVX2
+        // (2,32) and AVX-512 (4,64), plus widths that exercise the 8-byte word
+        // loop's tail.
+        let shapes = [
+            (2usize, 2usize),
+            (2, 32),
+            (4, 64),
+            (6, 12),
+            (16, 32),
+            (16, 128),
+            (32, 32),
+            (32, 96),
+            (64, 64),
+            (64, 256),
+        ];
+        // The NEON port must clear the same bar. Counted so a port that
+        // silently declined every shape cannot pass vacuously.
+        #[cfg(target_arch = "aarch64")]
+        let mut neon_shapes_covered = 0usize;
+
+        for (width, block_len) in shapes {
+            for blocks in [1usize, 2, 7] {
+                let data_len = block_len * blocks;
+                let data: Vec<u8> = (0..data_len)
+                    .map(|i| ((i * 37 + width * 5 + 1) % 256) as u8)
+                    .collect();
+
+                let mut got = vec![0u8; width];
+                let mut want = vec![0u8; width];
+                for block in data.chunks_exact(block_len) {
+                    update_packed_checksum(&mut got, block);
+                    reference(&mut want, block);
+                }
+                assert_eq!(
+                    got, want,
+                    "checksum differs width={width} block_len={block_len} blocks={blocks}"
+                );
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // Block-at-a-time, matching `gf16_checksum_block_neon`'s
+                    // own load/mul2/xor/store contract.
+                    let mut neon = vec![0u8; width];
+                    let mut neon_ran = true;
+                    for block in data.chunks_exact(block_len) {
+                        neon_ran &= parpar_neon_checksum::update_block(&mut neon, block);
+                    }
+                    // Whole-sweep form, with the accumulator held in registers
+                    // across blocks — the shape production actually calls.
+                    let swept = parpar_neon_checksum::fold(&data, block_len, width);
+
+                    if width % 16 == 0 {
+                        assert!(
+                            neon_ran && swept.is_some(),
+                            "NEON port declined a 16-byte-multiple shape \
+                             width={width} block_len={block_len}"
+                        );
+                        assert_eq!(
+                            neon, want,
+                            "NEON per-block differs width={width} \
+                             block_len={block_len} blocks={blocks}"
+                        );
+                        assert_eq!(
+                            &swept.expect("swept")[..width],
+                            &want[..],
+                            "NEON sweep differs width={width} \
+                             block_len={block_len} blocks={blocks}"
+                        );
+                        neon_shapes_covered += 1;
+                    } else {
+                        // Sub-vector widths have no oracle NEON form; the port
+                        // must decline rather than invent one.
+                        assert!(
+                            !neon_ran && swept.is_none(),
+                            "NEON port accepted a shape ParPar has no form for: \
+                             width={width} block_len={block_len}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            neon_shapes_covered, 18,
+            "NEON coverage went vacuous: expected all six 16-byte-multiple \
+             shapes across three block counts"
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        eprintln!("SKIP: NEON checksum arm not covered — target is not aarch64");
+    }
+
+    /// The NEON `mul2` idiom is a different construction from the scalar one
+    /// (arithmetic-shift mask instead of a branch), so it is pinned over the
+    /// whole 16-bit domain, including the 0x8000 reduction boundary.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn parpar_neon_vec_mul2_matches_scalar_exhaustively() {
+        // Drive it through the public block form: a width-16 accumulator XORed
+        // with a zero block is exactly one `gf16_vec_mul2_neon` application.
+        let zero_block = [0u8; 16];
+        for base in (0..=0xFFFFu32).step_by(8) {
+            let lanes: [u16; 8] = std::array::from_fn(|i| (base + i as u32) as u16);
+            let mut checksum = [0u8; 16];
+            for (i, lane) in lanes.iter().enumerate() {
+                checksum[i * 2..i * 2 + 2].copy_from_slice(&lane.to_le_bytes());
+            }
+            assert!(parpar_neon_checksum::update_block(
+                &mut checksum,
+                &zero_block
+            ));
+            for (i, lane) in lanes.iter().enumerate() {
+                assert_eq!(
+                    &checksum[i * 2..i * 2 + 2],
+                    &gf16_mul2(*lane).to_le_bytes(),
+                    "lane {lane:#06x} differs"
+                );
+            }
+        }
+    }
+
+    /// The whole-sweep NEON arm must agree byte-for-byte with the portable arm
+    /// it displaces, over every plane count (1-4) and a zero-block edge case.
+    /// Both arms are called directly, so this holds regardless of which one the
+    /// `WEAVER_PAR2_CKSUM_NEON` gate happens to select.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn parpar_neon_fold_agrees_with_portable_arm() {
+        // `(16, 32)` is the aarch64 production shape — `NeonPacked`, and
+        // ParPar's own `sizeof(uint8x16_t)` checksum over a
+        // `sizeof(uint8x16x2_t)` block.
+        for (width, block_len) in [
+            (16usize, 16usize),
+            (16, 32),
+            (16, 128),
+            (32, 32),
+            (32, 96),
+            (48, 96),
+            (64, 256),
+        ] {
+            for blocks in [0usize, 1, 3, 9] {
+                let data: Vec<u8> = (0..block_len * blocks)
+                    .map(|i| ((i * 131 + width * 7 + 5) % 256) as u8)
+                    .collect();
+                let neon = parpar_neon_checksum::fold(&data, block_len, width)
+                    .expect("NEON arm handles 16-byte-multiple widths");
+                let mut portable = [0u8; 64];
+                for block in data.chunks_exact(block_len) {
+                    update_packed_checksum(&mut portable[..width], block);
+                }
+                assert_eq!(
+                    &neon[..width],
+                    &portable[..width],
+                    "width={width} block_len={block_len} blocks={blocks}"
+                );
+            }
+        }
+    }
+
+    /// The aarch64 staging contract is ParPar's, and it is what production
+    /// selects. Both halves are pinned: a regression in the numbers *or* a
+    /// silent return to `Plain` would put `parpar_neon_checksum` back to being
+    /// dead code, which is the failure this whole arm exists to prevent.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_packed_is_the_oracle_contract_and_reaches_the_checksum_port() {
+        let method = CpuKernelKind::NeonPacked.method();
+        // `GF_PREPARE_PACKED_FUNCS(gf16_clmul, _neon, sizeof(uint8x16x2_t),
+        // gf16_prepare_block_neon, …, sizeof(uint8x16_t))` —
+        // parpar/gf16/gf16_clmul_neon.c:27.
+        assert_eq!(method.stride, 32, "oracle blockLen is sizeof(uint8x16x2_t)");
+        assert_eq!(
+            method.checksum_width, 16,
+            "oracle checksum width is sizeof(uint8x16_t)"
+        );
+        assert_eq!(
+            method.checksum_width / 16,
+            1,
+            "PLANES == 1 is gf16_checksum_block_neon verbatim, not a widened form"
+        );
+
+        // Identity staging: the batch shape stays exactly `Plain`'s, because
+        // the oracle's prepare is a plain copy. Only the granularity moves.
+        let plain = CpuKernelKind::Plain.method();
+        assert_eq!(method.ideal_input_multiple, plain.ideal_input_multiple);
+        assert_eq!(method.staging_multiple, plain.staging_multiple);
+        assert_eq!(method.alignment, plain.alignment);
+        assert_eq!(method.ideal_chunk_size, plain.ideal_chunk_size);
+
+        // The contract must land on a shape the NEON checksum port accepts —
+        // this is the reachability that `Plain` never had.
+        assert!(
+            parpar_neon_checksum::fold(&[0u8; 128], method.stride, method.checksum_width).is_some(),
+            "NeonPacked must reach the NEON checksum port"
+        );
+        assert!(
+            parpar_neon_checksum::fold(&[0u8; 128], plain.stride, plain.checksum_width).is_none(),
+            "Plain's 2-byte contract has no oracle NEON form — that was the gap"
+        );
+
+        // And it must be the default selection.
+        if std::env::var_os("WEAVER_PAR2_NEON_PACKED").is_none() {
+            assert!(
+                neon_packed_enabled(),
+                "NeonPacked must be default-on when the pin is unset"
+            );
+        }
+    }
+
+    /// The four-lane multiply-by-two must agree with the scalar one on every
+    /// 16-bit value, including the 0x8000 reduction boundary.
+    #[test]
+    fn gf16_mul2_x4_matches_scalar_exhaustively() {
+        for base in (0..=0xFFFFu32).step_by(4) {
+            let lanes: [u16; 4] = [
+                base as u16,
+                (base + 1) as u16,
+                (base + 2) as u16,
+                (base + 3) as u16,
+            ];
+            let mut packed = [0u8; 8];
+            for (i, lane) in lanes.iter().enumerate() {
+                packed[i * 2..i * 2 + 2].copy_from_slice(&lane.to_le_bytes());
+            }
+            let got = gf16_mul2_x4(u64::from_le_bytes(packed)).to_le_bytes();
+            for (i, lane) in lanes.iter().enumerate() {
+                let want = gf16_mul2(*lane).to_le_bytes();
+                assert_eq!(&got[i * 2..i * 2 + 2], &want, "lane {lane:#06x} differs");
+            }
+        }
     }
 
     #[test]

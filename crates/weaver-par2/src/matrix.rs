@@ -359,12 +359,13 @@ impl Matrix {
             let rhs_ptr = rhs.data.as_mut_ptr() as usize;
             let matrix_cols = self.cols;
             let rhs_cols = rhs.cols;
-            // `!cfg!(target_family = "wasm")` const-folds to `true` on native
-            // (the guard is the original expression, byte-identical codegen) and
-            // to `false` on wasm, so the row batches always take the serial
-            // `SIMD_ELIMINATION_ROWS` branch there and `rayon::current_num_threads`
-            // is never evaluated (wasip1 has no worker pool).
-            let row_group = if !cfg!(target_family = "wasm")
+            // `parallel_enabled()` const-folds to `true` on native (the guard is
+            // the original expression, byte-identical codegen). On wasm it is a
+            // cached runtime probe: `false` on single-threaded `wasm32-wasip1`,
+            // so the row batches take the serial `SIMD_ELIMINATION_ROWS` branch
+            // and `rayon::current_num_threads` is never evaluated; `true` on
+            // `wasm32-wasip1-threads`, where rayon has a real worker pool.
+            let row_group = if reedsolomon_rs::threading::parallel_enabled()
                 && n >= PARALLEL_ELIMINATION_THRESHOLD
                 && rayon::current_num_threads() > 1
             {

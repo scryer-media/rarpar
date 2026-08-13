@@ -46,6 +46,41 @@ fn repair_path_components(path: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
     Ok(components)
 }
 
+/// Read into `dst` until it is full or the source ends, returning how many
+/// bytes landed. Short of an error, the only way this returns less than
+/// `dst.len()` is end-of-file.
+///
+/// A single [`Read::read`] is permitted to return fewer bytes than asked for at
+/// any time and on any platform, so "one `read` fills the buffer" is never a
+/// safe assumption. It fails *systematically* under wasmtime on
+/// `wasm32-wasip1-threads`: a guest with shared linear memory cannot have host
+/// bytes written straight into it, so wasmtime's WASI preview1 `fd_read` stages
+/// every transfer through a bounce buffer that it caps at 64 KiB — measured,
+/// a 196,608-byte `read` there returns exactly 65,536 every time, while the
+/// same call on plain `wasm32-wasip1` returns all 196,608. That is legal POSIX
+/// behaviour, not a runtime bug.
+///
+/// It matters here because every [`FileAccess`] consumer reads a short return
+/// as end-of-file: `read_file_slice_into` and `checksum_file_slice_padded` stop
+/// filling at the first short read, and `check_slice_span` marks a whole span
+/// damaged when the fill does not reach the expected length. A truncated read
+/// therefore surfaces as *phantom damage* — the shape that made PAR2 repair
+/// fail on `wasm32-wasip1-threads` while the staged bytes on disk were already
+/// byte-perfect. Looping here keeps every filesystem-backed implementation
+/// honest to the contract its callers already assume, on every target.
+pub(crate) fn read_filled<R: Read + ?Sized>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < dst.len() {
+        match reader.read(&mut dst[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 #[cfg(unix)]
 fn c_component(component: &OsStr) -> io::Result<CString> {
     CString::new(component.as_bytes()).map_err(|_| {
@@ -461,7 +496,7 @@ impl FileAccess for DiskFileAccess {
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len as usize];
-        let n = file.read(&mut buf)?;
+        let n = read_filled(&mut file, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -477,7 +512,7 @@ impl FileAccess for DiskFileAccess {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
-        file.read(dst)
+        read_filled(&mut file, dst)
     }
 
     fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
@@ -588,7 +623,7 @@ impl FileAccess for PlacementFileAccess {
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len as usize];
-        let n = file.read(&mut buf)?;
+        let n = read_filled(&mut file, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -604,7 +639,7 @@ impl FileAccess for PlacementFileAccess {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
-        file.read(dst)
+        read_filled(&mut file, dst)
     }
 
     fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
@@ -1203,6 +1238,79 @@ mod tests {
 
         assert!(!access.file_exists(&file_id));
         assert!(access.read_file(&file_id).is_err());
+    }
+
+    /// A reader that hands back at most `cap` bytes per `read`, the way
+    /// wasmtime's WASI preview1 `fd_read` caps every transfer at 64 KiB for a
+    /// guest with shared linear memory (`wasm32-wasip1-threads`).
+    struct CappedReader<'a> {
+        data: &'a [u8],
+        cap: usize,
+    }
+
+    impl Read for CappedReader<'_> {
+        fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+            let take = dst.len().min(self.cap).min(self.data.len());
+            dst[..take].copy_from_slice(&self.data[..take]);
+            self.data = &self.data[take..];
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn read_filled_fills_across_short_reads() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let mut reader = CappedReader {
+            data: &data,
+            cap: 65_536,
+        };
+        let mut dst = vec![0u8; data.len()];
+
+        let filled = read_filled(&mut reader, &mut dst).unwrap();
+
+        assert_eq!(filled, data.len(), "a capped reader must still fill dst");
+        assert_eq!(dst, data);
+    }
+
+    #[test]
+    fn read_filled_stops_at_end_of_input() {
+        let data = vec![7u8; 100];
+        let mut reader = CappedReader {
+            data: &data,
+            cap: 8,
+        };
+        let mut dst = vec![0u8; 512];
+
+        let filled = read_filled(&mut reader, &mut dst).unwrap();
+
+        assert_eq!(filled, data.len());
+        assert!(dst[data.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    /// A truncated `read_file_range_into` is read as end-of-file by every
+    /// caller in `verify.rs`, so a disk-backed [`FileAccess`] that returns one
+    /// short read reports intact slices as damaged. This is the contract that
+    /// PAR2 repair on `wasm32-wasip1-threads` violated: the host capped each
+    /// `fd_read` at 64 KiB and the staged file — byte-perfect on disk — failed
+    /// its own post-repair readback.
+    #[test]
+    fn disk_access_read_file_range_fills_beyond_one_host_read() {
+        let dir = TempDir::new().unwrap();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (par2_set, file_id) = setup_par2_set(&data, 65_536, "big.dat");
+        std::fs::write(dir.path().join("big.dat"), &data).unwrap();
+
+        let access = DiskFileAccess::new(dir.path().to_path_buf(), &par2_set);
+
+        let mut dst = vec![0u8; data.len()];
+        let read = access.read_file_range_into(&file_id, 0, &mut dst).unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(dst, data);
+
+        let owned = access
+            .read_file_range(&file_id, 0, data.len() as u64)
+            .unwrap();
+        assert_eq!(owned, data);
     }
 
     #[test]

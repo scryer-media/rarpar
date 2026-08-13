@@ -12,6 +12,12 @@ mod output;
 mod plan;
 
 pub use encode::ForwardKernel;
+/// The process-stable worker width, under a name that says why the repairer
+/// wants it: sizing rayon's global pool on wasm (see
+/// [`reedsolomon_rs::threading::ensure_pool`]). Repair has no width knob of its
+/// own, and this value is already the crate's single embedder-supplied answer
+/// to "how wide is the host", so both sides agree by construction.
+pub(crate) use encode::configured_create_threads as configured_create_threads_for_pool;
 pub use options::{BlockSizing, CreationBackend, Par2CreatorOptions, RecoveryAmount, VolumeScheme};
 pub use output::Par2CreateOutcome;
 pub use plan::{Par2CreatePlan, Par2MemoryPlan};
@@ -50,6 +56,14 @@ impl Par2Creator {
         if self.options.cancellation.is_cancelled() {
             return Err(Par2Error::Cancelled);
         }
+        // No-op on native (rayon's default sizing is already right). On
+        // `wasm32-wasip1-threads` this is what actually gives the banded
+        // accumulation, parallel source hashing, and parallel volume
+        // validation a pool wider than one worker — the guest cannot read the
+        // host core count, so the width comes from the same process-stable
+        // value the band shape uses. Placed on the execution entry point, never
+        // on `plan()`, so plan-only callers still never spawn a pool.
+        reedsolomon_rs::threading::ensure_pool(self::encode::configured_create_threads);
         plan.validate_integrity()?;
         self::plan::validate_output_targets(
             &plan.output_paths,

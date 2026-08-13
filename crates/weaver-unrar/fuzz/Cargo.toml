@@ -1,0 +1,22 @@
+[package]
+name = "unrar-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+unrar-rs = { path = "..", default-features = false, features = ["crypto-rust"] }
+
+[[bin]]
+name = "rar_headers"
+path = "fuzz_targets/rar_headers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []

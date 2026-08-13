@@ -1,0 +1,355 @@
+# rarpar benchmark fleet — example configuration.
+#
+# Copy to bench/fleet.toml (gitignored) and replace every value. The real file
+# names private hosts and key locations, so it must never be committed.
+#
+#   cp bench/fleet.example.toml bench/fleet.toml
+#   $EDITOR bench/fleet.toml
+#   rarpar-bench fleet plan --config bench/fleet.toml     # dry run, no side effects
+#   rarpar-bench fleet run  --config bench/fleet.toml     # the whole round
+#
+# SECRETS: this file holds no secrets, ever. Authentication is either a path to
+# a private key (auth = "key") or a path to an askpass helper that reads the
+# secret from the operator's own environment at call time (auth = "askpass").
+# A `password`, `secret`, or `token` key here is rejected by config validation.
+#
+# TOML subset: comments, [tables], [[arrays of tables]], strings, integers,
+# floats, booleans, and single-line arrays. Inline tables ({...}), multi-line
+# strings, and multi-line arrays are rejected rather than mis-parsed.
+
+schema_version = 1
+
+# ---------------------------------------------------------------- fleet-wide --
+[fleet]
+# Where run directories are created. One directory per run id; charts, evidence,
+# summaries, and run state all live under it. Never inside the repository.
+results_root = "/Users/example/bench/fleet-results"
+# Run ids are "<prefix>-<UTC timestamp>".
+run_id_prefix = "fleet"
+# Optional: where bundles are assembled and where verified oracle artifacts are
+# cached between runs. Each bundle directory is rebuilt from scratch every run
+# (a stale binary would otherwise be shipped and measured); the oracle artifact
+# cache beside it is reused and re-verified. Defaults to <run dir>/bundles.
+bundle_cache = "/Users/example/bench/fleet-bundles"
+# Source trees. rarpar_path defaults to the current directory. weaver_path and
+# rapidyenc_path are only needed for the yenc-micro and crc-probe suites.
+rarpar_path = "/Users/example/dev/rarpar"
+weaver_path = "/Users/example/dev/weaver"
+rapidyenc_path = "/Users/example/dev/rapidyenc"
+docker = "docker"
+# How often a host is asked whether it has written its DONE sentinel.
+poll_seconds = 20
+# Hard cap per host. A host past this is abandoned (and, if it is a cloud host,
+# terminated); other hosts keep going.
+host_timeout_minutes = 240
+
+[fleet.defaults]
+# The standard protocol. Individual machines may override warmups/repeats.
+warmups = 1
+repeats = 7
+lane = "cpu"                      # cpu | metal | docker-cpu
+par2_placement = "canonical"      # canonical | smart (never compare the two)
+seed = "rarpar-benchmark-plan-v1"
+# Quiet-load gate, applied before every timed pass. Two independent checks:
+# a process-name check (another operator's bench mid-flight) and loadavg
+# (background housekeeping that owns no matching name).
+quiet_load_threshold = 0.5
+quiet_load_poll_seconds = 30
+# After this long above the threshold the gate proceeds anyway and says so, so a
+# host with a permanently non-zero idle baseline still produces evidence.
+quiet_load_timeout_seconds = 900
+quiet_load_process_names = ["rarpar-bench", "rarpar", "par2", "unrar", "decode_timing", "searchend_timing", "crc_probe"]
+# Perf diagnostic pass defaults.
+perf_stat_repeats = 3
+perf_record_frequency = 499
+
+[fleet.aws]
+cli = "aws"
+# Pinning the account is a guard, not decoration: the run refuses to launch if
+# the ambient credentials belong to a different account.
+account = "000000000000"
+region = "us-east-1"
+# Name of an ENVIRONMENT VARIABLE holding the profile to use. Never a secret,
+# and never the credentials themselves.
+profile_env = "RARPAR_FLEET_AWS_PROFILE"
+# The whole parallel launch is checked against this before anything is created.
+total_vcpu_quota = 64
+# Every ephemeral resource carries this prefix, which is also what
+# `fleet teardown` sweeps for.
+resource_prefix = "rarpar-fleet"
+# The session security group allows SSH from this machine's public address only.
+# Discovery is DNS-based because HTTP echo services are blocked on this network;
+# if none of these commands returns an IPv4, the run refuses to open a group.
+public_ip_lookup = ["dig +short -4 txt ch whoami.cloudflare @1.0.0.1", "dig +short -4 myip.opendns.com @resolver1.opendns.com"]
+ssh_ingress_port = 22
+# Ceiling for any single machine's ec2.max_hours.
+max_session_hours = 3
+
+[fleet.render]
+enabled = true
+
+# ------------------------------------------------- machine: key-auth Linux ----
+# A normal Linux box reachable by key. This one has perf, so it contributes the
+# full diagnostic pass.
+[[machines]]
+name = "linux-avx2"
+kind = "local-ssh"                       # local-ssh | aws-ec2
+# The platform label names the SVGs and the report's machine label. It must be
+# unique across the fleet or one machine's charts overwrite another's.
+platform_label = "linux-x86_64-adl-avx2"
+build_target = "x86_64-unknown-linux-musl"
+enabled = true
+suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
+
+[machines.connection]
+# Always an explicit address, user, and port. ssh_config aliases are refused:
+# an alias resolving to the wrong user has mis-authenticated a whole round.
+host = "192.0.2.10"
+port = 22
+user = "bench"
+auth = "key"                             # key | askpass
+key_path = "~/.ssh/rarpar-bench-linux"
+shell = "sh"                             # sh | bash | powershell
+ssh_options = ["-o", "ConnectTimeout=20"]
+
+[machines.capabilities]
+perf = "linux-perf"                      # linux-perf | samply | none
+docker = true
+no_pgrep = false
+
+[machines.paths]
+staging = "/home/bench/fleet-stage"
+# Timed passes stage here. A tmpfs keeps disk out of the measurement.
+scratch = "/dev/shm/fleet"
+corpus = "/home/bench/bench/corpus"
+cleanup = true
+
+[machines.bundle]
+source = "docker"                        # docker | prebuilt
+image = "docker.io/library/rust:1.97-alpine"
+# Only "local" is implemented today. A remote build host is accepted by the
+# schema and refused at build time with guidance: build the bundle on that host
+# yourself and point bundle.source = "prebuilt" at the result.
+build_host = "local"
+rust_target = "x86_64-unknown-linux-musl"
+go_os = "linux"
+go_arch = "amd64"
+goamd64 = "v2"
+crt_static = true
+
+# Oracles. Policy is host-path | official-binary | source-build.
+# Standing rule: never build an oracle where an official binary exists.
+[machines.oracles.rar]
+policy = "official-binary"
+url = "https://example.invalid/unrar-7.2.3-linux-amd64.tar.gz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+archive_member = "unrar"
+version = "unrar 7.2.3"
+
+[machines.oracles.par2]
+policy = "official-binary"
+url = "https://example.invalid/par2cmdline-turbo-1.4.0-linux-amd64.zip"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+archive_member = "par2"
+version = "par2cmdline-turbo 1.4.0"
+
+[machines.run]
+warmups = 1
+repeats = 7
+# A discarded warmup pass before the timed repeats faults the corpus into page
+# cache, so repeat 1 is not measuring cold I/O.
+warmup_pass = true
+# Optional: restrict the macro suites to specific corpus case ids.
+# cases = ["rar5-v7-normal-single", "par2-verify"]
+quiet_load_threshold = 0.5
+# Nominal clock for the crc-probe cycles/byte column.
+ghz = 4.4
+
+[machines.perf]
+# perf record runs only on these heavy cases: a sampled profile of everything
+# would perturb the very work being profiled.
+record_cases = ["par2-generate-rar5-v7-volumes", "rar5-v7-solid-multivolume"]
+stat_repeats = 3
+record_frequency = 499
+
+# ------------------------------------- machine: appliance NAS, askpass auth ----
+# A DSM-class appliance: password auth through an askpass helper, no perf, no
+# pgrep, sftp disabled (every transfer here is tar-over-ssh anyway).
+[[machines]]
+name = "nas-atom"
+kind = "local-ssh"
+platform_label = "linux-atom-c3538-noavx"
+build_target = "x86_64-unknown-linux-musl"
+enabled = true
+suites = ["crc-probe", "macro-rar", "macro-par2"]
+
+[machines.connection]
+host = "198.51.100.20"
+port = 2222
+user = "bench"
+auth = "askpass"
+# The helper reads the secret from the operator's own environment at call time.
+# The fleet never sees, stores, or logs the value.
+askpass_script = "/Users/example/bin/nas-askpass.sh"
+shell = "sh"
+
+[machines.capabilities]
+perf = "none"
+docker = false
+# busybox userland: the load gate falls back to `ps -ef | grep`, because a
+# missing pgrep silently makes every gate pass.
+no_pgrep = true
+
+[machines.paths]
+staging = "/var/services/homes/bench/fleet-stage"
+scratch = "/dev/shm/fleet"
+corpus = "/var/services/homes/bench/bench/fixtures/corpus"
+cleanup = true
+
+[machines.bundle]
+# The bundle for this class is built elsewhere and staged from a local
+# directory; the appliance has no toolchain of its own.
+source = "prebuilt"
+path = "/Users/example/bench/fleet-bundles/linux-x86_64-musl"
+
+[machines.oracles.rar]
+policy = "host-path"
+path = "/var/services/homes/bench/bench/bin/unrar-7.2.3-linux-amd64"
+binary_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+version = "unrar 7.2.3"
+
+[machines.oracles.par2]
+policy = "host-path"
+path = "/var/services/homes/bench/bench/bin/par2cmdline-turbo-1.4.0-linux-amd64"
+version = "par2cmdline-turbo 1.4.0"
+
+[machines.run]
+warmups = 1
+repeats = 7
+# This box has a non-zero idle baseline; gate on its real noise floor.
+quiet_load_threshold = 0.7
+ghz = 2.1
+
+# ---------------------------------------------------- machine: EC2 arm64 ------
+[[machines]]
+name = "ec2-graviton4"
+kind = "aws-ec2"
+platform_label = "linux-arm64-v2"
+build_target = "aarch64-unknown-linux-musl"
+enabled = true
+suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
+
+[machines.connection]
+# host is filled in from the launched instance; only the login user matters.
+user = "ubuntu"
+port = 22
+auth = "key"                             # always the ephemeral session keypair
+shell = "sh"
+
+[machines.capabilities]
+perf = "linux-perf"
+docker = false
+
+[machines.paths]
+staging = "/home/ubuntu/fleet-stage"
+scratch = "/dev/shm/fleet"
+corpus = "/home/ubuntu/corpus"
+cleanup = false                          # the whole instance is destroyed anyway
+
+[machines.bundle]
+source = "docker"
+image = "docker.io/library/rust:1.97-alpine"
+build_host = "local"                     # native aarch64 container on an Apple Silicon Mac
+rust_target = "aarch64-unknown-linux-musl"
+go_os = "linux"
+go_arch = "arm64"
+crt_static = true
+
+[machines.oracles.par2]
+policy = "official-binary"
+url = "https://example.invalid/par2cmdline-turbo-1.4.0-linux-arm64.zip"
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+archive_member = "par2"
+version = "par2cmdline-turbo 1.4.0"
+
+[machines.oracles.rar]
+# The only sanctioned source build: RARLAB publishes no linux-arm binary.
+# The recipe is audited and portable — stock makefile, stock CXXFLAGS, only CXX
+# and a static link set, and NO -march/-mcpu/-mtune anywhere. The build refuses
+# to proceed if the stock makefile has acquired a target-cpu flag.
+policy = "source-build"
+reason = "RARLAB publishes no official linux-arm64 UnRAR binary; recorded amendment"
+url = "https://example.invalid/unrarsrc-7.2.3.tar.gz"
+sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+recipe = "unrar-portable"
+binary_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
+version = "unrar 7.2.3 (portable source build)"
+
+[machines.run]
+warmups = 1
+repeats = 7
+ghz = 2.8
+
+[machines.perf]
+record_cases = ["par2-generate-rar5-v7-volumes"]
+stat_repeats = 3
+record_frequency = 499
+
+[machines.ec2]
+instance_type = "c8g.xlarge"
+region = "us-east-1"
+ami = "ami-00000000000000000"
+# Checked against describe-instance-types during preflight: a wrong number here
+# would make the quota arithmetic dishonest.
+vcpus = 4
+volume_gb = 30
+# subnet = "subnet-00000000000000000"    # optional; default subnet when unset
+# Deadman shutdown inside the instance, paired with terminate-on-shutdown. It is
+# the backstop and must be at least max_hours*60, so the cost cap fires first.
+deadman_minutes = 180
+max_hours = 2.0
+hourly_usd = 0.1440
+corpus_source = "generated-on-boot"
+
+# ------------------------------------------------- machine: Windows (dGPU) ----
+# UNVALIDATED PATH. The runner uploads and executes a .ps1 file (never an inline
+# PowerShell command string) and perf is unavailable. Treat the first run on a
+# Windows host as bring-up, not evidence.
+[[machines]]
+name = "win-dgpu"
+kind = "local-ssh"
+platform_label = "windows-x86_64-zen4"
+build_target = "x86_64-pc-windows-msvc"
+enabled = false
+suites = ["crc-probe", "macro-rar"]
+
+[machines.connection]
+host = "203.0.113.30"
+port = 22
+user = "bench"
+auth = "key"
+key_path = "~/.ssh/rarpar-bench-windows"
+shell = "powershell"
+
+[machines.capabilities]
+perf = "none"                            # enforced: Windows has no perf collector
+docker = false
+
+[machines.paths]
+staging = "C:\\bench\\fleet-stage"
+scratch = "C:\\bench\\work"
+corpus = "C:\\bench\\corpus"
+cleanup = true
+
+[machines.bundle]
+source = "prebuilt"
+path = "/Users/example/bench/fleet-bundles/windows-x86_64"
+
+[machines.oracles.rar]
+policy = "host-path"
+path = "C:\\bench\\oracles\\UnRAR.exe"
+version = "unrar 7.2.3"
+
+[machines.run]
+warmups = 1
+repeats = 7

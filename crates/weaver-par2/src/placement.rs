@@ -370,7 +370,9 @@ fn read_first_n_bytes(path: &Path, n: usize) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut buf = vec![0u8; n];
-    let bytes_read = file.read(&mut buf)?;
+    // Fill, don't single-read: a short read here would silently hash fewer
+    // bytes than the 16k quick hash is defined over. See `disk::read_filled`.
+    let bytes_read = crate::disk::read_filled(&mut file, &mut buf)?;
     crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, bytes_read as u64);
     buf.truncate(bytes_read);
     Ok(buf)

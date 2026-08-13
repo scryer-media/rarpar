@@ -47,9 +47,15 @@ const _: () = assert!(STAGING_AREA_COUNT == 2);
 pub(crate) fn configured_create_threads() -> usize {
     static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
-        // wasm never has a worker pool; keep rayon machinery untouched there
-        // (same convention as the matrix/repairer guards).
-        if cfg!(target_family = "wasm") {
+        // Single-threaded wasm (`wasm32-wasip1`) has no worker pool at all;
+        // keep rayon machinery untouched there, exactly as before. On
+        // `wasm32-wasip1-threads` the probe reports `true` and the normal
+        // resolution below applies — including `WEAVER_PAR2_CREATE_THREADS`,
+        // which is how an embedder states the host width, because
+        // `available_parallelism()` answers `Ok(1)` under wasi (the guest
+        // cannot see the host's core count) and would otherwise pin the
+        // banding to 1 on a perfectly capable threaded runtime.
+        if !reedsolomon_rs::threading::parallel_enabled() {
             return 1;
         }
         std::env::var("WEAVER_PAR2_CREATE_THREADS")

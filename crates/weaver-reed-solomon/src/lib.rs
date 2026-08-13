@@ -56,6 +56,7 @@ pub mod matrix_tiled;
 pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;
+pub mod threading;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_gf16;
 /// JIT-generated bit-plane XOR GF(2^16) multiply for pre-GFNI x86.

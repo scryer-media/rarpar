@@ -593,6 +593,20 @@ pub(crate) enum FileIdentity {
     },
     #[cfg(windows)]
     Windows { volume: u32, index: u64 },
+    // wasip1 is not `unix`, and `std::os::wasi::fs::MetadataExt` (the stdlib
+    // route to `dev`/`ino`) is still unstable behind `wasi_ext`, which this
+    // crate's pinned stable toolchain cannot use. Without an identity the
+    // publish step hard-errors with "staged output identity is unavailable",
+    // which is what made PAR2 creation impossible on wasm. `libc` — already a
+    // dependency — exposes `stat` on wasip1 and reports both fields, so the
+    // same (device, inode) guarantee holds here. wasi's `filestat` has no
+    // birth time, so `birth` is the documented degraded `None` case.
+    #[cfg(target_os = "wasi")]
+    Wasi {
+        device: u64,
+        inode: u64,
+        birth: Option<std::time::SystemTime>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,6 +652,32 @@ unsafe extern "system" {
 }
 
 impl FileIdentity {
+    /// wasip1 identity via `libc::lstat`, mirroring the `unix` arm's
+    /// `symlink_metadata` (lstat) semantics so a symlink is never followed.
+    ///
+    /// The caller has already established through `symlink_metadata` that the
+    /// path is a regular file; this second call only retrieves the two fields
+    /// stable Rust will not hand over on this target.
+    #[cfg(target_os = "wasi")]
+    fn from_wasi_path(path: &Path, metadata: &fs::Metadata) -> Option<Self> {
+        let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        // SAFETY: `raw` is a valid NUL-terminated C string that outlives the
+        // call, and `stat` is zero-initialized POD that `lstat` fully writes on
+        // success. Failure is handled by returning `None`.
+        let stat = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::lstat(raw.as_ptr(), &mut stat) != 0 {
+                return None;
+            }
+            stat
+        };
+        Some(Self::Wasi {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            birth: metadata.created().ok(),
+        })
+    }
+
     #[cfg(unix)]
     fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -812,10 +852,12 @@ impl StagedOutputs {
     ) -> Result<()> {
         // Volumes validate independently; running them in parallel overlaps
         // their fsyncs and re-read hashing, which dominates on network
-        // storage. The sequential arm keeps the wasm / pinned-single-thread
-        // behavior, and errors surface first-by-volume-order in both arms
+        // storage. The sequential arm keeps the single-threaded-wasm /
+        // pinned-single-thread behavior (`wasm32-wasip1-threads` probes `true`
+        // and validates in parallel like native), and errors surface
+        // first-by-volume-order in both arms
         // (rayon's own Result collection would report an arbitrary racer).
-        let validate_parallel = !cfg!(target_family = "wasm")
+        let validate_parallel = reedsolomon_rs::threading::parallel_enabled()
             && self.volumes.len() > 1
             && super::encode::configured_create_threads() != 1;
         if !validate_parallel {
@@ -1685,7 +1727,11 @@ fn target_file_identity(path: &Path) -> std::io::Result<Option<FileIdentity>> {
             Err(error) => Err(error),
         }
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(target_os = "wasi")]
+    {
+        Ok(FileIdentity::from_wasi_path(path, &metadata))
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
         let _ = path;
         Ok(None)
@@ -1832,8 +1878,14 @@ fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let target = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // Raw syscall rather than `libc::renameat2`: the libc crate declares the
+    // wrapper only for the gnu flavor, so the wrapper breaks musl builds
+    // (bitten twice by static bench bundles). `SYS_renameat2` is declared for
+    // both; the kernel call is identical (Linux 3.15+), and the existing
+    // ENOSYS/EINVAL fallback path continues to cover older kernels.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
@@ -1968,6 +2020,37 @@ fn publish_no_replace_with_tracking_hooks<F: FnOnce(), G: FnOnce()>(
     Ok(stage_identity)
 }
 
+/// A per-process token that keeps transaction scratch names distinct between
+/// concurrent creators writing into the same directory.
+///
+/// Native keeps `std::process::id()` exactly as before — same value, same
+/// filenames, no behavior change. wasm has no process ids: `std::process::id()`
+/// is `unsupported` there and **panics** ("no pids on this platform"), which
+/// made PAR2 creation abort on `wasm32-wasip1` the moment it tried to stage an
+/// output. A process-lifetime token derived once from the startup clock stands
+/// in.
+///
+/// Uniqueness never rested on this value alone in either case: the generated
+/// name also carries a nanosecond stamp, the output index, and an attempt
+/// counter, and the file/directory is created with `create_new` (or a failing
+/// `create_dir`), so a collision retries the loop instead of clobbering.
+fn process_token() -> u32 {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::process::id()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        static TOKEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *TOKEN.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.subsec_nanos())
+                .unwrap_or(0)
+        })
+    }
+}
+
 fn create_stage_file(target: &Path, index: usize) -> Result<(PathBuf, File)> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let stamp = SystemTime::now()
@@ -1977,7 +2060,7 @@ fn create_stage_file(target: &Path, index: usize) -> Result<(PathBuf, File)> {
     for attempt in 0..100u32 {
         let name = format!(
             ".par2-create-{}-{stamp}-{index}-{attempt}.tmp",
-            std::process::id()
+            process_token()
         );
         let path = parent.join(name);
         // Existing stage files are never reused; create_new makes crash
@@ -2025,7 +2108,7 @@ fn reserve_private_namespace(
     for attempt in 0..100u32 {
         let namespace = parent.join(format!(
             ".par2-create-{kind}-{}-{stamp}-{index}-{attempt}.tmp",
-            std::process::id()
+            process_token()
         ));
         match create_private_directory(&namespace) {
             Ok(()) => return Ok((namespace.clone(), namespace.join(target_name))),

@@ -15,9 +15,126 @@ use crate::error::{RarError, RarResult};
 // dictionary window; additional multi-megabyte input staging is pure overhead.
 const STREAMING_INPUT_BUFFER_SIZE: usize = 0x80000;
 
+/// Readable bytes a leased span keeps in reserve past its border.
+///
+/// UnRAR keeps its whole input in one buffer and refills it from the outer
+/// unpack loop, once per symbol, against `ReadBorder = ReadTop - 30`
+/// (unpack30.cpp:517). The 30 bytes of slack are what let `getbits()` be a
+/// plain unaligned load with no bounds test of its own.
+///
+/// The same idea, sized for this crate's cursor: a RAR4 symbol consumes at
+/// most 64 bits (15 length code + 5 length extra + 15 distance code + 14
+/// distance extra + 15 low-distance code), so a symbol started at the border
+/// ends at most 8 bytes past it, and the widest load any cursor operation
+/// makes from there is 8 more (`cursor_refill`). 32 covers both with margin,
+/// which is why no operation inside a leased span needs a length check.
+pub const LZ_SPAN_SLACK_BYTES: usize = 32;
+
+/// A contiguous run of input lent to a register-resident decode loop.
+///
+/// This is the rarpar shape of UnRAR's `InBuf`/`InAddr`/`ReadBorder` trio: a
+/// plain byte buffer, a bit offset to resume at, and a border the loop must
+/// stop at so every read inside it is unconditionally in bounds. The loop owns
+/// a [`BitCursor`](super::block_reader::BitCursor) over `data` for the duration
+/// and hands back the bit offset it stopped at; the reader is not touched in
+/// between, so none of its fields have to be re-loaded per symbol.
+#[doc(hidden)]
+pub struct LzSpan<'a> {
+    /// Input bytes. Bit `n` is bit `n % 8` (MSB-first) of `data[n / 8]`.
+    pub data: &'a [u8],
+    /// Bit offset in `data` where decoding resumes.
+    pub start_bit: usize,
+    /// Bit offset at or past which the loop must stop and re-lease.
+    ///
+    /// Always at least [`LZ_SPAN_SLACK_BYTES`] before the end of `data`.
+    pub border_bit: usize,
+}
+
+/// Knobs that let this crate's own tests drive one input through both decode
+/// paths and move the lease boundary to where it can be observed.
+///
+/// Everything here is `cfg(test)`, so no shipped build carries the checks, and
+/// every switch is thread-local, so tests running in parallel cannot disturb
+/// each other. Each setter restores the previous value on unwind.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PER_SYMBOL_ONLY: Cell<bool> = const { Cell::new(false) };
+        static FILL_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Restores a thread-local switch when the scope ends, panic or not.
+    struct Restore<T: Copy + 'static> {
+        slot: &'static std::thread::LocalKey<Cell<T>>,
+        previous: T,
+    }
+
+    impl<T: Copy + 'static> Drop for Restore<T> {
+        fn drop(&mut self) {
+            self.slot.with(|cell| cell.set(self.previous));
+        }
+    }
+
+    /// Run `body` with every reader declining to lend a span, so the retained
+    /// per-symbol path decodes the whole stream.
+    pub(crate) fn without_lz_span<T>(body: impl FnOnce() -> T) -> T {
+        let _restore = Restore {
+            slot: &PER_SYMBOL_ONLY,
+            previous: PER_SYMBOL_ONLY.with(Cell::get),
+        };
+        PER_SYMBOL_ONLY.with(|cell| cell.set(true));
+        body()
+    }
+
+    /// Run `body` with [`super::StreamingBitReader`] reading at most `bytes`
+    /// per fill.
+    ///
+    /// A production fill is 512 KiB, so the span border — and with it the
+    /// handover to the per-symbol path, the commit arithmetic and the
+    /// accumulator-straddling-two-fills case — is reached once per member.
+    /// Capping the fill makes all three recur every `bytes` instead.
+    pub(crate) fn with_fill_cap<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
+        let _restore = Restore {
+            slot: &FILL_CAP,
+            previous: FILL_CAP.with(Cell::get),
+        };
+        FILL_CAP.with(|cell| cell.set(Some(bytes)));
+        body()
+    }
+
+    pub(super) fn per_symbol_only() -> bool {
+        PER_SYMBOL_ONLY.with(Cell::get)
+    }
+
+    pub(super) fn fill_cap() -> Option<usize> {
+        FILL_CAP.with(Cell::get)
+    }
+}
+
 pub trait BitRead {
     fn bits_remaining(&mut self) -> usize;
     fn has_bits(&mut self) -> bool;
+
+    /// Lend the decode loop a contiguous span of buffered input.
+    ///
+    /// `f` receives the span and returns the bit offset in `data` it stopped
+    /// at; the reader then re-establishes its own cursor there. Readers that
+    /// cannot expose a large enough contiguous span — a short buffer, or an
+    /// accumulator still holding bits from a previous fill — return `None` and
+    /// the caller falls back to its per-symbol path.
+    ///
+    /// The default is `None`, so a reader opts in only if it can honour the
+    /// slack contract described on [`LZ_SPAN_SLACK_BYTES`].
+    #[doc(hidden)]
+    fn lease_lz_span<T>(
+        &mut self,
+        f: impl FnOnce(&LzSpan<'_>) -> (usize, T),
+    ) -> RarResult<Option<T>> {
+        let _ = f;
+        Ok(None)
+    }
     fn has_exact_bits(&mut self, bits: usize) -> RarResult<bool>;
     fn position(&self) -> usize;
     fn byte_position(&self) -> usize {
@@ -476,6 +593,30 @@ impl<'a> BitReader<'a> {
         Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
     }
 
+    /// Re-establish the accumulator at bit offset `position` of the source.
+    ///
+    /// The inverse of the `byte_pos * 8 == position() + acc_bits` invariant a
+    /// leased span reads: drop the accumulator, put `byte_pos` on the byte
+    /// holding `position`, then reload and discard the sub-byte remainder.
+    ///
+    /// Callers only commit positions inside a leased span, which end at least
+    /// [`LZ_SPAN_SLACK_BYTES`] minus one symbol before the source end, so the
+    /// reload here always takes `refill`'s bulk path.
+    #[inline]
+    fn seek_to_bit(&mut self, position: usize) {
+        self.byte_pos = position >> 3;
+        self.acc = 0;
+        self.acc_bits = 0;
+        let offset = (position & 7) as u8;
+        if offset != 0 {
+            self.refill();
+            debug_assert!(self.acc_bits >= offset);
+            self.acc <<= offset;
+            self.acc_bits -= offset;
+        }
+        debug_assert_eq!(self.position(), position);
+    }
+
     /// Return the remaining unconsumed bytes (aligned to next byte boundary).
     ///
     /// If the reader is mid-byte, the partial byte is skipped.
@@ -506,6 +647,33 @@ impl BitRead for BitReader<'_> {
 
     fn has_bits(&mut self) -> bool {
         BitReader::has_bits(self)
+    }
+
+    fn lease_lz_span<T>(
+        &mut self,
+        f: impl FnOnce(&LzSpan<'_>) -> (usize, T),
+    ) -> RarResult<Option<T>> {
+        #[cfg(test)]
+        if test_hooks::per_symbol_only() {
+            return Ok(None);
+        }
+        let Some(border_bytes) = self.data.len().checked_sub(LZ_SPAN_SLACK_BYTES) else {
+            return Ok(None);
+        };
+        let border_bit = border_bytes * 8;
+        let start_bit = BitReader::position(self);
+        if start_bit >= border_bit {
+            return Ok(None);
+        }
+
+        let (end_bit, value) = f(&LzSpan {
+            data: self.data,
+            start_bit,
+            border_bit,
+        });
+        debug_assert!((start_bit..=self.data.len() * 8).contains(&end_bit));
+        self.seek_to_bit(end_bit);
+        Ok(Some(value))
     }
 
     fn has_exact_bits(&mut self, bits: usize) -> RarResult<bool> {
@@ -624,13 +792,35 @@ impl<R: Read> StreamingBitReader<R> {
         self.buf
     }
 
+    /// Bytes a single fill may read. Always the whole buffer outside tests.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn fill_limit(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Test build: honour [`test_hooks::with_fill_cap`], clamped to a usable
+    /// range so a capped fill still makes progress and never reads past the
+    /// buffer.
+    #[cfg(test)]
+    #[inline]
+    fn fill_limit(&self) -> usize {
+        test_hooks::fill_cap()
+            .unwrap_or(self.buf.len())
+            .clamp(1, self.buf.len())
+    }
+
     #[inline]
     fn fill_buffer(&mut self) -> RarResult<()> {
         if self.buf_pos < self.buf_len || self.eof {
             return Ok(());
         }
 
-        let n = self.inner.read(&mut self.buf).map_err(RarError::Io)?;
+        let limit = self.fill_limit();
+        let n = self
+            .inner
+            .read(&mut self.buf[..limit])
+            .map_err(RarError::Io)?;
         self.buf_pos = 0;
         self.buf_len = n;
         if n == 0 {
@@ -708,6 +898,50 @@ impl<R: Read> StreamingBitReader<R> {
         let result = self.peek_bits(count)?;
         self.consume_bits(count)?;
         Ok(result)
+    }
+
+    /// Bit offset inside the current buffer fill that the cursor sits at.
+    ///
+    /// `refill`/`refill_slow` only ever credit whole bytes of `buf` to the
+    /// accumulator, so `buf_pos * 8` counts every bit of this fill that has
+    /// been loaded, consumed or not — making `buf_pos * 8 - acc_bits` the
+    /// unconsumed position.
+    ///
+    /// The one case where that does not hold is an accumulator straddling two
+    /// fills: `refill_slow` can top up across a `fill_buffer`, which resets
+    /// `buf_pos` to zero while the accumulator still holds bits of the
+    /// previous fill. Those bits are the oldest in the accumulator, so they
+    /// are consumed first and the invariant restores itself within one
+    /// symbol; until then `buf_pos * 8 < acc_bits` and this returns `None`.
+    #[inline]
+    fn buffer_bit_position(&self) -> Option<usize> {
+        (self.buf_pos * 8).checked_sub(self.acc_bits as usize)
+    }
+
+    /// Re-establish the accumulator at bit offset `position` of the buffer.
+    ///
+    /// The inverse of [`Self::buffer_bit_position`], and the same argument as
+    /// [`BitReader::seek_to_bit`]: committed positions always leave at least
+    /// [`LZ_SPAN_SLACK_BYTES`] minus one symbol of buffer behind them, so the
+    /// reload takes `refill`'s bulk path and never reaches `fill_buffer`.
+    #[inline]
+    fn seek_to_buffer_bit(&mut self, position: usize) -> RarResult<()> {
+        self.buf_pos = position >> 3;
+        self.acc = 0;
+        self.acc_bits = 0;
+        let offset = (position & 7) as u8;
+        if offset != 0 {
+            self.refill()?;
+            if self.acc_bits < offset {
+                return Err(RarError::CorruptArchive {
+                    detail: "bitstream: truncated span commit".into(),
+                });
+            }
+            self.acc <<= offset;
+            self.acc_bits -= offset;
+        }
+        debug_assert_eq!(self.buffer_bit_position(), Some(position));
+        Ok(())
     }
 
     #[inline(always)]
@@ -796,6 +1030,36 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         }
 
         self.fill_buffer().is_ok() && self.buf_pos < self.buf_len
+    }
+
+    fn lease_lz_span<T>(
+        &mut self,
+        f: impl FnOnce(&LzSpan<'_>) -> (usize, T),
+    ) -> RarResult<Option<T>> {
+        #[cfg(test)]
+        if test_hooks::per_symbol_only() {
+            return Ok(None);
+        }
+        let Some(border_bytes) = self.buf_len.checked_sub(LZ_SPAN_SLACK_BYTES) else {
+            return Ok(None);
+        };
+        let border_bit = border_bytes * 8;
+        let Some(start_bit) = self.buffer_bit_position() else {
+            return Ok(None);
+        };
+        if start_bit >= border_bit {
+            return Ok(None);
+        }
+
+        let (end_bit, value) = f(&LzSpan {
+            data: &self.buf[..self.buf_len],
+            start_bit,
+            border_bit,
+        });
+        debug_assert!((start_bit..=self.buf_len * 8).contains(&end_bit));
+        self.bit_pos += end_bit - start_bit;
+        self.seek_to_buffer_bit(end_bit)?;
+        Ok(Some(value))
     }
 
     fn has_exact_bits(&mut self, bits: usize) -> RarResult<bool> {

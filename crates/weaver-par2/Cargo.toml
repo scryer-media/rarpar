@@ -7,7 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-exclude = ["tests/fixtures/**"]
+exclude = ["tests/fixtures/**", "fuzz/**"]
 
 [features]
 default = ["native-crypto"]

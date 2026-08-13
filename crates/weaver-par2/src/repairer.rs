@@ -636,6 +636,12 @@ impl Par2Repairer {
         &self,
         want_carry: bool,
     ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
+        // No-op on native. On `wasm32-wasip1-threads` this is what lets the
+        // scan fan-out, the GF elimination, and the streamed repair
+        // controller's `rayon::current_num_threads()` worker sizing see more
+        // than one worker; the width comes from the same process-stable
+        // embedder-supplied value creation uses.
+        reedsolomon_rs::threading::ensure_pool(crate::create::configured_create_threads_for_pool);
         match self.verify_or_repair_pass(want_carry)? {
             RepairPassResult::Success(success) => self.finish_or_retry(success, want_carry),
             RepairPassResult::PostRepairVerificationFailed { reason, carry } => {
@@ -1517,11 +1523,18 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                         let file = self.source_files.get(path).ok_or_else(|| {
                             io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
                         })?;
-                        let read = read_file_at(file, &mut dst[..len], read_offset)
+                        // `read_exact_file_at`, not a bare `read_file_at` plus a
+                        // length check: a positional read may legally come back
+                        // short, and `fd_pread` under wasmtime always does above
+                        // 64 KiB (on *both* wasm targets — see
+                        // `disk::read_filled`). Treating that as a changed source
+                        // would abort reconstruction on any set whose slice size
+                        // exceeds the host's cap. The loop keeps the same
+                        // "anything less than a full fill is a changed source"
+                        // outcome for a genuinely truncated file.
+                        read_exact_file_at(file, &mut dst[..len], read_offset)
                             .map_err(|_| source_changed_io(path))?;
-                        if read != len {
-                            return Err(source_changed_io(path));
-                        }
+                        let read = len;
                         let file_len = file
                             .metadata()
                             .ok()
@@ -1554,7 +1567,7 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
-        let read = file.read(dst)?;
+        let read = crate::disk::read_filled(&mut file, dst)?;
         crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read as u64);
         Ok(read)
     }
@@ -1624,7 +1637,34 @@ fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
     file.seek_write(src, offset)
 }
 
-#[cfg(not(any(unix, windows)))]
+/// Positional write on wasi, via `libc::pwrite`.
+///
+/// The previous portable fallback (`try_clone` + `seek` + `write`) could never
+/// succeed here: `File::try_clone` is `Unsupported` on wasip1, so every staged
+/// repair write failed at the first call. `pwrite` is both correct and a closer
+/// match to the `unix` arm — it does not disturb the handle's seek cursor,
+/// which is the property the shared-handle callers rely on.
+#[cfg(target_os = "wasi")]
+fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `src` is a valid initialized slice of `src.len()` bytes and the
+    // fd is owned by `file`, which outlives the call.
+    let written = unsafe {
+        libc::pwrite(
+            file.as_raw_fd(),
+            src.as_ptr().cast::<libc::c_void>(),
+            src.len(),
+            offset as libc::off_t,
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(written as usize)
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
     let mut cloned = file.try_clone()?;
     cloned.seek(SeekFrom::Start(offset))?;
@@ -1651,7 +1691,29 @@ fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
     file.seek_read(dst, offset)
 }
 
-#[cfg(not(any(unix, windows)))]
+/// Positional read on wasi, via `libc::pread`; see [`write_file_at`] for why
+/// the `try_clone` fallback is unusable on this target.
+#[cfg(target_os = "wasi")]
+fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `dst` is a valid writable slice of `dst.len()` bytes and the fd is
+    // owned by `file`, which outlives the call.
+    let read = unsafe {
+        libc::pread(
+            file.as_raw_fd(),
+            dst.as_mut_ptr().cast::<libc::c_void>(),
+            dst.len(),
+            offset as libc::off_t,
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(read as usize)
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut cloned = file.try_clone()?;
     cloned.seek(SeekFrom::Start(offset))?;
@@ -1741,7 +1803,7 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
         let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len as usize];
-        let read_len = file.read(&mut buf)?;
+        let read_len = crate::disk::read_filled(&mut file, &mut buf)?;
         crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read_len as u64);
         buf.truncate(read_len);
         Ok(buf)
@@ -1760,7 +1822,7 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
-        let read = file.read(dst)?;
+        let read = crate::disk::read_filled(&mut file, dst)?;
         crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read as u64);
         Ok(read)
     }
@@ -2535,10 +2597,12 @@ impl RepairState {
         // measured as an intermittent worker stack overflow via rayon's
         // steal-on-block recursion).
         //
-        // `!cfg!(target_family = "wasm")` const-folds to `true` on native (the
-        // guard is unchanged) and to `false` on wasm, so the candidate scan is
-        // sequential there and `rayon::current_num_threads` is never called.
-        let results = if !cfg!(target_family = "wasm")
+        // `parallel_enabled()` const-folds to `true` on native (the guard is
+        // unchanged). On wasm it is a cached runtime probe: `false` on
+        // single-threaded `wasm32-wasip1`, so the candidate scan is sequential
+        // there and `rayon::current_num_threads` is never called; `true` on
+        // `wasm32-wasip1-threads`, where the candidate fan-out is real.
+        let results = if reedsolomon_rs::threading::parallel_enabled()
             && candidates.len() > 1
             && rayon::current_num_threads() > 1
         {
@@ -3958,11 +4022,13 @@ impl<'a> RollingBlockScanner<'a> {
         // per-file fan-out inside the per-candidate fan-out lets a blocked
         // worker steal other files' whole scan frames onto one stack —
         // measured as an intermittent worker stack overflow on 16-file sets.
-        // `cfg!(target_family = "wasm")` const-folds away on native (the OR
-        // chain is unchanged, byte-identical) and to `true` on wasm, forcing the
-        // serial scanner and short-circuiting before `rayon::current_num_threads`
-        // — the parallel segment scanner (and its worker pool) is never reached.
-        if cfg!(target_family = "wasm")
+        // `!parallel_enabled()` const-folds away on native (the OR chain is
+        // unchanged, byte-identical). On wasm it is a cached runtime probe: on
+        // single-threaded `wasm32-wasip1` it forces the serial scanner and
+        // short-circuits before `rayon::current_num_threads`, so the parallel
+        // segment scanner (and its worker pool) is never reached; on
+        // `wasm32-wasip1-threads` the ordinary parallel gating below applies.
+        if !reedsolomon_rs::threading::parallel_enabled()
             || scan_options.skip_data
             || ordered_scan_force_serial()
             || !ordered_scan_parallel_enabled()
@@ -5704,7 +5770,9 @@ fn read_first_16k(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut buf = vec![0u8; 16_384];
-    let read = file.read(&mut buf)?;
+    // Fill, don't single-read: a short read here would silently hash fewer
+    // bytes than the 16k quick hash is defined over. See `disk::read_filled`.
+    let read = crate::disk::read_filled(&mut file, &mut buf)?;
     crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, read as u64);
     buf.truncate(read);
     Ok(buf)

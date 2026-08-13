@@ -465,6 +465,14 @@ pub fn blake2sp_hash(data: &[u8]) -> [u8; 32] {
 ))]
 pub use blake2sp_simd::{CorpusReport, differential_corpus};
 
+/// The in-crate kernel's 4-leaf NEON group state, for the off-thread hash
+/// pipeline's aarch64 worker arrangement (see
+/// `crate::hash_pipeline::LEAVES_PER_WORKER`). Not public API: the pipeline is
+/// the only caller, and `Blake2spHasher` remains the whole-tree entry point.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use blake2sp_simd::{Blake2spLeafGroup, GROUP_LEAVES};
+
 // =============================================================================
 // KDF cache — avoids re-deriving keys for repeated password+salt combinations
 // =============================================================================
@@ -2388,6 +2396,227 @@ mod tests {
             "7de3c9354ee545c2c1b3e4f0a05ebe177465de87c1d134e8914ace0d7ad73a68"
         );
         assert_eq!(hex(&native.psw_check), "c2599769ca19cc07");
+    }
+
+    /// The RAR5 PBKDF2 password matrix, pinned.
+    ///
+    /// `derive_rar5_material` is a compatibility constant: its three outputs
+    /// are what every existing encrypted RAR5 archive was written against, so
+    /// they may never move — not for a performance change, not for a backend
+    /// swap. These expectations were captured from the **pre-cached-context**
+    /// implementation (a fresh `aws_lc_rs::hmac::sign` per PBKDF2 iteration)
+    /// and reproduced identically by the pre-change RustCrypto backend, which
+    /// is why the same table gates every backend and every target: run it under
+    /// `--features crypto-rust` or on wasm and it must still hold.
+    ///
+    /// The matrix deliberately spans the regimes that make the HMAC key
+    /// handling branch — an empty password, keys shorter than / exactly /
+    /// longer than the 64-byte SHA-256 block (the over-long ones are hashed
+    /// down first), non-ASCII UTF-8, and a password past RAR's 127-unit
+    /// truncation limit — crossed with four salts and KDF counts from 2^0 to
+    /// 2^17 (the last exercising the long iteration chain, plus both extended
+    /// +16 tails that produce the hash key and the password-check value).
+    #[test]
+    fn test_rar5_material_matches_pinned_pre_change_vectors() {
+        let passwords: [String; 11] = [
+            String::new(),
+            "a".to_string(),
+            "password".to_string(),
+            "e2e-test-password".to_string(),
+            "moonlit-harbour".to_string(),
+            "a".repeat(63),
+            "b".repeat(64),
+            "c".repeat(65),
+            "d".repeat(200),
+            "Grüße😀 königsallee".to_string(),
+            format!("{}tail", "p".repeat(RAR_PASSWORD_MAX_UNITS)),
+        ];
+
+        let mut salt_ramp = [0u8; 16];
+        for (index, byte) in salt_ramp.iter_mut().enumerate() {
+            *byte = 0x10 + index as u8;
+        }
+        let mut salt_stride = [0u8; 16];
+        for (index, byte) in salt_stride.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let salts: [[u8; 16]; 4] = [[0x00; 16], [0xFF; 16], salt_ramp, salt_stride];
+
+        // (password index, salt index, lg2 count, key, hash key, psw check)
+        const VECTORS: &[(usize, usize, u8, &str, &str, &str)] = &[
+            (
+                0,
+                0,
+                0,
+                "c8c2ef93624f53f746ad5664441f9e04f1dde6c84f8f0a06689d9f4ef61ec1bd",
+                "0e57fdea9ee639376781ae31ee36a7cc62ba390bd38ba5001b494d3ab29d8c42",
+                "bbf59e9588c5a77e",
+            ),
+            (
+                1,
+                1,
+                1,
+                "2b63fa5dc13ab42a5ce067ffda3ab2832b5293ff8f78b039c5fae9193baba332",
+                "3874db6a501f999439d4913153b64295e1cef289212e67d3470e13179825491b",
+                "43aadcb7c595b038",
+            ),
+            (
+                2,
+                2,
+                4,
+                "06c7dc5c1a7771be150f420258cf9e872721b660b4ba9b5b88bf3d2c6ff96fe1",
+                "6260b58333bff37c5aafbe2b606e7d1d596ee594a73ae6dde787b2f03f12b123",
+                "b9042cd3813975e4",
+            ),
+            (
+                3,
+                3,
+                6,
+                "f1ff8917c7adada118e9847ba69a0d072d4d73a2e5269e5425ce3e7bf8e347f0",
+                "f00ed65c6e32630f71dfe33a1219126a2c1c7050347d547f7d23dee9643ab7ee",
+                "db985fa3342eef58",
+            ),
+            (
+                4,
+                0,
+                1,
+                "da3f7db328dc4f7426af6630c03db980beff2627e31a8a27181836a6ae89bfab",
+                "731a62f6568a6de046ba401cceb45e11c39b09d712ffe528191355590a05bf16",
+                "b7b4e9093d6ce428",
+            ),
+            (
+                5,
+                1,
+                0,
+                "a310cbda8cfc7b61e259f96ce89e75cdaf82975fa8ebab8a2be20d164956fe33",
+                "f69d31b5667698da5654ee1c36e2850d7438f6a3d6ba0f14447bc38b47662e4e",
+                "d6d68a9e41c09dcc",
+            ),
+            (
+                6,
+                2,
+                1,
+                "0500aa6434cff2f4e09b82c2850dbfba5981c87e9229eced2dbdbd061ce4832b",
+                "9344239fc495265ede3cdcc4f6b3753aa33289af6185fb97bdebbcc6f4c8d785",
+                "4dfea124eae718d8",
+            ),
+            (
+                7,
+                3,
+                4,
+                "e067f683b36f4d53cd690e08a2b8e29efaef476f3da7a991bb3ac4d760382b30",
+                "4fe93b5074a20c153e653872520020ffe75a18250c8cd55b1221265a1c84f085",
+                "8a93b816a550a2e4",
+            ),
+            (
+                8,
+                0,
+                4,
+                "9ae5c957a46bffb1242ba22c84d24e8de1b84c65fb3d845a2d386e96b00c31c7",
+                "5e04833957290cbc29a688dfe1fd488dc8743446da273e1127a3791d39568145",
+                "307a00f99661b27f",
+            ),
+            (
+                9,
+                1,
+                6,
+                "75e57fe515e799945ee5b52af60d65232614565d333bf5b8e090c35ee38803e3",
+                "a1841a38f916aa5fe0d27070d61c42f2551d8e68b8faa694e956a65aea18707b",
+                "0eb7d5fdf27b165a",
+            ),
+            (
+                10,
+                2,
+                0,
+                "c5ba853db1e9a53dad321baa11dcea0d5a9ada4111bb012ee56d51bc0727a6df",
+                "18085f5c2165b70e5f84e18b96560139f29c963ecccecd4ae1388d5219255317",
+                "52ddfca0643ae491",
+            ),
+            (
+                2,
+                3,
+                0,
+                "c9f7abe7f1b2a505e650bea511329ecf8b7ebe59023b45d31fc73aa04763c8fb",
+                "f5144338da4e13b63954cf34517fddeab95b55faf7eb5c379d90f98c27f6163c",
+                "1e277388536fab24",
+            ),
+            (
+                3,
+                0,
+                15,
+                "09b929115a2f66f650330cde4410088ba62244ce7c33983c7ab252efc963234f",
+                "5e61aea2b17d01e53879445d894f1609aca9bb70daee573119497a8564afd721",
+                "b089d8b2987a2125",
+            ),
+            (
+                9,
+                1,
+                16,
+                "4ef1f48c1324fba00a6b40a8d8e821fb98c39588f2be20bd4678d063a0de9754",
+                "b946e9545a6cfd41199102d32d85533eb8df0440a8eb4cce8ef36602a686461c",
+                "8accb57e06f2d95d",
+            ),
+            (
+                7,
+                2,
+                17,
+                "ce82fc96c2e8300c9ea4606dee63e82f31fdbf994ca0015db5d477b5655df896",
+                "a798401f41e64686bb4390dee0c36150a59ac467401aea80676fd97530416387",
+                "665f3487f57a4431",
+            ),
+            (
+                0,
+                3,
+                1,
+                "a704da2baf23134e62ef3d18c362019d1b649856bdbd8316144b2f7adf4de91d",
+                "afb8e4732f7cb1c05ae373cb0d35ed3725030f7ff9277c200cf8bd3c2ab85f08",
+                "556d4acdf211afb9",
+            ),
+            (
+                1,
+                0,
+                4,
+                "883ac9bd895d7849fc13338c6b222be4d0548ac5505acfc9d2c72862a71eed57",
+                "b92fa9eaaf5e85af5b314cbacb309f6a288e6816a2a7dd05bbf53c6a406bec52",
+                "d7ea3732123f0b04",
+            ),
+            (
+                4,
+                1,
+                15,
+                "9afaedcba0da93d5057f946c3585c40b482165cc1b0fe3c2d97f97312ce188c9",
+                "997046660233aac933e1ea63a51b01e228a139c0d109f3730abd19e9623a807b",
+                "bbef6ca08106b0c8",
+            ),
+            (
+                6,
+                3,
+                6,
+                "7b5ed7043e3756ea899fc45345e86241902548c3a4fa80dc3fe71263e8f43f3f",
+                "0d1df12d24fda06e39209401a1732d46fc2f5029a31da0ac1073bf027ddba2a9",
+                "8ec473eb4a95a3af",
+            ),
+            (
+                8,
+                2,
+                1,
+                "9b171ebde79c39cee02239aa323a4cdda5324ae0bf68ec5a7d325e6d6f101b6a",
+                "afe545a594bd2d561ba2a925d07037c868b4ff638d8b3f8aa4c10402e8138050",
+                "efefdf70cd9ae47f",
+            ),
+        ];
+
+        for &(password, salt, lg2, key, hash_key, psw_check) in VECTORS {
+            let material = derive_rar5_material(&passwords[password], &salts[salt], lg2).unwrap();
+            let case = format!("password {password}, salt {salt}, lg2 {lg2}");
+            assert_eq!(hex(&material.key), key, "key moved: {case}");
+            assert_eq!(hex(&material.hash_key), hash_key, "hash key moved: {case}");
+            assert_eq!(
+                hex(&material.psw_check),
+                psw_check,
+                "password check moved: {case}"
+            );
+        }
     }
 
     #[test]

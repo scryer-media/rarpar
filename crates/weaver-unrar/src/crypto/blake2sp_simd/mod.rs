@@ -416,6 +416,275 @@ pub fn hash(data: &[u8]) -> [u8; OUT] {
     state.finalize()
 }
 
+// The group API's only production wiring is the `LEAVES_PER_WORKER > 1`
+// arrangement, pinned off in `hash_pipeline` (wall-clock regression); until
+// that flips, the sole consumer is the differential test there.
+/// Number of leaves one vector group covers — the kernel is 4-wide.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const GROUP_LEAVES: usize = 4;
+/// Number of vector groups a whole BLAKE2sp tree splits into.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+const GROUPS: usize = DEGREE / GROUP_LEAVES; // 2
+/// One group super-block feeds each of the group's leaves one 64-byte block, so
+/// it is a *contiguous* 256-byte half of the tree's 512-byte super-block.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+const GROUP_SUPERBLOCK: usize = GROUP_LEAVES * BLOCK; // 256
+/// Group twin of [`NEEDED_TAIL`]: bytes that must follow a group super-block
+/// for it to be non-final for all four of the group's leaves.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+const GROUP_NEEDED_TAIL: usize = (GROUP_LEAVES - 1) * BLOCK + 1; // 193
+
+/// One half of a BLAKE2sp tree: the four leaves `4*group .. 4*group+4`, driven
+/// by a single 4-wide vector — i.e. exactly the width the kernel computes.
+///
+/// [`Blake2spState`] owns all eight leaves and runs the kernel twice per
+/// 512-byte super-block (once per group). Those two groups are *independent*
+/// until the root combine, so a caller that wants leaf-level thread parallelism
+/// without giving up vector width can run one of these per thread instead:
+/// two threads, each 4-wide, rather than eight scalar leaves.
+///
+/// The group's input is its own interleaved substream: group `g` owns bytes
+/// `[k*512 + g*256, k*512 + g*256 + 256)` of the stream for every `k`, handed
+/// over in order. Within that substream the geometry is the same round-robin as
+/// the full tree with degree 4 — the first 64 bytes go to leaf `4g`, the next to
+/// leaf `4g+1`, and so on — which is why this reuses the parent's block
+/// bookkeeping wholesale, only with `GROUP_SUPERBLOCK` in place of
+/// `SUPERBLOCK`.
+///
+/// Finalization stops at the four leaf digests: the root node needs all eight,
+/// so combining them is the caller's job — the only cross-group step, run once
+/// per stream over 256 bytes, and cheap enough that the caller can keep using
+/// whatever root BLAKE2s it already has.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
+pub(crate) struct Blake2spLeafGroup {
+    /// This group's leaf state, transposed: `h[j]` lane `i` is leaf
+    /// `4*group + i`'s word `j`.
+    h: [[u32; 4]; 8],
+    /// Bytes of this group's substream buffered but not yet compressed.
+    buf: Vec<u8>,
+    /// Per-leaf byte counter already folded into `h` (a multiple of `BLOCK`).
+    count: u64,
+    /// Which half of the tree this is (0 or 1). Only leaf 7 — lane 3 of group 1
+    /// — carries the `last_node` flag.
+    group: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl Blake2spLeafGroup {
+    /// Create the state for leaves `4*group .. 4*group+4`.
+    pub(crate) fn new(group: usize) -> Self {
+        debug_assert!(group < GROUPS);
+        let base = (group * GROUP_LEAVES) as u64;
+        let init: [[u32; 8]; GROUP_LEAVES] = [
+            node_words(base, 0),
+            node_words(base + 1, 0),
+            node_words(base + 2, 0),
+            node_words(base + 3, 0),
+        ];
+        let mut h = [[0u32; 4]; 8];
+        for (word_idx, hj) in h.iter_mut().enumerate() {
+            *hj = [
+                init[0][word_idx],
+                init[1][word_idx],
+                init[2][word_idx],
+                init[3][word_idx],
+            ];
+        }
+        Self {
+            h,
+            buf: Vec::with_capacity(2 * GROUP_SUPERBLOCK),
+            count: 0,
+            group,
+        }
+    }
+
+    /// Compress one complete, non-final 256-byte group super-block.
+    #[inline(always)]
+    unsafe fn compress_group_superblock<S: Simd>(&mut self, data: &[u8]) {
+        debug_assert!(data.len() >= GROUP_SUPERBLOCK);
+        let block = |i: usize| -> &[u8; BLOCK] {
+            (&data[i * BLOCK..i * BLOCK + BLOCK])
+                .try_into()
+                .expect("block slice is 64 bytes")
+        };
+        let count = self.count.wrapping_add(BLOCK as u64);
+        // Non-final: all four lanes share one counter and no flags are set, so
+        // the `FINAL = false` kernel path reads only `counts[0]` and ignores the
+        // flag arrays (see `compress4_transposed`).
+        let counts = [count; 4];
+        let zeros = [0u32; 4];
+
+        // SAFETY: the kernel calls are gated by the caller's target; see the
+        // `Simd` trait safety note. `update` dispatches with the right backend.
+        unsafe {
+            let blocks = [block(0), block(1), block(2), block(3)];
+            let m = simd::transpose_block::<S>(&blocks);
+            let mut g = Blake2spState::load_group::<S>(&self.h);
+            simd::compress4_transposed::<S, false>(&mut g, &m, counts, zeros, zeros);
+            Blake2spState::store_group::<S>(&g, &mut self.h);
+        }
+
+        self.count = count;
+    }
+
+    /// Feed this group's substream, compressing complete group super-blocks that
+    /// are guaranteed non-final for each of its four leaves. The retained tail
+    /// rule is the parent's, at group scale: a super-block is only compressed
+    /// once at least [`GROUP_NEEDED_TAIL`] bytes follow it.
+    ///
+    /// The buffer is drained *before* the bulk is touched, taking only as much
+    /// of `input` as each buffered super-block needs. That matters here in a way
+    /// it does not for a one-shot hash: this state is fed multi-megabyte chunks
+    /// back to back, and every call but the first starts with a non-empty tail,
+    /// so appending the whole chunk first would copy the entire stream through
+    /// the buffer. Draining first gets back to the zero-copy path — compressing
+    /// straight out of the caller's slice — within at most two super-blocks.
+    #[inline(always)]
+    unsafe fn update_with<S: Simd>(&mut self, mut input: &[u8]) {
+        // Phase 1: retire the buffered tail, refilling it from the head of
+        // `input` one super-block at a time.
+        while !self.buf.is_empty() {
+            if self.buf.len() < GROUP_SUPERBLOCK {
+                let take = (GROUP_SUPERBLOCK - self.buf.len()).min(input.len());
+                self.buf.extend_from_slice(&input[..take]);
+                input = &input[take..];
+                if self.buf.len() < GROUP_SUPERBLOCK {
+                    // `input` is exhausted and the buffer is still short.
+                    return;
+                }
+            }
+            // A whole super-block is buffered. It may only be compressed if
+            // enough bytes follow it — in the buffer or still in `input` — for
+            // it to be non-final for all four leaves.
+            if (self.buf.len() - GROUP_SUPERBLOCK) + input.len() < GROUP_NEEDED_TAIL {
+                self.buf.extend_from_slice(input);
+                return;
+            }
+            let mut sb = [0u8; GROUP_SUPERBLOCK];
+            sb.copy_from_slice(&self.buf[..GROUP_SUPERBLOCK]);
+            // SAFETY: backend gated by the caller; see `Simd` safety note.
+            unsafe { self.compress_group_superblock::<S>(&sb) };
+            self.buf.drain(..GROUP_SUPERBLOCK);
+        }
+
+        // Phase 2: the buffer is empty, so `input` now starts on a group
+        // super-block boundary and can be compressed in place.
+        while input.len() >= GROUP_SUPERBLOCK + GROUP_NEEDED_TAIL {
+            // SAFETY: backend gated by the caller; see `Simd` safety note.
+            unsafe { self.compress_group_superblock::<S>(input) };
+            input = &input[GROUP_SUPERBLOCK..];
+        }
+        self.buf.extend_from_slice(input);
+    }
+
+    /// Finalize this group's four leaves over a copy of the state. Idempotent.
+    ///
+    /// Same two-step tail handling as [`Blake2spState::finalize_with`], with the
+    /// group's own geometry: leaf `lane`'s block `s` lives at buffer offset
+    /// `lane*BLOCK + s*GROUP_SUPERBLOCK`, and the buffer is shorter than
+    /// `GROUP_SUPERBLOCK + GROUP_NEEDED_TAIL`, so no leaf has more than two.
+    #[inline(always)]
+    unsafe fn finalize_leaves_with<S: Simd>(&self) -> [[u8; OUT]; GROUP_LEAVES] {
+        let len = self.buf.len();
+        debug_assert!(len < GROUP_SUPERBLOCK + GROUP_NEEDED_TAIL);
+
+        let mut nblocks = [0usize; GROUP_LEAVES];
+        for (lane, nb) in nblocks.iter_mut().enumerate() {
+            let mut s = 0usize;
+            while lane * BLOCK + s * GROUP_SUPERBLOCK < len {
+                s += 1;
+            }
+            // Every leaf always compresses at least one (possibly empty) block.
+            *nb = s.max(1);
+        }
+        let max_steps = *nblocks.iter().max().expect("four lanes");
+
+        let build_step = |s: usize| -> ([[u8; BLOCK]; 4], [u64; 4], [u32; 4], [u32; 4]) {
+            let mut padded = [[0u8; BLOCK]; 4];
+            let mut counts = [0u64; 4];
+            let mut f0 = [0u32; 4];
+            let mut f1 = [0u32; 4];
+            for lane in 0..GROUP_LEAVES {
+                let off = lane * BLOCK + s * GROUP_SUPERBLOCK;
+                let real = if off < len { (len - off).min(BLOCK) } else { 0 };
+                if real > 0 {
+                    padded[lane][..real].copy_from_slice(&self.buf[off..off + real]);
+                }
+                counts[lane] = self
+                    .count
+                    .wrapping_add((s as u64) * BLOCK as u64)
+                    .wrapping_add(real as u64);
+                if s + 1 == nblocks[lane] {
+                    f0[lane] = !0;
+                    // Only leaf 7 — lane 3 of the last group — is the last node.
+                    if self.group * GROUP_LEAVES + lane == DEGREE - 1 {
+                        f1[lane] = !0;
+                    }
+                }
+            }
+            (padded, counts, f0, f1)
+        };
+
+        let (p0, c0, f0_0, f1_0) = build_step(0);
+        let mut arr0 = [[0u32; 4]; 8];
+        // SAFETY: the kernel calls are gated by the caller's target; see the
+        // `Simd` trait safety note. `finalize_leaves` dispatches the backend.
+        unsafe {
+            let mut hg = Blake2spState::load_group::<S>(&self.h);
+            let blocks = [&p0[0], &p0[1], &p0[2], &p0[3]];
+            compress4::<S, true>(&mut hg, &blocks, c0, f0_0, f1_0);
+            Blake2spState::store_group::<S>(&hg, &mut arr0);
+        }
+
+        let arr1 = if max_steps == 2 {
+            let (p1, c1, f0_1, f1_1) = build_step(1);
+            let mut arr1 = [[0u32; 4]; 8];
+            // SAFETY: as above.
+            unsafe {
+                let mut hg = Blake2spState::load_group::<S>(&arr0);
+                let blocks = [&p1[0], &p1[1], &p1[2], &p1[3]];
+                compress4::<S, true>(&mut hg, &blocks, c1, f0_1, f1_1);
+                Blake2spState::store_group::<S>(&hg, &mut arr1);
+            }
+            Some(arr1)
+        } else {
+            None
+        };
+
+        let mut digests = [[0u8; OUT]; GROUP_LEAVES];
+        for (lane, digest) in digests.iter_mut().enumerate() {
+            let src = match arr1 {
+                Some(ref a1) if nblocks[lane] == 2 => a1,
+                _ => &arr0,
+            };
+            for word_idx in 0..8 {
+                let word = src[word_idx][lane];
+                digest[word_idx * 4..word_idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        digests
+    }
+
+    /// Add this group's substream bytes to the hash (backend-dispatched).
+    pub(crate) fn update(&mut self, input: &[u8]) {
+        // SAFETY: see [`Blake2spState::update`] — `Backend` matches the target.
+        unsafe { self.update_with::<Backend>(input) }
+    }
+
+    /// This group's four leaf digests, in leaf order. Idempotent.
+    pub(crate) fn finalize_leaves(&self) -> [[u8; OUT]; GROUP_LEAVES] {
+        // SAFETY: see [`Blake2spState::update`].
+        unsafe { self.finalize_leaves_with::<Backend>() }
+    }
+}
+
 /// Outcome of [`differential_corpus`].
 #[doc(hidden)]
 pub struct CorpusReport {

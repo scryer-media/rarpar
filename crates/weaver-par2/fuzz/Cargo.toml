@@ -1,0 +1,23 @@
+[package]
+name = "par2-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+par2-rs = { path = ".." }
+tempfile = "3"
+
+[[bin]]
+name = "par2_packets"
+path = "fuzz_targets/par2_packets.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []

@@ -16,7 +16,8 @@ use std::sync::OnceLock;
 
 use tracing::trace;
 
-use super::lz::bitstream::{BitRead, BitReader, StreamingBitReader};
+use super::lz::bitstream::{BitRead, BitReader, LzSpan, StreamingBitReader};
+use super::lz::block_reader::{BitCursor, cursor_read_bits, cursor_refill};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::Window;
 use super::ppmd::model::Model;
@@ -128,6 +129,885 @@ fn build_ddecode_tables() -> ([u32; DC], [u8; DC]) {
     (ddecode, dbits)
 }
 
+/// A table the decoder expected to have been built by `read_tables`.
+///
+/// Outlined so the symbol loop carries the branch but not the construction:
+/// the oracle's equivalent is a plain `&BlockTables.LD` with no failure case
+/// at all (unpack30.cpp:139).
+#[cold]
+#[inline(never)]
+fn missing_table(name: &str) -> RarError {
+    RarError::CorruptArchive {
+        detail: format!("RAR4: missing {name} table"),
+    }
+}
+
+/// A Huffman decode that ran out of input mid-symbol.
+///
+/// Outlined for the same reason as [`missing_table`]: `format!` in the
+/// per-symbol path keeps its arguments live and inflates the loop even though
+/// the oracle simply `break`s (unpack30.cpp:58-59).
+#[cold]
+#[inline(never)]
+fn decode_failed(name: &str, err: &RarError) -> RarError {
+    RarError::CorruptArchive {
+        detail: format!("RAR4: {name} decode failed: {err}"),
+    }
+}
+
+/// [`decode_failed`] for the two sites that also report the output position.
+#[cold]
+#[inline(never)]
+fn decode_failed_at(name: &str, output_size: u64, err: &RarError) -> RarError {
+    RarError::CorruptArchive {
+        detail: format!("RAR4: {name} decode failed at output_size={output_size}: {err}"),
+    }
+}
+
+/// The Huffman and distance tables a leased span decodes against.
+///
+/// Borrowed once per lease instead of being re-reached through
+/// `self.ld_table.as_ref().ok_or_else(..)?` on every symbol, which is where
+/// UnRAR simply has `&BlockTables.LD` (unpack30.cpp:139).
+struct Rar4FastTables<'a> {
+    ld: &'a HuffmanTable,
+    dd: &'a HuffmanTable,
+    ldd: &'a HuffmanTable,
+    rd: &'a HuffmanTable,
+    ddecode: &'a [u32; DC],
+    dbits: &'a [u8; DC],
+}
+
+/// The mutable decoder state a leased span keeps in locals.
+///
+/// UnRAR holds `OldDist`, `LastLength`, `LowDistRepCount` and `PrevLowDist` as
+/// `Unpack` members, but `Unpack29` is one function over them, so a release
+/// build keeps them in registers across the whole symbol loop. rarpar reaches
+/// them through `&mut Rar4LzDecoder`, so they are copied in here for the span
+/// and written back at every exit from it.
+#[derive(Clone, Copy)]
+struct Rar4FastState {
+    dist_cache: [usize; 4],
+    last_length: usize,
+    low_dist_rep_count: usize,
+    prev_low_dist: usize,
+}
+
+/// Why the leased-span loop handed control back.
+enum Rar4FastExit {
+    /// The cursor reached the span border; the caller takes a fresh lease or
+    /// falls back to the per-symbol path for the buffer tail.
+    Border,
+    /// `output_size` reached `unpacked_size`.
+    Complete,
+    /// The unflushed-output threshold was crossed and a flush can progress.
+    Yield,
+    /// Symbol 256 or 257 was decoded and consumed; the caller runs its arm.
+    Cold(usize),
+}
+
+/// `flush_is_pinned_by_pending_head` over the state a leased span can see.
+///
+/// Symbol 257 exits the span, so the pending-filter queue cannot change while
+/// one runs and its head is captured once per lease.
+#[inline]
+fn fast_flush_is_pinned(window: &Window, pending_head: Option<(u64, usize)>) -> bool {
+    let Some((block_start_total, block_length)) = pending_head else {
+        return false;
+    };
+    block_start_total == window.total_flushed()
+        && block_start_total.saturating_add(block_length as u64) > window.total_written()
+        && window.unflushed_bytes() <= window.dict_size() as u64
+}
+
+/// Where [`run_fast_symbols`] puts the operations it decodes.
+///
+/// The symbol loop is one implementation with two consumers: the serial path
+/// writes straight into the window ([`Rar4WindowSink`]), and the threaded path
+/// records the operation for an apply thread ([`Rar4RecordSink`]). Everything
+/// here is `#[inline(always)]` and the threaded sink's `yield_armed` is a
+/// literal `false`, so the serial monomorphization folds back to exactly the
+/// code that existed before the split. That is verified, not assumed: building
+/// the crate with `cargo rustc --release --lib -- --emit asm` before and after
+/// this split produces a byte-identical instruction stream for all five
+/// `decode_lz_symbols` monomorphizations (3859 instructions each for the four
+/// streaming readers, 1694 for `BitReader`). Re-run that comparison after
+/// touching anything in this loop.
+trait Rar4Sink {
+    /// Apply a run of `n` literals (1..=8) packed so literal `i` occupies bits
+    /// `8 * i`, which is the byte order [`Window::put_literal_batch`] stores.
+    fn put_literals(&mut self, packed: u64, n: usize);
+
+    /// Apply a match of `length` bytes at `distance`, of which the first
+    /// `visible` are inside the declared unpacked size.
+    fn copy_match(&mut self, distance: usize, length: usize, visible: usize) -> RarResult<()>;
+
+    /// Cheap pre-test: is the unflushed span (plus `pending_literals` still in
+    /// the register run) at or past the caller's flush threshold?
+    ///
+    /// Const-`false` for the threaded sink, whose apply thread owns the window
+    /// and flushes inline instead of handing control back.
+    fn yield_armed(&mut self, pending_literals: usize) -> bool;
+
+    /// Full test, run only after the pending literal run has been applied:
+    /// would a flush right now actually move the write border?
+    fn yield_now(&mut self) -> bool;
+}
+
+/// The serial sink: operations go straight into the sliding window.
+struct Rar4WindowSink<'a> {
+    window: &'a mut Window,
+    yield_threshold: Option<usize>,
+    pending_head: Option<(u64, usize)>,
+}
+
+impl Rar4Sink for Rar4WindowSink<'_> {
+    #[inline(always)]
+    fn put_literals(&mut self, packed: u64, n: usize) {
+        self.window.put_literal_batch(&packed.to_le_bytes(), n);
+    }
+
+    #[inline(always)]
+    fn copy_match(&mut self, distance: usize, length: usize, visible: usize) -> RarResult<()> {
+        self.window.copy_with_visible_len(distance, length, visible)
+    }
+
+    #[inline(always)]
+    fn yield_armed(&mut self, pending_literals: usize) -> bool {
+        match self.yield_threshold {
+            Some(threshold) => {
+                self.window.unflushed_bytes() as usize + pending_literals >= threshold
+            }
+            None => false,
+        }
+    }
+
+    #[inline(always)]
+    fn yield_now(&mut self) -> bool {
+        !fast_flush_is_pinned(self.window, self.pending_head)
+    }
+}
+
+// ─── Threaded decode/apply split ─────────────────────────────────────────────
+//
+// UnRAR does not multithread rar3/rar4 at all — `Unpack::DoUnpack` routes
+// version 29 straight to the single-threaded `Unpack29` (unpack.cpp), and only
+// RAR5 gets `Unpack5MT`. The structural template here is therefore rarpar's own
+// RAR5 controller (`lz/parallel.rs`) with UnRAR's `unpack50mt.cpp` supplying the
+// record shape and the batch sizing, adapted to the one thing RAR4 cannot do:
+// its Huffman blocks are not independently addressable, so decode cannot fan
+// out across blocks. What it can do is run *ahead* of the window, which is what
+// this split does — one decode thread producing records, the calling thread
+// applying them in stream order.
+
+/// Items per batch handed to the apply side.
+///
+/// UnRAR sizes its per-thread `Decoded` array at `0x4100` because "typical
+/// number of items in RAR blocks does not exceed 0x4000"
+/// (unpack50mt.cpp:46-49), and rarpar's RAR5 controller carries the same number
+/// as `DECODED_ITEMS_CAPACITY` (lz/parallel.rs:45-46). RAR4 reuses it unchanged
+/// so all three agree on what a batch costs.
+const RAR4_MT_BATCH_ITEMS: usize = 0x4100;
+
+/// Batches alive at once: one being applied on this thread, one being filled by
+/// the decode thread, one in transit. The RAR5 controller's `PIPELINE_DEPTH` is
+/// 2 for exactly this reason (lz/parallel.rs:40-43); the third slot is the
+/// recycling channel's headroom.
+const RAR4_MT_PIPELINE_DEPTH: usize = 2;
+
+/// Buffers the recycling channel holds, and the hard cap on how many are
+/// carried between leases.
+///
+/// Nothing may ever *block* on this channel. An earlier revision let the
+/// carried-over set grow past the channel's capacity and then primed it with a
+/// blocking `send` before the decode thread was spawned — with no receiver
+/// running, that hung the whole extraction. Every operation on the spare
+/// channel is now `try_*`, and the carried set is truncated to this, so the
+/// only blocking points left are the record channel's `send`/`recv` pair: a
+/// single producer and a single consumer that always drains.
+const RAR4_MT_SPARE_SLOTS: usize = RAR4_MT_PIPELINE_DEPTH + 1;
+
+/// Records per batch. A compile-time constant in every shipped build.
+#[cfg(not(test))]
+#[inline(always)]
+fn mt_batch_items() -> usize {
+    RAR4_MT_BATCH_ITEMS
+}
+
+/// Records per batch, shrinkable by a test.
+///
+/// The repo's RAR4 fixtures are small enough that a full-size batch is never
+/// filled, so nothing in the suite would cross the hand-off boundary — which is
+/// exactly where the recycling protocol lives. Tests therefore drive the batch
+/// down to a handful of records so the sweeps hammer it.
+#[cfg(test)]
+fn mt_batch_items() -> usize {
+    mt_test_hooks::batch_items().unwrap_or(RAR4_MT_BATCH_ITEMS)
+}
+
+/// Whether the split runs unless a caller explicitly asks for it.
+///
+/// **Measured false.** There is no member size at which the split pays, so
+/// there is no threshold to set — the cost is per byte, not per member, and it
+/// grows with the member instead of amortizing.
+///
+/// On an i5-1240P, 8 MiB text payloads, `perf`-pinned, best-of-9 in-process,
+/// serial on one CPU against the split on two of the same class:
+///
+/// | case                    | E serial | E split  | P serial | P split  |
+/// |-------------------------|---------:|---------:|---------:|---------:|
+/// | rar3 normal single      | 21.1 ms  | 23.6 ms  | 14.5 ms  | 16.9 ms  |
+/// | rar4 normal single      | 21.4 ms  | 23.4 ms  | 14.8 ms  | 17.2 ms  |
+/// | rar4 solid multivolume  | 21.4 ms  | 24.9 ms  | 15.0 ms  | 18.1 ms  |
+/// | rar4 solid, 85 MiB      | 1152 ms  | 1475 ms  |  837 ms  | 1002 ms  |
+///
+/// The cause is in the same runs' `cpu/wall`, which is 1.02–1.06 on the split:
+/// the two threads overlap for 2–6% of wall time and no more, because the apply
+/// half is all there is to hide and it is only a few percent of the work. A
+/// RAR4 apply is one eight-byte store per literal run and a `memcpy` per match;
+/// the per-member CRC — the other candidate for hiding — measures at 3% here
+/// (21.9 ms with verification against 21.5 ms without), because `crc-fast` is
+/// hardware-accelerated. Against that ceiling the record stream costs about two
+/// bytes written and two bytes read per output byte, and that is the 16–28%.
+///
+/// The one shape that does not lose is a degenerate match-heavy stream, where
+/// records are rare per output byte and the `memcpy` share is large:
+/// `test_read_format_rar_multi_lzss_blocks` (20 MiB out of 24 KiB in) runs
+/// 17.09 → 16.90 ms on an E-core and 11.71 → 11.53 ms on a P-core, a 1%
+/// improvement — not enough to admit on, and not detectable before decoding.
+///
+/// The mechanism is kept, tested and reachable through
+/// `WEAVER_RAR4_MT_THREADS`, because what it establishes — that RAR4 decode can
+/// be lifted off the window thread byte-exactly — is the prerequisite for any
+/// future arc that finds *more* work to move. What it does not do is pay for
+/// itself today, so it does not run today.
+const RAR4_MT_ADMITTED_BY_DEFAULT: bool = false;
+
+/// One decoded RAR4 LZ operation, in flight between the two threads.
+///
+/// Shaped after UnRAR's `UnpackDecodedItem` (unpack.hpp:99-108): a small tag, a
+/// length, and an eight-byte payload that is *either* the packed literal run or
+/// the match distance. Same 16 bytes as the oracle's record.
+///
+/// Unlike the RAR5 controller's [`DecodedItem`], there is no `RepeatPrev` or
+/// `CacheRef` variant: RAR5 fans decode out over several workers that cannot
+/// see the running distance cache, so it defers cache resolution to the apply
+/// phase. RAR4 has exactly one decode thread, which owns `Rar4FastState` and
+/// therefore resolves every distance before the record is emitted. Two kinds is
+/// all that reaches the window.
+///
+/// [`DecodedItem`]: super::lz::parallel::DecodedItem
+#[derive(Clone, Copy)]
+struct Rar4Item {
+    /// Literals held in `payload` (1..=8), or 0 when this is a match.
+    literals: u8,
+    /// Full match length, when `literals == 0`.
+    length: u32,
+    /// The packed literal run (`literals != 0`) or the match distance.
+    payload: u64,
+}
+
+/// The threaded sink: operations are recorded, not applied.
+///
+/// Backpressure is the bounded `items` channel: once the apply side is one
+/// batch behind, `send` blocks the decode thread, which is what bounds this
+/// path's memory to [`RAR4_MT_PIPELINE_DEPTH`] batches no matter how far ahead
+/// decode could otherwise run.
+struct Rar4RecordSink {
+    /// [`RAR4_MT_BATCH_ITEMS`], except where a test shrinks it so small
+    /// fixtures still cross the hand-off boundary many times over.
+    batch_items: usize,
+    batch: Vec<Rar4Item>,
+    items: std::sync::mpsc::SyncSender<Vec<Rar4Item>>,
+    spare: std::sync::mpsc::Receiver<Vec<Rar4Item>>,
+    /// Set once the apply side has stopped taking batches, which only happens
+    /// when it has already failed. Decode then runs the span out with the
+    /// records discarded — see [`Rar4RecordSink::hand_off`].
+    detached: bool,
+}
+
+impl Rar4RecordSink {
+    fn new(
+        items: std::sync::mpsc::SyncSender<Vec<Rar4Item>>,
+        spare: std::sync::mpsc::Receiver<Vec<Rar4Item>>,
+    ) -> Self {
+        let batch_items = mt_batch_items();
+        let batch = Self::take_empty(&spare, batch_items);
+        Self {
+            batch_items,
+            batch,
+            items,
+            spare,
+            detached: false,
+        }
+    }
+
+    /// A batch buffer to fill, recycled if one is waiting.
+    ///
+    /// The `clear` is load-bearing and is why every take goes through here: a
+    /// buffer handed back by the apply side still holds the records it just
+    /// applied, and filling on top of them would re-apply the whole batch.
+    fn take_empty(
+        spare: &std::sync::mpsc::Receiver<Vec<Rar4Item>>,
+        batch_items: usize,
+    ) -> Vec<Rar4Item> {
+        match spare.try_recv() {
+            Ok(mut buf) => {
+                buf.clear();
+                buf.reserve(batch_items.saturating_sub(buf.capacity()));
+                buf
+            }
+            Err(_) => Vec::with_capacity(batch_items),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, item: Rar4Item) {
+        self.batch.push(item);
+        if self.batch.len() >= self.batch_items {
+            self.hand_off();
+        }
+    }
+
+    /// Hand the full batch to the apply side and take an empty one back.
+    ///
+    /// Outlined: it runs once per batch, so keeping
+    /// the channel code out of the symbol loop's inlined body matters more than
+    /// its own speed.
+    #[cold]
+    #[inline(never)]
+    fn hand_off(&mut self) {
+        if self.detached {
+            // The apply side has failed; nothing downstream will read these.
+            // Decode still runs the span out so the thread terminates and the
+            // scope can join — the alternative, blocking on a dead channel, is
+            // the deadlock this branch exists to prevent.
+            self.batch.clear();
+            return;
+        }
+        let empty = Self::take_empty(&self.spare, self.batch_items);
+        let full = std::mem::replace(&mut self.batch, empty);
+        if self.items.send(full).is_err() {
+            self.detached = true;
+        }
+    }
+
+    /// Send the trailing partial batch, close the item channel, and collect
+    /// whatever buffers are already back for the next lease.
+    ///
+    /// Dropping the item sender is what ends the apply loop, so it happens
+    /// first. The drain that follows is non-blocking: a buffer the apply side
+    /// hands back after this point is kept on *its* side instead (see the
+    /// consumer loop in [`Rar4LzDecoder::lease_fast_symbols_mt`]), so nothing
+    /// is lost and nothing waits.
+    fn finish(mut self) -> Vec<Vec<Rar4Item>> {
+        if !self.detached && !self.batch.is_empty() {
+            let full = std::mem::take(&mut self.batch);
+            if self.items.send(full).is_err() {
+                self.detached = true;
+            }
+        }
+        drop(self.items);
+
+        let mut recovered = Vec::with_capacity(RAR4_MT_SPARE_SLOTS);
+        if self.batch.capacity() > 0 {
+            self.batch.clear();
+            recovered.push(std::mem::take(&mut self.batch));
+        }
+        while let Ok(mut buf) = self.spare.try_recv() {
+            buf.clear();
+            recovered.push(buf);
+        }
+        recovered.truncate(RAR4_MT_SPARE_SLOTS);
+        recovered
+    }
+}
+
+impl Rar4Sink for Rar4RecordSink {
+    #[inline(always)]
+    fn put_literals(&mut self, packed: u64, n: usize) {
+        debug_assert!((1..=8).contains(&n), "literal run out of range: {n}");
+        self.push(Rar4Item {
+            literals: n as u8,
+            length: 0,
+            payload: packed,
+        });
+    }
+
+    #[inline(always)]
+    fn copy_match(&mut self, distance: usize, length: usize, _visible: usize) -> RarResult<()> {
+        // A RAR4 match is at most LDECODE's 224 + 3 + 31 extra bits + 2 of
+        // distance adjustment, so `length` cannot reach `u32::MAX`; the apply
+        // side recomputes `visible` from its own running output size, which is
+        // in lockstep with the decode side's by construction.
+        debug_assert!(length <= u32::MAX as usize, "match length {length}");
+        self.push(Rar4Item {
+            literals: 0,
+            length: length as u32,
+            payload: distance as u64,
+        });
+        Ok(())
+    }
+
+    /// Const-`false`: the apply thread owns the window, so it flushes in place
+    /// instead of handing control back. This folds the whole yield block out of
+    /// the threaded monomorphization.
+    #[inline(always)]
+    fn yield_armed(&mut self, _pending_literals: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn yield_now(&mut self) -> bool {
+        false
+    }
+}
+
+/// Which lease `decode_lz_symbols` drives: the serial one or the split one.
+///
+/// This is the "two monomorphizations" half of keeping the serial engine
+/// untouched. Both instantiations share one copy of the per-symbol tail — the
+/// arms that run for the last [`LZ_SPAN_SLACK_BYTES`] of every buffer fill and
+/// for readers that cannot lend a span at all — while the lease call itself is
+/// a zero-sized, always-inlined dispatch. The serial instantiation compiles to
+/// the same instructions it did before the split existed — see the codegen note
+/// on [`Rar4Sink`] for how that is checked.
+///
+/// [`LZ_SPAN_SLACK_BYTES`]: super::lz::bitstream::LZ_SPAN_SLACK_BYTES
+trait Rar4LeaseDriver {
+    fn lease<R: BitRead>(
+        &mut self,
+        decoder: &mut Rar4LzDecoder,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        yield_threshold: Option<usize>,
+    ) -> RarResult<Option<Rar4FastExit>>;
+}
+
+/// The serial driver: decode writes straight into the window, as it always has.
+struct Rar4SerialLease;
+
+impl Rar4LeaseDriver for Rar4SerialLease {
+    #[inline(always)]
+    fn lease<R: BitRead>(
+        &mut self,
+        decoder: &mut Rar4LzDecoder,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        yield_threshold: Option<usize>,
+    ) -> RarResult<Option<Rar4FastExit>> {
+        decoder.lease_fast_symbols(reader, unpacked_size, output_size, yield_threshold)
+    }
+}
+
+/// The split driver: decode runs on a worker, apply and flush run here.
+struct Rar4ThreadedLease<'w, W: Write + ?Sized> {
+    writer: &'w mut W,
+    flush_threshold: usize,
+}
+
+impl<W: Write + ?Sized> Rar4LeaseDriver for Rar4ThreadedLease<'_, W> {
+    fn lease<R: BitRead>(
+        &mut self,
+        decoder: &mut Rar4LzDecoder,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        _yield_threshold: Option<usize>,
+    ) -> RarResult<Option<Rar4FastExit>> {
+        decoder.lease_fast_symbols_mt(
+            reader,
+            unpacked_size,
+            output_size,
+            self.flush_threshold,
+            self.writer,
+        )
+    }
+}
+
+/// Test-only switches for the threaded LZ path.
+///
+/// Thread-local for the same reason [`super::lz::bitstream::test_hooks`] is:
+/// the suite runs tests in parallel inside one process, so a process-wide
+/// switch (an environment variable, a static) would let one test's setting
+/// decide another test's path. The production knob stays the environment
+/// variable; this only overrides it, and only in `cfg(test)` builds.
+#[cfg(test)]
+pub(crate) mod mt_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED_THREADS: Cell<Option<usize>> = const { Cell::new(None) };
+        static BATCH_ITEMS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    thread_local! {
+        /// Spans actually handed to a decode thread. Thread-local and exact:
+        /// the lease is taken on the calling thread, so a test can assert that
+        /// its own run engaged the split without a concurrently running test
+        /// perturbing the count.
+        pub(super) static MT_LEASES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Restore(Option<usize>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCED_THREADS.with(|cell| cell.set(self.0));
+        }
+    }
+
+    /// Run `body` with the RAR4 LZ split forced to `threads` (1 = serial).
+    pub(crate) fn with_mt_threads<T>(threads: usize, body: impl FnOnce() -> T) -> T {
+        let _restore = Restore(FORCED_THREADS.with(Cell::get));
+        FORCED_THREADS.with(|cell| cell.set(Some(threads)));
+        body()
+    }
+
+    struct RestoreBatch(Option<usize>);
+
+    impl Drop for RestoreBatch {
+        fn drop(&mut self) {
+            BATCH_ITEMS.with(|cell| cell.set(self.0));
+        }
+    }
+
+    /// Run `body` with the record batch shrunk to `items`, so the hand-off and
+    /// buffer-recycling protocol runs many times over even on a small fixture.
+    pub(crate) fn with_mt_batch_items<T>(items: usize, body: impl FnOnce() -> T) -> T {
+        let _restore = RestoreBatch(BATCH_ITEMS.with(Cell::get));
+        BATCH_ITEMS.with(|cell| cell.set(Some(items)));
+        body()
+    }
+
+    pub(super) fn batch_items() -> Option<usize> {
+        BATCH_ITEMS.with(Cell::get)
+    }
+
+    pub(super) fn forced_threads() -> Option<usize> {
+        FORCED_THREADS.with(Cell::get)
+    }
+
+    pub(super) fn note_mt_lease() {
+        MT_LEASES.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub(crate) fn mt_lease_count() -> usize {
+        MT_LEASES.with(Cell::get)
+    }
+}
+
+/// Threads the RAR4 LZ split may use, and the knob the tests and the perf
+/// harness drive it with.
+///
+/// The split is one producer plus one consumer, so any width at or above two
+/// engages the same two threads; the value is still read (rather than treated
+/// as a bool) so a harness can sweep it the way it sweeps the RAR5 worker
+/// count, and so `1` means "serial" everywhere.
+fn rar4_mt_threads() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = mt_test_hooks::forced_threads() {
+        return forced;
+    }
+    if let Some(raw) = std::env::var_os("WEAVER_RAR4_MT_THREADS")
+        && let Some(text) = raw.to_str()
+        && let Ok(value) = text.trim().parse::<usize>()
+    {
+        return value;
+    }
+    if std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_some() {
+        return 1;
+    }
+    // `parallel_enabled` const-folds to `true` on native and probes once on
+    // wasm, where `wasm32-wasip1` cannot spawn at all. See
+    // `reedsolomon_rs::threading` for why this is not a plain `cfg!`.
+    if !reedsolomon_rs::threading::parallel_enabled() {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Whether the decode/apply split runs for this member.
+///
+/// The RAR5 controller's admission shape (`MIN_PARALLEL_BLOCKS`,
+/// lz/parallel.rs:37-38): decide once, up front, and fall back to the untouched
+/// serial engine rather than degrade inside it. The difference is what the
+/// decision reduces to — see [`RAR4_MT_ADMITTED_BY_DEFAULT`] for why RAR4's is
+/// a measured "no" rather than a size threshold.
+///
+/// `unpacked_size` is taken so a future arc that does find a crossover has
+/// somewhere to put it, and so the shape stays comparable to RAR5's.
+fn rar4_mt_admitted(unpacked_size: u64) -> bool {
+    let _ = unpacked_size;
+    if rar4_mt_threads() < 2 {
+        return false;
+    }
+    // An explicit width is a deliberate request — a test, or a perf sweep —
+    // and turns the split on regardless of the default.
+    #[cfg(test)]
+    if mt_test_hooks::forced_threads().is_some() {
+        return true;
+    }
+    if std::env::var_os("WEAVER_RAR4_MT_THREADS").is_some() {
+        return true;
+    }
+    RAR4_MT_ADMITTED_BY_DEFAULT
+}
+
+/// `Rar4LzDecoder::decode_distance` driven off the register cursor.
+///
+/// Line for line the same shape as the oracle's inline distance decode
+/// (unpack30.cpp:154-190); only the bit source differs.
+#[inline(always)]
+fn fast_decode_distance(
+    cursor: &mut BitCursor,
+    data: &[u8],
+    end_bit: usize,
+    tables: &Rar4FastTables<'_>,
+    state: &mut Rar4FastState,
+) -> usize {
+    let (dist_number, _) = tables.dd.decode_cursor(cursor, data, end_bit);
+    let dist_number = dist_number as usize;
+    // The DD table is built from exactly `DC` code lengths, and
+    // `decode_cursor` cannot return a symbol at or past `num_symbols`.
+    debug_assert!(
+        dist_number < DC,
+        "distance code out of range: {dist_number}"
+    );
+
+    let mut distance = tables.ddecode[dist_number] as usize + 1;
+    let bits = tables.dbits[dist_number];
+
+    if bits > 0 {
+        if dist_number > 9 {
+            if bits > 4 {
+                distance += (cursor_read_bits(cursor, data, end_bit, bits - 4) as usize) << 4;
+            }
+
+            if state.low_dist_rep_count > 0 {
+                state.low_dist_rep_count -= 1;
+                distance += state.prev_low_dist;
+            } else {
+                let (low_dist, _) = tables.ldd.decode_cursor(cursor, data, end_bit);
+                let low_dist = low_dist as usize;
+                if low_dist == 16 {
+                    state.low_dist_rep_count = LOW_DIST_REP_COUNT - 1;
+                    distance += state.prev_low_dist;
+                } else {
+                    distance += low_dist;
+                    state.prev_low_dist = low_dist;
+                }
+            }
+        } else {
+            distance += cursor_read_bits(cursor, data, end_bit, bits) as usize;
+        }
+    }
+
+    distance
+}
+
+/// Decode RAR4 LZ symbols across one leased input span.
+///
+/// This is the loop the whole restructure exists for. Everything it touches
+/// per symbol is a local or a table load: the bit cursor is a `BitCursor`
+/// copy, the distance/length state is `Rar4FastState`, the tables are
+/// borrowed once, and the input has [`LZ_SPAN_SLACK_BYTES`] of guaranteed
+/// slack so no read needs a bounds or availability test — the same three
+/// properties that make UnRAR's `Unpack29` loop cheap.
+///
+/// Returns the bit offset in `span.data` it stopped at, which the reader uses
+/// to re-establish its own cursor, plus why it stopped.
+///
+/// [`LZ_SPAN_SLACK_BYTES`]: super::lz::bitstream::LZ_SPAN_SLACK_BYTES
+fn run_fast_symbols<S: Rar4Sink>(
+    span: &LzSpan<'_>,
+    tables: &Rar4FastTables<'_>,
+    state: &mut Rar4FastState,
+    sink: &mut S,
+    unpacked_size: u64,
+    output_size: &mut u64,
+) -> (usize, RarResult<Rar4FastExit>) {
+    let data = span.data;
+    let end_bit = data.len() * 8;
+    let mut cursor = BitCursor {
+        acc: 0,
+        acc_bits: 0,
+        pos: span.start_bit,
+    };
+    cursor_refill(&mut cursor, data, end_bit);
+
+    let mut out = *output_size;
+
+    // Pending literal run, packed so that literal `i` occupies bits `8 * i` —
+    // the byte order `Window::put_literal_batch` stores. Accumulating in a
+    // register and storing eight at a time replaces eight
+    // store/increment/wrap-compare/counter sequences with one 8-byte store.
+    let mut lit_packed: u64 = 0;
+    let mut lit_len: usize = 0;
+
+    // Every window read has to see the literals decoded before it, so the run
+    // is applied before any match copy, before the flush bookkeeping is
+    // consulted, and before the loop hands control back.
+    macro_rules! apply_literals {
+        () => {
+            if lit_len != 0 {
+                sink.put_literals(lit_packed, lit_len);
+                lit_packed = 0;
+                lit_len = 0;
+            }
+        };
+    }
+
+    macro_rules! copy_match {
+        ($distance:expr, $length:expr) => {{
+            apply_literals!();
+            let length = $length;
+            let remaining = (unpacked_size - out) as usize;
+            let visible_len = length.min(remaining);
+            if let Err(err) = sink.copy_match($distance, length, visible_len) {
+                *output_size = out;
+                return (cursor.pos, Err(err));
+            }
+            out += visible_len as u64;
+        }};
+    }
+
+    let exit = loop {
+        if out >= unpacked_size {
+            break Rar4FastExit::Complete;
+        }
+        // UnRAR's `Inp.InAddr > ReadBorder` (unpack30.cpp:56), in bits.
+        if cursor.pos >= span.border_bit {
+            break Rar4FastExit::Border;
+        }
+
+        let (number, _) = tables.ld.decode_cursor(&mut cursor, data, end_bit);
+        let number = number as usize;
+        let mut produced_output = false;
+
+        if number < 256 {
+            // Literal byte (most common — first).
+            lit_packed |= (number as u64) << (8 * lit_len);
+            lit_len += 1;
+            out += 1;
+            if lit_len == 8 {
+                sink.put_literals(lit_packed, 8);
+                lit_packed = 0;
+                lit_len = 0;
+            }
+            produced_output = true;
+        } else if number >= 271 {
+            // Regular match: decode length then distance.
+            let length_idx = number - 271;
+            debug_assert!(
+                length_idx < LDECODE.len(),
+                "length index out of range: {length_idx}"
+            );
+            let mut length = LDECODE[length_idx] as usize + 3;
+            let lbits = LBITS[length_idx];
+            if lbits > 0 {
+                length += cursor_read_bits(&mut cursor, data, end_bit, lbits) as usize;
+            }
+
+            let distance = fast_decode_distance(&mut cursor, data, end_bit, tables, state);
+
+            // Distance-based length adjustment.
+            if distance >= 0x2000 {
+                length += 1;
+                if distance >= 0x40000 {
+                    length += 1;
+                }
+            }
+
+            state.dist_cache[3] = state.dist_cache[2];
+            state.dist_cache[2] = state.dist_cache[1];
+            state.dist_cache[1] = state.dist_cache[0];
+            state.dist_cache[0] = distance;
+            state.last_length = length;
+            copy_match!(distance, length);
+            produced_output = true;
+        } else if number == 256 || number == 257 {
+            // End of block and VM filter code both need the reader itself.
+            apply_literals!();
+            break Rar4FastExit::Cold(number);
+        } else if number == 258 {
+            // Repeat previous match.
+            if state.last_length != 0 {
+                copy_match!(state.dist_cache[0], state.last_length);
+                produced_output = true;
+            }
+        } else if number < 263 {
+            // Repeat distance from cache (259-262).
+            let cache_idx = number - 259;
+            let distance = state.dist_cache[cache_idx];
+
+            // Rotate cache.
+            for j in (1..=cache_idx).rev() {
+                state.dist_cache[j] = state.dist_cache[j - 1];
+            }
+            state.dist_cache[0] = distance;
+
+            // Decode length from RD table.
+            let (length_number, _) = tables.rd.decode_cursor(&mut cursor, data, end_bit);
+            let length_number = length_number as usize;
+            debug_assert!(
+                length_number < LDECODE.len(),
+                "RD length index out of range: {length_number}"
+            );
+            let mut length = LDECODE[length_number] as usize + 2; // +2 for cache refs
+            let lbits = LBITS[length_number];
+            if lbits > 0 {
+                length += cursor_read_bits(&mut cursor, data, end_bit, lbits) as usize;
+            }
+
+            state.last_length = length;
+            copy_match!(distance, length);
+            produced_output = true;
+        } else if number < 272 {
+            // Short match (263-270): length=2, decode short distance.
+            let sd_idx = number - 263;
+            let mut distance = SDDECODE[sd_idx] as usize + 1;
+            let sd_bits = SDBITS[sd_idx];
+            if sd_bits > 0 {
+                distance += cursor_read_bits(&mut cursor, data, end_bit, sd_bits) as usize;
+            }
+
+            state.dist_cache[3] = state.dist_cache[2];
+            state.dist_cache[2] = state.dist_cache[1];
+            state.dist_cache[1] = state.dist_cache[0];
+            state.dist_cache[0] = distance;
+            state.last_length = 2;
+            copy_match!(distance, 2);
+            produced_output = true;
+        } else {
+            // Unreachable for the same reason as the per-symbol path: the LD
+            // table has 299 symbols and 256..=298 are covered above.
+            debug_assert!(false, "invalid symbol: {number}");
+        }
+
+        if produced_output && sink.yield_armed(lit_len) {
+            // The pin test reads the window's write/flush borders, so the
+            // pending literals have to be in the window before it runs.
+            apply_literals!();
+            if sink.yield_now() {
+                break Rar4FastExit::Yield;
+            }
+        }
+    };
+
+    // `Cold` and `Yield` already applied their run before breaking; `Border`
+    // and `Complete` land here with one still pending.
+    if lit_len != 0 {
+        sink.put_literals(lit_packed, lit_len);
+    }
+    *output_size = out;
+    (cursor.pos, Ok(exit))
+}
+
 /// State for the RAR4 LZ decompressor.
 pub struct Rar4LzDecoder {
     /// Sliding window / ring buffer.
@@ -195,6 +1075,14 @@ pub struct Rar4LzDecoder {
     /// loop is not re-entered once per symbol.
     #[cfg(test)]
     decode_lz_calls: usize,
+    /// Recycled record batches for the threaded LZ path.
+    ///
+    /// An empty `Vec` allocates nothing, so a build that never admits the
+    /// threaded path — wasm, a single-CPU host, or the default configuration —
+    /// pays one 24-byte field and no work at all. Once the path does run, the
+    /// batches are carried between leases here rather than reallocated per
+    /// span.
+    mt_spare_batches: Vec<Vec<Rar4Item>>,
     /// Recycled `StreamingBitReader` input buffer (512 KiB).
     ///
     /// Every streaming decode entry point builds a fresh `StreamingBitReader`
@@ -244,6 +1132,7 @@ impl Rar4LzDecoder {
             last_pending_filter_base: 0,
             #[cfg(test)]
             decode_lz_calls: 0,
+            mt_spare_batches: Vec::new(),
             input_buffer: None,
         })
     }
@@ -1117,6 +2006,14 @@ impl Rar4LzDecoder {
         self.begin_file_decode();
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
+        // Decided once per member, as the RAR5 controller decides its own
+        // admission once per member. Only this entry point can take the split:
+        // the chunked variants place their volume boundaries at
+        // `reader.byte_position()` observed between decode rounds, and a decode
+        // thread that runs ahead of the window would move those observations.
+        // Here output is a single ordered stream, so nothing observes decode's
+        // lead but the window itself — and the window is on this thread.
+        let threaded = rar4_mt_admitted(unpacked_size);
 
         while output_size < unpacked_size {
             if reader.bits_remaining() < 1 {
@@ -1124,6 +2021,23 @@ impl Rar4LzDecoder {
             }
 
             match self.block_type {
+                // PPMd members stay serial. A mixed solid archive flips
+                // `block_type` at symbol 256, which ends the lease and hands the
+                // fully materialized window back before the PPMd round starts,
+                // so the transition is the same one the serial path makes.
+                BlockType::Lz if threaded => {
+                    let mut driver = Rar4ThreadedLease {
+                        writer: &mut *writer,
+                        flush_threshold,
+                    };
+                    output_size = self.decode_lz_symbols_with(
+                        reader,
+                        unpacked_size,
+                        output_size,
+                        Some(flush_threshold),
+                        &mut driver,
+                    )?;
+                }
                 BlockType::Lz => {
                     output_size = self.decode_lz_symbols(
                         reader,
@@ -1668,18 +2582,420 @@ impl Rar4LzDecoder {
         Ok(())
     }
 
+    /// Decode symbols out of one leased input span, if the reader can lend one.
+    ///
+    /// Borrows the tables and the window as disjoint fields, copies the small
+    /// mutable state into locals, and writes everything back before returning
+    /// — including on the error path, so a failed match leaves the decoder
+    /// exactly where the per-symbol path would have left it.
+    fn lease_fast_symbols<R: BitRead>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        yield_threshold: Option<usize>,
+    ) -> RarResult<Option<Rar4FastExit>> {
+        // A missing table is an error the per-symbol path already reports with
+        // the table's name; do not duplicate that here. This guard and the
+        // reader's own span test are all the per-symbol fallback pays.
+        if self.ld_table.is_none()
+            || self.dd_table.is_none()
+            || self.ldd_table.is_none()
+            || self.rd_table.is_none()
+        {
+            return Ok(None);
+        }
+
+        // Everything below runs only once a span has actually been lent, so
+        // declining a lease costs nothing beyond the guard above.
+        let leased = reader.lease_lz_span(|span| {
+            let mut state = Rar4FastState {
+                dist_cache: self.dist_cache,
+                last_length: self.last_length,
+                low_dist_rep_count: self.low_dist_rep_count,
+                prev_low_dist: self.prev_low_dist,
+            };
+            let pending_head = self
+                .pending_vm_filters
+                .first()
+                .map(|filter| (filter.block_start_total, filter.block_length));
+
+            let outcome = {
+                let tables = Rar4FastTables {
+                    ld: self.ld_table.as_ref().expect("LD table checked above"),
+                    dd: self.dd_table.as_ref().expect("DD table checked above"),
+                    ldd: self.ldd_table.as_ref().expect("LDD table checked above"),
+                    rd: self.rd_table.as_ref().expect("RD table checked above"),
+                    ddecode: &self.ddecode,
+                    dbits: &self.dbits,
+                };
+                let mut sink = Rar4WindowSink {
+                    window: &mut self.window,
+                    yield_threshold,
+                    pending_head,
+                };
+                run_fast_symbols(
+                    span,
+                    &tables,
+                    &mut state,
+                    &mut sink,
+                    unpacked_size,
+                    output_size,
+                )
+            };
+
+            self.dist_cache = state.dist_cache;
+            self.last_length = state.last_length;
+            self.low_dist_rep_count = state.low_dist_rep_count;
+            self.prev_low_dist = state.prev_low_dist;
+            outcome
+        })?;
+
+        match leased {
+            None => Ok(None),
+            Some(exit) => exit.map(Some),
+        }
+    }
+
+    /// Materialize one batch of decoded records into the window, in order.
+    ///
+    /// This is the RAR4 twin of [`LzDecoder::apply_decoded_items_parallel`]
+    /// (lz/parallel.rs:2539): the same per-item shape, the same "check the
+    /// flush border once per item" cadence, and the same rule that nothing
+    /// about the window may be decided anywhere else. It runs only on the
+    /// thread that owns the decoder, so solid and multivolume window continuity
+    /// is not merely serialized — it never leaves its owner.
+    ///
+    /// The one difference from the RAR5 apply loop is what is *not* here: no
+    /// distance cache is touched, because RAR4's single decode thread already
+    /// resolved every distance.
+    ///
+    /// [`LzDecoder::apply_decoded_items_parallel`]: super::lz::LzDecoder
+    fn apply_lz_items<W: Write + ?Sized>(
+        &mut self,
+        items: &[Rar4Item],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        flush_threshold: usize,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        for item in items {
+            if item.literals != 0 {
+                let n = item.literals as usize;
+                self.window
+                    .put_literal_batch(&item.payload.to_le_bytes(), n);
+                *output_size += n as u64;
+            } else {
+                let length = item.length as usize;
+                let remaining = (unpacked_size - *output_size) as usize;
+                let visible_len = length.min(remaining);
+                self.window
+                    .copy_with_visible_len(item.payload as usize, length, visible_len)?;
+                *output_size += visible_len as u64;
+            }
+
+            // The serial loop's `Rar4FastExit::Yield`, resolved in place. The
+            // serial path breaks out so its caller can flush; here the flush is
+            // already on this thread, so the same test drives it directly. The
+            // pin test is the same one the serial path consults, for the same
+            // reason: while the pending-filter head holds the write border, a
+            // flush would move nothing.
+            if self.window.unflushed_bytes() as usize >= flush_threshold
+                && !self.flush_is_pinned_by_pending_head()
+            {
+                self.flush_ready_output_to_writer(writer, false)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decode one leased span on a worker thread while applying its records
+    /// here, in stream order.
+    ///
+    /// The decode thread sees only a byte slice, the Huffman tables and
+    /// `Rar4FastState`; the window, the pending-filter queue, the flush and the
+    /// writer never leave this thread. That is what keeps the split free of new
+    /// invariants: everything the serial path does to the window still happens
+    /// on the decoder's own thread, in the same order, under the same tests.
+    ///
+    /// The tables are moved out of `self` for the duration of the lease rather
+    /// than borrowed, so the apply half keeps a whole `&mut self` — which is
+    /// what lets it call [`Self::flush_ready_output_to_writer`] between items
+    /// instead of unwinding to a caller. They are put back on every exit path.
+    fn lease_fast_symbols_mt<R: BitRead, W: Write + ?Sized>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        flush_threshold: usize,
+        writer: &mut W,
+    ) -> RarResult<Option<Rar4FastExit>> {
+        // Same guard, same reason, as the serial lease.
+        if self.ld_table.is_none()
+            || self.dd_table.is_none()
+            || self.ldd_table.is_none()
+            || self.rd_table.is_none()
+        {
+            return Ok(None);
+        }
+
+        let ld = self.ld_table.take().expect("LD table checked above");
+        let dd = self.dd_table.take().expect("DD table checked above");
+        let ldd = self.ldd_table.take().expect("LDD table checked above");
+        let rd = self.rd_table.take().expect("RD table checked above");
+        let ddecode = self.ddecode;
+        let dbits = self.dbits;
+        let mut state = Rar4FastState {
+            dist_cache: self.dist_cache,
+            last_length: self.last_length,
+            low_dist_rep_count: self.low_dist_rep_count,
+            prev_low_dist: self.prev_low_dist,
+        };
+        let mut spare = std::mem::take(&mut self.mt_spare_batches);
+
+        let leased = reader.lease_lz_span(|span| {
+            #[cfg(test)]
+            mt_test_hooks::note_mt_lease();
+            // Copied out of the borrowed span so the decode thread owns a plain
+            // value; every field is already a `Copy` view of the reader's
+            // buffer, which stays put for the whole lease.
+            let span = LzSpan {
+                data: span.data,
+                start_bit: span.start_bit,
+                border_bit: span.border_bit,
+            };
+            let tables = Rar4FastTables {
+                ld: &ld,
+                dd: &dd,
+                ldd: &ldd,
+                rd: &rd,
+                ddecode: &ddecode,
+                dbits: &dbits,
+            };
+            let start_out = *output_size;
+            let mut applied_out = *output_size;
+            let mut apply_result: RarResult<()> = Ok(());
+
+            let scoped = std::thread::scope(|scope| {
+                // Capacity one: the decode thread may be at most one batch
+                // ahead of the apply thread before `send` parks it. This, and
+                // nothing else, is what bounds this path's memory.
+                let (item_tx, item_rx) = std::sync::mpsc::sync_channel::<Vec<Rar4Item>>(1);
+                // Hand-backs are `try_send`, so this only sizes how many
+                // buffers survive to the next lease.
+                let (spare_tx, spare_rx) =
+                    std::sync::mpsc::sync_channel::<Vec<Rar4Item>>(RAR4_MT_SPARE_SLOTS);
+                // The carried set must never outgrow the channel. When it did,
+                // and priming still used a blocking `send`, this loop parked
+                // with no receiver running and hung the extraction. Both halves
+                // of that are now impossible: the set is truncated where it is
+                // built, and priming cannot block.
+                #[cfg(test)]
+                assert!(
+                    spare.len() <= RAR4_MT_SPARE_SLOTS,
+                    "carried {} recycled batches, more than the {RAR4_MT_SPARE_SLOTS} slots",
+                    spare.len()
+                );
+                for buf in spare.drain(..) {
+                    let _ = spare_tx.try_send(buf);
+                }
+                // Buffers the apply side could not hand back, kept here so the
+                // next lease still gets them.
+                let mut kept: Vec<Vec<Rar4Item>> = Vec::new();
+
+                let span = &span;
+                let tables = &tables;
+                let mut decode_state = state;
+                let decoder = scope.spawn(move || {
+                    let mut sink = Rar4RecordSink::new(item_tx, spare_rx);
+                    let mut out = start_out;
+                    let outcome = run_fast_symbols(
+                        span,
+                        tables,
+                        &mut decode_state,
+                        &mut sink,
+                        unpacked_size,
+                        &mut out,
+                    );
+                    // Drops the item sender, which is what ends the apply loop
+                    // below, then reclaims the buffers already handed back.
+                    let recovered = sink.finish();
+                    ((outcome, decode_state, out), recovered)
+                });
+
+                while let Ok(batch) = item_rx.recv() {
+                    if apply_result.is_ok() {
+                        apply_result = self.apply_lz_items(
+                            &batch,
+                            unpacked_size,
+                            &mut applied_out,
+                            flush_threshold,
+                            writer,
+                        );
+                    }
+                    // On failure the loop keeps draining rather than dropping
+                    // the receiver: the decode thread runs the rest of the span
+                    // out and exits, so the scope can join. Nothing here can
+                    // wait on a thread that is itself waiting on this channel.
+                    //
+                    // `try_send`, never `send`: a blocking hand-back could park
+                    // this thread while the decode thread waits for it to take
+                    // the next batch. A buffer that does not fit is carried in
+                    // `kept` instead of being dropped.
+                    match spare_tx.try_send(batch) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(buf))
+                        | Err(std::sync::mpsc::TrySendError::Disconnected(buf)) => kept.push(buf),
+                    }
+                }
+                drop(spare_tx);
+
+                let (decoded, recovered) = decoder
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+                (decoded, recovered, kept)
+            });
+
+            let (decoded, recovered, kept) = scoped;
+            // Underscored: only the `cfg(test)` cross-check below reads it.
+            let ((end_bit, exit), final_state, _decoded_out) = decoded;
+            state = final_state;
+            spare = recovered;
+            spare.extend(kept);
+            spare.truncate(RAR4_MT_SPARE_SLOTS);
+
+            // Both halves count output with identical arithmetic over an
+            // identical record sequence, so a mismatch is a decode/apply drift
+            // bug and nothing else. `cfg(test)` rather than `debug_assert!`
+            // because the suite runs in release, where a debug assertion would
+            // compile away and check nothing.
+            #[cfg(test)]
+            assert!(
+                apply_result.is_err() || applied_out == _decoded_out,
+                "RAR4 MT: applied {applied_out} bytes, decoded {_decoded_out}"
+            );
+            *output_size = applied_out;
+
+            // The apply side's failure wins: it is the one the serial path
+            // would have reported, at the same output offset. The decode side
+            // cannot fail at all here — its sink is infallible — but the result
+            // is threaded through rather than discarded so that stays true by
+            // construction rather than by comment.
+            let outcome = match apply_result {
+                Err(err) => Err(err),
+                Ok(()) => exit,
+            };
+            (end_bit, outcome)
+        });
+
+        self.ld_table = Some(ld);
+        self.dd_table = Some(dd);
+        self.ldd_table = Some(ldd);
+        self.rd_table = Some(rd);
+        self.dist_cache = state.dist_cache;
+        self.last_length = state.last_length;
+        self.low_dist_rep_count = state.low_dist_rep_count;
+        self.prev_low_dist = state.prev_low_dist;
+        self.mt_spare_batches = spare;
+
+        match leased? {
+            None => Ok(None),
+            Some(exit) => exit.map(Some),
+        }
+    }
+
+    /// Run the arm for a symbol that needs the reader itself: 256 or 257.
+    ///
+    /// Shared by the per-symbol path and the leased-span path so the two
+    /// cannot drift. Returns `false` when the member's decode ends here.
+    fn handle_cold_symbol<R: BitRead>(
+        &mut self,
+        reader: &mut R,
+        number: usize,
+        output_size: u64,
+    ) -> RarResult<bool> {
+        if number == 256 {
+            // End of block.
+            if rar4_debug_filters_enabled() {
+                eprintln!(
+                    "RAR4 end_of_block: output_size={output_size} bits_remaining={}",
+                    reader.bits_remaining()
+                );
+            }
+            let continue_decompressing = self.read_end_of_block(reader)?;
+            if !continue_decompressing {
+                // "New file" ends this member's decode; re-entering would
+                // decode LZ symbols against the next member's stream.
+                self.member_decode_done = true;
+                return Ok(false);
+            }
+            return Ok(self.block_type == BlockType::Lz);
+        }
+
+        debug_assert_eq!(number, 257);
+        if !self.read_vm_code(reader, output_size)? {
+            // Truncated VM code packet: unpack30.cpp:210-215 breaks out
+            // of the main loop and returns the partial output.
+            self.member_decode_done = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn decode_lz_symbols<R: BitRead>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        output_size: u64,
+        yield_threshold: Option<usize>,
+    ) -> RarResult<u64> {
+        self.decode_lz_symbols_with(
+            reader,
+            unpacked_size,
+            output_size,
+            yield_threshold,
+            &mut Rar4SerialLease,
+        )
+    }
+
+    fn decode_lz_symbols_with<R: BitRead, L: Rar4LeaseDriver>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
         mut output_size: u64,
         yield_threshold: Option<usize>,
+        driver: &mut L,
     ) -> RarResult<u64> {
         #[cfg(test)]
         {
             self.decode_lz_calls += 1;
         }
-        while output_size < unpacked_size {
+        'stream: while output_size < unpacked_size {
+            // Fast path: decode as many symbols as the reader can lend input
+            // for. The per-symbol path below runs only for the last
+            // `LZ_SPAN_SLACK_BYTES` of each buffer fill and for readers that
+            // cannot lend a span at all.
+            while let Some(exit) = driver.lease(
+                self,
+                reader,
+                unpacked_size,
+                &mut output_size,
+                yield_threshold,
+            )? {
+                match exit {
+                    // A fresh lease starts past the border and declines, which
+                    // is what drops through to the per-symbol path.
+                    Rar4FastExit::Border => continue,
+                    Rar4FastExit::Complete | Rar4FastExit::Yield => break 'stream,
+                    Rar4FastExit::Cold(number) => {
+                        if !self.handle_cold_symbol(reader, number, output_size)? {
+                            break 'stream;
+                        }
+                    }
+                }
+            }
+
             if !reader.has_bits() {
                 break;
             }
@@ -1687,13 +3003,10 @@ impl Rar4LzDecoder {
             let number = self
                 .ld_table
                 .as_ref()
-                .ok_or_else(|| RarError::CorruptArchive {
-                    detail: "RAR4: missing LD table".into(),
-                })?
+                .ok_or_else(|| missing_table("LD"))?
                 .decode(reader)
-                .map_err(|err| RarError::CorruptArchive {
-                    detail: format!("RAR4: LD decode failed at output_size={output_size}: {err}"),
-                })? as usize;
+                .map_err(|err| decode_failed_at("LD", output_size, &err))?
+                as usize;
             let mut should_check_yield = false;
 
             if number < 256 {
@@ -1735,29 +3048,9 @@ impl Rar4LzDecoder {
                     .copy_with_visible_len(distance, length, visible_len)?;
                 output_size += visible_len as u64;
                 should_check_yield = true;
-            } else if number == 256 {
-                // End of block.
-                if rar4_debug_filters_enabled() {
-                    eprintln!(
-                        "RAR4 end_of_block: output_size={output_size} bits_remaining={}",
-                        reader.bits_remaining()
-                    );
-                }
-                let continue_decompressing = self.read_end_of_block(reader)?;
-                if !continue_decompressing {
-                    // "New file" ends this member's decode; re-entering would
-                    // decode LZ symbols against the next member's stream.
-                    self.member_decode_done = true;
-                    break;
-                }
-                if self.block_type != BlockType::Lz {
-                    break;
-                }
-            } else if number == 257 {
-                if !self.read_vm_code(reader, output_size)? {
-                    // Truncated VM code packet: unpack30.cpp:210-215 breaks out
-                    // of the main loop and returns the partial output.
-                    self.member_decode_done = true;
+            } else if number == 256 || number == 257 {
+                // End of block and VM filter code; shared with the fast path.
+                if !self.handle_cold_symbol(reader, number, output_size)? {
                     break;
                 }
             } else if number == 258 {
@@ -1786,15 +3079,10 @@ impl Rar4LzDecoder {
                 let length_number = self
                     .rd_table
                     .as_ref()
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR4: missing RD table".into(),
-                    })?
+                    .ok_or_else(|| missing_table("RD"))?
                     .decode(reader)
-                    .map_err(|err| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4: RD decode failed at output_size={output_size}: {err}"
-                        ),
-                    })? as usize;
+                    .map_err(|err| decode_failed_at("RD", output_size, &err))?
+                    as usize;
                 // The RD table is built from exactly `RC` (28) code lengths,
                 // which is LDECODE's length, and `HuffmanTable::decode` cannot
                 // return a symbol at or past `num_symbols`.
@@ -1890,13 +3178,9 @@ impl Rar4LzDecoder {
         let dist_number = self
             .dd_table
             .as_ref()
-            .ok_or_else(|| RarError::CorruptArchive {
-                detail: "RAR4: missing DD table".into(),
-            })?
+            .ok_or_else(|| missing_table("DD"))?
             .decode(reader)
-            .map_err(|err| RarError::CorruptArchive {
-                detail: format!("RAR4: DD decode failed: {err}"),
-            })? as usize;
+            .map_err(|err| decode_failed("DD", &err))? as usize;
         // The DD table is built from exactly `DC` (60) code lengths — the size
         // of `ddecode`/`dbits` — and `HuffmanTable::decode` cannot return a
         // symbol at or past `num_symbols`.
@@ -1923,13 +3207,10 @@ impl Rar4LzDecoder {
                     let low_dist = self
                         .ldd_table
                         .as_ref()
-                        .ok_or_else(|| RarError::CorruptArchive {
-                            detail: "RAR4: missing LDD table".into(),
-                        })?
+                        .ok_or_else(|| missing_table("LDD"))?
                         .decode(reader)
-                        .map_err(|err| RarError::CorruptArchive {
-                            detail: format!("RAR4: LDD decode failed: {err}"),
-                        })? as usize;
+                        .map_err(|err| decode_failed("LDD", &err))?
+                        as usize;
                     if low_dist == 16 {
                         // Repeat previous low distance.
                         self.low_dist_rep_count = LOW_DIST_REP_COUNT - 1;
@@ -3794,6 +5075,524 @@ mod tests {
         assert_eq!(
             decoder.window.total_flushed(),
             decoder.window.total_written()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Leased-span fast path vs. retained per-symbol path.
+    //
+    // `run_fast_symbols` and the per-symbol tail of `decode_lz_symbols` are two
+    // implementations of the same arms, so they have to be pinned against each
+    // other permanently. These tests decode real rar3/rar4 LZ fixtures through
+    // both and require byte-identical output and identical error behaviour,
+    // under conditions the corpus does not reach on its own:
+    //
+    //   * forced small dictionaries, so the ring wraps continuously and the
+    //     batched literal store's wrap handling is exercised (sizes that are
+    //     and are not multiples of eight put the boundary at both phases);
+    //   * forced small input fills, so the span border — and with it the
+    //     handover to the per-symbol path, `seek_to_buffer_bit`'s commit
+    //     arithmetic and the accumulator-straddling-two-fills decline — recurs
+    //     every few dozen bytes instead of once per member.
+
+    /// rar3/rar4 LZ fixtures covering plain, solid, multi-member, RAR 2.0,
+    /// VM-filtered and multi-block streams.
+    const LZ_PATH_FIXTURES: &[&str] = &[
+        "rar4_lz.rar",
+        "rar4_solid.rar",
+        "rar4_lz_solid_mv.rar",
+        "rar4_multifile_lz.rar",
+        "rar20_lz.rar",
+        "test_read_format_rar_filter.rar",
+        "test_read_format_rar_multi_lzss_blocks.rar",
+    ];
+
+    /// Every member of `filename`, decoded with verification off.
+    ///
+    /// Verification is off deliberately: a forced small dictionary produces
+    /// output that legitimately fails the archive's checksum, and comparing
+    /// two identical "checksum mismatch" errors would not discriminate between
+    /// the paths. Comparing the bytes does.
+    fn decode_members(filename: &str) -> Vec<Result<Vec<u8>, String>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar4")
+            .join(filename);
+        let data =
+            std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let mut archive = crate::RarArchive::open(std::io::Cursor::new(data))
+            .unwrap_or_else(|err| panic!("open {filename}: {err}"));
+        let options = crate::ExtractOptions {
+            verify: false,
+            ..Default::default()
+        };
+
+        (0..archive.metadata().members.len())
+            .map(|index| {
+                archive
+                    .extract_member(index, &options, None)
+                    .and_then(|member| member.into_bytes())
+                    .map_err(|err| err.to_string())
+            })
+            .collect()
+    }
+
+    /// Thread widths the split is pinned at, alongside the two serial paths.
+    ///
+    /// The split is one decode thread plus the calling apply thread, so 2 and 4
+    /// drive the same two threads; both are pinned anyway so that a future
+    /// width-dependent change cannot land without moving this list.
+    const MT_WIDTHS: &[usize] = &[2, 4];
+
+    /// Decode `filename` down all three paths and require them to agree exactly.
+    ///
+    /// The three are the per-symbol reference path, the leased-span path
+    /// writing straight into the window, and the leased-span path decoding on a
+    /// worker while this thread applies. Every caller passes fixtures whose
+    /// window sizes and fill caps put the comparison on the forced-wrap and
+    /// lease-border seams, so all three are pinned there too.
+    /// Returns whether the threaded runs actually leased a span.
+    ///
+    /// Not every (fixture, setting) pair can: `rar20_lz.rar` is decoded by the
+    /// RAR 2.0 engine, which has no leased-span path at all, and a fill cap
+    /// near [`LZ_SPAN_SLACK_BYTES`] leaves too little contiguous input to lend.
+    /// The callers therefore require that the split engaged *somewhere* in
+    /// their sweep rather than everywhere in it, which keeps the requirement
+    /// honest without pinning it to a fixture list.
+    ///
+    /// [`LZ_SPAN_SLACK_BYTES`]: super::super::lz::bitstream::LZ_SPAN_SLACK_BYTES
+    fn assert_paths_agree(filename: &str, label: &str) -> bool {
+        // Serial, so a stray thread-local from an earlier `with_mt_threads`
+        // cannot make "fast-direct" secretly mean "fast-MT".
+        let fast = super::mt_test_hooks::with_mt_threads(1, || decode_members(filename));
+        let reference = super::super::lz::bitstream::test_hooks::without_lz_span(|| {
+            super::mt_test_hooks::with_mt_threads(1, || decode_members(filename))
+        });
+        assert_eq!(
+            fast, reference,
+            "{filename} [{label}]: leased-span output differs from the \
+             per-symbol path"
+        );
+        assert!(
+            !fast.is_empty(),
+            "{filename} [{label}]: fixture decoded no members, so the \
+             comparison proved nothing"
+        );
+
+        // The full-size batch (0x4100 records) is never filled by a fixture
+        // this small, so a run at the shipped size would never cross the
+        // hand-off boundary and the recycling protocol would go untested. 3 and
+        // 17 cross it constantly, on and off the eight-literal batch boundary;
+        // the shipped size is run too so the common path is not left out.
+        let mut leased = false;
+        for &batch in &[super::RAR4_MT_BATCH_ITEMS, 3, 17] {
+            for &threads in MT_WIDTHS {
+                let before = super::mt_test_hooks::mt_lease_count();
+                let threaded = super::mt_test_hooks::with_mt_batch_items(batch, || {
+                    super::mt_test_hooks::with_mt_threads(threads, || decode_members(filename))
+                });
+                assert_eq!(
+                    threaded, fast,
+                    "{filename} [{label}]: {threads}-thread apply with \
+                     {batch}-record batches differs from the leased-span direct \
+                     write"
+                );
+                leased |= super::mt_test_hooks::mt_lease_count() > before;
+            }
+        }
+        leased
+    }
+
+    /// The subset used for the exhaustive sweeps below.
+    ///
+    /// Every stream shape in [`LZ_PATH_FIXTURES`] except `rar4_solid.rar`,
+    /// whose 85 MB of packed data would dominate the suite's runtime without
+    /// adding a shape — `rar4_lz_solid_mv.rar` is also solid, at 1/400th the
+    /// size. The sweeps decode each of these once per path per setting, so
+    /// keeping them small is what makes the full cross-product affordable.
+    const LZ_PATH_SWEEP_FIXTURES: &[&str] = &[
+        "rar4_lz.rar",
+        "rar4_lz_solid_mv.rar",
+        "rar4_multifile_lz.rar",
+        "rar20_lz.rar",
+        "test_read_format_rar_filter.rar",
+        "test_read_format_rar_multi_lzss_blocks.rar",
+    ];
+
+    #[test]
+    fn fast_and_per_symbol_paths_agree_on_lz_fixtures() {
+        let mut leased = false;
+        for filename in LZ_PATH_FIXTURES {
+            leased |= assert_paths_agree(filename, "native dictionary");
+        }
+        assert!(leased, "the threaded path never engaged in this sweep");
+    }
+
+    #[test]
+    fn fast_and_per_symbol_paths_agree_when_the_window_wraps() {
+        // 12288 is a multiple of the eight-literal batch, 6151 and 65537 are
+        // not, so the ring boundary lands both on and between batch stores.
+        let mut leased = false;
+        for window in [12288u64, 6151, 65537] {
+            for filename in LZ_PATH_SWEEP_FIXTURES {
+                super::super::rar4_old::with_rar4_window_size(window, || {
+                    leased |= assert_paths_agree(filename, &format!("window={window}"));
+                });
+            }
+        }
+        assert!(leased, "the threaded path never engaged in this sweep");
+    }
+
+    #[test]
+    fn fast_and_per_symbol_paths_agree_across_span_borders() {
+        // A leased span reserves LZ_SPAN_SLACK_BYTES (32), so a fill of 40
+        // leaves only 8 bytes of fast path per fill and hands over constantly;
+        // 33 is the smallest fill that can still be leased at all; 97 is odd,
+        // so the border lands at a different bit phase each time; and 16 is
+        // below the slack, which declines every lease and must still decode
+        // correctly.
+        let mut leased = false;
+        for fill in [16usize, 33, 40, 97] {
+            for filename in LZ_PATH_SWEEP_FIXTURES {
+                super::super::lz::bitstream::test_hooks::with_fill_cap(fill, || {
+                    leased |= assert_paths_agree(filename, &format!("fill={fill}"));
+                });
+            }
+        }
+        // The whole point of this sweep for the threaded path: a span border
+        // every few dozen bytes means a decode thread per lease, so the
+        // handover itself is what is under test.
+        assert!(leased, "the threaded path never engaged in this sweep");
+    }
+
+    #[test]
+    fn span_border_handover_preserves_the_native_decode() {
+        // The tests above pin the two paths against each other; this one pins
+        // both against the archive's own checksum. Whatever the fill size, the
+        // bytes must still be the ones the native full-fill decode produces —
+        // so a lease/commit bug that corrupted both paths identically cannot
+        // pass unnoticed.
+        for filename in LZ_PATH_SWEEP_FIXTURES {
+            let native = super::mt_test_hooks::with_mt_threads(1, || decode_members(filename));
+            for fill in [16usize, 40, 97, 4096] {
+                let capped = super::super::lz::bitstream::test_hooks::with_fill_cap(fill, || {
+                    super::mt_test_hooks::with_mt_threads(1, || decode_members(filename))
+                });
+                assert_eq!(
+                    native, capped,
+                    "{filename}: decoding with {fill}-byte fills changed the output"
+                );
+                let per_symbol =
+                    super::super::lz::bitstream::test_hooks::with_fill_cap(fill, || {
+                        super::super::lz::bitstream::test_hooks::without_lz_span(|| {
+                            super::mt_test_hooks::with_mt_threads(1, || decode_members(filename))
+                        })
+                    });
+                assert_eq!(
+                    native, per_symbol,
+                    "{filename}: per-symbol decoding with {fill}-byte fills \
+                     changed the output"
+                );
+                for &threads in MT_WIDTHS {
+                    let threaded =
+                        super::super::lz::bitstream::test_hooks::with_fill_cap(fill, || {
+                            super::mt_test_hooks::with_mt_threads(threads, || {
+                                decode_members(filename)
+                            })
+                        });
+                    assert_eq!(
+                        native, threaded,
+                        "{filename}: {threads}-thread decoding with {fill}-byte \
+                         fills changed the output"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Threaded decode/apply split.
+    //
+    // The equivalence sweeps above already pin the split's output against both
+    // serial paths, at every window size and fill cap they exercise. What is
+    // left is what those sweeps cannot see: that the split actually engages,
+    // that it hands the window over cleanly at an LZ/PPMd transition, and that
+    // a member which fails mid-stream fails the same way — and terminates — no
+    // matter how many threads were asked for.
+
+    /// Run `body` on its own thread and fail if it has not finished in time.
+    ///
+    /// Every threaded-path test goes through this. The split's failure mode is
+    /// not a wrong answer but a stalled one — a decode thread parked on a
+    /// channel nobody drains, or a hand-back parked on a channel nobody
+    /// empties — and a plain `assert_eq!` cannot see that. The guard is
+    /// deliberately generous: it is there to turn a hang into a failure, not to
+    /// measure anything.
+    fn with_timeout<T: Send + 'static>(
+        seconds: u64,
+        what: &str,
+        body: impl FnOnce() -> T + Send,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = tx.send(body());
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(seconds)) {
+                Ok(value) => value,
+                Err(_) => panic!("{what}: did not finish within {seconds}s — the split stalled"),
+            }
+        })
+    }
+
+    /// A member that fails must fail identically on all three paths, and end.
+    ///
+    /// Both halves of the split can be the one that notices: the apply side
+    /// raises window errors, the decode thread runs the span out afterwards.
+    /// The error the caller sees has to be the apply side's either way, and the
+    /// run has to terminate — which is what the timeout guard is for.
+    #[test]
+    fn corrupt_members_fail_identically_on_every_path() {
+        // Fixtures whose members do not all decode cleanly; the comparison is
+        // over the `Err(String)` surface `decode_members` already produces.
+        for filename in LZ_PATH_SWEEP_FIXTURES {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rar4")
+                .join(filename);
+            let data = std::fs::read(&path).unwrap();
+
+            // Truncating the packed data mid-member forces a decode that runs
+            // out of input, and truncating at several points reaches different
+            // failure sites (table read, symbol loop, filter block).
+            for numerator in [2usize, 3, 5, 7] {
+                let cut = data.len() * numerator / 8;
+                if cut == 0 {
+                    continue;
+                }
+                let truncated = data[..cut].to_vec();
+
+                let serial =
+                    super::mt_test_hooks::with_mt_threads(1, || decode_bytes_members(&truncated));
+                for &batch in &[super::RAR4_MT_BATCH_ITEMS, 3] {
+                    for &threads in MT_WIDTHS {
+                        let input = truncated.clone();
+                        let what = format!(
+                            "{filename} truncated to {cut}, {threads} threads, batch {batch}"
+                        );
+                        let threaded = with_timeout(120, &what, || {
+                            super::mt_test_hooks::with_mt_batch_items(batch, || {
+                                super::mt_test_hooks::with_mt_threads(threads, || {
+                                    decode_bytes_members(&input)
+                                })
+                            })
+                        });
+                        assert_eq!(
+                            serial, threaded,
+                            "{what}: error surface differs from serial"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The recycling protocol must survive many leases and many hand-offs.
+    ///
+    /// This is the shape that hung: buffers accumulated across leases until the
+    /// carried-over set outgrew the recycling channel, and the next lease's
+    /// priming send — issued before the decode thread existed — blocked with no
+    /// receiver running. It also covers filling on top of a handed-back buffer,
+    /// which silently re-applied a whole batch. A small fill cap gives many
+    /// leases and a three-record batch gives many hand-offs per lease, so both
+    /// are hammered together.
+    #[test]
+    fn many_leases_and_hand_offs_neither_stall_nor_duplicate() {
+        for filename in [
+            "rar4_lz.rar",
+            "rar4_lz_solid_mv.rar",
+            "rar4_multifile_lz.rar",
+        ] {
+            let expected = super::mt_test_hooks::with_mt_threads(1, || decode_members(filename));
+            // `None` is the production 512 KiB fill: a lease then covers a whole
+            // buffer, so a small batch hands off thousands of times inside one
+            // lease and the recycled set carried to the *next* lease is at its
+            // largest. That combination — a full fill and a small batch — is
+            // what overflowed the recycling channel and stalled the priming
+            // send; the capped fills add the many-leases dimension instead.
+            for fill in [None, Some(64usize), Some(512)] {
+                for batch in [1usize, 3, 8] {
+                    let what = format!("{filename} fill={fill:?} batch={batch}");
+                    let run = || {
+                        super::mt_test_hooks::with_mt_batch_items(batch, || {
+                            super::mt_test_hooks::with_mt_threads(2, || decode_members(filename))
+                        })
+                    };
+                    let got = with_timeout(180, &what, || match fill {
+                        Some(bytes) => {
+                            super::super::lz::bitstream::test_hooks::with_fill_cap(bytes, run)
+                        }
+                        None => run(),
+                    });
+                    assert_eq!(expected, got, "{what}: threaded output diverged");
+                }
+            }
+        }
+    }
+
+    /// Every member of an in-memory archive image, decoded with verification
+    /// off, tolerating an archive that will not even open.
+    fn decode_bytes_members(data: &[u8]) -> Vec<Result<Vec<u8>, String>> {
+        let options = crate::ExtractOptions {
+            verify: false,
+            ..Default::default()
+        };
+        let mut archive = match crate::RarArchive::open(std::io::Cursor::new(data.to_vec())) {
+            Ok(archive) => archive,
+            Err(err) => return vec![Err(format!("open: {err}"))],
+        };
+        (0..archive.metadata().members.len())
+            .map(|index| {
+                archive
+                    .extract_member(index, &options, None)
+                    .and_then(|member| member.into_bytes())
+                    .map_err(|err| err.to_string())
+            })
+            .collect()
+    }
+
+    /// A solid archive that mixes LZ and PPMd members must hand the window
+    /// between the threaded LZ path and the serial PPMd path intact.
+    ///
+    /// PPMd is out of the split's scope, so every PPMd round runs on this
+    /// thread against a window the previous LZ round left fully materialized.
+    /// If the split ever returned with records still in flight, a following
+    /// PPMd member would read a short window and this would diverge.
+    #[test]
+    fn mixed_lz_and_ppmd_solid_members_agree_on_every_path() {
+        for filename in [
+            // Switches between PPMd and LZ blocks inside one stream.
+            "test_read_format_rar_ppmd_lzss_conversion.rar",
+            "rar4_ppm_solid_mv.rar",
+            "rar4_ppm_solid_restart.rar",
+            "rar4_ppm_order16_32m.rar",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rar4")
+                .join(filename);
+            assert!(path.exists(), "missing fixture {filename}");
+            assert_paths_agree(filename, "mixed LZ/PPMd solid");
+        }
+    }
+
+    /// The split must engage on its own on the arc's own reference shapes.
+    ///
+    /// The sweeps above tolerate a fixture that cannot lease; this one does
+    /// not, so a regression that quietly stopped admitting the threaded path
+    /// would fail here instead of turning every other assertion vacuous.
+    #[test]
+    fn the_threaded_path_engages_on_plain_and_solid_lz() {
+        for filename in ["rar4_lz.rar", "rar4_lz_solid_mv.rar"] {
+            let before = super::mt_test_hooks::mt_lease_count();
+            let threaded = super::mt_test_hooks::with_mt_threads(2, || decode_members(filename));
+            assert!(
+                super::mt_test_hooks::mt_lease_count() > before,
+                "{filename}: the threaded path leased no span"
+            );
+            assert!(
+                threaded.iter().any(Result::is_ok),
+                "{filename}: no member decoded"
+            );
+        }
+    }
+
+    /// Admission is off by default, at every member size, and an explicit
+    /// width decides it either way.
+    ///
+    /// The default is a *measured* one — see [`RAR4_MT_ADMITTED_BY_DEFAULT`].
+    /// This test exists so flipping it is a deliberate act with a number
+    /// attached, not a drive-by edit.
+    ///
+    /// [`RAR4_MT_ADMITTED_BY_DEFAULT`]: super::RAR4_MT_ADMITTED_BY_DEFAULT
+    #[test]
+    fn admission_is_off_by_default_at_every_size() {
+        for size in [0u64, 1, 1 << 20, 1 << 30, u64::MAX] {
+            assert_eq!(
+                super::rar4_mt_admitted(size),
+                super::RAR4_MT_ADMITTED_BY_DEFAULT,
+                "member size {size} changed admission, but the split's cost is \
+                 per byte and has no crossover"
+            );
+        }
+        // Deliberately a compile-time check: flipping the default should break
+        // the build here and send the author back to the measurement.
+        const {
+            assert!(
+                !RAR4_MT_ADMITTED_BY_DEFAULT,
+                "the split measured 16-28% slower on rar3/rar4; turning it on \
+                 needs a new measurement, not a new constant"
+            );
+        }
+
+        // A forced width decides both ways, whatever the size.
+        super::mt_test_hooks::with_mt_threads(1, || {
+            assert!(!super::rar4_mt_admitted(u64::MAX));
+        });
+        super::mt_test_hooks::with_mt_threads(2, || {
+            assert!(super::rar4_mt_admitted(0));
+        });
+    }
+
+    /// Report how many spans each fixture hands to a decode thread.
+    ///
+    /// Each lease is one thread handover, so this number times the spawn cost
+    /// is the split's fixed overhead. Printed rather than asserted on absolute
+    /// values, but the ratio to output size is pinned: a regression that
+    /// re-leased per Huffman block instead of per buffer fill would blow past
+    /// it and the split would lose on every member.
+    #[test]
+    fn leases_stay_proportional_to_input_not_to_blocks() {
+        for filename in [
+            "rar4_lz.rar",
+            "rar4_multifile_lz.rar",
+            "rar4_lz_solid_mv.rar",
+            "test_read_format_rar_filter.rar",
+            "test_read_format_rar_multi_lzss_blocks.rar",
+        ] {
+            let before = super::mt_test_hooks::mt_lease_count();
+            let members = super::mt_test_hooks::with_mt_threads(2, || decode_members(filename));
+            let leases = super::mt_test_hooks::mt_lease_count() - before;
+            let bytes: usize = members
+                .iter()
+                .filter_map(|m| m.as_ref().ok())
+                .map(Vec::len)
+                .sum();
+            println!("{filename}: {leases} leases for {bytes} output bytes");
+            // One lease per 4 KiB of output would mean the handover, not the
+            // decode, is the unit of work.
+            assert!(
+                leases <= 1 + bytes / 4096,
+                "{filename}: {leases} leases for {bytes} bytes is a handover \
+                 per block, not per buffer fill"
+            );
+        }
+    }
+
+    /// One decoded record is the same 16 bytes UnRAR's `UnpackDecodedItem` is
+    /// (unpack.hpp:99-108), which is what makes the batch sizing below
+    /// transferable from the oracle and from the RAR5 controller.
+    #[test]
+    fn record_and_queue_sizing_match_the_templates() {
+        assert_eq!(std::mem::size_of::<super::Rar4Item>(), 16);
+        // UnRAR: `DecodedAllocated = 0x4100` (unpack50mt.cpp:47).
+        // rarpar RAR5: `DECODED_ITEMS_CAPACITY = 0x4100` (lz/parallel.rs:46).
+        assert_eq!(super::RAR4_MT_BATCH_ITEMS, 0x4100);
+        // rarpar RAR5: `PIPELINE_DEPTH = 2` (lz/parallel.rs:43).
+        assert_eq!(super::RAR4_MT_PIPELINE_DEPTH, 2);
+        // Bounded memory: depth batches of records, and nothing else.
+        assert!(
+            super::RAR4_MT_BATCH_ITEMS
+                * std::mem::size_of::<super::Rar4Item>()
+                * (super::RAR4_MT_PIPELINE_DEPTH + 1)
+                <= 1 << 20
         );
     }
 }

@@ -16,8 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,17 +31,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
-      CC: sccache cc
-      CXX: sccache c++
-      CMAKE_C_COMPILER_LAUNCHER: sccache
-      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CC: cc
+      CXX: c++
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: Hydrate CLI test fixtures
         run: |
           set -euo pipefail
@@ -57,7 +53,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
           components: clippy, rustfmt
@@ -65,21 +61,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm mandoc
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-v1-rarpar-release-preflight-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-v1-rarpar-release-preflight-
-            gha-sccache-v1-rarpar-release-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Prime sccache server
-        run: |
-          sccache --start-server || true
-          sccache --zero-stats || true
       - name: Validate release tag and package versions
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
@@ -194,15 +175,6 @@ jobs:
           mandoc -Tlint target/dist/docs/share/man/man1/rarpar.1
           cargo clippy --locked -p rarpar --all-targets -- -D warnings
           cargo test --locked -p rarpar --no-fail-fast
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: always() && steps.sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   build:
     name: build-${{ matrix.platform }}
@@ -210,8 +182,6 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 45
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
     strategy:
       fail-fast: false
@@ -266,9 +236,10 @@ jobs:
             features: runtime
             package_root: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: Hydrate smoke fixtures
         shell: bash
         run: |
@@ -284,7 +255,7 @@ jobs:
               exit 1
             fi
           done < .ci-lfs-hydrated.txt
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
@@ -331,25 +302,11 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-v1-rarpar-release-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-v1-rarpar-release-${{ matrix.platform }}-
-            gha-sccache-v1-rarpar-release-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure build environment (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
-          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
-
           case "${{ runner.os }}" in
             Linux)
               echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
@@ -357,18 +314,18 @@ jobs:
                 *-musl)
                   target_env="${{ matrix.target }}"
                   target_env="${target_env//-/_}"
-                  printf 'CC_%s=%s\n' "$target_env" "sccache musl-gcc" >> "$GITHUB_ENV"
+                  printf 'CC_%s=%s\n' "$target_env" "musl-gcc" >> "$GITHUB_ENV"
                   ;;
                 *)
-                  echo "CC=sccache cc" >> "$GITHUB_ENV"
-                  echo "CXX=sccache c++" >> "$GITHUB_ENV"
+                  echo "CC=cc" >> "$GITHUB_ENV"
+                  echo "CXX=c++" >> "$GITHUB_ENV"
                   ;;
               esac
               ;;
             macOS)
               echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
-              echo "CC=sccache clang" >> "$GITHUB_ENV"
-              echo "CXX=sccache clang++" >> "$GITHUB_ENV"
+              echo "CC=clang" >> "$GITHUB_ENV"
+              echo "CXX=clang++" >> "$GITHUB_ENV"
               ;;
           esac
       - name: Configure build environment (Windows)
@@ -377,13 +334,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=. -Clinker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "CMAKE_C_COMPILER_LAUNCHER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "CMAKE_CXX_COMPILER_LAUNCHER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Prime sccache server
-        shell: bash
-        run: |
-          sccache --start-server || true
-          sccache --zero-stats || true
       - name: Stage rarpar release source (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -568,17 +518,8 @@ jobs:
             --target "${{ matrix.target }}"
           tar -czf "package-roots/package-root-${RELEASE_TAG}-${{ matrix.platform }}.tar.gz" \
             -C package-root .
-      - name: Show sccache stats
-        if: always()
-        shell: bash
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats | tee "logs/rarpar-${{ matrix.platform }}-sccache-stats.txt"
-          else
-            echo "sccache not installed" | tee "logs/rarpar-${{ matrix.platform }}-sccache-stats.txt"
-          fi
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rarpar-release-${{ matrix.platform }}
           path: |
@@ -588,7 +529,7 @@ jobs:
           retention-days: 14
       - name: Upload package root inspection artifact
         if: matrix.package_root
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rarpar-package-root-${{ matrix.platform }}
           path: package-roots/*
@@ -600,12 +541,16 @@ jobs:
     needs: [build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: Download portable Linux artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: rarpar-release-linux-*-musl-direct
           path: container-artifacts
@@ -643,17 +588,17 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Build and push CPU-only image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: container-context
           file: .github/docker/Dockerfile
@@ -667,13 +612,16 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later AND UnRAR-restriction
       - name: Validate container images
         shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_VERSION: ${{ steps.image.outputs.version }}
         run: |
           set -euo pipefail
-          image="${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}"
+          image="${IMAGE_NAME}:${IMAGE_VERSION}"
           for platform in linux/amd64 linux/arm64; do
             docker run --rm --platform "$platform" "$image" --version \
               | tee "rarpar-${platform//\//-}-version.txt"
-            grep -Fxq "rarpar ${{ steps.image.outputs.version }}" "rarpar-${platform//\//-}-version.txt"
+            grep -Fxq "rarpar ${IMAGE_VERSION}" "rarpar-${platform//\//-}-version.txt"
             docker run --rm --platform "$platform" "$image" --help >/dev/null
           done
           docker buildx imagetools inspect "$image" | tee ghcr-manifest.txt
@@ -685,12 +633,15 @@ jobs:
     needs: [build, container]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - name: Download release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: rarpar-release-*
           path: dist

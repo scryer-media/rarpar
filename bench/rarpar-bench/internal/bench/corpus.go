@@ -35,6 +35,11 @@ func (config CorpusConfig) Validate() error {
 	if config.PAR2RedundancyPercent <= 0 || config.PAR2RedundancyPercent > 100 {
 		return fmt.Errorf("PAR2 redundancy must be in 1..100")
 	}
+	// A branch or tag would let the source-text payload move under the corpus;
+	// only a full commit id is immutable enough to pin a payload class to.
+	if config.SourceRev != "" && !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(config.SourceRev) {
+		return fmt.Errorf("corpus source_rev must be a full commit id")
+	}
 	seen := map[string]bool{}
 	for _, item := range config.Cases {
 		if item.ID == "" || item.Workload == "" || seen[item.ID] {
@@ -51,13 +56,19 @@ func (config CorpusConfig) Validate() error {
 		}
 		profile := item.PayloadProfile
 		if profile == "" {
-			profile = "binary"
+			profile = profileBinary
 		}
-		if profile != "binary" && profile != "text" {
+		if !supportedPayloadProfile(profile) {
 			return fmt.Errorf("case %q has unsupported payload profile %q", item.ID, item.PayloadProfile)
 		}
-		if item.PPMd && profile != "text" {
+		if item.PPMd && profile != profileText {
 			return fmt.Errorf("PPMd case %q must use the text payload profile", item.ID)
+		}
+		if profileNeedsSourceRev(profile) && config.SourceRev == "" {
+			return fmt.Errorf("case %q uses payload profile %q but the corpus pins no source_rev", item.ID, profile)
+		}
+		if item.Blake2 && item.Format != 5 {
+			return fmt.Errorf("case %q requests BLAKE2sp checksums outside RAR5", item.ID)
 		}
 		if item.HeaderEncrypted && !item.Encrypted {
 			return fmt.Errorf("case %q encrypts headers without enabling encryption", item.ID)
@@ -124,11 +135,19 @@ func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock T
 	}
 	generationDigest := bytesSHA256(append(configBytes, toolchainBytes...))
 	for _, caseConfig := range config.Cases {
+		if videoProfiles[caseConfig.PayloadProfile] && lock.VideoEncoder.Image == "" {
+			return fmt.Errorf("case %q uses payload profile %q but the toolchain lock pins no video encoder",
+				caseConfig.ID, caseConfig.PayloadProfile)
+		}
+	}
+	assets := newPayloadAssets(ctx, docker, harnessRoot, lock.DockerBase, config.SourceRev, lock.VideoEncoder)
+	defer assets.Close()
+	for _, caseConfig := range config.Cases {
 		writer, found := lock.Writer(caseConfig.Writer)
 		if !found {
 			return fmt.Errorf("case %q references unavailable writer %q", caseConfig.ID, caseConfig.Writer)
 		}
-		if err := generateCase(ctx, docker, harnessRoot, out, config, generationDigest, lock, writer, caseConfig); err != nil {
+		if err := generateCase(ctx, docker, harnessRoot, out, config, generationDigest, lock, writer, caseConfig, assets); err != nil {
 			return err
 		}
 	}
@@ -160,7 +179,7 @@ func GenerateCorpus(ctx context.Context, docker, harnessRoot, out string, lock T
 	})
 }
 
-func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, config CorpusConfig, generationDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig) error {
+func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, config CorpusConfig, generationDigest string, lock ToolchainLock, writer RARWriter, item CaseConfig, assets *PayloadAssets) error {
 	caseRoot := filepath.Join(corpusRoot, item.ID)
 	workRoot, err := os.MkdirTemp("", "rarpar-bench-corpus-")
 	if err != nil {
@@ -181,9 +200,21 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 		if err := os.MkdirAll(payloadRoot, 0o755); err != nil {
 			return err
 		}
-		expected, err = writeDeterministicPayload(payloadRoot, config.Seed, item.ID, payloadBytesForCase(config, item), item.PayloadProfile)
+		if realisticProfiles[item.PayloadProfile] {
+			expected, err = writeRealisticPayload(assets, payloadRoot, config.Seed, item.PayloadProfile, payloadBytesForCase(config, item))
+		} else {
+			expected, err = writeDeterministicPayload(payloadRoot, config.Seed, item.ID, payloadBytesForCase(config, item), item.PayloadProfile)
+		}
 		if err != nil {
 			return fmt.Errorf("write payload for %s: %w", item.ID, err)
+		}
+		// Payload files carry a pinned timestamp, but writing them updates the
+		// mtime of the directories holding them, and a RAR4-format header always
+		// stores a modification time (unlike RAR5, where -tsm- suppresses it).
+		// Without this the directory entry alone makes every RAR3/RAR4 archive
+		// differ between two runs of the same configuration.
+		if err := stampDeterministicTree(payloadRoot); err != nil {
+			return fmt.Errorf("pin payload timestamps for %s: %w", item.ID, err)
 		}
 		volumeSize := config.VolumeSize
 		if item.VolumeSize != "" {
@@ -197,6 +228,12 @@ func generateCase(ctx context.Context, docker, harnessRoot, corpusRoot string, c
 		}
 		if item.Store {
 			archiveArgs = append(archiveArgs, "-m0")
+		}
+		if item.Blake2 {
+			// RAR5 stores a BLAKE2sp member checksum instead of CRC32. The
+			// hash is independent of the compression method, so this applies
+			// to stored members too.
+			archiveArgs = append(archiveArgs, "-htb")
 		}
 		if item.PPMd {
 			// RAR4's text module is its PPMd decoder path. Force it and pin its
@@ -362,11 +399,47 @@ func writePayloadFileWithProfile(path, seed, caseID, fileID string, bytes int64,
 	if err := file.Close(); err != nil {
 		return "", err
 	}
-	deterministicTime := time.Unix(946684800, 0).UTC()
-	if err := os.Chtimes(path, deterministicTime, deterministicTime); err != nil {
+	if err := stampDeterministicTime(path); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// stampDeterministicTime pins a payload file's timestamps so archive bytes never
+// depend on when the corpus was generated.
+func stampDeterministicTime(path string) error {
+	deterministicTime := time.Unix(946684800, 0).UTC()
+	return os.Chtimes(path, deterministicTime, deterministicTime)
+}
+
+// stampDeterministicTree pins timestamps across a finished payload tree,
+// directories included. Directories must be stamped after their contents,
+// because writing a file updates the mtime of the directory that holds it.
+func stampDeterministicTree(root string) error {
+	paths, err := sortedFiles(root)
+	if err != nil {
+		return err
+	}
+	directories := map[string]bool{filepath.Clean(root): true}
+	for _, path := range paths {
+		if err := stampDeterministicTime(path); err != nil {
+			return err
+		}
+		for parent := filepath.Dir(path); len(parent) > len(root); parent = filepath.Dir(parent) {
+			directories[parent] = true
+		}
+	}
+	ordered := make([]string, 0, len(directories))
+	for directory := range directories {
+		ordered = append(ordered, directory)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ordered)))
+	for _, directory := range ordered {
+		if err := stampDeterministicTime(directory); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func corpusContentDigest(manifests []CorpusCaseManifest) (string, error) {

@@ -306,7 +306,7 @@ impl HuffmanTable {
     /// fields. It exists here, rather than in the decode loop, only because
     /// this table's lookup state is private to this module.
     #[inline(always)]
-    pub(super) fn decode_cursor(
+    pub(crate) fn decode_cursor(
         &self,
         cursor: &mut super::block_reader::BitCursor,
         data: &[u8],
