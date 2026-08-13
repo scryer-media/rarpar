@@ -8,7 +8,7 @@ RAR archive reading and extraction in pure Rust. No C bindings, no external
 
 ```toml
 [dependencies]
-unrar-rs = "0.4"
+unrar-rs = "0.5"
 ```
 
 This crate reads existing archives. It exposes no writer, builder, or

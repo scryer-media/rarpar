@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -27,7 +27,7 @@ metal = ["reedsolomon-rs/metal"]
 wgpu = ["reedsolomon-rs/wgpu"]
 
 [dependencies]
-reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.3.0", default-features = false }
+reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.4.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
@@ -65,8 +65,11 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
 # `unrar-rs` is native test-suite tooling (differential RAR extraction
 # checks) and is not needed by the wasm harness, so it stays off the wasm build.
+# Deliberately path-only (no `version`): cargo strips path-only
+# dev-dependencies from the published manifest, so the crates.io package
+# carries no unrar-rs (and no UnRAR license-restriction) reference.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-unrar-rs = { path = "../weaver-unrar", version = "0.4.0", default-features = false, features = [
+unrar-rs = { path = "../weaver-unrar", default-features = false, features = [
     "native-crypto",
 ] }
 criterion = "0.5"

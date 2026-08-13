@@ -8,7 +8,7 @@ binary.
 
 ```toml
 [dependencies]
-par2-rs = "0.3"
+par2-rs = "0.4"
 ```
 
 ## Usage

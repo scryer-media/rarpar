@@ -8,7 +8,7 @@ arithmetic underneath PAR2 repair and RAR5 recovery records.
 
 ```toml
 [dependencies]
-reedsolomon-rs = "0.3"
+reedsolomon-rs = "0.4"
 ```
 
 This is a kernel crate, not a codec. It provides field operations and

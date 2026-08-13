@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0
+
+This is a minor release from 0.3.0 with source-compatible additions only; no
+existing API changed shape.
+
+### Public API
+
+- Metal GF16 sessions gained explicit planning and admission:
+  `metal_gf16_memory_plan`, `MetalGf16MemoryPlan`, `MetalGf16PlanError`,
+  `MetalGf16AdmissionError`, `MetalGf16Buffer`, `try_new_explicit`,
+  `try_new_with_source_capacity`, and `finish_chunk_into`.
+- Packed XOR-JIT batches gained up-front memory estimation:
+  `PackedJitBatch::memory_upper_bound` and `PackedMemoryEstimate`, so callers
+  can admit JIT arenas against a budget before building.
+
+### Runtime Behavior
+
+- GF16 kernel and dispatch refinements behind the existing public surface;
+  benchmark methodology and results are documented in the dependent crates'
+  READMEs.
+
 ## 0.3.0
 
 This is a minor release from 0.2.3.

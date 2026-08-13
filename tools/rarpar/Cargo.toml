@@ -29,8 +29,8 @@ wgpu = ["runtime", "par2-rs/wgpu"]
 metal = ["runtime", "par2-rs/metal"]
 
 [dependencies]
-par2-rs = { path = "../../crates/weaver-par2", version = "0.3.0", default-features = false, optional = true }
-unrar-rs = { path = "../../crates/weaver-unrar", version = "0.4.0", default-features = false, optional = true }
+par2-rs = { path = "../../crates/weaver-par2", version = "0.4.0", default-features = false, optional = true }
+unrar-rs = { path = "../../crates/weaver-unrar", version = "0.5.0", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
