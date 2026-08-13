@@ -6,8 +6,8 @@ there, repair what can be repaired, restore recovery volumes when possible, and
 extract the archive with verification enabled.
 
 It is built on reusable archive and parity crates that live in this workspace
-and are intended to be publishable on crates.io. The CLI is distributed as a
-binary release and source build, not as a crates.io package.
+and are published on crates.io. The CLI is distributed as a binary release
+and source build, not as a crates.io package.
 
 `rarpar` is not an official RAR or PAR2 utility. It does not ship binaries named
 `unrar`, `rar`, `par2`, or `par2repair`, and it does not provide RAR archive
@@ -18,6 +18,8 @@ writing, compression, or modification APIs.
 - Discovers RAR, REV, and PAR2 sets from paths, headers, magic bytes, and
   bounded directory scans.
 - Verifies and repairs PAR2 sets before extraction.
+- Creates PAR2 recovery sets with validated, atomically committed output
+  (`par create`).
 - Restores missing RAR volumes from `.rev` recovery volumes when available.
 - Extracts RAR archives with integrity checks enabled.
 - Handles encrypted archives through secure password sources or a hidden
@@ -30,40 +32,46 @@ writing, compression, or modification APIs.
 
 ## Performance
 
-`rarpar` uses the same RAR and PAR2 engines benchmarked in Weaver. These are
-selected warm-cache median results from shipped-style release builds with
-verified output, not benchmark-only binaries. They are shape-specific; archive
-content, storage, and CPU features matter. Release builds use AWS-LC-backed
-native crypto and CPU execution only. This keeps startup behavior consistent
-across supported platforms; `rarpar` deliberately does not enable optional GPU
-backends from its underlying PAR2 library.
+`rarpar` uses the same RAR and PAR2 engines benchmarked in Weaver. The charts
+below are deterministic end-to-end runs from the `rarpar-bench` corpus — one
+warmup, seven measured runs, byte-validated output — against reference
+UnRAR 7.23 and `par2cmdline-turbo 1.4.0`, using shipped-style portable
+release builds, not benchmark-only binaries. Results are shape-specific;
+archive content, storage, and CPU features matter. Release builds use
+AWS-LC-backed native crypto and CPU execution only. This keeps startup
+behavior consistent across supported platforms; `rarpar` deliberately does
+not enable optional GPU backends from its underlying PAR2 library. The Metal
+chart measures the PAR2 library's optional `metal` feature for comparison.
+Click any chart to open it full size.
 
-RAR extraction, compared with the reference RAR extraction utility:
+**RAR extraction**
 
-| Platform | Workload | Reference | Weaver engine | Result |
-|---|---|---:|---:|---|
-| Apple M5 Max | RAR7 video, 4.9 GB, 4.6 GB dictionary | 8.6 s | **5.8 s** | ~1.5x faster |
-| Apple M5 Max | RAR5 encrypted, AES-256 | 0.41 s | **0.25 s** | ~1.6x faster |
-| Core Ultra 9 285H | RAR7 video, 4.9 GB, `-m3` | 17.7 s | **13.5 s** | ~1.3x faster |
-| Core Ultra 9 285H | RAR5 encrypted, AES-256 | 0.83 s | **0.52 s** | ~1.6x faster |
-| Ryzen 5 3600, Windows | RAR7 video, 4.94 GB, `-m3` | **13.5 s** | 13.6 s | parity |
-| Ryzen 5 3600, Windows | Store-mode BLAKE2sp verify, 4.94 GB | 3.48 s | **1.80 s** | ~1.9x faster |
+[![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-PAR2 verification and repair, compared with `par2cmdline-turbo 1.4.0`:
+[![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-| Platform | Workload | turbo | Weaver engine | Result |
-|---|---|---:|---:|---|
-| Apple M5 Max | 4 GB set, 1 MB slices, 407 missing | 112 s wall / 1622 s CPU | **28.5 s / 338 s** | ~3.9x faster |
-| Apple M5 Max | 2 GB set, 32,768 slices, 3,000 missing | 457 s wall / 6507 s CPU | **95 s / 1288 s** | ~4.8x faster |
-| Apple M5 Max | Verify clean 1 GB set | 2.43 s | **0.09 s** | ~27x faster |
-| Core Ultra 9 285H | 4 GB set, 1 MB slices, 407 missing | 12.1 s | **8.1 s** | ~1.5x faster |
-| Core Ultra 9 285H | Verify clean 1 GB set | 0.66 s | **0.37 s** | ~1.8x faster |
-| Ryzen 5 3600, Windows | Verify clean 1 GB set | 1.70 s | **0.30 s** | ~5.7x faster |
+[![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
 
-Known weaker shapes remain: compressible-text RARs, RAR4 PPMd, Windows
-store-mode write-to-disk, and single-file/many-slice PAR2 repair on x86.
-`rarpar` verifies repaired and extracted output rather than trusting timing-only
-success.
+[![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
+
+**PAR2 verification, repair, and generation**
+
+[![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
+
+[![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+
+[![PAR2 workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)
+
+[![PAR2 CPU workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
+
+[![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+
+Known weaker shapes remain: RAR4 PPMd and dense compressible-text archives
+trail the reference decoder, and PAR2 generation trails `par2cmdline-turbo`
+— most visibly on Windows — because `rarpar` flushes and re-validates every
+written recovery volume before commit, which the reference tool does not do.
+`rarpar` verifies repaired and extracted output rather than trusting
+timing-only success.
 
 ## Install
 
@@ -300,8 +308,9 @@ the archive set; it waits for each later volume instead.
   RAR recovery and PAR2 repair. Licensed GPL-3.0-or-later.
 - `crates/weaver-unrar`: RAR reading, probing, extraction, and recovery only.
   Licensed GPL-3.0-or-later with the additional UnRAR source-code restriction.
-- `crates/weaver-par2`: PAR2 packet loading, verification, placement-aware
-  repair, and post-repair verification. Licensed GPL-3.0-or-later.
+- `crates/weaver-par2`: PAR2 packet loading, creation, verification,
+  placement-aware repair, and post-repair verification. Licensed
+  GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Source is GPL-3.0-or-later. Normal
   binary builds link `unrar-rs`, so binary distribution also carries the
   additional UnRAR source-code restriction.
