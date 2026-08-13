@@ -253,7 +253,7 @@ docker = false
 [machines.paths]
 staging = "/home/ubuntu/fleet-stage"
 scratch = "/dev/shm/fleet"
-corpus = "/home/ubuntu/corpus"
+# No corpus path: this machine's corpus arrives via ec2.corpus_source below.
 cleanup = false                          # the whole instance is destroyed anyway
 
 [machines.bundle]
@@ -309,7 +309,11 @@ volume_gb = 30
 deadman_minutes = 180
 max_hours = 2.0
 hourly_usd = 0.1440
-corpus_source = "generated-on-boot"
+# Local corpus root on the orchestrator (must hold corpus.json — rarpar's
+# target/bench/corpus after `corpus generate`). The runner uploads it into the
+# run root so $CORPUS is never empty on a fresh instance. Mutually exclusive
+# with paths.corpus; preflight refuses to launch anything if it is missing.
+corpus_source = "/Users/you/rarpar/target/bench/corpus"
 
 # ------------------------------------------------- machine: Windows (dGPU) ----
 # UNVALIDATED PATH. The runner uploads and executes a .ps1 file (never an inline

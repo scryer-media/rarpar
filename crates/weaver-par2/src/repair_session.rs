@@ -276,6 +276,10 @@ pub struct Par2RepairSession {
     source_generation: u64,
     diagnostics: Par2RepairSessionDiagnostics,
     assessment: Option<Par2RepairOutcome>,
+    /// Held from the first `analyze()` until the session drops: pages the
+    /// scan verifies must survive to a later `repair()` on the same session,
+    /// or the accumulate pass re-reads them from physical storage.
+    cache_retention: Option<crate::file_cache::CacheEvictionDeferral>,
 }
 
 impl Par2RepairSession {
@@ -309,6 +313,7 @@ impl Par2RepairSession {
             source_generation: 0,
             diagnostics: Par2RepairSessionDiagnostics::default(),
             assessment: None,
+            cache_retention: None,
         };
         session.refresh_diagnostics();
         session.enforce_retained_limit()?;
@@ -537,6 +542,8 @@ impl Par2RepairSession {
     /// caller decides what to do about them.
     pub fn analyze(&mut self) -> Result<Par2RepairOutcome, Par2SessionError> {
         self.ensure_committed_sources_unchanged()?;
+        self.cache_retention
+            .get_or_insert_with(crate::file_cache::CacheEvictionDeferral::acquire);
         if let Some(assessment) = &self.assessment {
             return Ok(assessment.clone());
         }
@@ -691,6 +698,8 @@ impl Par2RepairSession {
     /// as blocks are staged and as streamed reconstruction reads consume them.
     pub fn repair(&mut self) -> Result<Par2RepairOutcome, Par2SessionError> {
         self.ensure_committed_sources_unchanged()?;
+        self.cache_retention
+            .get_or_insert_with(crate::file_cache::CacheEvictionDeferral::acquire);
         let assessment = self.assessment()?.clone();
         if !matches!(assessment.status, Par2RepairStatus::RepairPossible) {
             return Ok(assessment);
@@ -1220,6 +1229,7 @@ mod tests {
             source_generation: 0,
             diagnostics: Par2RepairSessionDiagnostics::default(),
             assessment: None,
+            cache_retention: None,
         }
     }
 

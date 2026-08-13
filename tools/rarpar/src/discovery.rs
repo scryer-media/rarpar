@@ -697,8 +697,17 @@ fn label_related(label: &str, path: Option<&Path>) -> bool {
 fn read_prefix(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut buf = vec![0u8; len];
-    let read = file.read(&mut buf)?;
-    buf.truncate(read);
+    // A short `read` is not EOF; an under-filled prefix would make
+    // magic-number checks miss real PAR2 files.
+    let mut filled = 0;
+    while filled < len {
+        let read = file.read(&mut buf[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    buf.truncate(filled);
     Ok(buf)
 }
 

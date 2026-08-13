@@ -158,6 +158,18 @@ func (orch *orchestrator) hasCloud() bool {
 // preflight fails fast and, critically, before anything is created: credentials
 // first, then quota arithmetic, then host reachability.
 func (orch *orchestrator) preflight(ctx context.Context) error {
+	// A corpus_source that does not hold a corpus must stop the round here,
+	// before any instance exists; on-host it is only caught by the first
+	// corpus-verify gate, after the spend.
+	for _, machine := range orch.options.Config.Machines {
+		if machine.EC2 == nil || machine.EC2.CorpusSource == "" {
+			continue
+		}
+		manifest := filepath.Join(machine.EC2.CorpusSource, "corpus.json")
+		if _, err := os.Stat(manifest); err != nil {
+			return fmt.Errorf("machine %s: ec2.corpus_source is not a corpus root: %w", machine.Name, err)
+		}
+	}
 	orch.prepareAWS()
 	if orch.hasCloud() {
 		orch.log("preflight: AWS credentials")
@@ -370,6 +382,13 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 	defer transport.Close()
 
 	layout := LayoutFor(machine, orch.options.RunID)
+	// corpus_source ships a local corpus into the run root; $CORPUS must point
+	// there before RunScript bakes it into the script.
+	corpusUpload := ""
+	if machine.EC2 != nil && machine.EC2.CorpusSource != "" && machine.Paths.Corpus == "" {
+		corpusUpload = machine.EC2.CorpusSource
+		machine.Paths.Corpus = joinPosix(layout.Base, "corpus")
+	}
 	oracleTargets := map[string]string{}
 	for role, resolution := range hostState.Oracles {
 		oracleTargets[role] = resolution.RemotePath
@@ -383,6 +402,12 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 	orch.log("machine %s: uploading bundle to %s", machine.Name, layout.Bin)
 	if err := transport.UploadDir(ctx, hostState.BundleDir, layout.Bin); err != nil {
 		return err
+	}
+	if corpusUpload != "" {
+		orch.log("machine %s: uploading corpus %s to %s", machine.Name, corpusUpload, machine.Paths.Corpus)
+		if err := transport.UploadDir(ctx, corpusUpload, machine.Paths.Corpus); err != nil {
+			return err
+		}
 	}
 	upload := filepath.Join(orch.runDir, "upload-"+machine.Name)
 	if err := os.MkdirAll(upload, 0o755); err != nil {

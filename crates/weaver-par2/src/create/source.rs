@@ -194,11 +194,10 @@ pub(crate) fn collect_sources(
             .map(hash_one)
             .collect::<Result<Vec<_>>>()?
     };
-    // The creation memory plan accounts this vector by ALLOCATION CAPACITY
-    // (plan.rs validate_integrity passes `sources.capacity()` into
-    // `estimate_source_metadata_bytes`), and collecting through a Result
-    // adapter is not TrustedLen, so its capacity can exceed the length.
-    // Rebuild at exact capacity so the plan cross-check stays byte-stable.
+    // The creation memory plan accounts this vector by LENGTH (plan.rs passes
+    // `sources.len()` into `estimate_source_metadata_bytes`), so a collect
+    // through a Result adapter cannot skew the estimate. The exact-capacity
+    // rebuild stays so the allocation itself matches what the plan admits.
     let mut sources = Vec::with_capacity(active_inputs.len());
     sources.extend(scanned);
 

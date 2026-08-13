@@ -255,7 +255,7 @@ impl Par2CreatePlan {
         )?;
         let expected_memory = memory_plan_for(
             &self.sources,
-            self.sources.capacity(),
+            self.sources.len(),
             self.source_slice_count,
             MemoryPlanPaths {
                 base_path: &self.base_path,
@@ -478,7 +478,7 @@ fn estimate_source_metadata_bytes(sources: &[CreationSource], capacity: usize) -
         total = checked_memory_add(
             total,
             checked_memory_mul(
-                source.slice_checksums.capacity(),
+                source.slice_checksums.len(),
                 size_of::<SliceChecksum>(),
                 "source checksum estimate overflows",
             )?,

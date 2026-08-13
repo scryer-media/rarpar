@@ -83,6 +83,9 @@ func TestExampleMachineDetails(t *testing.T) {
 	if cloud.Oracles["rar"].Policy != OracleSourceBuild || cloud.Oracles["rar"].Reason == "" {
 		t.Fatal("the linux-arm unrar oracle must be a source build with a recorded reason")
 	}
+	if cloud.EC2.CorpusSource == "" || cloud.Paths.Corpus != "" {
+		t.Fatal("the EC2 example must provision its corpus via corpus_source, not a pre-seeded host path")
+	}
 
 	windows, ok := byName["win-dgpu"]
 	if !ok {
@@ -118,6 +121,12 @@ func TestConfigValidation(t *testing.T) {
 		new  string
 		want string
 	}{
+		{
+			name: "corpus_source excludes a host corpus path",
+			old:  "staging = \"/home/ubuntu/fleet-stage\"",
+			new:  "staging = \"/home/ubuntu/fleet-stage\"\ncorpus = \"/home/ubuntu/corpus\"",
+			want: "mutually exclusive",
+		},
 		{
 			name: "schema version pinned",
 			old:  "schema_version = 1",

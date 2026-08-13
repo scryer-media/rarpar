@@ -142,3 +142,51 @@ func TestSetEnvironmentValueReplacesLocale(t *testing.T) {
 		t.Fatalf("locale was not pinned: %q", joined)
 	}
 }
+
+func TestParsePerfStatOutputSumsHybridPMUEvents(t *testing.T) {
+	output := []byte(strings.Join([]string{
+		"1000,,cpu_core/cycles/,100.00",
+		"500,,cpu_atom/cycles/,100.00",
+		"2000,,cpu_core/instructions/,100.00",
+		"1000,,cpu_atom/instructions/,100.00",
+		"300,,cpu_core/branches/,100.00",
+		"<not counted>,,cpu_atom/branches/,0.00",
+		"4,,cpu_core/branch-misses/,100.00",
+		"2,,cpu_atom/branch-misses/,100.00",
+		"5000,,cpu_core/cache-references/,100.00",
+		"2500,,cpu_atom/cache-references/,100.00",
+		"600,,cpu_core/cache-misses/,100.00",
+		"300,,cpu_atom/cache-misses/,100.00",
+		"12.5,msec,task-clock,100.00",
+		"7,,context-switches,100.00",
+		"8,,cpu-migrations,100.00",
+		"123456789,,duration_time,100.00",
+	}, "\n"))
+
+	counters, err := parsePerfStatOutput(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counters.Cycles == nil || *counters.Cycles != 1500 {
+		t.Fatalf("cycles = %#v", counters)
+	}
+	if counters.Instructions == nil || *counters.Instructions != 3000 {
+		t.Fatalf("instructions = %#v", counters)
+	}
+	if counters.Branches == nil || *counters.Branches != 300 {
+		t.Fatalf("branches = %#v", counters)
+	}
+	if counters.BranchMisses == nil || *counters.BranchMisses != 6 {
+		t.Fatalf("branch misses = %#v", counters)
+	}
+	if counters.TaskClockMillis == nil || *counters.TaskClockMillis != 12.5 {
+		t.Fatalf("task clock = %#v", counters)
+	}
+}
+
+func TestParsePerfStatOutputRejectsDuplicatePlainRows(t *testing.T) {
+	output := []byte("1000,,cycles,100.00\n1000,,cycles,100.00\n")
+	if _, err := parsePerfStatOutput(output); err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("duplicate plain rows error = %v", err)
+	}
+}

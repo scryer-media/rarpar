@@ -663,19 +663,24 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 }
 
 func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
-	values := make(map[string]string, len(perfEvents))
+	uintSums := make(map[string]uint64, len(perfEvents))
+	floatSums := make(map[string]float64, 1)
+	counted := make(map[string]bool, len(perfEvents))
+	plainRows := make(map[string]bool, len(perfEvents))
 	for _, line := range strings.Split(string(output), "\n") {
 		fields := strings.Split(strings.TrimSpace(line), ",")
 		if len(fields) == 0 || strings.TrimSpace(fields[0]) == "" {
 			continue
 		}
 		event := ""
+		hybrid := false
 		eventIndex := -1
 		for index, field := range fields[1:] {
-			candidate := normalizePerfEvent(field)
+			pmu, candidate := splitHybridPerfEvent(normalizePerfEvent(field))
 			for _, expected := range perfEvents {
 				if candidate == expected {
 					event = expected
+					hybrid = pmu != ""
 					eventIndex = index + 1
 					break
 				}
@@ -687,8 +692,20 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 		if event == "" {
 			continue
 		}
-		if _, exists := values[event]; exists {
+		// Hybrid kernels emit one row per PMU class (cpu_core/cpu_atom) for
+		// the same logical event; those rows sum. A repeated plain row, or a
+		// plain row mixed with hybrid rows, is still a malformed report.
+		if counted[event] && (!hybrid || plainRows[event]) {
 			return nil, fmt.Errorf("%s was reported more than once", event)
+		}
+		value := strings.TrimSpace(fields[0])
+		if strings.HasPrefix(value, "<") {
+			if hybrid {
+				// The PMU class this process never scheduled on reports
+				// `<not counted>`; it contributes nothing to the sum.
+				continue
+			}
+			return nil, fmt.Errorf("%s reported %s", event, value)
 		}
 		if eventIndex+1 >= len(fields) {
 			return nil, fmt.Errorf("%s did not report a running percentage", event)
@@ -702,50 +719,58 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 				runningField,
 			)
 		}
-		value := strings.TrimSpace(fields[0])
-		if strings.HasPrefix(value, "<") {
-			return nil, fmt.Errorf("%s reported %s", event, value)
+		if event == "task-clock" {
+			parsed, parseErr := parsePerfFloat(value)
+			if parseErr != nil {
+				return nil, fmt.Errorf("%s: %w", event, parseErr)
+			}
+			floatSums[event] += *parsed
+		} else {
+			parsed, parseErr := parsePerfUint(value)
+			if parseErr != nil {
+				return nil, fmt.Errorf("%s: %w", event, parseErr)
+			}
+			uintSums[event] += *parsed
 		}
-		values[event] = value
+		counted[event] = true
+		if !hybrid {
+			plainRows[event] = true
+		}
 	}
 	for _, event := range perfEvents {
-		if _, ok := values[event]; !ok {
+		if !counted[event] {
 			return nil, fmt.Errorf("%s was not reported", event)
 		}
 	}
-	counters := &PerfCounters{}
-	var err error
-	if counters.Cycles, err = parsePerfUint(values["cycles"]); err != nil {
-		return nil, fmt.Errorf("cycles: %w", err)
+	uintValue := func(event string) *uint64 {
+		value := uintSums[event]
+		return &value
 	}
-	if counters.Instructions, err = parsePerfUint(values["instructions"]); err != nil {
-		return nil, fmt.Errorf("instructions: %w", err)
+	taskClock := floatSums["task-clock"]
+	return &PerfCounters{
+		Cycles:          uintValue("cycles"),
+		Instructions:    uintValue("instructions"),
+		Branches:        uintValue("branches"),
+		BranchMisses:    uintValue("branch-misses"),
+		CacheReferences: uintValue("cache-references"),
+		CacheMisses:     uintValue("cache-misses"),
+		TaskClockMillis: &taskClock,
+		ContextSwitches: uintValue("context-switches"),
+		CPUMigrations:   uintValue("cpu-migrations"),
+		DurationNanos:   uintValue("duration_time"),
+	}, nil
+}
+
+// splitHybridPerfEvent splits a hybrid-PMU event name such as
+// "cpu_core/cycles/" into its PMU class and logical event. Plain event names
+// return an empty PMU.
+func splitHybridPerfEvent(candidate string) (string, string) {
+	for _, prefix := range []string{"cpu_core/", "cpu_atom/"} {
+		if rest, ok := strings.CutPrefix(candidate, prefix); ok {
+			return strings.TrimSuffix(prefix, "/"), strings.TrimSuffix(rest, "/")
+		}
 	}
-	if counters.Branches, err = parsePerfUint(values["branches"]); err != nil {
-		return nil, fmt.Errorf("branches: %w", err)
-	}
-	if counters.BranchMisses, err = parsePerfUint(values["branch-misses"]); err != nil {
-		return nil, fmt.Errorf("branch-misses: %w", err)
-	}
-	if counters.CacheReferences, err = parsePerfUint(values["cache-references"]); err != nil {
-		return nil, fmt.Errorf("cache-references: %w", err)
-	}
-	if counters.CacheMisses, err = parsePerfUint(values["cache-misses"]); err != nil {
-		return nil, fmt.Errorf("cache-misses: %w", err)
-	}
-	if counters.TaskClockMillis, err = parsePerfFloat(values["task-clock"]); err != nil {
-		return nil, fmt.Errorf("task-clock: %w", err)
-	}
-	if counters.ContextSwitches, err = parsePerfUint(values["context-switches"]); err != nil {
-		return nil, fmt.Errorf("context-switches: %w", err)
-	}
-	if counters.CPUMigrations, err = parsePerfUint(values["cpu-migrations"]); err != nil {
-		return nil, fmt.Errorf("cpu-migrations: %w", err)
-	}
-	if counters.DurationNanos, err = parsePerfUint(values["duration_time"]); err != nil {
-		return nil, fmt.Errorf("duration_time: %w", err)
-	}
-	return counters, nil
+	return "", candidate
 }
 
 func setEnvironmentValue(environment []string, name, value string) []string {

@@ -642,6 +642,10 @@ impl Par2Repairer {
         // than one worker; the width comes from the same process-stable
         // embedder-supplied value creation uses.
         reedsolomon_rs::threading::ensure_pool(crate::create::configured_create_threads_for_pool);
+        // This entry point carries repair intent: pages the scan verifies are
+        // read again by staging and by copy-only repair, which never reaches
+        // `execute_repair_with_options`' own deferral.
+        let _cache_retention = crate::file_cache::CacheEvictionDeferral::acquire();
         match self.verify_or_repair_pass(want_carry)? {
             RepairPassResult::Success(success) => self.finish_or_retry(success, want_carry),
             RepairPassResult::PostRepairVerificationFailed { reason, carry } => {

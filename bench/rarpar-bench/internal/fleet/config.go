@@ -573,6 +573,9 @@ func validate(state *decodeState, config *Config) {
 		if machine.needsCorpus() && machine.Paths.Corpus == "" && (machine.EC2 == nil || machine.EC2.CorpusSource == "") {
 			state.fail("%s: paths.corpus is required for the macro suites", prefix)
 		}
+		if machine.EC2 != nil && machine.EC2.CorpusSource != "" && machine.Paths.Corpus != "" {
+			state.fail("%s: ec2.corpus_source and paths.corpus are mutually exclusive; corpus_source uploads into the run root", prefix)
+		}
 
 		switch machine.Capabilities.Perf {
 		case PerfLinux, PerfSamply, PerfNone:

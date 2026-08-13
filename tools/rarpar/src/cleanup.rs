@@ -189,8 +189,11 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, RarparError> {
     let mut left_buf = [0u8; 64 * 1024];
     let mut right_buf = [0u8; 64 * 1024];
     loop {
-        let left_read = left.read(&mut left_buf)?;
-        let right_read = right.read(&mut right_buf)?;
+        // `read` may return short for either file independently; comparing
+        // raw counts would call equal files unequal. Fill each side to the
+        // same boundary first.
+        let left_read = read_filled(&mut left, &mut left_buf)?;
+        let right_read = read_filled(&mut right, &mut right_buf)?;
         if left_read != right_read {
             return Ok(false);
         }
@@ -201,6 +204,19 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, RarparError> {
             return Ok(false);
         }
     }
+}
+
+/// Read until `buf` is full or EOF; a short `read` is not EOF.
+fn read_filled(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let read = file.read(&mut buf[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 fn move_to_trash(paths: &[PathBuf]) -> Result<(), RarparError> {
