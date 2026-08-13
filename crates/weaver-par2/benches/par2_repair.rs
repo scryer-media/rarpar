@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use benchmark_support::{crate_bench_scenarios, select_scenarios, stage_scenario};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use md5::{Digest, Md5};
-use tempfile::tempdir;
-use weaver_par2::{
+use par2_rs::{
     DiskFileAccess, FactorDst, FileDescription, FileId, Par2FileSet, Par2RepairStatus,
     Par2Repairer, Par2RepairerOptions, RecoverySetId, SliceChecksum, SliceChecksumState,
     mul_acc_multi_region, mul_acc_region, verify_slices,
 };
+use tempfile::tempdir;
 
 fn bench_filter() -> Vec<String> {
     std::env::var("WEAVER_PAR2_BENCH_SCENARIOS")
@@ -85,8 +85,8 @@ fn repairer_options(
 }
 
 fn synthetic_par2_file(filename: &str, data: &[u8], slice_size: u64) -> (Par2FileSet, FileId) {
-    let hash_full = weaver_par2::checksum::md5(data);
-    let hash_16k = weaver_par2::checksum::md5(&data[..data.len().min(16 * 1024)]);
+    let hash_full = par2_rs::checksum::md5(data);
+    let hash_16k = par2_rs::checksum::md5(&data[..data.len().min(16 * 1024)]);
     let mut file_id_bytes = [0u8; 16];
     file_id_bytes[..8].copy_from_slice(&slice_size.to_le_bytes());
     file_id_bytes[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -302,15 +302,15 @@ fn bench_gf_kernel(c: &mut Criterion) {
     let batch_factors: Vec<u16> = (0..8).map(|i| 0x1021 + i * 0x0777).collect();
     group.bench_function("mul_acc_input_batch_64kb_x8src", |b| {
         b.iter(|| {
-            let srcs: Vec<weaver_par2::gf_simd::FactorSrc<'_>> = batch_factors
+            let srcs: Vec<par2_rs::gf_simd::FactorSrc<'_>> = batch_factors
                 .iter()
                 .zip(batch_srcs.iter())
-                .map(|(&factor, src)| weaver_par2::gf_simd::FactorSrc {
+                .map(|(&factor, src)| par2_rs::gf_simd::FactorSrc {
                     factor,
                     src: src.as_slice(),
                 })
                 .collect();
-            weaver_par2::gf_simd::mul_acc_input_batch(&mut dst, &srcs);
+            par2_rs::gf_simd::mul_acc_input_batch(&mut dst, &srcs);
         });
     });
 
@@ -328,7 +328,7 @@ fn bench_md5_hotloop(c: &mut Criterion) {
 
     group.bench_function("native_backend", |b| {
         b.iter(|| {
-            black_box(weaver_par2::checksum::md5(black_box(&data)));
+            black_box(par2_rs::checksum::md5(black_box(&data)));
         });
     });
 
@@ -350,7 +350,7 @@ fn bench_md5_hotloop(c: &mut Criterion) {
 /// elimination strategy. Toggled via the explicit `use_tiled` A/B hook, not the
 /// `WEAVER_MATRIX_TILED` env gate, so the comparison is deterministic.
 fn bench_matrix_solve(c: &mut Criterion) {
-    use weaver_par2::matrix::build_repair_matrix_ab;
+    use par2_rs::matrix::build_repair_matrix_ab;
 
     let mut group = c.benchmark_group("matrix_solve");
     group.sample_size(10);
@@ -360,7 +360,7 @@ fn bench_matrix_solve(c: &mut Criterion) {
     for &n in &[512usize, 1024, 2048] {
         let avail = 2 * n;
         let total = n + avail;
-        let constants = weaver_par2::gf::input_slice_constants(total);
+        let constants = par2_rs::gf::input_slice_constants(total);
         let missing: Vec<usize> = (0..n).collect();
         let available: Vec<usize> = (n..total).collect();
         let exponents: Vec<u32> = (0..n as u32).collect();

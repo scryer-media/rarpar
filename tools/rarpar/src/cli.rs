@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const ROOT_LONG_ABOUT: &str = "\
 rarpar is a smart RAR/PAR2 repair and extraction tool.
@@ -26,7 +26,7 @@ Examples:
 rarpar is not an official RAR, UnRAR, or PAR2 utility and does not create or
 modify RAR archives.";
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(
     name = "rarpar",
     version,
@@ -38,6 +38,10 @@ pub struct Cli {
     /// Emit machine-readable JSON reports for planning and automation.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Suppress human-readable progress and summaries.
+    #[arg(long, global = true)]
+    pub quiet: bool,
 
     /// Inspect only the paths given; do not recurse into directories.
     #[arg(long, global = true)]
@@ -51,7 +55,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 20_000)]
     pub max_files: usize,
 
-    /// Plan/report work without repairing, extracting, or deleting files.
+    /// Plan/report work without creating, repairing, extracting, or deleting files.
     #[arg(long, global = true)]
     pub dry_run: bool,
 
@@ -67,6 +71,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub search_dir: Vec<PathBuf>,
 
+    /// PAR2 file placement policy: smart scans by content; canonical uses recorded paths only.
+    #[arg(long, global = true, value_enum, default_value_t = ParPlacement::Smart)]
+    pub par_placement: ParPlacement,
+
     /// File containing candidate archive passwords, one per line; values are never printed.
     #[arg(long, global = true, value_name = "PATH")]
     pub password_file: Option<PathBuf>,
@@ -79,7 +87,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FD")]
     pub password_fd: Option<i32>,
 
-    /// Allow extraction to overwrite existing output files.
+    /// Allow extraction and PAR2 creation to overwrite existing output files.
     #[arg(long, global = true)]
     pub overwrite: bool,
 
@@ -160,7 +168,17 @@ files are rejected unless --overwrite is supplied.")]
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ParCommand {
+    /// Create a PAR2 recovery set for explicit input files.
+    #[command(
+        long_about = "Create a PAR2 recovery set for the explicitly supplied input files. Inputs are resolved relative to --base-path; use --dry-run to inspect the planned packet and volume output without writing it."
+    )]
+    Create(ParCreateArgs),
     /// Verify files against a PAR2 set.
+    #[command(long_about = "\
+Verify files against a PAR2 set. The default smart placement mode can locate
+renamed or moved protected files by content. Use --par-placement canonical to
+verify only the paths recorded by the PAR2 set, which is useful for direct
+comparison with conventional PAR2 verification tools.")]
     Verify(ParArgs),
     /// Repair files using a PAR2 set.
     #[command(long_about = "\
@@ -177,4 +195,242 @@ pub struct ParArgs {
     /// Additional directories containing protected data files.
     #[arg(value_name = "SEARCH_DIR")]
     pub search_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ParCreateArgs {
+    /// Output PAR2 path or stem; recovery volumes use this stem as well.
+    #[arg(value_name = "OUTPUT")]
+    pub output: PathBuf,
+
+    /// Explicit input files to include in the recovery set; no recursion or file-list expansion is performed.
+    #[arg(value_name = "FILE", required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+
+    /// Base directory used to make PAR2 names relative and to resolve inputs; defaults to OUTPUT's parent.
+    #[arg(long, value_name = "DIR")]
+    pub base_path: Option<PathBuf>,
+
+    /// Target PAR2 block size in bytes.
+    #[arg(
+        short = 's',
+        long,
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "block_count"
+    )]
+    pub block_size: Option<u64>,
+
+    /// Target number of source blocks.
+    #[arg(
+        short = 'b',
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with = "block_size"
+    )]
+    pub block_count: Option<u32>,
+
+    /// Recovery amount as a percentage of source blocks.
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "PERCENT",
+        value_parser = clap::value_parser!(u32),
+        conflicts_with = "recovery_count"
+    )]
+    pub recovery_percent: Option<u32>,
+
+    /// Exact number of recovery blocks (long option only).
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(0..=32_768),
+        conflicts_with = "recovery_percent"
+    )]
+    pub recovery_count: Option<u32>,
+
+    /// Exponent assigned to the first recovery block.
+    #[arg(
+        short = 'f',
+        long,
+        default_value_t = 0,
+        value_name = "EXPONENT",
+        value_parser = clap::value_parser!(u32).range(0..=32_768)
+    )]
+    pub first_exponent: u32,
+
+    /// Recovery volume sizing scheme.
+    #[arg(long, value_enum, default_value_t = ParVolumeScheme::Variable)]
+    pub volume_scheme: ParVolumeScheme,
+
+    /// Number of recovery volumes to write.
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(1..=31)
+    )]
+    pub volume_count: Option<u32>,
+
+    /// Processing-buffer budget for forward encoding, in MiB; metadata and packet storage are reported separately.
+    #[arg(
+        long,
+        value_name = "MIB",
+        value_parser = clap::value_parser!(usize)
+    )]
+    pub memory_mib: Option<usize>,
+
+    /// Recovery creation backend: cpu, auto, or metal. Auto keeps work below
+    /// 16 GiB on CPU and preflights native Metal when available at or above it.
+    #[arg(long, value_enum, default_value_t = ParCreationBackend::Cpu)]
+    pub backend: ParCreationBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParCreationBackend {
+    /// Always use the CPU/SIMD creation path.
+    Cpu,
+    /// Keep work below 16 GiB on CPU; at or above it, preflight native Metal
+    /// when available and use CPU if Metal cannot be admitted.
+    Auto,
+    /// Require Metal for recovery-data creation.
+    Metal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParVolumeScheme {
+    /// Use the library's variable recovery-volume sizing.
+    Variable,
+    /// Divide recovery blocks as evenly as possible among the volumes.
+    Uniform,
+    /// Cap each recovery volume at the largest source file's block count.
+    Limited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParPlacement {
+    /// Locate renamed or moved files by content before verification or repair.
+    Smart,
+    /// Verify only the paths recorded by PAR2 and explicitly supplied search directories.
+    Canonical,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_args(arguments: &[&str]) -> ParCreateArgs {
+        let mut command = vec!["rarpar", "par", "create"];
+        command.extend(arguments);
+        let cli = Cli::try_parse_from(command).expect("create arguments should parse");
+        match cli.command.expect("a command is required") {
+            Command::Par {
+                command: ParCommand::Create(args),
+            } => args,
+            other => panic!("expected par create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_has_distinct_output_and_explicit_files() {
+        let args = create_args(&["release/set", "release/a.bin", "release/b.bin"]);
+
+        assert_eq!(args.output, PathBuf::from("release/set"));
+        assert_eq!(
+            args.files,
+            [
+                PathBuf::from("release/a.bin"),
+                PathBuf::from("release/b.bin")
+            ]
+        );
+        assert_eq!(args.base_path, None);
+        assert_eq!(args.volume_scheme, ParVolumeScheme::Variable);
+    }
+
+    #[test]
+    fn create_supports_short_sizing_and_recovery_options() {
+        let args = create_args(&[
+            "set",
+            "a.bin",
+            "-s",
+            "4096",
+            "-r",
+            "5",
+            "-f",
+            "7",
+            "--volume-scheme",
+            "uniform",
+            "-n",
+            "3",
+            "--memory-mib",
+            "128",
+        ]);
+
+        assert_eq!(args.block_size, Some(4096));
+        assert_eq!(args.recovery_percent, Some(5));
+        assert_eq!(args.first_exponent, 7);
+        assert_eq!(args.volume_scheme, ParVolumeScheme::Uniform);
+        assert_eq!(args.volume_count, Some(3));
+        assert_eq!(args.memory_mib, Some(128));
+    }
+
+    #[test]
+    fn create_accepts_explicit_backend_selection() {
+        let args = create_args(&["set", "a.bin", "--backend", "metal"]);
+        assert_eq!(args.backend, ParCreationBackend::Metal);
+    }
+
+    #[test]
+    fn create_recovery_percent_is_integral() {
+        let result = Cli::try_parse_from([
+            "rarpar",
+            "par",
+            "create",
+            "set",
+            "a.bin",
+            "--recovery-percent",
+            "5.5",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_recovery_percent_allows_values_above_one_hundred() {
+        let args = create_args(&["set", "a.bin", "--recovery-percent", "150"]);
+
+        assert_eq!(args.recovery_percent, Some(150));
+    }
+
+    #[test]
+    fn create_limits_recovery_volume_count_to_thirty_one() {
+        let result = Cli::try_parse_from([
+            "rarpar",
+            "par",
+            "create",
+            "set",
+            "a.bin",
+            "--volume-count",
+            "32",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_keeps_global_working_dir_short_option_unambiguous() {
+        let cli = Cli::try_parse_from([
+            "rarpar", "-C", "work", "par", "create", "set", "a.bin", "-b", "2",
+        ])
+        .expect("global working directory and block count should parse together");
+
+        assert_eq!(cli.working_dir, Some(PathBuf::from("work")));
+        match cli.command {
+            Some(Command::Par {
+                command: ParCommand::Create(args),
+            }) => assert_eq!(args.block_count, Some(2)),
+            other => panic!("expected par create, got {other:?}"),
+        }
+    }
 }

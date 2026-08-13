@@ -356,4 +356,41 @@ mod tests {
         assert_eq!(Rar4HostOs::from(2), Rar4HostOs::Windows);
         assert_eq!(Rar4HostOs::from(3), Rar4HostOs::Unix);
     }
+
+    /// The cipher table, pinned over the whole unpack-version range.
+    ///
+    /// This is the crate's single copy of RAR4's version-to-cipher rule and
+    /// three unrelated places now read it: header parsing
+    /// (`rar4_file_encryption_method`), the extraction path's decryptor
+    /// selection, and the stored-layout `rar4_uses_aes` predicate that decides
+    /// whether an encrypted RAR4 member may be direct-stored at all. A change
+    /// to any arm changes which cipher runs over a member's bytes, so the
+    /// boundaries are stated rather than left to the `_` arm's shape.
+    #[test]
+    fn the_unpack_version_cipher_table_is_pinned_across_the_whole_range() {
+        for version in 0..=u8::MAX {
+            let expected = match version {
+                13 => Rar4EncryptionMethod::Rar13,
+                15 => Rar4EncryptionMethod::Rar15,
+                20 | 26 => Rar4EncryptionMethod::Rar20,
+                _ => Rar4EncryptionMethod::Rar30,
+            };
+            assert_eq!(
+                Rar4EncryptionMethod::for_unpack_version(version),
+                expected,
+                "unpack version {version}"
+            );
+        }
+
+        // And the salt rule that rides on it: only "RAR 3.0" encryption reads
+        // the header's 8-byte file salt.
+        for method in [
+            Rar4EncryptionMethod::Rar13,
+            Rar4EncryptionMethod::Rar15,
+            Rar4EncryptionMethod::Rar20,
+        ] {
+            assert!(!method.uses_salt(), "{method:?} predates the file salt");
+        }
+        assert!(Rar4EncryptionMethod::Rar30.uses_salt());
+    }
 }

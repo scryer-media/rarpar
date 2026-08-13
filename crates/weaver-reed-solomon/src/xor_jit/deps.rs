@@ -4,21 +4,23 @@
 //! `output_plane[o] = XOR of input_plane[k]` over the set bits of row `o` of a
 //! 16×16 GF(2) matrix — the same linear map the GFNI affine kernel and the
 //! shuffle tables encode, in the bit-plane basis the JIT'd `vpxor` kernel
-//! consumes. The matrix is fixed per factor (once-per-factor setup); ParPar
-//! builds it with a SIMD generator, but the result is pure GF math, so it is
-//! computed scalar here and validated byte-exact end to end.
+//! consumes. The matrix is fixed per factor, computed scalar during setup,
+//! and validated byte-exact end to end.
 //!
 //! [`muladd_planar`] is the correctness oracle the JIT codegen must reproduce.
 
 use super::transpose::{BLOCK_BYTES, PLANE_BYTES};
 use crate::gf;
+use std::sync::OnceLock;
 
 /// The 16×16 GF(2) dependency matrix for multiply-by-`factor`, plane-space.
 /// `rows[o]` bit `k` set ⇒ output plane `o` receives (XORs in) input plane `k`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorDeps {
     pub rows: [u16; 16],
 }
+
+static NIBBLE_DEPS: OnceLock<[[XorDeps; 16]; 4]> = OnceLock::new();
 
 /// Build the dependency matrix for `factor`.
 ///
@@ -26,6 +28,27 @@ pub struct XorDeps {
 /// `15-k`; its contribution to the product is `factor · 2^(15-k)`, whose bit
 /// `15-o` lands in output plane `o`.
 pub fn compute_deps(factor: u16) -> XorDeps {
+    let table = NIBBLE_DEPS.get_or_init(|| {
+        let mut table = [[XorDeps { rows: [0; 16] }; 16]; 4];
+        for (nibble, entries) in table.iter_mut().enumerate() {
+            for (value, entry) in entries.iter_mut().enumerate() {
+                *entry = compute_deps_reference((value as u16) << (nibble * 4));
+            }
+        }
+        table
+    });
+
+    let mut rows = [0u16; 16];
+    for (nibble, entries) in table.iter().enumerate() {
+        let value = usize::from((factor >> (nibble * 4)) & 0x0f);
+        for (row, contribution) in rows.iter_mut().zip(entries[value].rows) {
+            *row ^= contribution;
+        }
+    }
+    XorDeps { rows }
+}
+
+fn compute_deps_reference(factor: u16) -> XorDeps {
     let mut rows = [0u16; 16];
     for k in 0..16usize {
         let contribution = gf::mul(factor, 1u16 << (15 - k));
@@ -118,6 +141,13 @@ mod tests {
             unsafe { finish_block(&mut dst_planes) };
 
             assert_eq!(dst_planes, expected, "factor {factor:#06x}");
+        }
+    }
+
+    #[test]
+    fn nibble_lookup_matches_reference_for_every_factor() {
+        for factor in 0..=u16::MAX {
+            assert_eq!(compute_deps(factor), compute_deps_reference(factor));
         }
     }
 

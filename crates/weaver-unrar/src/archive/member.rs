@@ -15,6 +15,25 @@ use crate::hash_pipeline::SharedHashStream;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Output buffer for member extraction, deliberately smaller than the spans the
+/// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
+/// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
+/// a single write at or above capacity, so a capacity above the flush span
+/// would memcpy every output byte for no reduction in syscalls; below it, large
+/// spans go straight to `write` and only the small ones (per-filter subranges)
+/// are coalesced.
+const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
+/// Input buffer for the volume-chained decode streams, the read-side twin of
+/// [`OUTPUT_WRITE_BUFFER_BYTES`] and deliberately smaller than the spans the
+/// decoders ask for (`StreamingBitReader` fills 512 KiB at a time on the RAR4
+/// and RAR5 single-thread paths; the RAR5 staged path reads up to 4 MiB).
+/// `BufReader` bypasses its buffer only when its buffer is empty *and* the
+/// request is at or above capacity, so the previous 1 MiB capacity memcpy'd
+/// every compressed byte of a 512 KiB request instead of reading straight into
+/// the decoder's buffer. At 256 KiB every decoder-sized request passes through,
+/// while short reads — notably the shrinking tail of the RAR5 staged refill
+/// loop — stay buffered.
+const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
 #[cfg(any(windows, test))]
@@ -316,7 +335,7 @@ impl RarArchive {
                     &self.limits,
                 )?;
                 let written = output.len() as u64;
-                let actual_crc = expected_crc.map(|_| crc32fast::hash(&output));
+                let actual_crc = expected_crc.map(|_| crate::crc::hash(&output));
                 let actual_blake = expected_blake.map(|_| {
                     let mut hasher = Blake2spHasher::new();
                     hasher.update(&output);
@@ -334,7 +353,7 @@ impl RarArchive {
             });
         }
         if let Some(expected) = service.comment_crc16 {
-            let actual = (crc32fast::hash(&output) & 0xffff) as u16;
+            let actual = (crate::crc::hash(&output) & 0xffff) as u16;
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
                     member: fh.name.clone(),
@@ -1110,7 +1129,7 @@ impl RarArchive {
             .unwrap_or(payload.len());
         let target_bytes = &payload[..nul_pos];
         if verify && let Some(expected) = fh.data_crc32 {
-            let actual = crc32fast::hash(target_bytes);
+            let actual = crate::crc::hash(target_bytes);
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
                     member: fh.name.clone(),
@@ -3399,16 +3418,21 @@ impl RarArchive {
         Ok(())
     }
 
-    fn normalized_provider_segments(segments: &[DataSegment]) -> (Vec<DataSegment>, usize) {
+    /// A member's segments in volume order, alongside the volume its data
+    /// starts in.
+    ///
+    /// Both stay in the volume set's own absolute numbering — the same
+    /// numbering [`RarArchive::member_segments`], [`RarArchive::add_volume`],
+    /// [`RarArchive::attach_volume_reader`] and [`VolumeProvider::get_volume`]
+    /// speak. The streaming paths hand these straight to a provider, so a
+    /// member that starts in volume 5 asks the provider for volume 5.
+    fn sorted_member_segments(segments: &[DataSegment]) -> (Vec<DataSegment>, usize) {
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by_key(|segment| segment.volume_index);
-        let volume_base = sorted_segments
+        let first_volume = sorted_segments
             .first()
             .map_or(0, |segment| segment.volume_index);
-        for segment in &mut sorted_segments {
-            segment.volume_index -= volume_base;
-        }
-        (sorted_segments, volume_base)
+        (sorted_segments, first_volume)
     }
 
     fn advance_solid_cursor_to_streaming(
@@ -3437,7 +3461,7 @@ impl RarArchive {
 
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_unpacked = self.target_unpacked_size(&skip_fh);
-                let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
+                let (segments, _) = Self::sorted_member_segments(&skip_entry.segments);
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
                     .with_member_name(&skip_fh.name)
                     .with_max_data_segment(self.limits.max_data_segment)
@@ -3540,6 +3564,25 @@ impl RarArchive {
         }
 
         Ok(())
+    }
+
+    /// The effective solid flag for one member.
+    ///
+    /// RAR4 headers already carry the **per-file** value: `parse.rs`'s
+    /// `rar4_effective_solid` folds the archive-level flag in only for the
+    /// RAR 1.3-1.5 versions that need it, exactly like extract.cpp:917-922.
+    /// OR-ing the archive flag back in here would make every member of a solid
+    /// RAR4 archive inherit the previous member's window, tables and filters,
+    /// which unrar does only when the member's own header asks for it.
+    ///
+    /// RAR5 keeps the existing behavior: the first compressed member of a solid
+    /// archive has no per-file SOLID flag but still seeds the following ones.
+    fn member_is_solid(&self, fh: &FileHeader) -> bool {
+        if fh.compression.format.is_rar4_family() {
+            fh.compression.solid
+        } else {
+            self.is_solid || fh.compression.solid
+        }
     }
 
     fn effective_member_dict_size(fh: &FileHeader) -> u64 {
@@ -3977,7 +4020,7 @@ impl RarArchive {
         let fh = entry.file_header.clone();
         let hash = entry.hash.clone();
         let mi = self.member_info(index);
-        let is_solid = fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let archive_format = self.format;
         if !allow_link_payload {
             self.reject_link_member_without_file_target(entry, &fh)?;
@@ -4150,6 +4193,11 @@ impl RarArchive {
 
             let (actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
+                let decoder = Self::prepare_rar5_member_decoder(
+                    &mut self.solid_decoder,
+                    &fh,
+                    self.limits.max_dict_size,
+                )?;
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
@@ -4159,32 +4207,21 @@ impl RarArchive {
                     expected_blake.is_some(),
                 );
 
-                if let Some(crypto) = rar5_crypto.as_ref() {
+                let written = if let Some(crypto) = rar5_crypto.as_ref() {
                     let reader = crate::crypto::DecryptingReader::new_rar5(
                         base_reader,
                         &crypto.key,
                         &crypto.iv,
                     );
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
+                    decoder.decompress_reader_to_writer(reader, unpacked_size, &mut hash_writer)?
                 } else {
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            base_reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                }
+                    decoder.decompress_reader_to_writer(
+                        base_reader,
+                        unpacked_size,
+                        &mut hash_writer,
+                    )?
+                };
+                self.enforce_unknown_lz_output_limit(&fh, written)?;
 
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
@@ -4265,22 +4302,24 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    let written = crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
                 } else {
-                    let written = crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         base_reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
@@ -4456,7 +4495,7 @@ impl RarArchive {
     /// This is the memory-efficient alternative to `extract_member()`. Instead of
     /// returning the full decompressed content as a `Vec<u8>`, it writes directly
     /// to disk via a `BufWriter`. Memory usage is bounded to dict_size (max 256 MB)
-    /// for LZ-compressed files, or ~8 MB for Store (uncompressed) files.
+    /// for LZ-compressed files, or a few MB for Store (uncompressed) files.
     ///
     /// For Store method without encryption: reads segments directly from volumes
     /// and writes to disk without buffering the full file.
@@ -4495,7 +4534,7 @@ impl RarArchive {
         let owner = entry.owner.clone();
         let rar4_salt = entry.rar4_salt;
         let mi = self.member_info(index);
-        let is_solid = fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let archive_format = self.format;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
@@ -4545,7 +4584,7 @@ impl RarArchive {
             Self::create_regular_output_file_for_member(&member_name, out_path)?;
         let out_path = resolved_out_path.as_path();
         Self::preallocate_output_file(&file, self.target_unpacked_size(&fh));
-        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
 
         if fh.compression.method == CompressionMethod::Store {
             let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -4688,48 +4727,48 @@ impl RarArchive {
             };
 
             let segments = self.members[index].segments.clone();
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                &fh,
+                self.limits.max_dict_size,
+            )?;
             let base_reader =
                 ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                     .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
-            let (actual_crc, actual_blake) = {
-                let mut hash_writer = HashingWriter::new(
-                    &mut writer,
-                    expected_crc.is_some(),
-                    expected_blake.is_some(),
-                );
-                if let Some(crypto) = rar5_crypto.as_ref() {
+            // BLAKE2sp runs off-thread for large members (see hash_pipeline).
+            // CRC32 stays inline on purpose: hardware CRC keeps up with the
+            // decoder without paying for the channel hop.
+            let blake_stream = expected_blake
+                .is_some()
+                .then(|| SharedHashStream::new(false, false, true, unpacked_size));
+
+            let (actual_crc, written) = {
+                let mut blake_writer = HashTrackingWriter {
+                    inner: &mut writer,
+                    hash: blake_stream.clone(),
+                };
+                let mut hash_writer =
+                    HashingWriter::new(&mut blake_writer, expected_crc.is_some(), false);
+                let written = if let Some(crypto) = rar5_crypto.as_ref() {
                     let reader = crate::crypto::DecryptingReader::new_rar5(
                         base_reader,
                         &crypto.key,
                         &crypto.iv,
                     );
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
+                    decoder.decompress_reader_to_writer(reader, unpacked_size, &mut hash_writer)?
                 } else {
-                    let written =
-                        crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                            base_reader,
-                            unpacked_size,
-                            &fh.compression,
-                            &mut hash_writer,
-                            self.limits.max_dict_size,
-                        )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                }
+                    decoder.decompress_reader_to_writer(
+                        base_reader,
+                        unpacked_size,
+                        &mut hash_writer,
+                    )?
+                };
                 hash_writer.flush().map_err(RarError::Io)?;
-                (
-                    expected_crc.map(|_| hash_writer.finalize_crc()),
-                    expected_blake.map(|_| hash_writer.finalize_blake2()),
-                )
+                (expected_crc.map(|_| hash_writer.finalize_crc()), written)
             };
+            self.enforce_unknown_lz_output_limit(&fh, written)?;
+            let (_, actual_blake) = finalize_shared_hash(blake_stream)?;
 
             Self::verify_member_crc32(
                 &fh.name,
@@ -4798,21 +4837,23 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?
                 } else {
-                    crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                    Self::solid_decode_reader_to_writer(
+                        &mut self.solid_decoder_rar4,
+                        &mut self.solid_decoder,
+                        self.limits.max_dict_size,
                         base_reader,
                         unpacked_size,
-                        fh.compression.version,
-                        fh.compression.method.code(),
-                        fh.compression.dict_size,
+                        &fh,
                         &mut hash_writer,
                     )?
                 };
@@ -4864,12 +4905,20 @@ impl RarArchive {
                 None
             };
 
-            let (written, actual_crc, actual_blake) = {
-                let mut hash_writer = HashingWriter::new(
-                    &mut writer,
-                    expected_crc.is_some(),
-                    expected_blake.is_some(),
-                );
+            // BLAKE2sp runs off-thread for large members (see hash_pipeline).
+            // CRC32 stays inline on purpose: hardware CRC keeps up with the
+            // decoder without paying for the channel hop.
+            let blake_stream = expected_blake
+                .is_some()
+                .then(|| SharedHashStream::new(false, false, true, unpacked_size));
+
+            let (written, actual_crc) = {
+                let mut blake_writer = HashTrackingWriter {
+                    inner: &mut writer,
+                    hash: blake_stream.clone(),
+                };
+                let mut hash_writer =
+                    HashingWriter::new(&mut blake_writer, expected_crc.is_some(), false);
                 self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
@@ -4931,12 +4980,9 @@ impl RarArchive {
                 };
                 self.enforce_unknown_lz_output_limit(&fh, written)?;
                 hash_writer.flush().map_err(RarError::Io)?;
-                (
-                    written,
-                    expected_crc.map(|_| hash_writer.finalize_crc()),
-                    expected_blake.map(|_| hash_writer.finalize_blake2()),
-                )
+                (written, expected_crc.map(|_| hash_writer.finalize_crc()))
             };
+            let (_, actual_blake) = finalize_shared_hash(blake_stream)?;
 
             Self::verify_member_crc32(
                 &fh.name,
@@ -5259,6 +5305,30 @@ impl RarArchive {
 
         Ok(chunks)
     }
+    /// Prepare the archive-wide RAR5 decoder for the next **non-solid** member.
+    ///
+    /// RAR runs one `Unpack` object per command and re-inits it per file, so a
+    /// non-solid member reuses the existing window and input staging instead of
+    /// allocating a fresh decoder. This is the same slot the solid path uses:
+    /// whatever state a member leaves behind stays available to a following
+    /// solid member, exactly as it would in the oracle.
+    fn prepare_rar5_member_decoder<'a>(
+        solid_decoder: &'a mut Option<LzDecoder>,
+        fh: &FileHeader,
+        max_dict_size: u64,
+    ) -> RarResult<&'a mut LzDecoder> {
+        let dict_size =
+            crate::decompress::lz::checked_lz_dict_size(&fh.compression, max_dict_size)?;
+        let version = fh.compression.version;
+        match solid_decoder {
+            // A non-solid member starts from an empty history, so a dictionary
+            // change in either direction is fine here.
+            Some(decoder) => decoder.prepare_reuse(dict_size, version)?,
+            None => *solid_decoder = Some(LzDecoder::try_new(dict_size, version)?),
+        }
+        Ok(solid_decoder.as_mut().expect("RAR5 decoder prepared above"))
+    }
+
     fn solid_decode_reader_to_sink<R: Read>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
@@ -5298,22 +5368,16 @@ impl RarArchive {
 
         let dict_size = dict_size as usize;
         if fh.compression.format.is_rar4_family() {
-            if solid_decoder_rar4
-                .as_ref()
-                .is_some_and(|decoder| !decoder.supports_version(fh.compression.version))
-            {
-                *solid_decoder_rar4 = None;
-            }
-            let decoder = if let Some(decoder) = solid_decoder_rar4 {
-                decoder.prepare_solid_continuation();
-                decoder
-            } else {
-                solid_decoder_rar4.insert(Rar4Decoder::new(
-                    fh.compression.version,
-                    dict_size,
-                    fh.compression.method.code(),
-                )?)
-            };
+            // Per-file dispatch: `fh.compression.solid` is already the
+            // effective RAR4 value, so a non-solid member gets the full
+            // `UnpInitData*(false)` reset even mid-solid-archive.
+            let decoder = Rar4Decoder::prepare_slot(
+                solid_decoder_rar4,
+                fh.compression.solid,
+                dict_size,
+                fh.compression.version,
+                fh.compression.method.code(),
+            )?;
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
             let decoder = if let Some(decoder) = solid_decoder {
@@ -5355,22 +5419,14 @@ impl RarArchive {
         let mut writer_factory = writer_factory;
 
         let chunks = if fh.compression.format.is_rar4_family() {
-            if solid_decoder_rar4
-                .as_ref()
-                .is_some_and(|decoder| !decoder.supports_version(fh.compression.version))
-            {
-                *solid_decoder_rar4 = None;
-            }
-            let decoder = if let Some(decoder) = solid_decoder_rar4 {
-                decoder.prepare_solid_continuation();
-                decoder
-            } else {
-                solid_decoder_rar4.insert(Rar4Decoder::new(
-                    fh.compression.version,
-                    dict_size,
-                    fh.compression.method.code(),
-                )?)
-            };
+            // Per-file dispatch; see `solid_decode_reader_to_writer`.
+            let decoder = Rar4Decoder::prepare_slot(
+                solid_decoder_rar4,
+                fh.compression.solid,
+                dict_size,
+                fh.compression.version,
+                fh.compression.method.code(),
+            )?;
             let hash_clone = shared_hash.clone();
             decoder.decompress_reader_to_writer_chunked(
                 compressed,
@@ -5443,11 +5499,17 @@ impl RarArchive {
     /// from the provider as needed — which may block until the volume finishes
     /// downloading.
     ///
+    /// Volumes are addressed in the **volume set's own numbering**, the same
+    /// one [`RarArchive::member_segments`] reports and
+    /// [`RarArchive::add_volume`] accepts: a member whose first segment lives
+    /// in volume 5 calls `provider.get_volume(5)`. The provider is the set's,
+    /// not the member's — do not re-key it to the member's first volume.
+    ///
     /// Currently supports:
     /// - **Store** (uncompressed): streams directly, minimal memory.
     /// - **LZ** (compressed, non-solid): reads compressed data through a
-    ///   [`ChainedSegmentReader`], then streams decompressed output.
-    /// - **Encrypted** (Store or LZ): wraps the reader in [`DecryptingReader`]
+    ///   chained segment reader, then streams decompressed output.
+    /// - **Encrypted** (Store or LZ): wraps the reader in a decrypting reader
     ///   for on-the-fly AES-CBC decryption.
     ///
     /// Falls back to the buffered path for solid archives.
@@ -5467,7 +5529,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -5508,15 +5570,7 @@ impl RarArchive {
         if fh.compression.method != CompressionMethod::Store {
             let entry = &self.members[index];
             let split_after = entry.file_header.split_after;
-            let mut sorted_segs = entry.segments.clone();
-            sorted_segs.sort_by_key(|s| s.volume_index);
-            // Normalize volume indices to 0-based for the provider.
-            // Archive segments use absolute volume numbers (from main header),
-            // but the streaming provider uses 0-based local indices.
-            let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-            for seg in &mut sorted_segs {
-                seg.volume_index -= vol_base;
-            }
+            let (sorted_segs, _) = Self::sorted_member_segments(&entry.segments);
 
             debug!(
                 member = %fh.name,
@@ -5546,13 +5600,7 @@ impl RarArchive {
         // One continuous reader → one DecryptingReader → maintains AES-CBC state across volumes.
         let entry = &self.members[index];
         let split_after = entry.file_header.split_after;
-        let mut sorted_segs = entry.segments.clone();
-        sorted_segs.sort_by_key(|s| s.volume_index);
-        // Normalize volume indices to 0-based (see LZ path comment above).
-        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-        for seg in &mut sorted_segs {
-            seg.volume_index -= vol_base;
-        }
+        let (sorted_segs, _) = Self::sorted_member_segments(&entry.segments);
 
         debug!(
             member = %fh.name,
@@ -5605,7 +5653,7 @@ impl RarArchive {
             None
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
-        let (segments, _) = Self::normalized_provider_segments(&self.members[index].segments);
+        let (segments, _) = Self::sorted_member_segments(&self.members[index].segments);
 
         if fh.compression.method == CompressionMethod::Store {
             return self.extract_member_streaming_store(
@@ -5881,7 +5929,7 @@ impl RarArchive {
     /// data. For encrypted members, wraps in `DecryptingReader`.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz<W: Write>(
-        &self,
+        &mut self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
         options: &ExtractOptions,
@@ -5967,22 +6015,22 @@ impl RarArchive {
         };
 
         let written = if self.format == ArchiveFormat::Rar5 {
-            let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
-            crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
-                &mut buf_reader,
-                unpacked_size,
-                &fh.compression,
-                &mut hash_writer,
+            let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                fh,
                 self.limits.max_dict_size,
-            )?
+            )?;
+            decoder.decompress_reader_to_writer(&mut buf_reader, unpacked_size, &mut hash_writer)?
         } else {
-            let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
-            crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+            let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
+            Self::solid_decode_reader_to_writer(
+                &mut self.solid_decoder_rar4,
+                &mut self.solid_decoder,
+                self.limits.max_dict_size,
                 &mut buf_reader,
                 unpacked_size,
-                fh.compression.version,
-                fh.compression.method.code(),
-                fh.compression.dict_size,
+                fh,
                 &mut hash_writer,
             )?
         };
@@ -6022,6 +6070,11 @@ impl RarArchive {
     /// new writer. Each writer receives that volume's decompressed contribution.
     /// Returns `Vec<(volume_index, bytes_written)>` for each chunk.
     ///
+    /// Every `volume_index` here — the provider's, the factory's, and the
+    /// returned chunks' — is the volume set's own, as
+    /// [`RarArchive::extract_member_streaming`] describes. A member starting in
+    /// volume 5 reads volume 5 and reports its first chunk against 5.
+    ///
     /// For Store mode: detects volume transitions via the volume tracker and
     /// switches writers at each boundary.
     ///
@@ -6047,7 +6100,7 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
-        let is_solid = fh.compression.solid;
+        let is_solid = self.member_is_solid(&fh);
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -6085,13 +6138,7 @@ impl RarArchive {
 
         let entry = &self.members[index];
         let split_after = entry.file_header.split_after;
-        let mut sorted_segs = entry.segments.clone();
-        sorted_segs.sort_by_key(|s| s.volume_index);
-        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
-        for seg in &mut sorted_segs {
-            seg.volume_index -= vol_base;
-        }
-        let first_vol = sorted_segs.first().map_or(0, |s| s.volume_index);
+        let (sorted_segs, first_vol) = Self::sorted_member_segments(&entry.segments);
 
         if fh.compression.method != CompressionMethod::Store {
             debug!(
@@ -6324,8 +6371,7 @@ impl RarArchive {
             None
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
-        let (segments, first_vol) =
-            Self::normalized_provider_segments(&self.members[index].segments);
+        let (segments, first_vol) = Self::sorted_member_segments(&self.members[index].segments);
 
         if fh.compression.method == CompressionMethod::Store {
             return self.extract_member_streaming_store_chunked(
@@ -6472,7 +6518,7 @@ impl RarArchive {
     /// then splits decompressed output at those boundaries.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz_chunked<F>(
-        &self,
+        &mut self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
         options: &ExtractOptions,
@@ -6559,16 +6605,20 @@ impl RarArchive {
         let chunks = if self.format == ArchiveFormat::Rar5 {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tracking_reader = VolumeTrackingReader::new(
-                BufReader::with_capacity(1024 * 1024, inner),
+                BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner),
                 volume_tracker,
             )
             .with_shared_transitions(Arc::clone(&shared_transitions));
 
             let hash_clone = shared_hash.clone();
-            crate::decompress::lz::decompress_lz_reader_to_writer_chunked_with_max_dict_size(
+            let decoder = Self::prepare_rar5_member_decoder(
+                &mut self.solid_decoder,
+                fh,
+                self.limits.max_dict_size,
+            )?;
+            decoder.decompress_reader_to_writer_chunked(
                 tracking_reader,
                 unpacked_size,
-                &fh.compression,
                 first_vol,
                 shared_transitions,
                 |vol_idx| {
@@ -6582,23 +6632,23 @@ impl RarArchive {
                         Ok(writer)
                     }
                 },
-                self.limits.max_dict_size,
             )?
         } else {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tracking_reader = VolumeTrackingReader::new(
-                BufReader::with_capacity(1024 * 1024, inner),
+                BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner),
                 volume_tracker,
             )
             .with_shared_transitions(Arc::clone(&shared_transitions));
 
             let hash_clone = shared_hash.clone();
-            crate::decompress::rar4_old::decompress_rar4_reader_to_writer_chunked(
+            Self::solid_decode_reader_to_writer_chunked(
+                &mut self.solid_decoder_rar4,
+                &mut self.solid_decoder,
+                self.limits.max_dict_size,
                 tracking_reader,
+                fh,
                 unpacked_size,
-                fh.compression.version,
-                fh.compression.method.code(),
-                fh.compression.dict_size,
                 first_vol,
                 shared_transitions,
                 |vol_idx| {
@@ -6612,6 +6662,9 @@ impl RarArchive {
                         Ok(writer)
                     }
                 },
+                // The writer factory above already wraps each volume writer in
+                // a HashTrackingWriter, so the helper must not wrap it again.
+                None,
             )?
         };
         self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
@@ -6646,7 +6699,7 @@ impl RarArchive {
 /// Writer wrapper that updates a shared CRC hasher.
 struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
-    crc: Option<crc32fast::Hasher>,
+    crc: Option<crate::crc::Crc32>,
     blake2: Option<Blake2spHasher>,
 }
 
@@ -6654,7 +6707,7 @@ impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, compute_crc: bool, compute_blake2: bool) -> Self {
         Self {
             inner,
-            crc: compute_crc.then(crc32fast::Hasher::new),
+            crc: compute_crc.then(crate::crc::Crc32::new),
             blake2: compute_blake2.then(Blake2spHasher::new),
         }
     }
@@ -6725,7 +6778,7 @@ fn finalize_shared_hash(
 }
 
 enum SegmentPackedHashState {
-    Crc32(crc32fast::Hasher),
+    Crc32(Box<crate::crc::Crc32>),
     Blake2sp(Box<Blake2spHasher>),
 }
 
@@ -6740,9 +6793,12 @@ struct SegmentPackedHashVerifier {
 
 impl SegmentPackedHashVerifier {
     fn new(member_name: &str, segment: &DataSegment, hash_key: Option<[u8; 32]>) -> Option<Self> {
-        let expected = segment.packed_hash?;
+        // A header may carry both packed checksums; extraction verifies one.
+        let expected = segment.packed_hashes.preferred()?;
         let state = match expected {
-            PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crc32fast::Hasher::new()),
+            PackedDataHash::Crc32(_) => {
+                SegmentPackedHashState::Crc32(Box::new(crate::crc::Crc32::new()))
+            }
             PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Box::default()),
         };
         Some(Self {
@@ -7159,11 +7215,11 @@ impl<'a> ChainedSegmentReader<'a> {
                     }
                     let file_header =
                         RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    self.segments.push(DataSegment::with_packed_hash(
+                    self.segments.push(DataSegment::with_packed_hashes(
                         vol_idx,
                         fh.data_offset,
                         fh.packed_size,
-                        RarArchive::packed_hash_for_split_segment(&file_header, None),
+                        RarArchive::packed_hashes_for_split_segment(&file_header, None),
                         false,
                     ));
                     self.split_after = fh.split_after;
@@ -7194,17 +7250,17 @@ impl<'a> ChainedSegmentReader<'a> {
                             pf.header.data_size, self.max_data_segment
                         )));
                     }
-                    let packed_hash =
-                        RarArchive::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+                    let packed_hashes =
+                        RarArchive::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
                     let packed_hash_uses_mac = pf
                         .file_encryption
                         .as_ref()
                         .is_some_and(|fe| fe.use_hash_mac);
-                    self.segments.push(DataSegment::with_packed_hash(
+                    self.segments.push(DataSegment::with_packed_hashes(
                         vol_idx,
                         pf.header.data_offset,
                         pf.header.data_size,
-                        packed_hash,
+                        packed_hashes,
                         packed_hash_uses_mac,
                     ));
                     self.split_after = pf.header.split_after;
@@ -8149,6 +8205,40 @@ mod tests {
     }
 
     #[test]
+    fn rar4_member_solid_dispatch_is_per_file_like_rar_behavior() {
+        let mut archive = empty_rar5_archive();
+        archive.is_solid = true;
+
+        let mut rar4 = test_rar5_service("m", 0, 0).file_header;
+        rar4.compression.format = ArchiveFormat::Rar4;
+        rar4.compression.version = 29;
+        rar4.compression.method = CompressionMethod::Normal;
+
+        // extract.cpp:922 dispatches on FileHead.Solid for RAR 2.0+ members, and
+        // parse.rs has already folded the archive flag into that value for the
+        // RAR 1.3-1.5 versions that need it. A non-solid member inside a solid
+        // RAR4 archive therefore decodes non-solid.
+        rar4.compression.solid = false;
+        assert!(!archive.member_is_solid(&rar4));
+        rar4.compression.solid = true;
+        assert!(archive.member_is_solid(&rar4));
+
+        let mut rar14 = rar4.clone();
+        rar14.compression.format = ArchiveFormat::Rar14;
+        rar14.compression.solid = false;
+        assert!(!archive.member_is_solid(&rar14));
+
+        // RAR5 keeps folding the archive-level flag in: the first compressed
+        // member of a solid archive carries no per-file SOLID flag.
+        let rar5 = test_rar5_service("m", 0, 0).file_header;
+        assert!(!rar5.compression.solid);
+        assert!(archive.member_is_solid(&rar5));
+
+        archive.is_solid = false;
+        assert!(!archive.member_is_solid(&rar5));
+    }
+
+    #[test]
     fn ntfs_stream_name_rules_match_rar_behavior() {
         assert!(RarArchive::is_allowed_ntfs_stream_name(":Zone.Identifier"));
         assert!(RarArchive::is_allowed_ntfs_stream_name(":stream"));
@@ -8432,7 +8522,7 @@ mod tests {
             reader: Box::new(Cursor::new(target.to_vec())),
         }));
 
-        let mut fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
+        let mut fh = test_rar3_symlink_header(Some(crate::crc::hash(target)));
         fh.unpacked_size = Some(target.len() as u64);
         fh.data_size = target.len() as u64;
         archive.members.push(MemberEntry {
@@ -8688,6 +8778,7 @@ mod tests {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
+                psw_check_present: false,
                 use_hash_mac: false,
             }),
         );
@@ -8711,6 +8802,7 @@ mod tests {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
+                psw_check_present: false,
                 use_hash_mac: false,
             }),
         );

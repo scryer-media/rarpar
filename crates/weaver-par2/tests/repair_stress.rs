@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use weaver_par2::{
+use par2_rs::{
     FileAccess, MemoryFileAccess, Repairability, execute_repair, plan_repair, verify_all,
 };
 

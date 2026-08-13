@@ -1,7 +1,5 @@
 use crate::error::{Par2Error, Result};
-use crate::types::{FileId, RecoverySetId};
-
-const MAX_FILE_IDS: usize = 32_768;
+use crate::types::{FileId, MAX_FILES_PER_SET, RecoverySetId};
 
 /// Parsed Main packet.
 ///
@@ -54,9 +52,9 @@ impl MainPacket {
         }
 
         let total_ids = file_id_area.len() / 16;
-        if total_ids > MAX_FILE_IDS {
+        if total_ids > MAX_FILES_PER_SET {
             return Err(Par2Error::InvalidMainPacket {
-                reason: format!("file ID count {total_ids} exceeds maximum {MAX_FILE_IDS}"),
+                reason: format!("file ID count {total_ids} exceeds maximum {MAX_FILES_PER_SET}"),
             });
         }
         if recovery_file_count > total_ids {

@@ -6,6 +6,9 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::CommandFactory;
@@ -44,6 +47,7 @@ fn run() -> Result<()> {
         Some("docs") => run_docs(args.collect()),
         Some("package-root") => run_package_root(args.collect()),
         Some("feature-audit") => run_feature_audit(args.collect()),
+        Some("bench") => run_bench(args.collect()),
         Some("-h" | "--help") | None => {
             print_usage();
             Ok(())
@@ -59,8 +63,520 @@ Usage:
   cargo run -p xtask -- docs [--out DIR]
   cargo run -p xtask -- docs --check
   cargo run -p xtask -- package-root --binary PATH --out DIR [--docs DIR] [--target TRIPLE]
-  cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST --gpu POLICY"
+  cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST
+  cargo run -p xtask -- bench <toolchains|corpus|plan|preflight|run|report|render> [OPTIONS]
+  cargo run -p xtask -- bench all-hosts [--config PATH] [--jobs N]"
     );
+}
+
+fn run_bench(args: Vec<OsString>) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "all-hosts") {
+        return run_bench_all_hosts(args.into_iter().skip(1).collect());
+    }
+
+    let bench_root = workspace_root().join("bench/rarpar-bench");
+    if !bench_root.join("go.mod").is_file() {
+        return fail("benchmark harness is missing bench/rarpar-bench/go.mod");
+    }
+    let status = Command::new("go")
+        .args(["run", "./cmd/rarpar-bench"])
+        .args(args)
+        .current_dir(&bench_root)
+        .env("RARPAR_BENCH_WORKSPACE_ROOT", workspace_root())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        fail(format!("benchmark harness exited with {status}"))
+    }
+}
+
+struct BenchAllHostsOptions {
+    config: PathBuf,
+    jobs: Option<usize>,
+}
+
+impl BenchAllHostsOptions {
+    fn parse(args: Vec<OsString>) -> Result<Self> {
+        let mut config = None;
+        let mut jobs = None;
+        let mut args = args.into_iter();
+        while let Some(argument) = args.next() {
+            match argument.to_str() {
+                Some("--config") => config = Some(next_path(&mut args, "--config")?),
+                Some("--jobs") => {
+                    let value = next_string(&mut args, "--jobs")?;
+                    let parsed = value
+                        .parse::<usize>()
+                        .map_err(|_| error("--jobs must be a positive integer"))?;
+                    if parsed == 0 {
+                        return fail("--jobs must be a positive integer");
+                    }
+                    jobs = Some(parsed);
+                }
+                _ => return fail(format!("unknown bench all-hosts option {argument:?}")),
+            }
+        }
+        Ok(Self {
+            config: config.unwrap_or_else(default_bench_hosts_config),
+            jobs,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchHostsConfig {
+    schema_version: u32,
+    hosts: Vec<BenchHost>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchHost {
+    label: String,
+    host: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    identity_file: Option<PathBuf>,
+    #[serde(default)]
+    ssh_options: Vec<String>,
+    workspace_dir: String,
+    corpus_dir: String,
+    output_dir: String,
+    candidate: String,
+    reference_rar: String,
+    reference_par2: String,
+    source_target: String,
+    #[serde(default = "default_bench_go_binary")]
+    go_binary: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default = "default_bench_candidate_label")]
+    candidate_label: String,
+    #[serde(default = "default_bench_reference_label")]
+    reference_label: String,
+    #[serde(default = "default_bench_seed")]
+    seed: String,
+    #[serde(default = "default_bench_lane")]
+    lane: String,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default = "default_bench_par2_placement")]
+    par2_placement: String,
+    #[serde(default = "default_bench_warmups")]
+    warmups: usize,
+    #[serde(default = "default_bench_repeats")]
+    repeats: usize,
+}
+
+fn default_bench_hosts_config() -> PathBuf {
+    workspace_root().join("bench/rarpar-bench/config/hosts.local.json")
+}
+
+fn default_bench_go_binary() -> String {
+    "go".to_owned()
+}
+
+fn default_bench_candidate_label() -> String {
+    "rarpar".to_owned()
+}
+
+fn default_bench_reference_label() -> String {
+    "reference".to_owned()
+}
+
+fn default_bench_seed() -> String {
+    "rarpar-benchmark-plan-v1".to_owned()
+}
+
+fn default_bench_lane() -> String {
+    "cpu".to_owned()
+}
+
+fn default_bench_par2_placement() -> String {
+    "canonical".to_owned()
+}
+
+fn default_bench_warmups() -> usize {
+    1
+}
+
+fn default_bench_repeats() -> usize {
+    5
+}
+
+fn run_bench_all_hosts(args: Vec<OsString>) -> Result<()> {
+    if args.len() == 1 && matches!(args[0].to_str(), Some("-h" | "--help")) {
+        eprintln!(
+            "Usage: cargo run --locked -p xtask -- bench all-hosts [--config PATH] [--jobs N]"
+        );
+        return Ok(());
+    }
+    let options = BenchAllHostsOptions::parse(args)?;
+    let config = load_bench_hosts_config(&options.config)?;
+    let jobs = options
+        .jobs
+        .unwrap_or(config.hosts.len())
+        .min(config.hosts.len());
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(config.hosts.len()));
+
+    thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= config.hosts.len() {
+                        return;
+                    }
+                    let host = &config.hosts[index];
+                    eprintln!("bench all-hosts [{}]: started", host.label);
+                    let result = run_bench_host(host).map_err(|error| error.to_string());
+                    match &result {
+                        Ok(()) => eprintln!("bench all-hosts [{}]: completed", host.label),
+                        Err(error) => {
+                            eprintln!("bench all-hosts [{}]: failed: {error}", host.label)
+                        }
+                    }
+                    results
+                        .lock()
+                        .expect("benchmark result lock must not be poisoned")
+                        .push((host.label.as_str(), result));
+                }
+            });
+        }
+    });
+
+    let mut failures = results
+        .into_inner()
+        .expect("benchmark result lock must not be poisoned")
+        .into_iter()
+        .filter_map(|(label, result)| result.err().map(|error| format!("{label}: {error}")))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    failures.sort();
+    fail(format!("benchmark host failures:\n{}", failures.join("\n")))
+}
+
+fn load_bench_hosts_config(path: &Path) -> Result<BenchHostsConfig> {
+    let data =
+        fs::read(path).map_err(|source| error(format!("read {}: {source}", path.display())))?;
+    let config: BenchHostsConfig = serde_json::from_slice(&data)
+        .map_err(|source| error(format!("decode {}: {source}", path.display())))?;
+    validate_bench_hosts_config(&config)?;
+    Ok(config)
+}
+
+fn validate_bench_hosts_config(config: &BenchHostsConfig) -> Result<()> {
+    if config.schema_version != 1 {
+        return fail("benchmark hosts config schema_version must be 1");
+    }
+    if config.hosts.is_empty() {
+        return fail("benchmark hosts config must declare at least one host");
+    }
+    let mut labels = HashSet::new();
+    let mut outputs = HashSet::new();
+    for host in &config.hosts {
+        validate_bench_value("host label", &host.label)?;
+        if !labels.insert(&host.label) {
+            return fail(format!(
+                "benchmark host label is duplicated: {}",
+                host.label
+            ));
+        }
+        validate_bench_value("host", &host.host)?;
+        if host.host.starts_with('-') {
+            return fail(format!(
+                "benchmark host must not begin with '-': {}",
+                host.host
+            ));
+        }
+        let short_host = host.host.split('.').next().unwrap_or(&host.host);
+        if host.label.eq_ignore_ascii_case(&host.host)
+            || host.label.eq_ignore_ascii_case(short_host)
+        {
+            return fail(
+                "benchmark host label must describe the machine without using its hostname",
+            );
+        }
+        if let Some(user) = &host.user {
+            validate_bench_value("SSH user", user)?;
+            if user.contains('@') {
+                return fail("SSH user must not contain '@'");
+            }
+        }
+        for option in &host.ssh_options {
+            validate_bench_value("SSH option", option)?;
+        }
+        for (name, path) in [
+            ("workspace_dir", &host.workspace_dir),
+            ("corpus_dir", &host.corpus_dir),
+            ("output_dir", &host.output_dir),
+            ("candidate", &host.candidate),
+            ("reference_rar", &host.reference_rar),
+            ("reference_par2", &host.reference_par2),
+        ] {
+            validate_remote_absolute_path(name, path)?;
+        }
+        let output_key = format!(
+            "{}\0{}\0{}\0{}",
+            host.user.as_deref().unwrap_or(""),
+            host.host.to_ascii_lowercase(),
+            host.port.unwrap_or(22),
+            host.output_dir
+        );
+        if !outputs.insert(output_key) {
+            return fail("benchmark hosts must not share an SSH endpoint and output directory");
+        }
+        for (name, value) in [
+            ("source_target", &host.source_target),
+            ("go_binary", &host.go_binary),
+            ("candidate_label", &host.candidate_label),
+            ("reference_label", &host.reference_label),
+            ("seed", &host.seed),
+            ("lane", &host.lane),
+            ("par2_placement", &host.par2_placement),
+        ] {
+            validate_bench_value(name, value)?;
+        }
+        if let Some(path) = &host.path {
+            validate_bench_value("PATH", path)?;
+        }
+        if let Some(family) = &host.family
+            && family != "rar"
+            && family != "par2"
+        {
+            return fail("benchmark family must be rar or par2");
+        }
+        if host.lane != "cpu" && host.lane != "metal" && host.lane != "docker-cpu" {
+            return fail(format!("benchmark lane is unsupported: {}", host.lane));
+        }
+        if host.par2_placement != "canonical" && host.par2_placement != "smart" {
+            return fail(format!(
+                "benchmark PAR2 placement is unsupported: {}",
+                host.par2_placement
+            ));
+        }
+        if host.repeats == 0 {
+            return fail("benchmark repeats must be positive");
+        }
+        if let Some(identity_file) = &host.identity_file {
+            let identity_file = expand_home(identity_file)?;
+            if !fs::metadata(&identity_file).is_ok_and(|metadata| metadata.is_file()) {
+                return fail(format!(
+                    "SSH identity file for {} does not exist or is not a file: {}",
+                    host.label,
+                    identity_file.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bench_value(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return fail(format!(
+            "{name} must be non-empty and contain no control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_absolute_path(name: &str, path: &str) -> Result<()> {
+    validate_bench_value(name, path)?;
+    if !path.starts_with('/') {
+        return fail(format!("{name} must be an absolute POSIX path: {path}"));
+    }
+    Ok(())
+}
+
+fn expand_home(path: &Path) -> Result<PathBuf> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| error("SSH identity file must be valid UTF-8"))?;
+    if value == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| error("cannot expand ~ without HOME"));
+    }
+    if let Some(suffix) = value.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(suffix))
+            .ok_or_else(|| error("cannot expand ~/ without HOME"));
+    }
+    Ok(path.to_owned())
+}
+
+fn run_bench_host(host: &BenchHost) -> Result<()> {
+    let mut command = Command::new("ssh");
+    command.arg("-o").arg("BatchMode=yes");
+    if let Some(port) = host.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    if let Some(identity_file) = &host.identity_file {
+        command.arg("-i").arg(expand_home(identity_file)?);
+        command.arg("-o").arg("IdentitiesOnly=yes");
+    }
+    command.args(&host.ssh_options);
+    let target = match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let status = command.arg(target).arg(bench_host_script(host)).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        fail(format!("SSH benchmark command exited with {status}"))
+    }
+}
+
+fn bench_host_script(host: &BenchHost) -> String {
+    let harness_dir = remote_join(&host.workspace_dir, "bench/rarpar-bench");
+    let plan = remote_join(&host.output_dir, "plan.json");
+    let run_dir = remote_join(&host.output_dir, "run");
+    let raw = remote_join(&run_dir, "raw.json");
+    let report = remote_join(&host.output_dir, "report.json");
+    let charts = remote_join(&host.output_dir, "charts");
+    let source_manifest = remote_join(&host.workspace_dir, "tools/rarpar/Cargo.toml");
+    let output_parent = Path::new(&host.output_dir)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("/");
+
+    let mut plan_args = vec![
+        "plan".to_owned(),
+        "create".to_owned(),
+        "--corpus".to_owned(),
+        host.corpus_dir.clone(),
+        "--out".to_owned(),
+        plan,
+        "--seed".to_owned(),
+        host.seed.clone(),
+        "--lane".to_owned(),
+        host.lane.clone(),
+        "--par2-placement".to_owned(),
+        host.par2_placement.clone(),
+        "--warmups".to_owned(),
+        host.warmups.to_string(),
+        "--repeats".to_owned(),
+        host.repeats.to_string(),
+    ];
+    if let Some(family) = &host.family {
+        plan_args.extend(["--family".to_owned(), family.clone()]);
+    }
+
+    let run_args = vec![
+        "run".to_owned(),
+        "--corpus".to_owned(),
+        host.corpus_dir.clone(),
+        "--plan".to_owned(),
+        remote_join(&host.output_dir, "plan.json"),
+        "--candidate".to_owned(),
+        host.candidate.clone(),
+        "--candidate-label".to_owned(),
+        host.candidate_label.clone(),
+        "--reference-rar".to_owned(),
+        host.reference_rar.clone(),
+        "--reference-par2".to_owned(),
+        host.reference_par2.clone(),
+        "--reference-label".to_owned(),
+        host.reference_label.clone(),
+        "--machine".to_owned(),
+        host.label.clone(),
+        "--out".to_owned(),
+        run_dir,
+        "--source-manifest".to_owned(),
+        source_manifest,
+        "--source-target".to_owned(),
+        host.source_target.clone(),
+    ];
+
+    let mut lines = vec![
+        "set -eu".to_owned(),
+        format!("cd {}", shell_quote(&harness_dir)),
+    ];
+    if let Some(path) = &host.path {
+        lines.push(format!("export PATH={}", shell_quote(path)));
+    }
+    lines.push(format!(
+        "export RARPAR_BENCH_WORKSPACE_ROOT={}",
+        shell_quote(&host.workspace_dir)
+    ));
+    lines.push(format!("mkdir -p {}", shell_quote(output_parent)));
+    lines.push(format!(
+        "if ! mkdir {}; then printf '%s\\n' {} >&2; exit 64; fi",
+        shell_quote(&host.output_dir),
+        shell_quote(&format!(
+            "benchmark output already exists: {}",
+            host.output_dir
+        ))
+    ));
+    lines.push(format!("{} test ./...", shell_quote(&host.go_binary)));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "corpus".to_owned(),
+            "verify".to_owned(),
+            "--root".to_owned(),
+            host.corpus_dir.clone(),
+        ],
+    ));
+    lines.push(bench_go_command(&host.go_binary, &plan_args));
+    lines.push(bench_go_command(&host.go_binary, &run_args));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "report".to_owned(),
+            "--input".to_owned(),
+            raw,
+            "--out".to_owned(),
+            report,
+        ],
+    ));
+    lines.push(bench_go_command(
+        &host.go_binary,
+        &[
+            "render".to_owned(),
+            "--input".to_owned(),
+            remote_join(&host.output_dir, "report.json"),
+            "--out".to_owned(),
+            charts,
+        ],
+    ));
+    lines.join("\n")
+}
+
+fn remote_join(base: &str, child: &str) -> String {
+    if base == "/" {
+        format!("/{child}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), child)
+    }
+}
+
+fn bench_go_command(go_binary: &str, args: &[String]) -> String {
+    let mut words = vec![
+        go_binary.to_owned(),
+        "run".to_owned(),
+        "./cmd/rarpar-bench".to_owned(),
+    ];
+    words.extend(args.iter().cloned());
+    words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
 fn run_docs(args: Vec<OsString>) -> Result<()> {
@@ -102,11 +618,7 @@ fn run_feature_audit(args: Vec<OsString>) -> Result<()> {
     reject_target_cpu_flags()?;
     let metadata = cargo_metadata(&options)?;
     audit_feature_metadata(&metadata, &options)?;
-    println!(
-        "feature audit passed: target={} gpu={}",
-        options.target,
-        options.gpu.as_str()
-    );
+    println!("feature audit passed: target={}", options.target);
     Ok(())
 }
 
@@ -175,7 +687,6 @@ struct FeatureAuditOptions {
     manifest: PathBuf,
     target: String,
     features: String,
-    gpu: GpuPolicy,
 }
 
 impl FeatureAuditOptions {
@@ -183,14 +694,12 @@ impl FeatureAuditOptions {
         let mut manifest = None;
         let mut target = None;
         let mut features = None;
-        let mut gpu = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.to_string_lossy().as_ref() {
                 "--manifest" => manifest = Some(next_path(&mut iter, "--manifest")?),
                 "--target" => target = Some(next_string(&mut iter, "--target")?),
                 "--features" => features = Some(next_string(&mut iter, "--features")?),
-                "--gpu" => gpu = Some(GpuPolicy::parse(&next_string(&mut iter, "--gpu")?)?),
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -202,34 +711,7 @@ impl FeatureAuditOptions {
             manifest: manifest.ok_or_else(|| error("--manifest is required"))?,
             target: target.ok_or_else(|| error("--target is required"))?,
             features: features.ok_or_else(|| error("--features is required"))?,
-            gpu: gpu.ok_or_else(|| error("--gpu is required"))?,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GpuPolicy {
-    None,
-    Metal,
-    Wgpu,
-}
-
-impl GpuPolicy {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "none" => Ok(Self::None),
-            "metal" => Ok(Self::Metal),
-            "wgpu" => Ok(Self::Wgpu),
-            _ => fail("--gpu must be one of: none, metal, wgpu"),
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Metal => "metal",
-            Self::Wgpu => "wgpu",
-        }
     }
 }
 
@@ -288,8 +770,8 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
 
 fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
-    require_feature(metadata, "weaver-par2", "native-crypto")?;
-    require_feature(metadata, "weaver-unrar", "crypto-aws-lc")?;
+    require_feature(metadata, "par2-rs", "native-crypto")?;
+    require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
 
     let aws_lc_versions = resolved_package_versions(metadata, "aws-lc-sys");
     if aws_lc_versions.len() != 1 {
@@ -299,12 +781,19 @@ fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOption
         ));
     }
 
-    match options.gpu {
-        GpuPolicy::None => assert_cpu_only(metadata)?,
-        GpuPolicy::Metal => assert_metal(metadata, &options.target)?,
-        GpuPolicy::Wgpu => assert_wgpu(metadata, &options.target)?,
+    if requested_feature(options, "metal") {
+        assert_metal_only(metadata, &options.target)?;
+    } else {
+        assert_cpu_only(metadata)?;
     }
     Ok(())
+}
+
+fn requested_feature(options: &FeatureAuditOptions, feature: &str) -> bool {
+    options
+        .features
+        .split([',', ' '])
+        .any(|requested| requested == feature)
 }
 
 fn reject_target_cpu_flags() -> Result<()> {
@@ -326,42 +815,25 @@ fn assert_cpu_only(metadata: &CargoMetadata) -> Result<()> {
     reject_resolved_package(metadata, "objc2-metal")
 }
 
-fn assert_metal(metadata: &CargoMetadata, target: &str) -> Result<()> {
+fn assert_metal_only(metadata: &CargoMetadata, target: &str) -> Result<()> {
     if target != "aarch64-apple-darwin" {
         return fail(format!(
-            "Metal policy is only valid for aarch64-apple-darwin, got {target}"
+            "Metal is supported only for aarch64-apple-darwin, not {target}"
         ));
     }
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
         require_feature(metadata, package, "metal")?;
         reject_feature(metadata, package, "wgpu")?;
     }
-    require_resolved_package(metadata, "objc2-metal")?;
-    reject_resolved_package(metadata, "wgpu")
-}
-
-fn assert_wgpu(metadata: &CargoMetadata, target: &str) -> Result<()> {
-    const WGPU_TARGETS: &[&str] = &[
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    ];
-    if !WGPU_TARGETS.contains(&target) {
-        return fail(format!("wgpu policy is not supported for target {target}"));
+    reject_resolved_package(metadata, "wgpu")?;
+    if resolved_package_versions(metadata, "objc2-metal").is_empty() {
+        return fail("Metal build must resolve objc2-metal");
     }
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
-        require_feature(metadata, package, "wgpu")?;
-        reject_feature(metadata, package, "metal")?;
-    }
-    require_resolved_package(metadata, "wgpu")?;
-    reject_resolved_package(metadata, "objc2-metal")
+    Ok(())
 }
 
 fn reject_gpu_features(metadata: &CargoMetadata) -> Result<()> {
-    for package in ["rarpar", "weaver-par2", "weaver-reed-solomon"] {
+    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
         reject_feature(metadata, package, "metal")?;
         reject_feature(metadata, package, "wgpu")?;
     }
@@ -380,13 +852,6 @@ fn reject_feature(metadata: &CargoMetadata, package: &str, feature: &str) -> Res
     let (_, node) = resolved_package_node(metadata, package)?;
     if node.features.iter().any(|enabled| enabled == feature) {
         return fail(format!("{package} must not resolve feature {feature:?}"));
-    }
-    Ok(())
-}
-
-fn require_resolved_package(metadata: &CargoMetadata, package: &str) -> Result<()> {
-    if resolved_package_versions(metadata, package).is_empty() {
-        return fail(format!("expected resolved package {package}"));
     }
     Ok(())
 }
@@ -505,6 +970,10 @@ fn normalize_manpage(manpage: &str) -> String {
             in_example = false;
             output.push_str(&line);
             output.push('\n');
+            continue;
+        }
+
+        if !in_example && (line.is_empty() || line == ".br") && output.ends_with(".br\n") {
             continue;
         }
 
@@ -680,7 +1149,7 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
     )?;
     copy_into_root(
         out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.weaver-unrar"),
+        Path::new("usr/share/licenses/rarpar/LICENSE.unrar-rs"),
         &root.join("crates/weaver-unrar/LICENSE"),
         0o644,
     )?;
@@ -775,7 +1244,7 @@ fn validate_package_root(root: &Path) -> Result<()> {
         "usr/share/doc/rarpar/README.md",
         "usr/share/licenses/rarpar/LICENSE",
         "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-        "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
+        "usr/share/licenses/rarpar/LICENSE.unrar-rs",
     ] {
         let path = root.join(relative);
         if !path.is_file() {
@@ -953,10 +1422,10 @@ Zsh completion script.
 Fish completion script.
 .SH LICENSE
 \fBrarpar\fR source is GPL-3.0-or-later. Normal binary builds link
-\fBweaver-unrar\fR, so distributed \fBrarpar\fR binaries also carry the
+\fBunrar-rs\fR, so distributed \fBrarpar\fR binaries also carry the
 additional UnRAR source-code restriction for RAR extraction and recovery code.
 Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
-\fBLICENSE.weaver-unrar\fR.
+\fBLICENSE.unrar-rs\fR.
 "#;
 
 #[cfg(test)]
@@ -964,21 +1433,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feature_audit_accepts_each_supported_policy() -> Result<()> {
-        for (gpu, target) in [
-            (GpuPolicy::None, "x86_64-apple-darwin"),
-            (GpuPolicy::Metal, "aarch64-apple-darwin"),
-            (GpuPolicy::Wgpu, "x86_64-unknown-linux-musl"),
+    fn bench_host_script_runs_the_complete_direct_harness_pipeline() {
+        let host = bench_host_fixture();
+        let script = bench_host_script(&host);
+
+        for required in [
+            "set -eu",
+            "cd '/remote/rarpar/bench/rarpar-bench'",
+            "export RARPAR_BENCH_WORKSPACE_ROOT='/remote/rarpar'",
+            "'/opt/go/bin/go' test ./...",
+            "corpus' 'verify' '--root' '/remote/corpus'",
+            "plan' 'create'",
+            "run' '--corpus' '/remote/corpus'",
+            "--candidate' '/remote/bin/rarpar'",
+            "report' '--input' '/remote/results/run/raw.json'",
+            "render' '--input' '/remote/results/report.json'",
         ] {
-            let options = FeatureAuditOptions {
-                manifest: PathBuf::from("Cargo.toml"),
-                target: target.to_owned(),
-                features: "runtime".to_owned(),
-                gpu,
-            };
-            audit_feature_metadata(&feature_metadata(gpu, &["0.42.0"]), &options)?;
+            assert!(
+                script.contains(required),
+                "missing {required:?} in {script}"
+            );
         }
-        Ok(())
+        assert!(!script.contains("cargo run"));
+    }
+
+    #[test]
+    fn bench_host_config_rejects_relative_paths_and_duplicate_labels() {
+        let mut config = BenchHostsConfig {
+            schema_version: 1,
+            hosts: vec![bench_host_fixture()],
+        };
+        validate_bench_hosts_config(&config).expect("fixture must be valid");
+
+        config.hosts[0].output_dir = "relative/results".to_owned();
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("relative path must fail")
+                .to_string()
+                .contains("absolute POSIX path")
+        );
+
+        config.hosts = vec![bench_host_fixture(), bench_host_fixture()];
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("duplicate host label must fail")
+                .to_string()
+                .contains("duplicated")
+        );
+
+        let mut second = bench_host_fixture();
+        second.label = "Second Linux test machine".to_owned();
+        config.hosts = vec![bench_host_fixture(), second];
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("duplicate endpoint output must fail")
+                .to_string()
+                .contains("output directory")
+        );
+
+        config.hosts = vec![bench_host_fixture()];
+        config.hosts[0].label = "host-a".to_owned();
+        assert!(
+            validate_bench_hosts_config(&config)
+                .expect_err("hostname label must fail")
+                .to_string()
+                .contains("without using its hostname")
+        );
+    }
+
+    #[test]
+    fn feature_audit_accepts_cpu_only_metadata() -> Result<()> {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        audit_feature_metadata(&feature_metadata(&["0.42.0"]), &options)
+    }
+
+    #[test]
+    fn feature_audit_accepts_apple_silicon_metal_metadata() -> Result<()> {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "aarch64-apple-darwin".to_owned(),
+            features: "runtime,metal".to_owned(),
+        };
+        audit_feature_metadata(&metal_feature_metadata(), &options)
+    }
+
+    #[test]
+    fn feature_audit_rejects_metal_on_intel_macos() {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime,metal".to_owned(),
+        };
+        let error = audit_feature_metadata(&metal_feature_metadata(), &options)
+            .expect_err("Intel macOS must not resolve Metal");
+        assert!(error.to_string().contains("aarch64-apple-darwin"));
     }
 
     #[test]
@@ -987,13 +1539,9 @@ mod tests {
             manifest: PathBuf::from("Cargo.toml"),
             target: "x86_64-apple-darwin".to_owned(),
             features: "runtime".to_owned(),
-            gpu: GpuPolicy::None,
         };
-        let error = audit_feature_metadata(
-            &feature_metadata(GpuPolicy::None, &["0.41.0", "0.42.0"]),
-            &options,
-        )
-        .expect_err("duplicate aws-lc-sys versions must fail the audit");
+        let error = audit_feature_metadata(&feature_metadata(&["0.41.0", "0.42.0"]), &options)
+            .expect_err("duplicate aws-lc-sys versions must fail the audit");
         assert!(
             error
                 .to_string()
@@ -1066,7 +1614,7 @@ mod tests {
             "usr/share/doc/rarpar/README.md",
             "usr/share/licenses/rarpar/LICENSE",
             "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-            "usr/share/licenses/rarpar/LICENSE.weaver-unrar",
+            "usr/share/licenses/rarpar/LICENSE.unrar-rs",
         ] {
             assert!(out.join(relative).is_file(), "missing {relative}");
         }
@@ -1094,27 +1642,27 @@ mod tests {
         Ok(())
     }
 
-    fn feature_metadata(gpu: GpuPolicy, aws_lc_versions: &[&str]) -> CargoMetadata {
+    fn feature_metadata(aws_lc_versions: &[&str]) -> CargoMetadata {
         let mut packages = vec![
             CargoPackage {
                 id: "rarpar".to_owned(),
                 name: "rarpar".to_owned(),
-                version: "0.2.5".to_owned(),
+                version: "0.3.0".to_owned(),
             },
             CargoPackage {
-                id: "weaver-par2".to_owned(),
-                name: "weaver-par2".to_owned(),
-                version: "0.2.3".to_owned(),
+                id: "par2-rs".to_owned(),
+                name: "par2-rs".to_owned(),
+                version: "0.3.0".to_owned(),
             },
             CargoPackage {
-                id: "weaver-unrar".to_owned(),
-                name: "weaver-unrar".to_owned(),
-                version: "0.3.1".to_owned(),
+                id: "unrar-rs".to_owned(),
+                name: "unrar-rs".to_owned(),
+                version: "0.4.0".to_owned(),
             },
             CargoPackage {
-                id: "weaver-reed-solomon".to_owned(),
-                name: "weaver-reed-solomon".to_owned(),
-                version: "0.2.3".to_owned(),
+                id: "reedsolomon-rs".to_owned(),
+                name: "reedsolomon-rs".to_owned(),
+                version: "0.3.0".to_owned(),
             },
         ];
         let mut nodes = vec![
@@ -1123,15 +1671,15 @@ mod tests {
                 features: vec!["runtime".to_owned()],
             },
             CargoNode {
-                id: "weaver-par2".to_owned(),
+                id: "par2-rs".to_owned(),
                 features: vec!["native-crypto".to_owned()],
             },
             CargoNode {
-                id: "weaver-unrar".to_owned(),
+                id: "unrar-rs".to_owned(),
                 features: vec!["crypto-aws-lc".to_owned()],
             },
             CargoNode {
-                id: "weaver-reed-solomon".to_owned(),
+                id: "reedsolomon-rs".to_owned(),
                 features: Vec::new(),
             },
         ];
@@ -1149,52 +1697,34 @@ mod tests {
             });
         }
 
-        match gpu {
-            GpuPolicy::None => {}
-            GpuPolicy::Metal => {
-                for node in &mut nodes {
-                    if matches!(
-                        node.id.as_str(),
-                        "rarpar" | "weaver-par2" | "weaver-reed-solomon"
-                    ) {
-                        node.features.push("metal".to_owned());
-                    }
-                }
-                packages.push(CargoPackage {
-                    id: "objc2-metal".to_owned(),
-                    name: "objc2-metal".to_owned(),
-                    version: "0.3.2".to_owned(),
-                });
-                nodes.push(CargoNode {
-                    id: "objc2-metal".to_owned(),
-                    features: Vec::new(),
-                });
-            }
-            GpuPolicy::Wgpu => {
-                for node in &mut nodes {
-                    if matches!(
-                        node.id.as_str(),
-                        "rarpar" | "weaver-par2" | "weaver-reed-solomon"
-                    ) {
-                        node.features.push("wgpu".to_owned());
-                    }
-                }
-                packages.push(CargoPackage {
-                    id: "wgpu".to_owned(),
-                    name: "wgpu".to_owned(),
-                    version: "30.0.0".to_owned(),
-                });
-                nodes.push(CargoNode {
-                    id: "wgpu".to_owned(),
-                    features: Vec::new(),
-                });
-            }
-        }
-
         CargoMetadata {
             packages,
             resolve: CargoResolve { nodes },
         }
+    }
+
+    fn metal_feature_metadata() -> CargoMetadata {
+        let mut metadata = feature_metadata(&["0.42.0"]);
+        for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
+            metadata
+                .resolve
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == package)
+                .expect("test package node")
+                .features
+                .push("metal".to_owned());
+        }
+        metadata.packages.push(CargoPackage {
+            id: "objc2-metal".to_owned(),
+            name: "objc2-metal".to_owned(),
+            version: "0.3.2".to_owned(),
+        });
+        metadata.resolve.nodes.push(CargoNode {
+            id: "objc2-metal".to_owned(),
+            features: Vec::new(),
+        });
+        metadata
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -1206,5 +1736,33 @@ mod tests {
             "rarpar-xtask-test-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn bench_host_fixture() -> BenchHost {
+        BenchHost {
+            label: "Linux test machine".to_owned(),
+            host: "host-a.example.net".to_owned(),
+            user: Some("bench".to_owned()),
+            port: Some(22),
+            identity_file: None,
+            ssh_options: vec!["-o".to_owned(), "ConnectTimeout=30".to_owned()],
+            workspace_dir: "/remote/rarpar".to_owned(),
+            corpus_dir: "/remote/corpus".to_owned(),
+            output_dir: "/remote/results".to_owned(),
+            candidate: "/remote/bin/rarpar".to_owned(),
+            reference_rar: "/remote/bin/unrar".to_owned(),
+            reference_par2: "/remote/bin/par2".to_owned(),
+            source_target: "x86_64-unknown-linux-gnu".to_owned(),
+            go_binary: "/opt/go/bin/go".to_owned(),
+            path: Some("/remote/bin:/usr/bin:/bin".to_owned()),
+            candidate_label: "rarpar".to_owned(),
+            reference_label: "reference".to_owned(),
+            seed: "seed".to_owned(),
+            lane: "cpu".to_owned(),
+            family: None,
+            par2_placement: "canonical".to_owned(),
+            warmups: 1,
+            repeats: 5,
+        }
     }
 }

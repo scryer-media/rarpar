@@ -35,14 +35,9 @@ use crate::gf;
 /// kernels. Bounded by the line-fill buffers of the smallest supported cores;
 /// larger groups stall on L1 misses instead of computing.
 ///
-/// Deliberate deviations from ParPar's muladd_multi machinery, for the record:
-/// this is a memory-stream bound over flat separate source slices, not
-/// upstream's per-method register-interleave over a packed input layout
-/// (`idealInputMultiple` = 3/2/1 per method, gf16mul.cpp:234-525), and
-/// upstream's per-cacheline software prefetch (`_mm_prefetch`/`PREFETCH_MEM`
-/// throughout its cores, plus the `_stridepf`/`_packpf` drivers) is not
-/// carried over — modern large-core hardware prefetchers cover the flat
-/// streaming pattern; revisit if small-core x86 profiles say otherwise.
+/// This is a memory-stream bound over flat, separate source slices. Modern
+/// large-core hardware prefetchers cover that access pattern, so the kernels
+/// do not issue per-cacheline software prefetches by default.
 /// On aarch64 an explicit source-stream prefetch experiment exists behind
 /// [`NEON_SRC_PREFETCH`], currently off pending measurement.
 #[cfg(target_arch = "x86_64")]
@@ -93,14 +88,14 @@ fn prefetch_src_l1(ptr: *const u8) {
 /// to PSHUFB / VTBL which operate on bytes.
 #[derive(Clone)]
 pub struct MulTables {
-    /// tables[0]: low byte of result contribution from nibble 0 (bits 0-3 of input low byte)
-    /// tables[1]: high byte of result contribution from nibble 0
-    /// tables[2]: low byte of result contribution from nibble 1 (bits 4-7 of input low byte)
-    /// tables[3]: high byte of result contribution from nibble 1
-    /// tables[4]: low byte of result contribution from nibble 2 (bits 0-3 of input high byte)
-    /// tables[5]: high byte of result contribution from nibble 2
-    /// tables[6]: low byte of result contribution from nibble 3 (bits 4-7 of input high byte)
-    /// tables[7]: high byte of result contribution from nibble 3
+    /// `tables[0]`: low byte of result contribution from nibble 0 (bits 0-3 of input low byte)
+    /// `tables[1]`: high byte of result contribution from nibble 0
+    /// `tables[2]`: low byte of result contribution from nibble 1 (bits 4-7 of input low byte)
+    /// `tables[3]`: high byte of result contribution from nibble 1
+    /// `tables[4]`: low byte of result contribution from nibble 2 (bits 0-3 of input high byte)
+    /// `tables[5]`: high byte of result contribution from nibble 2
+    /// `tables[6]`: low byte of result contribution from nibble 3 (bits 4-7 of input high byte)
+    /// `tables[7]`: high byte of result contribution from nibble 3
     pub tables: [[u8; 16]; 8],
     /// The original factor, stored for scalar tail processing.
     pub factor: u16,
@@ -462,9 +457,8 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // Mirror upstream method selection: CLMul over VTBL shuffle when the
-        // input count exceeds 3 (ParPar gf16mul.cpp:1607-1626), SHA3 flavor
-        // when FEAT_SHA3 is present.
+        // CLMul overtakes VTBL shuffle for larger input groups; use the SHA3
+        // reduction flavor when FEAT_SHA3 is present.
         if factors_and_srcs.len() > 3 && clmul_batch_enabled() {
             if clmul_sha3_available() {
                 unsafe { mul_acc_input_batch_clmul_sha3(dst, factors_and_srcs) };
@@ -491,7 +485,7 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
 ///
 /// This is the AVX2 split *layout* gate. Both the GFNI folded kernel
 /// ([`mul_acc_folded_group`]) and the non-GFNI shuffle2x kernel
-/// ([`mul_acc_shuffle2x_group`]) consume the identical layout; which kernel
+/// (`mul_acc_shuffle2x_group_avx2`) consume the identical layout; which kernel
 /// runs is chosen per group by [`folded_uses_gfni`].
 pub fn altmap_supported() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -667,8 +661,8 @@ pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
 };
 
 /// Precomputed 256-bit shuffle tables for the non-GFNI AVX2 "shuffle2x"
-/// GF(2^16) multiply on the split byte-plane layout (a faithful port of
-/// ParPar's `gf16_shuffle2x`). Each table is a full 32-byte `__m256i`: the low
+/// GF(2^16) multiply on the split byte-plane layout. Each table is a full
+/// 32-byte `__m256i`: the low
 /// 128-bit lane serves the low-byte plane, the high lane the high-byte plane,
 /// so one `vpshufb` per table covers both planes at once.
 ///
@@ -678,7 +672,7 @@ pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
 /// `swap_hi=[n1hi|n3lo]`. `norm` lookups land in the plane they belong to;
 /// `swap` lookups land in the opposite plane and are folded in with one
 /// `permute2x128` lane swap per destination block (see
-/// [`mul_acc_shuffle2x_group`]). This mirrors the affine `norm=[ll|hh]`,
+/// `mul_acc_shuffle2x_group_avx2`). This mirrors the affine `norm=[ll|hh]`,
 /// `swap=[hl|lh]` fold the GFNI kernel uses.
 #[derive(Clone)]
 pub struct Shuffle2xTables {
@@ -821,11 +815,9 @@ pub fn mul_acc_shuffle2x_batch(
 /// cross-plane terms accumulate separately and fold in with a single lane
 /// swap per block.
 ///
-/// Packing note: this adopts shuffle2x's full-register split layout
-/// (all-lo | all-hi halves, `permute2x128` fold) rather than upstream
-/// affine2x's per-128-lane [8lo|8hi] packing with a `shuffle_epi32(1,0,3,2)`
-/// fold (gf16_affine2x_x86.h) — same norm/swap algebra, one staging layout
-/// shared with the non-GFNI shuffle2x kernel.
+/// The full-register split layout uses all-low and all-high halves with a
+/// `permute2x128` fold, allowing one staging layout to serve both GFNI and
+/// non-GFNI kernels.
 pub fn mul_acc_folded_group(
     dst: &mut [u8],
     staging: &[u8],
@@ -930,8 +922,8 @@ unsafe fn mul_acc_folded_group_gfni_avx2(
 }
 
 /// Multiply one interleaved six-source group into a split-layout destination
-/// with ParPar's non-GFNI "shuffle2x" formulation — the AVX2 analog of
-/// [`mul_acc_folded_group_gfni_avx2`], consuming the identical split staging.
+/// with the non-GFNI AVX2 shuffle kernel, consuming the same split staging as
+/// [`mul_acc_folded_group_gfni_avx2`].
 ///
 /// Because the sources are already in split byte-plane layout, the hot loop
 /// carries no per-block deinterleave. Each source costs four `vpshufb` — norm
@@ -1169,9 +1161,8 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
 
     #[cfg(target_arch = "aarch64")]
     {
-        // CLMUL preparation is six broadcasts — effectively free — so the
-        // prepared path routes through the same upstream >3-inputs selection
-        // using the raw factor carried by `PreparedInputFactor`.
+        // CLMUL preparation is six broadcasts, so larger prepared batches use
+        // the same threshold and raw factor carried by `PreparedInputFactor`.
         if factors_and_srcs.len() > 3 && clmul_batch_enabled() {
             if clmul_sha3_available() {
                 unsafe { mul_acc_input_batch_clmul_sha3_prepared(dst, factors_and_srcs) };
@@ -1773,8 +1764,8 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
 // ---------------------------------------------------------------------------
 // wasm simd128 kernel: 16 bytes (8 GF elements) per iteration
 //
-// A near-mechanical port of the NEON split-nibble kernel above (see the
-// module-level "Split-nibble shuffle" note). The same 8 precomputed 16-byte
+// Uses the same split-nibble algorithm as the NEON kernel above. Eight
+// precomputed 16-byte
 // tables map each of the four input nibbles to its low/high product byte, and
 // the eight table lookups are byte swizzles (wasm's PSHUFB/VTBL equivalent).
 //
@@ -2015,9 +2006,8 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
 // Grouped-input GFNI + AVX2 kernel
 //
 // Keeps one destination chunk hot in registers while accumulating multiple
-// source regions into it. This mirrors ParPar's grouped-input execution shape
-// more closely than repeatedly issuing single-input updates against the same
-// destination buffer.
+// source regions into it instead of repeatedly issuing single-input updates
+// against the same destination buffer.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -2958,10 +2948,9 @@ unsafe fn mul_acc_input_batch_avx512(dst: &mut [u8], factors_and_srcs: &[FactorS
 //
 // One source region × many (factor, dst) pairs. Karatsuba PMULL products per
 // coefficient with the packed Barrett reduction shared with the input-batch
-// CLMUL kernels ([`clmul_barrett_reduce`], upstream `gf16_clmul_neon_reduction`,
-// poly 0x1100b) — the source's byte planes are deinterleaved once per 32-byte
-// block and reused across every destination. The one-src-many-dst shape itself
-// is rarpar-native (upstream's CLMUL kernels are grouped-input only).
+// CLMUL kernels ([`clmul_barrett_reduce`], polynomial 0x1100b). The source's
+// byte planes are deinterleaved once per 32-byte block and reused across every
+// destination.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -3040,31 +3029,27 @@ unsafe fn mul_acc_multi_region_clmul_sha3(factors_and_dsts: &mut [FactorDst<'_>]
 // ---------------------------------------------------------------------------
 // Input-batch CLMUL kernels (aarch64)
 //
-// Faithful port of ParPar's grouped-input CLMul kernel family:
-// `gf16_clmul_muladd_x` (gf16_clmul_neon_base.h), generated upstream as
-// `gf16_clmul_muladd_*_neon` / `*_sha3` (gf16_clmul_sha3.c). Many sources
-// accumulate into one destination; each 32-byte block runs one packed Barrett
-// reduction (`gf16_clmul_neon_reduction`, gf16_clmul_neon.h:52-101, poly
-// 0x1100b) shared by every source — the reason CLMul beats VTBL shuffle once
-// the input count exceeds 3 (ParPar gf16mul.cpp:1607-1626 selection).
+// Many sources accumulate into one destination; each 32-byte block runs one
+// packed Barrett reduction with polynomial 0x1100b shared by every source.
+// Sharing reduction work is why CLMul overtakes VTBL shuffle for larger input
+// groups.
 //
-// Three accumulation flavors, mirroring upstream exactly:
-//   - plain NEON (`_neon`): PMULL then EOR per partial (upstream `pmacl_*`).
-//   - SHA3 non-Apple (`_sha3`, Neoverse V1/N2, Graviton3+): per-source product
-//     sets merged with EOR3, two sources per merge (`gf16_clmul_sha3_merge2`).
+// Three accumulation flavors are available:
+//   - plain NEON: PMULL then EOR per partial.
+//   - SHA3 non-Apple: per-source product sets merged with EOR3, two sources per
+//     merge.
 //   - SHA3 Apple: PMULL+EOR kept adjacent via inline asm so Apple cores fuse
-//     the pair; EOR3 is deliberately NOT used for accumulation
-//     (gf16_clmul_sha3.c:19-45), though the reduction still uses it.
-// Upstream processes at most 8 sources per pass (CLMUL_NUM_REGIONS, aarch64);
-// larger batches make additional passes over dst.
+//     the pair; EOR3 is not used for accumulation, though reduction still uses
+//     it.
+// Each pass processes at most eight sources; larger batches make additional
+// passes over the destination.
 // ---------------------------------------------------------------------------
 
-/// Upstream compiles the Apple flavor with `__APPLE__`; mirror that at build
-/// time. Only affects which SHA3 accumulation strategy is emitted.
+/// Select the Apple SHA3 accumulation strategy at build time.
 #[cfg(target_arch = "aarch64")]
 const CLMUL_APPLE_FUSION: bool = cfg!(target_vendor = "apple");
 
-/// Sources per pass, = upstream CLMUL_NUM_REGIONS on aarch64.
+/// Sources processed per CLMUL pass on aarch64.
 #[cfg(target_arch = "aarch64")]
 const CLMUL_SRC_GROUP: usize = 8;
 
@@ -3085,8 +3070,7 @@ fn clmul_sha3_available() -> bool {
 }
 
 /// Per-source broadcast coefficients: factor split into lo/hi bytes plus the
-/// Karatsuba middle term (upstream builds the same triple per region,
-/// gf16_clmul_neon_base.h:66-72).
+/// Karatsuba middle term.
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct ClmulBatchCoeff {
@@ -3110,8 +3094,7 @@ unsafe fn clmul_batch_coeff(factor: u16) -> ClmulBatchCoeff {
     }
 }
 
-/// The six per-block partial products (upstream low1/low2/mid1/mid2/high1/high2).
-/// Shared with `gf_pmul`, whose upstream kernel reuses the same reduction.
+/// Six per-block Karatsuba partial products shared with `gf_pmul`.
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 pub(crate) struct ClmulPartials {
@@ -3138,8 +3121,7 @@ unsafe fn veorq_p16x(
     }
 }
 
-/// 3-way XOR: EOR3 when the SHA3 flavor is active, EOR pair otherwise
-/// (upstream `eor3q_u8` and its non-SHA3 fallback, gf16_clmul_neon.h:46-50).
+/// 3-way XOR: EOR3 when the SHA3 flavor is active, paired EOR otherwise.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn eor3q<const SHA3: bool>(
@@ -3183,8 +3165,7 @@ unsafe fn clmul_load_planes(src: *const u8) -> ClmulSrcPlanes {
     }
 }
 
-/// The six Karatsuba products of loaded planes × broadcast coefficient
-/// (the multiply half of upstream `gf16_clmul_neon_round1`).
+/// The six Karatsuba products of loaded planes and broadcast coefficients.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_partials(d: ClmulSrcPlanes, c: &ClmulBatchCoeff) -> ClmulPartials {
@@ -3201,17 +3182,15 @@ unsafe fn clmul_partials(d: ClmulSrcPlanes, c: &ClmulBatchCoeff) -> ClmulPartial
     }
 }
 
-/// One source's six products for a 32-byte block (upstream
-/// `gf16_clmul_neon_round1`): load the byte planes, multiply by the
-/// broadcast coefficient.
+/// Load one source's byte planes and produce its six products for a 32-byte
+/// block.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_round1(src: *const u8, c: &ClmulBatchCoeff) -> ClmulPartials {
     unsafe { clmul_partials(clmul_load_planes(src), c) }
 }
 
-/// Accumulating round, plain-NEON flavor: six PMULL + six EOR (upstream
-/// `gf16_clmul_neon_round` with intrinsic `pmacl_*`).
+/// Accumulating round, plain-NEON flavor: six PMULL plus six EOR operations.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_round_acc(acc: &mut ClmulPartials, src: *const u8, c: &ClmulBatchCoeff) {
@@ -3227,9 +3206,8 @@ unsafe fn clmul_round_acc(acc: &mut ClmulPartials, src: *const u8, c: &ClmulBatc
 }
 
 /// PMULL immediately followed by EOR, as one asm unit, so Apple cores fuse the
-/// pair (upstream gf16_clmul_sha3.c:27-44). `out` (not `lateout`) keeps the
-/// result register distinct from all inputs: it is written by the first
-/// instruction while `sum` is still live.
+/// pair. `out` (not `lateout`) keeps the result register distinct from all
+/// inputs while `sum` is still live.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn pmacl_low_fused(
@@ -3295,8 +3273,7 @@ unsafe fn clmul_round_acc_fused(acc: &mut ClmulPartials, src: *const u8, c: &Clm
     }
 }
 
-/// Merge one source's product set into the accumulators with plain EOR
-/// (upstream `gf16_clmul_sha3_merge1`).
+/// Merge one source's product set into the accumulators with plain EOR.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_merge1(acc: &mut ClmulPartials, b: ClmulPartials) {
@@ -3310,8 +3287,7 @@ unsafe fn clmul_merge1(acc: &mut ClmulPartials, b: ClmulPartials) {
     }
 }
 
-/// Merge two sources' product sets at once with EOR3 (upstream
-/// `gf16_clmul_sha3_merge2`).
+/// Merge two sources' product sets at once with EOR3.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_merge2<const SHA3: bool>(
@@ -3339,13 +3315,11 @@ unsafe fn clmul_merge2<const SHA3: bool>(
     }
 }
 
-/// Packed Barrett reduction, verbatim port of `gf16_clmul_neon_reduction`
-/// (gf16_clmul_neon.h:52-101), poly 0x1100b (first reduction coefficient
-/// 0x1111a). Returns four byte-plane vectors; the block result's even plane is
-/// `out[0]^out[1]`, the odd plane `out[2]^out[3]` — folded into dst by the
-/// caller. The `SHA3` flavor replaces the non-SHA3 `vqtbl1q` bit-fold trick
-/// with an extra term carried into the final EOR3 (upstream's
-/// `__ARM_FEATURE_SHA3` branches at :73-80 and :95-99).
+/// Packed Barrett reduction for polynomial 0x1100b with first reduction
+/// coefficient 0x1111a. Returns four byte-plane vectors; the block result's
+/// even plane is `out[0]^out[1]` and the odd plane is `out[2]^out[3]`. The
+/// `SHA3` flavor carries an extra term into the final EOR3 instead of using the
+/// non-SHA3 `vqtbl1q` bit fold.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) unsafe fn clmul_barrett_reduce<const SHA3: bool>(
@@ -3400,13 +3374,13 @@ pub(crate) unsafe fn clmul_barrett_reduce<const SHA3: bool>(
 
 /// Shared body for the input-batch CLMUL kernels. `SHA3` selects the EOR3
 /// reduction/merge flavor; `FUSED` selects Apple's PMULL+EOR-paired
-/// accumulation (upstream: `FUSED` ≙ `__APPLE__`, where the merge rotation is
-/// NOT used and the final dst fold stays a plain EOR pair).
+/// accumulation, where merge rotation is disabled and the final destination
+/// fold stays a plain EOR pair.
 ///
 /// Takes `(factor, src)` pairs as a cloneable iterator so both the raw and
 /// prepared dispatch paths run allocation-free: sources are consumed in
 /// fixed groups of [`CLMUL_SRC_GROUP`] through a stack buffer, one full pass
-/// over `dst` per group (upstream makes one muladd_multi call per group).
+/// over `dst` per group.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool>(
@@ -3462,8 +3436,8 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
                 let mut acc = clmul_round1(first.2.as_ptr().add(offset), &first.1);
                 let rest = &group[1..];
                 if SHA3 && !FUSED {
-                    // EOR3 rotation: two fresh product sets per merge, odd
-                    // leftover via plain merge (gf16_clmul_sha3.c:86-112).
+                    // Merge pairs through EOR3 and handle an odd final product
+                    // with the single-product path.
                     let mut i = 0usize;
                     while i + 2 <= rest.len() {
                         let b = rest[i].unwrap();
@@ -3514,7 +3488,7 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
     }
 }
 
-/// Input-batch CLMUL, plain-NEON flavor (upstream `gf16_clmul_muladd_*_neon`).
+/// Input-batch CLMUL, plain-NEON flavor.
 #[cfg(target_arch = "aarch64")]
 unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
     unsafe {
@@ -3525,8 +3499,8 @@ unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSr
     }
 }
 
-/// Input-batch CLMUL, SHA3 flavor (upstream `gf16_clmul_muladd_*_sha3`):
-/// EOR3 merges on non-Apple cores, fused PMULL+EOR pairs on Apple.
+/// Input-batch CLMUL, SHA3 flavor: EOR3 merges on non-Apple cores and fused
+/// PMULL+EOR pairs on Apple.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "sha3")]
 unsafe fn mul_acc_input_batch_clmul_sha3(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
@@ -3572,10 +3546,8 @@ unsafe fn mul_acc_input_batch_clmul_sha3_prepared(
     }
 }
 
-/// Test-only instantiation of the non-Apple EOR3 merge flavor so the
-/// Neoverse/Graviton codepath is oracle-verified on Apple hardware too:
-/// M-series has FEAT_SHA3, and upstream's Apple carve-out is a scheduling
-/// preference, not a capability difference.
+/// Test-only instantiation of the non-Apple EOR3 merge flavor so that path can
+/// be validated on Apple hardware, where FEAT_SHA3 is also available.
 #[cfg(all(target_arch = "aarch64", test))]
 #[target_feature(enable = "sha3")]
 unsafe fn mul_acc_input_batch_clmul_sha3_unfused(
@@ -4175,7 +4147,7 @@ mod tests {
         }
     }
 
-    /// Small-batch multi-region oracle: with ≤2 non-trivial factors the
+    /// Small-batch multi-region reference: with ≤2 non-trivial factors the
     /// aarch64 dispatcher stays on the VTBL shuffle kernel instead of CLMUL
     /// (the matrix rank-1 path), so this pins that kernel across lengths
     /// straddling its 32-byte block and the 0/1 factor edges.
@@ -4298,7 +4270,7 @@ mod tests {
         }
     }
 
-    /// Dispatch-level oracle across a batch WIDER than the stream group (8),
+    /// Dispatch-level reference across a batch WIDER than the stream group (8),
     /// so the group-boundary dst reload is exercised on every arch's grouped
     /// kernel (x86 SRC_STREAM_GROUP paths on x86 CI, CLMUL groups here).
     #[test]
@@ -4355,7 +4327,7 @@ mod tests {
         }
     }
 
-    /// Direct oracle test for the unprepared 512-bit GFNI grouped-input entry
+    /// Direct reference test for the unprepared 512-bit GFNI grouped-input entry
     /// (runs only on GFNI+AVX512 hardware; no-ops elsewhere, including under
     /// Rosetta 2). Lengths cross the full-width 128-byte strip and the
     /// AVX2/scalar tail chain (126/128/130 and 254/256/258 straddles).
@@ -4395,7 +4367,7 @@ mod tests {
         }
     }
 
-    /// Direct oracle test for the non-GFNI 512-bit shuffle grouped-input
+    /// Direct reference test for the non-GFNI 512-bit shuffle grouped-input
     /// entry and its prepared twin (runs on any AVX-512BW/VL hardware — GFNI
     /// or not, since the entry forces the Avx2 table flavor; no-ops
     /// elsewhere, including under Rosetta 2). Lengths straddle the 128-byte
@@ -4466,7 +4438,7 @@ mod tests {
         }
     }
 
-    /// Direct oracle test for both input-batch CLMUL flavors: source counts
+    /// Direct reference test for both input-batch CLMUL flavors: source counts
     /// straddle the 8-source group (CLMUL_SRC_GROUP) and lengths straddle the
     /// 32-byte block, with factor edge cases (0, 1, 0x8000, 0xFFFF) mixed in.
     #[cfg(target_arch = "aarch64")]
@@ -4525,7 +4497,7 @@ mod tests {
         }
     }
 
-    /// Direct oracle test for the grouped-input VTBL NEON entries, raw and
+    /// Direct reference test for the grouped-input VTBL NEON entries, raw and
     /// prepared (dispatch only routes batches of at most 3 sources here, so
     /// the wide dispatch-level tests never reach them). Lengths straddle the
     /// 32-byte full-width strip and its scalar tail; the factor rotation
@@ -4918,7 +4890,7 @@ mod tests {
         }
     }
 
-    /// Direct oracle test for both multi-region CLMUL flavors (plain and
+    /// Direct reference test for both multi-region CLMUL flavors (plain and
     /// EOR3-reduction), across block-tail straddles and 0/1 factor edges.
     #[cfg(target_arch = "aarch64")]
     #[test]

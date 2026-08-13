@@ -75,6 +75,6 @@ pub(crate) use rust::*;
     feature = "crypto-rust"
 )))]
 compile_error!(
-    "weaver-unrar needs a crypto backend: enable feature `crypto-aws-lc` (native, default), \
+    "unrar-rs needs a crypto backend: enable feature `crypto-aws-lc` (native, default), \
      `crypto-host` (wasm; delegates AES to the host), or `crypto-rust` (portable/wasm)."
 );

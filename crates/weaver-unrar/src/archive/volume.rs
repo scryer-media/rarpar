@@ -76,16 +76,16 @@ impl RarArchive {
 
         // Process file headers from this volume.
         for pf in parsed.files {
-            let packed_hash = Self::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+            let packed_hashes = Self::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
             let packed_hash_uses_mac = pf
                 .file_encryption
                 .as_ref()
                 .is_some_and(|enc| enc.use_hash_mac);
-            let segment = DataSegment::with_packed_hash(
+            let segment = DataSegment::with_packed_hashes(
                 vol_num,
                 pf.header.data_offset,
                 pf.header.data_size,
-                packed_hash,
+                packed_hashes,
                 packed_hash_uses_mac,
             );
 
@@ -106,17 +106,17 @@ impl RarArchive {
         }
 
         for service in parsed.services {
-            let packed_hash =
-                Self::packed_hash_for_split_segment(&service.header.inner, service.hash.as_ref());
+            let packed_hashes =
+                Self::packed_hashes_for_split_segment(&service.header.inner, service.hash.as_ref());
             let packed_hash_uses_mac = service
                 .file_encryption
                 .as_ref()
                 .is_some_and(|enc| enc.use_hash_mac);
-            let segment = DataSegment::with_packed_hash(
+            let segment = DataSegment::with_packed_hashes(
                 vol_num,
                 service.header.inner.data_offset,
                 service.header.inner.data_size,
-                packed_hash,
+                packed_hashes,
                 packed_hash_uses_mac,
             );
             let mut file_header = service.header.inner;
@@ -228,11 +228,11 @@ impl RarArchive {
         }
         for fh in &parsed.files {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-            let segment = DataSegment::with_packed_hash(
+            let segment = DataSegment::with_packed_hashes(
                 vol_num,
                 fh.data_offset,
                 fh.packed_size,
-                Self::packed_hash_for_split_segment(&file_header, None),
+                Self::packed_hashes_for_split_segment(&file_header, None),
                 false,
             );
 
@@ -263,11 +263,11 @@ impl RarArchive {
                 hash: None,
                 comment_crc16: None,
                 ntfs_stream_name: None,
-                segments: vec![DataSegment::with_packed_hash(
+                segments: vec![DataSegment::with_packed_hashes(
                     vol_num,
                     fh.data_offset,
                     fh.packed_size,
-                    Self::packed_hash_for_split_segment(&file_header, None),
+                    Self::packed_hashes_for_split_segment(&file_header, None),
                     false,
                 )],
             };

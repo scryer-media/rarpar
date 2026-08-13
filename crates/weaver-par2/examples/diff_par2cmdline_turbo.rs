@@ -9,7 +9,7 @@ use benchmark_support::{
     DEFAULT_TURBO_BINARY, TurboMode, differential_scenarios, format_shell_command,
     select_scenarios, stage_scenario, turbo_args,
 };
-use weaver_par2::{Par2RepairOutcome, Par2Repairer, Par2RepairerOptions};
+use par2_rs::{Par2RepairOutcome, Par2Repairer, Par2RepairerOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Engine {
@@ -46,7 +46,7 @@ struct Config {
 fn usage() -> &'static str {
     "\
 Usage:
-  cargo run -p weaver-par2 --example diff_par2cmdline_turbo -- [options]
+  cargo run -p par2-rs --example diff_par2cmdline_turbo -- [options]
 
 Options:
   --list                     List available scenarios and exit
@@ -75,7 +75,7 @@ fn main() {
         return;
     }
 
-    println!("weaver-par2 differential scaffold");
+    println!("par2-rs differential scaffold");
     println!("  execute: {}", config.execute);
     println!("  engine:  {:?}", config.engine);
     println!("  mode:    {:?}", config.mode);
@@ -298,7 +298,7 @@ fn run_weaver(
     mode: TurboMode,
     scan_skip_data: bool,
     scan_skip_leeway: Option<u64>,
-) -> weaver_par2::Result<Par2RepairOutcome> {
+) -> par2_rs::Result<Par2RepairOutcome> {
     let mut options = Par2RepairerOptions::new(
         staged.temp.path().to_path_buf(),
         vec![staged.main_par2.clone()],

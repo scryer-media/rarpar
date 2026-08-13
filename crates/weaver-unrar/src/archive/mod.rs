@@ -11,7 +11,8 @@ mod volume;
 
 pub use cache::CachedArchiveHeaders;
 pub use facts::{
-    RarVolumeFacts, RarVolumeHostOs, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeFacts, RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
+    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
     RarVolumeUnixOwnerFacts,
 };
 
@@ -42,6 +43,9 @@ pub(super) struct FileEncryptionInfo {
     pub(super) salt: [u8; 16],
     pub(super) iv: [u8; 16],
     pub(super) check_data: Option<[u8; 12]>,
+    /// Whether the record's flags claimed a password check, whether or not its
+    /// checksum validated (enc_flags & 0x0001).
+    pub(super) psw_check_present: bool,
     /// When true, CRC32/BLAKE2 hashes are HMAC-transformed (enc_flags & 0x0002).
     pub(super) use_hash_mac: bool,
 }
@@ -93,6 +97,33 @@ pub(super) enum PackedDataHash {
     Blake2sp([u8; 32]),
 }
 
+/// Every packed-data checksum a split-after header carries.
+///
+/// A RAR5 header can state both the `Pack-CRC32` field and a BLAKE2sp hash
+/// record, and on a non-final part both describe the packed bytes stored in
+/// that volume. Extraction verifies just one of them (see `preferred`), but
+/// callers that compose ranges out of order need the CRC32 kept even when
+/// BLAKE2sp is present, because CRC32 composes and BLAKE2sp does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct PackedDataHashes {
+    pub(super) crc32: Option<u32>,
+    pub(super) blake2sp: Option<[u8; 32]>,
+}
+
+impl PackedDataHashes {
+    /// Whether the header carried any packed-data checksum at all.
+    pub(super) fn is_present(self) -> bool {
+        self.crc32.is_some() || self.blake2sp.is_some()
+    }
+
+    /// The single hash extraction verifies, preferring BLAKE2sp over CRC32.
+    pub(super) fn preferred(self) -> Option<PackedDataHash> {
+        self.blake2sp
+            .map(PackedDataHash::Blake2sp)
+            .or_else(|| self.crc32.map(PackedDataHash::Crc32))
+    }
+}
+
 /// A contiguous data segment within a single volume.
 #[derive(Debug, Clone)]
 pub struct DataSegment {
@@ -102,9 +133,9 @@ pub struct DataSegment {
     pub data_offset: u64,
     /// Size of this data segment.
     pub data_size: u64,
-    /// Optional hash of this segment's packed bytes, present on split-after
-    /// headers and verified as we leave the segment.
-    pub(super) packed_hash: Option<PackedDataHash>,
+    /// Hashes of this segment's packed bytes, present on split-after headers
+    /// and verified as we leave the segment.
+    pub(super) packed_hashes: PackedDataHashes,
     pub(super) packed_hash_uses_mac: bool,
 }
 
@@ -114,51 +145,55 @@ impl DataSegment {
             volume_index,
             data_offset,
             data_size,
-            packed_hash: None,
+            packed_hashes: PackedDataHashes::default(),
             packed_hash_uses_mac: false,
         }
     }
 
-    pub(super) fn with_packed_hash(
+    pub(super) fn with_packed_hashes(
         volume_index: usize,
         data_offset: u64,
         data_size: u64,
-        packed_hash: Option<PackedDataHash>,
+        packed_hashes: PackedDataHashes,
         packed_hash_uses_mac: bool,
     ) -> Self {
         Self {
             volume_index,
             data_offset,
             data_size,
-            packed_hash,
-            packed_hash_uses_mac: packed_hash.is_some() && packed_hash_uses_mac,
+            packed_hashes,
+            packed_hash_uses_mac: packed_hashes.is_present() && packed_hash_uses_mac,
         }
     }
 }
 
 impl RarArchive {
-    pub(super) fn packed_hash_for_split_segment(
+    pub(super) fn packed_hashes_for_split_segment(
         file_header: &FileHeader,
         hash: Option<&FileHash>,
-    ) -> Option<PackedDataHash> {
+    ) -> PackedDataHashes {
         if !file_header.split_after {
-            return None;
+            return PackedDataHashes::default();
         }
 
         if file_header.compression.format == ArchiveFormat::Rar5 {
-            return hash
-                .map(|hash| match hash {
-                    FileHash::Blake2sp(value) => PackedDataHash::Blake2sp(*value),
-                })
-                .or_else(|| file_header.data_crc32.map(PackedDataHash::Crc32));
+            return PackedDataHashes {
+                crc32: file_header.data_crc32,
+                blake2sp: hash.map(|hash| match hash {
+                    FileHash::Blake2sp(value) => *value,
+                }),
+            };
         }
 
         if file_header.compression.format.is_rar4_family() && file_header.compression.version >= 20
         {
-            return file_header.data_crc32.map(PackedDataHash::Crc32);
+            return PackedDataHashes {
+                crc32: file_header.data_crc32,
+                blake2sp: None,
+            };
         }
 
-        None
+        PackedDataHashes::default()
     }
 }
 
@@ -757,7 +792,7 @@ mod tests {
 
         let header_size = body.len() as u64;
         let header_size_bytes = crate::vint::encode_vint(header_size);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(&header_size_bytes);
         hasher.update(&body);
 
@@ -800,7 +835,7 @@ mod tests {
         body.extend_from_slice(cached_header);
 
         let size = crate::vint::encode_vint(body.len() as u64);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(&size);
         hasher.update(&body);
 

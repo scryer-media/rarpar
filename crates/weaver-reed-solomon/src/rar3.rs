@@ -1,8 +1,8 @@
 //! Legacy RAR3 GF(2^8) Reed-Solomon erasure coder.
 //!
-//! This is a Rust port of UnRAR's `RSCoder` (`rs.cpp`) over polynomial
-//! `0x11D`. RAR3 recovery applies this scalar decoder independently for each
-//! byte position across all data and recovery volumes.
+//! The coder uses polynomial `0x11D`. RAR3 recovery applies this scalar
+//! decoder independently for each byte position across all data and recovery
+//! volumes.
 
 const MAX_PAR: usize = 255;
 const MAX_POL: usize = 512;

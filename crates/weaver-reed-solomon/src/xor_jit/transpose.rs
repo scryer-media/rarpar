@@ -3,14 +3,11 @@
 //! A block is [`BLOCK_BYTES`] = 512 bytes = 256 GF(2^16) words, stored
 //! bit-planar as 16 planes of 256 bits (32 bytes each). Plane `p` lives at
 //! byte offset `32*p` and holds word-bit `15-p` of every word (plane 0 = MSB,
-//! plane 15 = LSB), matching ParPar's layout so the deps mapping lines up.
+//! plane 15 = LSB).
 //!
-//! [`prepare_block`] and [`finish_block`] are **faithful 1:1 AVX2 ports** of
-//! ParPar's `gf16_xor_prepare_block` / `gf16_xor_finish_block_avx2`
-//! (`gf16_xor_common_funcs.h`, `gf16_xor_avx2.c`) — the multiply consumes this
-//! exact layout, so the transpose is not a place to substitute a simpler
-//! structure. Correctness is pinned by a prepare→finish round-trip and the
-//! end-to-end deps multiply test (both on real AVX2).
+//! The multiply consumes this exact layout. Correctness is pinned by a
+//! prepare-to-finish round trip and an end-to-end dependency multiply test on
+//! AVX2 hardware.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use core::arch::x86_64::*;
@@ -28,13 +25,13 @@ const fn mm_shuffle(z: i32, y: i32, x: i32, w: i32) -> i32 {
 }
 
 /// Transpose one 512-byte block of little-endian u16 words (`src`) into the
-/// 16-plane layout (`dst`). Faithful port of `gf16_xor_prepare_block`.
+/// 16-plane layout (`dst`).
 ///
 /// # Safety
 /// Requires AVX2. `src`/`dst` are exactly [`BLOCK_BYTES`].
 #[target_feature(enable = "avx2")]
 pub unsafe fn prepare_block(src: &[u8; BLOCK_BYTES], dst: &mut [u8; BLOCK_BYTES]) {
-    // Per-128-lane byte de-interleave controls (gf16_xor_prep_split, AVX2 arm).
+    // Per-128-lane byte de-interleave controls.
     let shuf_a = _mm256_set_epi32(
         0x0f0d0b09, 0x07050301, 0x0e0c0a08, 0x06040200, 0x0f0d0b09, 0x07050301, 0x0e0c0a08,
         0x06040200,
@@ -93,8 +90,8 @@ unsafe fn extract_nibble(src: &mut __m256i) -> __m128i {
     t
 }
 
-/// `gf16_xor_finish_extract_bits`: rebuild interleaved words from a plane group
-/// (first-pass form; result buffered by the caller).
+/// Rebuild interleaved words from a plane group, buffering the first-pass
+/// result for the caller.
 #[target_feature(enable = "avx2")]
 unsafe fn finish_extract_bits(mut src: __m256i) -> __m256i {
     let words1 = extract_nibble(&mut src);
@@ -111,7 +108,7 @@ unsafe fn finish_extract_bits(mut src: __m256i) -> __m256i {
     _mm256_permute4x64_epi64::<{ mm_shuffle(3, 1, 2, 0) }>(words)
 }
 
-/// `gf16_xor_finish_extract_bits_store`: second-pass form, writes 8 u32 words.
+/// Second-pass extraction form, writing eight `u32` words.
 #[target_feature(enable = "avx2")]
 unsafe fn finish_extract_bits_store(dst: *mut u32, src: __m256i) {
     let src_shifted = _mm256_add_epi8(src, src);
@@ -141,7 +138,7 @@ unsafe fn write_u32(dst: *mut u32, idx: usize, val: i32) {
 
 /// One `LOAD_HALVES(a, b, upper)`: two 128-bit reads assembled into a 256-bit
 /// vector (low = plane-half `a`, high = plane-half `b`), reading the block in
-/// ParPar's reverse plane order `120 + upper*4 - x*8` (u32 units).
+/// reverse plane order `120 + upper*4 - x*8` (u32 units).
 #[target_feature(enable = "avx2")]
 unsafe fn load_halves(src: *const u32, a: usize, b: usize, upper: usize) -> __m256i {
     let lo = _mm_loadu_si128(src.add(120 + upper * 4 - a * 8) as *const __m128i);
@@ -188,8 +185,7 @@ unsafe fn unpack_vects(w: [__m256i; 8]) -> [__m256i; 8] {
     q
 }
 
-/// Inverse of [`prepare_block`], in place. Faithful port of
-/// `gf16_xor_finish_block_avx2`.
+/// Inverse of [`prepare_block`], in place.
 ///
 /// # Safety
 /// Requires AVX2. `buf` is exactly [`BLOCK_BYTES`].

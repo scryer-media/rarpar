@@ -3,6 +3,7 @@ use std::path::Path;
 
 use tracing::{debug, warn};
 
+use crate::checksum;
 use crate::error::{Par2Error, Result};
 use crate::packet::{Packet, RecoverySliceData, scan_packets, scan_packets_from_path};
 use crate::types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum};
@@ -85,7 +86,7 @@ impl Par2FileSet {
 
     /// Create a Par2FileSet with diagnostic information about parse errors.
     ///
-    /// Unlike [`from_files`], this does not fail on individual file parse errors.
+    /// Unlike [`Self::from_files`], this does not fail on individual file parse errors.
     /// Instead, errors are collected into [`Par2Diagnostic`]. Returns an error
     /// only if no valid main packet was found across all files.
     pub fn from_files_with_diagnostics(par2_files: &[&[u8]]) -> Result<Par2ParseResult> {
@@ -140,6 +141,65 @@ impl Par2FileSet {
         self.slice_checksums.get(file_id).map(|v| v.as_slice())
     }
 
+    /// Return the CRC32 expected for the unpadded bytes of a file.
+    ///
+    /// PAR2 IFSC records store the CRC32 for each full input slice. A short
+    /// final slice is zero-padded before its IFSC checksum is calculated, so
+    /// its padding must be removed in GF(2) before the per-slice CRCs can be
+    /// combined into the file's actual CRC32. Missing or internally
+    /// inconsistent metadata produces no value.
+    pub fn expected_file_crc32(&self, file_id: FileId) -> Option<u32> {
+        let description = self.files.get(&file_id)?;
+        if self.slice_size == 0 {
+            return None;
+        }
+
+        // Empty files have a well-defined CRC32 without IFSC data. PAR2
+        // producers commonly omit the corresponding zero-entry IFSC packet;
+        // accept that absence, but reject a contradictory non-empty packet.
+        if description.length == 0 {
+            return match self.slice_checksums.get(&file_id) {
+                Some(checksums) if !checksums.is_empty() => None,
+                _ => Some(checksum::crc32(&[])),
+            };
+        }
+
+        let expected_slice_count = description.length.div_ceil(self.slice_size);
+        if expected_slice_count > u32::MAX as u64 {
+            return None;
+        }
+        let expected_slice_count = usize::try_from(expected_slice_count).ok()?;
+        let checksums = self.slice_checksums.get(&file_id)?;
+        if checksums.len() != expected_slice_count {
+            return None;
+        }
+
+        let mut file_crc = None;
+        for (index, checksum) in checksums.iter().enumerate() {
+            let is_last = index + 1 == checksums.len();
+            let short_final_slice = is_last && description.length % self.slice_size != 0;
+            let slice_len = if short_final_slice {
+                description.length % self.slice_size
+            } else {
+                self.slice_size
+            };
+            let slice_crc = if short_final_slice {
+                let padding_len = self.slice_size.checked_sub(slice_len)?;
+                let padding_crc = checksum::crc32_padded(&[], padding_len);
+                checksum::crc32_uncombine(checksum.crc32, padding_crc, padding_len)
+            } else {
+                checksum.crc32
+            };
+
+            file_crc = Some(match file_crc {
+                Some(prefix_crc) => checksum::crc32_combine(prefix_crc, slice_crc, slice_len),
+                None => slice_crc,
+            });
+        }
+
+        file_crc
+    }
+
     /// Return all file descriptions in the recovery set, in order.
     pub fn recovery_files(&self) -> Vec<&FileDescription> {
         self.recovery_file_ids
@@ -159,6 +219,15 @@ impl Par2FileSet {
     /// Ignores duplicate packets. Returns error if a conflicting recovery
     /// set ID is encountered.
     pub fn merge_packets(&mut self, packets: Vec<Packet>) -> Result<MergeResult> {
+        if packets.iter().any(|packet| {
+            matches!(
+                packet,
+                Packet::Main(main) if main.recovery_set_id != self.recovery_set_id
+            )
+        }) {
+            return Err(Par2Error::ConflictingRecoverySet);
+        }
+
         let mut new_recovery_slices = 0u32;
         let mut duplicates_ignored = 0u32;
 
@@ -397,6 +466,7 @@ impl Par2FileSetBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checksum;
     use crate::packet::header;
     use md5::{Digest, Md5};
     use tempfile::tempdir;
@@ -466,6 +536,33 @@ mod tests {
     /// Compute RSID as MD5 of main body (that's how PAR2 spec works).
     fn compute_rsid(main_body: &[u8]) -> [u8; 16] {
         Md5::digest(main_body).into()
+    }
+
+    fn crc_test_set(
+        slice_size: u64,
+        length: u64,
+        checksums: Vec<SliceChecksum>,
+    ) -> (Par2FileSet, FileId) {
+        let file_id = FileId::from_bytes([0x7A; 16]);
+        let description = FileDescription {
+            file_id,
+            hash_full: [0; 16],
+            hash_16k: [0; 16],
+            length,
+            par2_name: "crc-test.bin".to_string(),
+            filename: "crc-test.bin".to_string(),
+        };
+        let set = Par2FileSet {
+            recovery_set_id: RecoverySetId::from_bytes([0; 16]),
+            slice_size,
+            recovery_file_ids: vec![file_id],
+            non_recovery_file_ids: Vec::new(),
+            files: std::collections::HashMap::from([(file_id, description)]),
+            slice_checksums: std::collections::HashMap::from([(file_id, checksums)]),
+            recovery_slices: std::collections::BTreeMap::new(),
+            creator: None,
+        };
+        (set, file_id)
     }
 
     #[test]
@@ -606,6 +703,130 @@ mod tests {
     }
 
     #[test]
+    fn expected_file_crc32_handles_empty_and_exact_slices() {
+        let (empty_set, empty_id) = crc_test_set(4, 0, Vec::new());
+        assert_eq!(
+            empty_set.expected_file_crc32(empty_id),
+            Some(checksum::crc32(&[]))
+        );
+
+        let (mut empty_without_ifsc, empty_id) = crc_test_set(4, 0, Vec::new());
+        empty_without_ifsc.slice_checksums.clear();
+        assert_eq!(
+            empty_without_ifsc.expected_file_crc32(empty_id),
+            Some(checksum::crc32(&[]))
+        );
+
+        let data = b"exactly-four-bytes";
+        let (set, file_id) = crc_test_set(
+            6,
+            data.len() as u64,
+            vec![
+                SliceChecksum {
+                    crc32: checksum::crc32(&data[..6]),
+                    md5: [0; 16],
+                },
+                SliceChecksum {
+                    crc32: checksum::crc32(&data[6..12]),
+                    md5: [0; 16],
+                },
+                SliceChecksum {
+                    crc32: checksum::crc32(&data[12..]),
+                    md5: [0; 16],
+                },
+            ],
+        );
+        assert_eq!(
+            set.expected_file_crc32(file_id),
+            Some(checksum::crc32(data))
+        );
+    }
+
+    #[test]
+    fn expected_file_crc32_unpads_short_final_slice_before_combining() {
+        let data = b"abcdefghij";
+        let (set, file_id) = crc_test_set(
+            4,
+            data.len() as u64,
+            vec![
+                SliceChecksum {
+                    crc32: checksum::crc32(&data[..4]),
+                    md5: [0; 16],
+                },
+                SliceChecksum {
+                    crc32: checksum::crc32(&data[4..8]),
+                    md5: [0; 16],
+                },
+                SliceChecksum {
+                    crc32: checksum::crc32_padded(&data[8..], 4),
+                    md5: [0; 16],
+                },
+            ],
+        );
+
+        assert_eq!(
+            set.expected_file_crc32(file_id),
+            Some(checksum::crc32(data))
+        );
+    }
+
+    #[test]
+    fn expected_file_crc32_matches_randomized_direct_file_crc32() {
+        let mut seed = 0xD1CE_BAAD_F00D_CAFEu64;
+        for case in 0..128usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let slice_size = 1 + (seed as usize % 257);
+            let length = 1 + ((seed >> 16) as usize % 4096) + case;
+            let mut data = vec![0u8; length];
+            for byte in &mut data {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+            let checksums = data
+                .chunks(slice_size)
+                .map(|slice| {
+                    let mut state = checksum::SliceChecksumState::new();
+                    state.update(slice);
+                    let (crc32, md5) = state.finalize(Some(slice_size as u64));
+                    SliceChecksum { crc32, md5 }
+                })
+                .collect();
+            let (set, file_id) = crc_test_set(slice_size as u64, length as u64, checksums);
+
+            assert_eq!(
+                set.expected_file_crc32(file_id),
+                Some(checksum::crc32(&data)),
+                "case={case} slice_size={slice_size} length={length}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_file_crc32_rejects_absent_or_inconsistent_metadata() {
+        let data = b"five!";
+        let checksums = vec![SliceChecksum {
+            crc32: checksum::crc32_padded(data, 4),
+            md5: [0; 16],
+        }];
+        let (mut set, file_id) = crc_test_set(4, data.len() as u64, checksums);
+        assert_eq!(set.expected_file_crc32(file_id), None);
+
+        set.slice_checksums.clear();
+        assert_eq!(set.expected_file_crc32(file_id), None);
+
+        let (mut no_description, file_id) = crc_test_set(4, 0, Vec::new());
+        no_description.files.clear();
+        assert_eq!(no_description.expected_file_crc32(file_id), None);
+
+        let (zero_slice_size, file_id) = crc_test_set(0, 0, Vec::new());
+        assert_eq!(zero_slice_size.expected_file_crc32(file_id), None);
+    }
+
+    #[test]
     fn merge_packets_adds_recovery() {
         let file_id_a = [0x01; 16];
         let main_body = make_main_body(1024, &[file_id_a]);
@@ -654,7 +875,15 @@ mod tests {
         // Different main body = different RSID
         let other_main_body = make_main_body(2048, &[file_id_a]);
         let other_rsid = compute_rsid(&other_main_body);
-        let other_stream = make_full_packet(header::TYPE_MAIN, &other_main_body, other_rsid);
+        let mut recovery_body = Vec::new();
+        recovery_body.extend_from_slice(&0u32.to_le_bytes());
+        recovery_body.extend_from_slice(&[0xAB; 2048]);
+        let mut other_stream = make_full_packet(header::TYPE_RECOVERY, &recovery_body, other_rsid);
+        other_stream.extend_from_slice(&make_full_packet(
+            header::TYPE_MAIN,
+            &other_main_body,
+            other_rsid,
+        ));
 
         let packets: Vec<_> = crate::packet::scan_packets(&other_stream, 0)
             .into_iter()
@@ -663,6 +892,7 @@ mod tests {
 
         let err = set.merge_packets(packets).unwrap_err();
         assert!(matches!(err, Par2Error::ConflictingRecoverySet));
+        assert_eq!(set.recovery_block_count(), 0);
     }
 
     #[test]

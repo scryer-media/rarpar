@@ -22,7 +22,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  RARPAR_LFS_TEST_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**
+  RARPAR_LFS_TEST_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_recovery_volumes.part*,crates/weaver-unrar/tests/fixtures/rar4/rar4_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_oldmv*,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**
   RARPAR_LFS_SMOKE_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
@@ -59,7 +59,7 @@ jobs:
           done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
           components: clippy, rustfmt
       - name: Install native build dependencies
         run: |
@@ -107,9 +107,9 @@ jobs:
           ])
           packages = json.loads(metadata)["packages"]
           required = {
-              "weaver-reed-solomon",
-              "weaver-unrar",
-              "weaver-par2",
+              "reedsolomon-rs",
+              "unrar-rs",
+              "par2-rs",
               "rarpar",
           }
           selected = {
@@ -151,8 +151,8 @@ jobs:
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           expected_requirements = {
-              "weaver-par2": "^0.2.3",
-              "weaver-unrar": "^0.3.1",
+              "par2-rs": "^0.3.0",
+              "unrar-rs": "^0.4.0",
           }
           for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)
@@ -178,7 +178,7 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in expected_requirements
           }
-          expected_versions = {"weaver-par2": "0.2.3", "weaver-unrar": "0.3.1"}
+          expected_versions = {"par2-rs": "0.3.0", "unrar-rs": "0.4.0"}
           if resolved != expected_versions:
               print(
                   f"packaged rarpar resolved {resolved}, expected {expected_versions}",
@@ -221,71 +221,49 @@ jobs:
             runs_on: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: true
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
-            package_root: false
-          - platform: linux-x86_64-docker
-            runs_on: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: true
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,wgpu
-            gpu: wgpu
-            package_root: false
-          - platform: linux-arm64-docker
-            runs_on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
             archive_ext: tar.gz
             features: runtime,metal
-            gpu: metal
             package_root: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
             features: runtime
-            gpu: none
             package_root: false
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             archive_ext: zip
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: false
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
             archive_ext: zip
-            features: runtime,wgpu
-            gpu: wgpu
+            features: runtime
             package_root: false
     steps:
       - uses: actions/checkout@v7
@@ -308,7 +286,7 @@ jobs:
           done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
@@ -429,7 +407,7 @@ jobs:
               package for package in metadata["packages"] if package["name"] == "rarpar"
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("weaver-par2", "weaver-unrar"):
+          for name in ("par2-rs", "unrar-rs"):
               dep = dependencies.get(name)
               if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
@@ -461,7 +439,7 @@ jobs:
               package for package in metadata["packages"] if package["name"] == "rarpar"
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("weaver-par2", "weaver-unrar"):
+          for name in ("par2-rs", "unrar-rs"):
               dep = dependencies.get(name)
               if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
                   print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
@@ -478,7 +456,7 @@ jobs:
         run: >-
           cargo run --locked -p xtask -- feature-audit
           --manifest "$RARPAR_RELEASE_SOURCE/Cargo.toml" --target ${{ matrix.target }}
-          --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+          --features ${{ matrix.features }}
       - name: Audit release target features (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -486,7 +464,7 @@ jobs:
           $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
           cargo run --locked -p xtask -- feature-audit `
             --manifest $manifest --target ${{ matrix.target }} `
-            --features ${{ matrix.features }} --gpu ${{ matrix.gpu }}
+            --features ${{ matrix.features }}
       - name: Build rarpar (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -556,7 +534,7 @@ jobs:
           cp README.md package/
           cp tools/rarpar/LICENSE package/LICENSE
           cp LICENSE package/LICENSE.GPL-3.0-or-later
-          cp crates/weaver-unrar/LICENSE package/LICENSE.weaver-unrar
+          cp crates/weaver-unrar/LICENSE package/LICENSE.unrar-rs
           cp -R target/dist/docs/share package/share
           tar -czf "$archive" -C package .
           mv "$archive" dist/
@@ -572,7 +550,7 @@ jobs:
           Copy-Item README.md package\
           Copy-Item tools\rarpar\LICENSE package\LICENSE
           Copy-Item LICENSE package\LICENSE.GPL-3.0-or-later
-          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.weaver-unrar
+          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.unrar-rs
           Copy-Item target\dist\docs\share package\share -Recurse
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\
@@ -626,10 +604,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - name: Download Docker artifacts
+      - name: Download portable Linux artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: rarpar-release-linux-*-docker
+          pattern: rarpar-release-linux-*-musl-direct
           path: container-artifacts
           merge-multiple: true
       - name: Stage container context
@@ -638,8 +616,8 @@ jobs:
           set -euo pipefail
           rm -rf container-context
           mkdir -p container-context/amd64 container-context/arm64
-          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-x86_64-docker.tar.gz" -C container-context/amd64
-          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-arm64-docker.tar.gz" -C container-context/arm64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-x86_64-musl-direct.tar.gz" -C container-context/amd64
+          tar -xzf "container-artifacts/dist/rarpar-${RELEASE_TAG}-linux-arm64-musl-direct.tar.gz" -C container-context/arm64
           test -x container-context/amd64/rarpar
           test -x container-context/arm64/rarpar
           if find container-context -path '*/tests/fixtures/*' -print -quit | grep -q .; then
@@ -727,8 +705,8 @@ jobs:
                 cp "$file" "release-assets/$(basename "$file")"
               done
           asset_count="$(find release-assets -maxdepth 1 -type f \( -name 'rarpar-*.tar.gz' -o -name 'rarpar-*.zip' \) | wc -l | tr -d ' ')"
-          if [ "$asset_count" != 10 ]; then
-            echo "::error::expected 10 release archives, found $asset_count"
+          if [ "$asset_count" != 8 ]; then
+            echo "::error::expected 8 release archives, found $asset_count"
             find dist -maxdepth 4 -type f | sort
             exit 1
           fi
@@ -865,7 +843,7 @@ jobs:
               if File.exist?("LICENSE.GPL-3.0-or-later")
                 pkgshare.install "LICENSE.GPL-3.0-or-later"
               end
-              pkgshare.install "LICENSE.weaver-unrar" if File.exist?("LICENSE.weaver-unrar")
+              pkgshare.install "LICENSE.unrar-rs" if File.exist?("LICENSE.unrar-rs")
             end
 
             test do

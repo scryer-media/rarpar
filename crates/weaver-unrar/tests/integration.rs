@@ -1,11 +1,33 @@
-//! Integration tests for weaver-unrar decompression.
+//! Integration tests for unrar-rs decompression.
 //!
 //! These tests construct RAR5 archives programmatically and verify
 //! that the parser + decompressor produce correct output.
 
 use std::io::Cursor;
 
-use weaver_unrar::test_support::encrypt_aes128_cbc;
+use unrar_rs::test_support::encrypt_aes128_cbc;
+
+mod crc32fast {
+    pub fn hash(data: &[u8]) -> u32 {
+        crc_fast::crc32_iso_hdlc(data)
+    }
+
+    pub struct Hasher(crc_fast::Digest);
+
+    impl Hasher {
+        pub fn new() -> Self {
+            Self(crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc))
+        }
+
+        pub fn update(&mut self, data: &[u8]) {
+            self.0.update(data);
+        }
+
+        pub fn finalize(self) -> u32 {
+            self.0.finalize() as u32
+        }
+    }
+}
 
 #[cfg(unix)]
 fn current_unix_owner_names() -> Option<(String, String)> {
@@ -616,7 +638,7 @@ fn test_open_and_list_stored_archive() {
     let archive_bytes = build_stored_rar5_archive("hello.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let names = archive.member_names();
     assert_eq!(names, vec!["hello.txt"]);
@@ -626,7 +648,7 @@ fn test_open_and_list_stored_archive() {
     assert_eq!(meta.members[0].name, "hello.txt");
     assert_eq!(
         meta.members[0].compression.method,
-        weaver_unrar::CompressionMethod::Store
+        unrar_rs::CompressionMethod::Store
     );
     assert_eq!(meta.members[0].unpacked_size, Some(content.len() as u64));
 }
@@ -637,10 +659,10 @@ fn test_extract_stored_member() {
     let archive_bytes = build_stored_rar5_archive("test.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let result = archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
 
     assert_eq!(result, content);
@@ -652,10 +674,10 @@ fn test_extract_stored_by_name() {
     let archive_bytes = build_stored_rar5_archive("named.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let result = archive
-        .extract_by_name("named.txt", &weaver_unrar::ExtractOptions::default(), None)
+        .extract_by_name("named.txt", &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
 
     assert_eq!(result, content);
@@ -667,13 +689,13 @@ fn test_extract_stored_crc_verification() {
     let archive_bytes = build_stored_rar5_archive("crc.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     // Should succeed with verification enabled (default)
     let result = archive
         .extract_member(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -689,10 +711,10 @@ fn test_extract_stored_empty_file() {
     let archive_bytes = build_stored_rar5_archive("empty.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let result = archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     assert!(result.is_empty());
 }
@@ -704,10 +726,10 @@ fn test_extract_stored_large_file() {
     let archive_bytes = build_stored_rar5_archive("large.bin", &content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let result = archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     assert_eq!(result, content);
 }
@@ -717,17 +739,17 @@ fn test_archive_limits_reject_declared_unpacked_size() {
     let content = b"a";
     let file_header = build_file_header_ex("too-big.txt", 0, content.len() as u64, 5, None, 0);
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_unpacked_size: 4,
         ..Default::default()
     });
 
-    let result = archive.extract_member(0, &weaver_unrar::ExtractOptions::default(), None);
+    let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::ResourceLimit { .. })
+        Err(unrar_rs::RarError::ResourceLimit { .. })
     ));
 }
 
@@ -737,17 +759,17 @@ fn test_archive_limits_reject_packed_data_size() {
     let file_header =
         build_file_header_ex("packed-too-big.txt", 0, content.len() as u64, 5, None, 0);
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_data_segment: 4,
         ..Default::default()
     });
 
-    let result = archive.extract_member(0, &weaver_unrar::ExtractOptions::default(), None);
+    let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::ResourceLimit { .. })
+        Err(unrar_rs::RarError::ResourceLimit { .. })
     ));
 }
 
@@ -764,17 +786,17 @@ fn test_archive_limits_reject_compressed_dictionary_size() {
         normal_method_256k_dict,
     );
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_dict_size: 128 * 1024,
         ..Default::default()
     });
 
-    let result = archive.extract_member(0, &weaver_unrar::ExtractOptions::default(), None);
+    let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::DictionaryTooLarge {
+        Err(unrar_rs::RarError::DictionaryTooLarge {
             size: 262_144,
             max: 131_072
         })
@@ -795,17 +817,17 @@ fn test_unknown_unpacked_size_uses_configured_output_ceiling() {
         &[],
     );
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_unpacked_size: 4,
         ..Default::default()
     });
 
-    let result = archive.extract_member(0, &weaver_unrar::ExtractOptions::default(), None);
+    let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::ResourceLimit { .. })
+        Err(unrar_rs::RarError::ResourceLimit { .. })
     ));
 }
 
@@ -827,24 +849,24 @@ fn test_streaming_unknown_unpacked_size_uses_configured_output_ceiling() {
     let archive_path = temp_dir.path().join("unknown-streaming.rar");
     std::fs::write(&archive_path, &archive_bytes).unwrap();
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_unpacked_size: 4,
         ..Default::default()
     });
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![archive_path]);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![archive_path]);
     let mut output = Vec::new();
 
     let result = archive.extract_member_streaming(
         0,
-        &weaver_unrar::ExtractOptions::default(),
+        &unrar_rs::ExtractOptions::default(),
         &provider,
         &mut output,
     );
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::ResourceLimit { .. })
+        Err(unrar_rs::RarError::ResourceLimit { .. })
     ));
 }
 
@@ -866,23 +888,23 @@ fn test_streaming_chunked_unknown_unpacked_size_uses_configured_output_ceiling()
     let archive_path = temp_dir.path().join("unknown-chunked.rar");
     std::fs::write(&archive_path, &archive_bytes).unwrap();
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(weaver_unrar::Limits {
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(unrar_rs::Limits {
         max_unpacked_size: 4,
         ..Default::default()
     });
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![archive_path]);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![archive_path]);
 
     let result = archive.extract_member_streaming_chunked(
         0,
-        &weaver_unrar::ExtractOptions::default(),
+        &unrar_rs::ExtractOptions::default(),
         &provider,
         |_| Ok(Box::new(std::io::sink())),
     );
 
     assert!(matches!(
         result,
-        Err(weaver_unrar::RarError::ResourceLimit { .. })
+        Err(unrar_rs::RarError::ResourceLimit { .. })
     ));
 }
 
@@ -892,11 +914,11 @@ fn test_member_not_found() {
     let archive_bytes = build_stored_rar5_archive("test.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let result = archive.extract_by_name(
         "nonexistent.txt",
-        &weaver_unrar::ExtractOptions::default(),
+        &unrar_rs::ExtractOptions::default(),
         None,
     );
     assert!(result.is_err());
@@ -911,9 +933,9 @@ fn test_multivolume_open_volumes() {
     let content = b"Hello, this is data that spans two volumes!";
     let (vol0, vol1, _full) = build_two_volume_stored_archive("movie.mkv", content, 20);
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let names = archive.member_names();
     assert_eq!(names.len(), 1);
@@ -922,7 +944,7 @@ fn test_multivolume_open_volumes() {
     let result = archive
         .extract_by_name(
             "movie.mkv",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: false,
                 ..Default::default()
             },
@@ -937,14 +959,14 @@ fn test_multivolume_extract_with_crc() {
     let content = b"CRC-verified multi-volume content spanning two volumes here";
     let (vol0, vol1, _full) = build_two_volume_stored_archive("data.bin", content, 30);
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let result = archive
         .extract_by_name(
             "data.bin",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -968,14 +990,14 @@ fn test_multivolume_split_after_pack_crc_is_verified() {
         final_crc,
     );
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let result = archive
         .extract_by_name(
             "packed.bin",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -996,10 +1018,10 @@ fn test_rar5_volume_facts_expose_redirection_target_raw_bytes() {
     let extra = build_extra_record(0x05, &redirection_body);
     let archive = build_stored_archive_with_extra("link", b"", &extra);
 
-    let facts = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
+    let facts = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     let member = &facts.members[0];
-    assert_eq!(member.host_os, Some(weaver_unrar::RarVolumeHostOs::Unix));
+    assert_eq!(member.host_os, Some(unrar_rs::RarVolumeHostOs::Unix));
     assert_eq!(member.attributes, Some(0o644));
     assert_eq!(member.redirection_type, Some(1));
     assert_eq!(member.redirection_target.as_deref(), Some("safe/target"));
@@ -1021,7 +1043,7 @@ fn test_rar5_volume_facts_expose_member_timestamps() {
         1,
     );
 
-    let facts = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
+    let facts = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     let member = &facts.members[0];
     assert_eq!(member.attributes, Some(0o600));
@@ -1044,7 +1066,7 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
         final_crc,
     );
 
-    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    let facts0 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert_eq!(facts0.members.len(), 1);
     assert_eq!(
         facts0.members[0].name_raw.as_deref(),
@@ -1056,7 +1078,7 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
     assert!(facts0.members[0].packed_blake2_hash.is_none());
     assert!(!facts0.members[0].packed_hash_uses_mac);
 
-    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    let facts1 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.members.len(), 1);
     assert_eq!(
         facts1.members[0].name_raw.as_deref(),
@@ -1075,7 +1097,7 @@ fn test_rar5_volume_facts_expose_split_comment_pack_crc() {
     let full_crc = crc32fast::hash(comment);
     let (vol0, vol1) = build_two_volume_rar5_comment_archive(comment, split_at);
 
-    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    let facts0 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert!(facts0.members.is_empty());
     assert_eq!(facts0.services.len(), 1);
     assert_eq!(facts0.services[0].name, "CMT");
@@ -1085,7 +1107,7 @@ fn test_rar5_volume_facts_expose_split_comment_pack_crc() {
     assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
     assert!(!facts0.services[0].packed_hash_uses_mac);
 
-    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    let facts1 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.services.len(), 1);
     assert_eq!(facts1.services[0].name, "CMT");
     assert_eq!(facts1.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
@@ -1108,14 +1130,14 @@ fn test_multivolume_split_after_pack_crc_mismatch_fails_before_completion() {
         final_crc,
     );
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let err = archive
         .extract_by_name(
             "bad-packed.bin",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1124,7 +1146,7 @@ fn test_multivolume_split_after_pack_crc_mismatch_fails_before_completion() {
         .unwrap_err();
     assert!(matches!(
         err,
-        weaver_unrar::RarError::PackedDataCrcMismatch {
+        unrar_rs::RarError::PackedDataCrcMismatch {
             member,
             volume: 0,
             expected,
@@ -1147,14 +1169,14 @@ fn test_streaming_split_after_pack_crc_mismatch_fails() {
         final_crc,
     );
     let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
     let mut out = Vec::new();
 
     let err = archive
         .extract_member_streaming(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1164,7 +1186,7 @@ fn test_streaming_split_after_pack_crc_mismatch_fails() {
         .unwrap_err();
     assert!(matches!(
         err,
-        weaver_unrar::RarError::PackedDataCrcMismatch {
+        unrar_rs::RarError::PackedDataCrcMismatch {
             member,
             volume: 0,
             expected,
@@ -1182,14 +1204,14 @@ fn test_streaming_continuation_final_crc_is_verified_when_first_header_has_none(
     let (vol0, vol1) =
         build_two_volume_stored_archive_with_final_crc("stream.bin", content, 25, wrong_final_crc);
     let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
     let mut out = Vec::new();
 
     let err = archive
         .extract_member_streaming(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1200,7 +1222,7 @@ fn test_streaming_continuation_final_crc_is_verified_when_first_header_has_none(
 
     assert!(matches!(
         err,
-        weaver_unrar::RarError::DataCrcMismatch {
+        unrar_rs::RarError::DataCrcMismatch {
             expected,
             actual,
             ..
@@ -1217,14 +1239,14 @@ fn test_streaming_chunked_continuation_final_crc_is_verified_when_first_header_h
     let (vol0, vol1) =
         build_two_volume_stored_archive_with_final_crc("chunk.bin", content, 30, wrong_final_crc);
     let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
     let chunk_dir = tempfile::tempdir().unwrap();
 
     let err = archive
         .extract_member_streaming_chunked(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1233,14 +1255,14 @@ fn test_streaming_chunked_continuation_final_crc_is_verified_when_first_header_h
                 let path = chunk_dir.path().join(format!("vol{volume_index}.chunk"));
                 std::fs::File::create(path)
                     .map(|file| Box::new(file) as Box<dyn std::io::Write>)
-                    .map_err(weaver_unrar::RarError::Io)
+                    .map_err(unrar_rs::RarError::Io)
             },
         )
         .unwrap_err();
 
     assert!(matches!(
         err,
-        weaver_unrar::RarError::DataCrcMismatch {
+        unrar_rs::RarError::DataCrcMismatch {
             expected,
             actual,
             ..
@@ -1254,7 +1276,7 @@ fn test_multivolume_incremental_add() {
     let (vol0, vol1, _full) = build_two_volume_stored_archive("file.dat", content, 25);
 
     // Open first volume only.
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
 
     // Should not be extractable yet (missing volume 1).
     assert!(!archive.is_extractable("file.dat"));
@@ -1273,7 +1295,7 @@ fn test_multivolume_incremental_add() {
     let result = archive
         .extract_by_name(
             "file.dat",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: false,
                 ..Default::default()
             },
@@ -1288,7 +1310,7 @@ fn test_multivolume_is_extractable_missing() {
     let content = b"Test content for extractability check";
     let (vol0, _vol1, _full) = build_two_volume_stored_archive("split.bin", content, 15);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
 
     // Only volume 0 present, file needs volume 1 too.
     assert!(!archive.is_extractable("split.bin"));
@@ -1302,7 +1324,7 @@ fn test_multivolume_missing_volumes_query() {
     let content = b"Query missing volumes for this file";
     let (vol0, _vol1, _full) = build_two_volume_stored_archive("query.dat", content, 10);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
 
     let missing = archive.missing_volumes("query.dat");
     assert_eq!(missing, vec![1]);
@@ -1318,11 +1340,11 @@ fn test_multivolume_volume_continuation_flags() {
     let (vol0, vol1, _) = build_two_volume_stored_archive("flags.dat", content, 25);
 
     // Parse volume 0 — it should indicate more volumes.
-    let archive0 = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let archive0 = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
     assert!(archive0.more_volumes());
 
     // Parse volume 1 — it should NOT indicate more volumes.
-    let archive1 = weaver_unrar::RarArchive::open(Cursor::new(vol1)).unwrap();
+    let archive1 = unrar_rs::RarArchive::open(Cursor::new(vol1)).unwrap();
     assert!(!archive1.more_volumes());
 }
 
@@ -1339,7 +1361,7 @@ fn test_solid_archive_stored_files() {
         build_solid_stored_archive("first.txt", file1_content, "second.txt", file2_content);
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     assert!(archive.is_solid());
 
@@ -1350,7 +1372,7 @@ fn test_solid_archive_stored_files() {
     let result1 = archive
         .extract_by_name(
             "first.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1362,7 +1384,7 @@ fn test_solid_archive_stored_files() {
     let result2 = archive
         .extract_by_name(
             "second.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -1377,7 +1399,7 @@ fn test_solid_archive_metadata() {
     let archive_bytes = build_solid_stored_archive("a.txt", b"AAA", "b.txt", b"BBB");
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert!(meta.is_solid);
@@ -1978,11 +2000,11 @@ fn test_rar4_multivolume_open_volumes() {
     let content = b"RAR4 multi-volume stored file content spanning two volumes!";
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("movie.avi", content, 30);
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
-    assert_eq!(archive.format(), weaver_unrar::ArchiveFormat::Rar4);
+    assert_eq!(archive.format(), unrar_rs::ArchiveFormat::Rar4);
 
     let names = archive.member_names();
     assert_eq!(names.len(), 1);
@@ -1991,7 +2013,7 @@ fn test_rar4_multivolume_open_volumes() {
     let result = archive
         .extract_by_name(
             "movie.avi",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: false,
                 ..Default::default()
             },
@@ -2023,16 +2045,14 @@ fn test_rar4_volume_facts_map_only_supported_host_os_families() {
     }
 
     let mac_facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(4)), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(4)), None).unwrap();
     assert_eq!(
         mac_facts.members[0].host_os,
-        Some(weaver_unrar::RarVolumeHostOs::Darwin)
+        Some(unrar_rs::RarVolumeHostOs::Darwin)
     );
 
     let msdos_facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(0)), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(0)), None).unwrap();
     assert_eq!(msdos_facts.members[0].host_os, None);
 }
 
@@ -2044,7 +2064,7 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
     let final_crc = crc32fast::hash(content);
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("facts-rar4.bin", content, split_at);
 
-    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    let facts0 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert_eq!(facts0.members.len(), 1);
     assert_eq!(
         facts0.members[0].name_raw.as_deref(),
@@ -2052,7 +2072,7 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
     );
     assert_eq!(
         facts0.members[0].host_os,
-        Some(weaver_unrar::RarVolumeHostOs::Unix)
+        Some(unrar_rs::RarVolumeHostOs::Unix)
     );
     assert_eq!(facts0.members[0].attributes, Some(0));
     assert!(facts0.members[0].split_after);
@@ -2060,7 +2080,7 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
     assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
     assert!(facts0.members[0].packed_blake2_hash.is_none());
 
-    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    let facts1 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.members.len(), 1);
     assert_eq!(
         facts1.members[0].name_raw.as_deref(),
@@ -2068,7 +2088,7 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
     );
     assert_eq!(
         facts1.members[0].host_os,
-        Some(weaver_unrar::RarVolumeHostOs::Unix)
+        Some(unrar_rs::RarVolumeHostOs::Unix)
     );
     assert_eq!(facts1.members[0].attributes, Some(0));
     assert!(!facts1.members[0].split_after);
@@ -2084,7 +2104,7 @@ fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
     let full_crc = crc32fast::hash(comment);
     let (vol0, vol1) = build_two_volume_rar4_comment_service_archive(comment, split_at);
 
-    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    let facts0 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert!(facts0.members.is_empty());
     assert_eq!(facts0.services.len(), 1);
     assert_eq!(facts0.services[0].name, "CMT");
@@ -2093,7 +2113,7 @@ fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
     assert_eq!(facts0.services[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
 
-    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    let facts1 = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.services.len(), 1);
     assert_eq!(facts1.services[0].name, "CMT");
     assert_eq!(facts1.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
@@ -2104,7 +2124,7 @@ fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
 
 #[test]
 fn test_rar4_volume_facts_expose_old_acl_and_stream_services() {
-    let facts = weaver_unrar::RarArchive::parse_volume_facts(
+    let facts = unrar_rs::RarArchive::parse_volume_facts(
         Cursor::new(build_rar4_archive_with_old_services()),
         None,
     )
@@ -2143,8 +2163,8 @@ fn test_rar4_multivolume_incremental_add() {
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("file.dat", content, 25);
 
     // Open first volume only.
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
-    assert_eq!(archive.format(), weaver_unrar::ArchiveFormat::Rar4);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
+    assert_eq!(archive.format(), unrar_rs::ArchiveFormat::Rar4);
 
     // Should not be extractable yet.
     assert!(!archive.is_extractable("file.dat"));
@@ -2159,7 +2179,7 @@ fn test_rar4_multivolume_incremental_add() {
     let result = archive
         .extract_by_name(
             "file.dat",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: false,
                 ..Default::default()
             },
@@ -2174,14 +2194,14 @@ fn test_rar4_multivolume_crc_verification() {
     let content = b"CRC verified RAR4 multi-volume content here for testing";
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("data.bin", content, 28);
 
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let result = archive
         .extract_by_name(
             "data.bin",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -2196,7 +2216,7 @@ fn test_rar4_multivolume_missing_volumes_query() {
     let content = b"Query missing volumes for RAR4";
     let (vol0, _vol1) = build_two_volume_rar4_stored_archive("query.dat", content, 15);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
 
     assert!(!archive.is_extractable("query.dat"));
     let missing = archive.missing_volumes("query.dat");
@@ -2226,14 +2246,14 @@ fn test_rar4_single_volume_stored() {
     vol.extend_from_slice(content);
     vol.extend_from_slice(&build_rar4_end_header(false));
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol)).unwrap();
-    assert_eq!(archive.format(), weaver_unrar::ArchiveFormat::Rar4);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol)).unwrap();
+    assert_eq!(archive.format(), unrar_rs::ArchiveFormat::Rar4);
     assert!(!archive.more_volumes());
 
     let result = archive
         .extract_by_name(
             "single.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -2267,16 +2287,15 @@ fn test_rar4_legacy_av_and_sign_headers_are_skipped() {
     vol.extend_from_slice(content);
     vol.extend_from_slice(&build_rar4_end_header(false));
 
-    let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol.clone()), None).unwrap();
+    let facts = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(vol.clone()), None).unwrap();
     assert!(facts.has_authenticity_verification);
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol)).unwrap();
     assert!(archive.has_authenticity_verification());
     let result = archive
         .extract_by_name(
             "signed.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -2291,8 +2310,7 @@ fn test_rar4_uowner_service_attaches_owner_metadata_to_previous_member() {
     let archive_bytes =
         build_rar4_archive_with_uowner_service("owned.txt", b"owned content", "alice", "media");
     let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     let facts_owner = facts.members[0]
         .owner
@@ -2305,7 +2323,7 @@ fn test_rar4_uowner_service_attaches_owner_metadata_to_previous_member() {
     assert_eq!(facts_owner.uid, None);
     assert_eq!(facts_owner.gid, None);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let info = archive.member_info(0).unwrap();
     let owner = info
@@ -2327,8 +2345,7 @@ fn test_rar4_uowner_payload_service_attaches_owner_metadata_to_previous_member()
         None,
     );
     let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     let facts_owner = facts.members[0]
         .owner
@@ -2341,7 +2358,7 @@ fn test_rar4_uowner_payload_service_attaches_owner_metadata_to_previous_member()
     assert_eq!(facts_owner.uid, None);
     assert_eq!(facts_owner.gid, None);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let info = archive.member_info(0).unwrap();
     let owner = info
@@ -2358,8 +2375,7 @@ fn test_rar4_old_uowner_service_attaches_owner_metadata_to_previous_member() {
     let archive_bytes =
         build_rar4_archive_with_old_uowner_service("owned.txt", b"owned content", "alice", "media");
     let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     let facts_owner = facts.members[0]
         .owner
@@ -2372,7 +2388,7 @@ fn test_rar4_old_uowner_service_attaches_owner_metadata_to_previous_member() {
     assert_eq!(facts_owner.uid, None);
     assert_eq!(facts_owner.gid, None);
 
-    let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let info = archive.member_info(0).unwrap();
     let owner = info
@@ -2395,15 +2411,14 @@ fn test_rar4_uowner_payload_crc_error_is_optional_metadata() {
         Some(0xdead_beef),
     );
     let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None).unwrap();
     assert!(facts.members[0].owner.is_none());
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     assert!(archive.member_info(0).unwrap().owner.is_none());
     let result = archive
-        .extract_by_name("owned.txt", &weaver_unrar::ExtractOptions::default(), None)
+        .extract_by_name("owned.txt", &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     assert_eq!(result, content);
 }
@@ -2413,7 +2428,7 @@ fn test_rar4_uowner_service_ignores_empty_owner_or_group() {
     for (owner, group) in [("", "media"), ("alice", "")] {
         let archive_bytes =
             build_rar4_archive_with_uowner_service("owned.txt", b"owned content", owner, group);
-        let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
         assert!(
             archive.member_info(0).unwrap().owner.is_none(),
@@ -2441,14 +2456,14 @@ fn test_extract_member_to_file_restores_rar4_uowner_when_enabled() {
         &group_name,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("owned.txt");
 
     let written = archive
         .extract_member_to_file(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 restore_owners: true,
                 ..Default::default()
             },
@@ -2538,14 +2553,13 @@ fn test_rar4_encrypted_stored_file() {
     let password = "secret123";
     let salt: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     let content = b"RAR4 encrypted stored content!!"; // 31 bytes
-    let (key, iv) = weaver_unrar::crypto::rar4_derive_key(password, Some(&salt));
+    let (key, iv) = unrar_rs::crypto::rar4_derive_key(password, Some(&salt));
     let vol = build_rar4_encrypted_stored_archive("secret.txt", content, &salt, &key, &iv);
 
     // Open and extract with password.
-    let mut archive =
-        weaver_unrar::RarArchive::open_with_password(Cursor::new(vol), password).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_with_password(Cursor::new(vol), password).unwrap();
 
-    assert_eq!(archive.format(), weaver_unrar::ArchiveFormat::Rar4);
+    assert_eq!(archive.format(), unrar_rs::ArchiveFormat::Rar4);
 
     let meta = archive.metadata();
     assert!(meta.members[0].is_encrypted);
@@ -2553,7 +2567,7 @@ fn test_rar4_encrypted_stored_file() {
     let result = archive
         .extract_by_name(
             "secret.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -2589,12 +2603,12 @@ fn build_rar4_long_password_unrar_fixture() -> Vec<u8> {
 fn test_rar4_long_password_unrar_vector_archive_extracts() {
     let vol = build_rar4_long_password_unrar_fixture();
     let mut archive =
-        weaver_unrar::RarArchive::open_with_password(Cursor::new(vol), RAR4_LONG_PASSWORD).unwrap();
+        unrar_rs::RarArchive::open_with_password(Cursor::new(vol), RAR4_LONG_PASSWORD).unwrap();
 
     let result = archive
         .extract_by_name(
             "long-password.txt",
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 verify: true,
                 ..Default::default()
             },
@@ -2603,6 +2617,25 @@ fn test_rar4_long_password_unrar_vector_archive_extracts() {
         .unwrap();
 
     assert_eq!(result, RAR4_LONG_PASSWORD_CONTENT);
+}
+
+/// Builds an `unrar` invocation with a UTF-8 locale pinned on the child.
+///
+/// UnRAR renders member names through the process locale, and with `LANG`/
+/// `LC_ALL` unset it falls back to the C locale and drops every non-ASCII name.
+/// Pinning the locale on the spawned command keeps the oracle correct however
+/// the test runner itself was invoked. macOS ships `en_US.UTF-8` on every
+/// release but only gained `C.UTF-8` in macOS 15, while glibc has carried a
+/// built-in `C.UTF-8` since 2.35 that needs no locale generation.
+fn unrar_command(unrar_bin: &str) -> std::process::Command {
+    let locale = if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    };
+    let mut command = std::process::Command::new(unrar_bin);
+    command.env("LANG", locale).env("LC_ALL", locale);
+    command
 }
 
 #[test]
@@ -2619,7 +2652,7 @@ fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() 
     let archive_path = dir.path().join("long-password.rar");
     std::fs::write(&archive_path, build_rar4_long_password_unrar_fixture()).unwrap();
 
-    let output = std::process::Command::new(unrar_bin)
+    let output = unrar_command(&unrar_bin)
         .arg("t")
         .arg("-idq")
         .arg(format!("-p{RAR4_LONG_PASSWORD}"))
@@ -2660,7 +2693,7 @@ fn extract_old_rar_fixture_with_unrar(unrar_bin: &str, archive_path: &std::path:
         output_dir.path().display(),
         std::path::MAIN_SEPARATOR
     );
-    let output = std::process::Command::new(unrar_bin)
+    let output = unrar_command(unrar_bin)
         .arg("x")
         .arg("-idq")
         .arg("-y")
@@ -2691,7 +2724,7 @@ fn extract_old_rar_fixture_with_unrar(unrar_bin: &str, archive_path: &std::path:
 fn extract_first_regular_member_with_weaver(archive_path: &std::path::Path) -> Vec<u8> {
     let file = std::fs::File::open(archive_path)
         .unwrap_or_else(|err| panic!("failed to open {}: {err}", archive_path.display()));
-    let mut archive = weaver_unrar::RarArchive::open(file)
+    let mut archive = unrar_rs::RarArchive::open(file)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", archive_path.display()));
     let metadata = archive.metadata();
     let member_index = metadata
@@ -2701,7 +2734,7 @@ fn extract_first_regular_member_with_weaver(archive_path: &std::path::Path) -> V
         .unwrap_or_else(|| panic!("{} has no regular members", archive_path.display()));
 
     archive
-        .extract_member(member_index, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(member_index, &unrar_rs::ExtractOptions::default(), None)
         .and_then(|member| member.into_bytes())
         .unwrap_or_else(|err| {
             panic!(
@@ -2722,11 +2755,11 @@ fn test_old_rar_lz_fixtures_extract_expected_bytes() {
 
     for (fixture_name, member_name) in cases {
         let mut archive = open_single("rar4", fixture_name);
-        assert_eq!(archive.metadata().format, weaver_unrar::ArchiveFormat::Rar4);
+        assert_eq!(archive.metadata().format, unrar_rs::ArchiveFormat::Rar4);
         assert_eq!(archive.member_names()[0], member_name);
         assert_eq!(
             archive
-                .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+                .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
                 .and_then(|member| member.into_bytes())
                 .unwrap(),
             expected,
@@ -2796,7 +2829,7 @@ fn test_old_rar_oracle_fixtures_match_unrar_when_available() {
 fn test_rar4_encrypted_no_password_fails() {
     let salt: [u8; 8] = [0xAA; 8];
     let content = b"needs a password";
-    let (key, iv) = weaver_unrar::crypto::rar4_derive_key("pass", Some(&salt));
+    let (key, iv) = unrar_rs::crypto::rar4_derive_key("pass", Some(&salt));
 
     let padded_len = (content.len() + 15) & !15;
     let mut padded = vec![0u8; padded_len];
@@ -2822,9 +2855,8 @@ fn test_rar4_encrypted_no_password_fails() {
     vol.extend_from_slice(&build_rar4_end_header(false));
 
     // Open without password — extraction should fail with EncryptedMember.
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol)).unwrap();
-    let result =
-        archive.extract_by_name("locked.txt", &weaver_unrar::ExtractOptions::default(), None);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol)).unwrap();
+    let result = archive.extract_by_name("locked.txt", &unrar_rs::ExtractOptions::default(), None);
     assert!(result.is_err());
 }
 
@@ -2962,7 +2994,7 @@ fn build_two_stored_members_with_extra(
 fn test_rar5_comment_service_is_read() {
     let archive_bytes = build_rar5_comment_archive("hello from CMT".as_bytes(), None);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     assert_eq!(
         archive.comment().unwrap().as_deref(),
@@ -2974,9 +3006,9 @@ fn test_rar5_comment_service_is_read() {
 fn test_rar5_split_comment_service_is_read() {
     let comment = b"RAR5 split CMT service comment across two volumes";
     let (vol0, vol1) = build_two_volume_rar5_comment_archive(comment, 19);
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     assert!(archive.member_names().is_empty());
     assert_eq!(
@@ -2992,14 +3024,14 @@ fn test_rar5_split_comment_pack_crc_mismatch_fails() {
     let wrong_first_packed_crc = crc32fast::hash(&comment[..split_at]) ^ 0xA5A5_5A5A;
     let (vol0, vol1) =
         build_two_volume_rar5_comment_archive_ex(comment, split_at, Some(wrong_first_packed_crc));
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let err = archive.comment().unwrap_err();
     assert!(matches!(
         err,
-        weaver_unrar::RarError::PackedDataCrcMismatch {
+        unrar_rs::RarError::PackedDataCrcMismatch {
             member,
             volume: 0,
             expected,
@@ -3012,7 +3044,7 @@ fn test_rar5_split_comment_pack_crc_mismatch_fails() {
 fn test_rar5_comment_defaults_to_none() {
     let archive_bytes = build_stored_rar5_archive("plain.txt", b"plain");
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     assert!(archive.comment().unwrap().is_none());
 }
@@ -3023,13 +3055,10 @@ fn test_rar5_comment_crc_mismatch_is_rejected() {
     hasher.update(b"right");
     let archive_bytes = build_rar5_comment_archive(b"wr0ng", Some(hasher.finalize()));
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let err = archive.comment().unwrap_err();
-    assert!(matches!(
-        err,
-        weaver_unrar::RarError::DataCrcMismatch { .. }
-    ));
+    assert!(matches!(err, unrar_rs::RarError::DataCrcMismatch { .. }));
 }
 
 #[test]
@@ -3039,7 +3068,7 @@ fn test_file_encryption_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("secret.txt", b"encrypted", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3062,18 +3091,17 @@ fn test_blake2_hash_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("hashed.bin", b"data", &extra);
 
     let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
-            .unwrap();
+        unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None).unwrap();
     assert_eq!(facts.members.len(), 1);
     assert_eq!(facts.members[0].data_blake2_hash, Some(expected_hash));
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
     match &meta.members[0].hash {
-        Some(weaver_unrar::FileHash::Blake2sp(hash)) => {
+        Some(unrar_rs::FileHash::Blake2sp(hash)) => {
             assert_eq!(hash, &expected_hash, "BLAKE2sp hash should match");
         }
         other => panic!("expected Some(Blake2sp(...)), got {other:?}"),
@@ -3090,8 +3118,7 @@ fn test_file_version_propagated_to_volume_facts() {
     let extra = build_extra_record(0x04, &version_body);
 
     let archive_bytes = build_stored_archive_with_extra("versioned.bin", b"data", &extra);
-    let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
+    let facts = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
 
     assert_eq!(facts.members.len(), 1);
     assert_eq!(facts.members[0].version, Some(7));
@@ -3112,8 +3139,7 @@ fn test_unix_owner_propagated_to_volume_facts() {
     let extra = build_extra_record(0x06, &owner_body);
 
     let archive_bytes = build_stored_archive_with_extra("owned.bin", b"data", &extra);
-    let facts =
-        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
+    let facts = unrar_rs::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
 
     assert_eq!(facts.members.len(), 1);
     let owner = facts.members[0].owner.as_ref().unwrap();
@@ -3135,7 +3161,7 @@ fn test_file_version_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("versioned.txt", b"data", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3159,7 +3185,7 @@ fn test_high_precision_file_times_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("times.txt", b"data", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3207,14 +3233,14 @@ fn test_extract_member_to_file_restores_rar5_numeric_owner_when_enabled() {
     let extra = build_extra_record(0x06, &owner_body);
     let archive_bytes = build_stored_archive_with_extra("owned.txt", b"owned bytes", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("owned.txt");
 
     let written = archive
         .extract_member_to_file(
             0,
-            &weaver_unrar::ExtractOptions {
+            &unrar_rs::ExtractOptions {
                 restore_owners: true,
                 ..Default::default()
             },
@@ -3244,7 +3270,7 @@ fn test_symlink_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3278,7 +3304,7 @@ fn test_hardlink_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3302,7 +3328,7 @@ fn test_filecopy_propagated_to_member_info() {
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
@@ -3322,9 +3348,9 @@ fn redirection_extra(redir_type: u64, target: &str) -> Vec<u8> {
     build_extra_record(0x05, &redir_body)
 }
 
-fn assert_unsupported_link_without_file_target(err: weaver_unrar::RarError, member: &str) {
+fn assert_unsupported_link_without_file_target(err: unrar_rs::RarError, member: &str) {
     match err {
-        weaver_unrar::RarError::UnsupportedLinkType {
+        unrar_rs::RarError::UnsupportedLinkType {
             member: actual,
             link_type,
         } => {
@@ -3342,10 +3368,10 @@ fn assert_unsupported_link_without_file_target(err: weaver_unrar::RarError, memb
 fn test_extract_member_rejects_rar5_link_without_file_target() {
     let extra = redirection_extra(1, "target.txt");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let err = archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap_err();
 
     assert_unsupported_link_without_file_target(err, "link");
@@ -3355,20 +3381,14 @@ fn test_extract_member_rejects_rar5_link_without_file_target() {
 fn test_extract_member_streaming_rejects_rar5_link_without_file_target() {
     let extra = redirection_extra(4, "target.txt");
     let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
-            "/not-needed-before-link-guard.rar",
-        )]);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
+        "/not-needed-before-link-guard.rar",
+    )]);
     let mut out = Vec::new();
 
     let err = archive
-        .extract_member_streaming(
-            0,
-            &weaver_unrar::ExtractOptions::default(),
-            &provider,
-            &mut out,
-        )
+        .extract_member_streaming(0, &unrar_rs::ExtractOptions::default(), &provider, &mut out)
         .unwrap_err();
 
     assert!(out.is_empty());
@@ -3379,17 +3399,16 @@ fn test_extract_member_streaming_rejects_rar5_link_without_file_target() {
 fn test_extract_member_streaming_chunked_rejects_rar5_link_without_file_target() {
     let extra = redirection_extra(5, "target.txt");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
-            "/not-needed-before-link-guard.rar",
-        )]);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
+        "/not-needed-before-link-guard.rar",
+    )]);
     let mut factory_called = false;
 
     let err = archive
         .extract_member_streaming_chunked(
             0,
-            &weaver_unrar::ExtractOptions::default(),
+            &unrar_rs::ExtractOptions::default(),
             &provider,
             |_| {
                 factory_called = true;
@@ -3413,12 +3432,12 @@ fn test_extract_member_to_file_restores_rar5_mtime() {
         1,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("timed.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"timed bytes".len() as u64);
@@ -3431,12 +3450,12 @@ fn test_extract_member_to_file_restores_rar5_mtime() {
 fn test_extract_member_to_file_creates_missing_parent_dirs_for_regular_file() {
     let archive_bytes = build_stored_archive_with_extra("dir/file.txt", b"nested bytes", &[]);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("dir").join("file.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"nested bytes".len() as u64);
@@ -3449,7 +3468,7 @@ fn test_extract_member_to_file_converts_symlink_parent_to_directory_like_unrar()
     let archive_bytes =
         build_stored_archive_with_extra("dir/link/poc.txt", b"protected bytes", &[]);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let dir = temp_dir.path().join("dir");
     let link_parent = dir.join("link");
@@ -3461,7 +3480,7 @@ fn test_extract_member_to_file_converts_symlink_parent_to_directory_like_unrar()
     std::os::unix::fs::symlink("../outside", &link_parent).unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"protected bytes".len() as u64);
@@ -3475,7 +3494,7 @@ fn test_extract_member_to_file_converts_symlink_parent_to_directory_like_unrar()
 fn test_extract_member_to_file_replaces_existing_output_symlink_like_unrar() {
     let archive_bytes = build_stored_archive_with_extra("victim.txt", b"archive bytes", &[]);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let outside_target = temp_dir.path().join("outside.txt");
     let out_path = temp_dir.path().join("victim.txt");
@@ -3484,7 +3503,7 @@ fn test_extract_member_to_file_replaces_existing_output_symlink_like_unrar() {
     std::os::unix::fs::symlink(&outside_target, &out_path).unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"archive bytes".len() as u64);
@@ -3507,12 +3526,12 @@ fn test_extract_member_to_file_restores_rar5_atime_without_overwriting_mtime() {
     let extra = build_extra_record(0x03, &time_body);
     let archive_bytes = build_stored_archive_with_extra("atime.txt", b"timed bytes", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("atime.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"timed bytes".len() as u64);
@@ -3535,12 +3554,12 @@ fn test_extract_member_to_file_restores_rar5_unix_permissions() {
     let archive_bytes =
         build_stored_rar5_archive_with_metadata("mode.txt", b"mode bytes", 0o600, None, 1);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("mode.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"mode bytes".len() as u64);
@@ -3558,12 +3577,12 @@ fn test_extract_member_to_file_maps_rar5_windows_readonly_to_unix_mode() {
     let archive_bytes =
         build_stored_rar5_archive_with_metadata("readonly.txt", b"readonly bytes", 0x01, None, 0);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("readonly.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"readonly bytes".len() as u64);
@@ -3577,12 +3596,12 @@ fn test_extract_member_to_file_creates_rar5_directory_with_metadata() {
     let expected_mtime = 1_700_000_321;
     let archive_bytes = build_directory_rar5_archive("dir", 0o750, Some(expected_mtime));
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("dir");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3605,12 +3624,12 @@ fn test_extract_member_to_file_creates_rar5_symlink() {
     let extra = redirection_extra(1, "target.txt");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3632,12 +3651,12 @@ fn test_extract_member_to_file_creates_missing_parent_dirs_for_rar5_symlink() {
     let extra = redirection_extra(1, "../target.txt");
     let archive_bytes = build_stored_archive_with_extra("dir/link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("dir").join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3661,12 +3680,12 @@ fn test_extract_member_to_file_restores_rar5_symlink_times_like_unrar() {
     extra.extend_from_slice(&redirection_extra(1, "target.txt"));
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3684,12 +3703,12 @@ fn test_extract_member_to_file_preserves_rar5_unix_symlink_backslashes() {
     let extra = redirection_extra(1, "dir\\target.txt");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3705,12 +3724,12 @@ fn test_extract_member_to_file_normalizes_rar5_windows_symlink_target() {
     let extra = redirection_extra(2, "dir\\target.txt");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3725,18 +3744,15 @@ fn test_extract_member_to_file_rejects_unsafe_rar5_link_target() {
     let extra = redirection_extra(1, "/etc/passwd");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let err = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap_err();
 
-    assert!(matches!(
-        err,
-        weaver_unrar::RarError::UnsafeLinkTarget { .. }
-    ));
+    assert!(matches!(err, unrar_rs::RarError::UnsafeLinkTarget { .. }));
 }
 
 #[test]
@@ -3745,12 +3761,12 @@ fn test_extract_member_to_file_creates_unrar_style_windows_device_rar5_symlink()
     let extra = redirection_extra(2, "\\??\\C:\\Windows\\system32");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3766,7 +3782,7 @@ fn test_extract_member_to_file_converts_symlink_parent_before_link_safety_like_u
     let extra = redirection_extra(1, "../target.txt");
     let archive_bytes = build_stored_archive_with_extra("linkdir/link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let real_parent = temp_dir.path().join("real-linkdir");
     let symlink_parent = temp_dir.path().join("linkdir");
@@ -3775,7 +3791,7 @@ fn test_extract_member_to_file_converts_symlink_parent_before_link_safety_like_u
     std::os::unix::fs::symlink(&real_parent, &symlink_parent).unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3798,14 +3814,14 @@ fn test_extract_member_to_file_creates_rar5_hardlink() {
     let extra = redirection_extra(4, "original.txt");
     let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("hardlink");
     std::fs::write(&original, b"linked bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3817,14 +3833,14 @@ fn test_extract_member_to_file_resolves_nested_rar5_hardlink_target_from_root() 
     let extra = redirection_extra(4, "original.txt");
     let archive_bytes = build_stored_archive_with_extra("dir/hardlink", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("dir").join("hardlink");
     std::fs::write(&original, b"linked bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3846,7 +3862,7 @@ fn test_extract_member_to_file_applies_rar5_hardlink_attributes() {
     archive_bytes.extend_from_slice(&build_end_header(false));
 
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("hardlink");
@@ -3856,7 +3872,7 @@ fn test_extract_member_to_file_applies_rar5_hardlink_attributes() {
     std::fs::set_permissions(&original, original_permissions).unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3877,7 +3893,7 @@ fn test_extract_member_to_file_normalizes_rar5_hardlink_target() {
     let extra = redirection_extra(4, "dir\\original.txt");
     let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let dir = temp_dir.path().join("dir");
     std::fs::create_dir(&dir).unwrap();
@@ -3886,7 +3902,7 @@ fn test_extract_member_to_file_normalizes_rar5_hardlink_target() {
     std::fs::write(&original, b"linked bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, 0);
@@ -3898,14 +3914,14 @@ fn test_extract_member_to_file_copies_existing_rar5_filecopy_source() {
     let extra = redirection_extra(5, "original.txt");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("copy.txt");
     std::fs::write(&original, b"copied bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"copied bytes".len() as u64);
@@ -3917,14 +3933,14 @@ fn test_extract_member_to_file_resolves_nested_rar5_filecopy_target_from_root() 
     let extra = redirection_extra(5, "original.txt");
     let archive_bytes = build_stored_archive_with_extra("dir/copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("dir").join("copy.txt");
     std::fs::write(&original, b"copied bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"copied bytes".len() as u64);
@@ -3942,14 +3958,14 @@ fn test_extract_member_to_file_applies_rar5_filecopy_metadata() {
     extra.extend_from_slice(&redirection_extra(5, "original.txt"));
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("copy.txt");
     std::fs::write(&original, b"copied bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"copied bytes".len() as u64);
@@ -3965,7 +3981,7 @@ fn test_extract_member_to_file_normalizes_existing_rar5_filecopy_source() {
     let extra = redirection_extra(5, "dir\\original.txt");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let dir = temp_dir.path().join("dir");
     std::fs::create_dir(&dir).unwrap();
@@ -3974,7 +3990,7 @@ fn test_extract_member_to_file_normalizes_existing_rar5_filecopy_source() {
     std::fs::write(&original, b"copied bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"copied bytes".len() as u64);
@@ -3993,12 +4009,12 @@ fn test_extract_member_to_file_extracts_archive_filecopy_source() {
         &extra,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
     let written = archive
-        .extract_member_to_file(1, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(1, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"archive source".len() as u64);
@@ -4017,18 +4033,18 @@ fn test_extract_member_to_file_rejects_later_rar5_filecopy_source_like_unrar() {
         &[],
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
     // RefList only helps after the referenced source has been encountered in
     // stream order. A future source is not available yet.
     let err = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap_err();
 
     assert!(
-        matches!(err, weaver_unrar::RarError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+        matches!(err, unrar_rs::RarError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
     );
     assert!(!out_path.exists());
 }
@@ -4046,14 +4062,14 @@ fn test_extract_member_to_file_copies_archive_hardlink_source_like_unrar() {
         &filecopy_extra,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let original = temp_dir.path().join("original.txt");
     let out_path = temp_dir.path().join("copy.txt");
     std::fs::write(&original, b"hardlink source bytes").unwrap();
 
     let written = archive
-        .extract_member_to_file(1, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(1, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"hardlink source bytes".len() as u64);
@@ -4072,12 +4088,12 @@ fn test_extract_member_to_file_normalizes_archive_rar5_filecopy_source() {
         &extra,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
     let written = archive
-        .extract_member_to_file(1, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(1, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"archive source".len() as u64);
@@ -4089,7 +4105,7 @@ fn test_extract_member_to_file_sanitizes_absolute_rar5_filecopy_target_like_unra
     let extra = redirection_extra(5, "/etc/passwd");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let normalized_source = temp_dir.path().join("etc/passwd");
     std::fs::create_dir_all(normalized_source.parent().unwrap()).unwrap();
@@ -4097,7 +4113,7 @@ fn test_extract_member_to_file_sanitizes_absolute_rar5_filecopy_target_like_unra
     let out_path = temp_dir.path().join("copy.txt");
 
     let written = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap();
 
     assert_eq!(written, b"safe normalized source".len() as u64);
@@ -4109,16 +4125,16 @@ fn test_extract_member_to_file_rejects_missing_rar5_filecopy_source() {
     let extra = redirection_extra(5, "missing.txt");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
     let err = archive
-        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap_err();
 
     assert!(
-        matches!(err, weaver_unrar::RarError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+        matches!(err, unrar_rs::RarError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
     );
 }
 
@@ -4135,17 +4151,17 @@ fn test_extract_member_to_file_rejects_rar5_filecopy_cycle() {
         &second_extra,
     );
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
     let err = archive
-        .extract_member_to_file(1, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .extract_member_to_file(1, &unrar_rs::ExtractOptions::default(), None, &out_path)
         .unwrap_err();
 
     assert!(matches!(
         err,
-        weaver_unrar::RarError::UnsupportedLinkType { .. }
+        unrar_rs::RarError::UnsupportedLinkType { .. }
     ));
 }
 
@@ -4156,7 +4172,7 @@ fn test_no_extra_records_defaults() {
     let archive_bytes = build_stored_rar5_archive("plain.txt", content);
 
     let cursor = Cursor::new(archive_bytes);
-    let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let archive = unrar_rs::RarArchive::open(cursor).unwrap();
 
     let meta = archive.metadata();
     let member = &meta.members[0];
@@ -4179,7 +4195,7 @@ fn test_no_extra_records_defaults() {
 // Encrypted tests are gated behind `slow-tests` because RAR uses kdf_count=15
 // (1 billion PBKDF2 iterations, ~90s per key derivation in release mode).
 //
-//     cargo test -p weaver-unrar --release --features slow-tests
+//     cargo test -p unrar-rs --release --features slow-tests
 //
 // Unencrypted tests run normally.
 // =============================================================================
@@ -4197,49 +4213,45 @@ fn original(name: &str) -> Vec<u8> {
     std::fs::read(fixture("originals", name)).unwrap()
 }
 
-fn open_single(dir: &str, filename: &str) -> weaver_unrar::RarArchive {
+fn open_single(dir: &str, filename: &str) -> unrar_rs::RarArchive {
     let data = std::fs::read(fixture(dir, filename)).unwrap();
-    weaver_unrar::RarArchive::open(Cursor::new(data)).unwrap()
+    unrar_rs::RarArchive::open(Cursor::new(data)).unwrap()
 }
 
-fn open_single_with_password(
-    dir: &str,
-    filename: &str,
-    password: &str,
-) -> weaver_unrar::RarArchive {
+fn open_single_with_password(dir: &str, filename: &str, password: &str) -> unrar_rs::RarArchive {
     let data = std::fs::read(fixture(dir, filename)).unwrap();
-    weaver_unrar::RarArchive::open_with_password(Cursor::new(data), password).unwrap()
+    unrar_rs::RarArchive::open_with_password(Cursor::new(data), password).unwrap()
 }
 
 fn open_single_file_with_password(
     dir: &str,
     filename: &str,
     password: &str,
-) -> weaver_unrar::RarArchive {
+) -> unrar_rs::RarArchive {
     let file = std::fs::File::open(fixture(dir, filename)).unwrap();
-    weaver_unrar::RarArchive::open_with_password(file, password).unwrap()
+    unrar_rs::RarArchive::open_with_password(file, password).unwrap()
 }
 
-fn open_multi(dir: &str, filenames: &[&str]) -> weaver_unrar::RarArchive {
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = filenames
+fn open_multi(dir: &str, filenames: &[&str]) -> unrar_rs::RarArchive {
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = filenames
         .iter()
         .map(|f| {
             let data = std::fs::read(fixture(dir, f)).unwrap();
-            Box::new(Cursor::new(data)) as Box<dyn weaver_unrar::ReadSeek>
+            Box::new(Cursor::new(data)) as Box<dyn unrar_rs::ReadSeek>
         })
         .collect();
-    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
+    unrar_rs::RarArchive::open_volumes(readers).unwrap()
 }
 
-fn open_multi_paths(paths: &[std::path::PathBuf]) -> weaver_unrar::RarArchive {
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+fn open_multi_paths(paths: &[std::path::PathBuf]) -> unrar_rs::RarArchive {
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
         .iter()
         .map(|path| {
             let data = std::fs::read(path).unwrap();
-            Box::new(Cursor::new(data)) as Box<dyn weaver_unrar::ReadSeek>
+            Box::new(Cursor::new(data)) as Box<dyn unrar_rs::ReadSeek>
         })
         .collect();
-    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
+    unrar_rs::RarArchive::open_volumes(readers).unwrap()
 }
 
 fn streaming_prefix_len_with_available_volumes(
@@ -4255,8 +4267,8 @@ fn streaming_prefix_len_with_available_volumes(
 
     let paths: Vec<_> = filenames.iter().map(|name| fixture(dir, name)).collect();
     let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(paths[..available_volumes].to_vec());
-    let options = weaver_unrar::ExtractOptions {
+        unrar_rs::StaticVolumeProvider::from_ordered(paths[..available_volumes].to_vec());
+    let options = unrar_rs::ExtractOptions {
         verify: false,
         password: password.map(str::to_owned),
         restore_owners: false,
@@ -4278,7 +4290,7 @@ fn streaming_prefix_len_with_available_volumes(
 #[test]
 fn test_rar5_fixture_store_batch() {
     let mut archive = open_single("rar5", "rar5_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4290,13 +4302,13 @@ fn test_rar5_fixture_store_batch() {
 #[test]
 fn test_rar5_fixture_store_streaming() {
     let mut archive = open_single("rar5", "rar5_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_store.rar")]);
+        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_store.rar")]);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4307,7 +4319,7 @@ fn test_rar5_fixture_store_streaming() {
 #[test]
 fn test_rar5_fixture_lz_batch() {
     let mut archive = open_single("rar5", "rar5_lz.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4319,13 +4331,13 @@ fn test_rar5_fixture_lz_batch() {
 #[test]
 fn test_rar5_fixture_lz_streaming() {
     let mut archive = open_single("rar5", "rar5_lz.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_lz.rar")]);
+        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_lz.rar")]);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4346,7 +4358,7 @@ fn test_rar5_fixture_multivolume_store_batch() {
         })
         .collect();
     let mut archive = open_multi("rar5", &vols);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4365,13 +4377,13 @@ fn test_rar5_fixture_multivolume_store_streaming() {
         "rar5_mv_store.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4384,7 +4396,7 @@ fn test_rar5_fixture_multivolume_store_streaming() {
 #[test]
 fn test_rar4_fixture_store_batch() {
     let mut archive = open_single("rar4", "rar4_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4396,7 +4408,7 @@ fn test_rar4_fixture_store_batch() {
 #[test]
 fn test_rar4_fixture_lz_batch() {
     let mut archive = open_single("rar4", "rar4_lz.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4418,7 +4430,7 @@ fn test_rar4_fixture_multivolume_store_batch() {
         })
         .collect();
     let mut archive = open_multi("rar4", &vols);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4442,7 +4454,7 @@ fn test_rar5_fixture_multivolume_video_batch() {
         })
         .collect();
     let mut archive = open_multi("rar5", &vols);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4461,13 +4473,13 @@ fn test_rar5_fixture_multivolume_video_streaming() {
         "rar5_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4485,13 +4497,13 @@ fn test_rar5_fixture_multivolume_video_chunked_matches_prefix_deltas() {
         "rar5_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|name| fixture("rar5", name)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths.clone());
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths.clone());
 
     let chunk_dir = tempfile::tempdir().unwrap();
     let mut chunk_paths = std::collections::BTreeMap::new();
@@ -4501,7 +4513,7 @@ fn test_rar5_fixture_multivolume_video_chunked_matches_prefix_deltas() {
             chunk_paths.insert(volume_index, path.clone());
             std::fs::File::create(path)
                 .map(|file| Box::new(file) as Box<dyn std::io::Write>)
-                .map_err(weaver_unrar::RarError::Io)
+                .map_err(unrar_rs::RarError::Io)
         })
         .unwrap();
 
@@ -4532,6 +4544,148 @@ fn test_rar5_fixture_multivolume_video_chunked_matches_prefix_deltas() {
     assert_eq!(actual_sizes, expected_sizes);
 }
 
+/// The volume numbering the streaming paths speak, held against the batch path
+/// for a member that does not start in the set's first volume.
+///
+/// `extract_member_streaming` and `extract_member_streaming_chunked` address
+/// volumes in the **set's own numbering** — the same one `member_segments`,
+/// `add_volume`, `attach_volume_reader` and `VolumeProvider::get_volume` use.
+/// So a plain [`StaticVolumeProvider`] over the whole set, with no re-keying at
+/// the call site, must produce exactly what the batch path produces.
+///
+/// Every other multi-volume fixture in this file holds a single member starting
+/// in volume 0, where a member-relative numbering and the set's own numbering
+/// coincide; only a second member reachable past a volume boundary tells them
+/// apart. When the streaming paths rebased each member's segments to that
+/// member's own first volume, this read the set from part 1 for a member that
+/// begins in part 6 and tripped the packed-data CRC.
+fn assert_streaming_matches_batch_for_member_past_volume_zero(
+    dir: &str,
+    vol_names: &[String],
+    member_name: &str,
+    password: Option<&str>,
+) {
+    let names: Vec<&str> = vol_names.iter().map(String::as_str).collect();
+    let paths: Vec<_> = names.iter().map(|name| fixture(dir, name)).collect();
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: password.map(str::to_owned),
+        restore_owners: false,
+    };
+    let open = || {
+        let mut archive = open_multi(dir, &names);
+        if let Some(password) = password {
+            archive.set_password(password);
+        }
+        archive
+    };
+
+    let mut batch = open();
+    let index = batch.find_member(member_name).expect("member present");
+    let member = batch.member_info(index).expect("member info");
+    let (first_volume, last_volume) = (member.volumes.first_volume, member.volumes.last_volume);
+    assert!(
+        first_volume > 0,
+        "{member_name} starts in volume {first_volume}: this differential only \
+         proves anything for a member that starts past the set's first volume",
+    );
+    let expected = batch
+        .extract_member(index, &options, None)
+        .and_then(|member| member.into_bytes())
+        .expect("batch extraction");
+
+    // The provider is the set's, keyed by the set's own volume numbers, and is
+    // handed to the library exactly as built.
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+
+    let mut streamed = Vec::new();
+    open()
+        .extract_member_streaming(index, &options, &provider, &mut streamed)
+        .expect("streaming extraction");
+    assert_eq!(
+        streamed, expected,
+        "{member_name}: streamed bytes differ from the batch path"
+    );
+
+    let chunk_dir = tempfile::tempdir().unwrap();
+    let mut chunk_paths = std::collections::BTreeMap::new();
+    let records = open()
+        .extract_member_streaming_chunked(index, &options, &provider, |volume_index| {
+            let path = chunk_dir.path().join(format!("vol{volume_index:03}.chunk"));
+            chunk_paths.insert(volume_index, path.clone());
+            std::fs::File::create(path)
+                .map(|file| Box::new(file) as Box<dyn std::io::Write>)
+                .map_err(unrar_rs::RarError::Io)
+        })
+        .expect("chunked streaming extraction");
+
+    assert_eq!(
+        records.first().map(|(volume_index, _)| *volume_index),
+        Some(first_volume),
+        "{member_name}: the first chunk must be reported against the set's \
+         volume {first_volume}, not an offset from it",
+    );
+    let mut assembled = Vec::new();
+    for (volume_index, bytes_written) in &records {
+        assert!(
+            (first_volume..=last_volume).contains(volume_index),
+            "{member_name}: chunk volume {volume_index} is outside the member's \
+             span {first_volume}..={last_volume}",
+        );
+        let data = std::fs::read(chunk_paths.get(volume_index).expect("chunk written")).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        assembled.extend_from_slice(&data);
+    }
+    assert_eq!(
+        assembled, expected,
+        "{member_name}: chunked bytes differ from the batch path"
+    );
+}
+
+fn store_pair_volumes(base: &str) -> Vec<String> {
+    (1..=9)
+        .map(|part| format!("{base}.part{part:02}.rar"))
+        .collect()
+}
+
+#[test]
+fn test_rar5_multivolume_store_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_mv_store_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        None,
+    );
+}
+
+/// The encrypted twin of the plaintext case above. The defect it guards is not
+/// encryption-specific — both sets have the same layout, and both failed the
+/// same way — but a wrong volume under AES-CBC surfaces as a decrypt-shaped
+/// error rather than a byte mismatch, so both are worth holding.
+#[test]
+fn test_rar5_encrypted_multivolume_store_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_enc_mv_store_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        Some(TEST_PASSWORD),
+    );
+}
+
+/// The solid variant, which reaches the streaming paths' third volume-indexing
+/// site: reading a member out of a solid set first decodes every member before
+/// it, and those skipped members' segments have to be addressed in the same
+/// numbering as the requested member's.
+#[test]
+fn test_rar5_multivolume_solid_pair_second_member_streams_from_its_own_volumes() {
+    assert_streaming_matches_batch_for_member_past_volume_zero(
+        "rar5",
+        &store_pair_volumes("rar5_mv_solid_pair"),
+        "Silver.Horizon.S02E02.mkv",
+        None,
+    );
+}
+
 #[test]
 fn test_rar4_fixture_multivolume_video_batch() {
     let vols: Vec<&str> = (1..=5)
@@ -4545,7 +4699,7 @@ fn test_rar4_fixture_multivolume_video_batch() {
         })
         .collect();
     let mut archive = open_multi("rar4", &vols);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4566,7 +4720,7 @@ fn test_rar5_encrypted_multivolume_video_batch() {
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -4587,13 +4741,13 @@ fn test_rar5_encrypted_multivolume_video_streaming() {
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4613,7 +4767,7 @@ fn test_rar4_encrypted_multivolume_video_batch() {
     ];
     let mut archive = open_multi("rar4", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -4627,7 +4781,7 @@ fn test_rar4_encrypted_multivolume_video_batch() {
 #[test]
 fn test_rar5_encrypted_no_password_fails() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4644,7 +4798,7 @@ fn test_rar5_encrypted_no_password_fails() {
 fn test_rar5_encrypted_store_batch() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -4658,15 +4812,13 @@ fn test_rar5_encrypted_store_batch() {
 fn test_rar5_encrypted_store_streaming() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
     };
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture(
-        "rar5",
-        "rar5_enc_store.rar",
-    )]);
+    let provider =
+        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_store.rar")]);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4679,7 +4831,7 @@ fn test_rar5_encrypted_store_streaming() {
 fn test_rar5_encrypted_lz_batch() {
     let mut archive = open_single("rar5", "rar5_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -4693,13 +4845,13 @@ fn test_rar5_encrypted_lz_batch() {
 fn test_rar5_encrypted_lz_streaming() {
     let mut archive = open_single("rar5", "rar5_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
     };
     let provider =
-        weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
+        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4719,7 +4871,7 @@ fn test_rar5_encrypted_multivolume_store_batch() {
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -4740,13 +4892,13 @@ fn test_rar5_encrypted_multivolume_store_streaming() {
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -4757,10 +4909,10 @@ fn test_rar5_encrypted_multivolume_store_streaming() {
 #[test]
 fn test_cached_headers_resume_encrypted_out_of_order_multivolume_topology() {
     let first = std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part1.rar")).unwrap();
-    let archive = weaver_unrar::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
+    let archive = unrar_rs::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
     let headers = archive.serialize_headers();
 
-    let mut restored = weaver_unrar::RarArchive::deserialize_headers_with_password(
+    let mut restored = unrar_rs::RarArchive::deserialize_headers_with_password(
         &headers,
         Some(TEST_PASSWORD.to_string()),
     )
@@ -4807,10 +4959,10 @@ fn test_cached_headers_resume_encrypted_out_of_order_multivolume_topology() {
 #[test]
 fn test_cached_headers_reverse_volume_arrival_merges_without_panicking() {
     let first = std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part1.rar")).unwrap();
-    let archive = weaver_unrar::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
+    let archive = unrar_rs::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
     let headers = archive.serialize_headers();
 
-    let mut restored = weaver_unrar::RarArchive::deserialize_headers_with_password(
+    let mut restored = unrar_rs::RarArchive::deserialize_headers_with_password(
         &headers,
         Some(TEST_PASSWORD.to_string()),
     )
@@ -4844,7 +4996,7 @@ fn test_cached_headers_reverse_volume_arrival_merges_without_panicking() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_wrong_password_fails() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("wrongpassword".into()),
         restore_owners: false,
@@ -4858,7 +5010,7 @@ fn test_rar5_encrypted_wrong_password_fails() {
 #[test]
 fn test_rar4_encrypted_no_password_fails_fixture() {
     let mut archive = open_single("rar4", "rar4_enc_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -4873,7 +5025,7 @@ fn test_rar4_encrypted_no_password_fails_fixture() {
 #[test]
 fn test_rar4_hp_encrypted_store() {
     let mut archive = open_single_with_password("rar4", "rar4_hp_store.rar", "secretpass");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("secretpass".into()),
         restore_owners: false,
@@ -4885,7 +5037,7 @@ fn test_rar4_hp_encrypted_store() {
 #[test]
 fn test_rar4_hp_encrypted_lz() {
     let mut archive = open_single_with_password("rar4", "rar4_hp_lz.rar", "secretpass");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("secretpass".into()),
         restore_owners: false,
@@ -4902,7 +5054,7 @@ fn test_rar4_hp_encrypted_large() {
         return;
     }
     let mut archive = open_single_with_password("rar4", "rar4_hp_large.rar", "e2e-test-password");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
@@ -4921,7 +5073,7 @@ fn test_rar4_hp_long_password_fixture_gate() {
 
     let password = "abcdefghijklmnopqrstuvwxyzabcdef";
     let mut archive = open_single_with_password("rar4", "rar4_hp_long_password.rar", password);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(password.into()),
         restore_owners: false,
@@ -4935,7 +5087,7 @@ fn test_rar4_hp_long_password_fixture_gate() {
 #[test]
 fn test_rar5_hp_encrypted_store() {
     let mut archive = open_single_with_password("rar5", "rar5_hp_store.rar", "secretpass");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("secretpass".into()),
         restore_owners: false,
@@ -4947,7 +5099,7 @@ fn test_rar5_hp_encrypted_store() {
 #[test]
 fn test_rar5_hp_encrypted_lz() {
     let mut archive = open_single_with_password("rar5", "rar5_hp_lz.rar", "secretpass");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("secretpass".into()),
         restore_owners: false,
@@ -4964,7 +5116,7 @@ fn test_rar5_hp_encrypted_large() {
         return;
     }
     let mut archive = open_single_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
@@ -4980,7 +5132,7 @@ fn test_rar5_hp_encrypted_large_to_file() {
         return;
     }
     let mut archive = open_single_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
@@ -5001,7 +5153,7 @@ fn test_rar5_hp_encrypted_large_disk_open_to_file() {
     }
     let mut archive =
         open_single_file_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
@@ -5018,7 +5170,7 @@ fn test_rar5_hp_encrypted_large_disk_open_to_file() {
 fn test_rar4_encrypted_store_batch() {
     let mut archive = open_single("rar4", "rar4_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -5032,7 +5184,7 @@ fn test_rar4_encrypted_store_batch() {
 fn test_rar4_encrypted_lz_batch() {
     let mut archive = open_single("rar4", "rar4_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -5053,7 +5205,7 @@ fn test_rar4_encrypted_multivolume_store_batch() {
     ];
     let mut archive = open_multi("rar4", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: Some(TEST_PASSWORD.into()),
         restore_owners: false,
@@ -5078,7 +5230,7 @@ fn test_rar5_multifile_store_list() {
 #[test]
 fn test_rar5_multifile_store_extract_all() {
     let mut archive = open_single("rar5", "rar5_multifile_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5097,7 +5249,7 @@ fn test_rar5_multifile_store_extract_all() {
 #[test]
 fn test_rar5_multifile_store_extract_by_name() {
     let mut archive = open_single("rar5", "rar5_multifile_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5116,7 +5268,7 @@ fn test_rar4_multifile_store_list() {
 #[test]
 fn test_rar4_multifile_store_extract_all() {
     let mut archive = open_single("rar4", "rar4_multifile_store.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5137,7 +5289,7 @@ fn test_rar4_multifile_store_extract_all() {
 #[test]
 fn test_rar5_empty_member() {
     let mut archive = open_single("rar5", "rar5_empty_member.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5164,7 +5316,7 @@ fn test_rar5_empty_member_info() {
 #[test]
 fn test_rar4_empty_member() {
     let mut archive = open_single("rar4", "rar4_empty_member.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5200,7 +5352,7 @@ fn test_rar5_unicode_filenames() {
 #[test]
 fn test_rar5_unicode_extract() {
     let mut archive = open_single("rar5", "rar5_unicode.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5228,7 +5380,7 @@ fn test_rar5_unicode_cjk_filename() {
 #[test]
 fn test_rar5_unicode_cjk_extract() {
     let mut archive = open_single("rar5", "rar5_unicode_cjk.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5275,7 +5427,7 @@ fn test_rar5_dirs_list() {
 #[test]
 fn test_rar5_dirs_extract_files() {
     let mut archive = open_single("rar5", "rar5_dirs.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5325,19 +5477,18 @@ fn test_rar5_solid_metadata() {
 #[test]
 fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
     let fixture = fixture("rar5", "rar5_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
 
     let first_chunk_dir = temp_dir.path().join("first");
@@ -5345,9 +5496,9 @@ fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
         .extract_member_solid_chunked(0, &options, |volume_index| {
             let path = first_chunk_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5365,9 +5516,9 @@ fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
         .extract_member_solid_chunked(1, &options, |volume_index| {
             let path = second_chunk_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5385,20 +5536,19 @@ fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
 #[test]
 fn test_rar5_solid_streaming_extracts_all_members_sequentially() {
     let fixture = fixture("rar5", "rar5_solid.rar");
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
-    let options = weaver_unrar::ExtractOptions {
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let mut first = Vec::new();
     archive
         .extract_member_streaming(0, &options, &provider, &mut first)
@@ -5415,20 +5565,19 @@ fn test_rar5_solid_streaming_extracts_all_members_sequentially() {
 #[test]
 fn test_rar5_solid_streaming_chunked_preserves_solid_continuation() {
     let fixture = fixture("rar5", "rar5_solid.rar");
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
-    let options = weaver_unrar::ExtractOptions {
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
 
     let first_dir = temp_dir.path().join("streaming-first");
@@ -5436,9 +5585,9 @@ fn test_rar5_solid_streaming_chunked_preserves_solid_continuation() {
         .extract_member_streaming_chunked(0, &options, &provider, |volume_index| {
             let path = first_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5455,9 +5604,9 @@ fn test_rar5_solid_streaming_chunked_preserves_solid_continuation() {
         .extract_member_streaming_chunked(1, &options, &provider, |volume_index| {
             let path = second_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5473,14 +5622,14 @@ fn test_rar5_solid_streaming_chunked_preserves_solid_continuation() {
 #[test]
 fn test_rar5_solid_reopen_archive_for_later_member() {
     let fixture = fixture("rar5", "rar5_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_second = expected_archive
         .extract_member(1, &options, None)
         .unwrap()
@@ -5488,7 +5637,7 @@ fn test_rar5_solid_reopen_archive_for_later_member() {
         .unwrap();
 
     let mut reopened_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
 
     assert_eq!(actual_second.to_bytes().unwrap(), expected_second);
@@ -5497,13 +5646,13 @@ fn test_rar5_solid_reopen_archive_for_later_member() {
 #[test]
 fn test_rar5_solid_encrypted_extract_all_members_sequentially() {
     let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
     };
 
-    let mut archive = weaver_unrar::RarArchive::open_with_password(
+    let mut archive = unrar_rs::RarArchive::open_with_password(
         std::fs::File::open(&fixture).unwrap(),
         "e2e-test-password",
     )
@@ -5530,13 +5679,13 @@ fn test_rar5_solid_encrypted_extract_all_members_sequentially() {
 #[test]
 fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
     let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
     };
 
-    let mut expected_archive = weaver_unrar::RarArchive::open_with_password(
+    let mut expected_archive = unrar_rs::RarArchive::open_with_password(
         std::fs::File::open(&fixture).unwrap(),
         "e2e-test-password",
     )
@@ -5544,7 +5693,7 @@ fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
-    let mut archive = weaver_unrar::RarArchive::open_with_password(
+    let mut archive = unrar_rs::RarArchive::open_with_password(
         std::fs::File::open(&fixture).unwrap(),
         "e2e-test-password",
     )
@@ -5556,9 +5705,9 @@ fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
         .extract_member_solid_chunked(0, &options, |volume_index| {
             let path = first_chunk_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5576,9 +5725,9 @@ fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
         .extract_member_solid_chunked(1, &options, |volume_index| {
             let path = second_chunk_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5596,21 +5745,20 @@ fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
 #[test]
 fn test_rar5_solid_encrypted_later_member_uses_per_call_password_for_skip() {
     let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
     };
 
-    let mut expected_archive = weaver_unrar::RarArchive::open_with_password(
+    let mut expected_archive = unrar_rs::RarArchive::open_with_password(
         std::fs::File::open(&fixture).unwrap(),
         "e2e-test-password",
     )
     .unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let actual_second = archive.extract_member(1, &options, None).unwrap();
 
     assert_eq!(
@@ -5622,15 +5770,14 @@ fn test_rar5_solid_encrypted_later_member_uses_per_call_password_for_skip() {
 #[test]
 fn test_rar5_solid_encrypted_streaming_chunked_later_member_uses_per_call_password_for_skip() {
     let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
-    let options = weaver_unrar::ExtractOptions {
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
         restore_owners: false,
     };
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_size = archive.member_info(1).unwrap().unpacked_size.unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
     let chunk_dir = temp_dir.path().join("per-call-password-second");
@@ -5639,9 +5786,9 @@ fn test_rar5_solid_encrypted_streaming_chunked_later_member_uses_per_call_passwo
         .extract_member_streaming_chunked(1, &options, &provider, |volume_index| {
             let path = chunk_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5661,14 +5808,14 @@ fn test_rar4_solid_metadata() {
 #[test]
 fn test_rar4_solid_reopen_archive_for_later_member() {
     let fixture = fixture("rar4", "rar4_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_second = expected_archive
         .extract_member(1, &options, None)
         .unwrap()
@@ -5676,7 +5823,7 @@ fn test_rar4_solid_reopen_archive_for_later_member() {
         .unwrap();
 
     let mut reopened_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
 
     assert_eq!(actual_second, expected_second);
@@ -5685,14 +5832,13 @@ fn test_rar4_solid_reopen_archive_for_later_member() {
 #[test]
 fn test_rar4_solid_extracts_all_members_sequentially() {
     let fixture = fixture("rar4", "rar4_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let metadata = archive.metadata().clone();
 
     for member_index in 0..metadata.members.len() {
@@ -5711,14 +5857,14 @@ fn test_rar4_solid_extracts_all_members_sequentially() {
 #[test]
 fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
     let fixture = fixture("rar4", "rar4_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let metadata = expected_archive.metadata().clone();
     let expected_outputs = (0..metadata.members.len())
         .map(|member_index| {
@@ -5730,8 +5876,7 @@ fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
         })
         .collect::<Vec<_>>();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
 
     for (member_index, expected) in expected_outputs.iter().enumerate() {
@@ -5740,9 +5885,9 @@ fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
             .extract_member_solid_chunked(member_index, &options, |volume_index| {
                 let path = member_dir.join(format!("{volume_index:05}.chunk"));
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                    std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
                 }
-                let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+                let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
                 Ok(Box::new(file))
             })
             .unwrap();
@@ -5765,15 +5910,15 @@ fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
 #[test]
 fn test_rar4_solid_streaming_extracts_all_members_sequentially() {
     let fixture = fixture("rar4", "rar4_solid.rar");
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
-    let options = weaver_unrar::ExtractOptions {
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let metadata = expected_archive.metadata().clone();
     let expected_outputs = (0..metadata.members.len())
         .map(|member_index| {
@@ -5785,8 +5930,7 @@ fn test_rar4_solid_streaming_extracts_all_members_sequentially() {
         })
         .collect::<Vec<_>>();
 
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     for (member_index, expected) in expected_outputs.iter().enumerate() {
         let mut actual = Vec::new();
         archive
@@ -5799,25 +5943,24 @@ fn test_rar4_solid_streaming_extracts_all_members_sequentially() {
 #[test]
 fn test_rar4_solid_chunked_reopen_from_cached_headers_for_later_member() {
     let fixture = fixture("rar4", "rar4_solid.rar");
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
 
     let mut expected_archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_second = expected_archive
         .extract_member(1, &options, None)
         .unwrap()
         .to_bytes()
         .unwrap();
 
-    let archive = weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let headers = archive.serialize_headers();
     let mut reopened =
-        weaver_unrar::RarArchive::deserialize_headers_with_password(&headers, None::<String>)
-            .unwrap();
+        unrar_rs::RarArchive::deserialize_headers_with_password(&headers, None::<String>).unwrap();
     reopened.attach_volume_reader(0, Box::new(std::fs::File::open(&fixture).unwrap()));
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5826,9 +5969,9 @@ fn test_rar4_solid_chunked_reopen_from_cached_headers_for_later_member() {
         .extract_member_solid_chunked(1, &options, |volume_index| {
             let path = member_dir.join(format!("{volume_index:05}.chunk"));
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+                std::fs::create_dir_all(parent).map_err(unrar_rs::RarError::Io)?;
             }
-            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            let file = std::fs::File::create(&path).map_err(unrar_rs::RarError::Io)?;
             Ok(Box::new(file))
         })
         .unwrap();
@@ -5854,7 +5997,7 @@ fn test_rar5_recovery_record_parses() {
 #[test]
 fn test_rar5_recovery_record_extract() {
     let mut archive = open_single("rar5", "rar5_recovery.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5875,7 +6018,7 @@ fn test_rar4_recovery_record_parses() {
 #[test]
 fn test_rar4_recovery_record_extract() {
     let mut archive = open_single("rar4", "rar4_recovery.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -5912,14 +6055,14 @@ fn test_rar5_recovery_volumes_restore_missing_part() {
     }
 
     let expected_path = temp_dir.path().join("rar5_recovery_volumes.part05.rar");
-    let options = weaver_unrar::RecoveryOptions {
+    let options = unrar_rs::RecoveryOptions {
         output_dir: Some(temp_dir.path().to_path_buf()),
         overwrite_existing: false,
         verify_restored: true,
     };
-    let report = weaver_unrar::restore_volumes_from_paths(&paths, &options).unwrap();
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
 
-    assert_eq!(report.format, weaver_unrar::ArchiveFormat::Rar5);
+    assert_eq!(report.format, unrar_rs::ArchiveFormat::Rar5);
     assert_eq!(report.missing_volume_numbers, vec![4]);
     assert_eq!(report.restored_paths, vec![expected_path.clone()]);
     assert_eq!(report.used_recovery_paths.len(), 2);
@@ -5944,7 +6087,7 @@ fn test_rar5_recovery_volumes_restore_missing_part() {
         ],
     );
     let expected_payload = expected_archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     let restored_paths: Vec<_> = (1..=10)
         .map(|volume| {
@@ -5956,7 +6099,7 @@ fn test_rar5_recovery_volumes_restore_missing_part() {
     let mut restored_archive = open_multi_paths(&restored_paths);
     assert_eq!(restored_archive.member_names(), vec!["payload.bin"]);
     let restored_payload = restored_archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     assert_eq!(
         restored_payload.to_bytes().unwrap(),
@@ -5985,14 +6128,14 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     }
 
     let expected_path = temp_dir.path().join("rar3_recovery_volumes.part3.rar");
-    let options = weaver_unrar::RecoveryOptions {
+    let options = unrar_rs::RecoveryOptions {
         output_dir: Some(temp_dir.path().to_path_buf()),
         overwrite_existing: false,
         verify_restored: true,
     };
-    let report = weaver_unrar::restore_volumes_from_paths(&paths, &options).unwrap();
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
 
-    assert_eq!(report.format, weaver_unrar::ArchiveFormat::Rar4);
+    assert_eq!(report.format, unrar_rs::ArchiveFormat::Rar4);
     assert_eq!(report.missing_volume_numbers, vec![2]);
     assert_eq!(report.restored_paths, vec![expected_path.clone()]);
     assert_eq!(report.used_recovery_paths.len(), 2);
@@ -6012,7 +6155,7 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
         ],
     );
     let expected_payload = expected_archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     let restored_paths: Vec<_> = (1..=5)
         .map(|volume| {
@@ -6024,12 +6167,47 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     let mut restored_archive = open_multi_paths(&restored_paths);
     assert_eq!(restored_archive.member_names(), vec!["payload.bin"]);
     let restored_payload = restored_archive
-        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
         .unwrap();
     assert_eq!(
         restored_payload.to_bytes().unwrap(),
         expected_payload.to_bytes().unwrap()
     );
+}
+
+#[test]
+fn test_recovery_restore_is_idempotent_for_complete_sets() {
+    let rar5_names = (1..=10)
+        .map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        .chain([
+            "rar5_recovery_volumes.part01.rev".to_string(),
+            "rar5_recovery_volumes.part02.rev".to_string(),
+        ])
+        .collect::<Vec<_>>();
+    let rar3_names = (1..=5)
+        .map(|volume| format!("rar3_recovery_volumes.part{volume}.rar"))
+        .chain([
+            "rar3_recovery_volumes.part1.rev".to_string(),
+            "rar3_recovery_volumes.part2.rev".to_string(),
+        ])
+        .collect::<Vec<_>>();
+
+    for (directory, names, format) in [
+        ("rar5", rar5_names, unrar_rs::ArchiveFormat::Rar5),
+        ("rar4", rar3_names, unrar_rs::ArchiveFormat::Rar4),
+    ] {
+        let paths = names
+            .iter()
+            .map(|name| fixture(directory, name))
+            .collect::<Vec<_>>();
+        let report =
+            unrar_rs::restore_volumes_from_paths(&paths, &unrar_rs::RecoveryOptions::default())
+                .unwrap();
+        assert_eq!(report.format, format);
+        assert!(report.missing_volume_numbers.is_empty());
+        assert!(report.restored_paths.is_empty());
+        assert!(report.used_recovery_paths.is_empty());
+    }
 }
 
 // -- Comment archives ---------------------------------------------------------
@@ -6044,7 +6222,7 @@ fn test_rar5_comment_archive_parses() {
 #[test]
 fn test_rar5_comment_archive_extract() {
     let mut archive = open_single("rar5", "rar5_comment.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6063,7 +6241,7 @@ fn test_rar4_comment_archive_parses() {
 #[test]
 fn test_rar4_comment_archive_extract() {
     let mut archive = open_single("rar4", "rar4_comment.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6078,7 +6256,7 @@ fn test_rar4_modern_comment_service_is_read() {
     let crc = crc32fast::hash(comment);
     let archive_bytes = build_rar4_comment_service_archive(comment, crc);
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     assert!(archive.member_names().is_empty());
     assert_eq!(
         archive.comment().unwrap().as_deref(),
@@ -6090,7 +6268,7 @@ fn test_rar4_modern_comment_service_is_read() {
 fn test_rar4_unicode_comment_service_uses_raw_utf16le() {
     let archive_bytes = build_rar4_unicode_comment_service_archive("Résumé 日本語 comment");
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     assert!(archive.member_names().is_empty());
     assert_eq!(
         archive.comment().unwrap().as_deref(),
@@ -6104,7 +6282,7 @@ fn test_rar4_old_embedded_comment_is_read() {
     let crc16 = (crc32fast::hash(comment) & 0xffff) as u16;
     let archive_bytes = build_rar4_old_comment_archive(comment, crc16);
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     assert!(archive.member_names().is_empty());
     assert_eq!(
         archive.comment().unwrap().as_deref(),
@@ -6130,7 +6308,7 @@ fn test_rar4_old_compressed_comment_uses_rar20_decoder() {
         crc16,
     );
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     let comment = archive.comment().unwrap().unwrap();
     assert!(
         comment.starts_with("RIFF"),
@@ -6143,10 +6321,10 @@ fn test_rar4_old_embedded_comment_crc_mismatch_is_rejected() {
     let comment = b"RAR4 old embedded comment with bad CRC";
     let archive_bytes = build_rar4_old_comment_archive(comment, 0xBEEF);
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     let err = archive.comment().unwrap_err();
     assert!(
-        matches!(err, weaver_unrar::RarError::DataCrcMismatch { .. }),
+        matches!(err, unrar_rs::RarError::DataCrcMismatch { .. }),
         "expected DataCrcMismatch, got {err:?}"
     );
 }
@@ -6155,9 +6333,9 @@ fn test_rar4_old_embedded_comment_crc_mismatch_is_rejected() {
 fn test_rar4_split_modern_comment_service_is_read() {
     let comment = b"RAR4 split modern CMT service comment across volumes";
     let (vol0, vol1) = build_two_volume_rar4_comment_service_archive(comment, 22);
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     assert!(archive.member_names().is_empty());
     assert_eq!(
@@ -6176,14 +6354,14 @@ fn test_rar4_split_modern_comment_pack_crc_mismatch_fails() {
         split_at,
         Some(wrong_first_packed_crc),
     );
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> =
         vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
-    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_volumes(readers).unwrap();
 
     let err = archive.comment().unwrap_err();
     assert!(matches!(
         err,
-        weaver_unrar::RarError::PackedDataCrcMismatch {
+        unrar_rs::RarError::PackedDataCrcMismatch {
             member,
             volume: 0,
             expected,
@@ -6197,10 +6375,10 @@ fn test_rar4_modern_comment_service_crc_mismatch_is_rejected() {
     let comment = b"RAR4 comment with bad CRC";
     let archive_bytes = build_rar4_comment_service_archive(comment, 0xDEADBEEF);
 
-    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
     let err = archive.comment().unwrap_err();
     assert!(
-        matches!(err, weaver_unrar::RarError::DataCrcMismatch { .. }),
+        matches!(err, unrar_rs::RarError::DataCrcMismatch { .. }),
         "expected DataCrcMismatch, got {err:?}"
     );
 }
@@ -6217,7 +6395,7 @@ fn test_rar5_tiny_volumes_batch() {
         "rar5_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6236,13 +6414,13 @@ fn test_rar5_tiny_volumes_streaming() {
         "rar5_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
     };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
     archive
         .extract_member_streaming(0, &opts, &provider, &mut out)
@@ -6260,7 +6438,7 @@ fn test_rar4_tiny_volumes_batch() {
         "rar4_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar4", &vol_names);
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6289,7 +6467,7 @@ fn test_rar5_longname() {
 #[test]
 fn test_rar5_longname_extract() {
     let mut archive = open_single("rar5", "rar5_longname.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6314,7 +6492,7 @@ fn test_rar4_longname() {
 #[test]
 fn test_rar4_longname_extract() {
     let mut archive = open_single("rar4", "rar4_longname.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6351,7 +6529,7 @@ fn test_rar5_symlink_metadata() {
 #[test]
 fn test_rar5_best_compression_extract() {
     let mut archive = open_single("rar5", "rar5_best.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6382,7 +6560,7 @@ fn test_rar5_multifile_lz_list() {
 #[test]
 fn test_rar4_ppmd_solid_restart_lockstep() {
     let mut archive = open_single("rar4", "rar4_ppm_solid_restart.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6395,6 +6573,66 @@ fn test_rar4_ppmd_solid_restart_lockstep() {
     assert!(bytes.iter().all(|b| b.is_ascii()));
 }
 
+/// Large order-16 performance corpus. The hash pins the deterministic payload
+/// independently of RAR header metadata emitted by the fixture generator.
+#[test]
+fn test_rar4_ppmd_order16_32m_payload() {
+    use sha2::{Digest, Sha256};
+
+    let mut archive = open_single("rar4", "rar4_ppm_order16_32m.rar");
+    let opts = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result.len(), 32 * 1024 * 1024);
+    let bytes = result.to_bytes().unwrap();
+    let digest = Sha256::digest(&bytes);
+    assert_eq!(
+        &digest[..],
+        &[
+            0xfe, 0xd0, 0x04, 0x27, 0x61, 0xd0, 0xc6, 0x52, 0xcc, 0xdd, 0x8a, 0xc4, 0x65, 0xde,
+            0x03, 0xea, 0xfc, 0x30, 0x13, 0xf5, 0x81, 0xa0, 0x62, 0x27, 0xc4, 0xe1, 0x7e, 0x2c,
+            0xd1, 0x84, 0xef, 0x8b,
+        ]
+    );
+}
+
+/// Classic `.rar`/`.r00` volumes exercise PPMd range decoding across reader
+/// boundaries as well as old-style volume ordering.
+#[test]
+fn test_rar4_ppmd_classic_multivolume_payload() {
+    use sha2::{Digest, Sha256};
+
+    let mut archive = open_multi(
+        "rar4",
+        &[
+            "rar4_ppm_oldmv.rar",
+            "rar4_ppm_oldmv.r00",
+            "rar4_ppm_oldmv.r01",
+            "rar4_ppm_oldmv.r02",
+        ],
+    );
+    let opts = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result.len(), 256 * 1024);
+    let bytes = result.to_bytes().unwrap();
+    let digest = Sha256::digest(&bytes);
+    assert_eq!(
+        &digest[..],
+        &[
+            0xc8, 0xf9, 0x58, 0x6b, 0xdf, 0xd5, 0x97, 0x68, 0xd2, 0x67, 0xe8, 0xa8, 0xeb, 0xb8,
+            0xd9, 0x6e, 0x35, 0x06, 0xe4, 0xbe, 0x7f, 0x6c, 0x3c, 0x8a, 0x5a, 0x99, 0xa6, 0x9a,
+            0xd8, 0x26, 0x05, 0xb0,
+        ]
+    );
+}
+
 /// Multi-member v29 solid streams end each member with an in-stream marker
 /// (LZ code 256 with new-file/new-table flags) that must be consumed after
 /// the member's last output symbol. Skipping it leaves stale Huffman tables
@@ -6405,7 +6643,7 @@ fn test_rar4_ppmd_solid_restart_lockstep() {
 #[test]
 fn test_rar4_lz_solid_multi_member_boundaries() {
     let mut archive = open_single("rar4", "rar4_lz_solid_mv.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -6433,7 +6671,7 @@ fn test_rar4_lz_solid_multi_member_boundaries() {
 #[test]
 fn test_rar4_ppmd_solid_multi_member_boundaries() {
     let mut archive = open_single("rar4", "rar4_ppm_solid_mv.rar");
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,

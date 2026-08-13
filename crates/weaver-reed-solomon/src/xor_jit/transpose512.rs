@@ -2,17 +2,13 @@
 //! 64 bytes (512 words per block), plane `p` holding word-bit `15-p` — the
 //! same plane↔bit contract as the 512-byte layout ([`super::transpose`]).
 //!
-//! Deliberate deviation from upstream: ParPar's `gf16_xor_avx512.c` has a
-//! native vpmovb2m-based prepare, but the JIT multiply only requires that
-//! prepare/finish agree and that the plane↔bit mapping holds — the intra-plane
-//! word order is free (XOR is bitwise-parallel). So the wide block is composed
-//! from two proven 512-byte AVX2 transposes with their half-planes
-//! interleaved: plane `p` = [block-A plane `p` | block-B plane `p`]. This
-//! keeps every piece testable on any AVX2 x86 host (vs a native vpmovb2m
-//! port, which would need real AVX512 silicon), and prepare/finish cost is
-//! amortized noise next to the multiply. Note that Rosetta 2 executes AVX2
-//! but does not advertise it via CPUID, so the detection-gated tests here
-//! skip under translation — real coverage needs native x86 hardware.
+//! The wide block is composed from two 512-byte AVX2 transposes with their
+//! half-planes interleaved: plane `p` = [block-A plane `p` | block-B plane
+//! `p`]. The multiply requires prepare/finish agreement and a stable
+//! plane-to-bit mapping; intra-plane word order is otherwise free because XOR
+//! is bitwise-parallel. This design remains testable on AVX2-only hosts. The
+//! detection-gated tests skip under Rosetta 2 because translated processes do
+//! not advertise AVX2 through CPUID.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::transpose;
@@ -126,7 +122,7 @@ mod tests {
         }
     }
 
-    /// The wide planar muladd oracle agrees with the word-wise GF multiply
+    /// The wide planar muladd reference agrees with the word-wise GF multiply
     /// through the wide transpose — the layout+deps contract at 64-byte
     /// planes (mirrors deps.rs::planar_muladd_matches_scalar_gf).
     #[test]

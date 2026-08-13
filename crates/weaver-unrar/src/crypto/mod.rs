@@ -12,7 +12,7 @@
 //! the common case).
 //!
 //! All cryptographic primitives that touch the underlying crypto library live
-//! behind the [`backend`] seam; the code in this module only ever calls that
+//! behind the `backend` seam; the code in this module only ever calls that
 //! seam, so a second backend can be added without editing shared logic.
 
 mod backend;
@@ -278,6 +278,81 @@ fn password_check_matches(psw_check: &[u8; 8], check_data: &[u8; 12]) -> bool {
     psw_check.as_slice().ct_eq(&check_data[..8]).into()
 }
 
+/// What a member's header lets a caller conclude about a candidate password,
+/// **before** any of that member's bytes are decrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordCheck {
+    /// The header carried a password-check value and this password reproduces
+    /// it.
+    ///
+    /// That is the whole of the claim: the password matches what *this header
+    /// states*. It is not a guarantee that decrypting yields the writer's
+    /// plaintext, because the check value is 8 unauthenticated bytes in a
+    /// header a hostile writer chooses. Forging them to the value a different
+    /// password derives makes this variant say `Verified` for that password
+    /// while every decrypted byte is garbage — see
+    /// `forged_password_check_admits_a_wrong_password_and_the_keyed_member_gate_still_catches_it`
+    /// in `tests/stored_layout_fixtures.rs`.
+    ///
+    /// The authority over the plaintext is the member's checksum, folded with
+    /// the same password's hash key when the header keys it
+    /// ([`convert_crc32_to_mac`] / [`convert_blake2_to_mac`]). A caller may use
+    /// this variant to admit a password cheaply and to reject one for free; it
+    /// must not use it to skip that gate before anything is kept.
+    Verified,
+    /// The header carried a password-check value and this password does not
+    /// reproduce it. Every byte decrypted with it would be garbage, so nothing
+    /// should be written on the strength of it.
+    Wrong,
+    /// The header carried no usable password-check value — the writer omitted
+    /// it, or the value failed its own SHA-256 tag — so nothing can be
+    /// concluded here. The password may still be right; the member's checksum
+    /// gates are then the earliest detector.
+    Unverifiable,
+}
+
+/// Check a candidate password against one member's RAR5 crypt facts.
+///
+/// The E-D1 admission surface: three outcomes, no key handed out, and a
+/// [`KdfCache`] so a set whose members share a KDF tuple pays for the
+/// derivation once. `psw_check` is
+/// [`crate::RarVolumeMemberEncryptionFacts::psw_check`] — already validated
+/// against its own tag by the parser, which is why the "claimed but corrupt"
+/// case arrives here as `None` and reads as [`PasswordCheck::Unverifiable`].
+///
+/// A KDF count the crate refuses (over [`CRYPT5_KDF_LG2_COUNT_MAX`]) also
+/// yields `Unverifiable`: the derivation never runs, so the password is
+/// neither confirmed nor refuted. Such a member cannot be decrypted at all —
+/// the caller learns that from the facts, not from here.
+pub fn check_member_password(
+    cache: &KdfCache,
+    password: &str,
+    salt: &[u8; 16],
+    kdf_count_lg2: u8,
+    psw_check: Option<&[u8; 12]>,
+) -> PasswordCheck {
+    let Some(psw_check) = psw_check else {
+        return PasswordCheck::Unverifiable;
+    };
+    if kdf_count_lg2 > CRYPT5_KDF_LG2_COUNT_MAX {
+        return PasswordCheck::Unverifiable;
+    }
+    match cache.derive_material_rar5(password, salt, kdf_count_lg2) {
+        Ok(mut material) => {
+            let matches = password_check_matches(&material.psw_check, psw_check);
+            material.key.zeroize();
+            material.hash_key.zeroize();
+            material.psw_check.zeroize();
+            if matches {
+                PasswordCheck::Verified
+            } else {
+                PasswordCheck::Wrong
+            }
+        }
+        Err(_) => PasswordCheck::Unverifiable,
+    }
+}
+
 pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
     let digest = backend::hmac_sha256(&backend::hmac_sha256_key(key), &value.to_le_bytes());
     let mut mac = 0u32;
@@ -297,7 +372,7 @@ pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
 /// same on every target; only the backend differs. `blake2s_simd` ships only
 /// AVX2/SSE4.1/portable backends, so on `aarch64` and `wasm32 + simd128` its
 /// BLAKE2sp runs scalar; on exactly those targets we substitute the in-crate
-/// [`blake2sp_simd`](crate::crypto::blake2sp_simd) NEON / `simd128` kernel.
+/// `blake2sp_simd` NEON / `simd128` kernel.
 /// Everywhere else (x86 AVX2, wasm without simd, other arches) it keeps calling
 /// `blake2s_simd` unchanged. The output is byte-identical either way.
 #[cfg(any(
@@ -1527,6 +1602,233 @@ impl CbcDecryptor {
     }
 }
 
+/// Decrypt one arbitrary range of a RAR5 member's cipher stream, in place.
+///
+/// The whole of E-D2 in one call: AES-CBC decrypts block *N* from block *N*
+/// and block *N−1* alone, so a range's plaintext depends only on its own
+/// cipher bytes plus the 16 immediately before them. No archive object, no
+/// chain state, no forward-only constraint — a router that has cipher bytes
+/// out of order can decrypt each span the moment its predecessor block has
+/// landed.
+///
+/// - `key` is the member's AES-256 key, from
+///   [`KdfCache::derive_key_rar5`] over its `FHEXTRA_CRYPT` salt and KDF count.
+/// - `preceding_block` is the 16 cipher bytes immediately before `cipher`'s
+///   first byte, or the member's header IV
+///   ([`crate::RarVolumeMemberEncryptionFacts::iv`]) when `cipher` starts at
+///   member-logical offset 0. Passing the wrong 16 bytes corrupts exactly the
+///   first block and leaves the rest correct — it is not a detectable error
+///   here, so the caller owns getting it right.
+/// - `cipher` is a whole number of blocks, so both its start offset and its
+///   length are multiples of 16. Cipher offset and member-logical offset are
+///   the same number for a stored member.
+///
+/// Errors only on a length that is not a multiple of 16; an empty range is a
+/// no-op. Decrypting past the member's declared size is legitimate — the final
+/// block's last bytes are its tail padding.
+pub fn decrypt_cipher_range(
+    key: &[u8; 32],
+    preceding_block: &[u8; AES_BLOCK],
+    cipher: &mut [u8],
+) -> RarResult<()> {
+    if cipher.is_empty() {
+        return Ok(());
+    }
+    if !cipher.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                cipher.len()
+            ),
+        });
+    }
+
+    CbcDecryptor::new(key, preceding_block).decrypt_blocks(cipher);
+    Ok(())
+}
+
+/// Encrypt one arbitrary range of a RAR5 member's cipher stream, in place.
+///
+/// The exact inverse of [`decrypt_cipher_range`], and its mirror in every
+/// respect: same argument order, same in-place semantics, same error type, same
+/// "the caller owns the predecessor" contract. AES-CBC encryption is
+/// deterministic given key, predecessor and plaintext, so a caller holding a
+/// member's plaintext can reproduce exactly the bytes that were posted — which
+/// is what a reader has to hand back when the archive's own bytes are gone and
+/// only the decrypted member is on disk.
+///
+/// - `key` is the member's AES-256 key, from
+///   [`KdfCache::derive_key_rar5`] over its `FHEXTRA_CRYPT` salt and KDF count.
+/// - `preceding_block` is the 16 **cipher** bytes immediately before `plain`'s
+///   first byte, or the member's header IV
+///   ([`crate::RarVolumeMemberEncryptionFacts::iv`]) when `plain` starts at
+///   member-logical offset 0. Passing the wrong 16 bytes is not a detectable
+///   error here, so the caller owns getting it right — and unlike the decrypt,
+///   the damage does **not** stop at the first block: CBC feeds each ciphertext
+///   block into the next, so every byte of the range comes out different from
+///   what was posted.
+/// - `plain` is a whole number of blocks, and holds the ciphertext on return.
+///
+/// Errors on a length that is not a multiple of 16, and on a backend that
+/// refuses the transform; an empty range is a no-op. Both are returned rather
+/// than asserted, because the caller is a reader that must be able to answer
+/// "these bytes are unavailable" instead of dying. On an error `plain`'s
+/// contents are unspecified.
+pub fn encrypt_cipher_range(
+    key: &[u8; 32],
+    preceding_block: &[u8; AES_BLOCK],
+    plain: &mut [u8],
+) -> RarResult<()> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    if !plain.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                plain.len()
+            ),
+        });
+    }
+
+    match backend::Aes256CbcEnc::new(key, preceding_block).encrypt_blocks(plain) {
+        true => Ok(()),
+        false => Err(RarError::CorruptArchive {
+            detail: format!(
+                "AES-256-CBC encryption of a {}-byte range was refused by the crypto backend",
+                plain.len()
+            ),
+        }),
+    }
+}
+
+/// Decrypt one arbitrary range of a **RAR4** member's cipher stream, in place.
+///
+/// The AES-128 twin of [`decrypt_cipher_range`], with the same contract in every
+/// respect — see it for what `preceding_block` must be and what happens when it
+/// is wrong. The only difference is the key width, and where the key comes from:
+/// RAR4 derives both key and IV together from the password plus the header's
+/// optional 8-byte file salt ([`KdfCache::derive_key_rar4`]), where RAR5 derives
+/// the key from a `FHEXTRA_CRYPT` record and reads the IV out of it.
+///
+/// Prefer [`MemberCipherKey::decrypt_range`] where the format is not known
+/// statically; this is the direct entry point for a RAR4-only caller.
+pub fn decrypt_cipher_range_rar4(
+    key: &[u8; 16],
+    preceding_block: &[u8; AES_BLOCK],
+    cipher: &mut [u8],
+) -> RarResult<()> {
+    if cipher.is_empty() {
+        return Ok(());
+    }
+    if !cipher.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                cipher.len()
+            ),
+        });
+    }
+
+    Rar4CbcDecryptor::new(key, preceding_block).decrypt_blocks(cipher);
+    Ok(())
+}
+
+/// Encrypt one arbitrary range of a **RAR4** member's cipher stream, in place.
+///
+/// The AES-128 twin of [`encrypt_cipher_range`], with the same contract: same
+/// argument order, same in-place semantics, same fallibility, and the same
+/// "the caller owns the predecessor" rule whose damage does *not* stop at the
+/// first block.
+///
+/// Prefer [`MemberCipherKey::encrypt_range`] where the format is not known
+/// statically; this is the direct entry point for a RAR4-only caller.
+pub fn encrypt_cipher_range_rar4(
+    key: &[u8; 16],
+    preceding_block: &[u8; AES_BLOCK],
+    plain: &mut [u8],
+) -> RarResult<()> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    if !plain.len().is_multiple_of(AES_BLOCK) {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "encrypted range length {} is not a multiple of AES block size ({AES_BLOCK})",
+                plain.len()
+            ),
+        });
+    }
+
+    match backend::Aes128CbcEnc::new(key, preceding_block).encrypt_blocks(plain) {
+        true => Ok(()),
+        false => Err(RarError::CorruptArchive {
+            detail: format!(
+                "AES-128-CBC encryption of a {}-byte range was refused by the crypto backend",
+                plain.len()
+            ),
+        }),
+    }
+}
+
+/// The AES key that turns one member's cipher stream into its plaintext, and
+/// back.
+///
+/// RAR encrypts a stored member's whole plaintext as **one CBC stream** whatever
+/// the format — the difference is only the key width and where the key and IV
+/// come from — so a router that has to decrypt at write time and re-encrypt on
+/// read wants one type it can carry per member and one pair of calls it can
+/// make. That is this: format-agnostic at the call site, exact at the cipher.
+///
+/// Which variant a member takes is not a guess. [`crate::MemberKeying`] is what
+/// the headers state, and it maps one-to-one:
+/// [`crate::MemberKeying::Rar5`] is [`Self::Aes256`] over
+/// [`KdfCache::derive_key_rar5`], and [`crate::MemberKeying::Rar4`] is
+/// [`Self::Aes128`] over [`KdfCache::derive_key_rar4`].
+///
+/// This is key material. It carries no `Debug`, no `Display` and no
+/// serialization, deliberately: a key in a log is a key on disk. `PartialEq` is
+/// here for *identity* — "did these two members derive the same key" — and is a
+/// plain byte comparison; nothing authenticates against it, and nothing should.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemberCipherKey {
+    /// RAR5 file encryption: AES-256-CBC, keyed by PBKDF2-HMAC-SHA256 over the
+    /// `FHEXTRA_CRYPT` salt and iteration count.
+    Aes256([u8; 32]),
+    /// RAR4/RAR3 "RAR 3.0" file encryption: AES-128-CBC, keyed by the legacy
+    /// iterative SHA-1 KDF over the password and the header's optional 8-byte
+    /// file salt.
+    Aes128([u8; 16]),
+}
+
+impl MemberCipherKey {
+    /// Decrypt `cipher` in place — see [`decrypt_cipher_range`] for the whole
+    /// contract, which is the same for both widths.
+    pub fn decrypt_range(
+        &self,
+        preceding_block: &[u8; AES_BLOCK],
+        cipher: &mut [u8],
+    ) -> RarResult<()> {
+        match self {
+            Self::Aes256(key) => decrypt_cipher_range(key, preceding_block, cipher),
+            Self::Aes128(key) => decrypt_cipher_range_rar4(key, preceding_block, cipher),
+        }
+    }
+
+    /// Encrypt `plain` in place — see [`encrypt_cipher_range`] for the whole
+    /// contract, which is the same for both widths.
+    pub fn encrypt_range(
+        &self,
+        preceding_block: &[u8; AES_BLOCK],
+        plain: &mut [u8],
+    ) -> RarResult<()> {
+        match self {
+            Self::Aes256(key) => encrypt_cipher_range(key, preceding_block, plain),
+            Self::Aes128(key) => encrypt_cipher_range_rar4(key, preceding_block, plain),
+        }
+    }
+}
+
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
     decryptor: backend::Aes128CbcDec,
@@ -1585,30 +1887,30 @@ impl CbcDecryptorAny {
     }
 }
 
-/// Decryption buffer size.
-/// Keep this modest because encrypted extraction already pays for the dictionary
-/// window and output sink; a very large decrypt staging buffer does not buy much
-/// once compressed input is streamed.
-const DECRYPT_BUF_SIZE: usize = 64 * 1024;
-
 /// A `Read` adapter that decrypts AES-CBC on-the-fly.
 ///
 /// Wraps an inner `Read` source (e.g. `ChainedSegmentReader`) and decrypts
-/// data as it flows through. Handles partial AES blocks at read boundaries
-/// by buffering internally.
+/// data as it flows through. Ciphertext is read straight into the caller's
+/// buffer and decrypted in place, matching unrar's `UnpRead` (rdwrfn.cpp),
+/// which decrypts the read buffer where it lands. The caller therefore sets
+/// the read granularity; nothing here caps it.
+///
+/// Only two things are carried between calls: ciphertext that does not
+/// complete an AES block (a volume boundary can split one), and — for callers
+/// whose buffer is smaller than a single block — one staged plaintext block.
 ///
 /// The total data from the inner reader MUST be a multiple of 16 bytes
 /// (guaranteed by RAR's archive format for encrypted members).
 pub struct DecryptingReader<R: Read> {
     inner: R,
     decryptor: CbcDecryptorAny,
-    /// Bytes read from inner but not yet forming a complete AES block.
+    /// Ciphertext read from inner but not yet forming a complete AES block.
     pending: [u8; AES_BLOCK],
     pending_len: usize,
-    /// Heap-allocated decryption buffer (too large for stack).
-    out_buf: Box<[u8]>,
-    out_pos: usize,
-    out_len: usize,
+    /// Plaintext staged for callers whose buffer cannot hold a whole block.
+    plain: [u8; AES_BLOCK],
+    plain_pos: usize,
+    plain_len: usize,
     /// Inner reader hit EOF.
     inner_eof: bool,
 }
@@ -1616,7 +1918,7 @@ pub struct DecryptingReader<R: Read> {
 impl<R: Read> Drop for DecryptingReader<R> {
     fn drop(&mut self) {
         self.pending.zeroize();
-        self.out_buf.zeroize();
+        self.plain.zeroize();
     }
 }
 
@@ -1627,11 +1929,53 @@ impl<R: Read> DecryptingReader<R> {
             decryptor,
             pending: [0u8; AES_BLOCK],
             pending_len: 0,
-            out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
-            out_pos: 0,
-            out_len: 0,
+            plain: [0u8; AES_BLOCK],
+            plain_pos: 0,
+            plain_len: 0,
             inner_eof: false,
         }
+    }
+
+    /// Stage one decrypted block in `plain`, for callers whose buffer is too
+    /// small to decrypt in place. Returns 0 at a clean end of stream.
+    fn stage_block(&mut self) -> std::io::Result<usize> {
+        let mut total = self.pending_len;
+        if total > 0 {
+            self.plain[..total].copy_from_slice(&self.pending[..total]);
+        }
+        while total < AES_BLOCK && !self.inner_eof {
+            match self.inner.read(&mut self.plain[total..AES_BLOCK]) {
+                Ok(0) => {
+                    self.inner_eof = true;
+                    break;
+                }
+                Ok(read) => total += read,
+                Err(error) => {
+                    // Keep what was staged so a retry resumes where it stopped.
+                    self.pending[..total].copy_from_slice(&self.plain[..total]);
+                    self.pending_len = total;
+                    return Err(error);
+                }
+            }
+        }
+        self.pending_len = 0;
+
+        if total == 0 {
+            return Ok(0);
+        }
+        if total < AES_BLOCK {
+            self.pending[..total].copy_from_slice(&self.plain[..total]);
+            self.pending_len = total;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encrypted data not aligned to AES block size",
+            ));
+        }
+
+        self.decryptor.decrypt(&mut self.plain[..]);
+        self.plain_pos = 0;
+        self.plain_len = AES_BLOCK;
+        Ok(AES_BLOCK)
     }
 
     /// Create a new decrypting reader for RAR5 (AES-256-CBC).
@@ -1696,84 +2040,84 @@ impl<R: Read> Read for DecryptingReader<R> {
             return Ok(read);
         }
 
-        // Return any buffered decrypted data first.
-        if self.out_pos < self.out_len {
-            let n = (self.out_len - self.out_pos).min(buf.len());
-            buf[..n].copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + n]);
-            self.out_pos += n;
+        // Serve plaintext held back from a sub-block-sized read.
+        if self.plain_pos < self.plain_len {
+            let n = (self.plain_len - self.plain_pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.plain[self.plain_pos..self.plain_pos + n]);
+            self.plain_pos += n;
             return Ok(n);
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
         }
 
         if self.inner_eof && self.pending_len == 0 {
             return Ok(0);
         }
 
-        // Read directly into out_buf, prepending any pending partial block.
-        let raw_start;
-        if self.pending_len > 0 {
-            self.out_buf[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
-            raw_start = self.pending_len;
-            self.pending_len = 0;
-        } else {
-            raw_start = 0;
+        // A buffer shorter than one AES block cannot be decrypted in place.
+        if buf.len() < AES_BLOCK {
+            if self.stage_block()? == 0 {
+                return Ok(0);
+            }
+            let n = self.plain_len.min(buf.len());
+            buf[..n].copy_from_slice(&self.plain[..n]);
+            self.plain_pos = n;
+            return Ok(n);
         }
 
-        // Fill out_buf as much as possible from inner.
-        // Loop to fill the buffer since a single read() may return short.
-        let mut total = raw_start;
-        if !self.inner_eof {
-            // Read at least enough to make progress, ideally fill the buffer.
-            while total < DECRYPT_BUF_SIZE {
-                let n = self
-                    .inner
-                    .read(&mut self.out_buf[total..DECRYPT_BUF_SIZE])?;
-                if n == 0 {
+        // Read ciphertext straight into the caller's buffer, prefixed by any
+        // partial block carried over from the previous call.
+        let mut total = self.pending_len;
+        if total > 0 {
+            buf[..total].copy_from_slice(&self.pending[..total]);
+        }
+        while total < buf.len() && !self.inner_eof {
+            debug_assert!(total < AES_BLOCK, "fill loop runs only until one block");
+            match self.inner.read(&mut buf[total..]) {
+                Ok(0) => {
                     self.inner_eof = true;
                     break;
                 }
-                total += n;
-                // Don't loop forever on small reads — one good read is enough
-                // to make progress. But try to fill the buffer for pipeline efficiency.
-                if total >= DECRYPT_BUF_SIZE / 2 {
-                    break;
+                Ok(read) => {
+                    total += read;
+                    // One whole block is enough to hand back; keep reading only
+                    // while a short read has not yet produced one.
+                    if total >= AES_BLOCK {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    // Carry the staged ciphertext so a retry resumes cleanly.
+                    self.pending[..total].copy_from_slice(&buf[..total]);
+                    self.pending_len = total;
+                    return Err(error);
                 }
             }
         }
+        self.pending_len = 0;
 
-        if total == 0 {
-            return Ok(0);
-        }
-
-        // How many complete AES blocks do we have?
-        let complete = (total / AES_BLOCK) * AES_BLOCK;
+        let complete = total - (total % AES_BLOCK);
         let leftover = total - complete;
-
-        // Save leftover for next call.
         if leftover > 0 {
-            self.pending[..leftover].copy_from_slice(&self.out_buf[complete..total]);
+            self.pending[..leftover].copy_from_slice(&buf[complete..total]);
             self.pending_len = leftover;
         }
 
         if complete == 0 {
-            if self.inner_eof {
+            // The fill loop stops below one block only at end of stream.
+            if leftover > 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "encrypted data not aligned to AES block size",
                 ));
             }
-            return self.read(buf);
+            return Ok(0);
         }
 
-        // Decrypt complete blocks in-place (no extra copy).
-        self.decryptor.decrypt(&mut self.out_buf[..complete]);
-        self.out_pos = 0;
-        self.out_len = complete;
-
-        // Copy to caller.
-        let n = complete.min(buf.len());
-        buf[..n].copy_from_slice(&self.out_buf[..n]);
-        self.out_pos = n;
-        Ok(n)
+        self.decryptor.decrypt(&mut buf[..complete]);
+        Ok(complete)
     }
 }
 
@@ -2252,5 +2596,432 @@ mod tests {
         }
 
         assert_eq!(actual, plaintext);
+    }
+
+    /// Inner reader that returns a scripted (cycling) number of bytes per
+    /// call, so an AES block can be split across inner reads the way a volume
+    /// boundary splits one.
+    struct ScriptedCursor {
+        data: Vec<u8>,
+        pos: usize,
+        sizes: Vec<usize>,
+        next: usize,
+    }
+
+    impl ScriptedCursor {
+        fn new(data: Vec<u8>, sizes: Vec<usize>) -> Self {
+            Self {
+                data,
+                pos: 0,
+                sizes,
+                next: 0,
+            }
+        }
+    }
+
+    impl Read for ScriptedCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let want = self.sizes[self.next % self.sizes.len()].max(1);
+            self.next += 1;
+            let take = want.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    fn decrypt_test_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 27) as u8
+            })
+            .collect()
+    }
+
+    fn read_all_in_steps<R: Read>(reader: &mut R, step: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; step];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..read]);
+        }
+    }
+
+    /// In-place decryption must reproduce the plaintext byte for byte no matter
+    /// how the inner stream is split or how large the caller's reads are —
+    /// including reads shorter than one AES block, which cannot decrypt in
+    /// place and take the staged-block path instead.
+    #[test]
+    fn decrypting_reader_is_byte_identical_across_read_and_split_sizes() {
+        let key256 = [0x9au8; 32];
+        let key128 = [0x4eu8; 16];
+        let iv = [0x1cu8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 512, 0xfeed);
+        let cipher256 = encrypt_aes256_cbc_for_test(&key256, &iv, &plaintext);
+        let cipher128 = encrypt_aes128_cbc_for_test(&key128, &iv, &plaintext);
+
+        for &split in &[1usize, 3, 15, 16, 17, 64, 1000, 4096, 65_536] {
+            for &step in &[1usize, 2, 15, 16, 17, 31, 97, 1024, 4095, 8192] {
+                let inner = ChunkedCursor::new(cipher256.clone(), split);
+                let mut reader = DecryptingReader::new_rar5(inner, &key256, &iv);
+                assert_eq!(
+                    read_all_in_steps(&mut reader, step).unwrap(),
+                    plaintext,
+                    "rar5 split {split} step {step}"
+                );
+
+                let inner = ChunkedCursor::new(cipher128.clone(), split);
+                let mut reader = DecryptingReader::new_rar4(inner, &key128, &iv);
+                assert_eq!(
+                    read_all_in_steps(&mut reader, step).unwrap(),
+                    plaintext,
+                    "rar4 split {split} step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decrypting_reader_matches_plaintext_under_randomized_read_sizes() {
+        let key = [0x5du8; 32];
+        let iv = [0xa7u8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 2048, 0xc0ffee);
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize + 1
+        };
+
+        for round in 0..8 {
+            let inner_sizes: Vec<usize> = (0..64).map(|_| next(9_001)).collect();
+            let read_sizes: Vec<usize> = (0..64).map(|_| next(8_192)).collect();
+            let inner = ScriptedCursor::new(ciphertext.clone(), inner_sizes);
+            let mut reader = DecryptingReader::new_rar5(inner, &key, &iv);
+
+            let mut actual = Vec::new();
+            let mut buf = vec![0u8; 8_192];
+            let mut index = 0usize;
+            loop {
+                let want = read_sizes[index % read_sizes.len()];
+                index += 1;
+                let read = reader.read(&mut buf[..want]).unwrap();
+                if read == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buf[..read]);
+            }
+            assert_eq!(actual, plaintext, "round {round}");
+        }
+    }
+
+    /// The reader must not impose a staging cap of its own: a caller asking for
+    /// a megabyte from a source that can supply it gets a megabyte.
+    #[test]
+    fn decrypting_reader_fills_large_buffers_in_one_call() {
+        let key = [0x11u8; 32];
+        let iv = [0x22u8; 16];
+        let plaintext = decrypt_test_bytes(1 << 20, 7);
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut reader = DecryptingReader::new_rar5(std::io::Cursor::new(ciphertext), &key, &iv);
+        let mut buf = vec![0u8; 1 << 20];
+        let read = reader.read(&mut buf).unwrap();
+        assert_eq!(read, 1 << 20);
+        assert_eq!(buf, plaintext);
+    }
+
+    #[test]
+    fn decrypting_reader_rejects_a_stream_that_is_not_block_aligned() {
+        let key = [0x77u8; 32];
+        let iv = [0x88u8; 16];
+        let plaintext = decrypt_test_bytes(AES_BLOCK * 3, 5);
+        let mut ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+        ciphertext.truncate(AES_BLOCK * 2 + 5);
+
+        // Both the in-place path (step >= block) and the staged path.
+        for step in [4usize, 64] {
+            let inner = std::io::Cursor::new(ciphertext.clone());
+            let mut reader = DecryptingReader::new_rar5(inner, &key, &iv);
+            let error = read_all_in_steps(&mut reader, step).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "step {step}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E-D2 range decryption and E-D1 password admission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decrypt_cipher_range_matches_a_whole_stream_decrypt_from_any_block() {
+        // The property the whole write transform rests on: decrypting block N
+        // needs block N-1 and nothing else. Every block boundary of a stream is
+        // tried, so this is the general statement, not one lucky offset.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 7 + 3) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..ciphertext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=ciphertext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = ciphertext[start..end].to_vec();
+                decrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "range {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_cipher_range_corrupts_only_its_first_block_on_a_wrong_predecessor() {
+        // Stated because it is the failure mode a router has to reason about:
+        // the wrong preceding block is not an error anyone can raise here, it
+        // is one block of garbage and a correct remainder.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 4).map(|i| (i * 5 + 1) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut range = ciphertext[AES_BLOCK..].to_vec();
+        decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut range).unwrap();
+
+        assert_ne!(range[..AES_BLOCK], plaintext[AES_BLOCK..AES_BLOCK * 2]);
+        assert_eq!(range[AES_BLOCK..], plaintext[AES_BLOCK * 2..]);
+    }
+
+    #[test]
+    fn decrypt_cipher_range_refuses_a_partial_block_and_accepts_an_empty_one() {
+        let key = [0x21u8; 32];
+        let mut partial = vec![0u8; AES_BLOCK + 1];
+        assert!(matches!(
+            decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut partial),
+            Err(RarError::CorruptArchive { .. })
+        ));
+        assert!(decrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn encrypt_cipher_range_is_the_exact_inverse_of_decrypt_cipher_range() {
+        // The property a reader that holds only the plaintext rests on: the
+        // posted bytes are reproducible from any block boundary, given that
+        // block's predecessor and nothing else. Every boundary of a stream is
+        // tried, in both directions, so this is the general statement.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 7 + 3) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..plaintext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=plaintext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = plaintext[start..end].to_vec();
+                encrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, ciphertext[start..end], "range {start}..{end}");
+
+                // And straight back, through the decrypt this is the inverse of.
+                decrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "round trip {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn encrypt_cipher_range_diverges_from_the_posted_stream_on_a_wrong_predecessor() {
+        // The mirror of the decrypt's wrong-predecessor test, and deliberately
+        // **not** the same statement. Decryption is self-healing: a wrong
+        // predecessor spoils one block and the rest come out right. Encryption
+        // is not — each ciphertext block is the next one's chaining input — so
+        // every block from the first onwards differs from what was posted.
+        // Nothing here can raise that as an error, which is why the caller owns
+        // the predecessor and why the docs say so.
+        let key = [0x21u8; 32];
+        let iv = [0x9Cu8; 16];
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 4).map(|i| (i * 5 + 1) as u8).collect();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
+
+        let mut range = plaintext[AES_BLOCK..].to_vec();
+        encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut range).unwrap();
+
+        for block in 0..range.len() / AES_BLOCK {
+            let at = block * AES_BLOCK;
+            assert_ne!(
+                range[at..at + AES_BLOCK],
+                ciphertext[AES_BLOCK + at..AES_BLOCK + at + AES_BLOCK],
+                "block {block} must not happen to match the posted stream"
+            );
+        }
+        // And the right predecessor reproduces it exactly, so the divergence is
+        // the predecessor's doing and nothing else's.
+        let mut range = plaintext[AES_BLOCK..].to_vec();
+        let preceding: [u8; AES_BLOCK] = ciphertext[..AES_BLOCK].try_into().unwrap();
+        encrypt_cipher_range(&key, &preceding, &mut range).unwrap();
+        assert_eq!(range, ciphertext[AES_BLOCK..]);
+    }
+
+    #[test]
+    fn encrypt_cipher_range_refuses_a_partial_block_and_accepts_an_empty_one() {
+        // Returned, never asserted: the caller is a reader on a blocking pool,
+        // and a contract violation has to come back as a refusal it can report
+        // as unavailable bytes rather than as a panicked task.
+        let key = [0x21u8; 32];
+        for length in [1usize, AES_BLOCK - 1, AES_BLOCK + 1, AES_BLOCK * 2 + 3] {
+            let mut partial = vec![0u8; length];
+            assert!(
+                matches!(
+                    encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut partial),
+                    Err(RarError::CorruptArchive { .. })
+                ),
+                "a {length}-byte range must be refused rather than panic"
+            );
+        }
+        assert!(encrypt_cipher_range(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn the_rar4_cipher_range_pair_is_an_exact_inverse_at_every_block_boundary() {
+        // The AES-128 twin of the two properties above, stated as
+        // one test because the RAR4 pair is the same claim over the same shape.
+        // The key and IV are a real derivation rather than constants, so what is
+        // exercised is the key a router would actually hold.
+        let (key, iv) = rar4_derive_key("moonlit-harbour", Some(&[0x11u8; 8]));
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 8).map(|i| (i * 11 + 5) as u8).collect();
+        let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, &plaintext);
+
+        for start in (0..plaintext.len()).step_by(AES_BLOCK) {
+            for end in ((start + AES_BLOCK)..=plaintext.len()).step_by(AES_BLOCK) {
+                let preceding: [u8; AES_BLOCK] = if start == 0 {
+                    iv
+                } else {
+                    ciphertext[start - AES_BLOCK..start].try_into().unwrap()
+                };
+                let mut range = plaintext[start..end].to_vec();
+                encrypt_cipher_range_rar4(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, ciphertext[start..end], "encrypt {start}..{end}");
+                decrypt_cipher_range_rar4(&key, &preceding, &mut range).unwrap();
+                assert_eq!(range, plaintext[start..end], "round trip {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rar4_cipher_range_pair_refuses_a_partial_block_and_accepts_an_empty_one() {
+        let (key, _) = rar4_derive_key("moonlit-harbour", None);
+        for length in [1usize, AES_BLOCK - 1, AES_BLOCK + 1, AES_BLOCK * 2 + 3] {
+            let mut partial = vec![0u8; length];
+            assert!(matches!(
+                encrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut partial),
+                Err(RarError::CorruptArchive { .. })
+            ));
+            assert!(matches!(
+                decrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut partial),
+                Err(RarError::CorruptArchive { .. })
+            ));
+        }
+        assert!(encrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+        assert!(decrypt_cipher_range_rar4(&key, &[0u8; AES_BLOCK], &mut []).is_ok());
+    }
+
+    #[test]
+    fn member_cipher_key_dispatches_to_the_width_its_variant_names() {
+        // The one thing a dispatching enum can get wrong is dispatching: an
+        // `Aes128` that quietly ran AES-256 over the first 16 bytes of a wider
+        // key would decrypt nothing correctly, and an `Aes256` that truncated
+        // would be worse. Both variants are held to the free functions they
+        // stand for, byte for byte.
+        let plaintext: Vec<u8> = (0..AES_BLOCK * 6).map(|i| (i * 13 + 7) as u8).collect();
+        let preceding = [0x3Cu8; 16];
+
+        let (rar4_key, _) = rar4_derive_key("moonlit-harbour", Some(&[0x22u8; 8]));
+        let mut through_enum = plaintext.clone();
+        MemberCipherKey::Aes128(rar4_key)
+            .encrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(
+            through_enum,
+            encrypt_aes128_cbc_for_test(&rar4_key, &preceding, &plaintext)
+        );
+        MemberCipherKey::Aes128(rar4_key)
+            .decrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(through_enum, plaintext);
+
+        let rar5_key = derive_rar5_material("moonlit-harbour", &[0x5Au8; 16], 4)
+            .unwrap()
+            .key;
+        let mut through_enum = plaintext.clone();
+        MemberCipherKey::Aes256(rar5_key)
+            .encrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(
+            through_enum,
+            encrypt_aes256_cbc_for_test(&rar5_key, &preceding, &plaintext)
+        );
+        MemberCipherKey::Aes256(rar5_key)
+            .decrypt_range(&preceding, &mut through_enum)
+            .unwrap();
+        assert_eq!(through_enum, plaintext);
+    }
+
+    #[test]
+    fn check_member_password_separates_wrong_from_unverifiable() {
+        let salt = [0x5Au8; 16];
+        let kdf_count = 4;
+        let cache = KdfCache::new();
+
+        let psw_check = derive_rar5_material("testpass123", &salt, kdf_count)
+            .unwrap()
+            .psw_check;
+        let mut check_data = [0u8; 12];
+        check_data[..8].copy_from_slice(&psw_check);
+        check_data[8..].copy_from_slice(&sha256_digest(&psw_check)[..4]);
+
+        assert_eq!(
+            check_member_password(&cache, "testpass123", &salt, kdf_count, Some(&check_data)),
+            PasswordCheck::Verified
+        );
+        assert_eq!(
+            check_member_password(&cache, "testpass124", &salt, kdf_count, Some(&check_data)),
+            PasswordCheck::Wrong
+        );
+        // No check value at all: the password may be right, but nothing here
+        // can say so — which is a different answer from `Wrong`, and the whole
+        // reason the two are distinct variants.
+        assert_eq!(
+            check_member_password(&cache, "testpass124", &salt, kdf_count, None),
+            PasswordCheck::Unverifiable
+        );
+        // A KDF count the crate refuses never runs a derivation, so it cannot
+        // refute the password either.
+        assert_eq!(
+            check_member_password(
+                &cache,
+                "testpass123",
+                &salt,
+                CRYPT5_KDF_LG2_COUNT_MAX + 1,
+                Some(&check_data)
+            ),
+            PasswordCheck::Unverifiable
+        );
     }
 }

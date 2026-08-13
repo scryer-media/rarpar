@@ -12,7 +12,7 @@ use crate::error::{RarError, RarResult};
 use crate::header::file::FileHeader;
 use crate::limits::Limits;
 use crate::progress::ProgressHandler;
-use crate::types::{CompressionMethod, FileHash, MemberInfo};
+use crate::types::{CompressionInfo, CompressionMethod, FileHash, MemberInfo};
 
 /// Options for extraction.
 pub struct ExtractOptions {
@@ -130,6 +130,97 @@ fn enforce_member_limits(file_header: &FileHeader, limits: &Limits) -> RarResult
     }
 
     Ok(())
+}
+
+/// In-memory output buffer that hashes every decoded span as it lands.
+///
+/// This is the in-memory counterpart of the file path's hashing writer stack:
+/// the member is walked once, on the way into the buffer, instead of once by
+/// the decoder and again by each checksum.
+struct HashingMemberSink {
+    data: Vec<u8>,
+    crc: Option<crate::crc::Crc32>,
+    blake2: Option<crate::crypto::Blake2spHasher>,
+}
+
+impl HashingMemberSink {
+    fn new(data: Vec<u8>, compute_crc: bool, compute_blake2: bool) -> Self {
+        Self {
+            data,
+            crc: compute_crc.then(crate::crc::Crc32::new),
+            blake2: compute_blake2.then(crate::crypto::Blake2spHasher::new),
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, Option<u32>, Option<[u8; 32]>) {
+        let crc = self.crc.map(|hasher| hasher.finalize());
+        let blake2 = self.blake2.map(|hasher| hasher.finalize());
+        (self.data, crc, blake2)
+    }
+}
+
+impl Write for HashingMemberSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.data.extend_from_slice(buf);
+        if let Some(ref mut hasher) = self.crc {
+            hasher.update(buf);
+        }
+        if let Some(ref mut hasher) = self.blake2 {
+            hasher.update(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Decode a compressed member into `writer` under the caller's limits.
+///
+/// Mirrors the dispatch in [`crate::decompress::decompress_to_writer`], except
+/// that the dictionary ceiling comes from `limits` instead of the library
+/// default. The size and dictionary ceilings themselves are already enforced by
+/// [`enforce_member_limits`] before this runs.
+fn decompress_member_to_writer<W: Write>(
+    input: &[u8],
+    unpacked_size: u64,
+    info: &CompressionInfo,
+    writer: &mut W,
+    limits: &Limits,
+) -> RarResult<u64> {
+    if let CompressionMethod::Unknown(code) = info.method {
+        return Err(RarError::UnsupportedCompression {
+            method: code,
+            version: info.version,
+        });
+    }
+
+    if info.format.is_rar4_family() {
+        decompress::rar4_old::ensure_supported_rar4_version(info.version, info.method.code())?;
+        return decompress::rar4_old::decompress_rar4_to_writer(
+            input,
+            unpacked_size,
+            info.version,
+            info.method.code(),
+            info.dict_size,
+            writer,
+        );
+    }
+
+    if info.version > 1 {
+        return Err(RarError::UnsupportedCompression {
+            method: info.method.code(),
+            version: info.version,
+        });
+    }
+    decompress::lz::decompress_lz_to_writer_with_max_dict_size(
+        input,
+        unpacked_size,
+        info,
+        writer,
+        limits.max_dict_size,
+    )
 }
 
 fn effective_member_dict_size(file_header: &FileHeader) -> u64 {
@@ -529,6 +620,9 @@ pub fn extract_member_with_limits<R: Read + Seek>(
         p.on_member_start(mi);
     }
 
+    // The compressed path verifies BLAKE2sp inline, on the same pass that
+    // fills the output buffer; the store path still checks it afterwards.
+    let mut blake_already_verified = false;
     let output = match file_header.compression.method {
         CompressionMethod::Store => {
             let mut output =
@@ -570,30 +664,51 @@ pub fn extract_member_with_limits<R: Read + Seek>(
                 }
             }
 
-            // For compressed data, decompress first then verify CRC.
-            let decompressed = decompress::decompress_with_limits(
+            // Decode straight into the output buffer, hashing each span as it
+            // lands: one pass over the member instead of a decode pass plus a
+            // separate CRC32 pass plus a separate BLAKE2sp pass.
+            let expected_crc = if options.verify {
+                file_header.data_crc32
+            } else {
+                None
+            };
+            let expected_blake = match (options.verify, hash) {
+                (true, Some(FileHash::Blake2sp(expected))) => Some(*expected),
+                _ => None,
+            };
+            let capacity = output_capacity_hint(file_header, limits)
+                .min(MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES);
+            let mut sink = HashingMemberSink::new(
+                Vec::with_capacity(capacity),
+                expected_crc.is_some(),
+                expected_blake.is_some(),
+            );
+            decompress_member_to_writer(
                 &compressed,
                 unpacked_size,
                 &file_header.compression,
-                None, // CRC verified post-decompression
+                &mut sink,
                 limits,
             )?;
+            let (decompressed, actual_crc, actual_blake) = sink.finish();
 
-            // Verify CRC32 of decompressed data.
-            if options.verify
-                && let Some(expected) = file_header.data_crc32
+            if let (Some(expected), Some(actual)) = (expected_crc, actual_crc)
+                && actual != expected
             {
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&decompressed);
-                let actual = hasher.finalize();
-                if actual != expected {
-                    return Err(RarError::DataCrcMismatch {
-                        member: file_header.name.clone(),
-                        expected,
-                        actual,
-                    });
-                }
+                return Err(RarError::DataCrcMismatch {
+                    member: file_header.name.clone(),
+                    expected,
+                    actual,
+                });
             }
+            if let (Some(expected), Some(actual)) = (expected_blake, actual_blake)
+                && actual != expected
+            {
+                return Err(RarError::Blake2Mismatch {
+                    member: file_header.name.clone(),
+                });
+            }
+            blake_already_verified = true;
 
             ExtractedMember::InMemory(decompressed)
         }
@@ -604,8 +719,9 @@ pub fn extract_member_with_limits<R: Read + Seek>(
         p.on_member_progress(mi, output.len() as u64);
     }
 
-    // Verify BLAKE2sp hash if provided.
-    if options.verify
+    // Verify BLAKE2sp hash if provided and not already checked in-line.
+    if !blake_already_verified
+        && options.verify
         && let Some(FileHash::Blake2sp(expected)) = hash
         && !verify_blake2_member(&output, expected)?
     {

@@ -9,11 +9,11 @@
 //! portable path). The numbers are a rough single-thread baseline, not a
 //! statistical benchmark: 1 warmup + 3 timed reps, best rep reported.
 //!
-//! Run:  cargo run --release --example crypto_baseline -p weaver-unrar
+//! Run:  cargo run --release --example crypto_baseline -p unrar-rs
 
 use std::time::Instant;
 
-use weaver_unrar::crypto::{Blake2spHasher, CbcDecryptor, derive_rar5_material};
+use unrar_rs::crypto::{Blake2spHasher, CbcDecryptor, derive_rar5_material};
 
 // Buffer sizes — kept as consts so they are easy to tweak.
 const KDF_LG2_COUNT: u8 = 15; // 2^15 PBKDF2 iterations.
@@ -100,11 +100,11 @@ fn main() {
         let data = vec![0x3Cu8; HASH_TOTAL_BYTES];
         let mut sink = 0u32;
         let secs = best_secs(|| {
-            let mut hasher = crc32fast::Hasher::new();
+            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
             for chunk in data.chunks(HASH_CHUNK_BYTES) {
                 hasher.update(chunk);
             }
-            sink ^= hasher.finalize();
+            sink ^= hasher.finalize() as u32;
         });
         std::hint::black_box(sink);
         println!("crc32\t{:.2}", mb_per_s(HASH_TOTAL_BYTES, secs));

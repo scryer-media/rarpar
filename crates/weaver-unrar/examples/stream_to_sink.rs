@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
-use weaver_unrar::{ExtractOptions, Limits, RarArchive, StaticVolumeProvider};
+use unrar_rs::{ExtractOptions, Limits, RarArchive, StaticVolumeProvider};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

@@ -48,20 +48,22 @@ pub struct PendingFilter {
     pub channels: u8,
 }
 
-/// Add a pending RAR5 filter with defensive queue behavior.
+/// Add a pending RAR5 filter, keeping the queue ordered by `block_start`.
 ///
-/// Weaver cannot always flush at descriptor-read time, so this helper keeps the
-/// queue bounded by resetting it before accepting the next malformed-stream
-/// filter.
-pub(crate) fn push_pending_filter(
-    filters: &mut Vec<PendingFilter>,
-    filter: PendingFilter,
-    max_filters: usize,
-) {
-    if filters.len() >= max_filters {
-        filters.clear();
+/// Descriptors arrive in near-monotonic order — a filter's start is the current
+/// output position plus a non-negative delta — so the common case is a plain
+/// append and the fix-up walk stops after one comparison. Keeping the queue
+/// sorted here means the flush path never has to sort it.
+pub(crate) fn push_pending_filter(filters: &mut Vec<PendingFilter>, filter: PendingFilter) {
+    let position = filters
+        .iter()
+        .rposition(|pending| pending.block_start <= filter.block_start)
+        .map_or(0, |index| index + 1);
+    if position == filters.len() {
+        filters.push(filter);
+    } else {
+        filters.insert(position, filter);
     }
-    filters.push(filter);
 }
 
 /// Apply the DELTA filter in-place.
@@ -79,7 +81,9 @@ pub fn apply_delta(data: &mut [u8], channels: u8) {
     for channel in 0..ch {
         let mut prev = 0u8;
         let mut dest = channel;
-        while dest < data.len() && src_pos < src.len() {
+        // The channels partition 0..len by residue class, so the writes consume
+        // exactly `src.len()` source bytes; only the dest bound can terminate.
+        while dest < data.len() {
             prev = prev.wrapping_sub(src[src_pos]);
             data[dest] = prev;
             src_pos += 1;
@@ -189,7 +193,10 @@ pub fn apply_arm(data: &mut [u8], file_offset: u64) {
             let b2 = data[i + 2] as u32;
             let offset = b0 | (b1 << 8) | (b2 << 16);
 
-            let cur_pos = ((file_offset as u32) + (i as u32)) / 4;
+            // RAR truncates WrittenFileSize to uint and relies on wraparound
+            // (unpack50.cpp:477); a checked add would panic in debug builds
+            // for outputs crossing 4 GiB.
+            let cur_pos = (file_offset as u32).wrapping_add(i as u32) / 4;
             let relative = offset.wrapping_sub(cur_pos) & 0x00FF_FFFF;
 
             data[i] = relative as u8;
@@ -431,37 +438,38 @@ mod tests {
         assert!(!FilterType::Unsupported(7).emits_output());
     }
 
+    fn pending(block_start: u64) -> PendingFilter {
+        PendingFilter {
+            filter_type: FilterType::E8,
+            block_start,
+            block_length: 4,
+            channels: 0,
+        }
+    }
+
     #[test]
-    fn push_pending_filter_resets_full_queue_like_rar_behavior() {
-        let mut filters = vec![
-            PendingFilter {
-                filter_type: FilterType::E8,
-                block_start: 0,
-                block_length: 5,
-                channels: 0,
-            },
-            PendingFilter {
-                filter_type: FilterType::Arm,
-                block_start: 8,
-                block_length: 4,
-                channels: 0,
-            },
-        ];
+    fn push_pending_filter_keeps_the_queue_sorted_by_block_start() {
+        let mut filters = vec![pending(0), pending(8)];
 
-        push_pending_filter(
-            &mut filters,
-            PendingFilter {
-                filter_type: FilterType::Delta,
-                block_start: 12,
-                block_length: 3,
-                channels: 1,
-            },
-            2,
-        );
+        // Monotonic arrival: plain append.
+        push_pending_filter(&mut filters, pending(12));
+        // Out-of-order arrival: inserted at its sorted position.
+        push_pending_filter(&mut filters, pending(4));
+        // Ties keep insertion order behind the existing equal entry.
+        push_pending_filter(&mut filters, pending(8));
 
-        assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].filter_type, FilterType::Delta);
-        assert_eq!(filters[0].block_start, 12);
+        let starts: Vec<u64> = filters.iter().map(|filter| filter.block_start).collect();
+        assert_eq!(starts, [0, 4, 8, 8, 12]);
+    }
+
+    #[test]
+    fn push_pending_filter_inserts_before_a_larger_head() {
+        let mut filters = vec![pending(9)];
+
+        push_pending_filter(&mut filters, pending(3));
+
+        let starts: Vec<u64> = filters.iter().map(|filter| filter.block_start).collect();
+        assert_eq!(starts, [3, 9]);
     }
 
     #[test]

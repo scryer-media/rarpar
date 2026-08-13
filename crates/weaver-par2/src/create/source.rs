@@ -1,0 +1,686 @@
+use std::collections::HashSet;
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rayon::prelude::*;
+
+use crate::checksum::{FileHashState, Md5State, SliceChecksumState};
+use crate::error::{Par2Error, Result};
+use crate::path::translate_par2_name_to_relative;
+use crate::types::{
+    CancellationToken, FileId, MAX_FILES_PER_SET, MAX_SLICES_PER_FILE, MAX_TOTAL_INPUT_SLICES,
+    ProgressCallback, ProgressStage, SliceChecksum,
+};
+
+use super::encode::ForwardSourceProvider;
+
+const FIRST_HASH_BYTES: u64 = 16 * 1024;
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+const MAX_PAR2_NAME_BYTES: usize = 100_000;
+
+/// A validated explicit source file and the metadata needed by critical PAR2
+/// packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationSource {
+    /// Canonical path read during creation.
+    pub path: PathBuf,
+    /// Safe path recorded in PAR2 packets, using `/` separators.
+    pub par2_name: String,
+    /// PAR2 file identifier.
+    pub file_id: FileId,
+    /// Source length in bytes.
+    pub file_length: u64,
+    /// MD5 of the complete source file.
+    pub hash_full: [u8; 16],
+    /// MD5 of the first 16KiB, or the complete file when shorter.
+    pub hash_16k: [u8; 16],
+    /// Zero-padded per-slice CRC32 and MD5 pairs.
+    pub slice_checksums: Vec<SliceChecksum>,
+}
+
+impl CreationSource {
+    /// Number of source slices represented by this source.
+    pub fn slice_count(&self) -> u32 {
+        self.slice_checksums.len() as u32
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InputLength {
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFingerprint {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl SourceFingerprint {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// Resolve, validate, and hash explicit source files in input order.
+pub(crate) fn collect_sources(
+    base_path: &Path,
+    inputs: &[PathBuf],
+    block_size: u64,
+    cancellation: &CancellationToken,
+    progress: Option<&ProgressCallback>,
+    total_bytes: u64,
+) -> Result<Vec<CreationSource>> {
+    if inputs.is_empty() {
+        return Err(Par2Error::InvalidCreationOptions {
+            reason: "at least one source file is required".to_string(),
+        });
+    }
+    let base = fs::canonicalize(base_path).map_err(Par2Error::Io)?;
+    let metadata = fs::metadata(&base).map_err(Par2Error::Io)?;
+    if !metadata.is_dir() {
+        return Err(Par2Error::UnsafeCreationSource {
+            path: base.display().to_string(),
+            reason: "base path is not a directory".to_string(),
+        });
+    }
+
+    let mut active_inputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let path = resolve_input_path(&base, input)?;
+        let metadata = fs::metadata(&path).map_err(Par2Error::Io)?;
+        if !metadata.is_file() {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source is not a regular file".to_string(),
+            });
+        }
+        let relative = path
+            .strip_prefix(&base)
+            .map_err(|_| Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source is outside the base directory".to_string(),
+            })?;
+        validate_relative_path(relative, input)?;
+        if relative.to_str().is_none() {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source filename is not valid UTF-8".to_string(),
+            });
+        }
+        if metadata.len() > 0 {
+            active_inputs.push(input);
+        }
+    }
+    if active_inputs.is_empty() {
+        return Err(Par2Error::InvalidCreationOptions {
+            reason: "at least one non-empty source file is required".to_string(),
+        });
+    }
+    validate_main_file_count(active_inputs.len())?;
+
+    let mut names = HashSet::with_capacity(active_inputs.len());
+    let mut ids = HashSet::with_capacity(active_inputs.len());
+    let bytes_processed = AtomicU64::new(0);
+    let file_total =
+        u32::try_from(active_inputs.len()).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: "source file count exceeds the supported progress range".to_string(),
+        })?;
+    let mut total_slices = 0usize;
+
+    let hash_one = |(index, input): (usize, &&PathBuf)| -> Result<CreationSource> {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        resolve_and_hash_source(
+            &base,
+            input,
+            block_size,
+            cancellation,
+            progress,
+            index as u32,
+            file_total,
+            &bytes_processed,
+            total_bytes,
+        )
+    };
+    // Hash one file per rayon task; each file's scan is independent. The
+    // shared byte counter is monotonic, but callbacks fire concurrently, so
+    // DELIVERY to the progress callback is not ordered. The sequential arm
+    // is the wasm path (no worker pool, matching the crate's other guards)
+    // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
+    let scan_parallel = !cfg!(target_family = "wasm")
+        && active_inputs.len() > 1
+        && super::encode::configured_create_threads() != 1;
+    let scanned: Vec<CreationSource> = if scan_parallel {
+        // Collect every per-file Result, then surface the FIRST error by
+        // input order: rayon's Result collection reports an arbitrary
+        // racer's error, which would let a concurrent I/O error mask
+        // `Cancelled` (or make the reported path vary run to run). The
+        // deliberate cost is losing error short-circuiting — in-flight
+        // files hash to completion before the error surfaces.
+        active_inputs
+            .par_iter()
+            .enumerate()
+            .map(hash_one)
+            .collect::<Vec<Result<_>>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        active_inputs
+            .iter()
+            .enumerate()
+            .map(hash_one)
+            .collect::<Result<Vec<_>>>()?
+    };
+    // The creation memory plan accounts this vector by ALLOCATION CAPACITY
+    // (plan.rs validate_integrity passes `sources.capacity()` into
+    // `estimate_source_metadata_bytes`), and collecting through a Result
+    // adapter is not TrustedLen, so its capacity can exceed the length.
+    // Rebuild at exact capacity so the plan cross-check stays byte-stable.
+    let mut sources = Vec::with_capacity(active_inputs.len());
+    sources.extend(scanned);
+
+    for (source, input) in sources.iter().zip(active_inputs.iter()) {
+        if !names.insert(source.par2_name.clone()) {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "duplicate relative PAR2 name".to_string(),
+            });
+        }
+        if !ids.insert(source.file_id) {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "duplicate PAR2 file identifier".to_string(),
+            });
+        }
+        total_slices = total_slices
+            .checked_add(source.slice_checksums.len())
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "total source slice count overflows".to_string(),
+            })?;
+        if total_slices > MAX_TOTAL_INPUT_SLICES {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: format!(
+                    "total source slice count {total_slices} exceeds {MAX_TOTAL_INPUT_SLICES}"
+                ),
+            });
+        }
+    }
+    Ok(sources)
+}
+
+/// Resolve explicit inputs and collect their lengths before selecting a slice size.
+pub(crate) fn collect_input_lengths(
+    base_path: &Path,
+    inputs: &[PathBuf],
+    cancellation: &CancellationToken,
+) -> Result<Vec<InputLength>> {
+    if inputs.is_empty() {
+        return Err(Par2Error::InvalidCreationOptions {
+            reason: "at least one source file is required".to_string(),
+        });
+    }
+    let base = fs::canonicalize(base_path).map_err(Par2Error::Io)?;
+    let base_metadata = fs::metadata(&base).map_err(Par2Error::Io)?;
+    if !base_metadata.is_dir() {
+        return Err(Par2Error::UnsafeCreationSource {
+            path: base.display().to_string(),
+            reason: "base path is not a directory".to_string(),
+        });
+    }
+
+    let mut lengths = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let path = resolve_input_path(&base, input)?;
+        let metadata = fs::metadata(&path).map_err(Par2Error::Io)?;
+        if !metadata.is_file() {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source is not a regular file".to_string(),
+            });
+        }
+        let relative = path
+            .strip_prefix(&base)
+            .map_err(|_| Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source is outside the base directory".to_string(),
+            })?;
+        validate_relative_path(relative, input)?;
+        if relative.to_str().is_none() {
+            return Err(Par2Error::UnsafeCreationSource {
+                path: input.display().to_string(),
+                reason: "source filename is not valid UTF-8".to_string(),
+            });
+        }
+        if metadata.len() > 0 {
+            lengths.push(InputLength {
+                length: metadata.len(),
+            });
+        }
+    }
+    validate_main_file_count(lengths.len())?;
+    Ok(lengths)
+}
+
+fn validate_main_file_count(file_count: usize) -> Result<()> {
+    if file_count > MAX_FILES_PER_SET {
+        return Err(Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "source file count {file_count} exceeds the Main packet limit of {MAX_FILES_PER_SET}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Seek/read source slices for one forward-encoding pass.
+pub(crate) struct DiskSourceProvider<'a> {
+    sources: &'a [CreationSource],
+    files: Vec<File>,
+    fingerprints: Vec<SourceFingerprint>,
+    slice_starts: Vec<usize>,
+    slice_size: usize,
+    cancellation: &'a CancellationToken,
+}
+
+impl<'a> DiskSourceProvider<'a> {
+    pub(crate) fn open(
+        sources: &'a [CreationSource],
+        slice_size: usize,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Self> {
+        if slice_size == 0 {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: "source provider slice size is zero".to_string(),
+            });
+        }
+        let mut files = Vec::with_capacity(sources.len());
+        let mut fingerprints = Vec::with_capacity(sources.len());
+        let mut slice_starts = Vec::with_capacity(sources.len());
+        let mut next_start = 0usize;
+        for source in sources {
+            if cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            let metadata = fs::metadata(&source.path).map_err(Par2Error::Io)?;
+            if !metadata.is_file() || metadata.len() != source.file_length {
+                return Err(Par2Error::CreationSourceChanged {
+                    path: source.path.display().to_string(),
+                });
+            }
+            let slice_count = source.slice_checksums.len();
+            slice_starts.push(next_start);
+            next_start = next_start.checked_add(slice_count).ok_or_else(|| {
+                Par2Error::ResourceLimitExceeded {
+                    reason: "source slice provider index overflows".to_string(),
+                }
+            })?;
+            fingerprints.push(SourceFingerprint::from_metadata(&metadata));
+            files.push(File::open(&source.path).map_err(Par2Error::Io)?);
+        }
+        Ok(Self {
+            sources,
+            files,
+            fingerprints,
+            slice_starts,
+            slice_size,
+            cancellation,
+        })
+    }
+
+    pub(crate) fn verify_unchanged(&self) -> Result<()> {
+        for (source, fingerprint) in self.sources.iter().zip(&self.fingerprints) {
+            let metadata = fs::metadata(&source.path).map_err(Par2Error::Io)?;
+            if SourceFingerprint::from_metadata(&metadata) != *fingerprint {
+                return Err(Par2Error::CreationSourceChanged {
+                    path: source.path.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn source_location(&self, source_index: usize) -> Result<(usize, usize)> {
+        let file_index = self
+            .slice_starts
+            .partition_point(|&start| start <= source_index)
+            .checked_sub(1)
+            .ok_or_else(|| Par2Error::CreationSourceChanged {
+                path: "source slice index is out of range".to_string(),
+            })?;
+        let local_index = source_index
+            .checked_sub(self.slice_starts[file_index])
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source slice index underflows".to_string(),
+            })?;
+        if local_index >= self.sources[file_index].slice_checksums.len() {
+            return Err(Par2Error::CreationSourceChanged {
+                path: self.sources[file_index].path.display().to_string(),
+            });
+        }
+        Ok((file_index, local_index))
+    }
+}
+
+impl ForwardSourceProvider for DiskSourceProvider<'_> {
+    fn source_count(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|source| source.slice_checksums.len())
+            .sum()
+    }
+
+    fn source_slice_len(&self, source_index: usize) -> Result<usize> {
+        let (file_index, local_index) = self.source_location(source_index)?;
+        let offset = (local_index as u64)
+            .checked_mul(self.slice_size as u64)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source slice offset overflows".to_string(),
+            })?;
+        usize::try_from(
+            self.sources[file_index]
+                .file_length
+                .saturating_sub(offset)
+                .min(self.slice_size as u64),
+        )
+        .map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: "source slice length exceeds addressable memory".to_string(),
+        })
+    }
+
+    fn read_source_chunk(
+        &mut self,
+        source_index: usize,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let (file_index, local_index) = self.source_location(source_index)?;
+        let slice_len = self.source_slice_len(source_index)?;
+        let start = offset.min(slice_len);
+        let take = destination.len().min(slice_len.saturating_sub(start));
+        if take == 0 {
+            return Ok(0);
+        }
+        let slice_offset = (local_index as u64)
+            .checked_mul(self.slice_size as u64)
+            .and_then(|value| value.checked_add(start as u64))
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source read offset overflows".to_string(),
+            })?;
+        self.files[file_index]
+            .seek(SeekFrom::Start(slice_offset))
+            .map_err(Par2Error::Io)?;
+        self.files[file_index]
+            .read_exact(&mut destination[..take])
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    Par2Error::CreationSourceChanged {
+                        path: self.sources[file_index].path.display().to_string(),
+                    }
+                } else {
+                    Par2Error::Io(error)
+                }
+            })?;
+        Ok(take)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_hash_source(
+    base: &Path,
+    input: &Path,
+    block_size: u64,
+    cancellation: &CancellationToken,
+    progress: Option<&ProgressCallback>,
+    file_index: u32,
+    file_total: u32,
+    bytes_processed: &AtomicU64,
+    total_bytes: u64,
+) -> Result<CreationSource> {
+    if block_size == 0 || !block_size.is_multiple_of(4) {
+        return Err(Par2Error::InvalidCreationOptions {
+            reason: format!("source block size {block_size} is not a positive multiple of four"),
+        });
+    }
+    let block_size_usize =
+        usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: format!("source block size {block_size} exceeds addressable memory"),
+        })?;
+
+    let path = resolve_input_path(base, input)?;
+    let metadata = fs::metadata(&path).map_err(Par2Error::Io)?;
+    if !metadata.is_file() {
+        return Err(Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: "source is not a regular file".to_string(),
+        });
+    }
+    let fingerprint = SourceFingerprint::from_metadata(&metadata);
+    let relative = path
+        .strip_prefix(base)
+        .map_err(|_| Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: "source is outside the base directory".to_string(),
+        })?;
+    validate_relative_path(relative, input)?;
+    let relative_name = relative
+        .to_str()
+        .ok_or_else(|| Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: "source filename is not valid UTF-8".to_string(),
+        })?;
+    let par2_name = relative_name.replace('\\', "/");
+    let par2_name = translate_par2_name_to_relative(&par2_name).map_err(|error| {
+        Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    if par2_name.is_empty()
+        || par2_name.len() > MAX_PAR2_NAME_BYTES
+        || par2_name.as_bytes().contains(&0)
+    {
+        return Err(Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: "PAR2 name is empty, contains NUL, or exceeds 100000 bytes".to_string(),
+        });
+    }
+
+    let mut file = File::open(&path).map_err(Par2Error::Io)?;
+    let slice_count = if fingerprint.length == 0 {
+        0
+    } else {
+        fingerprint
+            .length
+            .checked_add(block_size - 1)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source slice count overflows".to_string(),
+            })?
+            / block_size
+    };
+    if slice_count > MAX_SLICES_PER_FILE as u64 {
+        return Err(Par2Error::ResourceLimitExceeded {
+            reason: format!("source slice count {slice_count} exceeds {MAX_SLICES_PER_FILE}"),
+        });
+    }
+    let slice_count_usize =
+        usize::try_from(slice_count).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: "source slice count exceeds addressable memory".to_string(),
+        })?;
+
+    let mut full_hash = FileHashState::new();
+    let mut first_hash = Md5State::new();
+    let mut first_bytes = 0u64;
+    let mut checksums = Vec::with_capacity(slice_count_usize);
+    let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
+    for slice_index in 0..slice_count_usize {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let offset = (slice_index as u64)
+            .checked_mul(block_size)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source slice offset overflows".to_string(),
+            })?;
+        let actual_len = usize::try_from(fingerprint.length.saturating_sub(offset).min(block_size))
+            .map_err(|_| Par2Error::ResourceLimitExceeded {
+                reason: "source slice length exceeds addressable memory".to_string(),
+            })?;
+        let mut remaining = actual_len;
+        let mut slice_hash = SliceChecksumState::new();
+        while remaining > 0 {
+            if cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            let take = remaining.min(buffer.len());
+            read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
+            let chunk = &buffer[..take];
+            full_hash.update(chunk);
+            slice_hash.update(chunk);
+            if first_bytes < FIRST_HASH_BYTES {
+                let first_take = (FIRST_HASH_BYTES - first_bytes).min(take as u64) as usize;
+                first_hash.update(&chunk[..first_take]);
+                first_bytes += first_take as u64;
+            }
+            remaining -= take;
+            let processed_total = bytes_processed
+                .fetch_add(take as u64, Ordering::Relaxed)
+                .saturating_add(take as u64);
+            report_progress(
+                progress,
+                file_index,
+                file_total,
+                processed_total,
+                total_bytes,
+            );
+        }
+        let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
+        let (crc32, md5) = slice_hash.finalize(pad_to);
+        checksums.push(SliceChecksum { crc32, md5 });
+    }
+
+    if full_hash.bytes_fed() != fingerprint.length {
+        return Err(Par2Error::CreationSourceChanged {
+            path: input.display().to_string(),
+        });
+    }
+    let after = fs::metadata(&path).map_err(Par2Error::Io)?;
+    if SourceFingerprint::from_metadata(&after) != fingerprint {
+        return Err(Par2Error::CreationSourceChanged {
+            path: input.display().to_string(),
+        });
+    }
+
+    let hash_full = full_hash.finalize();
+    let hash_16k = first_hash.finalize();
+    let mut file_id_hash = Md5State::new();
+    file_id_hash.update(&hash_16k);
+    file_id_hash.update(&fingerprint.length.to_le_bytes());
+    file_id_hash.update(par2_name.as_bytes());
+    let file_id = FileId::from_bytes(file_id_hash.finalize());
+
+    Ok(CreationSource {
+        path,
+        par2_name,
+        file_id,
+        file_length: fingerprint.length,
+        hash_full,
+        hash_16k,
+        slice_checksums: checksums,
+    })
+}
+
+fn resolve_input_path(base: &Path, input: &Path) -> Result<PathBuf> {
+    if input.is_absolute() {
+        return fs::canonicalize(input).map_err(Par2Error::Io);
+    }
+
+    fs::canonicalize(base.join(input)).map_err(Par2Error::Io)
+}
+
+fn validate_relative_path(relative: &Path, input: &Path) -> Result<()> {
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Par2Error::UnsafeCreationSource {
+            path: input.display().to_string(),
+            reason: "source does not have a safe relative path".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn read_exact_or_changed(file: &mut File, buffer: &mut [u8], input: &Path) -> Result<()> {
+    file.read_exact(buffer).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            Par2Error::CreationSourceChanged {
+                path: input.display().to_string(),
+            }
+        } else {
+            Par2Error::Io(error)
+        }
+    })
+}
+
+fn report_progress(
+    progress: Option<&ProgressCallback>,
+    current: u32,
+    total: u32,
+    bytes_processed: u64,
+    total_bytes: u64,
+) {
+    if let Some(progress) = progress {
+        progress(crate::types::ProgressUpdate {
+            stage: ProgressStage::Creating,
+            current,
+            total,
+            bytes_processed,
+            total_bytes: Some(total_bytes),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_file_count_boundary_matches_parser_limit() {
+        assert!(validate_main_file_count(MAX_FILES_PER_SET).is_ok());
+        assert!(matches!(
+            validate_main_file_count(MAX_FILES_PER_SET + 1),
+            Err(Par2Error::ResourceLimitExceeded { .. })
+        ));
+    }
+}

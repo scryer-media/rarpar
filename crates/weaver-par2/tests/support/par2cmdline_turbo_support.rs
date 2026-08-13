@@ -4,21 +4,72 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use bytes::Bytes;
 use md5::{Digest, Md5};
-use tempfile::{Builder, TempDir};
-use weaver_par2::checksum::{self, SliceChecksumState};
-use weaver_par2::packet::header;
-use weaver_par2::{
+use par2_rs::checksum::{self, SliceChecksumState};
+use par2_rs::packet::header;
+use par2_rs::{
     FileAccess, FileId, Par2FileSet, Par2RepairOutcome, Par2RepairStatus, Par2Repairer,
     Par2RepairerOptions, RecoverySlice, Repairability, SliceChecksum, execute_repair, gf_pow,
     input_slice_constants, mul_acc_region, plan_repair, verify_all,
 };
+use tempfile::{Builder, TempDir};
 
 pub const UPSTREAM_FUNCTIONAL_CASE_COUNT: usize = 46;
 pub const UPSTREAM_UNIT_CASE_COUNT: usize = 11;
+pub const PAR2_TURBO_BINARY: &str = "PAR2_TURBO_BINARY";
+pub const PAR2_INTEROP_BINARIES: &str = "PAR2_INTEROP_BINARIES";
+
+/// Return the external compatibility executable configured for ignored tests.
+/// Keeping this in the existing support module shares setup with the Rust
+/// interoperability tests.
+pub fn par2_turbo_binary() -> Option<PathBuf> {
+    std::env::var_os(PAR2_TURBO_BINARY).map(PathBuf::from)
+}
+
+pub fn par2_interop_binaries() -> Vec<PathBuf> {
+    let mut configured = Vec::new();
+    if let Some(paths) = std::env::var_os(PAR2_INTEROP_BINARIES) {
+        configured.extend(std::env::split_paths(&paths));
+    }
+    if let Some(binary) = par2_turbo_binary() {
+        configured.push(binary);
+    }
+
+    let mut binaries = Vec::new();
+    for binary in configured {
+        let canonical = fs::canonicalize(&binary).unwrap_or_else(|error| {
+            panic!(
+                "configured interoperability binary cannot be canonicalized {}: {error}",
+                binary.display()
+            )
+        });
+        assert!(
+            canonical.is_file(),
+            "configured interoperability binary is not a file: {}",
+            binary.display()
+        );
+        if !binaries.contains(&canonical) {
+            binaries.push(canonical);
+        }
+    }
+    binaries
+}
+
+pub fn run_par2_binary(binary: &Path, base_dir: &Path, args: &[&str]) -> Output {
+    Command::new(binary)
+        .current_dir(base_dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run {}: {error}", binary.display()))
+}
+
+pub fn run_par2_turbo(base_dir: &Path, args: &[&str]) -> Option<Output> {
+    let binary = par2_turbo_binary()?;
+    Some(run_par2_binary(&binary, base_dir, args))
+}
 
 pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/par2cmdline-turbo")

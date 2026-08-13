@@ -1,8 +1,8 @@
 //! Quick diagnostic: load PAR2 files from a directory, remap obfuscated names, verify.
 
+use par2_rs::{DiskFileAccess, Par2FileSet, verify_all};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use weaver_par2::{DiskFileAccess, Par2FileSet, verify_all};
 
 fn main() {
     let dir = std::env::args()
@@ -102,21 +102,21 @@ fn main() {
     let mut damaged = 0u32;
     for fv in &result.files {
         match fv.status {
-            weaver_par2::verify::FileStatus::Missing => {
+            par2_rs::verify::FileStatus::Missing => {
                 println!(
                     "  MISSING: {} ({} blocks)",
                     fv.filename, fv.missing_slice_count
                 );
                 missing += 1;
             }
-            weaver_par2::verify::FileStatus::Damaged(n) => {
+            par2_rs::verify::FileStatus::Damaged(n) => {
                 println!("  DAMAGED: {} ({} bad blocks)", fv.filename, n);
                 damaged += 1;
             }
-            weaver_par2::verify::FileStatus::Complete => {
+            par2_rs::verify::FileStatus::Complete => {
                 complete += 1;
             }
-            weaver_par2::verify::FileStatus::Renamed(ref p) => {
+            par2_rs::verify::FileStatus::Renamed(ref p) => {
                 println!("  RENAMED: {} -> {}", fv.filename, p.display());
             }
         }

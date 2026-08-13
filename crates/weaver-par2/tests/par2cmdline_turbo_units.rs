@@ -4,12 +4,12 @@ mod support;
 use std::fs;
 use std::path::Path;
 
-use support::{Rng, build_synthetic_par2, run_repair_scenario, setup_par2_set};
-use weaver_par2::checksum::{crc32, md5};
-use weaver_par2::{
+use par2_rs::checksum::{crc32, md5};
+use par2_rs::{
     DiskFileAccess, FileAccess, FileHashState, SliceChecksumState, gf_add, gf_inv, gf_mul, gf_pow,
     translate_par2_name_to_local_path, translate_par2_name_to_relative,
 };
+use support::{Rng, build_synthetic_par2, run_repair_scenario, setup_par2_set};
 
 fn chunked_crc(data: &[u8], rng: &mut Rng) -> u32 {
     let mut state = SliceChecksumState::new();

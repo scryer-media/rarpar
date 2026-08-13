@@ -39,7 +39,7 @@ pub fn validate_extracted_outputs(
 ) -> Result<(), RarparError> {
     crate::rar::with_password_retry(rar, passwords, |mut archive| {
         let tempdir = tempfile::tempdir()?;
-        let options = weaver_unrar::ExtractOptions {
+        let options = unrar_rs::ExtractOptions {
             verify: true,
             password: None,
             restore_owners: false,

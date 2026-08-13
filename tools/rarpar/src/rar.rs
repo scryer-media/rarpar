@@ -98,13 +98,27 @@ pub fn extract_set(
 
     std::fs::create_dir_all(output_dir)?;
     with_password_retry(set, passwords, |mut archive| {
-        preflight_outputs(&archive, output_dir, cli.overwrite)?;
-        let options = extract_options(archive_password(&archive));
+        // One metadata build per extraction: it walks every member and
+        // allocates a name per entry, so the preflight reuses this list.
         let members = archive.metadata().members;
+        preflight_outputs(&members, output_dir, cli.overwrite)?;
+        let options = extract_options(archive_password(&archive));
         for (index, member) in members.iter().enumerate() {
             let out_path = output_dir.join(&member.name);
-            if !cli.json {
-                println!("Extracting  {}", member.name);
+            if !cli.json && !cli.quiet {
+                println!(
+                    "{}  {}",
+                    if member.is_directory {
+                        "Creating"
+                    } else {
+                        "Extracting"
+                    },
+                    member.name
+                );
+            }
+            if member.is_directory {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
             }
             archive.extract_member_to_file(index, &options, None, &out_path)?;
         }
@@ -141,7 +155,7 @@ pub fn restore_volume_paths(cli: &Cli, paths: &[PathBuf]) -> Result<u8, RarparEr
 pub fn open_set_with_password(
     set: &RarSet,
     password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, weaver_unrar::RarError> {
+) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
     let mut paths = set
         .volumes
         .iter()
@@ -160,26 +174,27 @@ pub fn open_set_with_password(
 fn open_paths_with_password(
     paths: &[PathBuf],
     password: Option<&str>,
-) -> Result<weaver_unrar::RarArchive, weaver_unrar::RarError> {
+) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
     if paths.is_empty() {
-        return Err(weaver_unrar::RarError::CorruptArchive {
+        return Err(unrar_rs::RarError::CorruptArchive {
             detail: "no RAR volumes provided".to_string(),
         });
     }
 
-    let first = File::open(&paths[0]).map_err(weaver_unrar::RarError::Io)?;
+    let first = File::open(&paths[0]).map_err(unrar_rs::RarError::Io)?;
     let mut archive = if let Some(password) = password {
-        weaver_unrar::RarArchive::open_with_password(first, password)?
+        unrar_rs::RarArchive::open_with_password(first, password)?
     } else {
-        weaver_unrar::RarArchive::open(first)?
+        unrar_rs::RarArchive::open(first)?
     };
+    archive.set_limits(cli_extraction_limits());
     if let Some(password) = password {
         archive.set_password(password.to_string());
     }
 
     for (index, path) in paths.iter().enumerate().skip(1) {
-        let file = File::open(path).map_err(weaver_unrar::RarError::Io)?;
-        archive.add_volume(index, Box::new(file) as Box<dyn weaver_unrar::ReadSeek>)?;
+        let file = File::open(path).map_err(unrar_rs::RarError::Io)?;
+        archive.add_volume(index, Box::new(file) as Box<dyn unrar_rs::ReadSeek>)?;
     }
     Ok(archive)
 }
@@ -192,6 +207,10 @@ pub fn test_set(set: &RarSet, passwords: &mut PasswordResolver) -> Result<RarOut
         let members = archive.metadata().members;
         for (index, member) in members.iter().enumerate() {
             let out_path = tempdir.path().join(&member.name);
+            if member.is_directory {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
+            }
             archive.extract_member_to_file(index, &options, None, &out_path)?;
         }
         Ok(())
@@ -210,7 +229,7 @@ pub fn with_password_retry<T, F>(
     mut operation: F,
 ) -> Result<T, RarparError>
 where
-    F: FnMut(weaver_unrar::RarArchive) -> Result<T, RarparError>,
+    F: FnMut(unrar_rs::RarArchive) -> Result<T, RarparError>,
 {
     let prompt_reason = match open_set_with_password(set, None) {
         Ok(archive) => match operation(archive) {
@@ -269,12 +288,12 @@ fn restore_volume_paths_inner(
             restored_paths: Vec::new(),
         });
     }
-    let options = weaver_unrar::RecoveryOptions {
+    let options = unrar_rs::RecoveryOptions {
         output_dir: cli.output.clone(),
         overwrite_existing: cli.overwrite,
         verify_restored: true,
     };
-    let report = weaver_unrar::restore_volumes_from_paths(paths, &options)?;
+    let report = unrar_rs::restore_volumes_from_paths(paths, &options)?;
     Ok(RarRestoreOutcome {
         set_id: set_id.to_string(),
         success: true,
@@ -288,14 +307,14 @@ fn restore_volume_paths_inner(
 }
 
 fn preflight_outputs(
-    archive: &weaver_unrar::RarArchive,
+    members: &[unrar_rs::MemberInfo],
     output_dir: &Path,
     overwrite: bool,
 ) -> Result<(), RarparError> {
     if overwrite {
         return Ok(());
     }
-    for member in archive.metadata().members {
+    for member in members {
         let path = output_dir.join(&member.name);
         if member.is_directory {
             if path.exists() && !path.is_dir() {
@@ -341,15 +360,30 @@ fn single_archive_set(archive: &Path) -> Result<RarSet, RarparError> {
     })
 }
 
-fn extract_options(password: Option<String>) -> weaver_unrar::ExtractOptions {
-    weaver_unrar::ExtractOptions {
+/// Resource limits the CLI applies to every archive it opens.
+///
+/// The library default caps dictionaries at 256 MiB, which is the right
+/// conservative ceiling for an embedder that has not thought about memory. As a
+/// tool, rarpar has to match what `unrar 7.20` extracts, and unrar accepts any
+/// dictionary the format allows (`UNPACK_MAX_DICT`) unless `-md` narrows it —
+/// so the CLI raises the cap to the format ceiling and leaves the library
+/// default alone.
+pub fn cli_extraction_limits() -> unrar_rs::Limits {
+    unrar_rs::Limits {
+        max_dict_size: unrar_rs::limits::RAR_UNPACK_MAX_DICT_SIZE,
+        ..unrar_rs::Limits::default()
+    }
+}
+
+fn extract_options(password: Option<String>) -> unrar_rs::ExtractOptions {
+    unrar_rs::ExtractOptions {
         verify: true,
         password,
         restore_owners: false,
     }
 }
 
-fn archive_password(_archive: &weaver_unrar::RarArchive) -> Option<String> {
+fn archive_password(_archive: &unrar_rs::RarArchive) -> Option<String> {
     None
 }
 
@@ -360,12 +394,12 @@ fn is_password_error(error: &RarparError) -> bool {
     }
 }
 
-fn is_rar_password_error(error: &weaver_unrar::RarError) -> bool {
+fn is_rar_password_error(error: &unrar_rs::RarError) -> bool {
     matches!(
         error,
-        weaver_unrar::RarError::EncryptedArchive
-            | weaver_unrar::RarError::EncryptedMember { .. }
-            | weaver_unrar::RarError::InvalidPassword
-            | weaver_unrar::RarError::WrongPassword { .. }
+        unrar_rs::RarError::EncryptedArchive
+            | unrar_rs::RarError::EncryptedMember { .. }
+            | unrar_rs::RarError::InvalidPassword
+            | unrar_rs::RarError::WrongPassword { .. }
     )
 }

@@ -17,7 +17,7 @@
 //!
 //! Build (wasm):
 //!   RUSTFLAGS="-C target-feature=+simd128" cargo build --release \
-//!     -p weaver-unrar --no-default-features --features crypto-rust \
+//!     -p unrar-rs --no-default-features --features crypto-rust \
 //!     --target wasm32-wasip1 --example wasm_extract_check
 //!
 //! Run (wasmtime 46; host::guest preopens):
@@ -25,7 +25,7 @@
 //!     target/wasm32-wasip1/release/examples/wasm_extract_check.wasm /fixtures
 //!
 //! Also runnable natively for parity debugging:
-//!   cargo run --release -p weaver-unrar --example wasm_extract_check -- <fixtures>
+//!   cargo run --release -p unrar-rs --example wasm_extract_check -- <fixtures>
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -33,7 +33,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use weaver_unrar::{ExtractOptions, ExtractedMember, MemberInfo, RarArchive};
+use unrar_rs::{ExtractOptions, ExtractedMember, MemberInfo, RarArchive};
 
 /// One fixture in the matrix.
 struct Case {

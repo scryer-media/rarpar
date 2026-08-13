@@ -1,8 +1,10 @@
 [package]
-name = "weaver-par2"
+name = "par2-rs"
 description = "PAR2 parity verification and repair"
-version = "0.2.4"
+readme = "README.md"
+version = "0.3.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 exclude = ["tests/fixtures/**"]
@@ -11,24 +13,25 @@ exclude = ["tests/fixtures/**"]
 default = ["native-crypto"]
 native-crypto = ["dep:aws-lc-sys"]
 slow-tests = []
-# Opt-in Apple-GPU (Metal) acceleration for the streaming repair path. Off by
-# default: the CPU/rayon path is the always-present fallback, and the Metal
-# session (guarded in `repair.rs`) only engages when this feature is enabled on
-# Apple Silicon. Forwards to weaver-reed-solomon's `metal` backend.
-metal = ["weaver-reed-solomon/metal"]
+# Opt-in Apple-GPU (Metal) acceleration for repair and creation. Off by
+# default: repair may fall back to CPU, while creation follows its explicit
+# backend policy and admits Metal only when this feature is enabled on Apple
+# Silicon.
+# Forwards to reedsolomon-rs's `metal` backend.
+metal = ["reedsolomon-rs/metal"]
 # Opt-in portable-GPU (wgpu: Vulkan/DX12/Metal) streaming-repair arm for the
 # platforms the native Metal backend does not cover. Off by default (wgpu is a
 # heavy dependency tree); the session engages under the same size gating as
-# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to weaver-reed-solomon's
+# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to reedsolomon-rs's
 # `wgpu` backend.
-wgpu = ["weaver-reed-solomon/wgpu"]
+wgpu = ["reedsolomon-rs/wgpu"]
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon", version = "0.2.3", default-features = false }
+reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.3.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 md-5 = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
@@ -46,6 +49,12 @@ libc = { workspace = true }
 memmap2 = { workspace = true, default-features = false }
 aws-lc-sys = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Capability-relative path resolution prevents repair destinations from
+# escaping the caller-selected working directory through Windows reparse
+# points while preserving support for a caller-selected symlinked root.
+cap-std = "3.4.5"
+
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
@@ -54,10 +63,10 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # `criterion` hard-`compile_error!`s on wasm (wasi) targets, and building the
 # `wasm_par2_check` example for wasm compiles the crate's dev-dependencies, so
 # it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
-# `weaver-unrar` is native test-suite tooling (differential RAR extraction
+# `unrar-rs` is native test-suite tooling (differential RAR extraction
 # checks) and is not needed by the wasm harness, so it stays off the wasm build.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-weaver-unrar = { path = "../weaver-unrar", version = "0.3.1", default-features = false, features = [
+unrar-rs = { path = "../weaver-unrar", version = "0.4.0", default-features = false, features = [
     "native-crypto",
 ] }
 criterion = "0.5"

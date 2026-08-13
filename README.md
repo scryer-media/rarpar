@@ -34,9 +34,9 @@ writing, compression, or modification APIs.
 selected warm-cache median results from shipped-style release builds with
 verified output, not benchmark-only binaries. They are shape-specific; archive
 content, storage, and CPU features matter. Release builds use AWS-LC-backed
-native crypto, with Metal repair on Apple Silicon and `wgpu` repair in direct
-Linux and Windows builds. Every GPU-capable build falls back to CPU when a
-suitable device or driver is unavailable.
+native crypto and CPU execution only. This keeps startup behavior consistent
+across supported platforms; `rarpar` deliberately does not enable optional GPU
+backends from its underlying PAR2 library.
 
 RAR extraction, compared with the reference RAR extraction utility:
 
@@ -59,36 +59,6 @@ PAR2 verification and repair, compared with `par2cmdline-turbo 1.4.0`:
 | Core Ultra 9 285H | 4 GB set, 1 MB slices, 407 missing | 12.1 s | **8.1 s** | ~1.5x faster |
 | Core Ultra 9 285H | Verify clean 1 GB set | 0.66 s | **0.37 s** | ~1.8x faster |
 | Ryzen 5 3600, Windows | Verify clean 1 GB set | 1.70 s | **0.30 s** | ~5.7x faster |
-
-### GPU Backends
-
-Apple Silicon archives enable Weaver's Metal GF(2^16) repair tier for PAR2.
-Intel macOS archives are CPU-only. Direct Linux GNU, direct Linux musl, and
-Windows archives enable the portable `wgpu` tier; they need a compatible host
-graphics driver and fall back to CPU when no suitable device is available.
-Docker images are deliberately CPU-only and contain neither GPU backend nor
-graphics-driver requirements.
-
-The Apple Silicon repair engine attempts Metal when
-`outputs * sources * region_bytes` is at least 256 MiB; below that, the CPU path
-avoids GPU setup/upload overhead. Set
-`WEAVER_GF16_METAL=1` to force the Metal path or `WEAVER_GF16_METAL=0` to
-disable it. Once a Metal session engages, it runs the streaming repair chunks
-until completion or a GPU error, and any failed chunk is redone on the CPU.
-Repaired files are still read back and PAR2 verified before install.
-
-These numbers compare the same damaged PAR2 sets on an Apple M5 Max. `turbo` is
-`par2cmdline-turbo 1.4.0`; `Weaver CPU` is the all-core NEON path; `Weaver Metal`
-is the GPU path shipped in Apple Silicon archives:
-
-| Platform | Workload | turbo | Weaver CPU | Weaver Metal | Result |
-|---|---|---:|---:|---:|---|
-| Apple M5 Max | 512 MB set, 64 KiB slices, 1,400 missing | 78.1 s | 8.96 s | **4.10 s** | ~19x faster than turbo |
-| Apple M5 Max | 76 MB set, 400 missing | 3.71 s | 0.62 s | **0.40 s** | ~9x faster than turbo |
-
-Raw Metal GF16 throughput in the Weaver benchmark was about **1.26 TB/s** versus
-about **62 GB/s** for the all-core NEON path; at this point the larger Apple
-Silicon repairs are mostly I/O-bound.
 
 Known weaker shapes remain: compressible-text RARs, RAR4 PPMd, Windows
 store-mode write-to-disk, and single-file/many-slice PAR2 repair on x86.
@@ -116,10 +86,8 @@ GitHub Releases and place it on your `PATH`.
 Release archives include a `rarpar(1)` manpage and shell completions under
 `share/`. Homebrew installs those automatically.
 
-Linux direct archives are available in GNU and musl forms, both with `wgpu`
-acceleration and CPU fallback. The separate `linux-*-docker` archives are
-CPU-only musl binaries used to build the container image; they are not selected
-by Homebrew.
+Linux direct archives are available in GNU and musl forms. The portable musl
+archives are also the inputs used to build the CPU-only container image.
 
 With Docker or another OCI runtime:
 
@@ -205,7 +173,58 @@ PAR2 operations:
 ```bash
 rarpar par verify release.par2
 rarpar par repair release.par2
+rarpar par create ./release/release --block-size 1048576 \
+  --recovery-percent 5 part01.rar part02.rar
 ```
+
+`par create` takes one OUTPUT path or stem followed by one or more explicit
+FILE inputs. Directories, recursion, and file-list expansion are rejected. If omitted,
+`--base-path` defaults to OUTPUT's parent, and input names are recorded relative
+to that directory. Use `--block-size` or `--block-count` to choose source-block
+sizing, then select recovery with `--recovery-percent` or the exact, long-only
+`--recovery-count`. Recovery blocks begin at `--first-exponent`; volumes use the
+variable scheme by default and can be selected as `uniform` with
+`--volume-scheme`, then split with `--volume-count`. `--memory-mib` sets the
+creator's bounded planning/working budget.
+
+Creation honors the global safety/reporting flags:
+
+```bash
+rarpar --dry-run --json par create ./release/release \
+  --block-count 256 --recovery-count 16 \
+  part01.rar part02.rar
+rarpar --overwrite par create ./release/release --recovery-percent 10 \
+  part01.rar part02.rar
+```
+
+Dry-run produces a creation-specific plan report and does not write PAR2 files.
+Human progress is rate-limited and goes to stderr; JSON mode emits one final
+structured creation report on stdout. Add `--quiet` to suppress human output.
+
+Automation that already emits a PAR2-command-shaped repair invocation can use
+the compatibility form directly. This form accepts repair mode, `-B` as a
+separate or joined base-directory option, the PAR2 file, and an optional data
+wildcard:
+
+```bash
+rarpar r -B ./release ./release/release.par2 "*.rar"
+```
+
+The explicit `rarpar par ...` commands remain the general-purpose interface.
+
+PAR2 placement defaults to `smart`, which can locate renamed or moved data by
+content. For a conventional expected-path-only verification or repair, use:
+
+```bash
+rarpar par verify --par-placement canonical release.par2
+rarpar auto --par-placement canonical ./release
+```
+
+Explicit RAR selection recognizes modern `partNN` names and old-style `.r00`,
+`.s00`, and numeric volume sequences. Discovery probes only name-compatible
+siblings for an explicitly selected multi-volume archive. During `auto`, RAR
+volumes restored from `.rev` files stay beside the source set; `--output`
+controls extracted payload placement, not those intermediate volumes.
 
 Discovery controls are global:
 
@@ -271,6 +290,10 @@ and `-riN[:S]`.
 incremental prompt expected by UnRAR-compatible callers. `rarpar` intentionally
 does not print an UnRAR banner and does not claim to be official UnRAR.
 
+Normal `x` and `e` extraction uses sibling `.rev` recovery files to restore
+missing volumes before extraction. The incremental `-vp` path does not mutate
+the archive set; it waits for each later volume instead.
+
 ## Workspace Packages
 
 - `crates/weaver-reed-solomon`: Reed-Solomon finite-field kernels shared by
@@ -280,7 +303,7 @@ does not print an UnRAR banner and does not claim to be official UnRAR.
 - `crates/weaver-par2`: PAR2 packet loading, verification, placement-aware
   repair, and post-repair verification. Licensed GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Source is GPL-3.0-or-later. Normal
-  binary builds link `weaver-unrar`, so binary distribution also carries the
+  binary builds link `unrar-rs`, so binary distribution also carries the
   additional UnRAR source-code restriction.
 
 ## Development
@@ -307,20 +330,21 @@ cargo test --locked --workspace --no-fail-fast
 Release and crates.io publishing automation lives under `.github/workflows/`.
 Publishing notes are in `docs/publishing.md`.
 Linux packaging layout notes are in `docs/packaging.md`.
+Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
 The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
-`weaver-unrar` is used:
+`unrar-rs` is used:
 
-- `weaver-reed-solomon`, `weaver-par2`, and `rarpar` source are
+- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
   GPL-3.0-or-later.
-- `weaver-unrar` is GPL-3.0-or-later with the additional UnRAR source-code
+- `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
   restriction documented in `crates/weaver-unrar/LICENSE`.
-- `rarpar` binary releases link `weaver-unrar` and therefore carry that
+- `rarpar` binary releases link `unrar-rs` and therefore carry that
   additional restriction too. Release archives include `LICENSE`,
-  `LICENSE.GPL-3.0-or-later`, and `LICENSE.weaver-unrar`.
+  `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
 
 The additional restriction applies to the RAR extraction and recovery code in
-`weaver-unrar` and to `rarpar` binaries that include it. It does not apply to
+`unrar-rs` and to `rarpar` binaries that include it. It does not apply to
 the PAR2 or Reed-Solomon crates.

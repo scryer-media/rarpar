@@ -81,6 +81,31 @@ pub enum Par2Error {
     // --- I/O ---
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    // --- Creation errors ---
+    #[error("invalid PAR2 creation options: {reason}")]
+    InvalidCreationOptions { reason: String },
+
+    #[error("unsafe PAR2 source path {path}: {reason}")]
+    UnsafeCreationSource { path: String, reason: String },
+
+    #[error("source file changed while creating PAR2 data: {path}")]
+    CreationSourceChanged { path: String },
+
+    #[error("PAR2 output already exists: {path}")]
+    CreationOutputExists { path: String },
+
+    #[error("unsafe PAR2 output path {path}: {reason}")]
+    UnsafeCreationOutput { path: String, reason: String },
+
+    #[error("staged PAR2 output validation failed for {path}: {reason}")]
+    CreationValidation { path: String, reason: String },
+
+    #[error("Metal creation backend is unavailable: {reason}")]
+    MetalUnavailable { reason: String },
+
+    #[error("Metal creation failed after staging began: {reason}")]
+    MetalExecutionFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Par2Error>;

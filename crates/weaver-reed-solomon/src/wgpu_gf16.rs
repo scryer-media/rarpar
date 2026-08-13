@@ -3,10 +3,8 @@
 //! The wgpu twin of [`crate::metal_gf16`], for the platforms the native Metal
 //! backend does not cover (Windows/Linux discrete GPUs). Same product and the
 //! same 4×16-entry nibble-table formulation: each output's coefficient tables
-//! are staged into workgroup memory, the inner loop is on-chip table lookups.
-//! Not an upstream par2cmdline-turbo port — ParPar's GPU story is OpenCL and
-//! is not compiled there; this is rarpar-native engineering like the Metal
-//! arm.
+//! are staged into workgroup memory, and the inner loop uses on-chip table
+//! lookups.
 //!
 //! WGSL has no 16-bit integer type, so words travel in packed pairs: every
 //! `u32` holds two LE u16 words, tables store two entries per `u32`
@@ -286,7 +284,7 @@ fn shared_context() -> Option<&'static WgpuShared> {
 /// `IntegratedGpu` stays engaged, deliberately. The measurement that seems to
 /// argue otherwise — an Iris Xe at ~14.9 GiB/s losing to a single GFNI core at
 /// ~20.6 GiB/s — was taken on a box where this arm never engages: `engage` in
-/// `weaver-par2`'s repair path requires `!cpu_fast_path`, and `cpu_fast_path`
+/// `par2-rs`'s repair path requires `!cpu_fast_path`, and `cpu_fast_path`
 /// is `altmap_supported() || xorjit`, both of which are x86-64-with-AVX2. So
 /// the automatic path only ever runs on non-x86 (where the CPU tier is the
 /// NEON kernel) and on pre-AVX2 x86, and on neither has an integrated GPU been
@@ -302,7 +300,7 @@ fn shared_context() -> Option<&'static WgpuShared> {
 /// some Mesa builds), and refusing them would reject real hardware.
 ///
 /// This table governs hosts where nothing else owns accumulation. When an x86
-/// fast tier exists, weaver-par2's arbitration asks the stricter
+/// fast tier exists, par2-rs's arbitration asks the stricter
 /// [`discrete_auto_candidate`] question instead, and a non-discrete adapter on
 /// such a host never reaches this gate at all.
 fn auto_engageable(device_type: wgpu::DeviceType) -> bool {
@@ -346,8 +344,10 @@ fn discrete_auto_candidate_resolved(
     gate: WgpuGate,
     device_type: Option<wgpu::DeviceType>,
     effective_bytes: u64,
+    cpu_has_gfni: bool,
 ) -> bool {
     matches!(gate, WgpuGate::Auto)
+        && !cpu_has_gfni
         && effective_bytes >= MIN_EFFECTIVE_BYTES
         && matches!(device_type, Some(wgpu::DeviceType::DiscreteGpu))
 }
@@ -358,15 +358,17 @@ fn discrete_auto_candidate_resolved(
 /// This is a stricter question than [`auto_engageable`], and deliberately so:
 /// that gate serves hosts with no fast tier, where anything better than a CPU
 /// rasterizer wins by default. Here the GPU must beat a running start —
-/// AVX2/GFNI folded or XOR-JIT accumulation across every core — so the burden
-/// of proof flips, and only `DiscreteGpu` carries it. Measured (RTX 3080 Ti vs
-/// Ryzen 5 3600, AVX2/no-GFNI, `rar5_heavy_damage_250` end-to-end workflow):
-/// 2.21 s CPU vs 1.07 s GPU, ~2×. Kernel-isolated the same pairing is only at
-/// PARITY — the end-to-end win comes from freeing the whole CPU for the MD5 +
-/// I/O the repair runs concurrently, which is also why the decision cannot be
-/// made from kernel throughput alone. `IntegratedGpu` is refused here on the
-/// same evidence class: an Iris Xe measured 6.4× BEHIND a 16-thread GFNI CPU
-/// kernel-isolated, and no end-to-end win has been shown on an AVX2 host.
+/// AVX2 folded or XOR-JIT accumulation across every core — so the burden of
+/// proof flips, and only `DiscreteGpu` carries it. GFNI machines do not probe
+/// wgpu automatically at all: their CPU tier is already preferred. Measured
+/// (RTX 3080 Ti vs Ryzen 5 3600, AVX2/no-GFNI,
+/// `rar5_heavy_damage_250` end-to-end workflow): 2.21 s CPU vs 1.07 s GPU,
+/// ~2×. Kernel-isolated the same pairing is only at PARITY — the end-to-end
+/// win comes from freeing the whole CPU for the MD5 + I/O the repair runs
+/// concurrently, which is also why the decision cannot be made from kernel
+/// throughput alone. `IntegratedGpu` is refused here on the same evidence
+/// class: an Iris Xe measured 6.4× BEHIND a 16-thread GFNI CPU kernel-isolated,
+/// and no end-to-end win has been shown on an AVX2 host.
 /// `Other`/`VirtualGpu` are refused as unmeasured against a fast tier (the
 /// under-reporting-driver argument in [`auto_engageable`] does not outweigh a
 /// measured-fast CPU). `WEAVER_GF16_WGPU=1` remains the override for all of
@@ -379,13 +381,17 @@ fn discrete_auto_candidate_resolved(
 /// first so hosts with the tier off, or repairs under the size gate, never
 /// pay the probe.
 pub fn discrete_auto_candidate(effective_bytes: u64) -> bool {
-    if !matches!(wgpu_gate(), WgpuGate::Auto) || effective_bytes < MIN_EFFECTIVE_BYTES {
+    if crate::gf_simd::folded_uses_gfni()
+        || !matches!(wgpu_gate(), WgpuGate::Auto)
+        || effective_bytes < MIN_EFFECTIVE_BYTES
+    {
         return false;
     }
     discrete_auto_candidate_resolved(
         WgpuGate::Auto,
         shared_context().map(|shared| shared.device_type),
         effective_bytes,
+        false,
     )
 }
 
@@ -772,11 +778,12 @@ mod tests {
         let big = MIN_EFFECTIVE_BYTES;
         let small = MIN_EFFECTIVE_BYTES - 1;
 
-        // Only Auto + DiscreteGpu + at-or-above the size gate says yes.
+        // Only Auto + non-GFNI + DiscreteGpu + at-or-above the size gate says yes.
         assert!(discrete_auto_candidate_resolved(
             WgpuGate::Auto,
             Some(DeviceType::DiscreteGpu),
-            big
+            big,
+            false,
         ));
 
         // Every other adapter class is refused against a fast tier.
@@ -789,23 +796,38 @@ mod tests {
             assert!(!discrete_auto_candidate_resolved(
                 WgpuGate::Auto,
                 Some(device),
-                big
+                big,
+                false,
             ));
         }
         // No adapter at all.
-        assert!(!discrete_auto_candidate_resolved(WgpuGate::Auto, None, big));
+        assert!(!discrete_auto_candidate_resolved(
+            WgpuGate::Auto,
+            None,
+            big,
+            false,
+        ));
         // Under the size gate.
         assert!(!discrete_auto_candidate_resolved(
             WgpuGate::Auto,
             Some(DeviceType::DiscreteGpu),
-            small
+            small,
+            false,
+        ));
+        // GFNI wins before an automatic wgpu adapter probe.
+        assert!(!discrete_auto_candidate_resolved(
+            WgpuGate::Auto,
+            Some(DeviceType::DiscreteGpu),
+            big,
+            true,
         ));
         // Off never claims; Force is handled by `force_requested`, not here.
         for gate in [WgpuGate::Off, WgpuGate::Force] {
             assert!(!discrete_auto_candidate_resolved(
                 gate,
                 Some(DeviceType::DiscreteGpu),
-                big
+                big,
+                false,
             ));
         }
     }

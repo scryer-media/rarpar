@@ -1,6 +1,12 @@
 /target/
 /target-*/
 
+# Deterministic benchmark corpora, runs, and rendered reports.
+/target/bench/
+/bench/rarpar-bench/.cache/
+# Operator-specific benchmark host inventory; it may reference private SSH keys.
+/bench/rarpar-bench/config/hosts.local.json
+
 # Local CI/release artifacts
 /.ci/
 /dist/

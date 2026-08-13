@@ -5,11 +5,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use tempfile::TempDir;
-use weaver_par2::{
+use par2_rs::{
     DiskFileAccess, FileStatus, Par2FileSet, PlacementFileAccess, Repairability,
     apply_placement_plan, execute_repair, plan_repair, scan_placement, verify_all,
 };
+use tempfile::TempDir;
 
 const TEST_PASSWORD: &str = "testpass123";
 const HEAVY_DAMAGE_SLICE_SIZE: u64 = 65536;
@@ -65,12 +65,12 @@ fn load_par2_set(paths: &[PathBuf]) -> Par2FileSet {
     Par2FileSet::from_files(&refs).unwrap()
 }
 
-fn open_archive(paths: &[PathBuf]) -> weaver_unrar::RarArchive {
-    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+fn open_archive(paths: &[PathBuf]) -> unrar_rs::RarArchive {
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
         .iter()
-        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
+        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
         .collect();
-    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
+    unrar_rs::RarArchive::open_volumes(readers).unwrap()
 }
 
 fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Option<&str>) {
@@ -79,7 +79,7 @@ fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Optio
     if let Some(password) = password {
         archive.set_password(password);
     }
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: password.map(str::to_owned),
         restore_owners: false,
@@ -88,7 +88,7 @@ fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Optio
     assert_eq!(extracted, expected);
 }
 
-fn assert_repairable(result: &weaver_par2::VerificationResult, context: &str) {
+fn assert_repairable(result: &par2_rs::VerificationResult, context: &str) {
     assert!(
         matches!(result.repairable, Repairability::Repairable { .. }),
         "{context}: expected repairable result, got {:?}",
@@ -100,7 +100,7 @@ fn assert_repairable(result: &weaver_par2::VerificationResult, context: &str) {
     );
 }
 
-fn assert_not_needed(result: &weaver_par2::VerificationResult, context: &str) {
+fn assert_not_needed(result: &par2_rs::VerificationResult, context: &str) {
     assert!(
         matches!(result.repairable, Repairability::NotNeeded),
         "{context}: expected repaired result, got {:?}",
@@ -291,14 +291,14 @@ fn repairs_heavy_damage_28_regions_rar5() {
 
     // Extract and verify the file is byte-identical to the original.
     let volume_paths = collect_paths(temp.path(), prefix, "rar");
-    let mut archive = weaver_unrar::RarArchive::open_volumes(
+    let mut archive = unrar_rs::RarArchive::open_volumes(
         volume_paths
             .iter()
-            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
+            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
             .collect(),
     )
     .unwrap();
-    let opts = weaver_unrar::ExtractOptions {
+    let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,

@@ -2,10 +2,8 @@
 //!
 //! Emits only the instruction subset the XOR reconstruction codegen needs:
 //! 256-bit `vpxor`/`vmovdqa`, and the scalar
-//! `add`/`cmp`/`jl`/`ret`/`prefetcht1` for the block loop. The byte formulas
-//! follow ParPar's `x86_jit.h` where an upstream counterpart exists; the
-//! `vmovdqu` (F3-prefixed, unaligned) forms are rarpar additions — upstream
-//! emits only `vmovdqa` because its buffers are alignment-guaranteed.
+//! `add`/`cmp`/`jl`/`ret`/`prefetcht1` for the block loop. Both aligned
+//! `vmovdqa` and F3-prefixed unaligned `vmovdqu` forms are supported.
 //!
 //! Every function appends little-endian machine code to a `Vec<u8>`. Nothing
 //! here executes code — that is the caller's job via a W^X buffer
@@ -15,15 +13,19 @@
 //! - 2-byte VEX (`C5`) when the ModRM.rm register/base is < 8; else 3-byte
 //!   (`C4`). `VEX.R`/`VEX.B`/`VEX.vvvv` are stored inverted.
 //! - Displacement: none when `off == 0`, `disp8` when it fits a signed byte,
-//!   else `disp32`. The only base registers used (rax/rcx/rdx/rsi) are never
-//!   rsp(4)/rbp(5), so no SIB byte and no `mod=00`/rbp special case arises.
+//!   else `disp32`. The base registers used by packed dispatch avoid rsp/rbp,
+//!   so no SIB byte and no `mod=00`/rbp special case arises.
 
 /// General-purpose register encodings (low 8). These are the only GPRs the
-/// generated code touches — as pointers and the loop counter.
+/// generated code touches as pointers and loop state.
 pub const RAX: u8 = 0;
 pub const RCX: u8 = 1;
 pub const RDX: u8 = 2;
 pub const RSI: u8 = 6;
+pub const RDI: u8 = 7;
+pub const R8: u8 = 8;
+pub const R9: u8 = 9;
+pub const R10: u8 = 10;
 
 /// Emit a VEX prefix + opcode for a 256-bit AVX instruction.
 ///
@@ -125,6 +127,21 @@ pub fn cmp_rr(buf: &mut Vec<u8>, a: u8, b: u8) {
     buf.push((0b11 << 6) | ((b & 7) << 3) | (a & 7));
 }
 
+/// `TEST r64_a, r64_b` (`REX.W 85 /r`).
+pub fn test_rr(buf: &mut Vec<u8>, a: u8, b: u8) {
+    buf.push(0x48 | (((b >= 8) as u8) << 2) | ((a >= 8) as u8)); // REX.W (+R if b>=8, +B if a>=8)
+    buf.push(0x85);
+    buf.push((0b11 << 6) | ((b & 7) << 3) | (a & 7));
+}
+
+/// `JZ rel32` (`0F 84 cd`). `rel` is relative to the end of this 6-byte
+/// instruction.
+pub fn jz_rel32(buf: &mut Vec<u8>, rel: i32) {
+    buf.push(0x0F);
+    buf.push(0x84);
+    buf.extend_from_slice(&rel.to_le_bytes());
+}
+
 /// `JL rel32` (`0F 8C cd`). `rel` is relative to the end of this 6-byte
 /// instruction. Use [`jl_to`] to target an absolute buffer offset.
 pub fn jl_rel32(buf: &mut Vec<u8>, rel: i32) {
@@ -152,9 +169,9 @@ pub fn ret(buf: &mut Vec<u8>) {
 // forms X/B carry ModRM.rm bits 4/3, for memory forms X=1 and B carries the
 // base's bit 3), P1 = [W=0 | !vvvv:4 | 1 | pp], P2 = [z=0 L'L=10 b=0 | !V' |
 // aaa=000] where V' is vvvv bit 4. Memory displacements use EVEX compressed
-// disp8 (scale 64 for full-width zmm ops) — every plane offset the codegen
-// uses is a multiple of 64 within disp8 range, so upstream's `-384` pointer
-// bias trick (gf16_xor_common.h) is unnecessary here: bias 0, all disp8.
+// disp8 (scale 64 for full-width zmm ops). Every plane offset is a multiple of
+// 64 within disp8 range, so the emitter uses direct offsets without a pointer
+// bias.
 // Encodings pinned byte-exact against the system assembler in the tests.
 // ---------------------------------------------------------------------------
 
@@ -289,7 +306,7 @@ mod tests {
 
     #[test]
     fn vpxor_reg_reg() {
-        // vpxor ymm0, ymm0, ymm0  -> C5 FD EF C0  (matches ParPar template)
+        // vpxor ymm0, ymm0, ymm0 -> C5 FD EF C0
         assert_eq!(emit(|b| vpxor_rrr(b, 0, 0, 0)), [0xC5, 0xFD, 0xEF, 0xC0]);
         // vpxor ymm1, ymm2, ymm3  -> C5 ED EF CB
         assert_eq!(emit(|b| vpxor_rrr(b, 1, 2, 3)), [0xC5, 0xED, 0xEF, 0xCB]);
@@ -354,8 +371,15 @@ mod tests {
             emit(|b| add_ri(b, RDX, 512)),
             [0x48, 0x81, 0xC2, 0x00, 0x02, 0x00, 0x00]
         );
-        // cmp rdx, rcx -> 48 39 CA  (matches ParPar back-edge)
+        // cmp rdx, rcx -> 48 39 CA
         assert_eq!(emit(|b| cmp_rr(b, RDX, RCX)), [0x48, 0x39, 0xCA]);
+        // test rsi, rsi -> 48 85 F6
+        assert_eq!(emit(|b| test_rr(b, RSI, RSI)), [0x48, 0x85, 0xF6]);
+        // jz +0x12345678 -> 0F 84 78 56 34 12
+        assert_eq!(
+            emit(|b| jz_rel32(b, 0x1234_5678)),
+            [0x0F, 0x84, 0x78, 0x56, 0x34, 0x12]
+        );
         // ret -> C3
         assert_eq!(emit(ret), [0xC3]);
         // prefetcht1 [rsi] -> 0F 18 16  (/2, base rsi=6)
@@ -381,6 +405,22 @@ mod tests {
         assert_eq!(
             emit(|b| vmovdqu32_load(b, 31, RAX, 960)),
             [0x62, 0x61, 0x7E, 0x48, 0x6F, 0x78, 0x0F]
+        );
+        // Packed AVX512 sources use r8/r9/r10 as memory bases.
+        // vmovdqu32 zmm16, [r8+64] -> 62 C1 7E 48 6F 40 01
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 16, R8, 64)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x40, 0x01]
+        );
+        // vmovdqu32 zmm17, [r9+128] -> 62 C1 7E 48 6F 49 02
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 17, R9, 128)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x49, 0x02]
+        );
+        // vmovdqu32 zmm18, [r10+960] -> 62 C1 7E 48 6F 52 0F
+        assert_eq!(
+            emit(|b| vmovdqu32_load(b, 18, R10, 960)),
+            [0x62, 0xC1, 0x7E, 0x48, 0x6F, 0x52, 0x0F]
         );
         // vmovdqu32 [rdx+128], zmm0 -> 62 F1 7E 48 7F 42 02
         assert_eq!(

@@ -741,6 +741,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48ed47e602652e3410f9387fc0db70fefadcee4d78a78881421aabcab4e26b89"
 
 [[package]]
+name = "crc-fast"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+dependencies = [
+ "digest 0.10.7",
+ "spin",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1927,6 +1937,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "par2-rs"
+version = "0.3.0"
+dependencies = [
+ "aws-lc-sys",
+ "bytes",
+ "cap-std",
+ "crc-fast",
+ "criterion",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "unrar-rs",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2131,17 +2162,17 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "rarpar"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "clap",
+ "par2-rs",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "weaver-par2",
- "weaver-unrar",
+ "unrar-rs",
 ]
 
 [[package]]
@@ -2200,6 +2231,20 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.3.0"
+dependencies = [
+ "criterion",
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "pollster",
+ "rayon",
+ "wgpu",
 ]
 
 [[package]]
@@ -2471,6 +2516,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spirv"
@@ -2771,6 +2822,38 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unrar-rs"
+version = "0.4.0"
+dependencies = [
+ "aes",
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "blake2s_simd",
+ "cbc",
+ "crc-fast",
+ "criterion",
+ "filetime",
+ "hmac",
+ "libc",
+ "memchr",
+ "rayon",
+ "reedsolomon-rs",
+ "rmp-serde",
+ "serde",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "wasmtime",
+ "wasmtime-wasi",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
 
 [[package]]
 name = "url"
@@ -3278,72 +3361,6 @@ dependencies = [
  "log",
  "once_cell",
  "pkg-config",
-]
-
-[[package]]
-name = "weaver-par2"
-version = "0.2.4"
-dependencies = [
- "aws-lc-sys",
- "bytes",
- "crc32fast",
- "criterion",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "weaver-reed-solomon",
- "weaver-unrar",
-]
-
-[[package]]
-name = "weaver-reed-solomon"
-version = "0.2.3"
-dependencies = [
- "criterion",
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "pollster",
- "rayon",
- "wgpu",
-]
-
-[[package]]
-name = "weaver-unrar"
-version = "0.3.1"
-dependencies = [
- "aes",
- "aws-lc-rs",
- "aws-lc-sys",
- "blake2s_simd",
- "cbc",
- "crc32fast",
- "criterion",
- "filetime",
- "hmac",
- "libc",
- "memchr",
- "rayon",
- "rmp-serde",
- "serde",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "wasmtime",
- "wasmtime-wasi",
- "weaver-reed-solomon",
- "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
@@ -3859,7 +3876,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "clap",
  "clap_complete",

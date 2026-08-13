@@ -19,9 +19,9 @@ const MAX_CHECKSUM_ENTRIES: usize = 32_768;
 impl IfscPacket {
     /// Parse an IFSC packet from its body (after the 64-byte header).
     pub fn parse(body: &[u8]) -> Result<Self> {
-        if body.len() <= 16 {
+        if body.len() < 16 {
             return Err(Par2Error::InvalidIfscPacket {
-                reason: format!("body too short: {} bytes, need more than 16", body.len()),
+                reason: format!("body too short: {} bytes, need at least 16", body.len()),
             });
         }
 
@@ -96,10 +96,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_ifsc_no_checksums() {
+    fn accept_ifsc_with_no_checksums() {
         let body = make_ifsc_body([0; 16], &[]);
-        let err = IfscPacket::parse(&body).unwrap_err();
-        assert!(matches!(err, Par2Error::InvalidIfscPacket { .. }));
+        let packet = IfscPacket::parse(&body).unwrap();
+        assert_eq!(*packet.file_id.as_bytes(), [0; 16]);
+        assert!(packet.checksums.is_empty());
     }
 
     #[test]

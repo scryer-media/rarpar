@@ -214,6 +214,55 @@ mod tests {
         assert_eq!(enc.check_data, None);
     }
 
+    /// A full-length check value whose own SHA-256 tag does not match must come
+    /// back as **claimed but unusable**, never as a usable one.
+    ///
+    /// This is the archive-level twin of the per-member rule, and it is the
+    /// anti-footgun any `-hp` password-candidate loop would rest on: a corrupt
+    /// check refutes *no* password, so a caller that read it as a check would
+    /// find its very first candidate "verified" and decrypt garbage into the
+    /// user's output. The truncated case above reaches `None` by running out of
+    /// bytes; this one has all twelve and is still not a check.
+    #[test]
+    fn test_password_check_with_a_bad_tag_is_claimed_but_unusable() {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_vint(0)); // version
+        type_body.extend_from_slice(&encode_vint(0x0001)); // password check present
+        type_body.push(0); // kdf_count
+        type_body.extend_from_slice(&[0xAA; 16]); // salt
+        type_body.extend_from_slice(&[0xCC; 8]); // the 8 check bytes
+        type_body.extend_from_slice(&[0x00; 4]); // a tag that is not their SHA-256
+
+        let data = build_raw_encryption_header(&type_body);
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let enc = parse(&raw).unwrap();
+
+        assert!(
+            enc.has_password_check,
+            "the header does claim one, and that claim is worth reporting"
+        );
+        assert_eq!(
+            enc.check_data, None,
+            "but it must not be handed out as something a password can be proved against"
+        );
+
+        // Non-vacuity: the same 8 bytes with their real tag *are* handed out, so
+        // the refusal above is the tag check discriminating rather than the
+        // field never being populated at all.
+        let mut good = type_body;
+        let len = good.len();
+        good[len - 4..].copy_from_slice(&sha256_digest(&[0xCCu8; 8])[..4]);
+        let data = build_raw_encryption_header(&good);
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let enc = parse(&raw).unwrap();
+        assert_eq!(
+            enc.check_data.map(|check| check[..8].to_vec()),
+            Some(vec![0xCC; 8])
+        );
+    }
+
     #[test]
     fn test_future_encryption_version_is_unsupported_before_rest_of_header() {
         let type_body = encode_vint(CRYPT_VERSION + 1);

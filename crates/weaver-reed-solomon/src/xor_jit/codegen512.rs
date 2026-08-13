@@ -1,28 +1,13 @@
-//! Factor -> `vpternlogd`/`vpxord` schedule codegen for the AVX512 XOR-JIT
-//! tier — the zmm widening of [`super::codegen`], porting the instruction
-//! selection of ParPar's `gf16_xor_avx512.c` JIT.
+//! Factor-to-`vpternlogd`/`vpxord` schedule generation for the AVX-512
+//! XOR-JIT tier.
 //!
-//! What carries over from upstream: 1024-byte blocks (16 planes × 64 B),
-//! `vpternlogd imm8=0x96` folding TWO planes per instruction (halving the XOR
-//! count vs the AVX2 tier), and exploiting the 32 zmm registers to keep a full
-//! 16-plane set resident. Register-allocation nuance: upstream parks the 16
-//! DST planes in `zmm16..31` (`xor_write_init_jit`, gf16_xor_avx512.c:17-26);
-//! this port parks the 16 SRC planes there instead, mirroring the proven AVX2
-//! codegen structure (`super::codegen`) — either allocation captures the
-//! residency win, and this one lets the AVX2 CSE pair scheme carry over
-//! unchanged (AVX2 can only keep 13 source planes resident).
+//! Bodies process 1024-byte blocks (16 planes of 64 bytes), fold two planes
+//! per `vpternlogd imm8=0x96` instruction, and keep all 16 source planes in
+//! `zmm16..31`. The packed form supports up to six source regions and shares
+//! the finalized W^X arena used by single-factor bodies.
 //!
-//! Deliberate deviations, documented once here:
-//! - Upstream's JIT writer builds its instruction bytes with SIMD because it
-//!   re-JITs per coefficient on every call; rarpar pre-JITs one body per
-//!   factor and memoizes ([`crate::xor_jit::memory`]), so writer speed is
-//!   irrelevant and the byte-formula emitter style of `emit.rs` is kept.
-//! - Upstream's multi-region variant (one body over several sources,
-//!   `gf16_xor_avx512.c:815`) is not ported: par2cmdline-turbo's SLIM build
-//!   never selects the AVX512 JIT at all, and rarpar's streaming tier is
-//!   per-source; the instruction-density win is captured without it.
-//! - No `-384` pointer bias: EVEX compressed disp8 (×64) covers every plane
-//!   offset directly (see `emit.rs`), so plane `p` sits at `[ptr + p*64]`.
+//! EVEX compressed disp8 addressing covers every plane offset directly, so
+//! plane `p` resides at `[ptr + p*64]` without a pointer bias.
 //!
 //! Register convention: `rax=src-1024, rdx=dst-1024, rcx=dst_end-1024`; each
 //! iteration advances one block then addresses planes at `+p*64`. `zmm0`/
@@ -35,9 +20,8 @@ use super::emit::{self, RAX, RCX, RDX};
 /// Bytes per wide bit-planar block.
 const BLOCK: i32 = 1024;
 
-/// `prefetcht1` for the next block's src/dst first lines — the zmm twin of
-/// `super::codegen::JIT_NEXT_BLOCK_PREFETCH`; same UNMEASURED/off-by-default
-/// status and A/B protocol.
+/// Keep next-block hints disabled. The controller-facing prefetch body below
+/// uses a dedicated `rsi` stream instead.
 const JIT_NEXT_BLOCK_PREFETCH: bool = false;
 
 /// Byte offset of plane `p` from the (advanced) block pointer.
@@ -73,6 +57,13 @@ fn fold_pairs(buf: &mut Vec<u8>, acc: u8, mut mask: u16) -> Option<usize> {
 
 /// Generate the muladd loop body for `deps` (AVX512 flavor).
 pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
+    generate_muladd_with_prefetch(deps, false)
+}
+
+/// Generate the single-source AVX512 body, optionally adding a dedicated
+/// prefetch stream. `rsi` advances by 512 bytes and receives eight T1 hints;
+/// its trampoline seeds it at `prefetch - 384`.
+pub fn generate_muladd_with_prefetch(deps: &XorDeps, prefetch: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1024);
 
     // Loop top: advance to this block, load all 16 source planes.
@@ -83,6 +74,12 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
         // starts exactly one BLOCK ahead).
         emit::prefetcht1(&mut buf, RAX, BLOCK);
         emit::prefetcht1(&mut buf, RDX, BLOCK);
+    }
+    if prefetch {
+        emit::add_ri(&mut buf, emit::RSI, 512);
+        for offset in [-128, -64, 0, 64, 128, 192, 256, 320] {
+            emit::prefetcht1(&mut buf, emit::RSI, offset);
+        }
     }
     for k in 0..16usize {
         emit::vmovdqu32_load(&mut buf, src_reg(k), RAX, plane_off(k));
@@ -130,6 +127,64 @@ pub fn generate_muladd(deps: &XorDeps) -> Vec<u8> {
     buf
 }
 
+/// Maximum number of packed source regions handled by one AVX512 body.
+pub const MAX_PACKED_REGIONS: usize = 6;
+
+#[inline]
+fn source_base(index: usize) -> u8 {
+    match index {
+        0 => emit::RDX,
+        1 => emit::RSI,
+        2 => emit::RDI,
+        3 => emit::R8,
+        4 => emit::R9,
+        5 => emit::R10,
+        _ => unreachable!("packed AVX512 source register"),
+    }
+}
+
+/// Generate the AVX512 backend's packed multi-source body. Destination planes
+/// stay in `zmm0..15`; each source is loaded into `zmm16..31` and its
+/// coefficient dependency rows are XORed into the destination before the
+/// next source is loaded. The trampoline supplies source bases in the order
+/// defined by [`source_base`].
+pub fn generate_muladd_multi(deps: &[XorDeps]) -> Vec<u8> {
+    assert!(!deps.is_empty() && deps.len() <= MAX_PACKED_REGIONS);
+    let mut buf = Vec::with_capacity(4096);
+
+    emit::add_ri(&mut buf, emit::RAX, BLOCK);
+    for index in 0..deps.len() {
+        emit::add_ri(&mut buf, source_base(index), BLOCK);
+    }
+
+    for plane in 0..16usize {
+        emit::vmovdqu32_load(&mut buf, plane as u8, emit::RAX, plane_off(plane));
+    }
+
+    for (source, dep) in deps.iter().enumerate() {
+        let base = source_base(source);
+        for plane in 0..16usize {
+            emit::vmovdqu32_load(&mut buf, src_reg(plane), base, plane_off(plane));
+        }
+        for (output, &row) in dep.rows.iter().enumerate() {
+            let mut mask = row;
+            while mask != 0 {
+                let plane = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                emit::vpxord_rrr(&mut buf, output as u8, output as u8, src_reg(plane));
+            }
+        }
+    }
+
+    for plane in 0..16usize {
+        emit::vmovdqu32_store(&mut buf, emit::RAX, plane_off(plane), plane as u8);
+    }
+    emit::cmp_rr(&mut buf, emit::RAX, emit::RCX);
+    emit::jl_to(&mut buf, 0);
+    emit::ret(&mut buf);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::deps::{compute_deps, muladd_planar_sized};
@@ -165,6 +220,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn packed_multi_shape_has_one_return_and_supports_all_prefixes() {
+        let factors = [1u16, 2, 3, 0, 0x8000, 0xFFFF];
+        for count in 1..=factors.len() {
+            let deps = factors[..count]
+                .iter()
+                .copied()
+                .map(compute_deps)
+                .collect::<Vec<_>>();
+            let code = generate_muladd_multi(&deps);
+            assert_eq!(code.last(), Some(&0xC3));
+            assert!(code.len() < 16 * 1024);
+        }
+    }
+
+    #[test]
+    fn dedicated_prefetch_stream_adds_the_reference_hint_sequence() {
+        let deps = compute_deps(0x2F1D);
+        let code = generate_muladd_with_prefetch(&deps, true);
+        assert!(
+            code.windows(2)
+                .filter(|window| *window == [0x0F, 0x18])
+                .count()
+                >= 8
+        );
+    }
+
     /// [`generated_code_shape`] swept over the full factor domain — cheap and
     /// hardware-free. Execution semantics are validated on real AVX512
     /// hardware by `jit512_muladd_matches_planar`.
@@ -186,7 +268,7 @@ mod tests {
     }
 
     /// On real AVX512 hardware: the JIT'd body must reproduce the wide planar
-    /// oracle byte-for-byte over a multi-block region, including accumulation.
+    /// reference byte-for-byte over a multi-block region, including accumulation.
     /// (No-ops elsewhere — including under Rosetta 2, which lacks AVX512.)
     #[test]
     fn jit512_muladd_matches_planar() {

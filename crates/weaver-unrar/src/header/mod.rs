@@ -41,6 +41,14 @@ pub struct FileEncryptionParams {
     pub salt: [u8; 16],
     pub iv: [u8; 16],
     pub check_data: Option<[u8; 12]>,
+    /// Whether the record's flags claim a password-check value at all.
+    ///
+    /// Distinct from `check_data.is_some()`: the parser drops a check value
+    /// whose trailing SHA-256 tag does not match, so a claimed-but-unusable
+    /// check reads as `psw_check_present` with `check_data: None`. A caller
+    /// deciding whether a wrong password can be detected before decrypting
+    /// needs `check_data`; one reporting *why* it cannot needs both.
+    pub psw_check_present: bool,
     /// When true, CRC32 and BLAKE2 hashes in the header are HMAC-transformed
     /// and cannot be verified without HashKey from the RAR5 KDF chain.
     pub use_hash_mac: bool,
@@ -126,25 +134,170 @@ fn empty_parsed_headers() -> ParsedHeaders {
     }
 }
 
+/// Options controlling how the header walk reads an archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderParseOptions {
+    /// Whether the parser may answer from the archive's Quick Open cache.
+    ///
+    /// RAR can store a copy of every header in a `QO` service block near the
+    /// end of the archive, pointed at by a locator record in the main header.
+    /// When that block is present and parses cleanly through its cached
+    /// end-of-archive record, a reader can list the archive's contents from
+    /// that one block instead of seeking past every member's data area — which
+    /// is why it is consulted by default.
+    ///
+    /// The cache is not authoritative. Nothing in the format binds a `QO`
+    /// record to the physical header it claims to describe, so the two can
+    /// disagree — through staleness, or because the archive was crafted to
+    /// disagree. A forged cache can name a member that the physical walk never
+    /// sees, or point an honest-looking name at different data. A caller that
+    /// makes security or routing decisions from the parse result — which
+    /// members exist, where their data lives, what gets admitted downstream —
+    /// should set this to `false` and pay for the full physical walk.
+    pub allow_quick_open: bool,
+}
+
+impl Default for HeaderParseOptions {
+    /// Quick Open enabled — the long-standing behavior of
+    /// [`parse_all_headers`].
+    ///
+    /// Written by hand rather than derived: `#[derive(Default)]` yields `false`
+    /// for a `bool`, which would silently opt every existing caller out of
+    /// Quick Open and turn a performance choice into an accidental one.
+    fn default() -> Self {
+        Self {
+            allow_quick_open: true,
+        }
+    }
+}
+
 /// Parse all headers from a RAR5 archive stream.
 ///
 /// The reader should be positioned right after the RAR5 signature (8 bytes in).
 /// If a password is provided, archive-level encryption (encrypted headers) will
 /// be decrypted. Without a password, encountering an encryption header returns
 /// `Err(RarError::EncryptedArchive)`.
+///
+/// Parses under [`HeaderParseOptions::default()`], so the archive's Quick Open
+/// cache is used when present. Callers that must not trust that cache should
+/// use [`parse_all_headers_with_options`].
 pub fn parse_all_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
 ) -> RarResult<ParsedHeaders> {
-    let kdf_cache = crate::crypto::KdfCache::new();
-    parse_all_headers_with_kdf_cache(reader, password, &kdf_cache)
+    parse_all_headers_with_options(reader, password, HeaderParseOptions::default())
 }
 
+/// Parse all headers from a RAR5 archive stream under explicit `options`.
+///
+/// Same contract as [`parse_all_headers`], which is exactly this function with
+/// [`HeaderParseOptions::default()`]. Pass
+/// `HeaderParseOptions { allow_quick_open: false }` to require that every
+/// returned header came from the physical header walk, never from the
+/// archive's non-authoritative (and forgeable) Quick Open cache.
+pub fn parse_all_headers_with_options<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    options: HeaderParseOptions,
+) -> RarResult<ParsedHeaders> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    parse_all_headers_with_kdf_cache_and_options(reader, password, &kdf_cache, options)
+}
+
+/// Parse all headers reusing a caller-owned RAR5 KDF cache.
+///
+/// Uses [`HeaderParseOptions::default()`]; see
+/// [`parse_all_headers_with_kdf_cache_and_options`] to choose otherwise.
 pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<ParsedHeaders> {
+    parse_all_headers_with_kdf_cache_and_options(
+        reader,
+        password,
+        kdf_cache,
+        HeaderParseOptions::default(),
+    )
+}
+
+/// Parse all headers reusing a caller-owned RAR5 KDF cache, under explicit
+/// `options`.
+pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+) -> RarResult<ParsedHeaders> {
+    match walk_all_headers(reader, password, kdf_cache, options)? {
+        HeaderWalk::Parsed(parsed) => Ok(parsed),
+        HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
+    }
+}
+
+/// Read a header-encrypted (`-hp`) RAR5 stream's archive encryption record
+/// **with no password**.
+///
+/// The reader should be positioned right after the RAR5 signature, exactly as
+/// for [`parse_all_headers`].
+///
+/// `-hp` withholds *layout* facts, not *keying* facts: the type-4 record is
+/// plaintext, and the walk parses it before it consults the password. This is
+/// the accessor for it — [`parse_all_headers`] discards it along with the rest
+/// of the result when it refuses.
+///
+/// - `Ok(Some(header))` — the stream is `-hp` and this is what it states.
+/// - `Ok(None)` — the walk completed without meeting a type-4 record, so the
+///   stream's headers are readable and there is nothing archive-level to key.
+///   A `-p` (file-data-only) archive answers `None`: its crypt records are
+///   per file header, not archive level.
+/// - `Err(_)` — the stream could not be walked that far, or the record itself
+///   is one this build refuses (an encryption version it does not implement, or
+///   a KDF count over [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`]). A refusal is
+///   deliberately *not* flattened into `None`: "no archive encryption" and "an
+///   archive encryption this build will not derive from" are different answers
+///   and a caller that keys from this must not conflate them.
+///
+/// Quick Open is suppressed. The cache is forgeable and this walk exists to
+/// report what the physical stream states.
+pub fn parse_header_encryption<R: Read + Seek>(
+    reader: &mut R,
+) -> RarResult<Option<encryption::EncryptionHeader>> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    let walk = walk_all_headers(
+        reader,
+        None,
+        &kdf_cache,
+        HeaderParseOptions {
+            allow_quick_open: false,
+        },
+    )?;
+    Ok(match walk {
+        HeaderWalk::HeaderEncrypted(encryption) => Some(encryption),
+        HeaderWalk::Parsed(_) => None,
+    })
+}
+
+/// Where the plaintext header walk stopped.
+///
+/// Split out of [`parse_all_headers_with_kdf_cache_and_options`] so the
+/// archive's own type-4 record can be *returned* rather than dropped on the way
+/// to `Err(EncryptedArchive)`. Nothing about the walk changes; only what the
+/// caller is allowed to see when it stops at an encryption header it has no
+/// password for.
+enum HeaderWalk {
+    Parsed(ParsedHeaders),
+    /// A type-4 archive encryption record was reached with no password. Every
+    /// header past it is ciphertext; this record is not.
+    HeaderEncrypted(encryption::EncryptionHeader),
+}
+
+fn walk_all_headers<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+) -> RarResult<HeaderWalk> {
     let mut result = empty_parsed_headers();
 
     // Parse plaintext headers until we hit an encryption header or end.
@@ -153,7 +306,7 @@ pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
             Some(raw) => raw,
             None => {
                 debug!("reached EOF while reading headers");
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
         };
 
@@ -176,7 +329,11 @@ pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
 
                 let pwd = match password {
                     Some(p) => p,
-                    None => return Err(RarError::EncryptedArchive),
+                    // The record itself is plaintext and is handed back rather
+                    // than dropped: `-hp` withholds the layout, not the keying
+                    // facts. `parse_all_headers` turns this into
+                    // `Err(EncryptedArchive)` exactly as it always did.
+                    None => return Ok(HeaderWalk::HeaderEncrypted(enc)),
                 };
 
                 if let Some(check_data) = enc.check_data
@@ -192,20 +349,23 @@ pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
                 let encrypted_result = parse_encrypted_headers(reader, &key, &mut result);
                 key.zeroize();
                 encrypted_result?;
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
             HeaderType::EndArchive => {
                 let end = end_archive::parse(&raw)?;
                 debug!("end of archive: more_volumes={}", end.more_volumes);
                 result.end = Some(end);
-                return Ok(result);
+                return Ok(HeaderWalk::Parsed(result));
             }
             HeaderType::MainArchive => {
                 dispatch_header(&raw, data_offset, &mut result)?;
-                if let Some(quick_open) =
-                    try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
+                // The QuickOpen cache can disagree with the physical headers,
+                // so a caller that opted out gets the physical walk only.
+                if options.allow_quick_open
+                    && let Some(quick_open) =
+                        try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
                 {
-                    return Ok(quick_open);
+                    return Ok(HeaderWalk::Parsed(quick_open));
                 }
                 common::skip_data_area(reader, &raw)?;
             }
@@ -821,6 +981,7 @@ fn apply_extra_records(
                     salt: *salt,
                     iv: *iv,
                     check_data: *check_data,
+                    psw_check_present: enc_flags & extra::FHEXTRA_CRYPT_PSWCHECK != 0,
                     use_hash_mac: enc_flags & 0x0002 != 0,
                 });
             }
@@ -926,6 +1087,134 @@ mod tests {
         assert!(
             cache.rar5_cached_entry_count() > 0,
             "encrypted RAR5 header parsing should populate the caller-provided KDF cache"
+        );
+    }
+
+    /// A type-4 archive encryption header, built the way a `-hp` writer does.
+    fn build_test_crypt_header(kdf_count: u8, salt: [u8; 16], check: Option<[u8; 8]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&vint::encode_vint(0)); // AES-256.
+        body.extend_from_slice(&vint::encode_vint(u64::from(check.is_some())));
+        body.push(kdf_count);
+        body.extend_from_slice(&salt);
+        if let Some(check) = check {
+            body.extend_from_slice(&check);
+            body.extend_from_slice(&crate::crypto::sha256_digest(&check)[..4]);
+        }
+        build_test_raw_header(4, 0, &body, &[], None)
+    }
+
+    /// The E4 surfacing: the type-4 record comes out with no password, and
+    /// `parse_all_headers` still refuses exactly as it did.
+    ///
+    /// Held against a synthetic header rather than only the fixture so the
+    /// *values* can be pinned: a `parse_header_encryption` that returned a
+    /// default-constructed record would pass a `.is_some()` test and fail this
+    /// one, and a caller proving password candidates against a defaulted salt
+    /// would verify the first thing it tried.
+    #[test]
+    fn header_encryption_record_is_readable_with_no_password() {
+        let salt = [0x27u8; 16];
+        let check = [0x91u8; 8];
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(11, salt, Some(check)));
+        // Whatever follows is ciphertext to a reader with no key; the walk must
+        // stop at the record above without touching it.
+        image.extend_from_slice(&[0xEE; 256]);
+
+        let mut cursor = std::io::Cursor::new(image.clone());
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let surfaced = parse_header_encryption(&mut cursor)
+            .expect("the type-4 record is plaintext")
+            .expect("a `-hp` stream states one");
+        assert_eq!(surfaced.kdf_count, 11);
+        assert_eq!(surfaced.salt, salt);
+        assert!(surfaced.has_password_check);
+        assert_eq!(
+            surfaced.check_data.map(|data| data[..8].to_vec()),
+            Some(check.to_vec())
+        );
+
+        // Unchanged behaviour for the ordinary entry point.
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(matches!(
+            parse_all_headers(&mut cursor, None),
+            Err(RarError::EncryptedArchive)
+        ));
+    }
+
+    /// A stream with no type-4 record answers `None` — the non-vacuity for the
+    /// test above, and the answer every `-p` archive gives.
+    #[test]
+    fn a_stream_without_archive_encryption_surfaces_no_record() {
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_raw_header(
+            1,
+            0,
+            &vint::encode_vint(0),
+            &[],
+            None,
+        ));
+        image.extend_from_slice(&build_test_file_header("member.bin", 0, 0));
+
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(parse_header_encryption(&mut cursor).unwrap().is_none());
+    }
+
+    /// The KDF ceiling is the crate's, and a record over it is an **error**,
+    /// never `None`.
+    ///
+    /// `lg2_count` is the archive's claim, so an unbounded one lets a hostile
+    /// post decide how much PBKDF2 a password-candidate loop runs.
+    /// [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] bounds it before the salt is
+    /// even read. Flattening the refusal to `None` would be the dangerous
+    /// shape: a caller would read it as "not header-encrypted" and keep waiting
+    /// for a layout that is never coming.
+    #[test]
+    fn an_archive_kdf_count_over_the_ceiling_refuses_rather_than_reporting_none() {
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(
+            crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX + 1,
+            [0x27; 16],
+            None,
+        ));
+
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert!(matches!(
+            parse_header_encryption(&mut cursor),
+            Err(RarError::UnsupportedEncryptionKdf { count, max })
+                if count == crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX + 1
+                    && max == crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX
+        ));
+
+        // At the ceiling it is accepted, so the refusal above is the bound
+        // discriminating rather than the record never parsing.
+        let mut image = RAR5_SIGNATURE.to_vec();
+        image.extend_from_slice(&build_test_crypt_header(
+            crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX,
+            [0x27; 16],
+            None,
+        ));
+        let mut cursor = std::io::Cursor::new(image);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        assert_eq!(
+            parse_header_encryption(&mut cursor)
+                .unwrap()
+                .map(|record| record.kdf_count),
+            Some(crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX)
         );
     }
 
@@ -1247,6 +1536,107 @@ mod tests {
             parsed.files[0].header.data_offset,
             physical_file_offset + physical_file.len() as u64
         );
+        assert!(parsed.end.is_some());
+    }
+
+    /// Build an archive whose QuickOpen cache disagrees with its physical
+    /// headers: the `QO` block faithfully echoes the one real member and then
+    /// appends `forged.bin`, which no physical header describes.
+    ///
+    /// Returns the archive bytes and the data offset the physical walk should
+    /// report for `physical.bin`.
+    fn build_test_archive_with_forged_quick_open_member() -> (Vec<u8>, u64) {
+        let qopen_offset = 256u64;
+        let forged_file_offset = 160u64;
+        let cached_end_offset = 200u64;
+
+        let main = build_test_main_with_qopen_locator(qopen_offset - 8);
+        let physical_file = build_test_file_header("physical.bin", 0, 0);
+        let physical_end = build_test_end_header();
+        let physical_file_offset = RAR5_SIGNATURE.len() as u64 + main.len() as u64;
+
+        let forged_file = build_test_file_header("forged.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            physical_file_offset,
+            &physical_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            forged_file_offset,
+            &forged_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_end_offset,
+            &cached_end,
+        ));
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&main);
+        archive.extend_from_slice(&physical_file);
+        archive.extend_from_slice(&physical_end);
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_qopen_service(&qopen_payload));
+        archive.extend_from_slice(&qopen_payload);
+
+        (archive, physical_file_offset + physical_file.len() as u64)
+    }
+
+    fn parsed_file_names(parsed: &ParsedHeaders) -> Vec<&str> {
+        parsed
+            .files
+            .iter()
+            .map(|file| file.header.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn header_parse_options_default_keeps_quick_open_enabled() {
+        assert!(
+            HeaderParseOptions::default().allow_quick_open,
+            "the hand-written Default must preserve QuickOpen, not fall back to bool's false"
+        );
+    }
+
+    #[test]
+    fn quick_open_records_that_disagree_with_physical_headers_are_adopted_by_default() {
+        let (archive, _) = build_test_archive_with_forged_quick_open_member();
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, None).unwrap();
+
+        // Pins today's default: a clean QuickOpen cache wins outright, so a
+        // member present only in the `QO` block is reported as if it were real.
+        assert_eq!(parsed_file_names(&parsed), ["physical.bin", "forged.bin"]);
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
+    fn quick_open_can_be_disabled_so_only_physical_headers_are_returned() {
+        let (archive, physical_data_offset) = build_test_archive_with_forged_quick_open_member();
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers_with_options(
+            &mut cursor,
+            None,
+            HeaderParseOptions {
+                allow_quick_open: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(parsed_file_names(&parsed), ["physical.bin"]);
+        assert_eq!(parsed.files[0].header.data_offset, physical_data_offset);
         assert!(parsed.end.is_some());
     }
 

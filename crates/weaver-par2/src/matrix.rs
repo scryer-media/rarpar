@@ -434,12 +434,9 @@ impl Matrix {
 /// Fill the Vandermonde rows of `submatrix` (missing columns) and
 /// `repair_matrix` (`[avail | I]`). Rows whose exponent continues a run
 /// (`exp == prev_exp + 1`) are built by element-wise multiplication of the
-/// previous row with the gathered exponent-1 base row — the same strategy
-/// par2cmdline-turbo uses via `gf16pmul` (ParPar gfmat_inv.cpp `Construct`,
-/// :506-554). Gathering the base from `constants` generalizes upstream's
-/// requirement that the exponent-1 row be present in the matrix, and makes a
-/// per-row pmul-vs-pow decision instead of upstream's maxSkips bail-out; both
-/// paths are byte-identical (`c^e == c * c^(e-1)`, exact field).
+/// previous row with the gathered exponent-1 base row. Gathering that base
+/// from `constants` permits a per-row multiply-versus-power decision; both
+/// paths are byte-identical (`c^e == c * c^(e-1)` in the field).
 fn fill_vandermonde_rows(
     submatrix: &mut Matrix,
     repair_matrix: &mut Matrix,

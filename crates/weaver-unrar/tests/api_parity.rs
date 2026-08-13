@@ -194,24 +194,24 @@ fn volume_paths(case: &Case) -> Vec<PathBuf> {
         .collect()
 }
 
-fn open_case(case: &Case) -> weaver_unrar::RarArchive {
+fn open_case(case: &Case) -> unrar_rs::RarArchive {
     let label = case.volumes[0];
     let paths = volume_paths(case);
     let mut archive = if paths.len() == 1 {
         let file = File::open(&paths[0]).unwrap();
         match case.password {
             // Header-encrypted archives need the password at open time.
-            Some(password) => weaver_unrar::RarArchive::open_with_password(file, password)
+            Some(password) => unrar_rs::RarArchive::open_with_password(file, password)
                 .unwrap_or_else(|err| panic!("{label}: open_with_password: {err}")),
-            None => weaver_unrar::RarArchive::open(file)
+            None => unrar_rs::RarArchive::open(file)
                 .unwrap_or_else(|err| panic!("{label}: open: {err}")),
         }
     } else {
-        let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+        let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
             .iter()
-            .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
+            .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
             .collect();
-        weaver_unrar::RarArchive::open_volumes(readers)
+        unrar_rs::RarArchive::open_volumes(readers)
             .unwrap_or_else(|err| panic!("{label}: open_volumes: {err}"))
     };
     if let Some(password) = case.password {
@@ -220,8 +220,8 @@ fn open_case(case: &Case) -> weaver_unrar::RarArchive {
     archive
 }
 
-fn options(case: &Case) -> weaver_unrar::ExtractOptions {
-    weaver_unrar::ExtractOptions {
+fn options(case: &Case) -> unrar_rs::ExtractOptions {
+    unrar_rs::ExtractOptions {
         verify: true,
         password: case.password.map(str::to_owned),
         restore_owners: false,
@@ -250,7 +250,7 @@ fn all_extraction_apis_agree_on_every_fixture_member() {
     for case in CASES {
         let label = case.volumes[0];
         let paths = volume_paths(case);
-        let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths.clone());
+        let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths.clone());
         let opts = options(case);
 
         let mut archive = open_case(case);

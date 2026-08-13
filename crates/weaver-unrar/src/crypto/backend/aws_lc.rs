@@ -106,7 +106,7 @@ struct AwsLcCbcDecryptor {
     ctx: *mut EVP_CIPHER_CTX,
 }
 
-const AWS_LC_MAX_DECRYPT_UPDATE_LEN: usize = (i32::MAX as usize / AES_BLOCK) * AES_BLOCK;
+const AWS_LC_MAX_UPDATE_LEN: usize = (i32::MAX as usize / AES_BLOCK) * AES_BLOCK;
 
 unsafe impl Send for AwsLcCbcDecryptor {}
 
@@ -138,7 +138,7 @@ impl AwsLcCbcDecryptor {
 
     fn decrypt_blocks(&mut self, data: &mut [u8]) {
         debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-        for chunk in data.chunks_mut(AWS_LC_MAX_DECRYPT_UPDATE_LEN) {
+        for chunk in data.chunks_mut(AWS_LC_MAX_UPDATE_LEN) {
             let mut out_len = 0_i32;
             let input_len = chunk.len() as i32;
             let result = unsafe {
@@ -164,6 +164,105 @@ impl AwsLcCbcDecryptor {
 impl Drop for AwsLcCbcDecryptor {
     fn drop(&mut self) {
         unsafe { EVP_CIPHER_CTX_free(self.ctx) };
+    }
+}
+
+/// AES-CBC block **encryptor**, in place, no padding.
+///
+/// Unlike [`encrypt_cbc_for_test`] this is a real seam item: it is what
+/// [`crate::crypto::MemberCipherKey::encrypt_range`] runs on, so it allocates
+/// nothing, chunks its input the way the decryptor does rather than asserting a
+/// length, and reports a backend failure to its caller instead of panicking.
+struct AwsLcCbcEncryptor {
+    ctx: *mut EVP_CIPHER_CTX,
+}
+
+unsafe impl Send for AwsLcCbcEncryptor {}
+
+impl AwsLcCbcEncryptor {
+    fn new(cipher: *const EVP_CIPHER, key: &[u8], iv: &[u8; AES_BLOCK]) -> Self {
+        let ctx = unsafe { EVP_CIPHER_CTX_new() };
+        assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
+
+        let init =
+            unsafe { EVP_EncryptInit_ex(ctx, cipher, null_mut(), key.as_ptr(), iv.as_ptr()) };
+        assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
+
+        let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
+        assert_eq!(
+            no_padding, 1,
+            "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
+        );
+
+        Self { ctx }
+    }
+
+    /// Encrypts `data` in place as whole blocks. `false` if aws-lc refused,
+    /// which the caller turns into an error rather than a panic; `data` may then
+    /// hold a partial transform and must not be used.
+    fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+        for chunk in data.chunks_mut(AWS_LC_MAX_UPDATE_LEN) {
+            let mut out_len = 0_i32;
+            let input_len = chunk.len() as i32;
+            let result = unsafe {
+                EVP_EncryptUpdate(
+                    self.ctx,
+                    chunk.as_mut_ptr(),
+                    &mut out_len,
+                    chunk.as_ptr(),
+                    input_len,
+                )
+            };
+            if result != 1 || out_len < 0 || out_len as usize != chunk.len() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for AwsLcCbcEncryptor {
+    fn drop(&mut self) {
+        unsafe { EVP_CIPHER_CTX_free(self.ctx) };
+    }
+}
+
+/// AES-256-CBC block encryptor (RAR5).
+pub(crate) struct Aes256CbcEnc(AwsLcCbcEncryptor);
+
+impl Aes256CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
+        Self(AwsLcCbcEncryptor::new(
+            unsafe { EVP_aes_256_cbc() },
+            key,
+            iv,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        self.0.encrypt_blocks(data)
+    }
+}
+
+/// AES-128-CBC block encryptor (RAR4).
+pub(crate) struct Aes128CbcEnc(AwsLcCbcEncryptor);
+
+impl Aes128CbcEnc {
+    #[inline]
+    pub(crate) fn new(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
+        Self(AwsLcCbcEncryptor::new(
+            unsafe { EVP_aes_128_cbc() },
+            key,
+            iv,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_blocks(&mut self, data: &mut [u8]) -> bool {
+        self.0.encrypt_blocks(data)
     }
 }
 
@@ -202,9 +301,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_aws_lc_decrypt_update_chunk_limit_is_i32_aligned() {
-        assert_eq!(AWS_LC_MAX_DECRYPT_UPDATE_LEN % AES_BLOCK, 0);
-        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN <= i32::MAX as usize);
-        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN + AES_BLOCK > i32::MAX as usize);
+    fn test_aws_lc_update_chunk_limit_is_i32_aligned() {
+        assert_eq!(AWS_LC_MAX_UPDATE_LEN % AES_BLOCK, 0);
+        assert!(AWS_LC_MAX_UPDATE_LEN <= i32::MAX as usize);
+        assert!(AWS_LC_MAX_UPDATE_LEN + AES_BLOCK > i32::MAX as usize);
     }
 }

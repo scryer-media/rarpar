@@ -1,0 +1,87 @@
+{
+  "schema_version": "rarpar-bench-case-v1",
+  "id": "rar3-multivolume-store",
+  "config": {
+    "id": "rar3-multivolume-store",
+    "family": "rar",
+    "writer": "rarlab-3.93",
+    "format": 3,
+    "store": true,
+    "solid": false,
+    "encrypted": false,
+    "par2": false,
+    "recovery_volumes": false,
+    "mutation": "none",
+    "workload": "RAR3 multi-volume store extraction"
+  },
+  "corpus_id": "rarpar-v1",
+  "corpus_digest": "ffdbd0529b0aee9bd579e37968eab34a1a2ecd622ed1978621bef949147134f5",
+  "seed": "rarpar-benchmark-v1",
+  "toolchains": [
+    "rarlab-3.93"
+  ],
+  "expected": [
+    {
+      "path": "payload/part-01.bin",
+      "bytes": 6291456,
+      "sha256": "468073835b0085e431b54fce5979c6e51eec99fc3f16e1bb4468b1b02e6ac397"
+    },
+    {
+      "path": "payload/part-02.bin",
+      "bytes": 1048576,
+      "sha256": "2ca2cd930da6428482f785cb0071cb8e71de910cf7dbe9d8d3f24b1b044633dc"
+    },
+    {
+      "path": "payload/part-03.bin",
+      "bytes": 1048576,
+      "sha256": "c9de19ea2da7a88f81e0967f5ff697700b4e54a8969d6fdcf6543eaabe09b600"
+    }
+  ],
+  "sources": [
+    {
+      "path": "release.part01.rar",
+      "bytes": 1048576,
+      "sha256": "6be22ef3598b35818abfa938c95b0c660639c6367d53888363fbc62e74ae86ca"
+    },
+    {
+      "path": "release.part02.rar",
+      "bytes": 1048576,
+      "sha256": "c7e3e826a3c3ffc0f474ac47b5734a704f774e2619971cdcddb9fc08a037f430"
+    },
+    {
+      "path": "release.part03.rar",
+      "bytes": 1048576,
+      "sha256": "eafa5f536754d35183500a0d3c339d33d501a79e0c29aae08f083ca61a728902"
+    },
+    {
+      "path": "release.part04.rar",
+      "bytes": 1048576,
+      "sha256": "62a866a8c7ae193c0b65902592b0fe4563e94186b04a5c600bcc7f1f2e646f22"
+    },
+    {
+      "path": "release.part05.rar",
+      "bytes": 1048576,
+      "sha256": "e2f62e1af2a2600dc7ca9de37260b16969d13ab3126d17dfd6f1502d7d887d4e"
+    },
+    {
+      "path": "release.part06.rar",
+      "bytes": 1048576,
+      "sha256": "4ea7c52763240ca16544c474f12e7da84f9a59cce38804aec55a5623af3bfdf4"
+    },
+    {
+      "path": "release.part07.rar",
+      "bytes": 1048576,
+      "sha256": "2f9570a91ebf2882b49af7f8d130e470d8ecde7281568ca469df39d7571a953e"
+    },
+    {
+      "path": "release.part08.rar",
+      "bytes": 1048576,
+      "sha256": "ca04b54cf0190930f94b4b6a2b1448af59e0df21dba1051cbab1aca815ebf54d"
+    },
+    {
+      "path": "release.part09.rar",
+      "bytes": 984,
+      "sha256": "ecda5fb7629d429a0d87ebe9e1718b58b1ac4b2c8d8602cb45939f5aa9565e89"
+    }
+  ]
+}

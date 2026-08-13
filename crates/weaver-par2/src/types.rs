@@ -6,8 +6,15 @@ pub(crate) const MAX_SLICES_PER_FILE: usize = 32_768;
 /// constant-assignment sequence has exactly that many valid entries.
 pub(crate) const MAX_TOTAL_INPUT_SLICES: usize = 32_768;
 
+/// The Main packet parser's exact limit for the combined file-ID area.
+pub(crate) const MAX_FILES_PER_SET: usize = 32_768;
+
 /// 16-byte MD5-based file identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The ordering is over the raw identifier bytes. It carries no meaning of its
+/// own; it exists so identifiers can be used as stable tie-breakers and in
+/// ordered collections.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(pub(crate) [u8; 16]);
 
 impl FileId {
@@ -114,6 +121,11 @@ impl Default for CancellationToken {
 }
 
 /// Progress update from a long-running PAR2 operation.
+///
+/// Phases that hash concurrently (creation's source scan) deliver updates
+/// from multiple threads: values are individually accurate but arrive
+/// unordered, so consumers should latch maxima rather than assume each
+/// update supersedes the previous one.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
     /// What stage the operation is in.
@@ -131,6 +143,8 @@ pub struct ProgressUpdate {
 /// Stage of a PAR2 operation for progress reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressStage {
+    /// Reading and hashing source files for PAR2 creation.
+    Creating,
     /// Verifying file integrity.
     Verifying,
     /// Reading recovery slice data.

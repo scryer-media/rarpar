@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{PackedDataHash, RarArchive, ReadSeek};
+use super::{RarArchive, ReadSeek};
 use crate::error::RarResult;
 use crate::signature;
 use crate::types::{ArchiveFormat, CompressionMethod};
@@ -18,6 +18,106 @@ pub enum RarVolumeHostOs {
     Windows,
     Unix,
     Darwin,
+}
+
+/// The RAR5 per-file encryption record (`FHEXTRA_CRYPT`), exactly as one
+/// volume's header states it.
+///
+/// Facts, not keys: nothing here is derived, and no password is involved in
+/// producing it. A caller that wants a key feeds `salt` and `kdf_count_lg2`
+/// (with its own password) to [`crate::crypto::KdfCache::derive_material_rar5`],
+/// and checks the password with [`crate::crypto::check_member_password`].
+///
+/// Two fields deliberately absent:
+///
+/// - The hash-MAC flag (`enc_flags & 0x0002`) is already this header's
+///   [`RarVolumeMemberFacts::use_hash_mac`]. It is also the one field that
+///   genuinely differs between the parts of a single split member — RARLAB
+///   `rar` 7.20 sets it on the final part only, because only that part's
+///   checksum is the whole-member one — so keeping it out of this record lets
+///   the record be compared across parts for equality.
+/// - The AES key, hash key and password-check value, all of which need the
+///   password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RarVolumeMemberEncryptionFacts {
+    /// Encryption version the record states. Only 0 (AES-256) is supported;
+    /// the value is reported rather than validated.
+    pub version: u64,
+    /// PBKDF2 iteration count as its base-2 logarithm, exactly as stored.
+    pub kdf_count_lg2: u8,
+    /// 16-byte KDF salt.
+    pub salt: [u8; 16],
+    /// 16-byte AES-CBC initialisation vector for this member's data.
+    pub iv: [u8; 16],
+    /// Whether the record's flags claim a password-check value
+    /// (`enc_flags & 0x0001`).
+    pub psw_check_present: bool,
+    /// The 12-byte password-check field — 8 check bytes plus a 4-byte SHA-256
+    /// tag over them — kept only when the flag is set *and* the tag matched.
+    /// `psw_check_present` with `None` here means the writer claimed a check
+    /// this parse could not trust.
+    pub psw_check: Option<[u8; 12]>,
+}
+
+/// The RAR5 **archive-level** encryption record (`HEAD_CRYPT`, type 4) a
+/// header-encrypted (`-hp`) volume states, exactly as it states it.
+///
+/// Facts, not keys, and — this is the whole point of the type — obtainable with
+/// **no password**. `-hp` encrypts every header after this one, so the layout
+/// (member names, offsets, sizes) is unreadable without a key; the record that
+/// says how to *make* that key is plaintext and sits at the front of the
+/// volume. A caller with a list of candidate passwords can therefore prove one
+/// against [`Self::psw_check`] through
+/// [`crate::crypto::check_member_password`] before it decrypts anything, and
+/// only then re-parse with [`super::RarArchive::parse_volume_facts`].
+///
+/// The same shape as [`RarVolumeMemberEncryptionFacts`] minus the IV, which
+/// this record does not carry: each encrypted header stores its own IV inline,
+/// ahead of its ciphertext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RarVolumeHeaderEncryptionFacts {
+    /// Encryption version the record states. Only 0 (AES-256) is supported, and
+    /// unlike the per-member record this one *is* validated — a version this
+    /// build does not implement is an error rather than a reported number,
+    /// because nothing past it can be read at all.
+    pub version: u64,
+    /// PBKDF2 iteration count as its base-2 logarithm, exactly as stored.
+    /// Bounded by [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] at parse time: the
+    /// count is the *archive's* claim, so an unbounded one would let a hostile
+    /// post choose how much work a candidate loop does.
+    pub kdf_count_lg2: u8,
+    /// 16-byte KDF salt.
+    pub salt: [u8; 16],
+    /// Whether the record's flags claim a password-check value
+    /// (`enc_flags & 0x0001`).
+    pub psw_check_present: bool,
+    /// The 12-byte password-check field — 8 check bytes plus a 4-byte SHA-256
+    /// tag over them — kept only when the flag is set *and* the tag matched.
+    /// `psw_check_present` with `None` here means the writer claimed a check
+    /// this parse could not trust, which refutes no password and must never be
+    /// read as confirming one.
+    pub psw_check: Option<[u8; 12]>,
+}
+
+/// What one volume's headers say about **archive-level** (`-hp`) encryption,
+/// read with no password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RarVolumeHeaderEncryption {
+    /// No `-hp`: this volume's headers are readable as they stand. A `-p`
+    /// archive — file data encrypted, headers in the clear — answers this, and
+    /// so does an unencrypted one.
+    None,
+    /// RAR5 `-hp`. The type-4 record is plaintext and comes back whole.
+    Rar5(RarVolumeHeaderEncryptionFacts),
+    /// RAR4/RAR3 `-hp`, which states only that it *is* header-encrypted.
+    ///
+    /// There is deliberately nothing else to report. RAR4 derives a fresh key
+    /// per header from that header's own 8-byte salt and carries **no
+    /// password-check value anywhere** in the format, so a wrong password is
+    /// detected only by walking off the end of the archive. Nothing here can
+    /// prove a candidate before something is decrypted, which is why a caller
+    /// that requires proof must refuse this variant rather than guess.
+    Rar4,
 }
 
 /// Unix owner/group metadata from RAR5 `FHEXTRA_UOWNER`.
@@ -83,6 +183,10 @@ pub struct RarVolumeMemberFacts {
     pub data_blake2_hash: Option<[u8; 32]>,
     #[serde(default)]
     pub version: Option<u64>,
+    /// Checksums of the packed bytes this volume holds, from a split-after
+    /// header. A RAR5 header may state both, and both are kept: CRC32 composes
+    /// across out-of-order ranges where BLAKE2sp does not. Facts cached by
+    /// older binaries carry at most one of them.
     #[serde(default)]
     pub packed_crc32: Option<u32>,
     #[serde(default)]
@@ -93,6 +197,17 @@ pub struct RarVolumeMemberFacts {
     pub split_after: bool,
     pub is_directory: bool,
     pub is_encrypted: bool,
+    /// The RAR5 file-encryption record this header carries, when it carries
+    /// one. Facts cached by older binaries decode to `None` even for an
+    /// encrypted member, so `is_encrypted` stays the encryption predicate and
+    /// this field is only ever read as "the key material, if we have it".
+    #[serde(default)]
+    pub encryption: Option<RarVolumeMemberEncryptionFacts>,
+    /// RAR4's 8-byte per-file KDF salt, when the header states one. RAR4 has
+    /// no counterpart to the RAR5 record: its key and IV are derived from
+    /// password plus this salt alone, and it carries no password check.
+    #[serde(default)]
+    pub rar4_salt: Option<[u8; 8]>,
     #[serde(default)]
     pub host_os: Option<RarVolumeHostOs>,
     #[serde(default)]
@@ -223,6 +338,19 @@ fn file_hash_blake2(hash: Option<&crate::types::FileHash>) -> Option<[u8; 32]> {
     })
 }
 
+fn member_encryption_facts(
+    params: Option<&crate::header::FileEncryptionParams>,
+) -> Option<RarVolumeMemberEncryptionFacts> {
+    params.map(|params| RarVolumeMemberEncryptionFacts {
+        version: params.version,
+        kdf_count_lg2: params.kdf_count,
+        salt: params.salt,
+        iv: params.iv,
+        psw_check_present: params.psw_check_present,
+        psw_check: params.check_data,
+    })
+}
+
 fn unix_owner_facts(owner: Option<crate::types::UnixOwnerInfo>) -> Option<RarVolumeUnixOwnerFacts> {
     owner.map(|owner| RarVolumeUnixOwnerFacts {
         user_name: owner.user_name,
@@ -237,9 +365,7 @@ fn unix_owner_facts(owner: Option<crate::types::UnixOwnerInfo>) -> Option<RarVol
 impl RarVolumeServiceFacts {
     fn from_rar4_service(order: usize, fh: &crate::rar4::types::Rar4FileHeader) -> Self {
         let file_header = RarArchive::rar4_to_file_header(fh, false);
-        let (packed_crc32, packed_blake2_hash) = split_packed_hash(
-            RarArchive::packed_hash_for_split_segment(&file_header, None),
-        );
+        let packed_hashes = RarArchive::packed_hashes_for_split_segment(&file_header, None);
         Self {
             order: order as u32,
             name: fh.name.clone(),
@@ -253,8 +379,8 @@ impl RarVolumeServiceFacts {
             data_blake2_hash: None,
             version: file_header.version,
             comment_crc16: None,
-            packed_crc32,
-            packed_blake2_hash,
+            packed_crc32: packed_hashes.crc32,
+            packed_blake2_hash: packed_hashes.blake2sp,
             packed_hash_uses_mac: false,
             split_before: fh.split_before,
             split_after: fh.split_after,
@@ -415,10 +541,11 @@ impl RarVolumeServiceFacts {
     }
 
     fn from_rar5_service(order: usize, service: crate::header::ParsedService) -> Self {
-        let packed_hash =
-            RarArchive::packed_hash_for_split_segment(&service.header.inner, service.hash.as_ref());
-        let (packed_crc32, packed_blake2_hash) = split_packed_hash(packed_hash);
-        let packed_hash_uses_mac = packed_hash.is_some()
+        let packed_hashes = RarArchive::packed_hashes_for_split_segment(
+            &service.header.inner,
+            service.hash.as_ref(),
+        );
+        let packed_hash_uses_mac = packed_hashes.is_present()
             && service
                 .file_encryption
                 .as_ref()
@@ -436,8 +563,8 @@ impl RarVolumeServiceFacts {
             data_blake2_hash: file_hash_blake2(service.hash.as_ref()),
             version: service.header.inner.version,
             comment_crc16: None,
-            packed_crc32,
-            packed_blake2_hash,
+            packed_crc32: packed_hashes.crc32,
+            packed_blake2_hash: packed_hashes.blake2sp,
             packed_hash_uses_mac,
             split_before: service.header.inner.split_before,
             split_after: service.header.inner.split_after,
@@ -463,14 +590,6 @@ impl RarVolumeServiceFacts {
     }
 }
 
-fn split_packed_hash(packed_hash: Option<PackedDataHash>) -> (Option<u32>, Option<[u8; 32]>) {
-    match packed_hash {
-        Some(PackedDataHash::Crc32(value)) => (Some(value), None),
-        Some(PackedDataHash::Blake2sp(value)) => (None, Some(value)),
-        None => (None, None),
-    }
-}
-
 fn rar4_method_to_compression_method(method: crate::rar4::types::Rar4Method) -> CompressionMethod {
     match method {
         crate::rar4::types::Rar4Method::Store => CompressionMethod::Store,
@@ -492,6 +611,65 @@ impl RarArchive {
     ) -> RarResult<RarVolumeFacts> {
         let reader: Box<dyn ReadSeek> = Box::new(reader);
         Self::parse_volume_facts_boxed(reader, password)
+    }
+
+    /// Read one physical volume's **archive-level** encryption record with no
+    /// password.
+    ///
+    /// The companion to [`Self::parse_volume_facts`] for the one case that
+    /// function cannot answer: a header-encrypted (`-hp`) volume, whose headers
+    /// it refuses with `RarError::EncryptedArchive`. `-hp` withholds *layout*
+    /// facts, not *keying* facts, and this returns the keying facts.
+    ///
+    /// Errors are the walk's own, and a refused record — an encryption version
+    /// this build does not implement, or a KDF count over
+    /// [`crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX`] — is one of them rather than
+    /// [`RarVolumeHeaderEncryption::None`].
+    pub fn parse_volume_header_encryption(
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+    ) -> RarResult<RarVolumeHeaderEncryption> {
+        let reader: Box<dyn ReadSeek> = Box::new(reader);
+        Self::parse_volume_header_encryption_boxed(reader)
+    }
+
+    pub(crate) fn parse_volume_header_encryption_boxed(
+        mut reader: Box<dyn ReadSeek>,
+    ) -> RarResult<RarVolumeHeaderEncryption> {
+        use std::io::{Seek, SeekFrom};
+
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(crate::error::RarError::Io)?;
+        let format = signature::read_signature(&mut reader)?;
+
+        if format.is_rar4_family() {
+            // RAR 1.4 has no header encryption; RAR3/RAR4 signal it with the
+            // archive header's `ENCRYPTED_HEADERS` flag, which is the *only*
+            // thing the format states in the clear. `parse_rar4_headers` stops
+            // at that flag with no password, and it is the first header after
+            // the signature, so this costs one header read.
+            if format == ArchiveFormat::Rar14 {
+                return Ok(RarVolumeHeaderEncryption::None);
+            }
+            return match crate::rar4::parse_rar4_headers(&mut reader, None) {
+                Ok(_) => Ok(RarVolumeHeaderEncryption::None),
+                Err(crate::error::RarError::EncryptedArchive) => {
+                    Ok(RarVolumeHeaderEncryption::Rar4)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        Ok(match crate::header::parse_header_encryption(&mut reader)? {
+            Some(encryption) => RarVolumeHeaderEncryption::Rar5(RarVolumeHeaderEncryptionFacts {
+                version: encryption.version,
+                kdf_count_lg2: encryption.kdf_count,
+                salt: encryption.salt,
+                psw_check_present: encryption.has_password_check,
+                psw_check: encryption.check_data,
+            }),
+            None => RarVolumeHeaderEncryption::None,
+        })
     }
 
     pub(crate) fn parse_volume_facts_boxed(
@@ -554,9 +732,8 @@ impl RarArchive {
                 .map(|(order, fh)| {
                     let file_header =
                         RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    let (packed_crc32, packed_blake2_hash) = split_packed_hash(
-                        RarArchive::packed_hash_for_split_segment(&file_header, None),
-                    );
+                    let packed_hashes =
+                        RarArchive::packed_hashes_for_split_segment(&file_header, None);
                     RarVolumeMemberFacts {
                         order: order as u32,
                         name: fh.name.clone(),
@@ -565,13 +742,15 @@ impl RarArchive {
                         data_crc32: (!fh.is_rar14).then_some(fh.crc32),
                         data_blake2_hash: None,
                         version: file_header.version,
-                        packed_crc32,
-                        packed_blake2_hash,
+                        packed_crc32: packed_hashes.crc32,
+                        packed_blake2_hash: packed_hashes.blake2sp,
                         packed_hash_uses_mac: false,
                         split_before: fh.split_before,
                         split_after: fh.split_after,
                         is_directory: fh.is_directory,
                         is_encrypted: fh.is_encrypted,
+                        encryption: None,
+                        rar4_salt: fh.salt,
                         host_os: supported_rar4_host_os(fh.host_os),
                         attributes: Some(u64::from(fh.attributes)),
                         owner: member_owner_facts.get(order).cloned().flatten(),
@@ -666,12 +845,11 @@ impl RarArchive {
             .into_iter()
             .enumerate()
             .map(|(order, parsed_file)| {
-                let packed_hash = RarArchive::packed_hash_for_split_segment(
+                let packed_hashes = RarArchive::packed_hashes_for_split_segment(
                     &parsed_file.header,
                     parsed_file.hash.as_ref(),
                 );
-                let (packed_crc32, packed_blake2_hash) = split_packed_hash(packed_hash);
-                let packed_hash_uses_mac = packed_hash.is_some()
+                let packed_hash_uses_mac = packed_hashes.is_present()
                     && parsed_file
                         .file_encryption
                         .as_ref()
@@ -684,13 +862,15 @@ impl RarArchive {
                     data_crc32: parsed_file.header.data_crc32,
                     data_blake2_hash: file_hash_blake2(parsed_file.hash.as_ref()),
                     version: parsed_file.header.version,
-                    packed_crc32,
-                    packed_blake2_hash,
+                    packed_crc32: packed_hashes.crc32,
+                    packed_blake2_hash: packed_hashes.blake2sp,
                     packed_hash_uses_mac,
                     split_before: parsed_file.header.split_before,
                     split_after: parsed_file.header.split_after,
                     is_directory: parsed_file.header.is_directory,
                     is_encrypted: parsed_file.is_encrypted,
+                    encryption: member_encryption_facts(parsed_file.file_encryption.as_ref()),
+                    rar4_salt: None,
                     host_os: supported_host_os(parsed_file.header.host_os),
                     attributes: Some(parsed_file.header.attributes.0),
                     owner: unix_owner_facts(parsed_file.owner),
@@ -799,7 +979,7 @@ mod tests {
         header.extend_from_slice(&flags.to_le_bytes());
         header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
         header.extend_from_slice(body);
-        let crc16 = (crc32fast::hash(&header[2..]) & 0xffff) as u16;
+        let crc16 = (crate::crc::hash(&header[2..]) & 0xffff) as u16;
         header[0..2].copy_from_slice(&crc16.to_le_bytes());
         header
     }
@@ -815,6 +995,83 @@ mod tests {
         let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
         bytes.extend_from_slice(&build_rar4_main_header(0, 0x1234, 0x5678_9abc));
         bytes.extend_from_slice(&build_rar4_header(0x7b, 0, &[]));
+        bytes
+    }
+
+    /// Assemble one RAR5 block. `sizes` carries the optional extra-area and
+    /// data-area sizes, in the order their header flags select them.
+    fn build_rar5_block(
+        header_type: u64,
+        header_flags: u64,
+        sizes: &[u64],
+        type_body: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::vint::encode_vint(header_type));
+        body.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        for size in sizes {
+            body.extend_from_slice(&crate::vint::encode_vint(*size));
+        }
+        body.extend_from_slice(type_body);
+
+        let header_size = crate::vint::encode_vint(body.len() as u64);
+        let mut hasher = crate::crc::Crc32::new();
+        hasher.update(&header_size);
+        hasher.update(&body);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&hasher.finalize().to_le_bytes());
+        raw.extend_from_slice(&header_size);
+        raw.extend_from_slice(&body);
+        raw
+    }
+
+    /// A one-volume RAR5 archive whose only file header is a split-after
+    /// stored part carrying both a Pack-CRC32 field and a BLAKE2sp record.
+    fn rar5_split_after_archive_bytes(
+        name: &str,
+        payload: &[u8],
+        unpacked_size: u64,
+        packed_crc32: u32,
+        blake2: [u8; 32],
+    ) -> Vec<u8> {
+        let mut hash_body = crate::vint::encode_vint(0); // BLAKE2sp hash type.
+        hash_body.extend_from_slice(&blake2);
+        let hash_type = crate::vint::encode_vint(crate::header::extra::record_type::FILE_HASH);
+        let mut extra_area = crate::vint::encode_vint((hash_type.len() + hash_body.len()) as u64);
+        extra_area.extend_from_slice(&hash_type);
+        extra_area.extend_from_slice(&hash_body);
+
+        let mut file_body = Vec::new();
+        file_body.extend_from_slice(&crate::vint::encode_vint(
+            crate::header::file::flags::CRC32_PRESENT,
+        ));
+        file_body.extend_from_slice(&crate::vint::encode_vint(unpacked_size));
+        file_body.extend_from_slice(&crate::vint::encode_vint(0o644)); // attributes.
+        file_body.extend_from_slice(&packed_crc32.to_le_bytes());
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+        file_body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+        file_body.extend_from_slice(&crate::vint::encode_vint(name.len() as u64));
+        file_body.extend_from_slice(name.as_bytes());
+        file_body.extend_from_slice(&extra_area);
+
+        let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&build_rar5_block(
+            1,
+            0,
+            &[],
+            &crate::vint::encode_vint(crate::header::main_archive::flags::VOLUME),
+        ));
+        bytes.extend_from_slice(&build_rar5_block(
+            2,
+            crate::header::common::flags::EXTRA_AREA
+                | crate::header::common::flags::DATA_AREA
+                | crate::header::common::flags::SPLIT_AFTER,
+            &[extra_area.len() as u64, payload.len() as u64],
+            &file_body,
+        ));
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&build_rar5_block(5, 0, &[], &crate::vint::encode_vint(1)));
         bytes
     }
 
@@ -876,6 +1133,8 @@ mod tests {
         assert_eq!(decoded.members[0].packed_crc32, None);
         assert_eq!(decoded.members[0].packed_blake2_hash, None);
         assert!(!decoded.members[0].packed_hash_uses_mac);
+        assert_eq!(decoded.members[0].encryption, None);
+        assert_eq!(decoded.members[0].rar4_salt, None);
     }
 
     #[test]
@@ -947,11 +1206,238 @@ mod tests {
     }
 
     #[test]
+    fn rar5_split_after_facts_keep_packed_crc32_alongside_blake2() {
+        let payload = vec![0xA5u8; 64];
+        let packed_crc32 = crate::crc::hash(&payload);
+        let blake2 = [0x7Bu8; 32];
+        let bytes = rar5_split_after_archive_bytes(
+            "Silver.Horizon.S01E01.mkv",
+            &payload,
+            4096,
+            packed_crc32,
+            blake2,
+        );
+
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        let member = &facts.members[0];
+        assert!(member.split_after);
+        assert_eq!(member.data_size, payload.len() as u64);
+        // Both packed checksums survive: the CRC32 is no longer discarded just
+        // because the header also carried a BLAKE2sp record.
+        assert_eq!(member.packed_crc32, Some(packed_crc32));
+        assert_eq!(member.packed_blake2_hash, Some(blake2));
+        assert_eq!(member.data_crc32, Some(packed_crc32));
+        assert_eq!(member.data_blake2_hash, Some(blake2));
+    }
+
+    #[test]
     fn rar4_volume_facts_preserve_signed_main_header_like_rar_behavior() {
         let facts =
             RarArchive::parse_volume_facts(Cursor::new(signed_rar4_archive_bytes()), None).unwrap();
 
         assert_eq!(facts.format, 4);
         assert!(facts.has_authenticity_verification);
+    }
+
+    /// Key material the encrypted synthetic archives below state. Distinct
+    /// fills, so a test cannot pass by confusing the salt with the IV.
+    const CRYPT_SALT: [u8; 16] = [0x5A; 16];
+    const CRYPT_IV: [u8; 16] = [0x1F; 16];
+    const CRYPT_KDF_LG2: u8 = 15;
+
+    /// A one-volume RAR5 archive whose only file header is an encrypted,
+    /// unsplit stored member carrying an `FHEXTRA_CRYPT` record.
+    ///
+    /// The bytes are not real ciphertext — no test here decrypts them — but
+    /// the record is laid out exactly as the format states it, so the parse it
+    /// exercises is the real one.
+    fn rar5_encrypted_store_archive_bytes(
+        name: &str,
+        cipher_len: u64,
+        unpacked_size: u64,
+        enc_flags: u64,
+        check_data: Option<[u8; 12]>,
+    ) -> Vec<u8> {
+        let mut crypt_body = crate::vint::encode_vint(0); // version = AES-256.
+        crypt_body.extend_from_slice(&crate::vint::encode_vint(enc_flags));
+        crypt_body.push(CRYPT_KDF_LG2);
+        crypt_body.extend_from_slice(&CRYPT_SALT);
+        crypt_body.extend_from_slice(&CRYPT_IV);
+        if let Some(check_data) = check_data {
+            crypt_body.extend_from_slice(&check_data);
+        }
+        let crypt_type =
+            crate::vint::encode_vint(crate::header::extra::record_type::FILE_ENCRYPTION);
+        let mut extra_area = crate::vint::encode_vint((crypt_type.len() + crypt_body.len()) as u64);
+        extra_area.extend_from_slice(&crypt_type);
+        extra_area.extend_from_slice(&crypt_body);
+
+        let mut file_body = Vec::new();
+        file_body.extend_from_slice(&crate::vint::encode_vint(
+            crate::header::file::flags::CRC32_PRESENT,
+        ));
+        file_body.extend_from_slice(&crate::vint::encode_vint(unpacked_size));
+        file_body.extend_from_slice(&crate::vint::encode_vint(0o644)); // attributes.
+        file_body.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+        file_body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+        file_body.extend_from_slice(&crate::vint::encode_vint(name.len() as u64));
+        file_body.extend_from_slice(name.as_bytes());
+        file_body.extend_from_slice(&extra_area);
+
+        let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&build_rar5_block(1, 0, &[], &crate::vint::encode_vint(0)));
+        bytes.extend_from_slice(&build_rar5_block(
+            2,
+            crate::header::common::flags::EXTRA_AREA | crate::header::common::flags::DATA_AREA,
+            &[extra_area.len() as u64, cipher_len],
+            &file_body,
+        ));
+        bytes.extend_from_slice(&vec![0xE7u8; cipher_len as usize]);
+        bytes.extend_from_slice(&build_rar5_block(5, 0, &[], &crate::vint::encode_vint(0)));
+        bytes
+    }
+
+    /// The 12-byte password-check field: 8 check bytes plus the SHA-256 tag the
+    /// parser validates them against.
+    fn tagged_password_check(check: [u8; 8]) -> [u8; 12] {
+        let digest = crate::crypto::sha256_digest(&check);
+        let mut field = [0u8; 12];
+        field[..8].copy_from_slice(&check);
+        field[8..].copy_from_slice(&digest[..4]);
+        field
+    }
+
+    #[test]
+    fn rar5_file_encryption_record_reaches_member_facts_verbatim() {
+        let check_data = tagged_password_check([0xC4; 8]);
+        let bytes = rar5_encrypted_store_archive_bytes(
+            "Silver.Horizon.S02E09.mkv",
+            304,
+            290,
+            0x0001 | 0x0002, // password check present, checksums keyed.
+            Some(check_data),
+        );
+
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        let member = &facts.members[0];
+        assert!(member.is_encrypted);
+        assert!(member.use_hash_mac, "0x0002 keys the header's checksums");
+        assert_eq!(member.data_size, 304, "packed bytes are the padded cipher");
+        assert_eq!(member.unpacked_size, Some(290));
+        assert_eq!(
+            member.encryption,
+            Some(RarVolumeMemberEncryptionFacts {
+                version: 0,
+                kdf_count_lg2: CRYPT_KDF_LG2,
+                salt: CRYPT_SALT,
+                iv: CRYPT_IV,
+                psw_check_present: true,
+                psw_check: Some(check_data),
+            })
+        );
+        assert_eq!(member.rar4_salt, None);
+    }
+
+    #[test]
+    fn rar5_encryption_record_without_a_password_check_reports_it_absent() {
+        let bytes = rar5_encrypted_store_archive_bytes(
+            "Silver.Horizon.S02E10.mkv",
+            16,
+            10,
+            0, // neither flag.
+            None,
+        );
+
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        let encryption = facts.members[0].encryption.expect("record present");
+        assert!(!encryption.psw_check_present);
+        assert_eq!(encryption.psw_check, None);
+        assert!(!facts.members[0].use_hash_mac);
+    }
+
+    #[test]
+    fn rar5_encryption_record_with_a_corrupt_password_check_claims_one_it_lost() {
+        // The flag says a check is there; its SHA-256 tag says the bytes are
+        // not trustworthy. Facts must report both halves, because "the writer
+        // omitted it" and "we could not read it" are different diagnoses.
+        let mut check_data = tagged_password_check([0xC4; 8]);
+        check_data[11] ^= 0xFF;
+        let bytes = rar5_encrypted_store_archive_bytes(
+            "Silver.Horizon.S02E11.mkv",
+            16,
+            10,
+            0x0001,
+            Some(check_data),
+        );
+
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        let encryption = facts.members[0].encryption.expect("record present");
+        assert!(encryption.psw_check_present);
+        assert_eq!(encryption.psw_check, None);
+    }
+
+    #[test]
+    fn named_messagepack_new_volume_facts_decode_under_a_reader_without_the_crypt_fields() {
+        // The other direction of the cached-facts contract: a cache written by
+        // this binary must still load in one that predates the encryption
+        // record. Such a reader ignores `encryption` and `rar4_salt` — it
+        // keeps `is_encrypted`, which is the field it classified on — so an
+        // encrypted member reads exactly as it did before.
+        #[derive(Deserialize)]
+        struct OldVolumeFacts {
+            format: u8,
+            is_encrypted: bool,
+            members: Vec<OldMemberFacts>,
+        }
+
+        #[derive(Deserialize)]
+        struct OldMemberFacts {
+            name: String,
+            unpacked_size: Option<u64>,
+            data_crc32: Option<u32>,
+            is_encrypted: bool,
+            data_size: u64,
+            compression_method: u8,
+            use_hash_mac: bool,
+        }
+
+        let check_data = tagged_password_check([0xC4; 8]);
+        let bytes = rar5_encrypted_store_archive_bytes(
+            "Silver.Horizon.S02E12.mkv",
+            304,
+            290,
+            0x0001 | 0x0002,
+            Some(check_data),
+        );
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+        assert!(facts.members[0].encryption.is_some(), "non-vacuity");
+
+        let encoded = rmp_serde::to_vec_named(&facts).unwrap();
+        let decoded: OldVolumeFacts = rmp_serde::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.format, 5);
+        assert!(!decoded.is_encrypted, "-p leaves the headers plain");
+        assert_eq!(decoded.members.len(), 1);
+        let member = &decoded.members[0];
+        assert_eq!(member.name, "Silver.Horizon.S02E12.mkv");
+        assert_eq!(member.unpacked_size, Some(290));
+        assert_eq!(member.data_crc32, Some(0x1234_5678));
+        assert!(member.is_encrypted);
+        assert_eq!(member.data_size, 304);
+        assert_eq!(member.compression_method, 0);
+        assert!(member.use_hash_mac);
+
+        // And the round trip through this binary's own reader is lossless.
+        let round_tripped: RarVolumeFacts = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(
+            round_tripped.members[0].encryption,
+            facts.members[0].encryption
+        );
+        assert_eq!(round_tripped.members[0].rar4_salt, None);
     }
 }

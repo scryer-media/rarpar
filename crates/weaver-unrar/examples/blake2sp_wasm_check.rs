@@ -11,7 +11,7 @@
 //! Build & run (from the workspace root):
 //!   RUSTFLAGS="-C target-feature=+simd128" \
 //!     cargo build --release --example blake2sp_wasm_check \
-//!       -p weaver-unrar --no-default-features --features crypto-rust \
+//!       -p unrar-rs --no-default-features --features crypto-rust \
 //!       --target wasm32-wasip1
 //!   wasmtime run target/wasm32-wasip1/release/examples/blake2sp_wasm_check.wasm
 
@@ -20,7 +20,7 @@
     all(target_arch = "wasm32", target_feature = "simd128")
 ))]
 fn main() {
-    let report = weaver_unrar::crypto::differential_corpus();
+    let report = unrar_rs::crypto::differential_corpus();
     match report.first_mismatch {
         None => {
             println!(

@@ -1,0 +1,47 @@
+{
+  "schema_version": "rarpar-bench-case-v1",
+  "id": "rar5-normal",
+  "config": {
+    "id": "rar5-normal",
+    "family": "rar",
+    "writer": "rarlab-5.00",
+    "format": 5,
+    "store": false,
+    "solid": false,
+    "encrypted": false,
+    "par2": false,
+    "recovery_volumes": false,
+    "mutation": "none",
+    "workload": "RAR5 normal extraction"
+  },
+  "corpus_id": "rarpar-v1",
+  "corpus_digest": "ffdbd0529b0aee9bd579e37968eab34a1a2ecd622ed1978621bef949147134f5",
+  "seed": "rarpar-benchmark-v1",
+  "toolchains": [
+    "rarlab-5.00"
+  ],
+  "expected": [
+    {
+      "path": "payload/part-01.bin",
+      "bytes": 6291456,
+      "sha256": "8f5e220411d05cb5b401e7b9b3e80e8951bccc9a2adc9e6f1f9369a4954eed87"
+    },
+    {
+      "path": "payload/part-02.bin",
+      "bytes": 1048576,
+      "sha256": "bff1e5d22d4fce2d5a2cd5aba66539313e47b5a930d34498a0faf95417387f95"
+    },
+    {
+      "path": "payload/part-03.bin",
+      "bytes": 1048576,
+      "sha256": "0b1bfc17e18b323562fd1abfb5bf3c6b9b4f5a68999ef7a315e66104eca22dbb"
+    }
+  ],
+  "sources": [
+    {
+      "path": "release.rar",
+      "bytes": 69210,
+      "sha256": "a4c6c81576af631b0553abf124b7b604a176a708fc2ac03e7b42d8f21c086b5c"
+    }
+  ]
+}

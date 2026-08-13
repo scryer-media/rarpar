@@ -2,7 +2,7 @@
 //!
 //! Built for `wasm32-wasip1` with `--features crypto-host`, this decrypts a
 //! KNOWN AES-256-CBC (no-padding) vector through the public
-//! [`weaver_unrar::crypto::CbcDecryptor`], which on this build routes into the
+//! [`unrar_rs::crypto::CbcDecryptor`], which on this build routes into the
 //! `backend::host` `Aes256CbcDec` and therefore calls the real host import
 //! `host::host_aes_cbc_decrypt` over the fixed raw-offset ABI.
 //!
@@ -15,16 +15,16 @@
 //!
 //! Build & run (from the workspace root):
 //!   cargo build --release --example host_aes_smoke \
-//!     -p weaver-unrar --no-default-features --features crypto-host \
+//!     -p unrar-rs --no-default-features --features crypto-host \
 //!     --target wasm32-wasip1
 //!   # then run under the harness, which provides the host function:
-//!   cargo test -p weaver-unrar --test wasm_host_aes_smoke
+//!   cargo test -p unrar-rs --test wasm_host_aes_smoke
 //!
 //! Running the raw module under a plain `wasmtime` CLI will trap at
 //! instantiation because the `host_aes_cbc_decrypt` import is unsatisfied —
 //! that is expected; the module is only meaningful with a host that provides it.
 
-use weaver_unrar::crypto::CbcDecryptor;
+use unrar_rs::crypto::CbcDecryptor;
 
 // Known AES-256-CBC (no padding) vector, generated with RustCrypto AES-256-CBC.
 // 5 blocks (80 bytes) so a chunked decrypt threads the IV across boundaries.
