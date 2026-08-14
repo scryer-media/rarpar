@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -56,10 +57,11 @@ func (bundler *Bundler) log(format string, args ...any) {
 	}
 }
 
-// Build produces (or reuses) the bundle directory for one machine and returns
-// its path.
-func (bundler *Bundler) Build(ctx context.Context, machine Machine) (string, BuildInfo, error) {
-	target := filepath.Join(bundler.bundleRoot(), machine.Name)
+// SharedBuild produces the build artifacts for one bundle KEY — every machine
+// whose bundle configuration and content needs are identical shares one
+// container build instead of repeating it per machine.
+func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep Machine, machineNames []string) (string, BuildInfo, error) {
+	target := filepath.Join(bundler.bundleRoot(), sharedName)
 	// Assemble into a clean directory. A stale binary left over from an earlier
 	// run would be shipped, hashed into BUILDINFO, and silently measured.
 	if err := os.RemoveAll(target); err != nil {
@@ -70,43 +72,43 @@ func (bundler *Bundler) Build(ctx context.Context, machine Machine) (string, Bui
 	}
 	info := BuildInfo{
 		SchemaVersion: 1,
-		Bundle:        machine.Name,
+		Bundle:        sharedName,
 		BuiltUTC:      time.Now().UTC().Format(time.RFC3339),
-		Machine:       machine.Name,
-		PlatformLabel: machine.PlatformLabel,
-		BuildTarget:   machine.BuildTarget,
-		Source:        machine.Bundle.Source,
-		BuildHost:     machine.Bundle.BuildHost,
-		Image:         machine.Bundle.Image,
+		Machine:       strings.Join(machineNames, ","),
+		PlatformLabel: rep.Bundle.RustTarget,
+		BuildTarget:   rep.BuildTarget,
+		Source:        rep.Bundle.Source,
+		BuildHost:     rep.Bundle.BuildHost,
+		Image:         rep.Bundle.Image,
 		CodegenPolicy: map[string]string{},
 		Trees:         map[string]Tree{},
 		Binaries:      map[string]string{},
 	}
 
-	switch machine.Bundle.Source {
+	switch rep.Bundle.Source {
 	case BundlePrebuilt:
-		if err := copyTree(machine.Bundle.Path, target); err != nil {
-			return "", info, fmt.Errorf("machine %s: staging the prebuilt bundle: %w", machine.Name, err)
+		if err := copyTree(rep.Bundle.Path, target); err != nil {
+			return "", info, fmt.Errorf("bundle %s: staging the prebuilt bundle: %w", sharedName, err)
 		}
 		info.Notes = append(info.Notes,
-			"prebuilt bundle staged from "+machine.Bundle.Path+"; its own BUILDINFO (if any) records the codegen policy")
+			"prebuilt bundle staged from "+rep.Bundle.Path+"; its own BUILDINFO (if any) records the codegen policy")
 	case BundleDocker:
-		if err := bundler.dockerBuild(ctx, machine, target, &info); err != nil {
+		if err := bundler.dockerBuild(ctx, sharedName, rep, target, &info); err != nil {
 			return "", info, err
 		}
 	}
 
 	required := []string{"rarpar-bench"}
-	if machine.needsCorpus() {
+	if rep.needsCorpus() {
 		required = append(required, "rarpar")
 	}
-	if machine.hasSuite(SuiteCRCProbe) {
+	if rep.hasSuite(SuiteCRCProbe) {
 		required = append(required, "crc_probe")
 	}
 	for _, name := range required {
 		if _, err := os.Stat(filepath.Join(target, name)); err != nil {
-			return "", info, fmt.Errorf("machine %s: bundle is missing %s (suites %s need it)",
-				machine.Name, name, strings.Join(machine.Suites, ","))
+			return "", info, fmt.Errorf("bundle %s: bundle is missing %s (suites %s need it)",
+				sharedName, name, strings.Join(rep.Suites, ","))
 		}
 	}
 
@@ -131,6 +133,32 @@ func (bundler *Bundler) Build(ctx context.Context, machine Machine) (string, Bui
 	if bundler.Settings.RapidyencPath != "" {
 		info.Trees["rapidyenc"] = describeTree(ctx, bundler.Settings.RapidyencPath)
 	}
+	if err := writeJSONFile(filepath.Join(target, "BUILDINFO.json"), info); err != nil {
+		return "", info, err
+	}
+	return target, info, nil
+}
+
+// Assemble stages one machine's bundle directory from a shared build. The
+// binaries are copied (cheap); BUILDINFO identity and oracles stay
+// per-machine.
+func (bundler *Bundler) Assemble(machine Machine, sharedDir string, sharedInfo BuildInfo) (string, BuildInfo, error) {
+	target := filepath.Join(bundler.bundleRoot(), machine.Name)
+	if err := os.RemoveAll(target); err != nil {
+		return "", BuildInfo{}, err
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return "", BuildInfo{}, err
+	}
+	if err := copyTree(sharedDir, target); err != nil {
+		return "", BuildInfo{}, fmt.Errorf("machine %s: staging from shared bundle %s: %w", machine.Name, sharedDir, err)
+	}
+	info := sharedInfo
+	info.Bundle = machine.Name
+	info.Machine = machine.Name
+	info.PlatformLabel = machine.PlatformLabel
+	info.BuildTarget = machine.BuildTarget
+	info.Oracles = nil
 	if len(machine.Oracles) > 0 {
 		info.Oracles = machine.Oracles
 	}
@@ -138,6 +166,61 @@ func (bundler *Bundler) Build(ctx context.Context, machine Machine) (string, Bui
 		return "", info, err
 	}
 	return target, info, nil
+}
+
+// buildKey groups machines whose bundles are content-identical: the same build
+// configuration AND the same suite-driven bundle contents. One container build
+// serves the whole group.
+func buildKey(machine Machine) string {
+	bundle := machine.Bundle
+	features := []string{}
+	if machine.needsCorpus() {
+		features = append(features, "rarpar")
+	}
+	if machine.hasSuite(SuiteYencMicro) {
+		features = append(features, "yenc-micro")
+	}
+	if machine.hasSuite(SuiteCRCProbe) {
+		features = append(features, "crc-probe")
+	}
+	return strings.Join([]string{
+		bundle.Source, bundle.Path, bundle.Image, bundle.BuildHost,
+		bundle.RustTarget, bundle.GoOS, bundle.GoArch, bundle.GOAMD64,
+		fmt.Sprintf("crt=%t", bundle.CrtStatic),
+		strings.Join(features, "+"),
+	}, "|")
+}
+
+// sharedBundleName is the stable directory name for one build key.
+func sharedBundleName(machine Machine) string {
+	sum := sha256.Sum256([]byte(buildKey(machine)))
+	return "shared-" + machine.Bundle.RustTarget + "-" + hex.EncodeToString(sum[:4])
+}
+
+// rustTargetGoArch maps a Rust target triple to the GOARCH of the silicon it
+// runs on, for native-build enforcement.
+func rustTargetGoArch(rustTarget string) string {
+	switch {
+	case strings.HasPrefix(rustTarget, "x86_64-"):
+		return "amd64"
+	case strings.HasPrefix(rustTarget, "aarch64-"):
+		return "arm64"
+	case strings.HasPrefix(rustTarget, "i686-"):
+		return "386"
+	case strings.HasPrefix(rustTarget, "armv7-"):
+		return "arm"
+	}
+	return ""
+}
+
+func unameToGoArch(uname string) string {
+	switch strings.TrimSpace(uname) {
+	case "x86_64", "amd64":
+		return "amd64"
+	case "aarch64", "arm64":
+		return "arm64"
+	}
+	return strings.TrimSpace(uname)
 }
 
 func (bundler *Bundler) bundleRoot() string {
@@ -162,7 +245,7 @@ func (bundler *Bundler) rarparPath() string {
 //   - aws-lc built in-container against musl (cmake + clang), which is what keeps
 //     the native crypto backend rather than falling back to RustCrypto;
 //   - Go with CGO off so the harness is a static binary on appliance hosts.
-func (bundler *Bundler) dockerBuild(ctx context.Context, machine Machine, target string, info *BuildInfo) error {
+func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, machine Machine, target string, info *BuildInfo) error {
 	bundle := machine.Bundle
 	rustFlagVar := "CARGO_TARGET_" + strings.ToUpper(strings.ReplaceAll(bundle.RustTarget, "-", "_")) + "_RUSTFLAGS"
 	rustFlags := ""
@@ -175,7 +258,7 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, machine Machine, target
 	info.CodegenPolicy["go_flags"] = fmt.Sprintf("CGO_ENABLED=0 GOOS=%s GOARCH=%s %s -trimpath",
 		bundle.GoOS, bundle.GoArch, goamd64Flag(bundle))
 
-	work := filepath.Join(bundler.RunDir, "build", machine.Name)
+	work := filepath.Join(bundler.RunDir, "build", bundleName)
 	if err := os.MkdirAll(filepath.Join(work, "out"), 0o755); err != nil {
 		return err
 	}
@@ -194,26 +277,35 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, machine Machine, target
 	}
 	for name, path := range sources {
 		if err := snapshotTree(ctx, path, filepath.Join(work, name)); err != nil {
-			return fmt.Errorf("machine %s: snapshotting %s: %w", machine.Name, name, err)
+			return fmt.Errorf("bundle %s: snapshotting %s: %w", bundleName, name, err)
 		}
 	}
 
-	if bundle.BuildHost != "" && bundle.BuildHost != "local" {
-		return fmt.Errorf("machine %s: bundle.build_host = %q requires the remote build host to be reachable; run `fleet build --machine %s` from that host or use source = %q",
-			machine.Name, bundle.BuildHost, machine.Name, BundlePrebuilt)
-	}
-
-	docker := bundler.Settings.Docker
-	if docker == "" {
-		docker = "docker"
-	}
-	bundler.log("machine %s: building bundle in %s (%s)", machine.Name, bundle.Image, bundle.RustTarget)
-	command := exec.CommandContext(ctx, docker, "run", "--rm",
-		"-v", work+":/work", "-w", "/work", bundle.Image, "sh", "/work/build-in-container.sh")
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("machine %s: container build failed: %w", machine.Name, err)
+	// Measured binaries must be built on native silicon: a QEMU-emulated
+	// build's build scripts can probe the emulated CPU and emit a different
+	// binary, which is not evidence. (Fixture/corpus generation may run
+	// cross-arch docker — this gate is for candidate binaries only.)
+	targetArch := rustTargetGoArch(bundle.RustTarget)
+	if bundle.BuildHost == "" || bundle.BuildHost == "local" {
+		if targetArch != "" && targetArch != runtime.GOARCH {
+			return fmt.Errorf(
+				"bundle %s: refusing an emulated build: rust target %s needs %s silicon but this host is %s; set bundle.build_host to a native %s ssh host or use source = %q",
+				bundleName, bundle.RustTarget, targetArch, runtime.GOARCH, targetArch, BundlePrebuilt)
+		}
+		docker := bundler.Settings.Docker
+		if docker == "" {
+			docker = "docker"
+		}
+		bundler.log("bundle %s: building in %s (%s, local)", bundleName, bundle.Image, bundle.RustTarget)
+		command := exec.CommandContext(ctx, docker, "run", "--rm",
+			"-v", work+":/work", "-w", "/work", bundle.Image, "sh", "/work/build-in-container.sh")
+		command.Stdout = os.Stderr
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("bundle %s: container build failed: %w", bundleName, err)
+		}
+	} else if err := bundler.remoteDockerBuild(ctx, bundleName, bundle, work, targetArch); err != nil {
+		return err
 	}
 
 	// The Go harness cross-compiles natively on the orchestrator: CGO is off, so
@@ -227,9 +319,52 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, machine Machine, target
 	goBuild.Stdout = os.Stderr
 	goBuild.Stderr = os.Stderr
 	if err := goBuild.Run(); err != nil {
-		return fmt.Errorf("machine %s: building the Go harness: %w", machine.Name, err)
+		return fmt.Errorf("bundle %s: building the Go harness: %w", bundleName, err)
 	}
 	return copyTree(filepath.Join(work, "out"), target)
+}
+
+// remoteDockerBuild runs the same pinned container recipe on a native remote
+// host over ssh (BatchMode — it must never prompt). The remote workspace under
+// ~/.rarpar-fleet-build/<bundle> is left in place on purpose: the cargo caches
+// there make the next round's build incremental.
+func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string, bundle Bundle, work, targetArch string) error {
+	host := bundle.BuildHost
+	uname, err := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "uname", "-m").Output()
+	if err != nil {
+		return fmt.Errorf("bundle %s: build host %s unreachable over ssh: %w", bundleName, host, err)
+	}
+	if got := unameToGoArch(string(uname)); targetArch != "" && got != targetArch {
+		return fmt.Errorf("bundle %s: build host %s is %s silicon but rust target %s needs %s — emulated builds are refused everywhere",
+			bundleName, host, got, bundle.RustTarget, targetArch)
+	}
+	remote := ".rarpar-fleet-build/" + bundleName
+	bundler.log("bundle %s: building in %s (%s) on %s", bundleName, bundle.Image, bundle.RustTarget, host)
+	push := fmt.Sprintf("set -o pipefail; tar -C %s -cf - . | ssh -o BatchMode=yes %s %s",
+		shellQuote(work), shellQuote(host),
+		shellQuote(fmt.Sprintf("rm -rf %s && mkdir -p %s && tar -C %s -xf -", remote, remote, remote)))
+	if err := runShell(ctx, push); err != nil {
+		return fmt.Errorf("bundle %s: pushing sources to %s: %w", bundleName, host, err)
+	}
+	build := fmt.Sprintf("cd %s && docker run --rm -v \"$(pwd)\":/work -w /work %s sh /work/build-in-container.sh",
+		remote, bundle.Image)
+	if err := runShell(ctx, fmt.Sprintf("ssh -o BatchMode=yes %s %s", shellQuote(host), shellQuote(build))); err != nil {
+		return fmt.Errorf("bundle %s: remote container build on %s failed: %w", bundleName, host, err)
+	}
+	pull := fmt.Sprintf("set -o pipefail; ssh -o BatchMode=yes %s %s | tar -C %s -xf -",
+		shellQuote(host), shellQuote(fmt.Sprintf("tar -C %s/out -cf - .", remote)),
+		shellQuote(filepath.Join(work, "out")))
+	if err := runShell(ctx, pull); err != nil {
+		return fmt.Errorf("bundle %s: pulling the bundle back from %s: %w", bundleName, host, err)
+	}
+	return nil
+}
+
+func runShell(ctx context.Context, script string) error {
+	command := exec.CommandContext(ctx, "sh", "-c", script)
+	command.Stdout = os.Stderr
+	command.Stderr = os.Stderr
+	return command.Run()
 }
 
 func goamd64Flag(bundle Bundle) string {

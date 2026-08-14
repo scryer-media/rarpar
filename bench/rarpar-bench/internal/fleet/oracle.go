@@ -273,7 +273,10 @@ set -eu
 apk add --no-cache build-base g++ make binutils >/dev/null 2>&1
 cd /work/src
 # Audit trail: the stock makefile must carry no target-cpu flag of its own.
-grep -nE -- '-march|-mcpu|-mtune|native' makefile && { echo "REFUSING: stock makefile carries a target-cpu flag"; exit 1; } || echo "flag audit: no -march/-mcpu/-mtune in the stock makefile"
+# Comments are stripped first: unrar 7.2.3's stock makefile explains in a
+# comment that upstream REMOVED -march=native, and matching that text made
+# the guard refuse a makefile that carries no flag at all.
+grep -vE '^[[:space:]]*#' makefile | grep -nE -- '-march|-mcpu|-mtune|native' && { echo "REFUSING: stock makefile carries a target-cpu flag"; exit 1; } || echo "flag audit: no -march/-mcpu/-mtune in the stock makefile (comments ignored)"
 make clean >/dev/null 2>&1 || true
 # Only CXX and a static link are set. Stock CXXFLAGS are used verbatim.
 make CXX=g++ LDFLAGS="-pthread -static"

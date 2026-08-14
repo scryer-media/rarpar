@@ -259,6 +259,14 @@ cleanup = false                          # the whole instance is destroyed anywa
 [machines.bundle]
 source = "docker"
 image = "docker.io/library/rust:1.97-alpine"
+# Where the container build runs. Bundles are deduped by (bundle config +
+# suite contents) and built in parallel, one build per unique key. "local" is
+# only legal when the target's architecture matches this machine's silicon —
+# the orchestrator REFUSES emulated builds (measured binaries must come from
+# native hardware; a QEMU build's build scripts can probe the emulated CPU and
+# emit a different binary). For a foreign target, name a native ssh host and
+# the same pinned recipe runs there; fixture/corpus generation is exempt and
+# may still run cross-arch.
 build_host = "local"                     # native aarch64 container on an Apple Silicon Mac
 rust_target = "aarch64-unknown-linux-musl"
 go_os = "linux"

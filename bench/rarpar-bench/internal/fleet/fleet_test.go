@@ -645,3 +645,47 @@ func TestWindowsRunScriptExecutesAFile(t *testing.T) {
 		t.Fatal("PowerShell scripts must use CRLF line endings")
 	}
 }
+
+func TestBuildKeyGroupsIdenticalBundles(t *testing.T) {
+	base := Machine{
+		Name:   "a",
+		Suites: []string{"macro-rar", "macro-par2"},
+		Bundle: Bundle{
+			Source: BundleDocker, Image: "docker.io/library/rust:1.97-alpine",
+			BuildHost: "local", RustTarget: "aarch64-unknown-linux-musl",
+			GoOS: "linux", GoArch: "arm64", CrtStatic: true,
+		},
+	}
+	twin := base
+	twin.Name = "b"
+	if buildKey(base) != buildKey(twin) {
+		t.Fatal("machines with identical bundles and suite content must share one build")
+	}
+	other := base
+	other.Name = "c"
+	other.Bundle.RustTarget = "x86_64-unknown-linux-musl"
+	if buildKey(base) == buildKey(other) {
+		t.Fatal("different rust targets must not share a build")
+	}
+	if sharedBundleName(base) == sharedBundleName(other) {
+		t.Fatal("shared bundle names must differ per key")
+	}
+	wider := base
+	wider.Name = "d"
+	wider.Suites = []string{"macro-rar", "yenc-micro"}
+	if buildKey(base) == buildKey(wider) {
+		t.Fatal("different suite-driven bundle contents must not share a build")
+	}
+}
+
+func TestNativeBuildArchMapping(t *testing.T) {
+	if rustTargetGoArch("x86_64-unknown-linux-musl") != "amd64" {
+		t.Fatal("x86_64 target must map to amd64")
+	}
+	if rustTargetGoArch("aarch64-unknown-linux-musl") != "arm64" {
+		t.Fatal("aarch64 target must map to arm64")
+	}
+	if unameToGoArch("x86_64\n") != "amd64" || unameToGoArch("aarch64") != "arm64" {
+		t.Fatal("uname arch normalization is wrong")
+	}
+}

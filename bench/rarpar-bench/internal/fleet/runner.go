@@ -287,23 +287,66 @@ func (orch *orchestrator) build(ctx context.Context) error {
 	if orch.options.Config.Fleet.BundleCache != "" {
 		cacheDir = filepath.Join(orch.options.Config.Fleet.BundleCache, "oracle-cache")
 	}
+
+	// One container build per unique bundle content, all of them in parallel:
+	// machines sharing a target reuse the artifacts instead of rebuilding.
+	type buildGroup struct {
+		name     string
+		machines []Machine
+	}
+	byKey := map[string]*buildGroup{}
+	groups := []*buildGroup{}
 	for _, machine := range orch.options.Machines {
-		hostState := orch.state.Machine(machine.Name)
-		orch.state.SetStatus(hostState, StatusBuilding)
-		orch.log("build: %s (%s)", machine.Name, machine.Bundle.Source)
-		bundleDir, info, err := bundler.Build(ctx, machine)
+		key := buildKey(machine)
+		entry, ok := byKey[key]
+		if !ok {
+			entry = &buildGroup{name: sharedBundleName(machine)}
+			byKey[key] = entry
+			groups = append(groups, entry)
+		}
+		entry.machines = append(entry.machines, machine)
+		orch.state.SetStatus(orch.state.Machine(machine.Name), StatusBuilding)
+	}
+	sharedDirs := make([]string, len(groups))
+	sharedInfos := make([]BuildInfo, len(groups))
+	buildErrs := make([]error, len(groups))
+	var wait sync.WaitGroup
+	for index, entry := range groups {
+		wait.Add(1)
+		go func(index int, entry *buildGroup) {
+			defer wait.Done()
+			names := make([]string, len(entry.machines))
+			for i, machine := range entry.machines {
+				names[i] = machine.Name
+			}
+			orch.log("build: %s for %s (%s)", entry.name, strings.Join(names, ","), entry.machines[0].Bundle.Source)
+			sharedDirs[index], sharedInfos[index], buildErrs[index] = bundler.SharedBuild(ctx, entry.name, entry.machines[0], names)
+		}(index, entry)
+	}
+	wait.Wait()
+	for _, err := range buildErrs {
 		if err != nil {
 			return err
 		}
-		layout := LayoutFor(machine, orch.options.RunID)
-		oracles, err := ResolveOracles(ctx, machine, bundleDir, cacheDir, layout, orch.options.AllowFetch)
-		if err != nil {
-			return err
+	}
+
+	for index, entry := range groups {
+		for _, machine := range entry.machines {
+			hostState := orch.state.Machine(machine.Name)
+			bundleDir, info, err := bundler.Assemble(machine, sharedDirs[index], sharedInfos[index])
+			if err != nil {
+				return err
+			}
+			layout := LayoutFor(machine, orch.options.RunID)
+			oracles, err := ResolveOracles(ctx, machine, bundleDir, cacheDir, layout, orch.options.AllowFetch)
+			if err != nil {
+				return err
+			}
+			hostState.BundleDir = bundleDir
+			hostState.Oracles = oracles
+			orch.state.Record(hostState, "build", "bundle ready: %d binaries, rarpar tree %s (%d dirty)",
+				len(info.Binaries), short(info.Trees["rarpar"].GitSHA), info.Trees["rarpar"].DirtyFiles)
 		}
-		hostState.BundleDir = bundleDir
-		hostState.Oracles = oracles
-		orch.state.Record(hostState, "build", "bundle ready: %d binaries, rarpar tree %s (%d dirty)",
-			len(info.Binaries), short(info.Trees["rarpar"].GitSHA), info.Trees["rarpar"].DirtyFiles)
 	}
 	return nil
 }
