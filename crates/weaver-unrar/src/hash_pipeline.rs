@@ -28,11 +28,11 @@ use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
+#[cfg(target_arch = "aarch64")]
+use crate::crypto::GROUP_LEAVES;
 use blake2s_simd::Params as Blake2sParams;
 #[cfg(not(target_arch = "aarch64"))]
 use blake2s_simd::State as Blake2sState;
-#[cfg(target_arch = "aarch64")]
-use crate::crypto::GROUP_LEAVES;
 
 /// Chunk buffers cycled between the submitter and the hash workers.
 const CHUNK_CAPACITY: usize = 4 * 1024 * 1024;
