@@ -102,7 +102,45 @@ pub struct MulTables {
 }
 
 /// Precompute the 8 shuffle tables for a given GF(2^16) multiplication factor.
+///
+/// The tables are assembled from the shared nibble scratch
+/// ([`NibbleScratch`]) rather than rebuilt with field arithmetic: the entries
+/// are XOR-linear in `factor`, so four scratch reads and three XOR folds give
+/// the identical bytes that [`mul_tables_from_field`] computes. This is the
+/// per-(input, output) cost on every table-shuffle kernel, so the difference
+/// between 64 `gf::mul` log/antilog lookups and 128 bytes of L1-resident XOR
+/// lands on every coefficient pair an encode touches.
+#[inline]
 pub fn precompute_mul_tables(factor: u16) -> MulTables {
+    let scratch = nibble_scratch();
+    let f = factor as usize;
+    let a = &scratch.mul_tables[0][f & 0xf];
+    let b = &scratch.mul_tables[1][(f >> 4) & 0xf];
+    let c = &scratch.mul_tables[2][(f >> 8) & 0xf];
+    let d = &scratch.mul_tables[3][(f >> 12) & 0xf];
+
+    let mut tables = [[0u8; 16]; 8];
+    for (table, ((a, b), (c, d))) in tables
+        .iter_mut()
+        .zip(a.iter().zip(b.iter()).zip(c.iter().zip(d.iter())))
+    {
+        for (out, ((a, b), (c, d))) in table
+            .iter_mut()
+            .zip(a.iter().zip(b.iter()).zip(c.iter().zip(d.iter())))
+        {
+            *out = a ^ b ^ c ^ d;
+        }
+    }
+
+    MulTables { tables, factor }
+}
+
+/// Build the 8 nibble byte-tables straight from field arithmetic.
+///
+/// This is the definition [`precompute_mul_tables`] reproduces; it stays as the
+/// scratch builder and as the byte-identity reference the tests compare
+/// against.
+fn mul_tables_from_field(factor: u16) -> [[u8; 16]; 8] {
     let mut tables = [[0u8; 16]; 8];
 
     for nibble_val in 0u16..16 {
@@ -127,7 +165,48 @@ pub fn precompute_mul_tables(factor: u16) -> MulTables {
         tables[7][nibble_val as usize] = (prod3 >> 8) as u8;
     }
 
-    MulTables { tables, factor }
+    tables
+}
+
+/// Coefficient tables for the sixteen values of each factor nibble.
+///
+/// Multiplication in GF(2^16) is GF(2)-bilinear, so for a fixed input value the
+/// product is XOR-linear in the factor: `mul(f0 ^ f1, x) == mul(f0, x) ^
+/// mul(f1, x)`. Every entry of [`MulTables`] and every bit of
+/// [`AffineMulMatrices`] is a fixed bit selection out of such products, so both
+/// structures are XOR-linear in the factor too. Splitting the factor into its
+/// four nibbles therefore lets any factor's tables be assembled from four
+/// precomputed nibble contributions.
+///
+/// This is the shape the reference encoder uses (`parpar/gf16/
+/// gf16_affine_avx512.c:16` assembles its affine matrix from four nibble-indexed
+/// scratch loads). The whole scratch is 10 KiB and is built once per process,
+/// against 256 KiB of `gf::mul` log/antilog tables that the from-field builders
+/// stream through on every coefficient pair.
+struct NibbleScratch {
+    /// `mul_tables[n][v]` is `mul_tables_from_field(v << (4 * n))`.
+    mul_tables: [[[[u8; 16]; 8]; 16]; 4],
+    /// `affine[n][v]` is `affine_matrices_from_field(v << (4 * n))`, packed as
+    /// `[m_ll, m_lh, m_hl, m_hh]`.
+    affine: [[[u64; 4]; 16]; 4],
+}
+
+fn nibble_scratch() -> &'static NibbleScratch {
+    static SCRATCH: std::sync::OnceLock<Box<NibbleScratch>> = std::sync::OnceLock::new();
+    SCRATCH.get_or_init(|| {
+        let mut scratch = Box::new(NibbleScratch {
+            mul_tables: [[[[0u8; 16]; 8]; 16]; 4],
+            affine: [[[0u64; 4]; 16]; 4],
+        });
+        for nibble in 0..4usize {
+            for value in 0..16usize {
+                let factor = (value as u16) << (4 * nibble as u32);
+                scratch.mul_tables[nibble][value] = mul_tables_from_field(factor);
+                scratch.affine[nibble][value] = affine_matrices_from_field(factor);
+            }
+        }
+        scratch
+    })
 }
 
 /// Precomputed 8×8 binary affine matrices for GFNI-accelerated GF(2^16) multiply.
@@ -162,7 +241,31 @@ pub struct AffineMulMatrices {
 /// For each input bit position, we evaluate `gf_mul(factor, 1 << bit)` and
 /// record which output bits are set. The result is packed into the GFNI
 /// row-major format.
+///
+/// Assembled from the shared nibble scratch ([`NibbleScratch`]) with four reads
+/// and three XOR folds per matrix, mirroring the reference encoder's
+/// `gf16_affine_load_matrix`. The from-field construction below stays as
+/// [`affine_matrices_from_field`], which builds the scratch and anchors the
+/// byte-identity tests.
+#[inline]
 pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
+    let scratch = nibble_scratch();
+    let f = factor as usize;
+    let a = &scratch.affine[0][f & 0xf];
+    let b = &scratch.affine[1][(f >> 4) & 0xf];
+    let c = &scratch.affine[2][(f >> 8) & 0xf];
+    let d = &scratch.affine[3][(f >> 12) & 0xf];
+    AffineMulMatrices {
+        m_ll: a[0] ^ b[0] ^ c[0] ^ d[0],
+        m_lh: a[1] ^ b[1] ^ c[1] ^ d[1],
+        m_hl: a[2] ^ b[2] ^ c[2] ^ d[2],
+        m_hh: a[3] ^ b[3] ^ c[3] ^ d[3],
+        factor,
+    }
+}
+
+/// Build `[m_ll, m_lh, m_hl, m_hh]` straight from field arithmetic.
+fn affine_matrices_from_field(factor: u16) -> [u64; 4] {
     // Build the full 16×16 binary matrix: column `bit` = gf_mul(factor, 1 << bit).
     let mut cols = [0u16; 16];
     for bit in 0..16u32 {
@@ -192,13 +295,7 @@ pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
         matrix
     };
 
-    AffineMulMatrices {
-        m_ll: pack(0, 0),
-        m_lh: pack(8, 0),
-        m_hl: pack(0, 8),
-        m_hh: pack(8, 8),
-        factor,
-    }
+    [pack(0, 0), pack(8, 0), pack(0, 8), pack(8, 8)]
 }
 
 /// Multiply each u16 word in `src` by `factor` in GF(2^16) and XOR-accumulate
@@ -2705,9 +2802,7 @@ unsafe fn mul_acc_multi_region_avx512(factors_and_dsts: &mut [FactorDst<'_>], sr
         .map(|(idx, fd)| {
             let tables = precompute_mul_tables(fd.factor);
             let load_table = |i: usize| unsafe {
-                _mm512_broadcast_i32x4(_mm_loadu_si128(
-                    tables.tables[i].as_ptr() as *const __m128i
-                ))
+                _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[i].as_ptr() as *const __m128i))
             };
             BroadcastTables {
                 tables: [
@@ -4198,7 +4293,6 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
     dst: &mut [u8],
     inputs: impl Iterator<Item = (u16, &'a [u8])> + Clone,
 ) {
-    use std::arch::aarch64::*;
     let len = dst.len();
     // The public dispatchers assert this; guard direct (test/future) callers
     // too — a short src would send vld2q/tail slicing out of bounds.
@@ -4217,84 +4311,163 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
     let vec_len = len & !31;
     let mut it = inputs.filter(|&(factor, _)| factor > 1);
     loop {
-        // Fill the next group of up to CLMUL_SRC_GROUP sources.
-        let mut group: [Option<(u16, ClmulBatchCoeff, &[u8])>; CLMUL_SRC_GROUP] =
-            [None; CLMUL_SRC_GROUP];
-        let mut n = 0usize;
-        for slot in group.iter_mut() {
+        // Materialize the next group into fixed-size arrays before entering the
+        // block loop. Unused slots duplicate slot 0 rather than holding `None`:
+        // every index the const-width body can name is then in bounds by
+        // construction, so the hot loop carries no `Option` discriminant test,
+        // no slice-length compare, and no panic edge — and the coefficient
+        // registers stay loop-invariant instead of being re-walked out of a
+        // wide `Option<(u16, ClmulBatchCoeff, &[u8])>` array each block.
+        let Some((first_factor, first_src)) = it.next() else {
+            break;
+        };
+        let mut factors = [first_factor; CLMUL_SRC_GROUP];
+        let mut slices = [first_src; CLMUL_SRC_GROUP];
+        let mut srcs = [first_src.as_ptr(); CLMUL_SRC_GROUP];
+        let mut coeffs = [unsafe { clmul_batch_coeff(first_factor) }; CLMUL_SRC_GROUP];
+        let mut n = 1usize;
+        for slot in 1..CLMUL_SRC_GROUP {
             let Some((factor, src)) = it.next() else {
                 break;
             };
-            *slot = Some((factor, unsafe { clmul_batch_coeff(factor) }, src));
+            factors[slot] = factor;
+            slices[slot] = src;
+            srcs[slot] = src.as_ptr();
+            coeffs[slot] = unsafe { clmul_batch_coeff(factor) };
             n += 1;
         }
-        if n == 0 {
-            break;
-        }
-        let group = &group[..n];
 
+        // One straight-line body per live width, the shape the reference
+        // encoder generates from `gf16_muladd_multi` (`parpar/gf16/
+        // gf16_clmul_neon_base.h:54`, CLMUL_NUM_REGIONS 8): the source count is
+        // a constant inside the loop, so the whole region sequence unrolls to a
+        // single backedge.
         unsafe {
-            let mut offset = 0usize;
-            while offset < vec_len {
-                if NEON_SRC_PREFETCH {
-                    for e in group {
-                        let (_, _, src) = e.unwrap();
-                        prefetch_src_l1(src.as_ptr().wrapping_add(offset + 64));
-                    }
-                }
-
-                let first = group[0].unwrap();
-                let mut acc = clmul_round1(first.2.as_ptr().add(offset), &first.1);
-                let rest = &group[1..];
-                if SHA3 && !FUSED {
-                    // Merge pairs through EOR3 and handle an odd final product
-                    // with the single-product path.
-                    let mut i = 0usize;
-                    while i + 2 <= rest.len() {
-                        let b = rest[i].unwrap();
-                        let c = rest[i + 1].unwrap();
-                        let pb = clmul_round1(b.2.as_ptr().add(offset), &b.1);
-                        let pc = clmul_round1(c.2.as_ptr().add(offset), &c.1);
-                        clmul_merge2::<SHA3>(&mut acc, pb, pc);
-                        i += 2;
-                    }
-                    if i < rest.len() {
-                        let b = rest[i].unwrap();
-                        let pb = clmul_round1(b.2.as_ptr().add(offset), &b.1);
-                        clmul_merge1(&mut acc, pb);
-                    }
-                } else {
-                    for e in rest {
-                        let e = e.unwrap();
-                        if FUSED {
-                            clmul_round_acc_fused(&mut acc, e.2.as_ptr().add(offset), &e.1);
-                        } else {
-                            clmul_round_acc(&mut acc, e.2.as_ptr().add(offset), &e.1);
-                        }
-                    }
-                }
-
-                let r = clmul_barrett_reduce::<SHA3>(acc);
-                let mut vb = vld2q_u8(dst.as_ptr().add(offset));
-                if SHA3 && !FUSED {
-                    vb.0 = veor3q_u8(r[0], r[1], vb.0);
-                    vb.1 = veor3q_u8(r[2], r[3], vb.1);
-                } else {
-                    vb.0 = veorq_u8(veorq_u8(r[0], r[1]), vb.0);
-                    vb.1 = veorq_u8(veorq_u8(r[2], r[3]), vb.1);
-                }
-                vst2q_u8(dst.as_mut_ptr().add(offset), vb);
-
-                offset += 32;
+            let dst_ptr = dst.as_mut_ptr();
+            match n {
+                1 => clmul_pass::<SHA3, FUSED, 1>(dst_ptr, &srcs, &coeffs, vec_len),
+                2 => clmul_pass::<SHA3, FUSED, 2>(dst_ptr, &srcs, &coeffs, vec_len),
+                3 => clmul_pass::<SHA3, FUSED, 3>(dst_ptr, &srcs, &coeffs, vec_len),
+                4 => clmul_pass::<SHA3, FUSED, 4>(dst_ptr, &srcs, &coeffs, vec_len),
+                5 => clmul_pass::<SHA3, FUSED, 5>(dst_ptr, &srcs, &coeffs, vec_len),
+                6 => clmul_pass::<SHA3, FUSED, 6>(dst_ptr, &srcs, &coeffs, vec_len),
+                7 => clmul_pass::<SHA3, FUSED, 7>(dst_ptr, &srcs, &coeffs, vec_len),
+                _ => clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst_ptr, &srcs, &coeffs, vec_len),
             }
         }
 
         // Scalar tail (< one 32-byte block) for this group's sources.
         if vec_len < len {
-            for e in group {
-                let (factor, _, src) = e.unwrap();
-                mul_acc_region_scalar(factor, &src[vec_len..], &mut dst[vec_len..]);
+            for lane in 0..n {
+                mul_acc_region_scalar(factors[lane], &slices[lane][vec_len..], &mut dst[vec_len..]);
             }
+        }
+    }
+}
+
+/// One CLMUL pass over `dst` for exactly `N` live sources.
+///
+/// `N` is a constant so the region sequence below is straight-line code: the
+/// index expressions are compile-time, the `if N > k` guards fold away, and the
+/// loop keeps one backedge with the coefficients hoisted into registers. That
+/// is the structural half of the kernel — the arithmetic is identical to what
+/// the iterator-driven shape ran, in the identical order.
+///
+/// # Safety
+/// `dst` and every `srcs[i]` for `i < N` must be valid for `vec_len` bytes,
+/// `vec_len` must be a multiple of 32, and `dst` must not alias any source.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
+    dst: *mut u8,
+    srcs: &[*const u8; CLMUL_SRC_GROUP],
+    coeffs: &[ClmulBatchCoeff; CLMUL_SRC_GROUP],
+    vec_len: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut offset = 0usize;
+        while offset < vec_len {
+            macro_rules! prefetch_lane {
+                ($idx:expr) => {
+                    if N > $idx {
+                        prefetch_src_l1(srcs[$idx].wrapping_add(offset + 64));
+                    }
+                };
+            }
+            if NEON_SRC_PREFETCH {
+                prefetch_lane!(0);
+                prefetch_lane!(1);
+                prefetch_lane!(2);
+                prefetch_lane!(3);
+                prefetch_lane!(4);
+                prefetch_lane!(5);
+                prefetch_lane!(6);
+                prefetch_lane!(7);
+            }
+
+            let mut acc = clmul_round1(srcs[0].add(offset), &coeffs[0]);
+            if SHA3 && !FUSED {
+                // Merge pairs through EOR3, with the odd final product taking
+                // the single-product path — the same pairing the runtime loop
+                // produced, unrolled.
+                macro_rules! merge_pair {
+                    ($a:expr, $b:expr) => {
+                        if N >= $b + 1 {
+                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
+                            let pc = clmul_round1(srcs[$b].add(offset), &coeffs[$b]);
+                            clmul_merge2::<SHA3>(&mut acc, pb, pc);
+                        } else if N == $a + 1 {
+                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
+                            clmul_merge1(&mut acc, pb);
+                        }
+                    };
+                }
+                merge_pair!(1, 2);
+                merge_pair!(3, 4);
+                merge_pair!(5, 6);
+                if N == 8 {
+                    let pb = clmul_round1(srcs[7].add(offset), &coeffs[7]);
+                    clmul_merge1(&mut acc, pb);
+                }
+            } else {
+                macro_rules! accumulate_lane {
+                    ($idx:expr) => {
+                        if N > $idx {
+                            if FUSED {
+                                clmul_round_acc_fused(
+                                    &mut acc,
+                                    srcs[$idx].add(offset),
+                                    &coeffs[$idx],
+                                );
+                            } else {
+                                clmul_round_acc(&mut acc, srcs[$idx].add(offset), &coeffs[$idx]);
+                            }
+                        }
+                    };
+                }
+                accumulate_lane!(1);
+                accumulate_lane!(2);
+                accumulate_lane!(3);
+                accumulate_lane!(4);
+                accumulate_lane!(5);
+                accumulate_lane!(6);
+                accumulate_lane!(7);
+            }
+
+            let r = clmul_barrett_reduce::<SHA3>(acc);
+            let block = dst.add(offset);
+            let mut vb = vld2q_u8(block);
+            if SHA3 && !FUSED {
+                vb.0 = veor3q_u8(r[0], r[1], vb.0);
+                vb.1 = veor3q_u8(r[2], r[3], vb.1);
+            } else {
+                vb.0 = veorq_u8(veorq_u8(r[0], r[1]), vb.0);
+                vb.1 = veorq_u8(veorq_u8(r[2], r[3]), vb.1);
+            }
+            vst2q_u8(block, vb);
+
+            offset += 32;
         }
     }
 }
@@ -4713,6 +4886,63 @@ unsafe fn mul_acc_input_batch_neon_prepared(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nibble scratch is only sound if every coefficient structure is
+    /// XOR-linear in the factor. Prove it exhaustively for all 65536 factors
+    /// against the from-field builders the scratch itself is made of, so the
+    /// hot-path assembly can never silently diverge from field arithmetic.
+    #[test]
+    fn nibble_scratch_mul_tables_match_field_for_every_factor() {
+        for factor in 0..=0xFFFFu16 {
+            let assembled = precompute_mul_tables(factor);
+            assert_eq!(assembled.factor, factor);
+            assert_eq!(
+                assembled.tables,
+                mul_tables_from_field(factor),
+                "mul tables diverge at factor {factor:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn nibble_scratch_affine_matrices_match_field_for_every_factor() {
+        for factor in 0..=0xFFFFu16 {
+            let assembled = precompute_affine_matrices(factor);
+            let reference = affine_matrices_from_field(factor);
+            assert_eq!(assembled.factor, factor);
+            assert_eq!(
+                [
+                    assembled.m_ll,
+                    assembled.m_lh,
+                    assembled.m_hl,
+                    assembled.m_hh
+                ],
+                reference,
+                "affine matrices diverge at factor {factor:#06x}"
+            );
+        }
+    }
+
+    /// `precompute_shuffle2x_tables` is a pure rearrangement of the mul
+    /// tables, so covering the assembled source covers it; pin the
+    /// rearrangement anyway at the widths the folded kernel feeds.
+    #[test]
+    fn nibble_scratch_shuffle2x_tables_match_field() {
+        for factor in (0..=0xFFFFu16).step_by(97) {
+            let t = mul_tables_from_field(factor);
+            let assembled = precompute_shuffle2x_tables(factor);
+            let cat = |lo: &[u8; 16], hi: &[u8; 16]| {
+                let mut o = [0u8; 32];
+                o[..16].copy_from_slice(lo);
+                o[16..].copy_from_slice(hi);
+                o
+            };
+            assert_eq!(assembled.norm_lo, cat(&t[0], &t[5]));
+            assert_eq!(assembled.swap_lo, cat(&t[1], &t[4]));
+            assert_eq!(assembled.norm_hi, cat(&t[2], &t[7]));
+            assert_eq!(assembled.swap_hi, cat(&t[3], &t[6]));
+        }
+    }
 
     #[test]
     fn scalar_matches_gf_mul_add() {
@@ -5259,7 +5489,11 @@ mod tests {
             state
         };
 
-        for &count in &[1usize, 2, 3, 4, 5, 7, 8, 9, 17] {
+        // Every live width 1..=CLMUL_SRC_GROUP reaches its own straight-line
+        // `clmul_pass` instantiation, and the counts past 8 exercise the
+        // multi-pass group split. Two of the first four factors are 0/1, so a
+        // `count` of k lands on a live width of about k-2.
+        for &count in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17] {
             for &len in &[2usize, 30, 32, 34, 64, 96, 4094, 4096] {
                 let factors: Vec<u16> = (0..count)
                     .map(|i| match i {
@@ -5298,6 +5532,36 @@ mod tests {
                     assert_eq!(
                         unfused, reference,
                         "unfused sha3 clmul count={count} len={len}"
+                    );
+                }
+
+                // The prepared entries are what the create path calls; they
+                // share the straight-line body, so cover them at the same
+                // widths rather than trusting the raw entries to stand in.
+                let prepared_factors: Vec<PreparedInputFactor> =
+                    factors.iter().map(|&f| prepare_input_factor(f)).collect();
+                let prepared_srcs: Vec<PreparedFactorSrc<'_>> = prepared_factors
+                    .iter()
+                    .zip(inputs.iter())
+                    .map(|(prepared, input)| PreparedFactorSrc {
+                        prepared,
+                        src: input,
+                    })
+                    .collect();
+                let mut prepared_plain = vec![0xA7u8; len];
+                unsafe { mul_acc_input_batch_clmul_prepared(&mut prepared_plain, &prepared_srcs) };
+                assert_eq!(
+                    prepared_plain, reference,
+                    "prepared plain clmul count={count} len={len}"
+                );
+                if clmul_sha3_available() {
+                    let mut prepared_sha3 = vec![0xA7u8; len];
+                    unsafe {
+                        mul_acc_input_batch_clmul_sha3_prepared(&mut prepared_sha3, &prepared_srcs)
+                    };
+                    assert_eq!(
+                        prepared_sha3, reference,
+                        "prepared sha3 clmul count={count} len={len}"
                     );
                 }
             }
@@ -5596,16 +5860,18 @@ mod tests {
 
         for len in lens {
             for trial in 0..3 {
-                let factors_a: [u16; FOLDED_GROUP] = std::array::from_fn(|l| match (trial + l) % 6 {
-                    0 => 0,
-                    1 => 1,
-                    _ => rng() as u16,
-                });
-                let factors_b: [u16; FOLDED_GROUP] = std::array::from_fn(|l| match (trial + l) % 7 {
-                    0 => 0,
-                    3 => 1,
-                    _ => rng() as u16,
-                });
+                let factors_a: [u16; FOLDED_GROUP] =
+                    std::array::from_fn(|l| match (trial + l) % 6 {
+                        0 => 0,
+                        1 => 1,
+                        _ => rng() as u16,
+                    });
+                let factors_b: [u16; FOLDED_GROUP] =
+                    std::array::from_fn(|l| match (trial + l) % 7 {
+                        0 => 0,
+                        3 => 1,
+                        _ => rng() as u16,
+                    });
 
                 let make_inputs = |factors: &[u16; FOLDED_GROUP], rng: &mut dyn FnMut() -> u64| {
                     let _ = factors;
@@ -5691,7 +5957,9 @@ mod tests {
             return;
         }
         if !has_gfni {
-            eprintln!("NOTE multi_region_x86_arms_match_scalar: host lacks gfni, GFNI arms skipped");
+            eprintln!(
+                "NOTE multi_region_x86_arms_match_scalar: host lacks gfni, GFNI arms skipped"
+            );
         }
         if !has_avx512 {
             eprintln!(

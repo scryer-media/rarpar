@@ -83,6 +83,71 @@ struct SourceFingerprint {
     inode: u64,
 }
 
+/// Per-creator memo of the source scan, so one `Par2Creator` reads and hashes
+/// its inputs once instead of once per `build_plan` call.
+///
+/// `Par2Creator::create` rebuilds the plan from the current inputs and compares
+/// it with the caller's, which means the whole input set is otherwise scanned
+/// twice for one creation: once in `plan()` and once in `create()`. An entry is
+/// only reused when a fresh `stat` of the same canonical path still yields the
+/// identical [`SourceFingerprint`] (length, mtime, and on unix device+inode)
+/// *and* the same block size, so what changes is which read the hashes come
+/// from, not whether the inputs are re-validated. A file that moved, was
+/// replaced, was rewritten in place, or whose length changed misses the memo
+/// and is rehashed exactly as before.
+///
+/// Entries are removed as they are used: the memory plan admits two live copies
+/// of the source metadata (`source_metadata_bytes * 2`) for the create phase,
+/// and draining is what keeps that true while the rebuilt plan is assembled.
+pub(crate) struct SourceScanCache {
+    entries: std::sync::Mutex<Vec<CachedScan>>,
+}
+
+struct CachedScan {
+    fingerprint: SourceFingerprint,
+    block_size: u64,
+    source: CreationSource,
+}
+
+impl SourceScanCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(
+        &self,
+        path: &Path,
+        fingerprint: &SourceFingerprint,
+        block_size: u64,
+    ) -> Option<CreationSource> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = entries.iter().position(|entry| {
+            entry.block_size == block_size
+                && entry.fingerprint == *fingerprint
+                && entry.source.path == path
+        })?;
+        Some(entries.swap_remove(index).source)
+    }
+
+    fn store(&self, fingerprint: SourceFingerprint, block_size: u64, source: &CreationSource) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.source.path != source.path);
+        entries.push(CachedScan {
+            fingerprint,
+            block_size,
+            source: source.clone(),
+        });
+    }
+}
+
 impl SourceFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
@@ -107,6 +172,7 @@ pub(crate) fn collect_sources(
     cancellation: &CancellationToken,
     progress: Option<&ProgressCallback>,
     total_bytes: u64,
+    cache: Option<&SourceScanCache>,
 ) -> Result<Vec<CreationSource>> {
     if inputs.is_empty() {
         return Err(Par2Error::InvalidCreationOptions {
@@ -182,6 +248,7 @@ pub(crate) fn collect_sources(
             file_total,
             &bytes_processed,
             total_bytes,
+            cache,
         )
     };
     // Hash one file per rayon task; each file's scan is independent. The
@@ -484,6 +551,7 @@ fn resolve_and_hash_source(
     file_total: u32,
     bytes_processed: &AtomicU64,
     total_bytes: u64,
+    cache: Option<&SourceScanCache>,
 ) -> Result<CreationSource> {
     if block_size == 0 || !block_size.is_multiple_of(4) {
         return Err(Par2Error::InvalidCreationOptions {
@@ -532,6 +600,35 @@ fn resolve_and_hash_source(
             path: input.display().to_string(),
             reason: "PAR2 name is empty, contains NUL, or exceeds 100000 bytes".to_string(),
         });
+    }
+
+    // Memo hit: this exact path, at this exact fingerprint and block size, was
+    // already read and hashed by this creator, and the `stat` above is the
+    // guard that says so. The bytes are not read again; progress is still
+    // reported one slice at a time, with the same byte steps a real scan of
+    // this file would produce, so the callback stream a caller sees does not
+    // depend on which read the hashes came from.
+    if let Some(source) = cache.and_then(|cache| cache.take(&path, &fingerprint, block_size)) {
+        debug_assert_eq!(source.par2_name, par2_name);
+        let mut remaining = fingerprint.length;
+        for _ in 0..source.slice_checksums.len() {
+            if cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            let step = remaining.min(block_size);
+            remaining -= step;
+            let processed_total = bytes_processed
+                .fetch_add(step, Ordering::Relaxed)
+                .saturating_add(step);
+            report_progress(
+                progress,
+                file_index,
+                file_total,
+                processed_total,
+                total_bytes,
+            );
+        }
+        return Ok(source);
     }
 
     let mut file = File::open(&path).map_err(Par2Error::Io)?;
@@ -587,21 +684,31 @@ fn resolve_and_hash_source(
         let mut batch = vec![0u8; lanes * block_size_usize];
         let mut digests = vec![[0u8; 16]; lanes];
         let mut lens = vec![0usize; lanes];
+        let mut crcs = vec![0u32; lanes];
         let mut slice_index = 0usize;
 
         while slice_index < slice_count_usize {
             let batch_slices = lanes.min(slice_count_usize - slice_index);
-            let mut batch_bytes = 0usize;
 
-            for (lane, len) in lens.iter_mut().enumerate().take(batch_slices) {
+            for lane in 0..batch_slices {
                 if cancellation.is_cancelled() {
                     return Err(Par2Error::Cancelled);
                 }
                 let actual_len = slice_len(slice_index + lane)?;
                 let start = lane * block_size_usize;
-                read_exact_or_changed(&mut file, &mut batch[start..start + actual_len], input)?;
-                *len = actual_len;
-                batch_bytes += actual_len;
+                let slice = &mut batch[start..start + actual_len];
+                read_exact_or_changed(&mut file, slice, input)?;
+                lens[lane] = actual_len;
+
+                // Both single-stream digests run here, while this slice is
+                // still in the cache the read just filled, instead of after a
+                // second whole-batch walk. Only the file's final slice can be
+                // short, so lane order within a batch is file order and the
+                // serial stream sees exactly the bytes — and the byte order —
+                // that one `batch[..batch_bytes]` absorb produced.
+                let slice = &batch[start..start + actual_len];
+                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, slice);
+                crcs[lane] = checksum::crc32_padded(slice, block_size);
 
                 let processed_total = bytes_processed
                     .fetch_add(actual_len as u64, Ordering::Relaxed)
@@ -615,16 +722,6 @@ fn resolve_and_hash_source(
                 );
             }
 
-            // Only the file's final slice can be short, so within a batch the
-            // slices are laid out back to back and the batch's real bytes are
-            // one contiguous run in file order.
-            absorb_file_stream(
-                &mut full_hash,
-                &mut first_hash,
-                &mut first_bytes,
-                &batch[..batch_bytes],
-            );
-
             let inputs = (0..batch_slices)
                 .map(|lane| {
                     let start = lane * block_size_usize;
@@ -633,9 +730,9 @@ fn resolve_and_hash_source(
                 .collect::<Vec<_>>();
             md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
 
-            for (lane, input) in inputs.iter().enumerate() {
+            for lane in 0..batch_slices {
                 checksums.push(SliceChecksum {
-                    crc32: checksum::crc32_padded(input, block_size),
+                    crc32: crcs[lane],
                     md5: digests[lane],
                 });
             }
@@ -701,7 +798,7 @@ fn resolve_and_hash_source(
     file_id_hash.update(par2_name.as_bytes());
     let file_id = FileId::from_bytes(file_id_hash.finalize());
 
-    Ok(CreationSource {
+    let source = CreationSource {
         path,
         par2_name,
         file_id,
@@ -709,7 +806,11 @@ fn resolve_and_hash_source(
         hash_full,
         hash_16k,
         slice_checksums: checksums,
-    })
+    };
+    if let Some(cache) = cache {
+        cache.store(fingerprint, block_size, &source);
+    }
+    Ok(source)
 }
 
 fn resolve_input_path(base: &Path, input: &Path) -> Result<PathBuf> {

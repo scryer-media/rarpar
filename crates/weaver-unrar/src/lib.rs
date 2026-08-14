@@ -122,19 +122,32 @@
 //!
 //! # Benchmarks
 //!
-//! Relative-speed charts against reference `unrar 7.23` from the
-//! deterministic `rarpar-bench` corpus (methodology in the crate README).
-//! Click any chart to open it full size.
+//! Extraction against reference UnRAR, from the deterministic 43-case
+//! `rarpar-bench` corpus. Each figure is the geometric mean of
+//! `reference wall time / rarpar wall time` over a workload class, so `2.0x`
+//! means half the time. **binary** is store-mode extraction of uncompressible
+//! media payloads, including the encrypted and BLAKE2sp variants; **text** is
+//! compressed extraction across the LZ and PPMd decode paths, including
+//! compressed machine code and the encrypted compressed cases.
 //!
-//! [![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+//! | CPU | Arch | Instruction set | binary | text |
+//! |---|---|---|---:|---:|
+//! | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0x | 1.5x |
+//! | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9x | 1.4x |
+//! | Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5x | 1.2x |
+//! | AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6x | 1.5x |
+//! | Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2x | 1.3x |
+//! | Apple M5 Max | arm64 | NEON | 1.4x | 1.5x |
+//! | Arm Cortex-A72 | arm64 | NEON | 2.1x | 1.4x |
+//! | Arm Neoverse N1 | arm64 | NEON | 2.6x | 1.5x |
+//! | Arm Neoverse V2 | arm64 | NEON | 3.1x | 1.6x |
 //!
-//! [![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
+//! The text class includes RAR4 PPMd, an archaic mode deliberately left
+//! unoptimized, which loses on every machine.
 //!
-//! [![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
-//!
-//! [![RAR workloads on Intel Atom C3538 with Linux x86-64 and no AVX](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
-//!
-//! [![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
+//! Per-case charts for every machine, the full methodology, and the versions
+//! these numbers were measured with are in
+//! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 pub mod archive;
 pub(crate) mod crc;

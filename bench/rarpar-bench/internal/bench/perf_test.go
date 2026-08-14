@@ -105,6 +105,34 @@ func TestParsePerfStatOutputAcceptsMultiplexedCountersAndFlagsThem(t *testing.T)
 	}
 }
 
+func TestParsePerfStatOutputHandlesRunTimeColumnLayouts(t *testing.T) {
+	// Newer perf inserts a run-time column between event and percentage.
+	// perf 6.17 emits run times that read "1" — a magnitude probe mistakes
+	// that for a sub-floor percentage; detection must be structural (a
+	// numeric column AFTER the candidate means the candidate is run time).
+	output := []byte(strings.Join([]string{
+		"1000,,cycles,1,100.00",
+		"2000,,instructions,78273941,99.50",
+		"12.5,msec,task-clock,314159,100.00",
+		"7,,context-switches,1,100.00",
+		"8,,cpu-migrations,1,100.00",
+		"123456789,,duration_time,1,100.00",
+	}, "\n"))
+	counters, err := parsePerfStatOutput(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counters.Cycles == nil || *counters.Cycles != 1000 {
+		t.Fatalf("cycles = %#v", counters)
+	}
+	if counters.MinRunningPercent == nil || *counters.MinRunningPercent != 99.50 {
+		t.Fatalf("min running percent = %#v", counters)
+	}
+	if counters.DurationNanos == nil || *counters.DurationNanos != 123456789 {
+		t.Fatalf("duration = %#v", counters)
+	}
+}
+
 func TestParsePerfStatOutputRejectsCountersBelowTheRunningFloor(t *testing.T) {
 	output := []byte("1,,cycles,12.50\n")
 	_, err := parsePerfStatOutput(output)

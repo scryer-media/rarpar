@@ -742,14 +742,19 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 		}
 		// perf's -x, layout differs by version: older perf emits
 		// value,unit,event,percentage while newer perf inserts the counter's
-		// run time first: value,unit,event,run-time-ns,percentage. A run
-		// time can never pass for a percentage (it is orders of magnitude
-		// past 100), so a too-large first field means the newer layout —
-		// the percentage sits one column further right. Round 2 lost every
-		// per-subject counter on EC2 to exactly this misread.
+		// run time first: value,unit,event,run-time,percentage. Detect the
+		// layout STRUCTURALLY — if the column after the candidate percentage
+		// also parses as a number, the candidate is the run time and the
+		// percentage sits one further right. A magnitude probe is not enough:
+		// perf 6.17 emits run times that read "1", which passes for a (tiny)
+		// percentage and then trips the floor. Round 2 and the round-3 legs
+		// each lost per-subject counters to one of these misreads.
 		runningField := strings.TrimSpace(fields[eventIndex+1])
-		if probe, probeErr := strconv.ParseFloat(runningField, 64); probeErr == nil && probe > 100.01 && eventIndex+2 < len(fields) {
-			runningField = strings.TrimSpace(fields[eventIndex+2])
+		if eventIndex+2 < len(fields) {
+			next := strings.TrimSpace(fields[eventIndex+2])
+			if _, nextErr := strconv.ParseFloat(next, 64); nextErr == nil {
+				runningField = next
+			}
 		}
 		runningPercent, parseErr := strconv.ParseFloat(runningField, 64)
 		if parseErr != nil || math.IsNaN(runningPercent) || math.IsInf(runningPercent, 0) || runningPercent < perfMinRunningPercent || runningPercent > 100.01 {

@@ -235,8 +235,24 @@ impl LzDecoder {
         let distance = self.dist_cache[cache_idx];
 
         if cache_idx > 0 {
-            for index in (1..=cache_idx).rev() {
-                self.dist_cache[index] = self.dist_cache[index - 1];
+            // Explicit fixed rotations: a runtime-length shift loop here is
+            // recognized by LLVM's loop-idiom pass and lowered to a libc
+            // memmove call — 8-24 bytes through musl's backward `rep movsb`
+            // path, which fleet profiling measured as the hottest
+            // memmove caller in RAR extraction on musl builds.
+            match cache_idx {
+                1 => {
+                    self.dist_cache[1] = self.dist_cache[0];
+                }
+                2 => {
+                    self.dist_cache[2] = self.dist_cache[1];
+                    self.dist_cache[1] = self.dist_cache[0];
+                }
+                _ => {
+                    self.dist_cache[3] = self.dist_cache[2];
+                    self.dist_cache[2] = self.dist_cache[1];
+                    self.dist_cache[1] = self.dist_cache[0];
+                }
             }
             self.dist_cache[0] = distance;
         }

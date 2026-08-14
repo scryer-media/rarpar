@@ -32,6 +32,13 @@ const TRANSFER_BUFFER_COUNT: usize = 2;
 // would silently accumulate from the wrong area.
 const _: () = assert!(STAGING_AREA_COUNT == 2);
 
+/// Folded coefficient groups covered by one output row, bounding the stack
+/// reference tables in `accumulate_band`. Every [`KernelContract`] uses
+/// [`DEFAULT_INPUT_GROUPING`], so this is the exact group count, not a
+/// worst case; the arm still checks before slicing.
+#[cfg(target_arch = "x86_64")]
+const MAX_FOLDED_GROUPS: usize = DEFAULT_INPUT_GROUPING / gf_simd::FOLDED_GROUP;
+
 /// Worker bands used by forward accumulation. `WEAVER_PAR2_CREATE_THREADS=N`
 /// pins the band count (1 = the sequential pre-banding behavior) so the two
 /// shapes can be A/B'd without a rebuild (same escape-hatch pattern as
@@ -637,10 +644,93 @@ fn select_jit_width(capabilities: KernelCapabilities) -> Option<reedsolomon_rs::
     }
 }
 
+/// Bytes of one input region that a band's output rows consume together.
+///
+/// The stripe length handed to [`accumulate_band`] comes from [`BufferPlan`],
+/// which takes the largest chunk the memory budget allows — so without an inner
+/// tile every output row of the band re-streams the whole
+/// `input_grouping * aligned_len` staging area from memory, and the reuse
+/// distance is a memory-budget number rather than a cache-sized one. Tiling the
+/// byte dimension *inside* the in-memory stripe fixes that reuse distance
+/// without touching the stripe: sources are still read once per stripe and the
+/// coefficient state is still built once per (batch, band).
+///
+/// The constants are per kernel FAMILY, mirroring the reference's per-method
+/// ideal chunk size (4 KiB where the multiply is a GFNI affine transform,
+/// 8 KiB where it is a table/shuffle or CLMUL body): a family is a
+/// kernel-availability fact, exactly like the tier ladder itself. They are
+/// deliberately not per-microarchitecture and carry no topology probe.
+/// Only the folded family selects this tile, and that family is x86-only.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const AFFINE_TILE_BYTES: usize = 4 * 1024;
+const TABLE_TILE_BYTES: usize = 8 * 1024;
+/// Sentinel for a family that consumes the whole stripe in one call. Only the
+/// packed XOR-JIT family selects it, and that family is x86-only.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const UNTILED: usize = usize::MAX;
+
+/// A/B override for the per-family tile, in bytes; `0` selects the untiled
+/// shape. Same escape-hatch pattern as `WEAVER_PAR2_CREATE_THREADS`: it exists
+/// so the tiled and untiled shapes can be compared, and the ladder's constants
+/// re-derived on new hardware, without a rebuild. Nothing in the plan depends
+/// on it — the tile lives strictly inside one already-planned stripe, so every
+/// `Par2MemoryPlan` and `ForwardMemoryEstimate` number is identical at every
+/// setting, as are the produced recovery bytes.
+///
+/// Process-stable by construction, for the same reason the band count is: two
+/// reads inside one pass must not disagree.
+fn configured_tile_bytes() -> Option<usize> {
+    static CONFIGURED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("WEAVER_PAR2_CREATE_TILE")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map(|bytes| if bytes == 0 { UNTILED } else { bytes })
+    })
+}
+
+/// Resolve one family's tile: the A/B override when set, otherwise the
+/// family's constant, rounded up to a whole number of kernel strides.
+fn family_tile_bytes(default_bytes: usize, stride: usize) -> usize {
+    let requested = configured_tile_bytes().unwrap_or(default_bytes);
+    if requested == UNTILED || stride == 0 {
+        return requested;
+    }
+    requested
+        .max(stride)
+        .div_ceil(stride)
+        .saturating_mul(stride)
+}
+
+/// Output rows whose coefficient state is built in one step.
+///
+/// The tile loop runs *inside* this, which is what keeps a row's coefficients
+/// built once per (input batch, row) rather than once per tile: tiling must
+/// not turn into a coefficient rebuild multiplier. Holding whole bands instead
+/// would make the workspace scale with the recovery-row count, so this is a
+/// compile-time constant — the per-band temporaries then stay a fixed size,
+/// scaling with neither recovery rows nor threads, which is what
+/// [`factor_workspace_bytes`] promises.
+const COEFF_ROWS: usize = 16;
+
+/// Byte ranges of one stripe in `tile_bytes` steps, last range short.
+///
+/// `aligned_len` is a multiple of the kernel stride and every tile constant is
+/// a multiple of every stride in the ladder, so every emitted range is
+/// stride-aligned — which is what lets the split-layout and word-wise kernels
+/// be invoked per tile at all.
+fn stripe_tiles(aligned_len: usize, tile_bytes: usize) -> impl Iterator<Item = (usize, usize)> {
+    let tile = tile_bytes.min(aligned_len).max(1);
+    (0..aligned_len)
+        .step_by(tile)
+        .map(move |start| (start, tile.min(aligned_len - start)))
+}
+
 #[derive(Clone, Copy)]
 struct KernelContract {
     stride: usize,
     input_grouping: usize,
+    tile_bytes: usize,
 }
 
 impl KernelContract {
@@ -649,16 +739,37 @@ impl KernelContract {
             ResolvedKernel::Portable | ResolvedKernel::Simd => Self {
                 stride: 2,
                 input_grouping: DEFAULT_INPUT_GROUPING,
+                tile_bytes: family_tile_bytes(TABLE_TILE_BYTES, 2),
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::Folded => Self {
                 stride: gf_simd::SPLIT_BLOCK_BYTES,
                 input_grouping: DEFAULT_INPUT_GROUPING,
+                // The folded arm dispatches to the affine kernel exactly when
+                // GFNI is usable and to the shuffle tables otherwise; that is
+                // the same availability answer the arm itself branches on, so
+                // the tile follows the kernel that will actually run.
+                tile_bytes: family_tile_bytes(
+                    if gf_simd::folded_uses_gfni() {
+                        AFFINE_TILE_BYTES
+                    } else {
+                        TABLE_TILE_BYTES
+                    },
+                    gf_simd::SPLIT_BLOCK_BYTES,
+                ),
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::XorJit(width) => Self {
                 stride: width.block_bytes(),
                 input_grouping: DEFAULT_INPUT_GROUPING,
+                // Untiled by family contract, for two structural reasons that
+                // are properties of the packed XOR-JIT method rather than of
+                // any particular CPU: `PackedRun` addresses source region `r`
+                // at `src + r * len`, so a sub-range of the stripe is not
+                // expressible without re-laying-out staging; and each output
+                // row's generated code is built per call, so a tile loop would
+                // multiply code generation by the tile count.
+                tile_bytes: UNTILED,
             },
         }
     }
@@ -681,7 +792,15 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
             row,
             checked_add(
                 checked_mul(
-                    DEFAULT_INPUT_GROUPING,
+                    // One row chunk's prepared factors, not one row's: the tile
+                    // loop runs inside a chunk of `COEFF_ROWS` rows so no row's
+                    // coefficients are rebuilt per tile. A compile-time count,
+                    // so this still scales with neither rows nor threads.
+                    checked_mul(
+                        COEFF_ROWS,
+                        DEFAULT_INPUT_GROUPING,
+                        "prepared factor allocation overflow",
+                    )?,
                     size_of::<gf_simd::PreparedInputFactor>(),
                     "prepared factor allocation overflow",
                 )?,
@@ -697,13 +816,19 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
         #[cfg(target_arch = "x86_64")]
         ResolvedKernel::Folded => {
             let groups = DEFAULT_INPUT_GROUPING / gf_simd::FOLDED_GROUP;
-            let affine_tables = checked_mul(
+            // One row chunk's tables, not one row's; see the SIMD arm above.
+            let chunk_lanes = checked_mul(
+                COEFF_ROWS,
                 DEFAULT_INPUT_GROUPING,
+                "folded table allocation overflow",
+            )?;
+            let affine_tables = checked_mul(
+                chunk_lanes,
                 size_of::<gf_simd::AffineMulMatrices>(),
                 "folded affine table allocation overflow",
             )?;
             let shuffle_tables = checked_mul(
-                DEFAULT_INPUT_GROUPING,
+                chunk_lanes,
                 size_of::<gf_simd::Shuffle2xTables>(),
                 "folded shuffle table allocation overflow",
             )?;
@@ -741,9 +866,11 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
         #[cfg(target_arch = "x86_64")]
         ResolvedKernel::XorJit(_) => row,
     };
-    // Per-band kernel temporaries (~2 KiB each) are deliberately excluded:
-    // this value feeds Par2MemoryPlan.factor_workspace_bytes, which must not
-    // scale with recovery-row or band count.
+    // This counts ONE band's coefficient storage. The other bands' copies are
+    // deliberately excluded: this value feeds
+    // Par2MemoryPlan.factor_workspace_bytes, which must not scale with
+    // recovery-row or band count, and every term above is a compile-time
+    // quantity for exactly that reason.
     checked_add(constants, active, "factor workspace allocation overflow")
 }
 
@@ -760,6 +887,49 @@ fn jit_workspace_bytes(kernel: ResolvedKernel) -> Result<(usize, usize)> {
     }
     let _ = kernel;
     Ok((0, 0))
+}
+
+/// Optional cache-oriented cap on one stripe's working set, in MiB, from
+/// `WEAVER_PAR2_CREATE_STRIPE_MIB`. Unset or `0` keeps the shipped behavior:
+/// [`BufferPlan`] takes the largest chunk the caller's memory budget allows.
+///
+/// Why the hatch exists, and why it is not the default. The recovery-output
+/// stripe (`output_count * aligned_chunk_len`) is read and written once per
+/// *input batch*, so a stripe larger than the last-level cache makes every
+/// batch re-stream all of it from memory; capping the stripe is what decouples
+/// the chunk from `physical_memory / 8`. Measured both ways, same corpus
+/// (128 MiB over 2048 input slices, 410 recovery slices, 64 KiB slice),
+/// shipped default vs this cap at 8 MiB:
+///
+/// - 12th-gen mobile x86 (12 MB L3, GFNI-folded path): 3.96 -> 3.31 CPU-s and
+///   0.52 -> 0.42 s wall. The cache effect is real and large.
+/// - Apple-silicon aarch64 (18 threads, NEON/CLMUL path): 3.03 -> 4.19 CPU-s.
+///   The chunk size itself costs nothing there — with banding off
+///   (`WEAVER_PAR2_CREATE_THREADS=1`) the two budgets are indistinguishable
+///   (2.12 vs 2.14 user-s, 0.05 vs 0.06 sys-s). The whole regression is the
+///   per-`(stripe, batch)` rayon dispatch, which the smaller chunk multiplies
+///   by the stripe count.
+///
+/// So the win is gated behind an implementation artifact, not a hardware
+/// property: while the parallel dispatch happens once per (stripe, batch)
+/// rather than once per stripe, shrinking the stripe trades memory traffic for
+/// thread wakeups, and which side wins is a property of the host's cache and
+/// its thread-park cost. Making a smaller stripe unconditionally right needs
+/// the staging area to hold the stripe for *all* sources so each band can walk
+/// the batches itself; that is a separate change, and this hatch is here so
+/// the cap can be re-measured on any host without a rebuild until then.
+///
+/// Process-stable, and read through the same function by both the encoder and
+/// [`estimate_forward_memory`], so a plan and the pass it admits always agree.
+fn configured_stripe_cap_bytes() -> Option<usize> {
+    static CONFIGURED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("WEAVER_PAR2_CREATE_STRIPE_MIB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&mib| mib != 0)
+            .and_then(|mib| mib.checked_mul(1024 * 1024))
+    })
 }
 
 struct BufferPlan {
@@ -795,6 +965,15 @@ impl BufferPlan {
                 "forward persistent allocations need {reserved_bytes} bytes, limit is {memory_limit}"
             ))
         })?;
+        // Unset by default, in which case this is exactly `stripe_memory_limit`
+        // and nothing below changes; see `configured_stripe_cap_bytes`. A
+        // tighter caller budget always still wins, and the cap is never allowed
+        // to reject a shape the caller's budget admits: the loop below falls
+        // back to `stripe_memory_limit` once the chunk cannot shrink further.
+        let chosen_stripe_limit = match configured_stripe_cap_bytes() {
+            Some(cap) => stripe_memory_limit.min(cap),
+            None => stripe_memory_limit,
+        };
         let mut chunk_len = if slice_size >= contract.stride {
             slice_size - slice_size % contract.stride
         } else {
@@ -844,7 +1023,9 @@ impl BufferPlan {
                 )?,
                 "forward buffer allocation overflow",
             )?;
-            if data_bytes <= stripe_memory_limit {
+            if data_bytes <= chosen_stripe_limit
+                || (chunk_len <= 2 && data_bytes <= stripe_memory_limit)
+            {
                 return Ok(Self {
                     chunk_len: chunk_len.min(slice_size),
                     aligned_chunk_len,
@@ -867,7 +1048,7 @@ impl BufferPlan {
             }
             let bytes_per_aligned_byte = data_bytes / aligned_chunk_len;
             let max_aligned_len =
-                (stripe_memory_limit / bytes_per_aligned_byte) / contract.stride * contract.stride;
+                (chosen_stripe_limit / bytes_per_aligned_byte) / contract.stride * contract.stride;
             let smaller_chunk_len = chunk_len.saturating_sub(contract.stride).max(2);
             chunk_len = max_aligned_len.max(2).min(smaller_chunk_len);
         }
@@ -970,6 +1151,9 @@ fn auto_kernel_candidates(capabilities: KernelCapabilities) -> Vec<ResolvedKerne
 }
 
 struct FactorSource {
+    /// PAR2 input-slice constants, one per source block. Every entry is an
+    /// antilog value and therefore nonzero, which is what lets
+    /// [`RowFactors::fill_row`] use the log form of `gf::pow` unconditionally.
     constants: Vec<u16>,
 }
 
@@ -980,16 +1164,38 @@ impl FactorSource {
         }
     }
 
-    fn fill_row(
-        &self,
-        exponent: RecoveryExponent,
-        source_start: usize,
-        live_inputs: usize,
-        row: &mut [u16; DEFAULT_INPUT_GROUPING],
-    ) {
+    /// Bind one input group's constants for a whole band of output rows.
+    ///
+    /// The discrete logs are the only part of `base^exponent` that depends on
+    /// the source rather than the output row, so taking them once per (band,
+    /// input group) removes `live_inputs` lookups into the 128 KiB log table
+    /// from every output row — table traffic that also evicts the streaming
+    /// kernel's working set.
+    fn row_factors(&self, source_start: usize, live_inputs: usize) -> RowFactors {
+        let mut logs = [0u16; DEFAULT_INPUT_GROUPING];
+        for (lane, log) in logs[..live_inputs].iter_mut().enumerate() {
+            let constant = self.constants[source_start + lane];
+            debug_assert_ne!(constant, 0, "input slice constants are never zero");
+            *log = gf::log(constant);
+        }
+        RowFactors { logs, live_inputs }
+    }
+}
+
+/// One input group's per-source discrete logs, reused across a band's rows.
+struct RowFactors {
+    logs: [u16; DEFAULT_INPUT_GROUPING],
+    live_inputs: usize,
+}
+
+impl RowFactors {
+    fn fill_row(&self, exponent: RecoveryExponent, row: &mut [u16; DEFAULT_INPUT_GROUPING]) {
         row.fill(0);
-        for (lane, factor) in row[..live_inputs].iter_mut().enumerate() {
-            *factor = gf::pow(self.constants[source_start + lane], exponent);
+        for (factor, &log) in row[..self.live_inputs]
+            .iter_mut()
+            .zip(self.logs[..self.live_inputs].iter())
+        {
+            *factor = gf::pow_from_log(log, exponent);
         }
     }
 }
@@ -1268,108 +1474,169 @@ fn accumulate_band(
 ) -> Result<()> {
     let staging_bytes = staging.as_bytes();
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = contract;
-    #[cfg(not(target_arch = "x86_64"))]
     let _ = jit_code_budget;
+    // An empty batch has no coefficients to build and no sources to read; the
+    // per-arm row assembly below indexes lane 0 unconditionally.
+    if live_inputs == 0 {
+        return Ok(());
+    }
     let mut row = [0u16; DEFAULT_INPUT_GROUPING];
     match kernel {
         ResolvedKernel::Portable => {
-            for (output_index, &exponent) in exponents.iter().enumerate() {
-                factors.fill_row(exponent, source_start, live_inputs, &mut row);
-                let dst_start = output_index * output_stride;
-                scalar_accumulate(
-                    &mut output[dst_start..dst_start + aligned_len],
-                    staging_bytes,
-                    &row,
-                    live_inputs,
-                    aligned_len,
-                );
+            let row_factors = factors.row_factors(source_start, live_inputs);
+            let mut rows = [[0u16; DEFAULT_INPUT_GROUPING]; COEFF_ROWS];
+            for (chunk_index, chunk) in exponents.chunks(COEFF_ROWS).enumerate() {
+                for (slot, &exponent) in rows.iter_mut().zip(chunk) {
+                    row_factors.fill_row(exponent, slot);
+                }
+                let first_output = chunk_index * COEFF_ROWS;
+                for (tile_start, tile_len) in stripe_tiles(aligned_len, contract.tile_bytes) {
+                    for (offset, row) in rows[..chunk.len()].iter().enumerate() {
+                        let dst_start = (first_output + offset) * output_stride + tile_start;
+                        scalar_accumulate(
+                            &mut output[dst_start..dst_start + tile_len],
+                            &staging_bytes[tile_start..],
+                            aligned_len,
+                            row,
+                            live_inputs,
+                            tile_len,
+                        );
+                    }
+                }
             }
         }
         ResolvedKernel::Simd => {
-            // Reused across output rows: the factors differ per row but the
-            // capacity does not, so the row loop rebuilds contents instead of
-            // reallocating.
-            let mut prepared: Vec<gf_simd::PreparedInputFactor> = Vec::with_capacity(live_inputs);
-            for (output_index, &exponent) in exponents.iter().enumerate() {
-                factors.fill_row(exponent, source_start, live_inputs, &mut row);
+            // One allocation for the whole band: the factors differ per row but
+            // the capacity does not, so each row chunk rebuilds contents.
+            let mut prepared: Vec<gf_simd::PreparedInputFactor> =
+                Vec::with_capacity(COEFF_ROWS * live_inputs);
+            let row_factors = factors.row_factors(source_start, live_inputs);
+            for (chunk_index, chunk) in exponents.chunks(COEFF_ROWS).enumerate() {
                 prepared.clear();
-                prepared.extend(
-                    row[..live_inputs]
-                        .iter()
-                        .map(|&factor| gf_simd::prepare_input_factor(factor)),
-                );
-                let dst_start = output_index * output_stride;
-                let mut inputs = Vec::with_capacity(live_inputs);
-                for (lane, prepared_factor) in prepared.iter().enumerate() {
-                    let source_start_bytes = lane * aligned_len;
-                    inputs.push(PreparedFactorSrc {
-                        prepared: prepared_factor,
-                        src: &staging_bytes[source_start_bytes..source_start_bytes + aligned_len],
-                    });
+                for &exponent in chunk {
+                    row_factors.fill_row(exponent, &mut row);
+                    prepared.extend(
+                        row[..live_inputs]
+                            .iter()
+                            .map(|&factor| gf_simd::prepare_input_factor(factor)),
+                    );
                 }
-                gf_simd::mul_acc_input_batch_prepared(
-                    &mut output[dst_start..dst_start + aligned_len],
-                    &inputs,
-                );
+                let first_output = chunk_index * COEFF_ROWS;
+                for (tile_start, tile_len) in stripe_tiles(aligned_len, contract.tile_bytes) {
+                    for offset in 0..chunk.len() {
+                        let dst_start = (first_output + offset) * output_stride + tile_start;
+                        let row_base = offset * live_inputs;
+                        // Stack-resident: `live_inputs <=
+                        // DEFAULT_INPUT_GROUPING`, so the descriptor list never
+                        // needs the heap. Building it per row used to cost one
+                        // allocate/free pair per (output row, input group) —
+                        // 3.3M of them on the 4096×819 create shape.
+                        let inputs: [PreparedFactorSrc<'_>; DEFAULT_INPUT_GROUPING] =
+                            std::array::from_fn(|lane| {
+                                let clamped = lane.min(live_inputs - 1);
+                                let source_start_bytes = clamped * aligned_len + tile_start;
+                                PreparedFactorSrc {
+                                    prepared: &prepared[row_base + clamped],
+                                    src: &staging_bytes
+                                        [source_start_bytes..source_start_bytes + tile_len],
+                                }
+                            });
+                        gf_simd::mul_acc_input_batch_prepared(
+                            &mut output[dst_start..dst_start + tile_len],
+                            &inputs[..live_inputs],
+                        );
+                    }
+                }
             }
         }
         #[cfg(target_arch = "x86_64")]
         ResolvedKernel::Folded => {
             let groups = contract.input_grouping / gf_simd::FOLDED_GROUP;
-            let staging_views = (0..groups)
-                .map(|group| {
-                    let start = group * gf_simd::FOLDED_GROUP * aligned_len;
-                    &staging_bytes[start..start + gf_simd::FOLDED_GROUP * aligned_len]
-                })
-                .collect::<Vec<_>>();
-            let mut affine = Vec::with_capacity(live_inputs);
-            let mut shuffle2x = Vec::with_capacity(live_inputs);
-            for (output_index, &exponent) in exponents.iter().enumerate() {
-                factors.fill_row(exponent, source_start, live_inputs, &mut row);
-                let dst_start = output_index * output_stride;
-                if gf_simd::folded_uses_gfni() {
-                    affine.clear();
-                    affine.extend(
-                        row[..live_inputs]
-                            .iter()
-                            .map(|&factor| gf_simd::precompute_affine_matrices(factor)),
-                    );
-                    let matrix_sets = (0..groups)
-                        .map(|group| {
-                            std::array::from_fn(|lane| {
-                                let source_index = group * gf_simd::FOLDED_GROUP + lane;
-                                affine.get(source_index).unwrap_or(&gf_simd::ZERO_AFFINE)
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    gf_simd::mul_acc_folded_batch(
-                        &mut output[dst_start..dst_start + aligned_len],
-                        &staging_views,
-                        &matrix_sets,
-                    );
-                } else {
-                    shuffle2x.clear();
-                    shuffle2x.extend(
-                        row[..live_inputs]
-                            .iter()
-                            .map(|&factor| gf_simd::precompute_shuffle2x_tables(factor)),
-                    );
-                    let table_sets = (0..groups)
-                        .map(|group| {
-                            std::array::from_fn(|lane| {
-                                let source_index = group * gf_simd::FOLDED_GROUP + lane;
-                                shuffle2x
-                                    .get(source_index)
-                                    .unwrap_or(&gf_simd::ZERO_SHUFFLE2X)
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    gf_simd::mul_acc_shuffle2x_batch(
-                        &mut output[dst_start..dst_start + aligned_len],
-                        &staging_views,
-                        &table_sets,
-                    );
+            if groups > MAX_FOLDED_GROUPS {
+                return Err(invalid_input(
+                    "folded input grouping exceeds the reserved group count",
+                ));
+            }
+            let mut affine = Vec::with_capacity(COEFF_ROWS * live_inputs);
+            let mut shuffle2x = Vec::with_capacity(COEFF_ROWS * live_inputs);
+            // Hoisted: a process-wide capability answer, not a per-row one.
+            let uses_gfni = gf_simd::folded_uses_gfni();
+            let row_factors = factors.row_factors(source_start, live_inputs);
+            // Rebuilt per tile, not per (tile, output row): the views only
+            // depend on where the tile starts.
+            let mut staging_views: Vec<&[u8]> = Vec::with_capacity(groups);
+            for (chunk_index, chunk) in exponents.chunks(COEFF_ROWS).enumerate() {
+                affine.clear();
+                shuffle2x.clear();
+                for &exponent in chunk {
+                    row_factors.fill_row(exponent, &mut row);
+                    if uses_gfni {
+                        affine.extend(
+                            row[..live_inputs]
+                                .iter()
+                                .map(|&factor| gf_simd::precompute_affine_matrices(factor)),
+                        );
+                    } else {
+                        shuffle2x.extend(
+                            row[..live_inputs]
+                                .iter()
+                                .map(|&factor| gf_simd::precompute_shuffle2x_tables(factor)),
+                        );
+                    }
+                }
+                let first_output = chunk_index * COEFF_ROWS;
+                for (tile_start, tile_len) in stripe_tiles(aligned_len, contract.tile_bytes) {
+                    staging_views.clear();
+                    staging_views.extend((0..groups).map(|group| {
+                        // Within a group the six lanes are interleaved by
+                        // `SPLIT_BLOCK_BYTES` blocks, so the tile that starts at
+                        // logical byte `tile_start` of every lane starts at
+                        // `tile_start * FOLDED_GROUP` of the interleaved stream.
+                        let start = group * gf_simd::FOLDED_GROUP * aligned_len
+                            + tile_start * gf_simd::FOLDED_GROUP;
+                        &staging_bytes[start..start + gf_simd::FOLDED_GROUP * tile_len]
+                    }));
+                    for offset in 0..chunk.len() {
+                        let dst_start = (first_output + offset) * output_stride + tile_start;
+                        let row_base = offset * live_inputs;
+                        if uses_gfni {
+                            // Stack-resident for the same reason as the SIMD
+                            // arm's descriptor list: `groups` is bounded by the
+                            // compile-time input grouping, so the reference
+                            // table costs no allocator traffic per output row.
+                            let matrix_sets: [[&gf_simd::AffineMulMatrices; gf_simd::FOLDED_GROUP];
+                                MAX_FOLDED_GROUPS] = std::array::from_fn(|group| {
+                                std::array::from_fn(|lane| {
+                                    let source_index = group * gf_simd::FOLDED_GROUP + lane;
+                                    affine
+                                        .get(row_base + source_index)
+                                        .filter(|_| source_index < live_inputs)
+                                        .unwrap_or(&gf_simd::ZERO_AFFINE)
+                                })
+                            });
+                            gf_simd::mul_acc_folded_batch(
+                                &mut output[dst_start..dst_start + tile_len],
+                                &staging_views,
+                                &matrix_sets[..groups],
+                            );
+                        } else {
+                            let table_sets: [[&gf_simd::Shuffle2xTables; gf_simd::FOLDED_GROUP];
+                                MAX_FOLDED_GROUPS] = std::array::from_fn(|group| {
+                                std::array::from_fn(|lane| {
+                                    let source_index = group * gf_simd::FOLDED_GROUP + lane;
+                                    shuffle2x
+                                        .get(row_base + source_index)
+                                        .filter(|_| source_index < live_inputs)
+                                        .unwrap_or(&gf_simd::ZERO_SHUFFLE2X)
+                                })
+                            });
+                            gf_simd::mul_acc_shuffle2x_batch(
+                                &mut output[dst_start..dst_start + tile_len],
+                                &staging_views,
+                                &table_sets[..groups],
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1379,8 +1646,15 @@ fn accumulate_band(
             // any sink mutation. A later W^X/code-generation or execution
             // error is terminal for this pass; it is not a post-admission
             // tier downgrade.
+            //
+            // No tile loop here: this family consumes the whole stripe per
+            // call by contract (see `KernelContract::for_kernel`), and the
+            // `PackedRun` below encodes that by taking `aligned_len` as both
+            // the run length and the source region stride.
+            debug_assert_eq!(contract.tile_bytes, UNTILED);
+            let row_factors = factors.row_factors(source_start, live_inputs);
             for (output_index, &exponent) in exponents.iter().enumerate() {
-                factors.fill_row(exponent, source_start, live_inputs, &mut row);
+                row_factors.fill_row(exponent, &mut row);
                 let row_refs = [&row[..]];
                 let batch = jit_workspace
                     .build(width, &row_refs, jit_code_budget.max(1))
@@ -1415,11 +1689,23 @@ fn accumulate_band(
     Ok(())
 }
 
-fn scalar_accumulate(dst: &mut [u8], staging: &[u8], row: &[u16], live_inputs: usize, len: usize) {
+/// Word-wise accumulate of one tile.
+///
+/// `staging` starts at the tile's first byte of lane 0 and `staging_stride` is
+/// the distance between lanes in the whole stripe, which is the stripe length
+/// rather than the tile length whenever the stripe is tiled.
+fn scalar_accumulate(
+    dst: &mut [u8],
+    staging: &[u8],
+    staging_stride: usize,
+    row: &[u16],
+    live_inputs: usize,
+    len: usize,
+) {
     for word in 0..len / 2 {
         let mut value = u16::from_le_bytes([dst[word * 2], dst[word * 2 + 1]]);
         for (lane, &factor) in row.iter().take(live_inputs).enumerate() {
-            let source_offset = lane * len + word * 2;
+            let source_offset = lane * staging_stride + word * 2;
             let source = u16::from_le_bytes([staging[source_offset], staging[source_offset + 1]]);
             value ^= gf::mul(source, factor);
         }
@@ -1788,6 +2074,223 @@ mod tests {
                 "kernel {requested:?} banded output differs from sequential"
             );
         }
+    }
+
+    /// Every emitted tile is stride-aligned and the ranges tile the stripe
+    /// exactly once, including a stripe that is not a whole number of tiles.
+    #[test]
+    fn stripe_tiles_cover_the_stripe_exactly() {
+        for (aligned_len, tile) in [
+            (4096usize, 4096usize),
+            (4096, 8192),
+            (4096, UNTILED),
+            (10 * 1024, 4096),
+            (32, 4096),
+            (0, 4096),
+        ] {
+            let ranges: Vec<(usize, usize)> = stripe_tiles(aligned_len, tile).collect();
+            let mut next = 0usize;
+            for (start, len) in &ranges {
+                assert_eq!(*start, next, "tiles are contiguous");
+                assert!(*len > 0 && *len <= tile.min(aligned_len).max(1));
+                next += len;
+            }
+            assert_eq!(next, aligned_len, "tiles cover the stripe");
+            if aligned_len > 0 {
+                // Only the final tile may be short.
+                for (_, len) in &ranges[..ranges.len() - 1] {
+                    assert_eq!(*len, tile.min(aligned_len));
+                }
+            }
+        }
+    }
+
+    /// Tiling one in-memory stripe is a pure loop transformation: for every
+    /// runtime kernel whose family is tiled, the accumulated bytes must not
+    /// depend on the tile size, including tiles that do not divide the stripe.
+    #[test]
+    fn stripe_tiling_matches_untiled_accumulation() {
+        const SLICE: usize = 40 * 1024;
+        let sources: Vec<Vec<u8>> = (0..14usize)
+            .map(|source| {
+                (0..SLICE)
+                    .map(|index| (index.wrapping_mul(31) ^ (source * 131)) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let exponents: Vec<RecoveryExponent> = vec![0, 1, 2, 7, 31];
+        for requested in ForwardEncoder::available_kernels() {
+            let resolved =
+                resolve_kernel_with_capabilities(requested, runtime_kernel_capabilities())
+                    .expect("advertised kernels resolve");
+            let base = KernelContract::for_kernel(resolved);
+            if base.tile_bytes == UNTILED {
+                continue;
+            }
+            let aligned_len = round_up(SLICE, base.stride).unwrap();
+            let (_, jit_build_limit) = jit_workspace_bytes(resolved).unwrap();
+            let mut passes = Vec::new();
+            for tile_bytes in [UNTILED, 8192, 4096, 96, base.stride] {
+                let contract = KernelContract { tile_bytes, ..base };
+                let mut provider = InMemorySourceProvider { sources: &refs };
+                let mut staging = AlignedBuffer::new(contract.input_grouping * aligned_len);
+                let mut transfer = AlignedBuffer::new(aligned_len);
+                fill_staging(
+                    resolved,
+                    &mut staging,
+                    &mut transfer,
+                    &mut provider,
+                    0,
+                    0,
+                    SLICE,
+                    aligned_len,
+                    contract,
+                )
+                .unwrap();
+                let factors = FactorSource::new(refs.len());
+                let mut output = AlignedBuffer::new(exponents.len() * aligned_len);
+                #[cfg(target_arch = "x86_64")]
+                let mut jit_workspaces: Vec<
+                    reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+                > = vec![Default::default()];
+                accumulate_batch(
+                    resolved,
+                    output.as_bytes_mut(),
+                    &staging,
+                    &factors,
+                    &exponents,
+                    0,
+                    contract.input_grouping.min(refs.len()),
+                    aligned_len,
+                    aligned_len,
+                    contract,
+                    exponents.len(),
+                    #[cfg(target_arch = "x86_64")]
+                    &mut jit_workspaces,
+                    jit_build_limit.max(1),
+                )
+                .unwrap();
+                finish_output(
+                    resolved,
+                    output.as_bytes_mut(),
+                    aligned_len,
+                    aligned_len,
+                    exponents.len(),
+                    exponents.len(),
+                )
+                .unwrap();
+                passes.push(output.as_bytes().to_vec());
+            }
+            for (index, pass) in passes.iter().enumerate().skip(1) {
+                assert_eq!(
+                    *pass, passes[0],
+                    "kernel {requested:?} tiling pass {index} differs from the untiled pass"
+                );
+            }
+        }
+    }
+
+    /// The order in which the encode feed asks for source bytes, which is what
+    /// decides whether a hash can be driven from inside it.
+    ///
+    /// Within one stripe the feed walks sources in increasing index, and each
+    /// source's bytes arrive in increasing offset across stripes — so a
+    /// PER-SLICE digest can be carried across stripes and fused into the feed.
+    /// A PER-FILE digest cannot unless the pass is single-stripe: with more
+    /// than one stripe the order is stripe-major (every source's first chunk,
+    /// then every source's second chunk), never file order. This test pins that
+    /// distinction, because "hash from the encode feed" is only correct for the
+    /// file MD5 while `chunk_len == slice_size`.
+    #[test]
+    fn the_feed_is_stripe_major_once_a_slice_needs_more_than_one_stripe() {
+        struct Recorder<'a> {
+            sources: &'a [&'a [u8]],
+            reads: Vec<(usize, usize)>,
+        }
+        impl ForwardSourceProvider for Recorder<'_> {
+            fn source_count(&self) -> usize {
+                self.sources.len()
+            }
+            fn source_slice_len(&self, source_index: usize) -> Result<usize> {
+                Ok(self.sources[source_index].len())
+            }
+            fn read_source_chunk(
+                &mut self,
+                source_index: usize,
+                offset: usize,
+                destination: &mut [u8],
+            ) -> Result<usize> {
+                if source_index < self.sources.len() {
+                    self.reads.push((source_index, offset));
+                }
+                let source = self.sources[source_index];
+                let start = offset.min(source.len());
+                let take = destination.len().min(source.len() - start);
+                destination[..take].copy_from_slice(&source[start..start + take]);
+                Ok(take)
+            }
+        }
+
+        const SLICE: usize = 4096;
+        let sources: Vec<Vec<u8>> = (0..3usize).map(|s| vec![s as u8 + 1; SLICE]).collect();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoder = ForwardEncoder::new(SLICE, vec![0, 1]).unwrap();
+
+        // A budget that admits the whole slice: one stripe, so every source is
+        // delivered start to end before the next one begins — file order.
+        let mut single = Recorder {
+            sources: &refs,
+            reads: Vec::new(),
+        };
+        let mut sink = VecRecoverySink::new(&[0, 1], SLICE);
+        encoder
+            .encode_to(
+                &mut single,
+                &ForwardEncoderOptions {
+                    memory_limit: Some(4 * 1024 * 1024),
+                    ..ForwardEncoderOptions::default()
+                },
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            single.reads,
+            vec![(0, 0), (1, 0), (2, 0)],
+            "a single-stripe feed must deliver each source once, whole"
+        );
+
+        // A budget that forces the slice into several stripes: the same source
+        // is now revisited at a later offset only after every other source has
+        // been served at the earlier one.
+        let mut split = Recorder {
+            sources: &refs,
+            reads: Vec::new(),
+        };
+        let mut sink = VecRecoverySink::new(&[0, 1], SLICE);
+        encoder
+            .encode_to(
+                &mut split,
+                &ForwardEncoderOptions {
+                    memory_limit: Some(32 * 1024),
+                    ..ForwardEncoderOptions::default()
+                },
+                &mut sink,
+            )
+            .unwrap();
+        let offsets: Vec<usize> = split.reads.iter().map(|&(_, offset)| offset).collect();
+        assert!(
+            offsets.iter().any(|&offset| offset > 0),
+            "the tight budget must split the slice into stripes"
+        );
+        assert!(
+            split
+                .reads
+                .windows(2)
+                .any(|pair| pair[0].0 > pair[1].0 && pair[1].1 > pair[0].1),
+            "a multi-stripe feed is stripe-major: {:?}",
+            split.reads
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2188,6 +2691,7 @@ mod tests {
             KernelContract {
                 stride: 32,
                 input_grouping: DEFAULT_INPUT_GROUPING,
+                tile_bytes: TABLE_TILE_BYTES,
             },
             1,
             0,
@@ -2257,6 +2761,7 @@ mod tests {
             KernelContract {
                 stride: 2,
                 input_grouping: DEFAULT_INPUT_GROUPING,
+                tile_bytes: TABLE_TILE_BYTES,
             },
         )
         .unwrap();

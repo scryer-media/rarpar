@@ -32,43 +32,45 @@ writing, compression, or modification APIs.
 
 ## Performance
 
-`rarpar` uses the same RAR and PAR2 engines benchmarked in Weaver. The charts
-below are deterministic end-to-end runs from the `rarpar-bench` corpus — one
+Deterministic end-to-end runs from the 43-case `rarpar-bench` corpus — one
 warmup, seven measured runs, byte-validated output — against reference
-UnRAR 7.23 and `par2cmdline-turbo 1.4.0`, using shipped-style portable
-release builds, not benchmark-only binaries. Results are shape-specific;
-archive content, storage, and CPU features matter. Release builds use
-AWS-LC-backed native crypto and CPU execution only. This keeps startup
-behavior consistent across supported platforms; `rarpar` deliberately does
-not enable optional GPU backends from its underlying PAR2 library. The Metal
-chart measures the PAR2 library's optional `metal` feature for comparison.
-Click any chart to open it full size.
+UnRAR and `par2cmdline-turbo 1.4.0`, using shipped-style portable release
+builds rather than benchmark-only binaries.
 
-**RAR extraction**
+Each cell is the **geometric mean** of `reference wall time / rarpar wall
+time` over that workload class, so `2.0×` means `rarpar` finished in half the
+time.
 
-[![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+| CPU | Arch | Instruction set | unrar (binary) | unrar (text) | par2 (heavy) |
+|---|---|---|---:|---:|---:|
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 1.8× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× | 1.7× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× | 1.9× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.5× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.3× |
+| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× | 7.1× |
+| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× | 1.2× |
+| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× | 1.4× |
+| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× | 1.5× |
 
-[![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
+**unrar (binary)** is store-mode extraction — uncompressible media payloads,
+including the encrypted and BLAKE2sp variants; this is the dominant
+real-world shape by data volume. **unrar (text)** is compressed extraction
+across the LZ and PPMd decode paths, including compressed machine code and
+the encrypted compressed cases; it includes PPMd, an archaic RAR4 mode that
+is deliberately left unoptimized and loses on every machine. **par2 (heavy)**
+is the two heavy-repair cases. The Apple row is the CPU lane; the optional
+Metal lane is charted in the deep dive.
 
-[![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
+The class geomeans above blend quiet cases with `rarpar`'s widest wins:
+**encrypted extraction runs 2.0×–10.7×** depending on silicon (encrypted
+store-mode reaches 6.1×–10.7× on Arm), inside classes that average lower.
+Per-case charts for every machine are in the
+[benchmark deep dive](docs/benchmark.md).
 
-[![RAR workloads on Intel Atom C3538 with Linux x86-64 and no AVX](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
-
-[![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
-
-**PAR2 verification, repair, and generation**
-
-[![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
-
-[![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
-
-[![PAR2 workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)
-
-[![PAR2 workloads on Intel Atom C3538 with Linux x86-64 and no AVX](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
-
-[![PAR2 CPU workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
-
-[![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+One caveat travels with this table: the macOS PAR2 figure is measured against
+upstream's published macOS arm64 reference binary, which is much slower than
+the same version's Linux and Windows builds. The deep dive explains it.
 
 Known weaker shapes remain: RAR4 PPMd and dense compressible-text archives
 trail the reference decoder, and PAR2 generation trails `par2cmdline-turbo`
@@ -76,6 +78,15 @@ trail the reference decoder, and PAR2 generation trails `par2cmdline-turbo`
 written recovery volume before commit, which the reference tool does not do.
 `rarpar` verifies repaired and extracted output rather than trusting
 timing-only success.
+
+Release builds use AWS-LC-backed native crypto and CPU execution only, which
+keeps startup behavior consistent across supported platforms; `rarpar`
+deliberately does not enable optional GPU backends from its underlying PAR2
+library.
+
+**Per-case charts for all nine machines, the full methodology, and the
+versions these numbers were measured with are in
+[docs/benchmark.md](docs/benchmark.md).**
 
 ## Install
 

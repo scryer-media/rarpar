@@ -125,6 +125,28 @@ pub fn pow(base: u16, exp: u32) -> u16 {
     tables.antilog_table[log_result as usize]
 }
 
+/// Discrete log base g of `value`.
+///
+/// Only meaningful for `value != 0`; `log(0)` returns the unused table slot.
+/// Exposed so callers that raise one fixed base to many exponents can hoist the
+/// lookup out of their inner loop and finish with [`pow_from_log`].
+#[inline]
+pub fn log(value: u16) -> u16 {
+    TABLES.log_table[value as usize]
+}
+
+/// `g^(log_base * exp)`: the tail of [`pow`] once the base's log is known.
+///
+/// Equivalent to `pow(base, exp)` for every nonzero `base` — including
+/// `exp == 0`, because `log_base * 0 == 0` and `antilog(0) == 1`. Callers
+/// holding a base that can be zero must keep using [`pow`].
+#[inline]
+pub fn pow_from_log(log_base: u16, exp: u32) -> u16 {
+    let tables = &*TABLES;
+    let log_result = (log_base as u64 * exp as u64) % ORDER as u64;
+    tables.antilog_table[log_result as usize]
+}
+
 /// Compute the PAR2 input slice constant assignment sequence.
 ///
 /// PAR2 assigns a 16-bit constant to each input slice. The constants are

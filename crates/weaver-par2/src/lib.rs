@@ -89,21 +89,30 @@
 //!
 //! # Benchmarks
 //!
-//! Relative-speed charts against `par2cmdline-turbo 1.4.0` from the
-//! deterministic `rarpar-bench` corpus (methodology in the crate README).
-//! Click any chart to open it full size.
+//! Heavy PAR2 repair against `par2cmdline-turbo 1.4.0`, from the deterministic
+//! 43-case `rarpar-bench` corpus. Each figure is the geometric mean of
+//! `reference wall time / rarpar wall time` over `par2-heavy-damage-28` and
+//! `par2-heavy-damage-250`, so `2.0x` means half the time.
 //!
-//! [![PAR2 workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
+//! | CPU | Arch | Instruction set | par2 (heavy) |
+//! |---|---|---|---:|
+//! | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 1.8x |
+//! | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.7x |
+//! | Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.9x |
+//! | AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.5x |
+//! | Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.3x |
+//! | Apple M5 Max | arm64 | NEON | 7.1x |
+//! | Arm Cortex-A72 | arm64 | NEON | 1.2x |
+//! | Arm Neoverse N1 | arm64 | NEON | 1.4x |
+//! | Arm Neoverse V2 | arm64 | NEON | 1.5x |
 //!
-//! [![PAR2 workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+//! The Apple row is the CPU lane, and is measured against upstream's published
+//! macOS arm64 reference binary, which is much slower than the same version's
+//! Linux and Windows builds; that lifts every macOS PAR2 figure.
 //!
-//! [![PAR2 workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-avx512.svg)
-//!
-//! [![PAR2 workloads on Intel Atom C3538 with Linux x86-64 and no AVX](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
-//!
-//! [![PAR2 CPU workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
-//!
-//! [![PAR2 Metal repair workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+//! Per-case charts for every machine, the full methodology, and the versions
+//! these numbers were measured with are in
+//! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 //!
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 

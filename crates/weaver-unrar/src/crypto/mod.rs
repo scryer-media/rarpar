@@ -979,6 +979,7 @@ const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 /// Copy a compile-time-constant `N`-byte window at `off`. Constant width, so
 /// this lowers to plain loads/stores — never a `memcpy` call.
 #[inline(always)]
+#[cfg(not(target_arch = "aarch64"))]
 fn cp<const N: usize>(dst: &mut [u8], src: &[u8], off: usize) {
     let chunk: [u8; N] = src[off..off + N]
         .try_into()

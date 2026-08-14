@@ -403,7 +403,7 @@ fn running_translated() -> bool {
             // A non-zero return (ENOENT on a genuine pre-Rosetta Intel Mac, where
             // the key does not exist) means "not translated"; only
             // proc_translated == 1 signals a Rosetta 2 (translated) process.
-            return rc == 0 && translated == 1;
+            rc == 0 && translated == 1
         }
 
         #[cfg(not(target_os = "macos"))]

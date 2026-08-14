@@ -945,9 +945,21 @@ fn run_fast_symbols<S: Rar4Sink>(
             let cache_idx = number - 259;
             let distance = state.dist_cache[cache_idx];
 
-            // Rotate cache.
-            for j in (1..=cache_idx).rev() {
-                state.dist_cache[j] = state.dist_cache[j - 1];
+            // Rotate cache with explicit fixed moves — a runtime-length shift
+            // loop lowers to a libc memmove via LLVM's loop-idiom pass (see
+            // lz/mod.rs promote_old_dist).
+            match cache_idx {
+                0 => {}
+                1 => state.dist_cache[1] = state.dist_cache[0],
+                2 => {
+                    state.dist_cache[2] = state.dist_cache[1];
+                    state.dist_cache[1] = state.dist_cache[0];
+                }
+                _ => {
+                    state.dist_cache[3] = state.dist_cache[2];
+                    state.dist_cache[2] = state.dist_cache[1];
+                    state.dist_cache[1] = state.dist_cache[0];
+                }
             }
             state.dist_cache[0] = distance;
 
@@ -3110,9 +3122,21 @@ impl Rar4LzDecoder {
                 let cache_idx = number - 259;
                 let distance = self.dist_cache[cache_idx];
 
-                // Rotate cache.
-                for j in (1..=cache_idx).rev() {
-                    self.dist_cache[j] = self.dist_cache[j - 1];
+                // Rotate cache with explicit fixed moves — a runtime-length
+                // shift loop lowers to a libc memmove via LLVM's loop-idiom
+                // pass (see lz/mod.rs promote_old_dist).
+                match cache_idx {
+                    0 => {}
+                    1 => self.dist_cache[1] = self.dist_cache[0],
+                    2 => {
+                        self.dist_cache[2] = self.dist_cache[1];
+                        self.dist_cache[1] = self.dist_cache[0];
+                    }
+                    _ => {
+                        self.dist_cache[3] = self.dist_cache[2];
+                        self.dist_cache[2] = self.dist_cache[1];
+                        self.dist_cache[1] = self.dist_cache[0];
+                    }
                 }
                 self.dist_cache[0] = distance;
 

@@ -580,7 +580,16 @@ fn checked_memory_mul(left: usize, right: usize, reason: &'static str) -> Result
         })
 }
 
-pub(crate) fn build_plan(options: &Par2CreatorOptions) -> Result<Par2CreatePlan> {
+/// Build a creation plan, optionally reusing the creator's source-scan memo.
+///
+/// `Par2Creator` passes the same memo to `plan()` and to `create()`, so the
+/// canonical rebuild inside `create()` re-validates every input by `stat` but
+/// reads and hashes only what actually changed since planning. `None` is the
+/// unmemoized behavior: every input is read and hashed.
+pub(crate) fn build_plan_with_cache(
+    options: &Par2CreatorOptions,
+    cache: Option<&super::source::SourceScanCache>,
+) -> Result<Par2CreatePlan> {
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
     }
@@ -611,6 +620,7 @@ pub(crate) fn build_plan(options: &Par2CreatorOptions) -> Result<Par2CreatePlan>
         &options.cancellation,
         options.progress.as_ref(),
         total_bytes,
+        cache,
     )?;
     sources.sort_by_key(|source| source.file_id);
     if options.cancellation.is_cancelled() {

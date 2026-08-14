@@ -15,10 +15,10 @@
 //!   serial BLAKE2sp (verified against `blake2s_simd::blake2sp` in tests).
 //!
 //!   How many leaves one worker owns is a policy choice — see
-//!   [`LEAVES_PER_WORKER`]. Today it is one scalar leaf per worker on every
-//!   arch; the 4-leaf NEON group arrangement exists (see
-//!   `crate::crypto::Blake2spLeafGroup`) but is deliberately unwired pending
-//!   group-kernel scaling work — the constant's comment carries the numbers.
+//!   [`LEAVES_PER_WORKER`]. On aarch64 each worker owns a 4-leaf group and
+//!   drives the in-crate NEON group kernel (2 vector workers); elsewhere it
+//!   is one scalar leaf per worker (8 workers). The constant's comment
+//!   carries the measured reasoning for both regimes.
 //!
 //! Pipelines spawn threads per instance, so callers should only use them for
 //! members large enough to amortize spawn cost (see [`PIPELINE_MIN_BYTES`]).
@@ -29,7 +29,10 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use blake2s_simd::Params as Blake2sParams;
+#[cfg(not(target_arch = "aarch64"))]
 use blake2s_simd::State as Blake2sState;
+#[cfg(target_arch = "aarch64")]
+use crate::crypto::GROUP_LEAVES;
 
 /// Chunk buffers cycled between the submitter and the hash workers.
 const CHUNK_CAPACITY: usize = 4 * 1024 * 1024;
@@ -422,6 +425,17 @@ impl CrcShiftOp {
 // rotate caps a worker near 3.5x of scalar, so the remaining gap is
 // structural, not schedulable. Reverted — do not re-attempt pairing
 // without a kernel shape that changes the per-worker instruction ceiling.
+// REVERSED 2026-08-14 (operator decision, concurrent-load evidence): the
+// wall-only reasoning above held only for one lone archive on an idle box.
+// Under K concurrent hash streams — the deployment shape — the group
+// arrangement wins aggregate throughput from K=4 (1.20x) and reaches 2.07x
+// at physical-core count, while its 2.2-2.3x lower CPU per byte holds under
+// load; scalar8 at high K oversubscribes (8 threads per stream). aarch64
+// only: the group kernel is 4-wide NEON; x86 keeps one scalar leaf per
+// worker until an x86 group kernel exists and is measured.
+#[cfg(target_arch = "aarch64")]
+const LEAVES_PER_WORKER: usize = GROUP_LEAVES;
+#[cfg(not(target_arch = "aarch64"))]
 const LEAVES_PER_WORKER: usize = 1;
 
 /// Number of BLAKE2sp worker threads (8 leaf workers, or 2 group workers).
@@ -433,15 +447,28 @@ const BLAKE_WORKER_SPAN: usize = LEAVES_PER_WORKER * BLAKE_BLOCK;
 
 /// The hash state one worker drives: a single BLAKE2s leaf, or this crate's
 /// 4-leaf NEON group. See [`LEAVES_PER_WORKER`].
+#[cfg(target_arch = "aarch64")]
+type BlakeWorkerState = crate::crypto::Blake2spLeafGroup;
+#[cfg(not(target_arch = "aarch64"))]
 type BlakeWorkerState = Blake2sState;
 
 /// Build worker `worker`'s state, covering the `LEAVES_PER_WORKER` leaves that
 /// start at `worker * LEAVES_PER_WORKER`.
+#[cfg(target_arch = "aarch64")]
+fn new_worker_state(worker: usize) -> BlakeWorkerState {
+    crate::crypto::Blake2spLeafGroup::new(worker)
+}
+#[cfg(not(target_arch = "aarch64"))]
 fn new_worker_state(worker: usize) -> BlakeWorkerState {
     blake2sp_leaf_params(worker).to_state()
 }
 
 /// Worker `worker`'s finished leaf digests, in leaf order.
+#[cfg(target_arch = "aarch64")]
+fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
+    state.finalize_leaves()
+}
+#[cfg(not(target_arch = "aarch64"))]
 fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(state.finalize().as_bytes());
@@ -589,6 +616,9 @@ fn walk_spans(
 /// aarch64 the workers are 4-leaf NEON groups that carry the same parameters
 /// internally, so there this is only the tests' independent statement of the
 /// tree parameters.
+// Live on non-aarch64 (scalar workers) and in the aarch64 test suite's
+// reference implementations; dead only in aarch64 non-test builds.
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 fn blake2sp_leaf_params(lane: usize) -> Blake2sParams {
     let mut params = Blake2sParams::new();
     params

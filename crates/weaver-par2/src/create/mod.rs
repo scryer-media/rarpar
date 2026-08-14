@@ -27,18 +27,27 @@ pub use volume::RecoveryVolumePlan;
 use crate::error::{Par2Error, Result};
 
 use self::output::write_outputs;
-use self::plan::build_plan;
+use self::plan::build_plan_with_cache;
 
 /// High-level PAR2 creator.
 #[derive(Clone)]
 pub struct Par2Creator {
     options: Par2CreatorOptions,
+    /// Source scan shared by this creator's `plan()` and `create()` calls, so
+    /// one creation reads and hashes its inputs once rather than once per
+    /// plan build. See [`self::source::SourceScanCache`] for what a reused
+    /// entry still re-validates. Clones share it: a clone is the same creator
+    /// over the same inputs, not a second opinion about them.
+    scan: std::sync::Arc<self::source::SourceScanCache>,
 }
 
 impl Par2Creator {
     /// Construct a creator from explicit source and output options.
     pub fn new(options: Par2CreatorOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            scan: std::sync::Arc::new(self::source::SourceScanCache::new()),
+        }
     }
 
     /// Borrow the options used by this creator.
@@ -48,7 +57,7 @@ impl Par2Creator {
 
     /// Validate inputs, hash sources, and allocate packets and output volumes.
     pub fn plan(&self) -> Result<Par2CreatePlan> {
-        build_plan(&self.options)
+        build_plan_with_cache(&self.options, Some(&self.scan))
     }
 
     /// Create the outputs described by a validated plan.
@@ -70,7 +79,11 @@ impl Par2Creator {
             &plan.sources,
             self.options.overwrite,
         )?;
-        let canonical = self::plan::build_plan(&self.options)?;
+        // Rebuilt from the current inputs, exactly as before: every path is
+        // resolved and stat'ed again and every derived quantity recomputed.
+        // What the memo removes is the second READ of bytes whose fingerprint
+        // has not moved since `plan()` produced them.
+        let canonical = self::plan::build_plan_with_cache(&self.options, Some(&self.scan))?;
         if plan != &canonical {
             return Err(Par2Error::InvalidCreationOptions {
                 reason: "creation plan differs from creator options or current inputs".to_string(),

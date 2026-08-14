@@ -85,6 +85,70 @@ fn create_validates_empty_files_and_writes_critical_set() {
     assert_eq!(set.recovery_block_count(), 0);
 }
 
+/// The creator memoizes its source scan between `plan()` and `create()`, so
+/// `create()` reads a source again only when a fresh `stat` says it moved.
+/// Every way a source can change that `stat` can see must still reach the
+/// "plan differs from current inputs" rejection, and must reach it for a
+/// creator that planned first (memo warm) exactly as for a fresh one.
+#[test]
+fn a_source_changed_after_planning_is_still_rejected_by_create() {
+    for (label, rewrite) in [
+        ("content and length", &[0x11u8; 512][..]),
+        ("content only", &[0x22u8; 400][..]),
+    ] {
+        let directory = tempdir().unwrap();
+        let data = directory.path().join("data.bin");
+        fs::write(&data, vec![0x5a; 400]).unwrap();
+
+        let mut options = Par2CreatorOptions::with_output(
+            directory.path().join("set"),
+            Some(directory.path().to_path_buf()),
+            vec![data.clone()],
+        );
+        options.block_sizing = BlockSizing::Bytes(16);
+        options.recovery_amount = RecoveryAmount::Count(2);
+
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        // A rewrite moves mtime (and, for the first case, the length), which
+        // is what the memo's fingerprint guard keys on.
+        fs::write(&data, rewrite).unwrap();
+        let error = creator.create(&plan).unwrap_err();
+        assert!(
+            matches!(error, Par2Error::InvalidCreationOptions { .. }),
+            "{label}: rewritten source was accepted: {error:?}"
+        );
+    }
+}
+
+/// Planning twice on one creator must answer identically to planning once on
+/// two creators: the memo is an implementation detail of where the bytes were
+/// read, never of what the plan says.
+#[test]
+fn a_memoized_replan_matches_a_cold_plan() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data.bin");
+    fs::write(&data, vec![0x5a; 4096]).unwrap();
+
+    let build = || {
+        let mut options = Par2CreatorOptions::with_output(
+            directory.path().join("set"),
+            Some(directory.path().to_path_buf()),
+            vec![data.clone()],
+        );
+        options.block_sizing = BlockSizing::Bytes(64);
+        options.recovery_amount = RecoveryAmount::Count(3);
+        options
+    };
+
+    let warm = Par2Creator::new(build());
+    let first = warm.plan().unwrap();
+    let second = warm.plan().unwrap();
+    let cold = Par2Creator::new(build()).plan().unwrap();
+    assert_eq!(first, second, "memoized replan differs from the first plan");
+    assert_eq!(first, cold, "memoized plan differs from a cold plan");
+}
+
 #[test]
 fn creation_rejects_all_empty_inputs() {
     let directory = tempdir().unwrap();

@@ -72,59 +72,27 @@ than adding it.
 
 ## Performance
 
-### rarpar release validation
+`2.0×` means `rarpar` finished in half the time:
 
-These deterministic end-to-end runs use the synthetic `rarpar-bench` corpus,
-one warmup, seven measured runs, CPU-only release builds, and SHA-256 output
-validation. They include CLI discovery and output handling as well as archive
-extraction, so they are release-workflow measurements rather than isolated
-decoder microbenchmarks.
+| CPU | Arch | Instruction set | unrar (binary) | unrar (text) |
+|---|---|---|---:|---:|
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× |
+| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× |
+| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× |
+| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× |
+| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× |
 
-[![RAR workloads on AMD Ryzen 5 3600 with Windows x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+`binary` is store-mode extraction (uncompressible media payloads, encrypted
+variants included); `text` is compressed extraction (LZ and PPMd). Encrypted
+extraction is the widest win: 2.0×–10.7× depending on silicon.
 
-[![RAR workloads on Intel Core i5-1240P with Linux x86-64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
-
-[![RAR workloads on AMD EPYC 9R14 with Linux x86-64 and AVX-512](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-avx512.svg)
-
-[![RAR workloads on Intel Atom C3538 with Linux x86-64 and no AVX](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
-
-[![RAR workloads on Apple M5 Max with macOS arm64](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](https://raw.githubusercontent.com/scryer-media/rarpar/main/crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
-
-### Broader library workloads
-
-Measured against `unrar 7.20` on archives built natively with `rar 7.20` (and
-`rar 6.24` for RAR4). Extraction includes full verification, and every output is
-byte-compared against the source payload. Warm-cache medians from release builds
-with shipped flags. Test machines: Apple M5 Max (macOS), Intel Core Ultra 9 285H
-(Ubuntu 24.04, P-core pinned), AMD Ryzen 5 3600 (Windows, Zen 2).
-
-Absolute times for the broader workload set:
-
-| Machine | Workload | unrar 7.20 | unrar-rs | |
-|---|---|---:|---:|---|
-| M5 Max | RAR7 video, 4.9 GB, 4.6 GB dictionary, `-m3` | 8.6 s | **5.8 s** | 1.5× |
-| M5 Max | RAR5 encrypted, AES-256 | 0.41 s | **0.25 s** | 1.6× |
-| M5 Max | RAR5 solid video, 225 MB | 0.27 s | **0.22 s** | 1.2× |
-| M5 Max | Store-mode verify, BLAKE2sp, 4.9 GB | 1.27 s | **0.76 s** | 1.7× |
-| M5 Max | RAR4 solid video *(CPU seconds)* | 1.21 s | **0.19 s** | 6× |
-| M5 Max | RAR4 PPMd solid text, 200 MB | **44.2 s** | 50.9 s | 0.87× |
-| 285H | RAR7 video, 4.9 GB, `-m3` | 17.7 s | **13.5 s** | 1.3× |
-| 285H | RAR5 encrypted, AES-256 | 0.83 s | **0.52 s** | 1.6× |
-| 285H | RAR5 solid video, 216 MB | 0.78 s | **0.54 s** | 1.4× |
-| 285H | RAR5 solid text, 157 MB | **1.52 s** | 2.98 s | 0.5× |
-| 285H | RAR4 PPMd solid text, 156 MB | **28.7 s** | 47.5 s | 0.6× |
-| Ryzen 5 3600 | RAR7 video, 4.94 GB, `-m3` | 13.5 s | 13.6 s | parity |
-| Ryzen 5 3600 | Store-mode verify, BLAKE2sp, 4.94 GB | 3.48 s | **1.80 s** | 1.9× |
-| Ryzen 5 3600 | Store-mode extract to disk, 4.94 GB | **3.28 s** | 5.0 s | 0.66× |
-
-Video, encrypted, and store-mode verification win. Compressible text and RAR4
-PPMd lose: PPMd keeps bounds checks where the reference uses raw pointers, and
-dense text is a tighter per-symbol Huffman loop upstream. Windows store-mode
-write-to-disk trails on the write path.
-
-Peak memory is archive-size-independent, roughly 275 MB on a 2.25 GB solid set
-(reference unrar MT: ~264 MB). Encrypted extraction costs almost nothing extra
-because AES runs through AWS-LC.
+Per-case charts for every machine, the full methodology, and the versions
+these numbers were measured with:
+[**rarpar benchmarks**](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 ## Provenance
 
