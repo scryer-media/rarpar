@@ -324,10 +324,29 @@ pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) 
         assert_eq!(fd.dst.len(), len, "all dst slices must match src length");
     }
 
+    // Same four-arm ladder as `mul_acc_input_batch`: widest available kernel
+    // first, GFNI preferred over table lookups at each width. Dispatch is
+    // feature detection only — no per-microarchitecture selection.
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            unsafe { mul_acc_multi_region_gfni_avx512(factors_and_dsts, src) };
+            return;
+        }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_multi_region_gfni_avx2(factors_and_dsts, src) };
+            return;
+        }
+        // Non-GFNI implied: execution fell past the GFNI arms above.
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            unsafe { mul_acc_multi_region_avx512(factors_and_dsts, src) };
+            return;
+        }
+        if is_x86_feature_detected!("avx2") {
+            unsafe { mul_acc_multi_region_avx2(factors_and_dsts, src) };
             return;
         }
     }
@@ -378,8 +397,34 @@ pub struct PreparedInputFactor {
     pub factor: u16,
     #[cfg(target_arch = "x86_64")]
     x86: Option<PreparedX86Factor>,
+    /// aarch64 nibble tables, built on first use.
+    ///
+    /// The aarch64 dispatch in [`mul_acc_input_batch_prepared`] sends batches
+    /// of more than three live inputs to the CLMUL kernels, which derive their
+    /// coefficients from `clmul_batch_coeff` broadcasts and never read these
+    /// tables; only `mul_acc_input_batch_neon_prepared` consumes them. The
+    /// create path prepares its factors before the batch width is known, and
+    /// repair caches prepared factors across batches of differing widths, so
+    /// the cheapest correct arrangement is to defer the build to the one
+    /// consumer that needs it rather than to predict the dispatch at prepare
+    /// time. Building eagerly cost 64 `gf::mul` calls plus a 128-byte stack
+    /// zero per factor per output row on the CLMUL path, for tables nothing
+    /// read.
     #[cfg(target_arch = "aarch64")]
-    tables: Option<MulTables>,
+    tables: std::sync::OnceLock<MulTables>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl PreparedInputFactor {
+    /// The nibble tables for this factor, computed on first call.
+    ///
+    /// Only meaningful for `factor > 1`; the NEON kernel filters factors 0 and
+    /// 1 out before asking.
+    #[inline]
+    fn arm_tables(&self) -> &MulTables {
+        self.tables
+            .get_or_init(|| precompute_mul_tables(self.factor))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -408,8 +453,11 @@ pub fn prepare_input_factor(factor: u16) -> PreparedInputFactor {
         } else {
             None
         },
+        // Deliberately left empty: see `PreparedInputFactor::tables`. The NEON
+        // kernel fills it through `arm_tables()` on the first batch that
+        // actually shuffles; the CLMUL kernels never ask.
         #[cfg(target_arch = "aarch64")]
-        tables: (factor != 0 && factor != 1).then(|| precompute_mul_tables(factor)),
+        tables: std::sync::OnceLock::new(),
     }
 }
 
@@ -1334,9 +1382,10 @@ unsafe fn mul_acc_shuffle_group_ssse3(
 /// needs three data loads per destination block. Matrices fold per 128-bit
 /// lane across the source pair: norm = [ll_x | hh_x | ll_y | hh_y], swap =
 /// [hl_x | lh_x | hl_y | lh_y]. Twelve matrix registers cover both groups,
-/// ternary-logic ops fuse the XOR reduction, and one 512→256 fold per block
-/// (amortized over twelve sources) lands the accumulators on the 32-byte
-/// destination block.
+/// ternary-logic ops fuse the XOR reduction, and the narrowing fold is
+/// amortized over a *pair* of destination blocks: two `vshufi64x2` regroup the
+/// four accumulator halves into full-width low/high registers, so one 64-byte
+/// read-modify-write lands both blocks instead of two 32-byte ones.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "gfni,avx512bw,avx512vl")]
 unsafe fn mul_acc_folded_pair_gfni_avx512(
@@ -1387,52 +1436,98 @@ unsafe fn mul_acc_folded_pair_gfni_avx512(
 
         let len = dst.len();
         let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+
+        // Accumulate one 32-byte destination block's worth of products from
+        // the staging offset `$src`, leaving the two sources' contributions in
+        // the two 256-bit halves of each accumulator (still unreduced).
+        macro_rules! accumulate {
+            ($src:expr) => {{
+                let s = $src;
+                let da0 = _mm512_loadu_si512(staging_a.as_ptr().add(s) as *const __m512i);
+                let da1 = _mm512_loadu_si512(staging_a.as_ptr().add(s + 64) as *const __m512i);
+                let da2 = _mm512_loadu_si512(staging_a.as_ptr().add(s + 128) as *const __m512i);
+                let db0 = _mm512_loadu_si512(staging_b.as_ptr().add(s) as *const __m512i);
+                let db1 = _mm512_loadu_si512(staging_b.as_ptr().add(s + 64) as *const __m512i);
+                let db2 = _mm512_loadu_si512(staging_b.as_ptr().add(s + 128) as *const __m512i);
+
+                // acc = acc ^ p ^ q in one ternary-logic op per affine pair.
+                let mut acc1 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da0, na0),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da1, na1),
+                );
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(
+                    acc1,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da2, na2),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db0, nb0),
+                );
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(
+                    acc1,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db1, nb1),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db2, nb2),
+                );
+
+                let mut acc2 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da0, sa0),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da1, sa1),
+                );
+                acc2 = _mm512_ternarylogic_epi64::<0x96>(
+                    acc2,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(da2, sa2),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db0, sb0),
+                );
+                acc2 = _mm512_ternarylogic_epi64::<0x96>(
+                    acc2,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db1, sb1),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(db2, sb2),
+                );
+
+                (acc1, acc2)
+            }};
+        }
+
         let mut offset = 0usize;
         let mut src = 0usize;
-        while offset < len {
+
+        // Two destination blocks per pass. The 512→256 narrowing that a single
+        // block needs is a half-width reduction of one accumulator; done for a
+        // block *pair* it is instead two `vshufi64x2` gathering the four low
+        // halves and the four high halves into full-width registers, so one
+        // `vpxorq` reduces both blocks at once and the [lo|hi] plane swap, the
+        // dst read-modify-write and the store all run once per 64 bytes of
+        // output instead of once per 32. Identical arithmetic, identical byte
+        // order: shuffles only relocate whole 128-bit lanes, and the XOR terms
+        // per output byte are unchanged.
+        let pair_len = len & !(2 * SPLIT_BLOCK_BYTES - 1);
+        while offset < pair_len {
             _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
 
-            let da0 = _mm512_loadu_si512(staging_a.as_ptr().add(src) as *const __m512i);
-            let da1 = _mm512_loadu_si512(staging_a.as_ptr().add(src + 64) as *const __m512i);
-            let da2 = _mm512_loadu_si512(staging_a.as_ptr().add(src + 128) as *const __m512i);
-            let db0 = _mm512_loadu_si512(staging_b.as_ptr().add(src) as *const __m512i);
-            let db1 = _mm512_loadu_si512(staging_b.as_ptr().add(src + 64) as *const __m512i);
-            let db2 = _mm512_loadu_si512(staging_b.as_ptr().add(src + 128) as *const __m512i);
+            let (acc1_0, acc2_0) = accumulate!(src);
+            let (acc1_1, acc2_1) = accumulate!(src + stride);
 
-            // acc = acc ^ p ^ q in one ternary-logic op per affine pair.
-            let mut acc1 = _mm512_xor_si512(
-                _mm512_gf2p8affine_epi64_epi8::<0>(da0, na0),
-                _mm512_gf2p8affine_epi64_epi8::<0>(da1, na1),
+            // 0x44 = [a.lane0, a.lane1, b.lane0, b.lane1] = both low halves;
+            // 0xee = [a.lane2, a.lane3, b.lane2, b.lane3] = both high halves.
+            let red1 = _mm512_xor_si512(
+                _mm512_shuffle_i64x2::<0x44>(acc1_0, acc1_1),
+                _mm512_shuffle_i64x2::<0xee>(acc1_0, acc1_1),
             );
-            acc1 = _mm512_ternarylogic_epi64::<0x96>(
-                acc1,
-                _mm512_gf2p8affine_epi64_epi8::<0>(da2, na2),
-                _mm512_gf2p8affine_epi64_epi8::<0>(db0, nb0),
+            let red2 = _mm512_xor_si512(
+                _mm512_shuffle_i64x2::<0x44>(acc2_0, acc2_1),
+                _mm512_shuffle_i64x2::<0xee>(acc2_0, acc2_1),
             );
-            acc1 = _mm512_ternarylogic_epi64::<0x96>(
-                acc1,
-                _mm512_gf2p8affine_epi64_epi8::<0>(db1, nb1),
-                _mm512_gf2p8affine_epi64_epi8::<0>(db2, nb2),
-            );
+            // 0x4e swaps the two 128-bit halves inside each 256-bit lane, i.e.
+            // the `permute2x128<0x01>` plane swap applied to both blocks.
+            let crossed = _mm512_permutex_epi64::<0x4e>(red2);
+            let prior = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+            let mixed = _mm512_ternarylogic_epi64::<0x96>(prior, red1, crossed);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, mixed);
 
-            let mut acc2 = _mm512_xor_si512(
-                _mm512_gf2p8affine_epi64_epi8::<0>(da0, sa0),
-                _mm512_gf2p8affine_epi64_epi8::<0>(da1, sa1),
-            );
-            acc2 = _mm512_ternarylogic_epi64::<0x96>(
-                acc2,
-                _mm512_gf2p8affine_epi64_epi8::<0>(da2, sa2),
-                _mm512_gf2p8affine_epi64_epi8::<0>(db0, sb0),
-            );
-            acc2 = _mm512_ternarylogic_epi64::<0x96>(
-                acc2,
-                _mm512_gf2p8affine_epi64_epi8::<0>(db1, sb1),
-                _mm512_gf2p8affine_epi64_epi8::<0>(db2, sb2),
-            );
+            offset += 2 * SPLIT_BLOCK_BYTES;
+            src += 2 * stride;
+        }
 
-            // Halves of each accumulator hold the two sources' contributions
-            // to the same destination block: fold 512→256, swap the
-            // cross-plane half, and land everything with one ternary-logic.
+        // Odd trailing block: the original one-block narrowing tail.
+        if offset < len {
+            let (acc1, acc2) = accumulate!(src);
             let red1 = _mm256_xor_si256(
                 _mm512_castsi512_si256(acc1),
                 _mm512_extracti64x4_epi64::<1>(acc1),
@@ -1445,9 +1540,6 @@ unsafe fn mul_acc_folded_pair_gfni_avx512(
             let prior = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
             let mixed = _mm256_ternarylogic_epi64::<0x96>(prior, red1, crossed);
             _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, mixed);
-
-            offset += SPLIT_BLOCK_BYTES;
-            src += stride;
         }
     }
 }
@@ -2332,6 +2424,392 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
                 );
             }
         }
+    }
+}
+
+/// 512-bit GFNI multi-region kernel: the width-doubled twin of
+/// [`mul_acc_multi_region_gfni_avx2`], reached by the repair-side callers
+/// (Gaussian elimination's row updates and the recovery apply loops). Without
+/// it, AVX-512 boxes ran those at 256 bits while the grouped-input path
+/// already had a 512-bit arm — the same asymmetry `mul_acc_input_batch` fixed.
+///
+/// One 128-byte source strip is deinterleaved once and reused for every
+/// factor, so the per-factor cost is four affines plus the destination
+/// read-modify-write.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn mul_acc_multi_region_gfni_avx512(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+
+    struct BroadcastAffine {
+        m_ll: __m512i,
+        m_lh: __m512i,
+        m_hl: __m512i,
+        m_hh: __m512i,
+        dst_idx: usize,
+    }
+
+    let all_matrices: Vec<BroadcastAffine> = factors_and_dsts
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
+        .map(|(idx, fd)| {
+            let matrices = precompute_affine_matrices(fd.factor);
+            BroadcastAffine {
+                m_ll: _mm512_set1_epi64(matrices.m_ll as i64),
+                m_lh: _mm512_set1_epi64(matrices.m_lh as i64),
+                m_hl: _mm512_set1_epi64(matrices.m_hl as i64),
+                m_hh: _mm512_set1_epi64(matrices.m_hh as i64),
+                dst_idx: idx,
+            }
+        })
+        .collect();
+
+    // Handle factor=1 (XOR-only) destinations across the whole region.
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    if all_matrices.is_empty() {
+        return;
+    }
+
+    let vec_len = len & !127;
+    unsafe {
+        // Pair deinterleave mask (same [evens | odds] pattern in each lane).
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+
+        let mut offset = 0usize;
+        while offset < vec_len {
+            let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let s1 = _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
+
+            // Full-width pair deinterleave, hoisted once per strip. The
+            // 4-lane word trace is identical to the grouped-input 512-bit
+            // kernel (see `mul_acc_input_batch_gfni_avx512_prepared`).
+            let a = _mm512_shuffle_epi8(s0, deint_pair);
+            let b = _mm512_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm512_unpacklo_epi64(a, b);
+            let hi_bytes = _mm512_unpackhi_epi64(a, b);
+
+            for matrices in &all_matrices {
+                let dst_ptr = factors_and_dsts[matrices.dst_idx].dst.as_ptr();
+                let d0 = _mm512_loadu_si512(dst_ptr.add(offset) as *const __m512i);
+                let d1 = _mm512_loadu_si512(dst_ptr.add(offset + 64) as *const __m512i);
+
+                let result_lo = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_ll),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, matrices.m_lh),
+                );
+                let result_hi = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_hl),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, matrices.m_hh),
+                );
+
+                let product0 = _mm512_unpacklo_epi8(result_lo, result_hi);
+                let product1 = _mm512_unpackhi_epi8(result_lo, result_hi);
+
+                let out = factors_and_dsts[matrices.dst_idx].dst.as_mut_ptr();
+                _mm512_storeu_si512(
+                    out.add(offset) as *mut __m512i,
+                    _mm512_xor_si512(d0, product0),
+                );
+                _mm512_storeu_si512(
+                    out.add(offset + 64) as *mut __m512i,
+                    _mm512_xor_si512(d1, product1),
+                );
+            }
+
+            offset += 128;
+        }
+    }
+
+    // Tail: reuse the 256-bit kernel for the remainder. factor==1 pairs were
+    // already applied across the whole region above, so neutralize them here
+    // (factor 0 is skipped) instead of letting the delegate XOR them twice.
+    if vec_len < len {
+        let mut tail: Vec<FactorDst<'_>> = factors_and_dsts
+            .iter_mut()
+            .map(|fd| FactorDst {
+                factor: if fd.factor == 1 { 0 } else { fd.factor },
+                dst: &mut fd.dst[vec_len..],
+            })
+            .collect();
+        unsafe { mul_acc_multi_region_gfni_avx2(&mut tail, &src[vec_len..]) };
+    }
+}
+
+/// Non-GFNI AVX2 multi-region kernel. Boxes without GFNI previously fell all
+/// the way back to one `mul_acc_region` call per factor, redoing the source
+/// deinterleave and nibble split for every destination. Hoisting both out of
+/// the factor loop leaves eight `vpshufb` plus the destination
+/// read-modify-write per factor per 64-byte strip.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mul_acc_multi_region_avx2(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+
+    struct BroadcastTables {
+        tables: [__m256i; 8],
+        factor: u16,
+        dst_idx: usize,
+    }
+
+    let all_tables: Vec<BroadcastTables> = factors_and_dsts
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
+        .map(|(idx, fd)| {
+            let tables = precompute_mul_tables(fd.factor);
+            let load_table = |i: usize| unsafe {
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    tables.tables[i].as_ptr() as *const __m128i
+                ))
+            };
+            BroadcastTables {
+                tables: [
+                    load_table(0),
+                    load_table(1),
+                    load_table(2),
+                    load_table(3),
+                    load_table(4),
+                    load_table(5),
+                    load_table(6),
+                    load_table(7),
+                ],
+                factor: tables.factor,
+                dst_idx: idx,
+            }
+        })
+        .collect();
+
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    if all_tables.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let mask_0f = _mm256_set1_epi8(0x0F);
+        let deint_pair = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+
+        let mut offset = 0usize;
+        while offset + 64 <= len {
+            let s0 = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let s1 = _mm256_loadu_si256(src.as_ptr().add(offset + 32) as *const __m256i);
+
+            let a = _mm256_shuffle_epi8(s0, deint_pair);
+            let b = _mm256_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm256_unpacklo_epi64(a, b);
+            let hi_bytes = _mm256_unpackhi_epi64(a, b);
+
+            // Nibble split is factor-independent: hoist it out of the loop
+            // below so every destination reuses the same four indices.
+            let lo_n0 = _mm256_and_si256(lo_bytes, mask_0f);
+            let lo_n1 = _mm256_and_si256(_mm256_srli_epi16(lo_bytes, 4), mask_0f);
+            let hi_n0 = _mm256_and_si256(hi_bytes, mask_0f);
+            let hi_n1 = _mm256_and_si256(_mm256_srli_epi16(hi_bytes, 4), mask_0f);
+
+            for tables in &all_tables {
+                let dst_ptr = factors_and_dsts[tables.dst_idx].dst.as_ptr();
+                let d0 = _mm256_loadu_si256(dst_ptr.add(offset) as *const __m256i);
+                let d1 = _mm256_loadu_si256(dst_ptr.add(offset + 32) as *const __m256i);
+
+                let result_lo = _mm256_xor_si256(
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(tables.tables[0], lo_n0),
+                        _mm256_shuffle_epi8(tables.tables[2], lo_n1),
+                    ),
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(tables.tables[4], hi_n0),
+                        _mm256_shuffle_epi8(tables.tables[6], hi_n1),
+                    ),
+                );
+                let result_hi = _mm256_xor_si256(
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(tables.tables[1], lo_n0),
+                        _mm256_shuffle_epi8(tables.tables[3], lo_n1),
+                    ),
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(tables.tables[5], hi_n0),
+                        _mm256_shuffle_epi8(tables.tables[7], hi_n1),
+                    ),
+                );
+
+                let product0 = _mm256_unpacklo_epi8(result_lo, result_hi);
+                let product1 = _mm256_unpackhi_epi8(result_lo, result_hi);
+
+                let out = factors_and_dsts[tables.dst_idx].dst.as_mut_ptr();
+                _mm256_storeu_si256(
+                    out.add(offset) as *mut __m256i,
+                    _mm256_xor_si256(d0, product0),
+                );
+                _mm256_storeu_si256(
+                    out.add(offset + 32) as *mut __m256i,
+                    _mm256_xor_si256(d1, product1),
+                );
+            }
+
+            offset += 64;
+        }
+
+        if offset < len {
+            for tables in &all_tables {
+                mul_acc_region_scalar(
+                    tables.factor,
+                    &src[offset..],
+                    &mut factors_and_dsts[tables.dst_idx].dst[offset..],
+                );
+            }
+        }
+    }
+}
+
+/// Non-GFNI AVX-512 multi-region kernel: the width-doubled twin of
+/// [`mul_acc_multi_region_avx2`], mirroring the grouped-input ladder's
+/// non-GFNI 512-bit arm.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn mul_acc_multi_region_avx512(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+
+    struct BroadcastTables {
+        tables: [__m512i; 8],
+        dst_idx: usize,
+    }
+
+    let all_tables: Vec<BroadcastTables> = factors_and_dsts
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
+        .map(|(idx, fd)| {
+            let tables = precompute_mul_tables(fd.factor);
+            let load_table = |i: usize| unsafe {
+                _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    tables.tables[i].as_ptr() as *const __m128i
+                ))
+            };
+            BroadcastTables {
+                tables: [
+                    load_table(0),
+                    load_table(1),
+                    load_table(2),
+                    load_table(3),
+                    load_table(4),
+                    load_table(5),
+                    load_table(6),
+                    load_table(7),
+                ],
+                dst_idx: idx,
+            }
+        })
+        .collect();
+
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    if all_tables.is_empty() {
+        return;
+    }
+
+    let vec_len = len & !127;
+    unsafe {
+        let mask_0f = _mm512_set1_epi8(0x0F);
+        let deint_pair = _mm512_broadcast_i32x4(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+
+        let mut offset = 0usize;
+        while offset < vec_len {
+            let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let s1 = _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
+
+            let a = _mm512_shuffle_epi8(s0, deint_pair);
+            let b = _mm512_shuffle_epi8(s1, deint_pair);
+            let lo_bytes = _mm512_unpacklo_epi64(a, b);
+            let hi_bytes = _mm512_unpackhi_epi64(a, b);
+
+            let lo_n0 = _mm512_and_si512(lo_bytes, mask_0f);
+            let lo_n1 = _mm512_and_si512(_mm512_srli_epi16::<4>(lo_bytes), mask_0f);
+            let hi_n0 = _mm512_and_si512(hi_bytes, mask_0f);
+            let hi_n1 = _mm512_and_si512(_mm512_srli_epi16::<4>(hi_bytes), mask_0f);
+
+            for tables in &all_tables {
+                let dst_ptr = factors_and_dsts[tables.dst_idx].dst.as_ptr();
+                let d0 = _mm512_loadu_si512(dst_ptr.add(offset) as *const __m512i);
+                let d1 = _mm512_loadu_si512(dst_ptr.add(offset + 64) as *const __m512i);
+
+                // Four lookups per plane reduce in two ops: one fused 3-way
+                // ternary-logic XOR plus a plain XOR for the fourth term.
+                let result_lo = _mm512_xor_si512(
+                    _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_shuffle_epi8(tables.tables[0], lo_n0),
+                        _mm512_shuffle_epi8(tables.tables[2], lo_n1),
+                        _mm512_shuffle_epi8(tables.tables[4], hi_n0),
+                    ),
+                    _mm512_shuffle_epi8(tables.tables[6], hi_n1),
+                );
+                let result_hi = _mm512_xor_si512(
+                    _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_shuffle_epi8(tables.tables[1], lo_n0),
+                        _mm512_shuffle_epi8(tables.tables[3], lo_n1),
+                        _mm512_shuffle_epi8(tables.tables[5], hi_n0),
+                    ),
+                    _mm512_shuffle_epi8(tables.tables[7], hi_n1),
+                );
+
+                let product0 = _mm512_unpacklo_epi8(result_lo, result_hi);
+                let product1 = _mm512_unpackhi_epi8(result_lo, result_hi);
+
+                let out = factors_and_dsts[tables.dst_idx].dst.as_mut_ptr();
+                _mm512_storeu_si512(
+                    out.add(offset) as *mut __m512i,
+                    _mm512_xor_si512(d0, product0),
+                );
+                _mm512_storeu_si512(
+                    out.add(offset + 64) as *mut __m512i,
+                    _mm512_xor_si512(d1, product1),
+                );
+            }
+
+            offset += 128;
+        }
+    }
+
+    if vec_len < len {
+        let mut tail: Vec<FactorDst<'_>> = factors_and_dsts
+            .iter_mut()
+            .map(|fd| FactorDst {
+                factor: if fd.factor == 1 { 0 } else { fd.factor },
+                dst: &mut fd.dst[vec_len..],
+            })
+            .collect();
+        unsafe { mul_acc_multi_region_avx2(&mut tail, &src[vec_len..]) };
     }
 }
 
@@ -4152,11 +4630,7 @@ unsafe fn mul_acc_input_batch_neon_prepared(
             .iter()
             .filter(|fs| fs.prepared.factor != 0 && fs.prepared.factor != 1)
             .map(|fs| {
-                let tables = fs
-                    .prepared
-                    .tables
-                    .as_ref()
-                    .expect("prepared ARM factor must include mul tables");
+                let tables = fs.prepared.arm_tables();
                 NeonInputTableSet {
                     t: [
                         vld1q_u8(tables.tables[0].as_ptr()),
@@ -4984,7 +5458,10 @@ mod tests {
         // trailing group, and the single-group case; factors mix zero
         // (padding lanes), one, and arbitrary values.
         for groups in [1usize, 2, 3, 5] {
-            for len in [32usize, 4096, 21824] {
+            // Block counts 1/2/3/5/7 straddle the fused-pair kernel's 64-byte
+            // step and its odd trailing 32-byte block; the large sizes cover
+            // the steady state at both even and odd block counts.
+            for len in [32usize, 64, 96, 160, 224, 4096, 21824, 21856] {
                 let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
                     .map(|g| {
                         let mut set = [0u16; FOLDED_GROUP];
@@ -5064,6 +5541,223 @@ mod tests {
                     dst_seq, reference,
                     "sequential kernel mismatch groups={groups} len={len}"
                 );
+            }
+        }
+    }
+
+    /// Deterministic xorshift so the randomized sweeps below are reproducible
+    /// from the seed printed on failure.
+    #[cfg(test)]
+    fn test_rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed | 1;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        }
+    }
+
+    /// Byte-identity test for the fused two-group 512-bit folded kernel
+    /// against the scalar reference, driving `mul_acc_folded_pair_gfni_avx512`
+    /// directly rather than through the batch dispatcher. Covers the paired
+    /// 64-byte fold path and the odd trailing 32-byte block at every small
+    /// block count, plus randomized factor/data sweeps at larger sizes.
+    ///
+    /// Runs only on GFNI + AVX-512BW/VL hardware; skips loudly elsewhere.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn folded_pair_gfni_avx512_matches_scalar() {
+        if !is_x86_feature_detected!("gfni")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vl")
+        {
+            eprintln!(
+                "SKIP folded_pair_gfni_avx512_matches_scalar: host lacks gfni+avx512bw+avx512vl"
+            );
+            return;
+        }
+        // The split staging helpers below must be in their 256-bit form for
+        // the 512-bit kernel's lane mapping to hold.
+        if !altmap_uses_avx2() {
+            eprintln!(
+                "SKIP folded_pair_gfni_avx512_matches_scalar: split layout pinned to the \
+                 128-bit form (WEAVER_GF16_ALTMAP_SSE=1)"
+            );
+            return;
+        }
+
+        let mut rng = test_rng(0x5EED_1234_ABCD_0001);
+
+        // Every block count from 1..=9 walks the pair loop and the odd tail;
+        // the large sizes cover the steady state both ways.
+        let mut lens: Vec<usize> = (1..=9).map(|b| b * SPLIT_BLOCK_BYTES).collect();
+        lens.extend_from_slice(&[4096, 4128, 21824, 21856]);
+
+        for len in lens {
+            for trial in 0..3 {
+                let factors_a: [u16; FOLDED_GROUP] = std::array::from_fn(|l| match (trial + l) % 6 {
+                    0 => 0,
+                    1 => 1,
+                    _ => rng() as u16,
+                });
+                let factors_b: [u16; FOLDED_GROUP] = std::array::from_fn(|l| match (trial + l) % 7 {
+                    0 => 0,
+                    3 => 1,
+                    _ => rng() as u16,
+                });
+
+                let make_inputs = |factors: &[u16; FOLDED_GROUP], rng: &mut dyn FnMut() -> u64| {
+                    let _ = factors;
+                    (0..FOLDED_GROUP)
+                        .map(|_| (0..len).map(|_| (rng() & 0xFF) as u8).collect::<Vec<u8>>())
+                        .collect::<Vec<Vec<u8>>>()
+                };
+                let inputs_a = make_inputs(&factors_a, &mut rng);
+                let inputs_b = make_inputs(&factors_b, &mut rng);
+
+                let seed_byte = (rng() & 0xFF) as u8;
+                let mut reference = vec![seed_byte; len];
+                for (&factor, input) in factors_a.iter().zip(inputs_a.iter()) {
+                    mul_acc_region(factor, input, &mut reference);
+                }
+                for (&factor, input) in factors_b.iter().zip(inputs_b.iter()) {
+                    mul_acc_region(factor, input, &mut reference);
+                }
+
+                let stage = |inputs: &[Vec<u8>]| {
+                    let mut staging = vec![0u8; len * FOLDED_GROUP];
+                    for (lane, input) in inputs.iter().enumerate() {
+                        split_encode_scatter(input, &mut staging, lane);
+                    }
+                    staging
+                };
+                let staging_a = stage(&inputs_a);
+                let staging_b = stage(&inputs_b);
+
+                let mats_a: Vec<AffineMulMatrices> = factors_a
+                    .iter()
+                    .map(|&f| precompute_affine_matrices(f))
+                    .collect();
+                let mats_b: Vec<AffineMulMatrices> = factors_b
+                    .iter()
+                    .map(|&f| precompute_affine_matrices(f))
+                    .collect();
+                let set_a: [&AffineMulMatrices; FOLDED_GROUP] = [
+                    &mats_a[0], &mats_a[1], &mats_a[2], &mats_a[3], &mats_a[4], &mats_a[5],
+                ];
+                let set_b: [&AffineMulMatrices; FOLDED_GROUP] = [
+                    &mats_b[0], &mats_b[1], &mats_b[2], &mats_b[3], &mats_b[4], &mats_b[5],
+                ];
+
+                let mut got = vec![seed_byte; len];
+                altmap_encode(&mut got);
+                unsafe {
+                    mul_acc_folded_pair_gfni_avx512(
+                        &mut got, &staging_a, &staging_b, &set_a, &set_b,
+                    )
+                };
+                altmap_decode(&mut got);
+                assert_eq!(got, reference, "folded pair kernel len={len} trial={trial}");
+
+                // The 256-bit per-group kernel must produce the same bytes,
+                // so the pair kernel is a drop-in at any band count.
+                let mut seq = vec![seed_byte; len];
+                altmap_encode(&mut seq);
+                unsafe { mul_acc_folded_group_gfni_avx2(&mut seq, &staging_a, &set_a) };
+                unsafe { mul_acc_folded_group_gfni_avx2(&mut seq, &staging_b, &set_b) };
+                altmap_decode(&mut seq);
+                assert_eq!(
+                    seq, got,
+                    "pair kernel differs from 256-bit twin len={len} trial={trial}"
+                );
+            }
+        }
+    }
+
+    /// Byte-identity test for every x86 `mul_acc_multi_region` arm against the
+    /// scalar reference. Each arm is invoked directly and gated on its own
+    /// features, so a GFNI+AVX-512 host exercises all four and an AVX2-only
+    /// host exercises the two it can run. Skips loudly per arm.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn multi_region_x86_arms_match_scalar() {
+        let has_avx2 = is_x86_feature_detected!("avx2");
+        let has_gfni = is_x86_feature_detected!("gfni");
+        let has_avx512 =
+            is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl");
+        if !has_avx2 {
+            eprintln!("SKIP multi_region_x86_arms_match_scalar: host lacks avx2");
+            return;
+        }
+        if !has_gfni {
+            eprintln!("NOTE multi_region_x86_arms_match_scalar: host lacks gfni, GFNI arms skipped");
+        }
+        if !has_avx512 {
+            eprintln!(
+                "NOTE multi_region_x86_arms_match_scalar: host lacks avx512bw+avx512vl, \
+                 512-bit arms skipped"
+            );
+        }
+
+        let mut rng = test_rng(0x5EED_9876_5432_0007);
+
+        // Widths straddle the 64-byte and 128-byte block steps, the 512→256
+        // tail delegate, and the scalar remainder.
+        for &len in &[
+            2usize, 30, 62, 64, 66, 126, 128, 130, 190, 256, 258, 4096, 4094, 8322,
+        ] {
+            for trial in 0..2 {
+                let factors: Vec<u16> = (0..7)
+                    .map(|i| match (trial + i) % 5 {
+                        0 => 0,
+                        1 => 1,
+                        _ => rng() as u16,
+                    })
+                    .collect();
+                let src: Vec<u8> = (0..len).map(|_| (rng() & 0xFF) as u8).collect();
+                let seeds: Vec<Vec<u8>> = factors
+                    .iter()
+                    .map(|_| (0..len).map(|_| (rng() & 0xFF) as u8).collect())
+                    .collect();
+
+                let mut reference = seeds.clone();
+                for (&factor, dst) in factors.iter().zip(reference.iter_mut()) {
+                    mul_acc_region_scalar(factor, &src, dst);
+                }
+
+                let run = |name: &str, f: &dyn Fn(&mut [FactorDst<'_>], &[u8])| {
+                    let mut dsts = seeds.clone();
+                    let mut pairs: Vec<FactorDst<'_>> = factors
+                        .iter()
+                        .zip(dsts.iter_mut())
+                        .map(|(&factor, dst)| FactorDst {
+                            factor,
+                            dst: dst.as_mut_slice(),
+                        })
+                        .collect();
+                    f(&mut pairs, &src);
+                    drop(pairs);
+                    assert_eq!(dsts, reference, "{name} len={len} trial={trial}");
+                };
+
+                if has_gfni {
+                    run("gfni_avx2", &|p, s| unsafe {
+                        mul_acc_multi_region_gfni_avx2(p, s)
+                    });
+                }
+                if has_gfni && has_avx512 {
+                    run("gfni_avx512", &|p, s| unsafe {
+                        mul_acc_multi_region_gfni_avx512(p, s)
+                    });
+                }
+                run("avx2", &|p, s| unsafe { mul_acc_multi_region_avx2(p, s) });
+                if has_avx512 {
+                    run("avx512", &|p, s| unsafe {
+                        mul_acc_multi_region_avx512(p, s)
+                    });
+                }
+                run("dispatched", &|p, s| mul_acc_multi_region(p, s));
             }
         }
     }

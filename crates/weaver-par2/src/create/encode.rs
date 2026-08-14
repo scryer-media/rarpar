@@ -1287,12 +1287,18 @@ fn accumulate_band(
             }
         }
         ResolvedKernel::Simd => {
+            // Reused across output rows: the factors differ per row but the
+            // capacity does not, so the row loop rebuilds contents instead of
+            // reallocating.
+            let mut prepared: Vec<gf_simd::PreparedInputFactor> = Vec::with_capacity(live_inputs);
             for (output_index, &exponent) in exponents.iter().enumerate() {
                 factors.fill_row(exponent, source_start, live_inputs, &mut row);
-                let prepared = row[..live_inputs]
-                    .iter()
-                    .map(|&factor| gf_simd::prepare_input_factor(factor))
-                    .collect::<Vec<_>>();
+                prepared.clear();
+                prepared.extend(
+                    row[..live_inputs]
+                        .iter()
+                        .map(|&factor| gf_simd::prepare_input_factor(factor)),
+                );
                 let dst_start = output_index * output_stride;
                 let mut inputs = Vec::with_capacity(live_inputs);
                 for (lane, prepared_factor) in prepared.iter().enumerate() {

@@ -976,6 +976,57 @@ impl Drop for Rar20Decryptor {
 /// RAR4 key derivation iteration count.
 const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 
+/// Copy a compile-time-constant `N`-byte window at `off`. Constant width, so
+/// this lowers to plain loads/stores — never a `memcpy` call.
+#[inline(always)]
+fn cp<const N: usize>(dst: &mut [u8], src: &[u8], off: usize) {
+    let chunk: [u8; N] = src[off..off + N]
+        .try_into()
+        .expect("cp: constant-size window");
+    dst[off..off + N].copy_from_slice(&chunk);
+}
+
+/// Copy `src` into `dst` (equal lengths, `n <= 64`) without reaching libc.
+///
+/// The RAR3/RAR4 KDF drives `Rar29Sha1` through 262144 rounds of 1..63-byte
+/// partial-block fills. Expressed as `copy_from_slice` those become one
+/// dynamic-length `memcpy` call each. musl services short copies with
+/// `rep movs`, whose startup cost is severely penalized on Intel Golden Cove
+/// (Alder Lake / Sapphire Rapids): profiling a musl-static build put 53% of
+/// all encrypted-extraction cycles in memcpy, 44.9% on the `rep movsq` itself,
+/// while the SHA-NI transform ran nearly free. glibc builds hide this behind
+/// their own inline small-copy path, which is why only static fleet builds
+/// showed the tax.
+///
+/// Every copy below is constant-width and there is no loop, so nothing here
+/// can be turned back into a `memcpy` call by LLVM's loop-idiom pass. Size
+/// classes use the standard two-overlapping-blocks trick, so at most two
+/// stores cover any length in a class.
+#[inline(always)]
+fn copy_small(dst: &mut [u8], src: &[u8]) {
+    let n = src.len();
+    debug_assert_eq!(dst.len(), n, "copy_small: length mismatch");
+    debug_assert!(n <= 64, "copy_small: {n} exceeds the 64-byte size classes");
+    if n >= 32 {
+        cp::<32>(dst, src, 0);
+        cp::<32>(dst, src, n - 32);
+    } else if n >= 16 {
+        cp::<16>(dst, src, 0);
+        cp::<16>(dst, src, n - 16);
+    } else if n >= 8 {
+        cp::<8>(dst, src, 0);
+        cp::<8>(dst, src, n - 8);
+    } else if n >= 4 {
+        cp::<4>(dst, src, 0);
+        cp::<4>(dst, src, n - 4);
+    } else if n >= 2 {
+        cp::<2>(dst, src, 0);
+        cp::<2>(dst, src, n - 2);
+    } else if n == 1 {
+        dst[0] = src[0];
+    }
+}
+
 #[derive(Clone)]
 struct Rar29Sha1 {
     state: [u32; 5],
@@ -1013,7 +1064,7 @@ impl Rar29Sha1 {
 
         if j + data.len() > 63 {
             i = 64 - j;
-            self.buffer[j..64].copy_from_slice(&data[..i]);
+            copy_small(&mut self.buffer[j..64], &data[..i]);
             self.transform_buffer();
 
             while i + 63 < data.len() {
@@ -1025,7 +1076,7 @@ impl Rar29Sha1 {
 
         if data.len() > i {
             let len = data.len() - i;
-            self.buffer[j..j + len].copy_from_slice(&data[i..]);
+            copy_small(&mut self.buffer[j..j + len], &data[i..]);
         }
     }
 
@@ -1036,7 +1087,7 @@ impl Rar29Sha1 {
 
         if j + data.len() > 63 {
             i = 64 - j;
-            self.buffer[j..64].copy_from_slice(&data[..i]);
+            copy_small(&mut self.buffer[j..64], &data[..i]);
             self.transform_buffer();
 
             while i + 63 < data.len() {
@@ -1051,7 +1102,7 @@ impl Rar29Sha1 {
 
         if data.len() > i {
             let len = data.len() - i;
-            self.buffer[j..j + len].copy_from_slice(&data[i..]);
+            copy_small(&mut self.buffer[j..j + len], &data[i..]);
         }
     }
 
@@ -1536,18 +1587,50 @@ fn rar4_derive_key_material(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16]
     let mut iv = [0u8; 16];
     let mut sha = Rar29Sha1::new();
 
-    for i in 0..RAR4_KDF_ITERATIONS {
-        sha.process_rar29(&mut raw_psw);
+    // Fast path: when password+salt plus the 3 counter bytes fit in one SHA-1
+    // block, `process_rar29`'s in-place RAR29 write-back loop provably cannot
+    // fire — reaching a full block from `data` itself needs >= 65 input bytes,
+    // since `i` starts at `64 - j >= 1` and the loop requires `i + 63 < len`.
+    // So `raw_psw` is invariant across rounds, and the two absorbs can be fused
+    // into one contiguous absorb over a buffer whose only per-round mutation is
+    // the 3-byte counter tail. The absorbed byte stream and the `count`
+    // progression are identical to the two-call form, so SHA-1 reaches an
+    // identical state at every block boundary: same IV bytes, same key.
+    // Halves the per-round partial-block copies.
+    if raw_psw.len() + 3 <= 64 {
+        let mut round = raw_psw.clone();
+        round.extend_from_slice(&[0u8; 3]);
+        let tail = round.len() - 3;
 
-        // Append iteration counter as 3 bytes LE.
-        let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.process(&i_bytes);
+        for i in 0..RAR4_KDF_ITERATIONS {
+            round[tail] = i as u8;
+            round[tail + 1] = (i >> 8) as u8;
+            round[tail + 2] = (i >> 16) as u8;
+            sha.process(&round);
 
-        // Extract one IV byte at each interval boundary.
-        if i % iv_interval == 0 {
-            let intermediate = sha.clone().finish_words();
-            let iv_index = (i / iv_interval) as usize;
-            iv[iv_index] = intermediate[4] as u8;
+            // Extract one IV byte at each interval boundary.
+            if i % iv_interval == 0 {
+                let intermediate = sha.clone().finish_words();
+                let iv_index = (i / iv_interval) as usize;
+                iv[iv_index] = intermediate[4] as u8;
+            }
+        }
+
+        round.zeroize();
+    } else {
+        for i in 0..RAR4_KDF_ITERATIONS {
+            sha.process_rar29(&mut raw_psw);
+
+            // Append iteration counter as 3 bytes LE.
+            let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
+            sha.process(&i_bytes);
+
+            // Extract one IV byte at each interval boundary.
+            if i % iv_interval == 0 {
+                let intermediate = sha.clone().finish_words();
+                let iv_index = (i / iv_interval) as usize;
+                iv[iv_index] = intermediate[4] as u8;
+            }
         }
     }
 

@@ -252,6 +252,12 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, mach
 	if bundle.CrtStatic {
 		rustFlags = "-C target-feature=+crt-static"
 	}
+	// x86 release builds omit frame pointers, which reduces perf's fp
+	// unwinder to 3-deep stubs while ARM gets full graphs; the round-1
+	// profiles were caller-blind on x86 for exactly this reason.
+	if strings.HasPrefix(bundle.RustTarget, "x86_64") {
+		rustFlags = strings.TrimSpace(rustFlags + " -C force-frame-pointers=yes")
+	}
 	info.CodegenPolicy["target_cpu"] = "NONE (baseline); tier selection is runtime dispatch only"
 	info.CodegenPolicy["rust_target"] = bundle.RustTarget
 	info.CodegenPolicy["rust_flags"] = rustFlags + " (" + rustFlagVar + ", target-only)"
@@ -398,6 +404,12 @@ func containerBuildScript(machine Machine, rustFlagVar, rustFlags string, weaver
 	script.WriteString("apk add --no-cache musl-dev g++ make cmake clang clang-dev llvm-dev linux-headers perl pkgconfig git bash file >/dev/null 2>&1\n")
 	script.WriteString("export CARGO_HOME=/work/cargo-home\n")
 	script.WriteString("export CARGO_TARGET_DIR=/work/build-target\n")
+	// Keep symbol tables in the shipped binaries (overrides the workspace's
+	// strip=true). Symtabs are not loaded at runtime, so measurements are
+	// unaffected — but perf on the bench host can finally attribute samples
+	// instead of exporting 0%-symbolized profiles that need offline
+	// reconstruction against a rebuilt twin.
+	script.WriteString("export CARGO_PROFILE_RELEASE_STRIP=none\n")
 	if rustFlags != "" {
 		fmt.Fprintf(&script, "export %s=%q\n", rustFlagVar, rustFlags)
 	}
