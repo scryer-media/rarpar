@@ -308,9 +308,17 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, mach
 		return err
 	}
 
-	// The Go harness cross-compiles natively on the orchestrator: CGO is off, so
-	// there is nothing a container adds and a lot of container time it saves.
-	goBuild := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(work, "out", "rarpar-bench"), "./cmd/rarpar-bench")
+	if err := bundler.buildHarness(ctx, bundleName, bundle, filepath.Join(work, "out")); err != nil {
+		return err
+	}
+	return copyTree(filepath.Join(work, "out"), target)
+}
+
+// buildHarness cross-compiles the pure-Go harness on the orchestrator. It is
+// not a measured binary — CGO is off, output is byte-identical from any build
+// host — so there is nothing an on-host build would add.
+func (bundler *Bundler) buildHarness(ctx context.Context, bundleName string, bundle Bundle, outDir string) error {
+	goBuild := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(outDir, "rarpar-bench"), "./cmd/rarpar-bench")
 	goBuild.Dir = filepath.Join(bundler.rarparPath(), "bench", "rarpar-bench")
 	goBuild.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+bundle.GoOS, "GOARCH="+bundle.GoArch)
 	if bundle.GOAMD64 != "" {
@@ -321,7 +329,7 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, mach
 	if err := goBuild.Run(); err != nil {
 		return fmt.Errorf("bundle %s: building the Go harness: %w", bundleName, err)
 	}
-	return copyTree(filepath.Join(work, "out"), target)
+	return nil
 }
 
 // remoteDockerBuild runs the same pinned container recipe on a native remote

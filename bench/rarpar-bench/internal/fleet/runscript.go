@@ -66,6 +66,11 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write("W=%s", shellQuote(layout.Scratch))
 	write("MACHINE=%s", shellQuote(machine.PlatformLabel))
 	write("CORPUS=%s", shellQuote(machine.Paths.Corpus))
+	corpusSentinel := ""
+	if machine.EC2 != nil && machine.EC2.CorpusSource != "" {
+		corpusSentinel = joinPosix(layout.Base, "CORPUS-UPLOADED")
+	}
+	write("CORPUS_READY=%s", shellQuote(corpusSentinel))
 	write("BENCH=\"$BIN/rarpar-bench\"")
 	write("CANDIDATE=\"$BIN/rarpar\"")
 	write("ORACLE_RAR=%s", shellQuote(oracles["rar"]))
@@ -201,6 +206,16 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	// ---- macro suites ----------------------------------------------------
 	if len(families) > 0 {
 		write("# ---- macro suites: the standard report.json protocol")
+		write("if [ -n \"$CORPUS_READY\" ]; then")
+		write("  # The corpus uploads while the candidate builds; wait for its sentinel.")
+		write("  log 'waiting for the corpus upload to land'")
+		write("  CORPUS_WAIT=0")
+		write("  while [ ! -f \"$CORPUS_READY\" ]; do")
+		write("    sleep 15")
+		write("    CORPUS_WAIT=$((CORPUS_WAIT+15))")
+		write("    if [ \"$CORPUS_WAIT\" -ge 3600 ]; then fail corpus-upload-timeout; break; fi")
+		write("  done")
+		write("fi")
 		write("\"$BENCH\" corpus verify --root \"$CORPUS\" > \"$R/corpus-verify.txt\" 2>&1")
 		write("if [ $? -ne 0 ]; then fail corpus-verify; fi")
 		write("log \"corpus verify: $(tail -1 \"$R/corpus-verify.txt\")\"")

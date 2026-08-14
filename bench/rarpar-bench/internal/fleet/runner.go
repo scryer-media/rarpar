@@ -446,12 +446,6 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 	if err := transport.UploadDir(ctx, hostState.BundleDir, layout.Bin); err != nil {
 		return err
 	}
-	if corpusUpload != "" {
-		orch.log("machine %s: uploading corpus %s to %s", machine.Name, corpusUpload, machine.Paths.Corpus)
-		if err := transport.UploadDir(ctx, corpusUpload, machine.Paths.Corpus); err != nil {
-			return err
-		}
-	}
 	upload := filepath.Join(orch.runDir, "upload-"+machine.Name)
 	if err := os.MkdirAll(upload, 0o755); err != nil {
 		return err
@@ -482,6 +476,18 @@ echo "started pid $!"
 	}
 	orch.state.Record(hostState, "spawn", "detached run started: %s", strings.TrimSpace(stdout))
 	orch.state.SetStatus(hostState, StatusRunning)
+	if corpusUpload != "" {
+		// The run is already started: the host builds its candidate while this
+		// upload rides alongside; the run script gates its macro suites on the
+		// sentinel dropped here.
+		orch.log("machine %s: uploading corpus %s to %s (concurrent with the on-host build)", machine.Name, corpusUpload, machine.Paths.Corpus)
+		if err := transport.UploadDir(ctx, corpusUpload, machine.Paths.Corpus); err != nil {
+			return err
+		}
+		if _, _, err := transport.RunScript(ctx, "touch "+shellQuote(joinPosix(layout.Base, "CORPUS-UPLOADED"))+"\n"); err != nil {
+			return err
+		}
+	}
 	return orch.collectMachine(ctx, machine, hostState)
 }
 

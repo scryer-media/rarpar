@@ -127,9 +127,14 @@ cleanup = true
 [machines.bundle]
 source = "docker"                        # docker | prebuilt
 image = "docker.io/library/rust:1.97-alpine"
-# Only "local" is implemented today. A remote build host is accepted by the
-# schema and refused at build time with guidance: build the bundle on that host
-# yourself and point bundle.source = "prebuilt" at the result.
+# Where the container build runs. Bundles are deduped by (bundle config +
+# suite contents) and built in parallel, one build per unique key. "local" is
+# only legal when the target architecture matches this machine's silicon —
+# emulated builds are refused (a QEMU build's build scripts can probe the
+# emulated CPU and emit a different binary; measured binaries build on native
+# hardware, always with portable stock flags). For a foreign target, name a
+# native ssh host here and the same pinned recipe runs there; its cargo cache
+# persists so the next round's build is incremental.
 build_host = "local"
 rust_target = "x86_64-unknown-linux-musl"
 go_os = "linux"
@@ -259,14 +264,6 @@ cleanup = false                          # the whole instance is destroyed anywa
 [machines.bundle]
 source = "docker"
 image = "docker.io/library/rust:1.97-alpine"
-# Where the container build runs. Bundles are deduped by (bundle config +
-# suite contents) and built in parallel, one build per unique key. "local" is
-# only legal when the target's architecture matches this machine's silicon —
-# the orchestrator REFUSES emulated builds (measured binaries must come from
-# native hardware; a QEMU build's build scripts can probe the emulated CPU and
-# emit a different binary). For a foreign target, name a native ssh host and
-# the same pinned recipe runs there; fixture/corpus generation is exempt and
-# may still run cross-arch.
 build_host = "local"                     # native aarch64 container on an Apple Silicon Mac
 rust_target = "aarch64-unknown-linux-musl"
 go_os = "linux"
