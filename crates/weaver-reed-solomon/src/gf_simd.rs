@@ -4310,17 +4310,14 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
 
     let vec_len = len & !31;
     let mut it = inputs.filter(|&(factor, _)| factor > 1);
-    loop {
-        // Materialize the next group into fixed-size arrays before entering the
-        // block loop. Unused slots duplicate slot 0 rather than holding `None`:
-        // every index the const-width body can name is then in bounds by
-        // construction, so the hot loop carries no `Option` discriminant test,
-        // no slice-length compare, and no panic edge — and the coefficient
-        // registers stay loop-invariant instead of being re-walked out of a
-        // wide `Option<(u16, ClmulBatchCoeff, &[u8])>` array each block.
-        let Some((first_factor, first_src)) = it.next() else {
-            break;
-        };
+    // Materialize each group into fixed-size arrays before entering the
+    // block loop. Unused slots duplicate slot 0 rather than holding `None`:
+    // every index the const-width body can name is then in bounds by
+    // construction, so the hot loop carries no `Option` discriminant test,
+    // no slice-length compare, and no panic edge — and the coefficient
+    // registers stay loop-invariant instead of being re-walked out of a
+    // wide `Option<(u16, ClmulBatchCoeff, &[u8])>` array each block.
+    while let Some((first_factor, first_src)) = it.next() {
         let mut factors = [first_factor; CLMUL_SRC_GROUP];
         let mut slices = [first_src; CLMUL_SRC_GROUP];
         let mut srcs = [first_src.as_ptr(); CLMUL_SRC_GROUP];
@@ -4413,7 +4410,7 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 // produced, unrolled.
                 macro_rules! merge_pair {
                     ($a:expr, $b:expr) => {
-                        if N >= $b + 1 {
+                        if N > $b {
                             let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
                             let pc = clmul_round1(srcs[$b].add(offset), &coeffs[$b]);
                             clmul_merge2::<SHA3>(&mut acc, pb, pc);
