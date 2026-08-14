@@ -8,7 +8,10 @@
 /bench/rarpar-bench/config/hosts.local.json
 # Operator-private benchmark fleet configuration; it names private hosts, SSH
 # key paths, and askpass helper locations. Start from bench/fleet.example.toml.
-/bench/fleet.toml
+# Every fleet*.toml variant (per-pass configs like fleet-perf-rebuy.toml) is
+# ignored; only the example is tracked.
+/bench/fleet*.toml
+!/bench/fleet.example.toml
 
 # Local CI/release artifacts
 /.ci/
