@@ -856,6 +856,43 @@ mod tests {
             .join(name)
     }
 
+    /// Existence is the wrong guard under partial Git LFS hydration: the
+    /// no-fixture CI lane checks these fixtures out as pointer files, which
+    /// exist and then fail to parse, so discovery reports a resource error
+    /// instead of a volume set. A hydrated archive starts with `Rar!`; a
+    /// pointer starts with `version https://git-lfs…`.
+    fn fixture_is_hydrated(path: &Path) -> bool {
+        std::fs::read(path)
+            .ok()
+            .is_some_and(|bytes| bytes.starts_with(b"Rar!"))
+    }
+
+    fn rar4_fixtures_hydrated(names: &[&str]) -> bool {
+        names
+            .iter()
+            .all(|name| fixture_is_hydrated(&rar4_fixture(name)))
+    }
+
+    #[test]
+    fn fixture_hydration_guard_separates_archives_from_lfs_pointers() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let archive = temp.path().join("hydrated.rar");
+        std::fs::write(&archive, b"Rar!\x1a\x07\x00").unwrap();
+        assert!(fixture_is_hydrated(&archive));
+
+        // Byte for byte what Git leaves behind under GIT_LFS_SKIP_SMUDGE=1.
+        let pointer = temp.path().join("pointer.rar");
+        std::fs::write(
+            &pointer,
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0\nsize 0\n",
+        )
+        .unwrap();
+        assert!(!fixture_is_hydrated(&pointer));
+
+        assert!(!fixture_is_hydrated(&temp.path().join("absent.rar")));
+    }
+
     #[test]
     fn old_rar_volume_rollover_is_recognized_and_sorted() {
         for (name, index) in [
@@ -875,6 +912,11 @@ mod tests {
 
     #[test]
     fn explicit_single_volume_does_not_scan_unrelated_siblings() {
+        if !rar4_fixtures_hydrated(&["rar4_store.rar"]) {
+            eprintln!("skipping test: rar4_store.rar fixture not hydrated");
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("selected.rar");
         std::fs::copy(rar4_fixture("rar4_store.rar"), &archive).unwrap();
@@ -896,10 +938,22 @@ mod tests {
 
     #[test]
     fn explicit_multi_volume_probes_only_name_compatible_siblings() {
+        let volume_names: Vec<String> = (1..=5)
+            .map(|part| format!("rar4_tiny_volumes.part{part}.rar"))
+            .collect();
+        let required: Vec<&str> = volume_names
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("rar4_store.rar"))
+            .collect();
+        if !rar4_fixtures_hydrated(&required) {
+            eprintln!("skipping test: rar4_tiny_volumes fixtures not hydrated");
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
-        for part in 1..=5 {
-            let name = format!("rar4_tiny_volumes.part{part}.rar");
-            std::fs::copy(rar4_fixture(&name), temp.path().join(&name)).unwrap();
+        for name in &volume_names {
+            std::fs::copy(rar4_fixture(name), temp.path().join(name)).unwrap();
         }
         for index in 0..8 {
             std::fs::copy(
