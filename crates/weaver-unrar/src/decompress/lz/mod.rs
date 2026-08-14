@@ -2476,11 +2476,16 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar5")
             .join(fixture);
-        if !path.exists() {
+        // Existence is the wrong guard under partial Git LFS hydration (see
+        // stored_layout.rs): a pointer stub exists and then fails the parse.
+        let Ok(bytes) = std::fs::read(&path) else {
             eprintln!("skipping test: {fixture} fixture not present");
             return None;
+        };
+        if !bytes.starts_with(b"Rar!") {
+            eprintln!("skipping test: {fixture} fixture not hydrated (LFS pointer)");
+            return None;
         }
-        let bytes = std::fs::read(&path).expect("fixture readable");
         let archive =
             crate::RarArchive::open(std::io::Cursor::new(bytes.clone())).expect("fixture parses");
         let metadata = archive.metadata();

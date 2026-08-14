@@ -5113,6 +5113,30 @@ mod tests {
     /// output that legitimately fails the archive's checksum, and comparing
     /// two identical "checksum mismatch" errors would not discriminate between
     /// the paths. Comparing the bytes does.
+    /// Existence is the wrong guard under partial Git LFS hydration (see
+    /// stored_layout.rs): the no-fixture CI lane checks fixtures out as
+    /// pointer stubs, which exist and then fail the signature parse. A
+    /// hydrated RAR fixture starts with `Rar!`.
+    fn fixture_hydrated(filename: &str) -> bool {
+        use std::io::Read;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar4")
+            .join(filename);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && &magic == b"Rar!"
+    }
+
+    fn fixtures_hydrated(filenames: &[&str]) -> bool {
+        if filenames.iter().all(|name| fixture_hydrated(name)) {
+            return true;
+        }
+        eprintln!("skipping test: rar4 fixtures not hydrated (LFS pointers)");
+        false
+    }
+
     fn decode_members(filename: &str) -> Vec<Result<Vec<u8>, String>> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar4")
@@ -5220,6 +5244,9 @@ mod tests {
 
     #[test]
     fn fast_and_per_symbol_paths_agree_on_lz_fixtures() {
+        if !fixtures_hydrated(LZ_PATH_FIXTURES) {
+            return;
+        }
         let mut leased = false;
         for filename in LZ_PATH_FIXTURES {
             leased |= assert_paths_agree(filename, "native dictionary");
@@ -5229,6 +5256,9 @@ mod tests {
 
     #[test]
     fn fast_and_per_symbol_paths_agree_when_the_window_wraps() {
+        if !fixtures_hydrated(LZ_PATH_SWEEP_FIXTURES) {
+            return;
+        }
         // 12288 is a multiple of the eight-literal batch, 6151 and 65537 are
         // not, so the ring boundary lands both on and between batch stores.
         let mut leased = false;
@@ -5244,6 +5274,9 @@ mod tests {
 
     #[test]
     fn fast_and_per_symbol_paths_agree_across_span_borders() {
+        if !fixtures_hydrated(LZ_PATH_SWEEP_FIXTURES) {
+            return;
+        }
         // A leased span reserves LZ_SPAN_SLACK_BYTES (32), so a fill of 40
         // leaves only 8 bytes of fast path per fill and hands over constantly;
         // 33 is the smallest fill that can still be leased at all; 97 is odd,
@@ -5266,6 +5299,9 @@ mod tests {
 
     #[test]
     fn span_border_handover_preserves_the_native_decode() {
+        if !fixtures_hydrated(LZ_PATH_SWEEP_FIXTURES) {
+            return;
+        }
         // The tests above pin the two paths against each other; this one pins
         // both against the archive's own checksum. Whatever the fill size, the
         // bytes must still be the ones the native full-fill decode produces —
@@ -5352,6 +5388,9 @@ mod tests {
     /// run has to terminate — which is what the timeout guard is for.
     #[test]
     fn corrupt_members_fail_identically_on_every_path() {
+        if !fixtures_hydrated(LZ_PATH_SWEEP_FIXTURES) {
+            return;
+        }
         // Fixtures whose members do not all decode cleanly; the comparison is
         // over the `Err(String)` surface `decode_members` already produces.
         for filename in LZ_PATH_SWEEP_FIXTURES {
@@ -5406,6 +5445,13 @@ mod tests {
     /// are hammered together.
     #[test]
     fn many_leases_and_hand_offs_neither_stall_nor_duplicate() {
+        if !fixtures_hydrated(&[
+            "rar4_lz.rar",
+            "rar4_lz_solid_mv.rar",
+            "rar4_multifile_lz.rar",
+        ]) {
+            return;
+        }
         for filename in [
             "rar4_lz.rar",
             "rar4_lz_solid_mv.rar",
@@ -5468,6 +5514,14 @@ mod tests {
     /// PPMd member would read a short window and this would diverge.
     #[test]
     fn mixed_lz_and_ppmd_solid_members_agree_on_every_path() {
+        if !fixtures_hydrated(&[
+            "test_read_format_rar_ppmd_lzss_conversion.rar",
+            "rar4_ppm_solid_mv.rar",
+            "rar4_ppm_solid_restart.rar",
+            "rar4_ppm_order16_32m.rar",
+        ]) {
+            return;
+        }
         for filename in [
             // Switches between PPMd and LZ blocks inside one stream.
             "test_read_format_rar_ppmd_lzss_conversion.rar",
@@ -5490,6 +5544,9 @@ mod tests {
     /// would fail here instead of turning every other assertion vacuous.
     #[test]
     fn the_threaded_path_engages_on_plain_and_solid_lz() {
+        if !fixtures_hydrated(&["rar4_lz.rar", "rar4_lz_solid_mv.rar"]) {
+            return;
+        }
         for filename in ["rar4_lz.rar", "rar4_lz_solid_mv.rar"] {
             let before = super::mt_test_hooks::mt_lease_count();
             let threaded = super::mt_test_hooks::with_mt_threads(2, || decode_members(filename));

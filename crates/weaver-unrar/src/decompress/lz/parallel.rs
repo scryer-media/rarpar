@@ -3715,9 +3715,26 @@ mod tests {
         );
     }
 
+    /// Existence is the wrong guard under partial Git LFS hydration (see
+    /// stored_layout.rs): the no-fixture CI lane checks fixtures out as
+    /// pointer stubs, which exist and then fail the signature parse.
+    fn rar5_solid_hydrated() -> bool {
+        use std::io::Read;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        let hydrated = std::fs::File::open(&path).is_ok_and(|mut file| {
+            let mut magic = [0u8; 4];
+            file.read_exact(&mut magic).is_ok() && &magic == b"Rar!"
+        });
+        if !hydrated {
+            eprintln!("skipping test: rar5_solid.rar fixture not hydrated (LFS pointer)");
+        }
+        hydrated
+    }
+
     #[test]
     fn hydrated_multiblock_extraction_dispatches_controller() {
-        if rar_decode_worker_count() <= 1 {
+        if rar_decode_worker_count() <= 1 || !rar5_solid_hydrated() {
             return;
         }
         reset_dispatch_count();
@@ -3743,8 +3760,8 @@ mod tests {
         // is anywhere near large enough to need the mid-block streaming reader.
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar5/rar5_solid.rar");
-        if !fixture.exists() {
-            eprintln!("skipping test: rar5_solid.rar fixture not present");
+        if !rar5_solid_hydrated() {
+            let _ = &fixture;
             return;
         }
 
@@ -3789,7 +3806,7 @@ mod tests {
 
     #[test]
     fn phase_diagnostics_follow_process_opt_in_contract() {
-        if rar_decode_worker_count() <= 1 {
+        if rar_decode_worker_count() <= 1 || !rar5_solid_hydrated() {
             return;
         }
 
