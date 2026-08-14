@@ -5607,6 +5607,15 @@ mod tests {
     /// it and the split would lose on every member.
     #[test]
     fn leases_stay_proportional_to_input_not_to_blocks() {
+        if !fixtures_hydrated(&[
+            "rar4_lz.rar",
+            "rar4_multifile_lz.rar",
+            "rar4_lz_solid_mv.rar",
+            "test_read_format_rar_filter.rar",
+            "test_read_format_rar_multi_lzss_blocks.rar",
+        ]) {
+            return;
+        }
         for filename in [
             "rar4_lz.rar",
             "rar4_multifile_lz.rar",
