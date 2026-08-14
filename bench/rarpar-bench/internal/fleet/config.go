@@ -119,20 +119,24 @@ type Render struct {
 }
 
 type Machine struct {
-	Name          string            `json:"name"`
-	Kind          string            `json:"kind"`
-	PlatformLabel string            `json:"platform_label"`
-	BuildTarget   string            `json:"build_target"`
-	Enabled       bool              `json:"enabled"`
-	Suites        []string          `json:"suites"`
-	Connection    Connection        `json:"connection"`
-	Capabilities  Capabilities      `json:"capabilities"`
-	Paths         HostPaths         `json:"paths"`
-	Bundle        Bundle            `json:"bundle"`
-	Oracles       map[string]Oracle `json:"oracles,omitempty"`
-	Run           RunOverrides      `json:"run"`
-	Perf          PerfPlan          `json:"perf"`
-	EC2           *EC2              `json:"ec2,omitempty"`
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	PlatformLabel string `json:"platform_label"`
+	BuildTarget   string `json:"build_target"`
+	Enabled       bool   `json:"enabled"`
+	// Wave sequences cloud launches so no wave's vCPUs exceed the account
+	// quota: wave N+1 launches only after wave N's instances are terminated.
+	// Local machines ignore it and run alongside every wave.
+	Wave         int               `json:"wave,omitempty"`
+	Suites       []string          `json:"suites"`
+	Connection   Connection        `json:"connection"`
+	Capabilities Capabilities      `json:"capabilities"`
+	Paths        HostPaths         `json:"paths"`
+	Bundle       Bundle            `json:"bundle"`
+	Oracles      map[string]Oracle `json:"oracles,omitempty"`
+	Run          RunOverrides      `json:"run"`
+	Perf         PerfPlan          `json:"perf"`
+	EC2          *EC2              `json:"ec2,omitempty"`
 }
 
 type Connection struct {
@@ -332,6 +336,7 @@ func decodeMachine(item *section, settings Settings) Machine {
 		PlatformLabel: item.requiredStr("platform_label"),
 		BuildTarget:   item.str("build_target", ""),
 		Enabled:       item.boolean("enabled", true),
+		Wave:          item.integer("wave", 1),
 		Suites:        item.strings("suites", nil),
 	}
 
@@ -484,7 +489,7 @@ func validate(state *decodeState, config *Config) {
 	labels := map[string]string{}
 	endpoints := map[string]string{}
 	cloud := 0
-	vcpus := 0
+	vcpusByWave := map[int]int{}
 	for index := range config.Machines {
 		machine := &config.Machines[index]
 		prefix := fmt.Sprintf("machine %q", machine.Name)
@@ -605,11 +610,18 @@ func validate(state *decodeState, config *Config) {
 		if machine.Kind == KindAWSEC2 {
 			cloud++
 			validateEC2(state, prefix, machine, settings)
-			if machine.EC2 != nil && machine.Enabled {
-				vcpus += machine.EC2.VCPUs
+			if machine.Wave < 1 {
+				state.fail("%s: wave must be >= 1", prefix)
+			} else if machine.EC2 != nil && machine.Enabled {
+				vcpusByWave[machine.Wave] += machine.EC2.VCPUs
 			}
-		} else if machine.EC2 != nil {
-			state.fail("%s: [machines.ec2] is only valid for kind = %q", prefix, KindAWSEC2)
+		} else {
+			if machine.Wave != 1 {
+				state.fail("%s: wave is only valid for kind = %q; local machines run alongside every wave", prefix, KindAWSEC2)
+			}
+			if machine.EC2 != nil {
+				state.fail("%s: [machines.ec2] is only valid for kind = %q", prefix, KindAWSEC2)
+			}
 		}
 	}
 
@@ -623,9 +635,18 @@ func validate(state *decodeState, config *Config) {
 		if len(settings.AWS.PublicIPLookup) == 0 {
 			state.fail("fleet.aws.public_ip_lookup must not be empty; the session security group is scoped to this machine's public address")
 		}
-		if vcpus > settings.AWS.TotalVCPUQuota {
-			state.fail("parallel launch needs %d vCPUs but fleet.aws.total_vcpu_quota is %d; raise the quota or disable machines before running",
-				vcpus, settings.AWS.TotalVCPUQuota)
+		// Per wave, not the whole file: waves launch sequentially, so the
+		// quota only ever has to hold one wave's instances at a time.
+		waves := make([]int, 0, len(vcpusByWave))
+		for wave := range vcpusByWave {
+			waves = append(waves, wave)
+		}
+		sort.Ints(waves)
+		for _, wave := range waves {
+			if vcpusByWave[wave] > settings.AWS.TotalVCPUQuota {
+				state.fail("wave %d needs %d vCPUs but fleet.aws.total_vcpu_quota is %d; raise the quota, move machines to a later wave, or disable machines before running",
+					wave, vcpusByWave[wave], settings.AWS.TotalVCPUQuota)
+			}
 		}
 	}
 }
@@ -781,29 +802,49 @@ func validateEC2(state *decodeState, prefix string, machine *Machine, settings *
 	}
 }
 
-// QuotaCheck is the pre-launch arithmetic: the whole parallel launch has to fit
-// the account's vCPU quota before a single instance is created.
+// QuotaCheck is the pre-launch arithmetic: every wave has to fit the account's
+// vCPU quota before a single instance is created. Waves launch sequentially,
+// so Requested (the whole run) may exceed the quota as long as no single wave
+// does; Headroom is measured against the largest wave.
 type QuotaCheck struct {
 	Region       string          `json:"region"`
 	Quota        int             `json:"total_vcpu_quota"`
 	Requested    int             `json:"requested_vcpus"`
 	Headroom     int             `json:"headroom_vcpus"`
 	Fits         bool            `json:"fits"`
+	Waves        []QuotaWave     `json:"waves,omitempty"`
 	Instances    []QuotaInstance `json:"instances"`
 	EstimatedUSD float64         `json:"estimated_max_usd"`
+}
+
+type QuotaWave struct {
+	Wave      int  `json:"wave"`
+	Requested int  `json:"requested_vcpus"`
+	Fits      bool `json:"fits"`
 }
 
 type QuotaInstance struct {
 	Machine      string  `json:"machine"`
 	InstanceType string  `json:"instance_type"`
+	Wave         int     `json:"wave"`
 	VCPUs        int     `json:"vcpus"`
 	MaxHours     float64 `json:"max_hours"`
 	HourlyUSD    float64 `json:"hourly_usd"`
 	MaxUSD       float64 `json:"max_usd"`
 }
 
+// waveOf normalizes machines built in code (tests) that never went through
+// decodeMachine and carry the zero value.
+func waveOf(machine Machine) int {
+	if machine.Wave < 1 {
+		return 1
+	}
+	return machine.Wave
+}
+
 func ComputeQuota(config Config, selected []Machine) QuotaCheck {
 	check := QuotaCheck{Region: config.Fleet.AWS.Region, Quota: config.Fleet.AWS.TotalVCPUQuota}
+	byWave := map[int]int{}
 	for _, machine := range selected {
 		if machine.Kind != KindAWSEC2 || machine.EC2 == nil {
 			continue
@@ -811,6 +852,7 @@ func ComputeQuota(config Config, selected []Machine) QuotaCheck {
 		instance := QuotaInstance{
 			Machine:      machine.Name,
 			InstanceType: machine.EC2.InstanceType,
+			Wave:         waveOf(machine),
 			VCPUs:        machine.EC2.VCPUs,
 			MaxHours:     machine.EC2.MaxHours,
 			HourlyUSD:    machine.EC2.HourlyUSD,
@@ -819,10 +861,27 @@ func ComputeQuota(config Config, selected []Machine) QuotaCheck {
 		check.Requested += instance.VCPUs
 		check.EstimatedUSD += instance.MaxUSD
 		check.Instances = append(check.Instances, instance)
+		byWave[instance.Wave] += instance.VCPUs
+	}
+	waves := make([]int, 0, len(byWave))
+	for wave := range byWave {
+		waves = append(waves, wave)
+	}
+	sort.Ints(waves)
+	peak := 0
+	for _, wave := range waves {
+		check.Waves = append(check.Waves, QuotaWave{
+			Wave:      wave,
+			Requested: byWave[wave],
+			Fits:      byWave[wave] <= check.Quota,
+		})
+		if byWave[wave] > peak {
+			peak = byWave[wave]
+		}
 	}
 	check.EstimatedUSD = roundCents(check.EstimatedUSD)
-	check.Headroom = check.Quota - check.Requested
-	check.Fits = check.Requested <= check.Quota
+	check.Headroom = check.Quota - peak
+	check.Fits = peak <= check.Quota
 	return check
 }
 

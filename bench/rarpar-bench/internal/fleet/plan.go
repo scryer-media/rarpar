@@ -90,7 +90,7 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 		// first launch is how a fleet strands paid instances.
 		plan.Preflight = append(plan.Preflight,
 			"AWS credential check (sts get-caller-identity) before anything is built or launched",
-			fmt.Sprintf("vCPU quota arithmetic for the whole parallel launch against fleet.aws.total_vcpu_quota (%d)", config.Fleet.AWS.TotalVCPUQuota),
+			fmt.Sprintf("vCPU quota arithmetic per launch wave against fleet.aws.total_vcpu_quota (%d), held machines charged against every later wave", config.Fleet.AWS.TotalVCPUQuota),
 			"public IPv4 discovery by DNS for the session security group (HTTP echo services are blocked here)")
 	}
 	plan.Preflight = append(plan.Preflight,
@@ -176,9 +176,13 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 	}
 	plan.Quota = ComputeQuota(config, machines)
 	if cloud && !plan.Quota.Fits {
-		plan.Warnings = append(plan.Warnings,
-			fmt.Sprintf("QUOTA: the parallel launch needs %d vCPUs but the configured quota is %d; fleet run would refuse to launch",
-				plan.Quota.Requested, plan.Quota.Quota))
+		for _, wave := range plan.Quota.Waves {
+			if !wave.Fits {
+				plan.Warnings = append(plan.Warnings,
+					fmt.Sprintf("QUOTA: wave %d needs %d vCPUs but the configured quota is %d; fleet run would refuse to launch",
+						wave.Wave, wave.Requested, plan.Quota.Quota))
+			}
+		}
 	}
 	return plan
 }
@@ -307,15 +311,27 @@ func WritePlanText(writer io.Writer, plan FleetPlan) {
 		fmt.Fprintln(writer, "AWS QUOTA AND COST")
 		fmt.Fprintf(writer, "  region %s, quota %d vCPU\n", plan.Quota.Region, plan.Quota.Quota)
 		for _, instance := range plan.Quota.Instances {
-			fmt.Fprintf(writer, "  %-16s %-12s %2d vCPU  cap %.2fh  max $%.2f\n",
-				instance.Machine, instance.InstanceType, instance.VCPUs, instance.MaxHours, instance.MaxUSD)
+			fmt.Fprintf(writer, "  %-16s %-12s wave %d  %2d vCPU  cap %.2fh  max $%.2f\n",
+				instance.Machine, instance.InstanceType, instance.Wave, instance.VCPUs, instance.MaxHours, instance.MaxUSD)
 		}
-		verdict := "FITS"
-		if !plan.Quota.Fits {
-			verdict = "DOES NOT FIT"
+		if len(plan.Quota.Waves) > 1 {
+			for _, wave := range plan.Quota.Waves {
+				verdict := "FITS"
+				if !wave.Fits {
+					verdict = "DOES NOT FIT"
+				}
+				fmt.Fprintf(writer, "  wave %d: %d vCPU of %d (%s)\n", wave.Wave, wave.Requested, plan.Quota.Quota, verdict)
+			}
+			fmt.Fprintf(writer, "  total %d vCPU across %d sequential waves, worst-case spend $%.2f\n\n",
+				plan.Quota.Requested, len(plan.Quota.Waves), plan.Quota.EstimatedUSD)
+		} else {
+			verdict := "FITS"
+			if !plan.Quota.Fits {
+				verdict = "DOES NOT FIT"
+			}
+			fmt.Fprintf(writer, "  total %d vCPU of %d (%s), worst-case spend $%.2f\n\n",
+				plan.Quota.Requested, plan.Quota.Quota, verdict, plan.Quota.EstimatedUSD)
 		}
-		fmt.Fprintf(writer, "  total %d vCPU of %d (%s), worst-case spend $%.2f\n\n",
-			plan.Quota.Requested, plan.Quota.Quota, verdict, plan.Quota.EstimatedUSD)
 	}
 
 	if len(plan.Warnings) > 0 {

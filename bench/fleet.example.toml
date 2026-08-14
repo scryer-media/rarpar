@@ -72,7 +72,10 @@ region = "us-east-1"
 # Name of an ENVIRONMENT VARIABLE holding the profile to use. Never a secret,
 # and never the credentials themselves.
 profile_env = "RARPAR_FLEET_AWS_PROFILE"
-# The whole parallel launch is checked against this before anything is created.
+# Every launch wave is checked against this before anything is created. Cloud
+# machines carry a `wave` number (default 1); waves launch sequentially, each
+# waiting for the previous wave's instances to terminate, so a round larger
+# than the quota still runs as long as no single wave exceeds it.
 total_vcpu_quota = 64
 # Every ephemeral resource carries this prefix, which is also what
 # `fleet teardown` sweeps for.
@@ -242,6 +245,9 @@ kind = "aws-ec2"
 platform_label = "linux-arm64-v2"
 build_target = "aarch64-unknown-linux-musl"
 enabled = true
+# Launch wave (cloud machines only). Wave N+1 launches after wave N's
+# instances are terminated; a held machine stays charged against later waves.
+wave = 1
 suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
 
 [machines.connection]

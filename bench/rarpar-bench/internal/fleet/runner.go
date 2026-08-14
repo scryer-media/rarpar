@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -215,9 +216,25 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		} else {
 			orch.log("preflight: describe-instance-types unavailable (%v); using configured vCPU counts", err)
 		}
-		if !quota.Fits {
-			return fmt.Errorf("preflight: the parallel launch needs %d vCPUs but fleet.aws.total_vcpu_quota is %d; nothing was launched",
-				quota.Requested, quota.Quota)
+		for _, wave := range quota.Waves {
+			if !wave.Fits {
+				return fmt.Errorf("preflight: wave %d needs %d vCPUs but fleet.aws.total_vcpu_quota is %d; nothing was launched",
+					wave.Wave, wave.Requested, quota.Quota)
+			}
+		}
+		// A held machine keeps its instance past its wave, so its vCPUs stay
+		// charged against every later wave. Caught here, before any spend.
+		heldCarry := 0
+		for _, wave := range quota.Waves {
+			if wave.Requested+heldCarry > quota.Quota {
+				return fmt.Errorf("preflight: wave %d needs %d vCPUs plus %d held over from earlier waves, but fleet.aws.total_vcpu_quota is %d; release holds or move machines; nothing was launched",
+					wave.Wave, wave.Requested, heldCarry, quota.Quota)
+			}
+			for _, instance := range quota.Instances {
+				if instance.Wave == wave.Wave && orch.holds(instance.Machine) {
+					heldCarry += instance.VCPUs
+				}
+			}
 		}
 		if quota.EstimatedUSD > 0 {
 			orch.log("preflight: worst-case cloud spend for this run is $%.2f", quota.EstimatedUSD)
@@ -370,26 +387,63 @@ func (orch *orchestrator) build(ctx context.Context) error {
 // lifecycle. A failed or hung host is terminated and recorded; it never blocks
 // another host's collection.
 func (orch *orchestrator) runAll(ctx context.Context) {
-	var wait sync.WaitGroup
-	for _, machine := range orch.options.Machines {
-		wait.Add(1)
-		go func(machine Machine) {
-			defer wait.Done()
-			hostState := orch.state.Machine(machine.Name)
-			hostState.StartedUTC = time.Now().UTC().Format(time.RFC3339)
-			if err := orch.runMachine(ctx, machine, hostState); err != nil {
-				orch.log("machine %s FAILED: %v", machine.Name, err)
-				hostState.Failure = err.Error()
-				orch.state.SetStatus(hostState, StatusFailed)
-				// A cloud host that failed still has to be torn down, and the
-				// evidence of that teardown still has to be recorded.
-				if machine.Kind == KindAWSEC2 && hostState.Cloud != nil {
-					orch.teardownCloud(ctx, machine, hostState)
-				}
+	runOne := func(wait *sync.WaitGroup, machine Machine) {
+		defer wait.Done()
+		hostState := orch.state.Machine(machine.Name)
+		hostState.StartedUTC = time.Now().UTC().Format(time.RFC3339)
+		if err := orch.runMachine(ctx, machine, hostState); err != nil {
+			orch.log("machine %s FAILED: %v", machine.Name, err)
+			hostState.Failure = err.Error()
+			orch.state.SetStatus(hostState, StatusFailed)
+			// A cloud host that failed still has to be torn down, and the
+			// evidence of that teardown still has to be recorded.
+			if machine.Kind == KindAWSEC2 && hostState.Cloud != nil {
+				orch.teardownCloud(ctx, machine, hostState)
 			}
-			hostState.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
-			_ = orch.state.Save()
-		}(machine)
+		}
+		hostState.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
+		_ = orch.state.Save()
+	}
+
+	// Local machines are quota-free and run for the whole round. Cloud
+	// machines launch in waves: a wave's goroutines only return after the
+	// wave's instances are terminated (runMachine collects and tears down, and
+	// the failure arm above tears down too), so waiting on the wave IS waiting
+	// on the quota being free again. Held machines are the exception; the
+	// preflight already charged them against every later wave.
+	var wait sync.WaitGroup
+	cloudWaves := map[int][]Machine{}
+	for _, machine := range orch.options.Machines {
+		if machine.Kind == KindAWSEC2 {
+			wave := waveOf(machine)
+			cloudWaves[wave] = append(cloudWaves[wave], machine)
+			continue
+		}
+		wait.Add(1)
+		go runOne(&wait, machine)
+	}
+	waves := make([]int, 0, len(cloudWaves))
+	for wave := range cloudWaves {
+		waves = append(waves, wave)
+	}
+	sort.Ints(waves)
+	for _, wave := range waves {
+		if len(waves) > 1 {
+			vcpus := 0
+			for _, machine := range cloudWaves[wave] {
+				vcpus += machine.EC2.VCPUs
+			}
+			orch.log("wave %d: launching %d cloud machines (%d vCPUs)", wave, len(cloudWaves[wave]), vcpus)
+		}
+		var waveWait sync.WaitGroup
+		for _, machine := range cloudWaves[wave] {
+			waveWait.Add(1)
+			go runOne(&waveWait, machine)
+		}
+		waveWait.Wait()
+		if len(waves) > 1 {
+			orch.log("wave %d: complete", wave)
+		}
 	}
 	wait.Wait()
 }

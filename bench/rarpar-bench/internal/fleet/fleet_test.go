@@ -197,7 +197,19 @@ func TestConfigValidation(t *testing.T) {
 			name: "cloud vcpus over quota is refused",
 			old:  "total_vcpu_quota = 64",
 			new:  "total_vcpu_quota = 2",
-			want: "raise the quota or disable machines",
+			want: "raise the quota, move machines to a later wave, or disable machines",
+		},
+		{
+			name: "wave below one is refused",
+			old:  "wave = 1",
+			new:  "wave = 0",
+			want: "wave must be >= 1",
+		},
+		{
+			name: "wave on a local machine is refused",
+			old:  "kind = \"local-ssh\"                       # local-ssh | aws-ec2",
+			new:  "kind = \"local-ssh\"                       # local-ssh | aws-ec2\nwave = 2",
+			want: "wave is only valid for kind",
 		},
 		{
 			name: "unknown suite is refused",
@@ -249,9 +261,14 @@ func TestQuotaMath(t *testing.T) {
 		name      string
 		quota     int
 		instances []EC2
+		// waves assigns instances[i] to waves[i]; nil = everything in wave 1.
+		waves     []int
 		requested int
 		fits      bool
 		usd       float64
+		// headroom is only consulted when waves is set; the default
+		// expectation is quota-requested (single-wave arithmetic).
+		headroom int
 	}{
 		{name: "no cloud machines", quota: 64, fits: true},
 		{
@@ -275,6 +292,26 @@ func TestQuotaMath(t *testing.T) {
 			instances: []EC2{{InstanceType: "c8g.xlarge", VCPUs: 4, MaxHours: 0.5, HourlyUSD: 0.144}},
 			requested: 4, fits: true, usd: 0.07,
 		},
+		{
+			name:  "waves fit sequentially where one parallel launch would not",
+			quota: 16,
+			instances: []EC2{
+				{InstanceType: "c8g.xlarge", VCPUs: 4, MaxHours: 2, HourlyUSD: 0.144},
+				{InstanceType: "c6g.4xlarge", VCPUs: 16, MaxHours: 1, HourlyUSD: 0.544},
+			},
+			waves:     []int{2, 1},
+			requested: 20, fits: true, usd: 0.83, headroom: 0,
+		},
+		{
+			name:  "a single overfull wave still fails",
+			quota: 16,
+			instances: []EC2{
+				{InstanceType: "c8g.xlarge", VCPUs: 4, MaxHours: 2, HourlyUSD: 0.144},
+				{InstanceType: "c6g.4xlarge", VCPUs: 16, MaxHours: 1, HourlyUSD: 0.544},
+			},
+			waves:     []int{1, 1},
+			requested: 20, fits: false, usd: 0.83, headroom: -4,
+		},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
@@ -283,8 +320,12 @@ func TestQuotaMath(t *testing.T) {
 			var machines []Machine
 			for index := range item.instances {
 				spec := item.instances[index]
+				wave := 0
+				if item.waves != nil {
+					wave = item.waves[index]
+				}
 				machines = append(machines, Machine{
-					Name: "cloud", Kind: KindAWSEC2, EC2: &spec,
+					Name: "cloud", Kind: KindAWSEC2, Wave: wave, EC2: &spec,
 				})
 			}
 			check := ComputeQuota(local, machines)
@@ -297,8 +338,12 @@ func TestQuotaMath(t *testing.T) {
 			if item.usd != 0 && check.EstimatedUSD != item.usd {
 				t.Fatalf("estimated spend = %.2f, want %.2f", check.EstimatedUSD, item.usd)
 			}
-			if check.Headroom != item.quota-item.requested {
-				t.Fatalf("headroom = %d, want %d", check.Headroom, item.quota-item.requested)
+			wantHeadroom := item.quota - item.requested
+			if item.waves != nil {
+				wantHeadroom = item.headroom
+			}
+			if check.Headroom != wantHeadroom {
+				t.Fatalf("headroom = %d, want %d", check.Headroom, wantHeadroom)
 			}
 		})
 	}
