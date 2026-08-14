@@ -623,6 +623,18 @@ func TestUserDataAlwaysCarriesADeadman(t *testing.T) {
 	}
 }
 
+// Round 1 lost perf on four of five boxes because the stock Ubuntu AMIs ship
+// kernel.perf_event_paranoid=4 and perf refuses to count for an unprivileged user.
+func TestUserDataOpensThePerfCountersToTheBenchUser(t *testing.T) {
+	script := UserData(180)
+	if !strings.Contains(script, "sysctl -w kernel.perf_event_paranoid=1") {
+		t.Fatal("user-data must relax perf_event_paranoid for the running boot")
+	}
+	if !strings.Contains(script, "/etc/sysctl.d/99-bench-perf.conf") {
+		t.Fatal("the perf_event_paranoid relaxation must survive a reboot via a sysctl.d drop-in")
+	}
+}
+
 func TestWindowsRunScriptExecutesAFile(t *testing.T) {
 	config := loadExample(t)
 	var windows Machine

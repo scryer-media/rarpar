@@ -210,6 +210,12 @@ systemctl disable --now unattended-upgrades.service >/dev/null 2>&1
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
 systemctl disable --now snapd.service snapd.socket snapd.seeded.service >/dev/null 2>&1
 systemctl disable --now motd-news.timer man-db.timer >/dev/null 2>&1
+# Unprivileged perf. Stock Ubuntu cloud images ship kernel.perf_event_paranoid=4,
+# which makes perf stat/record fail for the bench user and silently costs the run
+# its perf evidence -- exactly how fleet round 1 lost perf on four of five boxes.
+# Applied live for this boot and dropped in so a reboot cannot take it back.
+echo 'kernel.perf_event_paranoid=1' > /etc/sysctl.d/99-bench-perf.conf
+sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1
 touch /var/lib/cloud/instance/BENCH_USERDATA_DONE
 `, deadmanMinutes)
 }
