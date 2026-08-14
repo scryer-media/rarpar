@@ -173,8 +173,13 @@ jobs:
             exit 1
           fi
 
-          # Cargo packages must never include fixture corpora.
-          if git grep -n 'tests/fixtures' -- crates/*/Cargo.toml | grep -v 'exclude = \["tests/fixtures/\*\*"\]'; then
+          # Cargo packages must never include fixture corpora. Every mention of
+          # tests/fixtures in a publishable manifest has to sit inside that
+          # manifest's exclude list; what else shares the list is not this
+          # check's business (the fuzz corpora joined it and the old pattern,
+          # which demanded the array end right after the fixtures glob, started
+          # reporting correctly-excluded crates).
+          if git grep -n 'tests/fixtures' -- crates/*/Cargo.toml | grep -v ':exclude = \[[^]]*"tests/fixtures/\*\*"'; then
             echo "::error::fixture directories must remain excluded from publishable crates"
             exit 1
           fi
