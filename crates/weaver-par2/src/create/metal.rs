@@ -3,8 +3,8 @@ use crate::error::{Par2Error, Result};
 use crate::gf;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 use crate::types::{
-    CancellationToken, MAX_TOTAL_INPUT_SLICES, ProgressCallback, ProgressStage, ProgressUpdate,
-    RecoveryExponent,
+    CancellationToken, MAX_TOTAL_INPUT_SLICES, ProgressCallback, ProgressPhase, ProgressStage,
+    ProgressUpdate, RecoveryExponent,
 };
 
 use super::encode::ForwardMemoryEstimate;
@@ -323,6 +323,7 @@ impl MetalCreationState {
                         .saturating_mul(self.dispatch_chunk_len as u64)
                         .min(total_bytes),
                     total_bytes: Some(total_bytes),
+                    phase: ProgressPhase::RecoveryEncode,
                 });
             }
             stripe_offset = stripe_offset.checked_add(live_len).ok_or_else(|| {

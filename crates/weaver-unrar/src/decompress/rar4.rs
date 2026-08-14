@@ -1016,6 +1016,16 @@ pub struct Rar4LzDecoder {
     dist_cache: [usize; 4],
     /// Last match length (for symbol 258 repeat).
     last_length: usize,
+    /// `OldDistPtr` and `LastDist` from the shared `Unpack` object.
+    ///
+    /// `Unpack29` reads neither — it indexes `OldDist` directly and repeats
+    /// `OldDist[0]` (unpack30.cpp:204-217, 227-231) — but both live in the same
+    /// object as the window and survive a solid unpack-version switch
+    /// (unpack.cpp:194-206), so this decoder carries them for whichever 1.5 or
+    /// 2.0 member the archive switches to next. See
+    /// [`Rar4Decoder::shared_lz_state`](super::rar4_old::Rar4Decoder).
+    carried_old_dist_ptr: usize,
+    carried_last_dist: usize,
     /// Huffman tables.
     ld_table: Option<HuffmanTable>,
     dd_table: Option<HuffmanTable>,
@@ -1106,6 +1116,8 @@ impl Rar4LzDecoder {
             window: Window::try_new(dict_size)?,
             dist_cache: [usize::MAX; 4],
             last_length: 0,
+            carried_old_dist_ptr: 0,
+            carried_last_dist: usize::MAX,
             ld_table: None,
             dd_table: None,
             ldd_table: None,
@@ -1534,13 +1546,25 @@ impl Rar4LzDecoder {
         data.truncate(data_size);
     }
 
+    /// Run one standard filter over the VM's memory.
+    ///
+    /// `data_size` is the oracle's `DataSize = R[4]`, taken unmasked from
+    /// `InitR[4]` (rarvm.cpp:24 copies `InitR` into `R`, then rarvm.cpp:130,
+    /// 165, 202, 218 and 262 read `R[4]`). It is **not** the length of `data`:
+    /// `data` is the VM memory window, which holds `min(R[4], VM_MEM_SIZE)`
+    /// bytes, while `R[4]` itself is a full 32-bit value that a crafted stream
+    /// can push past `VM_MEM_SIZE` to make every filter bail out. Each arm
+    /// range-checks `data_size` exactly like the oracle before touching
+    /// `data`, and every surviving bound is `<= VM_MEM_SIZE`, so the slices
+    /// below are always inside the buffer.
     fn execute_standard_filter(
         filter: &Rar4PendingVmFilter,
+        data_size: usize,
         written_file_size: u64,
         data: &mut Vec<u8>,
         scratch: &mut Vec<u8>,
     ) -> RarResult<()> {
-        let data_size = data.len();
+        debug_assert_eq!(data.len(), data_size.min(VM_MEM_SIZE));
         let file_offset = written_file_size as u32;
 
         match filter.filter_type {
@@ -1551,9 +1575,9 @@ impl Rar4LzDecoder {
                 }
 
                 if filter.filter_type == Rar4StandardFilter::E8E9 {
-                    super::lz::filter::apply_rar4_e8e9(data, file_offset);
+                    super::lz::filter::apply_rar4_e8e9(&mut data[..data_size], file_offset);
                 } else {
-                    super::lz::filter::apply_rar4_e8(data, file_offset);
+                    super::lz::filter::apply_rar4_e8(&mut data[..data_size], file_offset);
                 }
             }
             Rar4StandardFilter::Itanium => {
@@ -1877,19 +1901,36 @@ impl Rar4LzDecoder {
                 if filter.filter_type == Rar4StandardFilter::None {
                     self.filter_scratch.clear();
                 } else {
+                    // The VM sizes both the transform and its output from
+                    // `InitR[4]`, not from the staged block. `ReadVMCode` seeds
+                    // `InitR[4]` with `BlockLength` (unpack30.cpp:462) and then
+                    // lets the `FirstByte & 0x10` init-mask loop overwrite any
+                    // of `R0..R6` — index 4 included (unpack30.cpp:464-471) —
+                    // so a crafted stream decouples the two. `RarVM::Execute`
+                    // then runs the filter on `R[4]` bytes and reports
+                    // `InitR[4] & VM_MEMMASK` as the filtered size
+                    // (rarvm.cpp:24-36). Real RAR encoders only ever set R0/R1,
+                    // which is why the two agree on every archive a writer
+                    // produces.
+                    let vm_data_size = filter.init_regs[4] as usize;
+                    // `VM.SetMemory` copied `BlockLength` bytes to offset 0 and
+                    // left the rest of the VM's `Mem` buffer alone
+                    // (rarvm.cpp:107-117), so an `R[4]` beyond the staged block
+                    // reads VM memory the oracle never initialized. rarpar
+                    // defines those bytes as zero to stay deterministic.
+                    self.filter_scratch.resize(vm_data_size.min(VM_MEM_SIZE), 0);
                     Self::execute_standard_filter(
                         filter,
+                        vm_data_size,
                         self.current_file_written_size,
                         &mut self.filter_scratch,
                         &mut self.media_scratch,
                     )?;
-                    // `RarVM::Execute` reports `InitR[4] & VM_MEMMASK` as the
-                    // filtered size (rarvm.cpp:29-30). The transform above ran
-                    // over the whole block just as the oracle's does; only the
-                    // emitted span is masked, and the next filter in the chain
-                    // is matched against this masked size.
-                    self.filter_scratch
-                        .truncate(filter.block_length & VM_MEM_MASK);
+                    // Only the emitted span is masked; the next filter in the
+                    // chain is matched against this masked size, exactly as the
+                    // oracle matches `NextFilter->BlockLength` against
+                    // `FilteredDataSize` (unpack30.cpp:578-580).
+                    self.filter_scratch.truncate(vm_data_size & VM_MEM_MASK);
                 }
                 chain_len += 1;
             }
@@ -3747,6 +3788,8 @@ impl Rar4LzDecoder {
 
         self.dist_cache = [usize::MAX; 4];
         self.last_length = 0;
+        self.carried_old_dist_ptr = 0;
+        self.carried_last_dist = usize::MAX;
         self.ld_table = None;
         self.dd_table = None;
         self.ldd_table = None;
@@ -3769,10 +3812,23 @@ impl Rar4LzDecoder {
         ensure_solid_window_dict(self.window.dict_size(), dict_size)
     }
 
+    /// See [`Rar4Decoder::shared_lz_state`](super::rar4_old::Rar4Decoder).
+    pub(crate) fn shared_lz_state(&mut self) -> super::rar4_old::Rar4SharedLzState<'_> {
+        super::rar4_old::Rar4SharedLzState {
+            window: &mut self.window,
+            old_dist: &mut self.dist_cache,
+            old_dist_ptr: &mut self.carried_old_dist_ptr,
+            last_dist: &mut self.carried_last_dist,
+            last_length: &mut self.last_length,
+        }
+    }
+
     /// Reset the decoder for a new non-solid file.
     pub fn reset(&mut self) {
         self.dist_cache = [usize::MAX; 4];
         self.last_length = 0;
+        self.carried_old_dist_ptr = 0;
+        self.carried_last_dist = usize::MAX;
         self.ld_table = None;
         self.dd_table = None;
         self.ldd_table = None;
@@ -4244,7 +4300,10 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 0,
             block_length: VM_MEM_SIZE,
-            init_regs: [0; 7],
+            // ReadVMCode seeds InitR[4] from BlockLength (unpack30.cpp:462),
+            // so this is the register state a stream reaching this block size
+            // without an init-mask override produces.
+            init_regs: [0, 0, 0, 0, VM_MEM_SIZE as u32, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4392,7 +4451,9 @@ mod tests {
             init_regs: [1, 0, 0, 0, 4, 0, 0],
         };
         let mut data = vec![1u8, 2, 3, 4];
-        Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut data, &mut Vec::new()).unwrap();
+        let data_size = data.len();
+        Rar4LzDecoder::execute_standard_filter(&filter, data_size, 0, &mut data, &mut Vec::new())
+            .unwrap();
         assert_eq!(data, vec![255, 253, 250, 246]);
     }
 
@@ -4417,9 +4478,16 @@ mod tests {
             };
             let expected = data.clone();
             let mut actual = data;
+            let data_size = actual.len();
 
-            Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut actual, &mut Vec::new())
-                .unwrap();
+            Rar4LzDecoder::execute_standard_filter(
+                &filter,
+                data_size,
+                0,
+                &mut actual,
+                &mut Vec::new(),
+            )
+            .unwrap();
 
             assert_eq!(actual, expected, "filter {filter_type:?}");
         }
@@ -4444,6 +4512,7 @@ mod tests {
                 block_length: data.len(),
                 init_regs: [0; 7],
             },
+            data.len(),
             0,
             &mut data,
             &mut Vec::new(),
@@ -4469,7 +4538,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 2,
             block_length: 5,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 5, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4498,7 +4567,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 8,
             block_length: 5,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 5, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4542,7 +4611,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 3,
             block_length: 4,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 4, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4602,7 +4671,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 0,
             block_length: BLOCK,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, (BLOCK) as u32, 0, 0],
         });
         assert!(
             decoder.flush_is_pinned_by_pending_head(),
@@ -4676,7 +4745,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 2, // behind the filter already queued.
             block_length: 4,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 4, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4703,7 +4772,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 2,
             block_length: 5,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 5, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4756,7 +4825,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 6,
             block_length: 5,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 5, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -4823,6 +4892,7 @@ mod tests {
                 block_length: data.len(),
                 init_regs: [4, 0, 0, 0, 0, 0, 0],
             },
+            data.len(),
             0,
             &mut data,
             &mut Vec::new(),
@@ -4917,6 +4987,7 @@ mod tests {
                 block_length: data.len(),
                 init_regs: [1, 0, 0, 0, 0, 0, 0],
             },
+            data.len(),
             0,
             &mut data,
             &mut Vec::new(),
@@ -4940,7 +5011,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 0,
             block_length: VM_MEM_SIZE + 1,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, (VM_MEM_SIZE + 1) as u32, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -5062,7 +5133,7 @@ mod tests {
             filter_type: Rar4StandardFilter::E8,
             block_start_total: 5,
             block_length: 5,
-            init_regs: [0; 7],
+            init_regs: [0, 0, 0, 0, 5, 0, 0],
         });
 
         let mut out = Vec::new();
@@ -5158,6 +5229,107 @@ mod tests {
                     .map_err(|err| err.to_string())
             })
             .collect()
+    }
+
+    /// Expected bytes for `rar4_vm_initr4_override.rar`, straight from the
+    /// unrar 7.20 binary (`tests/fixtures/generate_vm_fidelity.py` stamps the
+    /// same bytes' CRC32 into the archive's file headers).
+    ///
+    /// Every member queues one VM filter over the same 64-byte block, and each
+    /// one drives `InitR[4]` somewhere the staged block length cannot reach:
+    ///
+    /// * `e8-shorter` — `R[4] = 16`, so the E8/E9 transform stops after 16
+    ///   bytes and only 16 are emitted; the two rewritten addresses are the
+    ///   markers at offsets 2 and 8.
+    /// * `e8-oversize` — `R[4] = 0x40010` exceeds `VM_MEMSIZE`, so
+    ///   `ExecuteStandardFilter` returns immediately (rarvm.cpp:129-130) and
+    ///   the untouched first `0x40010 & VM_MEMMASK == 16` bytes go out.
+    /// * `delta-shorter` — `R[4] = 32` with two channels, so the delta runs
+    ///   over half the block and emits the 32-byte result from `Mem+BlockSize`.
+    /// * `delta-oversize` — `R[4] = 0x40008` exceeds `VM_MEMSIZE/2`, so the
+    ///   filter fails and `FilteredData` falls back to `Mem` itself
+    ///   (rarvm.cpp:31-34): 8 raw bytes.
+    const VM_INITR4_EXPECTED: &[(&str, &[u8])] = &[
+        (
+            "e8-shorter.bin",
+            &[
+                0x40, 0x41, 0xE8, 0x0D, 0x00, 0x00, 0x00, 0x47, 0xE8, 0x17, 0x00, 0x00, 0x00, 0x4D,
+                0x4E, 0x4F,
+            ],
+        ),
+        (
+            "e8-oversize.bin",
+            &[
+                0x40, 0x41, 0xE8, 0x10, 0x00, 0x00, 0x00, 0x47, 0xE8, 0x20, 0x00, 0x00, 0x00, 0x4D,
+                0x4E, 0x4F,
+            ],
+        ),
+        (
+            "delta-shorter.bin",
+            &[
+                0xC0, 0xB0, 0x7F, 0x5F, 0x97, 0x0D, 0x87, 0xBA, 0x87, 0x66, 0x87, 0x11, 0x87, 0xBB,
+                0x40, 0x64, 0x58, 0x0C, 0x38, 0xB3, 0x38, 0x59, 0x38, 0xFE, 0x38, 0xA2, 0xEB, 0x45,
+                0x9D, 0x5D, 0x4E, 0x2D,
+            ],
+        ),
+        (
+            "delta-oversize.bin",
+            &[0x40, 0x41, 0xE8, 0x10, 0x00, 0x00, 0x00, 0x47],
+        ),
+    ];
+
+    /// The `InitR[4]` init-mask override decides both the transform width and
+    /// the emitted size, independently of the staged block (review item V7).
+    #[test]
+    fn vm_filter_honors_initr4_override_like_rar_behavior() {
+        const FIXTURE: &str = "rar4_vm_initr4_override.rar";
+        if !fixtures_hydrated(&[FIXTURE]) {
+            return;
+        }
+
+        let members = decode_members(FIXTURE);
+        assert_eq!(members.len(), VM_INITR4_EXPECTED.len());
+        for (member, (name, expected)) in members.iter().zip(VM_INITR4_EXPECTED) {
+            let bytes = member
+                .as_ref()
+                .unwrap_or_else(|err| panic!("{name} failed to decode: {err}"));
+            assert_eq!(bytes.as_slice(), *expected, "{name}");
+        }
+    }
+
+    /// A solid member that changes unpack version keeps reading the previous
+    /// member's dictionary (review item G5).
+    ///
+    /// The fixture's second member is RAR 2.9 and solid behind a RAR 2.0
+    /// member; its very first symbol is a 19-byte match at distance 32, which
+    /// lands entirely inside what the RAR 2.0 member decoded. unrar serves both
+    /// methods from one `Unpack` object (unpack.cpp:154-190) and
+    /// `UnpInitData(true)` keeps its `Window` (unpack.cpp:194-206), so those 19
+    /// bytes are the earlier member's tail — not zeroes from a fresh window.
+    #[test]
+    fn solid_unpack_version_switch_keeps_the_window_like_rar_behavior() {
+        const FIXTURE: &str = "rar4_version_switch_solid.rar";
+        if !fixtures_hydrated(&[FIXTURE]) {
+            return;
+        }
+
+        let first: Vec<u8> = (0x61u8..0x61 + 64).collect();
+        let mut expected_second = first[32..32 + 19].to_vec();
+        expected_second.extend_from_slice(&[0x30, 0x31, 0x32, 0x33, 0x34]);
+
+        let members = decode_members(FIXTURE);
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members[0].as_ref().expect("v20 member decodes").as_slice(),
+            first.as_slice()
+        );
+        assert_eq!(
+            members[1]
+                .as_ref()
+                .expect("solid v29 member decodes")
+                .as_slice(),
+            expected_second.as_slice()
+        );
     }
 
     /// Thread widths the split is pinned at, alongside the two serial paths.

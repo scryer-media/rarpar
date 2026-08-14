@@ -138,6 +138,7 @@
 
 pub mod archive;
 pub(crate) mod crc;
+pub(crate) mod crc_simd;
 extern crate self as crc32fast;
 pub(crate) use crc::{Crc32 as Hasher, hash};
 pub mod crypto;

@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
-use crate::checksum::{FileHashState, Md5State, SliceChecksumState};
+use crate::checksum::{self, FileHashState, Md5State, SliceChecksumState};
 use crate::error::{Par2Error, Result};
+use crate::md5_simd;
 use crate::path::translate_par2_name_to_relative;
 use crate::types::{
     CancellationToken, FileId, MAX_FILES_PER_SET, MAX_SLICES_PER_FILE, MAX_TOTAL_INPUT_SLICES,
@@ -19,6 +20,26 @@ use super::encode::ForwardSourceProvider;
 const FIRST_HASH_BYTES: u64 = 16 * 1024;
 const READ_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_PAR2_NAME_BYTES: usize = 100_000;
+/// Staging budget for one file's multi-buffer slice-hash batch.
+///
+/// Matches the verifier's and the repair scanner's equivalent budgets so the
+/// three hashing paths admit the same per-task working set. `plan.rs` accounts
+/// this exact number, so the two must move together.
+pub(crate) const CREATE_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many consecutive slices of one file to hash per multi-buffer MD5 call.
+///
+/// Consecutive slices are independent messages, so they lane directly. The
+/// width is the narrower of what the kernel offers ([`md5_simd::max_lanes`]:
+/// 8 on AVX2, 4 on NEON/SSE2/simd128, 1 scalar) and what the staging budget
+/// affords. A block size large enough to leave only one lane falls back to the
+/// streaming scan, which needs just one `READ_BUFFER_BYTES` chunk.
+pub(crate) fn create_md5_batch_lanes(block_size: usize) -> usize {
+    if block_size == 0 {
+        return 1;
+    }
+    (CREATE_MD5_BATCH_MEMORY_BYTES / block_size).clamp(1, md5_simd::max_lanes())
+}
 
 /// A validated explicit source file and the metadata needed by critical PAR2
 /// packets.
@@ -539,51 +560,125 @@ fn resolve_and_hash_source(
     let mut first_hash = Md5State::new();
     let mut first_bytes = 0u64;
     let mut checksums = Vec::with_capacity(slice_count_usize);
-    let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
-    for slice_index in 0..slice_count_usize {
-        if cancellation.is_cancelled() {
-            return Err(Par2Error::Cancelled);
-        }
+
+    // Per-slice length, shared by both scan shapes: every slice is a full
+    // block except the file's last, which is short and zero-padded to the
+    // block size for checksum purposes.
+    let slice_len = |slice_index: usize| -> Result<usize> {
         let offset = (slice_index as u64)
             .checked_mul(block_size)
             .ok_or_else(|| Par2Error::ResourceLimitExceeded {
                 reason: "source slice offset overflows".to_string(),
             })?;
-        let actual_len = usize::try_from(fingerprint.length.saturating_sub(offset).min(block_size))
-            .map_err(|_| Par2Error::ResourceLimitExceeded {
+        usize::try_from(fingerprint.length.saturating_sub(offset).min(block_size)).map_err(|_| {
+            Par2Error::ResourceLimitExceeded {
                 reason: "source slice length exceeds addressable memory".to_string(),
-            })?;
-        let mut remaining = actual_len;
-        let mut slice_hash = SliceChecksumState::new();
-        while remaining > 0 {
+            }
+        })
+    };
+
+    let lanes = create_md5_batch_lanes(block_size_usize);
+    if lanes >= 2 {
+        // Batched scan. Consecutive slices are independent MD5 messages, so a
+        // batch of them goes through the multi-buffer kernel in one pass. The
+        // whole-file MD5 stays a single serial stream over the same bytes: it
+        // is a different message and cannot be laned within one file (see the
+        // module note on why it is also not laned *across* files).
+        let mut batch = vec![0u8; lanes * block_size_usize];
+        let mut digests = vec![[0u8; 16]; lanes];
+        let mut lens = vec![0usize; lanes];
+        let mut slice_index = 0usize;
+
+        while slice_index < slice_count_usize {
+            let batch_slices = lanes.min(slice_count_usize - slice_index);
+            let mut batch_bytes = 0usize;
+
+            for (lane, len) in lens.iter_mut().enumerate().take(batch_slices) {
+                if cancellation.is_cancelled() {
+                    return Err(Par2Error::Cancelled);
+                }
+                let actual_len = slice_len(slice_index + lane)?;
+                let start = lane * block_size_usize;
+                read_exact_or_changed(&mut file, &mut batch[start..start + actual_len], input)?;
+                *len = actual_len;
+                batch_bytes += actual_len;
+
+                let processed_total = bytes_processed
+                    .fetch_add(actual_len as u64, Ordering::Relaxed)
+                    .saturating_add(actual_len as u64);
+                report_progress(
+                    progress,
+                    file_index,
+                    file_total,
+                    processed_total,
+                    total_bytes,
+                );
+            }
+
+            // Only the file's final slice can be short, so within a batch the
+            // slices are laid out back to back and the batch's real bytes are
+            // one contiguous run in file order.
+            absorb_file_stream(
+                &mut full_hash,
+                &mut first_hash,
+                &mut first_bytes,
+                &batch[..batch_bytes],
+            );
+
+            let inputs = (0..batch_slices)
+                .map(|lane| {
+                    let start = lane * block_size_usize;
+                    &batch[start..start + lens[lane]]
+                })
+                .collect::<Vec<_>>();
+            md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
+
+            for (lane, input) in inputs.iter().enumerate() {
+                checksums.push(SliceChecksum {
+                    crc32: checksum::crc32_padded(input, block_size),
+                    md5: digests[lane],
+                });
+            }
+
+            slice_index += batch_slices;
+        }
+    } else {
+        // Streaming scan: one slice at a time through a single read buffer.
+        // Selected when one block already fills the staging budget, so there
+        // is no second lane to fill anyway.
+        let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
+        for slice_index in 0..slice_count_usize {
             if cancellation.is_cancelled() {
                 return Err(Par2Error::Cancelled);
             }
-            let take = remaining.min(buffer.len());
-            read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
-            let chunk = &buffer[..take];
-            full_hash.update(chunk);
-            slice_hash.update(chunk);
-            if first_bytes < FIRST_HASH_BYTES {
-                let first_take = (FIRST_HASH_BYTES - first_bytes).min(take as u64) as usize;
-                first_hash.update(&chunk[..first_take]);
-                first_bytes += first_take as u64;
+            let actual_len = slice_len(slice_index)?;
+            let mut remaining = actual_len;
+            let mut slice_hash = SliceChecksumState::new();
+            while remaining > 0 {
+                if cancellation.is_cancelled() {
+                    return Err(Par2Error::Cancelled);
+                }
+                let take = remaining.min(buffer.len());
+                read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
+                let chunk = &buffer[..take];
+                slice_hash.update(chunk);
+                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, chunk);
+                remaining -= take;
+                let processed_total = bytes_processed
+                    .fetch_add(take as u64, Ordering::Relaxed)
+                    .saturating_add(take as u64);
+                report_progress(
+                    progress,
+                    file_index,
+                    file_total,
+                    processed_total,
+                    total_bytes,
+                );
             }
-            remaining -= take;
-            let processed_total = bytes_processed
-                .fetch_add(take as u64, Ordering::Relaxed)
-                .saturating_add(take as u64);
-            report_progress(
-                progress,
-                file_index,
-                file_total,
-                processed_total,
-                total_bytes,
-            );
+            let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
+            let (crc32, md5) = slice_hash.finalize(pad_to);
+            checksums.push(SliceChecksum { crc32, md5 });
         }
-        let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
-        let (crc32, md5) = slice_hash.finalize(pad_to);
-        checksums.push(SliceChecksum { crc32, md5 });
     }
 
     if full_hash.bytes_fed() != fingerprint.length {
@@ -642,6 +737,27 @@ fn validate_relative_path(relative: &Path, input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Feed one contiguous, in-file-order run of source bytes to the two
+/// whole-file digests.
+///
+/// Both are single serial MD5 streams over the entire file, so neither can be
+/// laned: multi-buffer widens a batch of independent messages, not one message.
+/// They stay scalar (the aws-lc backend when built with `native-crypto`) while
+/// the per-slice digests beside them go through the SIMD kernel.
+fn absorb_file_stream(
+    full_hash: &mut FileHashState,
+    first_hash: &mut Md5State,
+    first_bytes: &mut u64,
+    chunk: &[u8],
+) {
+    full_hash.update(chunk);
+    if *first_bytes < FIRST_HASH_BYTES {
+        let take = (FIRST_HASH_BYTES - *first_bytes).min(chunk.len() as u64) as usize;
+        first_hash.update(&chunk[..take]);
+        *first_bytes += take as u64;
+    }
+}
+
 fn read_exact_or_changed(file: &mut File, buffer: &mut [u8], input: &Path) -> Result<()> {
     file.read_exact(buffer).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -668,6 +784,7 @@ fn report_progress(
             total,
             bytes_processed,
             total_bytes: Some(total_bytes),
+            phase: crate::types::ProgressPhase::SourceScan,
         });
     }
 }

@@ -664,6 +664,12 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 				collectorErr = fmt.Errorf("invalid perf duration_time")
 			} else {
 				measurement.WallNanos = int64(*counters.DurationNanos)
+				if counters.MinRunningPercent != nil && *counters.MinRunningPercent < 99.0 {
+					measurement.PerfCollectorNote = fmt.Sprintf(
+						"perf counters multiplexed: min running %.1f%%; counts are perf's scaled estimates",
+						*counters.MinRunningPercent,
+					)
+				}
 			}
 		}
 	}
@@ -673,7 +679,15 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	return measurement, stdout.Bytes(), stderr.Bytes(), err
 }
 
+// perfMinRunningPercent is the lowest per-event running percentage a sample
+// may carry and still parse. Below 100 the PMU multiplexed the events and
+// perf reports scaled estimates; those remain usable for same-workload A/B
+// ratios and are flagged via PerfCounters.MinRunningPercent, but under this
+// floor the extrapolation window is too small to trust at all.
+const perfMinRunningPercent = 20.0
+
 func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
+	minRunning := 100.0
 	uintSums := make(map[string]uint64, len(perfEvents))
 	floatSums := make(map[string]float64, 1)
 	counted := make(map[string]bool, len(perfEvents))
@@ -728,12 +742,15 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 		}
 		runningField := strings.TrimSpace(fields[eventIndex+1])
 		runningPercent, parseErr := strconv.ParseFloat(runningField, 64)
-		if parseErr != nil || math.IsNaN(runningPercent) || math.IsInf(runningPercent, 0) || runningPercent < 99.0 || runningPercent > 100.01 {
+		if parseErr != nil || math.IsNaN(runningPercent) || math.IsInf(runningPercent, 0) || runningPercent < perfMinRunningPercent || runningPercent > 100.01 {
 			return nil, fmt.Errorf(
-				"%s ran for an incomplete percentage: %q",
+				"%s ran for an unusable percentage: %q",
 				event,
 				runningField,
 			)
+		}
+		if runningPercent < minRunning {
+			minRunning = runningPercent
 		}
 		if event == "task-clock" {
 			parsed, parseErr := parsePerfFloat(value)
@@ -767,16 +784,17 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 	}
 	taskClock := floatSums["task-clock"]
 	return &PerfCounters{
-		Cycles:          uintValue("cycles"),
-		Instructions:    uintValue("instructions"),
-		Branches:        uintValue("branches"),
-		BranchMisses:    uintValue("branch-misses"),
-		CacheReferences: uintValue("cache-references"),
-		CacheMisses:     uintValue("cache-misses"),
-		TaskClockMillis: &taskClock,
-		ContextSwitches: uintValue("context-switches"),
-		CPUMigrations:   uintValue("cpu-migrations"),
-		DurationNanos:   uintValue("duration_time"),
+		Cycles:            uintValue("cycles"),
+		Instructions:      uintValue("instructions"),
+		Branches:          uintValue("branches"),
+		BranchMisses:      uintValue("branch-misses"),
+		CacheReferences:   uintValue("cache-references"),
+		CacheMisses:       uintValue("cache-misses"),
+		TaskClockMillis:   &taskClock,
+		ContextSwitches:   uintValue("context-switches"),
+		CPUMigrations:     uintValue("cpu-migrations"),
+		DurationNanos:     uintValue("duration_time"),
+		MinRunningPercent: &minRunning,
 	}, nil
 }
 

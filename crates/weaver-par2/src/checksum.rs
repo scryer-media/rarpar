@@ -1,3 +1,4 @@
+use crate::crc_simd;
 #[cfg(feature = "native-crypto")]
 use aws_lc_sys::{MD5_CTX, MD5_Final, MD5_Init, MD5_Update};
 use crc_fast::{CrcAlgorithm, Digest as FastCrcDigest};
@@ -7,24 +8,71 @@ use std::mem::MaybeUninit;
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
 
+/// Streaming CRC-32/ISO-HDLC.
+///
+/// Wraps [`crc_fast::Digest`], with one detour: on hosts where
+/// [`crate::crc_simd`] has a tier `crc-fast` does not (VPCLMULQDQ without
+/// AVX-512VL — see that module for why the hole exists), updates at or above
+/// [`crc_simd::MIN_UPDATE`] are folded by the local kernel instead.
+///
+/// While the kernel is carrying the stream the authoritative value is the plain
+/// `u32` in `accel` — which is in the finalized (post-xor) domain — and `inner`
+/// is stale. `inner` is re-seeded from `accel` only when a below-threshold
+/// update arrives. PAR2 slices are hundreds of kilobytes, so a slice pass
+/// normally touches the digest exactly once, at construction.
+///
+/// Because `accel` is not a digest, [`crc_fast::Digest::get_amount`] and
+/// [`crc_fast::Digest::combine`] would see a byte counter that stopped
+/// advancing the moment the kernel engaged. Neither is surfaced through this
+/// wrapper, and neither may be added without tracking the folded byte count
+/// here first. [`Crc32CombineOp`] is unaffected — it takes an explicit `len2`.
 #[derive(Clone)]
 pub(crate) struct Crc32Hasher {
     inner: FastCrcDigest,
+    /// Carried CRC in the finalized domain. `Some` means `inner` is stale.
+    accel: Option<u32>,
+    /// Resolved once per hasher rather than per update, so the hot path is a
+    /// register test and not a `OnceLock` load. Always `false` on targets and
+    /// hosts with no tier, where it constant-folds the branch away entirely.
+    use_accel: bool,
 }
 
 impl Crc32Hasher {
     pub(crate) fn new() -> Self {
         Self {
             inner: FastCrcDigest::new(CrcAlgorithm::Crc32IsoHdlc),
+            accel: None,
+            use_accel: crc_simd::available(),
         }
     }
 
     pub(crate) fn update(&mut self, data: &[u8]) {
+        if self.use_accel && data.len() >= crc_simd::MIN_UPDATE {
+            // Both the kernel's input and its output are the finalized domain,
+            // so consecutive folded updates just carry a `u32`.
+            let initial = match self.accel {
+                Some(crc) => crc,
+                None => self.inner.finalize() as u32,
+            };
+            self.accel = Some(crc_simd::update(initial, data));
+            return;
+        }
+
+        // Leaving the folding path: materialize the carried value back into the
+        // resident digest exactly once, not once per update.
+        if let Some(crc) = self.accel.take() {
+            self.inner =
+                FastCrcDigest::new_with_init_state(CrcAlgorithm::Crc32IsoHdlc, u64::from(!crc));
+        }
+
         self.inner.update(data);
     }
 
     pub(crate) fn finalize(self) -> u32 {
-        self.inner.finalize() as u32
+        match self.accel {
+            Some(crc) => crc,
+            None => self.inner.finalize() as u32,
+        }
     }
 }
 
@@ -509,6 +557,208 @@ mod tests {
                 crc32(&data)
             );
         }
+    }
+
+    // =======================================================================
+    // The accelerated CRC tier's seam. Every assertion below uses
+    // `crc_fast::crc32_iso_hdlc` as the oracle rather than this module's own
+    // `crc32`, so the tier is pinned against an external implementation and
+    // never against itself.
+    // =======================================================================
+
+    /// A randomized sequence of chunk sizes (each >= 1) summing to `total`,
+    /// stressing the seam's update chaining across many boundaries.
+    fn random_splits(total: usize, seed: &mut u64) -> Vec<usize> {
+        let mut remaining = total;
+        let mut sizes = Vec::new();
+        while remaining > 0 {
+            let take = 1 + (next_pseudorandom(seed) % remaining.min(4096) as u64) as usize;
+            sizes.push(take);
+            remaining -= take;
+        }
+        sizes
+    }
+
+    /// Feed `data` through [`Crc32Hasher`] in the given `splits`.
+    fn hasher_over_splits(data: &[u8], splits: &[usize]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        let mut offset = 0usize;
+        for &size in splits {
+            hasher.update(&data[offset..offset + size]);
+            offset += size;
+        }
+        assert_eq!(offset, data.len(), "splits must cover the whole buffer");
+        hasher.finalize()
+    }
+
+    /// The hasher over randomized chunk splits (and the all-1-byte and
+    /// whole-buffer extremes) must equal the one-shot checksum at every length.
+    #[test]
+    fn crc32_hasher_matches_one_shot_over_random_splits() {
+        let mut seed = 0x00C3_2000_ABCD_EF01u64;
+        let mut cases = 0usize;
+
+        for &len in &[
+            0usize, 1, 2, 15, 16, 17, 63, 64, 255, 256, 1023, 1024, 4095, 4096, 4097, 65_535,
+            65_536, 65_537, 1_000_003,
+        ] {
+            let mut data = vec![0u8; len];
+            fill_pseudorandom(&mut data, &mut seed);
+            let reference = crc_fast::crc32_iso_hdlc(&data);
+
+            let all_1: Vec<usize> = vec![1usize; len];
+            let random = random_splits(len, &mut seed);
+            let whole = if len == 0 { vec![] } else { vec![len] };
+
+            for (label, splits) in [("all-1", &all_1), ("random", &random), ("whole", &whole)] {
+                assert_eq!(
+                    hasher_over_splits(&data, splits),
+                    reference,
+                    "Crc32Hasher diverged from one-shot CRC: len={len}, split={label}"
+                );
+            }
+
+            cases += 1;
+        }
+
+        assert!(cases >= 10, "expected >= 10 CRC cases, ran {cases}");
+    }
+
+    /// Update sequences that bounce across [`crc_simd::MIN_UPDATE`] in both
+    /// directions, checked at *every prefix* rather than only at the end, so a
+    /// bad hand-off is attributed to the update that introduced it.
+    ///
+    /// This is the load-bearing test for the tier's interaction with the
+    /// digest: entering the fold, leaving it, re-entering it, and the exact
+    /// threshold boundary (255 vs 256). On a host with no tier it still runs
+    /// and proves the seam unchanged, so it is never a silent skip.
+    #[test]
+    fn crc32_hasher_survives_updates_straddling_the_tier_threshold() {
+        const LEN: usize = 64 * 1024;
+        let mut seed = 0x00C3_2000_5111_D001u64;
+        let mut data = vec![0u8; LEN];
+        fill_pseudorandom(&mut data, &mut seed);
+
+        let min = crc_simd::MIN_UPDATE;
+        let sequences: [&[usize]; 8] = [
+            &[1, 64, 255, 256, 300, 4096, 7],
+            &[4096, 7, 256, 1, 300, 255, 64],
+            &[256, 256, 256, 1, 1, 1, 4096],
+            &[7, 7, 7, 300, 7, 4096, 255, 256],
+            &[300, 1, 4096, 64, 256, 255, 7, 256],
+            &[4096, 4096, 1, 4096, 255, 300, 256],
+            &[8192, 8192, 8192, 1],
+            &[1, 8192, 1, 8192, 1],
+        ];
+
+        let mut prefixes = 0usize;
+        for seq in sequences {
+            assert!(
+                seq.iter().any(|&len| len >= min) && seq.iter().any(|&len| len < min),
+                "sequence {seq:?} must straddle MIN_UPDATE ({min}) to be useful"
+            );
+            let total: usize = seq.iter().sum();
+            assert!(total <= LEN, "sequence {seq:?} exceeds the fixture");
+
+            let mut hasher = Crc32Hasher::new();
+            let mut offset = 0usize;
+            for &len in seq {
+                hasher.update(&data[offset..offset + len]);
+                offset += len;
+                assert_eq!(
+                    hasher.clone().finalize(),
+                    crc_fast::crc32_iso_hdlc(&data[..offset]),
+                    "sequence {seq:?} diverged at prefix {offset}"
+                );
+                prefixes += 1;
+            }
+        }
+
+        assert!(
+            prefixes >= 50,
+            "expected >= 50 prefix checks, ran {prefixes}"
+        );
+    }
+
+    /// The public one-shot [`crc32`] takes the tier for buffers at or above the
+    /// threshold and `crc-fast` below it; both arms must agree with `crc-fast`.
+    #[test]
+    fn crc32_one_shot_matches_crc_fast_across_the_threshold() {
+        let mut seed = 0x00C3_2000_5111_D002u64;
+        let mut data = vec![0u8; 8192];
+        fill_pseudorandom(&mut data, &mut seed);
+
+        let min = crc_simd::MIN_UPDATE;
+        for len in [
+            0,
+            1,
+            min.saturating_sub(2),
+            min.saturating_sub(1),
+            min,
+            min + 1,
+            min + 2,
+            1024,
+            8192,
+        ] {
+            assert_eq!(
+                crc32(&data[..len]),
+                crc_fast::crc32_iso_hdlc(&data[..len]),
+                "len {len}"
+            );
+        }
+    }
+
+    /// The zero-padding loops in [`crc32_padded`] and
+    /// [`SliceChecksumState::finalize`] feed 8 KiB chunks, which fold through
+    /// the tier. Both must match the CRC of an explicitly padded buffer, with
+    /// the data portion sized either side of the threshold.
+    #[test]
+    fn padded_crc_paths_fold_zero_padding_through_the_tier() {
+        let mut seed = 0x00C3_2000_5111_D003u64;
+        let min = crc_simd::MIN_UPDATE as u64;
+
+        let mut cases = 0usize;
+        for data_len in [0u64, 1, min - 1, min, min + 1, 4096, 20_000] {
+            for pad_to in [data_len, data_len + 1, data_len + 8192, data_len + 20_001] {
+                let mut data = vec![0u8; data_len as usize];
+                fill_pseudorandom(&mut data, &mut seed);
+
+                let mut expanded = data.clone();
+                expanded.resize(pad_to as usize, 0);
+                let reference = crc_fast::crc32_iso_hdlc(&expanded);
+
+                assert_eq!(
+                    crc32_padded(&data, pad_to),
+                    reference,
+                    "crc32_padded: data_len {data_len} pad_to {pad_to}"
+                );
+
+                // The same padding, reached through the streaming state, fed in
+                // chunks that straddle the threshold in both directions.
+                let mut state = SliceChecksumState::new();
+                let mut offset = 0usize;
+                for chunk in [1usize, 300, 7, 4096] {
+                    let take = chunk.min(data.len() - offset);
+                    state.update(&data[offset..offset + take]);
+                    offset += take;
+                }
+                state.update(&data[offset..]);
+                let (crc, md5_digest) = state.finalize(Some(pad_to));
+                assert_eq!(
+                    crc, reference,
+                    "SliceChecksumState: data_len {data_len} pad_to {pad_to}"
+                );
+                assert_eq!(
+                    md5_digest,
+                    md5(&expanded),
+                    "SliceChecksumState MD5: data_len {data_len} pad_to {pad_to}"
+                );
+
+                cases += 1;
+            }
+        }
+
+        assert!(cases >= 28, "expected >= 28 padding cases, ran {cases}");
     }
 
     fn next_pseudorandom(seed: &mut u64) -> u64 {

@@ -43,7 +43,7 @@ use crate::repairer::{
     PacketDiagnostics, Par2RepairOutcome, Par2RepairStatus, Par2Repairer, Par2RepairerOptions,
     RepairInstall, RepairState, RepairVerificationAccess, ScanDiagnostics, SourceLocation,
 };
-use crate::session::{SliceEvidence, SliceEvidenceStrength};
+use crate::session::SliceEvidence;
 use crate::types::{CancellationToken, FileId, ProgressCallback};
 use crate::verify::{self, FileAccess, FileStatus, Repairability, VerificationResult};
 
@@ -414,6 +414,11 @@ impl Par2RepairSession {
     /// for the file at `path`. Only valid slices seed a source block; an
     /// invalid verdict invalidates prior locations for the supplied path.
     ///
+    /// The verdict must be one a session may act on — see
+    /// [`SliceEvidence::may_seed_repair_input`], which admits a slice this
+    /// crate hashed with CRC32 and MD5, and an in-stream CRC32 verdict the
+    /// caller attested with [`SliceEvidence::from_in_stream_crc32`].
+    ///
     /// Use [`Self::add_slice_evidence_for_file`] for sources served by a
     /// [`FileAccess`] handle, which have no path to name.
     pub fn add_slice_evidence(
@@ -429,10 +434,17 @@ impl Par2RepairSession {
     /// handle rather than found on disk.
     ///
     /// The identifier comes from the evidence itself, so there is nothing to
-    /// pass but the verdict. As with the path-keyed form, only
-    /// [`SliceEvidenceStrength::Crc32AndMd5`] evidence may seed repair input,
-    /// and an invalid verdict clears any location previously held for that
-    /// slice.
+    /// pass but the verdict. As with the path-keyed form, only evidence that
+    /// passes [`SliceEvidence::may_seed_repair_input`] may seed repair input —
+    /// a slice this crate hashed with
+    /// [`crate::SliceEvidenceStrength::Crc32AndMd5`], or an in-stream CRC32
+    /// verdict attested by the caller with
+    /// [`SliceEvidence::from_in_stream_crc32`] — and an invalid verdict clears
+    /// any location previously held for that slice.
+    ///
+    /// This is the seat an in-stream verdict takes: a downloader that hashes
+    /// payload bytes once, cut on the recovery set's block grid, feeds its
+    /// block conclusions here and never hands the bytes over.
     ///
     /// This requires an access-backed session: without a handle there is no
     /// way to read the bytes a [`FileId`] names, and quietly falling back to
@@ -475,9 +487,9 @@ impl Par2RepairSession {
         if evidence.recovery_set_id() != self.state.set.recovery_set_id {
             return Err(Par2Error::ConflictingRecoverySet.into());
         }
-        if evidence.strength() != SliceEvidenceStrength::Crc32AndMd5 {
+        if !evidence.may_seed_repair_input() {
             return Err(Par2SessionError::InvalidState {
-                reason: "CRC32-only slice evidence cannot seed repair input",
+                reason: "unattested CRC32-only slice evidence cannot seed repair input",
             });
         }
         let key = (evidence.file_id(), evidence.slice_index());
@@ -1350,10 +1362,205 @@ mod tests {
             SliceEvidenceStrength::Crc32Only,
         );
 
+        match session.add_slice_evidence("payload.bin", evidence) {
+            Err(Par2SessionError::InvalidState { reason }) => assert!(
+                reason.contains("unattested"),
+                "the refusal must name what is missing, got: {reason}"
+            ),
+            other => panic!("expected a named refusal, got {other:?}"),
+        }
+    }
+
+    /// The recovery-set gate runs before admissibility: an attestation cannot
+    /// carry a verdict into a set it does not belong to.
+    #[test]
+    fn rejects_in_stream_evidence_from_another_recovery_set() {
+        let set_id = RecoverySetId::from_bytes([1; 16]);
+        let mut session = empty_session(set_id);
+        let evidence = in_stream_evidence(
+            RecoverySetId::from_bytes([2; 16]),
+            FileId::from_bytes([3; 16]),
+            0,
+            true,
+        );
+
         assert!(matches!(
             session.add_slice_evidence("payload.bin", evidence),
+            Err(Par2SessionError::Par2(Par2Error::ConflictingRecoverySet))
+        ));
+    }
+
+    /// An attestation says nothing about *which* slice exists. A verdict naming
+    /// a slice the set does not describe is still refused.
+    #[test]
+    fn rejects_in_stream_evidence_for_a_slice_the_set_does_not_describe() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x61; 16]);
+        let file_id = FileId::from_bytes([0x62; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+
+        // The file has two 8-byte slices; slice 9 is not one of them.
+        assert!(matches!(
+            session.add_slice_evidence_for_file(in_stream_evidence(set_id, file_id, 9, true)),
+            Err(Par2SessionError::EvidenceDoesNotMatch { .. })
+        ));
+        // An unknown file is refused the same way.
+        assert!(matches!(
+            session.add_slice_evidence_for_file(in_stream_evidence(
+                set_id,
+                FileId::from_bytes([0x63; 16]),
+                0,
+                true
+            )),
+            Err(Par2SessionError::EvidenceDoesNotMatch { .. })
+        ));
+    }
+
+    /// The FileId-keyed form still requires a handle to read those bytes with.
+    /// An attestation does not substitute for one.
+    #[test]
+    fn in_stream_evidence_for_file_still_requires_an_access_backed_session() {
+        let set_id = RecoverySetId::from_bytes([1; 16]);
+        let mut session = empty_session(set_id);
+
+        assert!(matches!(
+            session.add_slice_evidence_for_file(in_stream_evidence(
+                set_id,
+                FileId::from_bytes([3; 16]),
+                0,
+                true
+            )),
             Err(Par2SessionError::InvalidState { .. })
         ));
+    }
+
+    /// The acceptance case: attested in-stream CRC32 verdicts seed every slice
+    /// of an access-backed file, and the session verifies it without a scan and
+    /// without ever having been handed the bytes.
+    #[test]
+    fn in_stream_crc32_evidence_seeds_repair_input_without_md5() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x71; 16]);
+        let file_id = FileId::from_bytes([0x72; 16]);
+        // A decoy shares the name and length; resolving through it would show.
+        fs::write(dir.path().join("payload.bin"), vec![0xEE; payload.len()]).unwrap();
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+
+        for slice_index in 0..2 {
+            session
+                .add_slice_evidence_for_file(in_stream_evidence(set_id, file_id, slice_index, true))
+                .expect("an attested in-stream verdict seeds repair input");
+        }
+
+        assert_eq!(
+            session.analyze().unwrap().status,
+            Par2RepairStatus::Verified
+        );
+        assert_eq!(session.diagnostics().access_slice_evidence, 2);
+        assert_eq!(session.diagnostics().source_scan_passes, 0);
+        assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+    }
+
+    /// A contradicting verdict routes into the same invalidation any other
+    /// evidence class does, which for an access-backed source is `invalidate_file`:
+    /// the source is named by file identity, so retiring it retires the whole
+    /// file, not the one slice. A caller wanting the other slices to survive
+    /// simply does not seed the damaged one.
+    #[test]
+    fn contradicting_in_stream_verdict_retires_the_access_source_it_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x81; 16]);
+        let file_id = FileId::from_bytes([0x82; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+
+        for slice_index in 0..2 {
+            session
+                .add_slice_evidence_for_file(in_stream_evidence(set_id, file_id, slice_index, true))
+                .unwrap();
+        }
+        assert_eq!(
+            session.analyze().unwrap().status,
+            Par2RepairStatus::Verified
+        );
+
+        // The same slice, now contradicted.
+        session
+            .add_slice_evidence_for_file(in_stream_evidence(set_id, file_id, 1, false))
+            .expect("a contradicting verdict is admissible");
+
+        assert!(session.assessment.is_none());
+        assert!(
+            session
+                .state
+                .blocks
+                .iter()
+                .all(|block| block.location.is_none()),
+            "invalidating an access-backed source retires every block of the \
+             file it names, including slice 0, which was never contradicted"
+        );
+        assert_ne!(
+            session.analyze().unwrap().status,
+            Par2RepairStatus::Verified
+        );
+    }
+
+    /// The generation counter is how a caller asks "is my view still current?".
+    /// In-stream verdicts live under it exactly as session-hashed ones do.
+    #[test]
+    fn in_stream_evidence_is_retired_by_an_access_generation_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let path = dir.path().join("payload.bin");
+        fs::write(&path, payload).unwrap();
+        let set_id = RecoverySetId::from_bytes([0x91; 16]);
+        let file_id = FileId::from_bytes([0x92; 16]);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, payload.to_vec());
+        let mut session = access_session(
+            dir.path(),
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+            Arc::new(memory),
+        );
+        assert_eq!(session.source_generation(), 0);
+
+        // One physical, one virtual — only the virtual one should be retired.
+        session
+            .add_slice_evidence(&path, in_stream_evidence(set_id, file_id, 0, true))
+            .unwrap();
+        session
+            .add_slice_evidence_for_file(in_stream_evidence(set_id, file_id, 1, true))
+            .unwrap();
+        assert_eq!(session.diagnostics().slice_evidence, 2);
+        assert_eq!(session.diagnostics().access_slice_evidence, 1);
+
+        assert_eq!(session.invalidate_access_sources(), 1);
+
+        assert_eq!(session.source_generation(), 1);
+        assert_eq!(session.diagnostics().slice_evidence, 1);
+        assert_eq!(session.diagnostics().access_slice_evidence, 0);
+        assert!(session.state.blocks[0].location.is_some());
+        assert!(session.state.blocks[1].location.is_none());
     }
 
     #[test]
@@ -1809,6 +2016,23 @@ mod tests {
             slice_index,
             valid,
             SliceEvidenceStrength::Crc32AndMd5,
+        )
+    }
+
+    /// A verdict shaped like one a downloader derives in stream: CRC32 only,
+    /// carrying the attestation that admits it.
+    fn in_stream_evidence(
+        set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: u32,
+        valid: bool,
+    ) -> SliceEvidence {
+        SliceEvidence::from_in_stream_crc32(
+            set_id,
+            file_id,
+            slice_index,
+            valid,
+            crate::session::InStreamCrc32Proof::try_new(8, true, true, true).unwrap(),
         )
     }
 

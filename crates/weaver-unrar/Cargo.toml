@@ -20,7 +20,7 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 [features]
 default = ["crypto-aws-lc"]
 crypto-aws-lc = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
-crypto-rust = ["dep:sha2", "dep:hmac", "dep:aes", "dep:cbc"]
+crypto-rust = ["dep:hmac", "dep:aes", "dep:cbc"]
 # WASM-only backend that delegates bulk AES-CBC to a host function
 # (`host_aes_cbc_decrypt`, in the embedder-neutral `host` import namespace)
 # while reusing the RustCrypto KDF primitives in-wasm. It therefore pulls in
@@ -56,7 +56,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crc-fast = { workspace = true }
 blake2s_simd = { workspace = true }
-sha2 = { workspace = true, optional = true }
+# NOT optional and NOT part of a backend: the RAR5 KDF's HMAC-SHA256 runs on
+# `sha2` on every backend (see `crypto::kdf_hmac`) so the per-iteration path
+# never crosses FFI. `crypto-rust` additionally uses it for its whole seam.
+sha2 = { workspace = true }
 hmac = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 cbc = { workspace = true, optional = true }
@@ -106,7 +109,6 @@ wasmtime = "47"
 wasmtime-wasi = "47"
 aes = { workspace = true }
 cbc = { workspace = true }
-sha2 = { workspace = true }
 
 [[bench]]
 name = "archive_hotspots"

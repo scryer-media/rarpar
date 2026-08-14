@@ -461,6 +461,183 @@ fn access_backed_session_refuses_committed_file_evidence() {
     assert_eq!(session.diagnostics().committed_sources, 0);
 }
 
+/// Derive block CRC32s the way a downloader that already hashes every payload
+/// byte does — cut on the recovery set's block grid — compare them against the
+/// set's own IFSC entries, and mint the attested verdicts. par2-rs is never
+/// handed the bytes, and never re-hashes them.
+fn in_stream_evidence(set: &VirtualSet, bytes: &[u8], slice_indexes: &[u32]) -> Vec<SliceEvidence> {
+    let par2_bytes = fs::read(&set.par2_path).expect("read par2");
+    let file_set = par2_rs::Par2FileSet::from_files(&[&par2_bytes]).expect("parse par2 set");
+    let expected = file_set
+        .file_checksums(&set.file_id)
+        .expect("ifsc entries")
+        .to_vec();
+
+    slice_indexes
+        .iter()
+        .map(|&index| {
+            let start = index as usize * set.slice_size as usize;
+            let end = (start + set.slice_size as usize).min(bytes.len());
+            let mut state = SliceChecksumState::new();
+            state.update(&bytes[start..end]);
+            // Only the CRC32 is used: this is the whole point of the class.
+            let (crc32, _md5) = state.finalize(Some(set.slice_size));
+            let valid = crc32 == expected[index as usize].crc32;
+
+            let proof = par2_rs::InStreamCrc32Proof::try_new(
+                (end - start) as u64,
+                true, // the derivation covered the slice's whole extent
+                true, // over bytes the handle will serve
+                true, // and the same span carries an article-aligned CRC32
+            )
+            .expect("a complete attestation");
+            SliceEvidence::from_in_stream_crc32(
+                file_set.recovery_set_id,
+                set.file_id,
+                index,
+                valid,
+                proof,
+            )
+        })
+        .collect()
+}
+
+/// The payoff: block verdicts derived in stream stand in for the read-and-hash
+/// pass entirely. The clean slices are never read to be verified — only to be
+/// consumed by the repair that the damaged one forces.
+#[test]
+fn in_stream_crc32_evidence_repairs_a_damaged_virtual_volume() {
+    let payload: Vec<u8> = (0..48u8).map(|byte| byte.wrapping_mul(7)).collect();
+    let set = build_virtual_set(&payload, 16, 1);
+    let base_dir = set.temp.path().to_path_buf();
+    let decoy_path = base_dir.join(&set.filename);
+    fs::write(&decoy_path, vec![0xDEu8; payload.len()]).expect("write decoy");
+
+    // The served volume lost its middle slice, as a virtual volume with a
+    // damaged article would have.
+    let mut served = payload.clone();
+    served[16..32].fill(0xAB);
+    let mut memory = MemoryFileAccess::new();
+    memory.add_file(set.file_id, served.clone());
+    let access = Arc::new(CountingAccess::new(memory));
+
+    let mut options = Par2RepairSessionOptions::with_source_access(
+        base_dir.clone(),
+        vec![set.par2_path.clone()],
+        access.clone(),
+    );
+    options.memory_limit = Some(8 * 1024 * 1024);
+    let mut session = Par2RepairSession::open(options).expect("open access-backed session");
+
+    // In-stream verification adjudicates every block, damaged one included,
+    // without reading anything back.
+    let evidence = in_stream_evidence(&set, &served, &[0, 1, 2]);
+    assert_eq!(
+        evidence
+            .iter()
+            .map(SliceEvidence::is_valid)
+            .collect::<Vec<_>>(),
+        vec![true, false, true],
+        "the derived CRC32s must find exactly the damaged slice"
+    );
+
+    // Only the intact verdicts are seeded. A contradiction would retire the
+    // whole access-backed source — file identity is all such a source has to be
+    // named by — so a damaged block is left unresolved for repair to rebuild.
+    let reads_before_evidence = access.reads();
+    for entry in evidence.into_iter().filter(SliceEvidence::is_valid) {
+        session
+            .add_slice_evidence_for_file(entry)
+            .expect("attested in-stream verdicts seed the session");
+    }
+    assert_eq!(
+        access.reads(),
+        reads_before_evidence,
+        "seeding evidence must not read a single source byte"
+    );
+
+    let assessment = session.analyze().expect("analyze from in-stream evidence");
+    assert_eq!(assessment.status, Par2RepairStatus::RepairPossible);
+    assert_eq!(assessment.missing_blocks, 1);
+    assert_eq!(session.diagnostics().source_scan_passes, 0);
+    assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+
+    let outcome = session.repair().expect("repair from in-stream evidence");
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&decoy_path).expect("read repaired file"),
+        payload,
+        "repaired bytes must match the true source"
+    );
+}
+
+/// The backstop the class depends on. A verdict that wrongly calls a damaged
+/// slice intact is not trusted through repair: every byte repair consumes is
+/// re-checked against the IFSC CRC32 *and MD5*, so a false attestation fails
+/// loudly instead of installing wrong bytes.
+#[test]
+fn a_false_in_stream_attestation_fails_the_repair_rather_than_corrupting_output() {
+    let payload: Vec<u8> = (0..48u8).map(|byte| byte.wrapping_mul(11)).collect();
+    let set = build_virtual_set(&payload, 16, 1);
+    let base_dir = set.temp.path().to_path_buf();
+    let target_path = base_dir.join(&set.filename);
+    let stale = vec![0xDEu8; payload.len()];
+    fs::write(&target_path, &stale).expect("write stale target");
+
+    // Two slices are damaged. One is reported honestly, so a repair is planned;
+    // the other is falsely attested intact and will be consumed as a source.
+    let mut served = payload.clone();
+    served[16..32].fill(0xAB);
+    served[32..48].fill(0xCD);
+    let mut memory = MemoryFileAccess::new();
+    memory.add_file(set.file_id, served.clone());
+
+    let mut options = Par2RepairSessionOptions::with_source_access(
+        base_dir.clone(),
+        vec![set.par2_path.clone()],
+        Arc::new(CountingAccess::new(memory)),
+    );
+    options.memory_limit = Some(8 * 1024 * 1024);
+    let mut session = Par2RepairSession::open(options).expect("open access-backed session");
+
+    let proof = par2_rs::InStreamCrc32Proof::try_new(16, true, true, true).expect("attestation");
+    let par2_bytes = fs::read(&set.par2_path).expect("read par2");
+    let recovery_set_id = par2_rs::Par2FileSet::from_files(&[&par2_bytes])
+        .expect("parse par2 set")
+        .recovery_set_id;
+    // Slice 0 is genuinely intact; slice 1 is damaged but attested intact —
+    // the lie. Slice 2 is damaged and simply never seeded, so it stays
+    // unresolved and is what makes a repair run at all.
+    for slice_index in [0u32, 1] {
+        session
+            .add_slice_evidence_for_file(SliceEvidence::from_in_stream_crc32(
+                recovery_set_id,
+                set.file_id,
+                slice_index,
+                true,
+                proof,
+            ))
+            .expect("seed the session, lie included");
+    }
+
+    // The lie is believed at assessment time — nothing has read those bytes.
+    let assessment = session.analyze().expect("analyze");
+    assert_eq!(assessment.status, Par2RepairStatus::RepairPossible);
+    assert_eq!(assessment.missing_blocks, 1);
+
+    // It is not believed through repair.
+    let result = session.repair();
+    assert!(
+        result.is_err(),
+        "a falsely attested source must not repair, got {result:?}"
+    );
+    assert_eq!(
+        fs::read(&target_path).expect("read target"),
+        stale,
+        "a failed repair must not install wrong bytes"
+    );
+}
+
 #[test]
 fn file_keyed_slice_evidence_requires_an_access_backed_session() {
     let payload: Vec<u8> = (0..32u8).collect();

@@ -14,8 +14,20 @@
 //! All cryptographic primitives that touch the underlying crypto library live
 //! behind the `backend` seam; the code in this module only ever calls that
 //! seam, so a second backend can be added without editing shared logic.
+//!
+//! One deliberate exception: the RAR5 PBKDF2 loop. Its per-iteration
+//! HMAC-SHA256 is [`kdf_hmac`], which runs on the `sha2` crate on *every*
+//! backend so that a derivation of up to 2^24 iterations never crosses FFI.
+//! That module is not a backend and has no alternative implementation; see its
+//! docs. Everything else — AES, SHA-1, the non-KDF SHA-256 and HMAC uses — is
+//! the selected backend's, unchanged.
 
 mod backend;
+
+// The RAR5 KDF's HMAC-SHA256. Deliberately NOT part of the backend seam: the
+// derivation's inner loop runs on `sha2` regardless of which backend supplies
+// AES / SHA-1 / the non-KDF SHA-256 uses. See the module docs for why.
+mod kdf_hmac;
 
 // Multi-way SIMD BLAKE2sp kernel (NEON + wasm simd128). Only compiled on the
 // targets where `blake2s_simd` itself lacks a vector BLAKE2sp backend and this
@@ -156,13 +168,17 @@ pub fn derive_rar5_material(
 
     let count = 1u32 << kdf_count;
     let password = rar_password_compat(password);
-    let password_mac = backend::hmac_sha256_key(password.as_bytes());
+    // The derivation's HMAC is `crypto::kdf_hmac`, not the backend seam: this
+    // loop runs up to 2^24 times, so it goes straight to `sha2`'s SHA-256
+    // compression on every backend rather than crossing FFI twice per
+    // iteration. Everything else in this module still uses the backend.
+    let password_mac = kdf_hmac::KdfHmacKey::new(password.as_bytes());
 
     let mut salt_block = [0u8; 20];
     salt_block[..salt.len()].copy_from_slice(salt);
     salt_block[19] = 1;
 
-    let mut u = backend::hmac_sha256(&password_mac, &salt_block);
+    let mut u = password_mac.sign(&salt_block);
     let mut fn_value = u;
 
     let mut key = [0u8; 32];
@@ -175,7 +191,7 @@ pub fn derive_rar5_material(
         (16, &mut psw_check_value),
     ] {
         for _ in 0..rounds {
-            u = backend::hmac_sha256(&password_mac, &u);
+            u = password_mac.sign(&u);
             for (acc, next) in fn_value.iter_mut().zip(u.iter()) {
                 *acc ^= *next;
             }

@@ -178,6 +178,11 @@ type PerfCounters struct {
 	ContextSwitches *uint64  `json:"context_switches,omitempty"`
 	CPUMigrations   *uint64  `json:"cpu_migrations,omitempty"`
 	DurationNanos   *uint64  `json:"duration_nanos,omitempty"`
+	// MinRunningPercent is the lowest running percentage perf reported for
+	// any counter summed into this record. 100 means every event was
+	// scheduled for the whole run; anything lower means the PMU multiplexed
+	// and the counts are perf's scaled estimates.
+	MinRunningPercent *float64 `json:"min_running_percent,omitempty"`
 }
 
 // RAR5PhaseEvidence is populated only from the opt-in benchmark diagnostic

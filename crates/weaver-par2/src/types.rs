@@ -138,6 +138,27 @@ pub struct ProgressUpdate {
     pub bytes_processed: u64,
     /// Total bytes in this operation when known.
     pub total_bytes: Option<u64>,
+    /// Which pass within `stage` produced this update.
+    pub phase: ProgressPhase,
+}
+
+/// Pass within a [`ProgressStage`] that runs more than one of them.
+///
+/// `current`, `total`, and `bytes_processed` are counted per pass, so a stage
+/// with several passes restarts them at every pass boundary. The counts alone
+/// cannot mark that boundary: creation's source scan counts files while its
+/// recovery encode counts stripes, and the two totals coincide whenever a set
+/// has as many files as the encoder has stripes. Consumers that reset
+/// per-pass state must key on this field, never on a change in `total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProgressPhase {
+    /// The stage runs a single pass, or the emitter does not subdivide it.
+    #[default]
+    Whole,
+    /// Creation's source scan: reading and hashing the input files.
+    SourceScan,
+    /// Creation's recovery encode: computing the recovery slices.
+    RecoveryEncode,
 }
 
 /// Stage of a PAR2 operation for progress reporting.

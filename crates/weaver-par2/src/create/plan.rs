@@ -257,6 +257,7 @@ impl Par2CreatePlan {
             &self.sources,
             self.sources.len(),
             self.source_slice_count,
+            self.slice_size,
             MemoryPlanPaths {
                 base_path: &self.base_path,
                 output_stem: &self.output_stem,
@@ -349,10 +350,12 @@ struct MemoryPlanPaths<'a> {
     output_paths: &'a [PathBuf],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn memory_plan_for(
     sources: &[CreationSource],
     input_count: usize,
     source_slice_count: u32,
+    block_size: u64,
     paths: MemoryPlanPaths<'_>,
     volumes: &[RecoveryVolumePlan],
     processing_buffer_limit_bytes: usize,
@@ -364,7 +367,7 @@ fn memory_plan_for(
         });
     }
     let source_metadata_bytes = estimate_source_metadata_bytes(sources, input_count)?;
-    let source_hash_workspace_bytes = estimate_source_hash_workspace(input_count)?;
+    let source_hash_workspace_bytes = estimate_source_hash_workspace(input_count, block_size)?;
     let critical_packet_bytes = estimate_critical_packet_bytes(sources)?;
     let main_file_id_workspace_bytes = estimate_main_file_id_workspace_bytes(sources)?;
     let packet_build_workspace_bytes = estimate_packet_build_workspace_bytes(sources)?;
@@ -488,7 +491,7 @@ fn estimate_source_metadata_bytes(sources: &[CreationSource], capacity: usize) -
     Ok(total)
 }
 
-fn estimate_source_hash_workspace(input_count: usize) -> Result<usize> {
+fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result<usize> {
     const READ_BUFFER_BYTES: usize = 256 * 1024;
     const HASH_SET_ENTRY_RESERVE_BYTES: usize = 128;
     let input_lengths = checked_memory_mul(
@@ -514,8 +517,29 @@ fn estimate_source_hash_workspace(input_count: usize) -> Result<usize> {
     } else {
         input_count.min(threads.saturating_add(1))
     };
+    // A task either stages a batch of slices for the multi-buffer slice-hash
+    // kernel or streams one slice through a single read buffer, whichever
+    // `create_md5_batch_lanes` selected for this block size. Mirrors the split
+    // in `source.rs` exactly; the two must move together or the plan's
+    // self-consistency check in `Par2CreatePlan` fails.
+    // `READ_BUFFER_BYTES` stays a floor rather than the exact figure: the
+    // streaming arm allocates only `min(READ_BUFFER_BYTES, block_size)`, so
+    // this estimate has always been an upper bound for small blocks, and
+    // tightening it here would move a reported number for no benefit.
+    let block_size_usize = usize::try_from(block_size).unwrap_or(usize::MAX);
+    let lanes = super::source::create_md5_batch_lanes(block_size_usize);
+    let per_task_bytes = if lanes >= 2 {
+        checked_memory_mul(
+            lanes,
+            block_size_usize,
+            "source hash batch estimate overflows",
+        )?
+        .max(READ_BUFFER_BYTES)
+    } else {
+        READ_BUFFER_BYTES
+    };
     let read_buffers = checked_memory_mul(
-        READ_BUFFER_BYTES,
+        per_task_bytes,
         concurrent_reads,
         "concurrent source read buffer estimate overflows",
     )?;
@@ -666,6 +690,7 @@ pub(crate) fn build_plan(options: &Par2CreatorOptions) -> Result<Par2CreatePlan>
         &sources,
         input_lengths.len(),
         source_slice_count,
+        block_size,
         MemoryPlanPaths {
             base_path: &base_path,
             output_stem: &output_stem,

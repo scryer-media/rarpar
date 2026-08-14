@@ -39,7 +39,6 @@ use rayon::prelude::*;
 use tracing::{debug, warn};
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
-const SCANNER_MD5_BATCH_LANES: usize = 4;
 const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
@@ -5519,11 +5518,16 @@ fn can_record_block_location(
     })
 }
 
+/// Candidate blocks batched per multi-buffer MD5 call while scanning.
+///
+/// The kernel width comes from the ISA ([`md5_simd::max_lanes`]: 8 on AVX2, 4
+/// on NEON/SSE2/simd128, 1 scalar); the memory budget caps how many
+/// slice-sized candidates may be held at once on top of that.
 fn scanner_md5_batch_lanes(slice_size: usize) -> usize {
     if slice_size == 0 {
         return 1;
     }
-    (SCANNER_MD5_BATCH_MEMORY_BYTES / slice_size).clamp(1, SCANNER_MD5_BATCH_LANES)
+    (SCANNER_MD5_BATCH_MEMORY_BYTES / slice_size).clamp(1, md5_simd::max_lanes())
 }
 
 fn record_matching_md5_block(
@@ -6195,15 +6199,18 @@ fn crc32_zeros(len: u64) -> u32 {
     hasher.finalize()
 }
 
+/// MD5 of one short block, zero-padded to `pad_to`.
+///
+/// Deliberately the single-stream backend rather than [`md5_simd::md5_multi`]:
+/// a multi-buffer kernel driven with one input leaves every other lane idle and
+/// still pays the vector round latency, so it is slower here than the ordinary
+/// MD5 implementation. Multi-buffer only pays off with several independent
+/// messages in flight, which is what the batched scanner and verifier feed it.
 fn padded_md5(data: &[u8], pad_to: u64) -> [u8; 16] {
-    if usize::try_from(pad_to).is_ok_and(|pad_to| pad_to <= SCANNER_MD5_BATCH_MEMORY_BYTES) {
-        md5_simd::md5_multi(&[data], Some(pad_to))[0]
-    } else {
-        let mut hasher = Md5State::new();
-        hasher.update(data);
-        update_md5_zeros(&mut hasher, pad_to.saturating_sub(data.len() as u64));
-        hasher.finalize()
-    }
+    let mut hasher = Md5State::new();
+    hasher.update(data);
+    update_md5_zeros(&mut hasher, pad_to.saturating_sub(data.len() as u64));
+    hasher.finalize()
 }
 
 fn update_crc_zeros(hasher: &mut Crc32Hasher, mut len: u64) {

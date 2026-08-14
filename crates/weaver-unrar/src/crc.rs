@@ -42,6 +42,18 @@
 //! start); the result is the updated CRC in the low 32 bits. It chains:
 //! `crc32(crc32(0, A), B) == crc32(0, A ++ B)`. `buf_len` may be 0 (returns the
 //! seed unchanged).
+//!
+//! ## The accelerated tier
+//!
+//! Orthogonal to the backend split above, the non-host backend consults
+//! [`crate::crc_simd`], which supplies a CRC kernel for the one CPU class
+//! `crc-fast` leaves on a slower tier than its instruction set allows. That
+//! module owns the gate and the kernel; this one owns the streaming state that
+//! hands buffers to it. Where no tier applies — which is every non-x86-64
+//! target, all wasm, and any x86-64 host outside the gap — the seam is exactly
+//! the `crc-fast` wrapper it was before.
+
+use crate::crc_simd;
 
 // Raw host import: a bare `#[link]` extern (no embedder SDK dependency), so
 // any wasm runtime satisfies it by exposing a function of this name in the
@@ -126,12 +138,35 @@ impl Crc32 {
     }
 }
 
-/// Incremental IEEE CRC-32 of a byte stream (portable / native build). Thin
-/// wrapper over [`crc_fast::Digest`].
+/// Incremental IEEE CRC-32 of a byte stream (portable / native build).
+///
+/// Wraps [`crc_fast::Digest`], with one detour: on hosts where
+/// [`crate::crc_simd`] has a tier `crc-fast` does not (VPCLMULQDQ without
+/// AVX-512VL — see that module for why the hole exists), updates at or above
+/// [`crc_simd::MIN_UPDATE`] are folded by the local kernel instead.
+///
+/// While the kernel is carrying the stream, the authoritative value is the
+/// plain `u32` in `accel` — which is in the finalized (post-xor) domain — and
+/// `inner` is stale. `inner` is re-seeded from `accel` only when a
+/// below-threshold update arrives, so the dominant "a few large updates then
+/// finalize" shape (which is every bulk member-data CRC in this crate) touches
+/// the digest exactly once, at construction.
+///
+/// Because `accel` is not a digest, [`crc_fast::Digest::get_amount`] and
+/// [`crc_fast::Digest::combine`] would see a byte counter that stopped
+/// advancing the moment the kernel engaged. Neither is surfaced through this
+/// wrapper, and neither may be added without tracking the folded byte count
+/// here first.
 #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
 #[derive(Clone)]
 pub(crate) struct Crc32 {
     inner: crc_fast::Digest,
+    /// Carried CRC in the finalized domain. `Some` means `inner` is stale.
+    accel: Option<u32>,
+    /// Resolved once per hasher rather than per update, so the hot path is a
+    /// register test and not a `OnceLock` load. Always `false` on targets and
+    /// hosts with no tier, where it constant-folds the branch away entirely.
+    use_accel: bool,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
@@ -140,22 +175,56 @@ impl Crc32 {
     pub(crate) fn new() -> Self {
         Self {
             inner: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
+            accel: None,
+            use_accel: crc_simd::available(),
         }
     }
 
     #[inline]
     pub(crate) fn update(&mut self, data: &[u8]) {
+        if self.use_accel && data.len() >= crc_simd::MIN_UPDATE {
+            // Both the kernel's input and its output are the finalized domain,
+            // so consecutive folded updates just carry a `u32`.
+            let initial = match self.accel {
+                Some(crc) => crc,
+                None => self.inner.finalize() as u32,
+            };
+            self.accel = Some(crc_simd::update(initial, data));
+            return;
+        }
+
+        // Leaving the folding path: materialize the carried value back into the
+        // resident digest exactly once, not once per update.
+        if let Some(crc) = self.accel.take() {
+            self.inner = crc_fast::Digest::new_with_init_state(
+                crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                u64::from(!crc),
+            );
+        }
+
         self.inner.update(data);
     }
 
     #[inline]
     pub(crate) fn finalize(self) -> u32 {
-        self.inner.finalize() as u32
+        match self.accel {
+            Some(crc) => crc,
+            None => self.inner.finalize() as u32,
+        }
     }
 }
 
+/// One-shot IEEE CRC-32.
+///
+/// Takes the same accelerated tier as [`Crc32`] for buffers large enough to pay
+/// for the dispatch; everything else goes straight to `crc-fast`. The header
+/// and probe CRCs that dominate this function's call sites are tens of bytes,
+/// so they take the second arm.
 #[inline]
 pub(crate) fn hash(data: &[u8]) -> u32 {
+    if data.len() >= crc_simd::MIN_UPDATE && crc_simd::available() {
+        return crc_simd::update(0, data);
+    }
     crc_fast::crc32_iso_hdlc(data)
 }
 
@@ -268,6 +337,91 @@ mod tests {
         }
 
         assert!(cases >= 10, "expected >= 10 CRC cases, ran {cases}");
+    }
+
+    /// Update sequences that bounce across [`crc_simd::MIN_UPDATE`] in both
+    /// directions, checked at *every prefix* rather than only at the end, so a
+    /// bad hand-off is attributed to the update that introduced it.
+    ///
+    /// This is the load-bearing test for the accelerated tier's interaction
+    /// with the digest: entering the fold, leaving it, re-entering it, and the
+    /// exact threshold boundary (255 vs 256). On a host with no tier it still
+    /// runs and simply proves the seam unchanged, so it is never a silent skip.
+    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+    #[test]
+    fn crc32_seam_survives_updates_straddling_the_tier_threshold() {
+        const LEN: usize = 64 * 1024;
+        let mut rng = XorShift64::new(0x00C3_2000_5111_D001);
+        let mut data = vec![0u8; LEN];
+        rng.fill(&mut data);
+
+        let min = crc_simd::MIN_UPDATE;
+        let sequences: [&[usize]; 8] = [
+            &[1, 64, 255, 256, 300, 4096, 7],
+            &[4096, 7, 256, 1, 300, 255, 64],
+            &[256, 256, 256, 1, 1, 1, 4096],
+            &[7, 7, 7, 300, 7, 4096, 255, 256],
+            &[300, 1, 4096, 64, 256, 255, 7, 256],
+            &[4096, 4096, 1, 4096, 255, 300, 256],
+            &[8192, 8192, 8192, 1],
+            &[1, 8192, 1, 8192, 1],
+        ];
+
+        let mut prefixes = 0usize;
+        for seq in sequences {
+            assert!(
+                seq.iter().any(|&len| len >= min) && seq.iter().any(|&len| len < min),
+                "sequence {seq:?} must straddle MIN_UPDATE ({min}) to be useful"
+            );
+            let total: usize = seq.iter().sum();
+            assert!(total <= LEN, "sequence {seq:?} exceeds the fixture");
+
+            let mut crc = Crc32::new();
+            let mut offset = 0usize;
+            for &len in seq {
+                crc.update(&data[offset..offset + len]);
+                offset += len;
+                assert_eq!(
+                    crc.clone().finalize(),
+                    hash(&data[..offset]),
+                    "sequence {seq:?} diverged at prefix {offset}"
+                );
+                prefixes += 1;
+            }
+        }
+
+        assert!(
+            prefixes >= 50,
+            "expected >= 50 prefix checks, ran {prefixes}"
+        );
+    }
+
+    /// The one-shot [`hash`] helper takes a different arm above and below the
+    /// tier threshold; both must agree with `crc-fast` at the boundary.
+    #[test]
+    fn crc32_one_shot_hash_matches_crc_fast_across_the_threshold() {
+        let mut rng = XorShift64::new(0x00C3_2000_5111_D002);
+        let mut data = vec![0u8; 8192];
+        rng.fill(&mut data);
+
+        let min = crc_simd::MIN_UPDATE;
+        for len in [
+            0,
+            1,
+            min.saturating_sub(2),
+            min.saturating_sub(1),
+            min,
+            min + 1,
+            min + 2,
+            1024,
+            8192,
+        ] {
+            assert_eq!(
+                hash(&data[..len]),
+                crc_fast::crc32_iso_hdlc(&data[..len]),
+                "len {len}"
+            );
+        }
     }
 
     /// The `crc32_update_host` reference stand-in (native twin of the wasm host

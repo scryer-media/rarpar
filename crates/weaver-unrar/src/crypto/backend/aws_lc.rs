@@ -22,15 +22,21 @@ use crate::crypto::AES_BLOCK;
 /// SHA-256 block size in bytes — the HMAC key-padding width (RFC 4868).
 const SHA256_BLOCK: usize = 64;
 
-/// HMAC-SHA256 key handle used for RAR5 key derivation and MAC conversion.
+/// HMAC-SHA256 key handle used for MAC conversion
+/// ([`crate::crypto::convert_crc32_to_mac`] / `convert_blake2_to_mac`).
+///
+/// **Not** the RAR5 key derivation: that moved to [`crate::crypto::kdf_hmac`],
+/// which runs on `sha2` on every backend so its 2^24-iteration loop never
+/// crosses FFI. The cached-context shape below is kept anyway — it is strictly
+/// cheaper than the alternative even for the one tag per call the MAC
+/// conversions take, and it is what the pre-change differential test pins.
 ///
 /// This is deliberately **not** `aws_lc_rs::hmac::Key`. That type's only way to
 /// produce a tag is `hmac::sign` / `hmac::Context::with_key`, both of which
 /// clone the whole `HMAC_CTX` (`HMAC_CTX_init` + `HMAC_CTX_copy_ex` over three
 /// `EVP_MD_CTX`s, then `HMAC_CTX_cleanup` / `OPENSSL_cleanse` on drop) for every
-/// single tag. RAR5's PBKDF2 signs a 32-byte message up to 2^24 times under one
-/// key, so that per-tag context churn — not the SHA-256 compressions — dominated
-/// the derivation.
+/// single tag. When this backend still carried the derivation, that per-tag
+/// context churn — not the SHA-256 compressions — dominated it.
 ///
 /// Instead this is UnRAR's own shape (`crypt5.cpp:22-46,51-76`: `ICtxOpt` /
 /// `SetIOpt` and `RCtxOpt` / `SetROpt`): the key⊕ipad and key⊕opad blocks are

@@ -172,21 +172,44 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
 struct ProgressLatch {
     last: Instant,
     stage: Option<par2_rs::ProgressStage>,
+    phase: Option<par2_rs::ProgressPhase>,
     total: u32,
     current: u32,
     bytes: u64,
+    printed: Option<PrintedLine>,
 }
 
+type PrintedLine = (
+    par2_rs::ProgressStage,
+    par2_rs::ProgressPhase,
+    u32,
+    u32,
+    u64,
+);
+
 impl ProgressLatch {
-    fn print(&self) {
+    /// Print the latched state, unless it is exactly what was printed last.
+    ///
+    /// The same state reaches this twice at the end of an operation: the
+    /// final update is throttle-sampled, then the caller flushes the latch
+    /// once the operation returns (that flush is what makes the last line
+    /// truthful when the sample is suppressed). Suppressing the repeat here
+    /// keeps the tail line single without making the flush conditional on a
+    /// race.
+    fn print(&mut self) {
         let Some(stage) = self.stage else {
             return;
         };
+        let phase = self.phase.unwrap_or_default();
+        let current = self.current.saturating_add(1).min(self.total);
+        let line = (stage, phase, current, self.total, self.bytes);
+        if self.printed == Some(line) {
+            return;
+        }
+        self.printed = Some(line);
         eprintln!(
-            "create {stage:?}: {}/{} ({} bytes)",
-            self.current.saturating_add(1).min(self.total),
-            self.total,
-            self.bytes
+            "create {stage:?}: {current}/{} ({} bytes)",
+            self.total, self.bytes
         );
     }
 }
@@ -195,9 +218,11 @@ fn create_progress_callback() -> (par2_rs::ProgressCallback, Arc<Mutex<ProgressL
     let state = Arc::new(Mutex::new(ProgressLatch {
         last: Instant::now() - Duration::from_secs(1),
         stage: None,
+        phase: None,
         total: 0,
         current: 0,
         bytes: 0,
+        printed: None,
     }));
     let latch_handle = Arc::clone(&state);
     let callback: par2_rs::ProgressCallback = Arc::new(move |update| {
@@ -209,11 +234,15 @@ fn create_progress_callback() -> (par2_rs::ProgressCallback, Arc<Mutex<ProgressL
         // updates are not monotonic. Latch to the maximum seen, and reset
         // the latch when the phase changes (each phase carries its own
         // total: file count while scanning, stripe count while encoding).
+        // The phase is read from the update, not inferred from a change in
+        // `total`: both creation phases report stage `Creating`, and their
+        // totals coincide whenever the set has as many files as the encoder
+        // has stripes, which used to swallow the whole encode phase.
         // No update is identifiable as a phase's last, so the outgoing
         // phase's true final values are flushed at the transition and the
         // operation's final values are flushed by the caller after create
         // returns; in between, prints are purely throttle-sampled.
-        if update.total != latch.total {
+        if latch.phase != Some(update.phase) || update.total != latch.total {
             if latch.total != 0 {
                 latch.print();
             }
@@ -222,6 +251,7 @@ fn create_progress_callback() -> (par2_rs::ProgressCallback, Arc<Mutex<ProgressL
             latch.bytes = 0;
         }
         latch.stage = Some(update.stage);
+        latch.phase = Some(update.phase);
         latch.current = latch.current.max(update.current);
         latch.bytes = latch.bytes.max(update.bytes_processed);
         if now.duration_since(latch.last) < Duration::from_millis(250) {

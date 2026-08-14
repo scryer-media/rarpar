@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use thiserror::Error;
+
 use crate::checksum::SliceChecksumState;
 use crate::packet::Packet;
 use crate::par2_set::Par2FileSet;
@@ -134,6 +136,96 @@ pub enum SliceEvidenceStrength {
     Crc32AndMd5,
 }
 
+/// Why an in-stream CRC32 attestation cannot be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InStreamCrc32ProofError {
+    #[error("in-stream CRC32 covered no bytes")]
+    EmptyCoverage,
+    #[error("in-stream CRC32 did not cover the whole slice")]
+    IncompleteSliceCoverage,
+    #[error("in-stream CRC32 was not derived from the bytes the source will serve")]
+    UnverifiedSourceBytes,
+    #[error("in-stream CRC32 has no independent second-grid CRC32 coverage")]
+    NoIndependentCrc32Coverage,
+}
+
+/// Validated attestation that a caller derived a slice's PAR2 CRC32 in stream.
+///
+/// This is the counterpart to [`crate::ContiguousAssemblyProof`] for a single
+/// slice: it does not itself verify anything, it records that the caller
+/// asserted every property that makes a CRC32-only slice verdict admissible,
+/// and refuses to exist when any of them is false.
+///
+/// # What a proven attestation asserts
+///
+/// - The CRC32 covered the slice's full extent — every byte from the slice's
+///   own offset in the file the recovery set describes, zero-padded to the
+///   block size exactly as PAR2 checksums a short final slice.
+/// - Those bytes are the bytes the repair source will serve, already durable,
+///   not a speculative or in-flight buffer.
+/// - The same span is independently covered by a second CRC32 cut on an
+///   unrelated grid — for a Usenet download path, the article-aligned yEnc
+///   `pcrc32` beside the block-aligned PAR2 CRC32.
+///
+/// # What it does not assert
+///
+/// No MD5 was computed, so this is not slice *identity*: it is the statement
+/// that a 32-bit checksum over the slice's bytes agreed with the recovery
+/// set's IFSC entry. A verdict admitted this way seeds a repair *input*; it
+/// never promotes a file to a whole-file match, and repair still recomputes
+/// the IFSC CRC32 **and MD5** over every byte it consumes, so an attestation
+/// that turns out to be wrong fails the repair loudly rather than producing
+/// wrong output. Settle-time verification of slices with no verdict is
+/// likewise untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InStreamCrc32Proof {
+    covered_length: u64,
+}
+
+impl InStreamCrc32Proof {
+    /// Validate and record an in-stream CRC32 attestation.
+    ///
+    /// `covered_length` is the number of the file's real bytes the derivation
+    /// covered for this slice — the full block size, or the short remainder for
+    /// a final slice before PAR2's zero padding. The three flags are the
+    /// caller's assertions described on the type; every one must hold.
+    pub fn try_new(
+        covered_length: u64,
+        slice_fully_covered: bool,
+        derived_from_durable_bytes: bool,
+        independently_crc32_covered: bool,
+    ) -> Result<Self, InStreamCrc32ProofError> {
+        if covered_length == 0 {
+            return Err(InStreamCrc32ProofError::EmptyCoverage);
+        }
+        if !slice_fully_covered {
+            return Err(InStreamCrc32ProofError::IncompleteSliceCoverage);
+        }
+        if !derived_from_durable_bytes {
+            return Err(InStreamCrc32ProofError::UnverifiedSourceBytes);
+        }
+        if !independently_crc32_covered {
+            return Err(InStreamCrc32ProofError::NoIndependentCrc32Coverage);
+        }
+
+        Ok(Self { covered_length })
+    }
+
+    /// Real file bytes the attested derivation covered for this slice.
+    pub fn covered_length(&self) -> u64 {
+        self.covered_length
+    }
+}
+
+/// A completed PAR2 slice verdict, suitable for passing to a repair session.
+///
+/// Evidence deliberately identifies PAR2 coordinates only. It never exposes a
+/// filesystem path or assumes where the downloaded bytes were stored.
+///
+/// A session produces this itself from bytes it hashed
+/// ([`VerificationSession::slice_evidence`]). A caller that hashed the bytes
+/// during its own single pass over them — never handing them to par2-rs at all
+/// — mints one with [`SliceEvidence::from_in_stream_crc32`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceEvidence {
     recovery_set_id: RecoverySetId,
@@ -141,6 +233,9 @@ pub struct SliceEvidence {
     slice_index: u32,
     valid: bool,
     strength: SliceEvidenceStrength,
+    /// Present only for externally attested verdicts. This is what separates a
+    /// CRC32-only verdict a repair session may act on from one it may not.
+    in_stream: Option<InStreamCrc32Proof>,
 }
 
 impl SliceEvidence {
@@ -165,8 +260,87 @@ impl SliceEvidence {
     }
 
     /// Hash strength used to produce this verdict.
+    ///
+    /// Externally attested verdicts report [`SliceEvidenceStrength::Crc32Only`],
+    /// because that is what was actually computed. Use
+    /// [`Self::in_stream_proof`] to tell them apart from an unattested CRC32
+    /// comparison.
     pub fn strength(&self) -> SliceEvidenceStrength {
         self.strength
+    }
+
+    /// Mint a verdict the caller derived itself, in stream, from a slice's
+    /// PAR2 CRC32.
+    ///
+    /// This exists for a caller that already hashes every payload byte for its
+    /// own reasons and can cut that hash on the recovery set's block grid. It
+    /// hands par2-rs the *conclusion* — this slice's CRC32 did or did not agree
+    /// with the recovery set's IFSC entry — without ever handing over the
+    /// bytes, so nothing is read, buffered or hashed twice.
+    ///
+    /// `valid` is the result of that comparison. `proof` is the caller's
+    /// attestation, and [`InStreamCrc32Proof`] documents exactly what it does
+    /// and does not assert — in short, that a CRC32 covering the whole slice's
+    /// durable bytes agreed with the IFSC entry, and *not* that the slice's
+    /// identity was established, which needs MD5.
+    ///
+    /// The comparison itself is the caller's: par2-rs is not given the derived
+    /// CRC32 and does not re-run the check. That is the point — the recovery
+    /// set's expected CRC32 is public in its IFSC packet, so a caller that has
+    /// read the set can compare against it as well as this crate can, and
+    /// asking it to ship the value back for a redundant comparison would prove
+    /// nothing the attestation does not already carry.
+    ///
+    /// # Where this lands
+    ///
+    /// A **valid** verdict seeds a repair input for that one slice, the same
+    /// seat a slice hashed by [`VerificationSession`] takes. It never promotes
+    /// a file to a whole-file match — only a complete-file hash does that — and
+    /// repair re-derives both the IFSC CRC32 and MD5 over every byte it
+    /// consumes, so a mistaken attestation fails the repair loudly instead of
+    /// producing wrong output.
+    ///
+    /// An **invalid** verdict routes into the session's ordinary contradiction
+    /// handling, which retires the *source* the verdict named — for a source
+    /// served by a handle, that is the whole file, because file identity is the
+    /// only thing such a source has to be named by. A caller holding good
+    /// verdicts for a file's other slices should therefore seed those and
+    /// simply not seed the damaged one, leaving it unresolved for repair or for
+    /// a read-back pass, rather than seeding a contradiction that retires the
+    /// good slices alongside it.
+    pub fn from_in_stream_crc32(
+        recovery_set_id: RecoverySetId,
+        file_id: FileId,
+        slice_index: u32,
+        valid: bool,
+        proof: InStreamCrc32Proof,
+    ) -> Self {
+        Self {
+            recovery_set_id,
+            file_id,
+            slice_index,
+            valid,
+            strength: SliceEvidenceStrength::Crc32Only,
+            in_stream: Some(proof),
+        }
+    }
+
+    /// The in-stream attestation carried by this verdict, when it was minted by
+    /// [`Self::from_in_stream_crc32`] rather than hashed by a session.
+    pub fn in_stream_proof(&self) -> Option<&InStreamCrc32Proof> {
+        self.in_stream.as_ref()
+    }
+
+    /// Whether a repair session may act on this verdict.
+    ///
+    /// True for a slice this crate hashed with both the IFSC CRC32 and MD5, and
+    /// for an externally attested in-stream CRC32 verdict. False for a bare
+    /// CRC32 comparison with nothing vouching for where its bytes came from —
+    /// [`VerificationSession::verify_from_slice_crcs`] produces those, and a
+    /// caller-supplied CRC32 with no attestation cannot say whether it
+    /// describes the bytes a repair would later read.
+    pub fn may_seed_repair_input(&self) -> bool {
+        self.strength == SliceEvidenceStrength::Crc32AndMd5 || self.in_stream.is_some()
     }
 
     #[cfg(test)]
@@ -183,6 +357,7 @@ impl SliceEvidence {
             slice_index,
             valid,
             strength,
+            in_stream: None,
         }
     }
 }
@@ -511,6 +686,9 @@ impl FileVerificationState {
             } else {
                 SliceEvidenceStrength::Crc32Only
             },
+            // A session hashed these bytes itself; there is no external claim
+            // to record, and its own CRC32-only verdicts stay inadmissible.
+            in_stream: None,
         }
     }
 
@@ -1840,5 +2018,85 @@ mod tests {
         // set allocation instead of rebuilding every accumulated packet.
         session.add_par2_data(&packets[..1]);
         assert_eq!(before, Arc::as_ptr(session.par2_set.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn in_stream_proof_refuses_every_incomplete_attestation() {
+        let proof = InStreamCrc32Proof::try_new(4096, true, true, true)
+            .expect("a complete attestation should prove");
+        assert_eq!(proof.covered_length(), 4096);
+
+        assert!(matches!(
+            InStreamCrc32Proof::try_new(0, true, true, true),
+            Err(InStreamCrc32ProofError::EmptyCoverage)
+        ));
+        assert!(matches!(
+            InStreamCrc32Proof::try_new(4096, false, true, true),
+            Err(InStreamCrc32ProofError::IncompleteSliceCoverage)
+        ));
+        assert!(matches!(
+            InStreamCrc32Proof::try_new(4096, true, false, true),
+            Err(InStreamCrc32ProofError::UnverifiedSourceBytes)
+        ));
+        assert!(matches!(
+            InStreamCrc32Proof::try_new(4096, true, true, false),
+            Err(InStreamCrc32ProofError::NoIndependentCrc32Coverage)
+        ));
+    }
+
+    /// The attestation is what admits a verdict, not the hash strength: an
+    /// in-stream verdict still reports honestly that only a CRC32 was computed.
+    #[test]
+    fn in_stream_evidence_reports_crc32_only_strength_and_is_admissible() {
+        let set_id = RecoverySetId::from_bytes([0x51; 16]);
+        let file_id = FileId::from_bytes([0x52; 16]);
+        let proof = InStreamCrc32Proof::try_new(1024, true, true, true).unwrap();
+        let evidence = SliceEvidence::from_in_stream_crc32(set_id, file_id, 7, true, proof);
+
+        assert_eq!(evidence.recovery_set_id(), set_id);
+        assert_eq!(evidence.file_id(), file_id);
+        assert_eq!(evidence.slice_index(), 7);
+        assert!(evidence.is_valid());
+        assert_eq!(evidence.strength(), SliceEvidenceStrength::Crc32Only);
+        assert_eq!(evidence.in_stream_proof(), Some(&proof));
+        assert!(evidence.may_seed_repair_input());
+
+        // An invalid verdict is equally well formed: contradiction is a result,
+        // not a failure to attest.
+        let damaged = SliceEvidence::from_in_stream_crc32(set_id, file_id, 7, false, proof);
+        assert!(!damaged.is_valid());
+        assert!(damaged.may_seed_repair_input());
+    }
+
+    /// A CRC32 the session merely compared, with nothing vouching for where its
+    /// bytes came from, stays inadmissible — this is the case
+    /// `verify_from_slice_crcs` produces.
+    #[test]
+    fn session_hashed_crc32_only_evidence_carries_no_attestation() {
+        let slice_size = 8u64;
+        let file_data: Vec<u8> = (0..16u8).collect();
+        let (par2_bytes, file_id, _) = build_par2_packets(&file_data, slice_size);
+        let mut session = VerificationSession::new();
+        session.add_par2_data(&parse_packets(&par2_bytes));
+
+        let crcs: Vec<u32> = file_data
+            .chunks(slice_size as usize)
+            .map(|slice| {
+                let mut state = SliceChecksumState::new();
+                state.update(slice);
+                state.finalize(Some(slice_size)).0
+            })
+            .collect();
+        session
+            .verify_from_slice_crcs(&file_id, &crcs)
+            .expect("slice CRCs settle the file");
+
+        let evidence = session.slice_evidence();
+        assert!(!evidence.is_empty());
+        for entry in evidence {
+            assert_eq!(entry.strength(), SliceEvidenceStrength::Crc32Only);
+            assert_eq!(entry.in_stream_proof(), None);
+            assert!(!entry.may_seed_repair_input());
+        }
     }
 }

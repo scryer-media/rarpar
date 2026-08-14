@@ -441,6 +441,32 @@ func TestRunScriptEncodesHouseRules(t *testing.T) {
 	}
 }
 
+// The perf stat -r pass re-invokes the harness once per repetition, and
+// `run` refuses a non-empty --out directory — which the record pass just
+// populated. Without a shim clearing it inside each repetition, every
+// repetition measures the early refusal instead of the workload (caught
+// live: two different workloads agreeing on instruction count to four
+// significant figures across two fleet rounds). Failures must also warn,
+// not vanish into a discarded stream.
+func TestRunScriptStatPassMeasuresRealRunsNotRefusals(t *testing.T) {
+	config := loadExample(t)
+	byName := map[string]Machine{}
+	for _, machine := range config.Machines {
+		byName[machine.Name] = machine
+	}
+	linux := byName["linux-avx2"]
+	script := RunScript(linux, config.Fleet.Defaults, "fleet-testrun", LayoutFor(linux, "fleet-testrun"), nil)
+	if !strings.Contains(script, `sh -c 'rm -rf "$1" && shift && exec "$@"' stat-shim "$W/rec-$c"`) {
+		t.Fatal("perf stat must clear the run's --out directory inside each repetition via the stat-shim")
+	}
+	if !strings.Contains(script, `|| warn "perf-stat-$c"`) {
+		t.Fatal("a failed perf stat repetition must surface as a warning")
+	}
+	if strings.Contains(script, `"$BENCH" "$@" > /dev/null 2>&1 || log "perf stat`) {
+		t.Fatal("the stat pass must not regress to discarding the harness's failure output")
+	}
+}
+
 // A literal percent in a generated line silently becomes a format verb and
 // produces "%!Y(MISSING)" in the shipped script, which the remote shell then
 // rejects. This caught exactly that on the first live run.

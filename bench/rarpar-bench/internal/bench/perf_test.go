@@ -45,6 +45,9 @@ func TestParsePerfStatOutput(t *testing.T) {
 	if counters.DurationNanos == nil || *counters.DurationNanos != 123456789 {
 		t.Fatalf("duration = %#v", counters)
 	}
+	if counters.MinRunningPercent == nil || *counters.MinRunningPercent != 100.0 {
+		t.Fatalf("min running percent = %#v", counters)
+	}
 }
 
 func TestParsePerfStatOutputRejectsUnavailableCountersWithoutZeroes(t *testing.T) {
@@ -73,18 +76,47 @@ func TestParsePerfStatOutputRejectsDuplicateCounters(t *testing.T) {
 	}
 }
 
-func TestParsePerfStatOutputRejectsMultiplexedCounters(t *testing.T) {
-	output := []byte("1,,cycles,74.25\n")
+func TestParsePerfStatOutputAcceptsMultiplexedCountersAndFlagsThem(t *testing.T) {
+	// A sub-100 running percentage means the PMU multiplexed and perf
+	// reported scaled estimates. Those stay usable for same-workload A/B
+	// comparison and must be flagged via MinRunningPercent, not rejected —
+	// a hard 99% floor once cost an entire fleet pass its per-subject
+	// counters on hosts whose PMUs multiplex the full event list.
+	output := []byte(strings.Join([]string{
+		"1000,,cycles,74.25",
+		"2000,,instructions,33.10",
+		"12.5,msec,task-clock,100.00",
+		"7,,context-switches,100.00",
+		"8,,cpu-migrations,100.00",
+		"123456789,,duration_time,100.00",
+	}, "\n"))
+	counters, err := parsePerfStatOutput(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counters.MinRunningPercent == nil || *counters.MinRunningPercent != 33.10 {
+		t.Fatalf("min running percent = %#v", counters)
+	}
+	if counters.Cycles == nil || *counters.Cycles != 1000 {
+		t.Fatalf("cycles = %#v", counters)
+	}
+	if counters.Instructions == nil || *counters.Instructions != 2000 {
+		t.Fatalf("instructions = %#v", counters)
+	}
+}
+
+func TestParsePerfStatOutputRejectsCountersBelowTheRunningFloor(t *testing.T) {
+	output := []byte("1,,cycles,12.50\n")
 	_, err := parsePerfStatOutput(output)
-	if err == nil || !strings.Contains(err.Error(), "incomplete percentage") {
-		t.Fatalf("multiplexed counter error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unusable percentage") {
+		t.Fatalf("below-floor counter error = %v", err)
 	}
 }
 
 func TestParsePerfStatOutputRejectsNonFiniteRunningPercentage(t *testing.T) {
 	output := []byte("1,,cycles,NaN\n")
 	_, err := parsePerfStatOutput(output)
-	if err == nil || !strings.Contains(err.Error(), "incomplete percentage") {
+	if err == nil || !strings.Contains(err.Error(), "unusable percentage") {
 		t.Fatalf("non-finite counter percentage error = %v", err)
 	}
 }

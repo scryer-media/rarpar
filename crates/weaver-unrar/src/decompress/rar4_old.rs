@@ -100,6 +100,41 @@ pub(crate) enum Rar4Decoder {
     V29(Box<Rar4LzDecoder>),
 }
 
+/// Borrows of the `Unpack` members that outlive an unpack-version switch.
+///
+/// Field for field this is unrar's `Window` + `OldDist`/`OldDistPtr`/
+/// `LastDist`/`LastLength` block (unpack.hpp:296-310), which lives once per
+/// `Unpack` object and is therefore shared by methods 15, 20/26 and 29.
+pub(crate) struct Rar4SharedLzState<'a> {
+    /// `Window`, together with the `UnpPtr`/`WrPtr`/`FirstWinDone` cursors that
+    /// rarpar keeps inside it.
+    pub(crate) window: &'a mut Window,
+    /// `OldDist[4]`. Method 29 indexes it directly and shifts it in
+    /// `InsertOldDist`; methods 15 and 20 address it through `OldDistPtr`.
+    pub(crate) old_dist: &'a mut [usize; 4],
+    /// `OldDistPtr`, written only by `CopyString15`/`CopyString20`.
+    pub(crate) old_dist_ptr: &'a mut usize,
+    /// `LastDist`, read only by the 1.5/2.0 decoders.
+    pub(crate) last_dist: &'a mut usize,
+    /// `LastLength`.
+    pub(crate) last_length: &'a mut usize,
+}
+
+impl Rar4SharedLzState<'_> {
+    /// Exchange the shared block with another decoder's.
+    ///
+    /// A swap rather than a move: the incoming decoder was just built and its
+    /// own freshly allocated window goes back to the outgoing one, which is
+    /// about to be dropped.
+    fn swap_with(&mut self, other: &mut Rar4SharedLzState<'_>) {
+        std::mem::swap(self.window, other.window);
+        std::mem::swap(self.old_dist, other.old_dist);
+        std::mem::swap(self.old_dist_ptr, other.old_dist_ptr);
+        std::mem::swap(self.last_dist, other.last_dist);
+        std::mem::swap(self.last_length, other.last_length);
+    }
+}
+
 impl Rar4Decoder {
     pub(crate) fn new(version: u8, dict_size: usize, method: u8) -> RarResult<Self> {
         let dict_size = old_rar_window_size(dict_size);
@@ -126,15 +161,35 @@ impl Rar4Decoder {
         }
     }
 
+    /// The `Unpack` members every RAR4-family unpack method shares.
+    ///
+    /// unrar serves methods 15, 20/26 and 29 from one `Unpack` object:
+    /// `DoUnpack` dispatches into `Unpack15`/`Unpack20`/`Unpack29`
+    /// (unpack.cpp:154-190) and all three address the same `Window`, the same
+    /// `UnpPtr`/`WrPtr` cursors and the same `OldDist`/`LastDist`/`LastLength`
+    /// history. `UnpInitData(true)` deliberately leaves every one of them alone
+    /// (unpack.cpp:194-206), so a *solid* member that changes unpack version
+    /// keeps reading the previous member's dictionary. This borrow view is what
+    /// [`Self::prepare_slot`] hands from the outgoing decoder to the incoming
+    /// one to reproduce that.
+    fn shared_lz_state(&mut self) -> Rar4SharedLzState<'_> {
+        match self {
+            Self::V15(decoder) => decoder.shared_lz_state(),
+            Self::V20(decoder) => decoder.shared_lz_state(),
+            Self::V29(decoder) => decoder.shared_lz_state(),
+        }
+    }
+
     /// Prepare a cached decoder slot for the next member, building the decoder
     /// on first use.
     ///
-    /// An unpack-version switch (15 ↔ 20 ↔ 29) still drops and rebuilds the
-    /// decoder: the enum wraps a boxed per-version decoder, so changing variant
-    /// necessarily reallocates that variant's state and there is nothing to
-    /// reuse. Version switches inside one archive are rare; every same-version
-    /// member — solid or not — takes the reuse path through
-    /// [`Self::prepare_member`] and keeps its window, tables and PPMd arena.
+    /// An unpack-version switch (15 ↔ 20/26 ↔ 29) builds the incoming variant —
+    /// the enum wraps a boxed per-version decoder, so its per-version tables
+    /// necessarily restart — but the dictionary and the distance history move
+    /// across with [`Self::shared_lz_state`], which is the part the oracle
+    /// shares between methods. Every same-version member, solid or not, takes
+    /// the reuse path through [`Self::prepare_member`] and keeps its tables and
+    /// PPMd arena as well.
     pub(crate) fn prepare_slot(
         slot: &mut Option<Self>,
         solid: bool,
@@ -146,7 +201,16 @@ impl Rar4Decoder {
             .as_ref()
             .is_some_and(|decoder| !decoder.supports_version(version))
         {
-            *slot = None;
+            // Built before the hand-over so an unsupported version leaves the
+            // cached decoder untouched. Its fresh window is what the outgoing
+            // decoder keeps, and is dropped with it.
+            let mut next = Self::new(version, dict_size, method)?;
+            {
+                let previous = slot.as_mut().expect("slot is occupied");
+                let mut incoming = next.shared_lz_state();
+                previous.shared_lz_state().swap_with(&mut incoming);
+            }
+            *slot = Some(next);
         }
 
         match slot.as_mut() {
@@ -446,6 +510,17 @@ impl Rar20Decoder {
             tables_read: false,
             input_buffer: None,
         })
+    }
+
+    /// See [`Rar4Decoder::shared_lz_state`].
+    pub(crate) fn shared_lz_state(&mut self) -> Rar4SharedLzState<'_> {
+        Rar4SharedLzState {
+            window: &mut self.window,
+            old_dist: &mut self.old_dist,
+            old_dist_ptr: &mut self.old_dist_ptr,
+            last_dist: &mut self.last_dist,
+            last_length: &mut self.last_length,
+        }
     }
 
     /// Per-member preparation for the RAR 2.x decoder.
@@ -1110,6 +1185,17 @@ impl Rar15Decoder {
         decoder.init_non_solid_state();
         decoder.init_huff();
         Ok(decoder)
+    }
+
+    /// See [`Rar4Decoder::shared_lz_state`].
+    pub(crate) fn shared_lz_state(&mut self) -> Rar4SharedLzState<'_> {
+        Rar4SharedLzState {
+            window: &mut self.window,
+            old_dist: &mut self.old_dist,
+            old_dist_ptr: &mut self.old_dist_ptr,
+            last_dist: &mut self.last_dist,
+            last_length: &mut self.last_length,
+        }
     }
 
     /// Per-member preparation for the RAR 1.5 decoder.
@@ -2069,6 +2155,57 @@ mod tests {
 
         Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 15, 3).unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V15(_))));
+    }
+
+    /// A solid unpack-version switch hands the shared `Unpack` block over.
+    ///
+    /// unrar keeps one `Window` and one `OldDist`/`OldDistPtr`/`LastDist`/
+    /// `LastLength` set for methods 15/20/26/29 (unpack.cpp:154-190), and
+    /// `UnpInitData(true)` leaves all of them alone (unpack.cpp:194-206). The
+    /// round trip below also pins the two members `Unpack29` itself never
+    /// reads: they still have to survive a v29 member for the next 1.5/2.0 one.
+    #[test]
+    fn solid_version_switch_hands_over_the_shared_lz_state() {
+        let mut slot: Option<Rar4Decoder> = None;
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 20, 3).unwrap();
+
+        let written = {
+            let state = slot.as_mut().expect("built above").shared_lz_state();
+            state.window.put_bytes(b"carried across the version switch");
+            *state.old_dist = [11, 22, 33, 44];
+            *state.old_dist_ptr = 2;
+            *state.last_dist = 55;
+            *state.last_length = 66;
+            state.window.total_written()
+        };
+        assert_ne!(written, 0);
+
+        Rar4Decoder::prepare_slot(&mut slot, true, 0x40000, 29, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
+        {
+            let state = slot.as_mut().expect("switched above").shared_lz_state();
+            assert_eq!(state.window.total_written(), written);
+            assert_eq!(*state.old_dist, [11, 22, 33, 44]);
+            assert_eq!(*state.last_length, 66);
+        }
+
+        // Switching back restores the two members only 1.5/2.0 look at.
+        Rar4Decoder::prepare_slot(&mut slot, true, 0x40000, 15, 3).unwrap();
+        assert!(matches!(slot, Some(Rar4Decoder::V15(_))));
+        {
+            let state = slot.as_mut().expect("switched above").shared_lz_state();
+            assert_eq!(state.window.total_written(), written);
+            assert_eq!(*state.old_dist_ptr, 2);
+            assert_eq!(*state.last_dist, 55);
+        }
+
+        // A non-solid member after the switch restarts everything, exactly as
+        // `UnpInitData(false)` does.
+        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3).unwrap();
+        let state = slot.as_mut().expect("switched above").shared_lz_state();
+        assert_eq!(state.window.total_written(), 0);
+        assert_eq!(*state.old_dist, [usize::MAX; 4]);
+        assert_eq!(*state.last_length, 0);
     }
 
     #[test]

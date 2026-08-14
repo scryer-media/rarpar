@@ -17,8 +17,8 @@ use rayon::prelude::*;
 use crate::error::{Par2Error, Result};
 use crate::gf;
 use crate::types::{
-    CancellationToken, MAX_TOTAL_INPUT_SLICES, ProgressCallback, ProgressStage, ProgressUpdate,
-    RecoveryExponent,
+    CancellationToken, MAX_TOTAL_INPUT_SLICES, ProgressCallback, ProgressPhase, ProgressStage,
+    ProgressUpdate, RecoveryExponent,
 };
 use reedsolomon_rs::gf_simd::{self, PreparedFactorSrc};
 
@@ -1551,6 +1551,7 @@ fn report_progress(
             total,
             bytes_processed,
             total_bytes: Some(total_bytes),
+            phase: ProgressPhase::RecoveryEncode,
         });
     }
 }

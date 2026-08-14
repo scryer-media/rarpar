@@ -16,9 +16,13 @@ use crate::crypto::AES_BLOCK;
 
 /// HMAC-SHA256 key handle. Unlike the AWS-LC backend (where the key is a raw
 /// handle), here the *pre-keyed HMAC instance itself* is the key: it carries
-/// the precomputed ipad/opad inner/outer state. Cloning it per signature (see
-/// [`hmac_sha256`]) preserves that state, which is what makes the hand-rolled
-/// PBKDF2 loop in `derive_rar5_material` cheap — do not restructure that.
+/// the precomputed ipad/opad inner/outer state, and cloning it per signature
+/// (see [`hmac_sha256`]) preserves that state.
+///
+/// This no longer carries the RAR5 derivation — that runs on
+/// [`crate::crypto::kdf_hmac`] on every backend — so its callers are the MAC
+/// conversions, one tag apiece. It remains the reference this backend is held
+/// to by the cross-backend differential tests.
 pub(crate) type HmacSha256Key = Hmac<Sha256>;
 
 /// Build an HMAC-SHA256 key (a pre-keyed instance) from raw secret bytes.

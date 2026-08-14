@@ -95,12 +95,18 @@ fn hmac_and_sha256_match_across_backends() {
     assert!(cases >= 200, "expected >= 200 cases, ran {cases}");
 }
 
-/// (b) `derive_rar5_material` runs on the ACTIVE backend, so we cannot invoke
-/// both variants of it. Instead we cross-check the two primitives it is built
-/// from — a keyed-HMAC PBKDF2 chain over SHA-256 — reproducing the exact call
-/// shape of its inner loop (repeated `hmac_sha256(&key, &u)` with XOR folding)
-/// and asserting both backends produce the same derived block. The known
-/// reference vector for the full KDF is separately asserted in the unit tests
+/// (b) A keyed-HMAC PBKDF2 chain over SHA-256 — repeated `hmac_sha256(&key,
+/// &u)` with XOR folding — must fold to the same block on both backends.
+///
+/// `derive_rar5_material` itself no longer runs on either of these: its inner
+/// loop moved to [`crate::crypto::kdf_hmac`], which is backend-independent and
+/// is pinned against whichever backend is ACTIVE by
+/// `kdf_hmac::tests::kdf_hmac_matches_the_active_backend_hmac` (run once with
+/// AWS-LC active and once with RustCrypto active, which together pin it to
+/// both). This case therefore now covers the *other* keyed-HMAC callers —
+/// `convert_crc32_to_mac` and `convert_blake2_to_mac` — and keeps the reused-key
+/// clone-per-sign behaviour of both backends cross-checked. The known reference
+/// vector for the full KDF is separately asserted in the unit tests
 /// (`test_rar5_aws_lc_material_matches_reference_vector`).
 #[test]
 fn rar5_kdf_primitive_chain_matches_across_backends() {

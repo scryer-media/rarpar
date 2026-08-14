@@ -126,6 +126,7 @@ compile_error!(
 
 pub mod checksum;
 mod cpu_repair_controller;
+mod crc_simd;
 pub mod create;
 pub mod disk;
 pub mod error;
@@ -189,10 +190,13 @@ pub use repairer::{
     SourceFileEntry, SourceLocation,
 };
 pub use session::{
-    FeedDisposition, FeedOutcome, SettleRead, SliceEvidence, SliceEvidenceStrength,
-    VerificationMemoryBudget, VerificationSession, VerificationSessionOptions,
+    FeedDisposition, FeedOutcome, InStreamCrc32Proof, InStreamCrc32ProofError, SettleRead,
+    SliceEvidence, SliceEvidenceStrength, VerificationMemoryBudget, VerificationSession,
+    VerificationSessionOptions,
 };
-pub use types::{CancellationToken, ProgressCallback, ProgressStage, ProgressUpdate};
+pub use types::{
+    CancellationToken, ProgressCallback, ProgressPhase, ProgressStage, ProgressUpdate,
+};
 pub use types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum, SliceIndex};
 pub use verify::{
     FileAccess, FileStatus, FileVerification, MemoryFileAccess, Repairability, VerificationResult,

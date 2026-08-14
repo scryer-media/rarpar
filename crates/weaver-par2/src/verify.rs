@@ -6,13 +6,16 @@ use crate::checksum;
 use crate::md5_simd;
 use crate::par2_set::Par2FileSet;
 use crate::types::{
-    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressStage,
+    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressPhase, ProgressStage,
     ProgressUpdate, SliceChecksum,
 };
 
 const VERIFY_SLICE_CHUNK_BYTES: usize = 64 * 1024;
 const VERIFY_SIMD_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
-const VERIFY_SIMD_MAX_LANES: usize = 4;
+/// Upper bound on the multi-buffer MD5 kernel width, used only to size stack
+/// arrays. The width actually driven is [`md5_simd::max_lanes`], which selects
+/// by ISA (8 on AVX2, 4 on NEON/SSE2/simd128, 1 scalar) and never exceeds this.
+const VERIFY_SIMD_MAX_LANES: usize = 8;
 const QUICK_CHECK_16K_BYTES: usize = 16 * 1024;
 const VERIFY_FULL_HASH_CHUNK_BYTES: usize = 1024 * 1024;
 /// Read span per task for slice-parallel staged-file verification.
@@ -523,7 +526,11 @@ fn verify_slices_batched_md5(
         return Ok(None);
     }
 
-    let max_lanes = (VERIFY_SIMD_BATCH_MEMORY_BYTES / slice_size_usize).min(VERIFY_SIMD_MAX_LANES);
+    // Lane count is the narrower of what the kernel offers and what the batch
+    // memory budget affords, so a wide host is used fully without the staging
+    // buffers growing past the budget.
+    let max_lanes = (VERIFY_SIMD_BATCH_MEMORY_BYTES / slice_size_usize).min(md5_simd::max_lanes());
+    debug_assert!(max_lanes <= VERIFY_SIMD_MAX_LANES);
     if max_lanes < 2 {
         return Ok(None);
     }
@@ -943,7 +950,7 @@ fn sliced_verify_plan(
 /// the strict pipeline uses — a bare `read_file_range_into` is one `read(2)`
 /// and may come up short on a multi-megabyte span, which would report the
 /// whole span damaged. Its slices are then hashed in SIMD lanes
-/// ([`md5_simd::md5_multi`], up to [`VERIFY_SIMD_MAX_LANES`] at a time) rather
+/// ([`md5_simd::md5_multi`], [`md5_simd::max_lanes`] at a time) rather
 /// than one scalar MD5 per slice, matching the strict path's
 /// [`verify_slices_batched_md5`]. Padding semantics are unchanged:
 /// `md5_multi(.., Some(slice_size))` and [`checksum::crc32_padded`] zero-pad a
@@ -978,8 +985,9 @@ fn check_slice_span(
 
     let mut valid = Vec::with_capacity(count);
     let mut index = 0usize;
+    let kernel_lanes = md5_simd::max_lanes().min(VERIFY_SIMD_MAX_LANES);
     while index < count {
-        let lanes = VERIFY_SIMD_MAX_LANES.min(count - index);
+        let lanes = kernel_lanes.min(count - index);
         let mut inputs: [&[u8]; VERIFY_SIMD_MAX_LANES] = [&[]; VERIFY_SIMD_MAX_LANES];
         for (lane, input) in inputs.iter_mut().take(lanes).enumerate() {
             let slice_index = (index + lane) as u64;
@@ -1374,6 +1382,7 @@ fn verify_selected_file_ids_resolved(
                     total: total_files,
                     bytes_processed,
                     total_bytes: None,
+                    phase: ProgressPhase::Whole,
                 });
             }
             continue;
@@ -1417,6 +1426,7 @@ fn verify_selected_file_ids_resolved(
                     total: total_files,
                     bytes_processed,
                     total_bytes: None,
+                    phase: ProgressPhase::Whole,
                 });
             }
             continue;
@@ -1478,6 +1488,7 @@ fn verify_selected_file_ids_resolved(
                 total: total_files,
                 bytes_processed,
                 total_bytes: None,
+                phase: ProgressPhase::Whole,
             });
         }
     }

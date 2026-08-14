@@ -414,6 +414,14 @@ impl CrcShiftOp {
 // approaches ~4x scaling — two vector workers then win BOTH axes
 // (~7.4 GB/s projected). The group kernel and its digest-equivalence tests
 // stay live regardless.
+//
+// A paired-compression attempt at that scaling (two interleaved groups
+// feeding eight chains of ILP) measured flat in the 2026-08-13
+// quiet-window A/B (+0.00%/-0.17% quiet, +0.17%/-0.11% contended) and
+// failed to reproduce its +12.48% exploratory read; NEON's missing 32-bit
+// rotate caps a worker near 3.5x of scalar, so the remaining gap is
+// structural, not schedulable. Reverted — do not re-attempt pairing
+// without a kernel shape that changes the per-worker instruction ceiling.
 const LEAVES_PER_WORKER: usize = 1;
 
 /// Number of BLAKE2sp worker threads (8 leaf workers, or 2 group workers).

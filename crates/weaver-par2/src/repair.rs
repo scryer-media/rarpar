@@ -32,7 +32,7 @@ use crate::matrix;
 use crate::par2_set::Par2FileSet;
 use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, MAX_TOTAL_INPUT_SLICES, ProgressCallback,
-    ProgressStage, ProgressUpdate,
+    ProgressPhase, ProgressStage, ProgressUpdate,
 };
 use crate::verify::{FileAccess, FileRangeReader, Repairability, VerificationResult};
 
@@ -3814,6 +3814,7 @@ pub fn prepare_recovery_buffers(
                 total: n as u32,
                 bytes_processed: (i + 1) as u64 * slice_size as u64,
                 total_bytes: None,
+                phase: ProgressPhase::Whole,
             });
         }
     }
@@ -3987,6 +3988,7 @@ fn legacy_reconstruct_and_write(
                         .saturating_mul(2)
                         .min(repair_total_bytes),
                     total_bytes: Some(operation_total_bytes),
+                    phase: ProgressPhase::Whole,
                 });
             }
 
@@ -4034,6 +4036,7 @@ fn legacy_reconstruct_and_write(
                 bytes_processed: repair_total_bytes
                     .saturating_add((j + 1) as u64 * slice_size as u64),
                 total_bytes: Some(operation_total_bytes),
+                phase: ProgressPhase::Whole,
             });
         }
     }
@@ -4128,6 +4131,7 @@ fn reconstruct_and_write_grouped_inputs(
                     total: n as u32,
                     bytes_processed: current as u64 * slice_size as u64,
                     total_bytes: Some(operation_total_bytes),
+                    phase: ProgressPhase::Whole,
                 });
             }
 
@@ -4170,6 +4174,7 @@ fn reconstruct_and_write_grouped_inputs(
                 bytes_processed: repair_total_bytes
                     .saturating_add((j + 1) as u64 * slice_size as u64),
                 total_bytes: Some(operation_total_bytes),
+                phase: ProgressPhase::Whole,
             });
         }
     }
@@ -5196,6 +5201,7 @@ fn execute_repair_streaming_with_trace(
                             .saturating_mul(2)
                             .min(operation_total_bytes),
                         total_bytes: Some(operation_total_bytes),
+                        phase: ProgressPhase::Whole,
                     });
                 }
                 chunk_idx += 1;
@@ -5526,6 +5532,7 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
                 total: total_inputs_u32,
                 bytes_processed: (input_idx + 1) as u64 * slice_size as u64,
                 total_bytes: Some(operation_total_bytes),
+                phase: ProgressPhase::Whole,
             });
         }
     }
@@ -5552,6 +5559,7 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
                 total: total_inputs_u32,
                 bytes_processed: current as u64 * slice_size as u64,
                 total_bytes: Some(operation_total_bytes),
+                phase: ProgressPhase::Whole,
             });
         }
     }
@@ -5586,6 +5594,7 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
             total: n as u32,
             bytes_processed: read_total_bytes.saturating_add(repair_total_bytes),
             total_bytes: Some(operation_total_bytes),
+            phase: ProgressPhase::Whole,
         });
     }
 
@@ -5623,6 +5632,7 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
                     .saturating_add(repair_total_bytes)
                     .saturating_add((j + 1) as u64 * slice_size as u64),
                 total_bytes: Some(operation_total_bytes),
+                phase: ProgressPhase::Whole,
             });
         }
     }
