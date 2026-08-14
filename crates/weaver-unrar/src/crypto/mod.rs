@@ -1007,23 +1007,35 @@ fn copy_small(dst: &mut [u8], src: &[u8]) {
     let n = src.len();
     debug_assert_eq!(dst.len(), n, "copy_small: length mismatch");
     debug_assert!(n <= 64, "copy_small: {n} exceeds the 64-byte size classes");
-    if n >= 32 {
-        cp::<32>(dst, src, 0);
-        cp::<32>(dst, src, n - 32);
-    } else if n >= 16 {
-        cp::<16>(dst, src, 0);
-        cp::<16>(dst, src, n - 16);
-    } else if n >= 8 {
-        cp::<8>(dst, src, 0);
-        cp::<8>(dst, src, n - 8);
-    } else if n >= 4 {
-        cp::<4>(dst, src, 0);
-        cp::<4>(dst, src, n - 4);
-    } else if n >= 2 {
-        cp::<2>(dst, src, 0);
-        cp::<2>(dst, src, n - 2);
-    } else if n == 1 {
-        dst[0] = src[0];
+    // On aarch64 the plain libc path wins: musl's aarch64 memcpy is good, and
+    // fleet round 2 measured this cascade 1.7-4.0% SLOWER than memcpy on the
+    // encrypted cases across three ARM microarchitectures (A72/N1/V2, all-case
+    // medians flat). The cascade exists for x86, where musl's rep-movs memcpy
+    // is what cost the KDF 2x on Intel cores.
+    #[cfg(target_arch = "aarch64")]
+    {
+        dst.copy_from_slice(src);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if n >= 32 {
+            cp::<32>(dst, src, 0);
+            cp::<32>(dst, src, n - 32);
+        } else if n >= 16 {
+            cp::<16>(dst, src, 0);
+            cp::<16>(dst, src, n - 16);
+        } else if n >= 8 {
+            cp::<8>(dst, src, 0);
+            cp::<8>(dst, src, n - 8);
+        } else if n >= 4 {
+            cp::<4>(dst, src, 0);
+            cp::<4>(dst, src, n - 4);
+        } else if n >= 2 {
+            cp::<2>(dst, src, 0);
+            cp::<2>(dst, src, n - 2);
+        } else if n == 1 {
+            dst[0] = src[0];
+        }
     }
 }
 

@@ -740,7 +740,17 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 		if eventIndex+1 >= len(fields) {
 			return nil, fmt.Errorf("%s did not report a running percentage", event)
 		}
+		// perf's -x, layout differs by version: older perf emits
+		// value,unit,event,percentage while newer perf inserts the counter's
+		// run time first: value,unit,event,run-time-ns,percentage. A run
+		// time can never pass for a percentage (it is orders of magnitude
+		// past 100), so a too-large first field means the newer layout —
+		// the percentage sits one column further right. Round 2 lost every
+		// per-subject counter on EC2 to exactly this misread.
 		runningField := strings.TrimSpace(fields[eventIndex+1])
+		if probe, probeErr := strconv.ParseFloat(runningField, 64); probeErr == nil && probe > 100.01 && eventIndex+2 < len(fields) {
+			runningField = strings.TrimSpace(fields[eventIndex+2])
+		}
 		runningPercent, parseErr := strconv.ParseFloat(runningField, 64)
 		if parseErr != nil || math.IsNaN(runningPercent) || math.IsInf(runningPercent, 0) || runningPercent < perfMinRunningPercent || runningPercent > 100.01 {
 			return nil, fmt.Errorf(
