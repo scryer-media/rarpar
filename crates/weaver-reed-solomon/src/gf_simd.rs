@@ -5807,8 +5807,10 @@ mod tests {
     }
 
     /// Deterministic xorshift so the randomized sweeps below are reproducible
-    /// from the seed printed on failure.
+    /// from the seed printed on failure. Its only callers are x86-gated
+    /// sweeps, so non-x86 test builds see it as dead.
     #[cfg(test)]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn test_rng(seed: u64) -> impl FnMut() -> u64 {
         let mut s = seed | 1;
         move || {

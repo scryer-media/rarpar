@@ -350,7 +350,7 @@ impl ForwardEncoder {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = band_count;
         #[cfg(target_arch = "x86_64")]
-        let mut jit_workspaces: Vec<reedsolomon_rs::xor_jit::packed::PackedJitWorkspace> =
+        let mut jit_caches: Vec<reedsolomon_rs::xor_jit::packed::PackedJitCache> =
             (0..band_count).map(|_| Default::default()).collect();
 
         let stripe_count = self.slice_size.div_ceil(buffers.chunk_len);
@@ -413,7 +413,7 @@ impl ForwardEncoder {
                 if overlap {
                     let accumulate_slot = &mut accumulate_result;
                     #[cfg(target_arch = "x86_64")]
-                    let jit_workspaces = &mut jit_workspaces;
+                    let jit_caches = &mut jit_caches;
                     let exponents = &self.recovery_exponents;
                     let factors = &factors;
                     rayon::in_place_scope(|scope| {
@@ -431,7 +431,7 @@ impl ForwardEncoder {
                                 contract,
                                 band_size,
                                 #[cfg(target_arch = "x86_64")]
-                                jit_workspaces,
+                                jit_caches,
                                 jit_code_budget,
                             );
                         });
@@ -463,7 +463,7 @@ impl ForwardEncoder {
                         contract,
                         band_size,
                         #[cfg(target_arch = "x86_64")]
-                        &mut jit_workspaces,
+                        &mut jit_caches,
                         jit_code_budget,
                     );
                     if let Some(next_start) = next_start {
@@ -874,18 +874,35 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
     checked_add(constants, active, "factor workspace allocation overflow")
 }
 
-fn jit_workspace_bytes(kernel: ResolvedKernel) -> Result<(usize, usize)> {
+/// Reserved bytes for the pass-scoped packed-JIT cache, and the per-build
+/// arena limit handed to it.
+///
+/// The cache retains one sealed batch per input batch for the whole pass
+/// (see `PackedJitCache`), so the reservation covers every batch's full
+/// row set: `memory_upper_bound` over all recovery rows, times the number
+/// of input batches. The per-build limit is that same all-rows arena bound —
+/// any single band's build is a subset of it.
+fn jit_cache_bytes(
+    kernel: ResolvedKernel,
+    output_count: usize,
+    source_count: usize,
+) -> Result<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     if let ResolvedKernel::XorJit(width) = kernel {
         let estimate = reedsolomon_rs::xor_jit::packed::PackedJitBatch::memory_upper_bound(
             width,
-            1,
+            output_count.max(1),
             DEFAULT_INPUT_GROUPING,
         )
-        .ok_or_else(|| resource_limit("packed JIT workspace size overflows"))?;
-        return Ok((estimate.peak_bytes, estimate.executable_arena_bytes));
+        .ok_or_else(|| resource_limit("packed JIT cache size overflows"))?;
+        let batch_count = source_count.div_ceil(DEFAULT_INPUT_GROUPING).max(1);
+        let reserved = estimate
+            .peak_bytes
+            .checked_mul(batch_count)
+            .ok_or_else(|| resource_limit("packed JIT cache accounting overflows"))?;
+        return Ok((reserved, estimate.executable_arena_bytes));
     }
-    let _ = kernel;
+    let _ = (kernel, output_count, source_count);
     Ok((0, 0))
 }
 
@@ -921,6 +938,47 @@ fn jit_workspace_bytes(kernel: ResolvedKernel) -> Result<(usize, usize)> {
 ///
 /// Process-stable, and read through the same function by both the encoder and
 /// [`estimate_forward_memory`], so a plan and the pass it admits always agree.
+/// Parse a `WEAVER_PAR2_CREATE_KERNEL` value. Split out from the env reader
+/// so the mapping is unit-testable without process-global state.
+fn parse_kernel_override(value: &str) -> Result<ForwardKernel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(ForwardKernel::Auto),
+        "portable" => Ok(ForwardKernel::Portable),
+        "simd" => Ok(ForwardKernel::Simd),
+        #[cfg(target_arch = "x86_64")]
+        "folded" => Ok(ForwardKernel::Folded),
+        #[cfg(target_arch = "x86_64")]
+        "xor-jit-avx2" => Ok(ForwardKernel::XorJitAvx2),
+        #[cfg(target_arch = "x86_64")]
+        "xor-jit-avx512" => Ok(ForwardKernel::XorJitAvx512),
+        other => Err(invalid_input(format!(
+            "WEAVER_PAR2_CREATE_KERNEL={other:?} names no kernel on this \
+             architecture; use auto, portable, simd, folded, xor-jit-avx2 or \
+             xor-jit-avx512"
+        ))),
+    }
+}
+
+/// Optional create-kernel override from `WEAVER_PAR2_CREATE_KERNEL`, so a
+/// tier A/B never needs a rebuild (there is no CLI flag for the kernel).
+///
+/// The override replaces the caller's requested kernel *before* capability
+/// resolution, so forcing a kernel this host cannot run fails the pass loudly
+/// through `unavailable_kernel` instead of silently measuring another tier,
+/// and an unrecognized value is an error for the same reason. Process-stable,
+/// and applied inside `select_kernel_for_memory`, which both the encoder and
+/// `estimate_forward_memory` funnel through, so a plan and the pass it admits
+/// always agree.
+fn configured_kernel_override() -> Result<Option<ForwardKernel>> {
+    static CONFIGURED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| std::env::var("WEAVER_PAR2_CREATE_KERNEL").ok())
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_kernel_override)
+        .transpose()
+}
+
 fn configured_stripe_cap_bytes() -> Option<usize> {
     static CONFIGURED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
@@ -1080,23 +1138,22 @@ fn select_kernel_for_memory_with_capabilities(
     requested: ForwardKernel,
     capabilities: KernelCapabilities,
 ) -> Result<(ResolvedKernel, BufferPlan)> {
+    let requested = match configured_kernel_override()? {
+        Some(forced) => forced,
+        None => requested,
+    };
     let candidates = match requested {
         ForwardKernel::Auto => auto_kernel_candidates(capabilities),
         requested => vec![resolve_kernel_with_capabilities(requested, capabilities)?],
     };
-    let (_, bands) = create_band_shape(output_count);
     let mut last_error = None;
     for kernel in candidates {
         let contract = KernelContract::for_kernel(kernel);
         let factor_bytes = factor_workspace_bytes(kernel, source_count)?;
-        let (jit_bytes_per_band, jit_arena_bytes) = jit_workspace_bytes(kernel)?;
-        // Each accumulation band owns a JIT workspace, so admission reserves
-        // all of them; the build limit stays per-workspace.
-        let jit_bytes = checked_mul(
-            jit_bytes_per_band,
-            bands,
-            "banded JIT workspace accounting overflow",
-        )?;
+        // The pass-scoped JIT cache retains a sealed batch per input batch,
+        // so admission reserves the whole store up front; the build limit is
+        // the all-rows arena bound (any band's build is a subset of it).
+        let (jit_bytes, jit_arena_bytes) = jit_cache_bytes(kernel, output_count, source_count)?;
         match BufferPlan::new_with_reserved(
             slice_size,
             output_count,
@@ -1224,14 +1281,8 @@ pub(crate) fn estimate_forward_memory(
         memory_limit,
         requested_kernel,
     )?;
-    let (_, bands) = create_band_shape(output_count);
     let factor_workspace_bytes = factor_workspace_bytes(kernel, source_count)?;
-    let (jit_bytes_per_band, _) = jit_workspace_bytes(kernel)?;
-    let jit_workspace_bytes = checked_mul(
-        jit_bytes_per_band,
-        bands,
-        "banded JIT workspace accounting overflow",
-    )?;
+    let (jit_workspace_bytes, _) = jit_cache_bytes(kernel, output_count, source_count)?;
     Ok(ForwardMemoryEstimate {
         factor_workspace_bytes,
         jit_workspace_bytes,
@@ -1375,7 +1426,7 @@ fn accumulate_batch(
     contract: KernelContract,
     band_size: usize,
     #[cfg(target_arch = "x86_64")]
-    jit_workspaces: &mut [reedsolomon_rs::xor_jit::packed::PackedJitWorkspace],
+    jit_caches: &mut [reedsolomon_rs::xor_jit::packed::PackedJitCache],
     jit_code_budget: usize,
 ) -> Result<()> {
     let output_count = exponents.len();
@@ -1384,10 +1435,7 @@ fn accumulate_batch(
     // disagrees with the workspace count.
     debug_assert_eq!(output.len(), output_count * output_stride);
     #[cfg(target_arch = "x86_64")]
-    debug_assert_eq!(
-        jit_workspaces.len(),
-        output_count.max(1).div_ceil(band_size)
-    );
+    debug_assert_eq!(jit_caches.len(), output_count.max(1).div_ceil(band_size));
     if band_size >= output_count || output_count <= 1 {
         return accumulate_band(
             kernel,
@@ -1401,7 +1449,7 @@ fn accumulate_batch(
             output_stride,
             contract,
             #[cfg(target_arch = "x86_64")]
-            &mut jit_workspaces[0],
+            &mut jit_caches[0],
             jit_code_budget,
         );
     }
@@ -1415,8 +1463,8 @@ fn accumulate_batch(
         output
             .par_chunks_mut(band_bytes)
             .zip(exponents.par_chunks(band_size))
-            .zip(jit_workspaces.par_iter_mut())
-            .try_for_each(|((band_output, band_exponents), jit_workspace)| {
+            .zip(jit_caches.par_iter_mut())
+            .try_for_each(|((band_output, band_exponents), jit_cache)| {
                 accumulate_band(
                     kernel,
                     band_output,
@@ -1428,7 +1476,7 @@ fn accumulate_batch(
                     aligned_len,
                     output_stride,
                     contract,
-                    jit_workspace,
+                    jit_cache,
                     jit_code_budget,
                 )
             })
@@ -1468,8 +1516,7 @@ fn accumulate_band(
     aligned_len: usize,
     output_stride: usize,
     contract: KernelContract,
-    #[cfg(target_arch = "x86_64")]
-    jit_workspace: &mut reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+    #[cfg(target_arch = "x86_64")] jit_cache: &mut reedsolomon_rs::xor_jit::packed::PackedJitCache,
     jit_code_budget: usize,
 ) -> Result<()> {
     let staging_bytes = staging.as_bytes();
@@ -1652,16 +1699,35 @@ fn accumulate_band(
             // `PackedRun` below encodes that by taking `aligned_len` as both
             // the run length and the source region stride.
             debug_assert_eq!(contract.tile_bytes, UNTILED);
-            let row_factors = factors.row_factors(source_start, live_inputs);
-            for (output_index, &exponent) in exponents.iter().enumerate() {
-                row_factors.fill_row(exponent, &mut row);
-                let row_refs = [&row[..]];
-                let batch = jit_workspace
-                    .build(width, &row_refs, jit_code_budget.max(1))
-                    .map_err(|error| jit_build_error(error.to_string()))?;
+            // Rows depend on the input batch and exponents, never the stripe:
+            // the cache builds this band's batch once (all rows in one sealed
+            // arena, the AVX2 codebook discipline) and every later stripe
+            // reuses it — no per-row codegen, mapping, or W^X transition.
+            let batch = jit_cache
+                .get_or_build(
+                    width,
+                    source_start,
+                    live_inputs,
+                    jit_code_budget.max(1),
+                    || {
+                        let row_factors = factors.row_factors(source_start, live_inputs);
+                        exponents
+                            .iter()
+                            .map(|&exponent| {
+                                // Full-width row: zero tail factors keep their
+                                // source positions for the packed group shape.
+                                let mut row = [0u16; DEFAULT_INPUT_GROUPING];
+                                row_factors.fill_row(exponent, &mut row);
+                                row.to_vec()
+                            })
+                            .collect()
+                    },
+                )
+                .map_err(|error| jit_build_error(error.to_string()))?;
+            for output_index in 0..exponents.len() {
                 let dst_start = output_index * output_stride;
                 let code = batch
-                    .row(0)
+                    .row(output_index)
                     .ok_or_else(|| invalid_input("packed XOR-JIT output row missing"))?;
                 unsafe {
                     width
@@ -1680,9 +1746,6 @@ fn accumulate_band(
                         )
                         .map_err(|error| jit_build_error(error.to_string()))?;
                 }
-                jit_workspace
-                    .recycle(batch)
-                    .map_err(|error| jit_build_error(error.to_string()))?;
             }
         }
     }
@@ -1997,6 +2060,40 @@ mod tests {
         assert_eq!(auto, explicit, "automatic kernel {selected:?} differs");
     }
 
+    /// The env override's value mapping, tested without process-global state.
+    #[test]
+    fn kernel_override_values_parse_and_reject() {
+        assert!(matches!(
+            parse_kernel_override("auto"),
+            Ok(ForwardKernel::Auto)
+        ));
+        assert!(matches!(
+            parse_kernel_override(" Portable "),
+            Ok(ForwardKernel::Portable)
+        ));
+        assert!(matches!(
+            parse_kernel_override("SIMD"),
+            Ok(ForwardKernel::Simd)
+        ));
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(matches!(
+                parse_kernel_override("folded"),
+                Ok(ForwardKernel::Folded)
+            ));
+            assert!(matches!(
+                parse_kernel_override("xor-jit-avx2"),
+                Ok(ForwardKernel::XorJitAvx2)
+            ));
+            assert!(matches!(
+                parse_kernel_override("xor-jit-avx512"),
+                Ok(ForwardKernel::XorJitAvx512)
+            ));
+        }
+        assert!(parse_kernel_override("fast").is_err());
+        assert!(parse_kernel_override("").is_err());
+    }
+
     /// The banded accumulate/finish split must be byte-identical to the
     /// sequential pass for every runtime kernel, including an uneven trailing
     /// band (seven outputs over three bands).
@@ -2011,7 +2108,8 @@ mod tests {
                     .expect("advertised kernels resolve");
             let contract = KernelContract::for_kernel(resolved);
             let aligned_len = round_up(256, contract.stride).unwrap();
-            let (_, jit_build_limit) = jit_workspace_bytes(resolved).unwrap();
+            let (_, jit_build_limit) =
+                jit_cache_bytes(resolved, exponents.len(), refs.len()).unwrap();
 
             let mut passes = Vec::new();
             // band_size = 7 covers the sequential path; 3 exercises uneven
@@ -2036,8 +2134,8 @@ mod tests {
                 let factors = FactorSource::new(refs.len());
                 let mut output = AlignedBuffer::new(exponents.len() * aligned_len);
                 #[cfg(target_arch = "x86_64")]
-                let mut jit_workspaces: Vec<
-                    reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+                let mut jit_caches: Vec<
+                    reedsolomon_rs::xor_jit::packed::PackedJitCache,
                 > = (0..band_count).map(|_| Default::default()).collect();
                 #[cfg(not(target_arch = "x86_64"))]
                 let _ = band_count;
@@ -2054,7 +2152,7 @@ mod tests {
                     contract,
                     band_size,
                     #[cfg(target_arch = "x86_64")]
-                    &mut jit_workspaces,
+                    &mut jit_caches,
                     jit_build_limit.max(1),
                 )
                 .unwrap();
@@ -2129,7 +2227,8 @@ mod tests {
                 continue;
             }
             let aligned_len = round_up(SLICE, base.stride).unwrap();
-            let (_, jit_build_limit) = jit_workspace_bytes(resolved).unwrap();
+            let (_, jit_build_limit) =
+                jit_cache_bytes(resolved, exponents.len(), refs.len()).unwrap();
             let mut passes = Vec::new();
             for tile_bytes in [UNTILED, 8192, 4096, 96, base.stride] {
                 let contract = KernelContract { tile_bytes, ..base };
@@ -2151,8 +2250,8 @@ mod tests {
                 let factors = FactorSource::new(refs.len());
                 let mut output = AlignedBuffer::new(exponents.len() * aligned_len);
                 #[cfg(target_arch = "x86_64")]
-                let mut jit_workspaces: Vec<
-                    reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+                let mut jit_caches: Vec<
+                    reedsolomon_rs::xor_jit::packed::PackedJitCache,
                 > = vec![Default::default()];
                 accumulate_batch(
                     resolved,
@@ -2167,7 +2266,7 @@ mod tests {
                     contract,
                     exponents.len(),
                     #[cfg(target_arch = "x86_64")]
-                    &mut jit_workspaces,
+                    &mut jit_caches,
                     jit_build_limit.max(1),
                 )
                 .unwrap();

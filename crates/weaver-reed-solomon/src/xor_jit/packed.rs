@@ -857,6 +857,72 @@ impl PackedJitWorkspace {
     }
 }
 
+/// Pass-scoped store of sealed packed batches, keyed by input batch.
+///
+/// The create path's coefficient rows depend only on the input batch
+/// (`source_start`, `live_inputs`) and the recovery exponents — never on the
+/// stripe — so rebuilding a batch per stripe repeats identical codegen,
+/// mapping, and W^X transitions. This applies the AVX2 codebook's
+/// build-once/seal-once discipline at create scope: the first stripe builds a
+/// detached batch per input batch, every later stripe runs the sealed code,
+/// and the whole store drops with the pass. Admission reserves every entry up
+/// front (`memory_upper_bound` times the input-batch count), so a cache miss
+/// never allocates past what the plan admitted.
+#[derive(Default)]
+pub struct PackedJitCache {
+    entries: Vec<((usize, usize), PackedJitBatch)>,
+}
+
+impl PackedJitCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Batches built and retained so far (one per distinct input batch).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Return the sealed batch for `(source_start, live_inputs)`, building it
+    /// on first use from the rows `build_rows` produces (one row per output).
+    ///
+    /// The arena bound for the produced rows is checked against `limit_bytes`
+    /// before any code is generated, so an over-budget shape fails before
+    /// work, exactly like the workspace path it replaces.
+    pub fn get_or_build<F>(
+        &mut self,
+        width: JitWidth,
+        source_start: usize,
+        live_inputs: usize,
+        limit_bytes: usize,
+        build_rows: F,
+    ) -> Result<&PackedJitBatch, PackedBuildError>
+    where
+        F: FnOnce() -> Vec<Vec<u16>>,
+    {
+        let key = (source_start, live_inputs);
+        if let Some(index) = self.entries.iter().position(|(entry, _)| *entry == key) {
+            return Ok(&self.entries[index].1);
+        }
+        let rows = build_rows();
+        let row_refs: Vec<&[u16]> = rows.iter().map(Vec::as_slice).collect();
+        let factors_per_row = validate_batch_rows(&row_refs)?;
+        let bound =
+            PackedJitBatch::active_arena_upper_bound(width, row_refs.len(), factors_per_row)
+                .ok_or_else(|| resource_error(usize::MAX, limit_bytes))?;
+        if bound > limit_bytes {
+            return Err(resource_error(bound, limit_bytes));
+        }
+        let batch = PackedJitBatch::new_with_limit(width, &row_refs, limit_bytes)?;
+        self.entries.push((key, batch));
+        Ok(&self.entries.last().expect("entry just pushed").1)
+    }
+}
+
 fn validate_batch_rows(rows: &[&[u16]]) -> Result<usize, PackedBuildError> {
     let first = rows.first().ok_or(PackedBuildError::InvalidInput(
         "packed batch needs at least one row",
@@ -1395,7 +1461,7 @@ mod tests {
             );
         }
 
-        let row = vec![0x1AFFu16; 12];
+        let row = [0x1AFFu16; 12];
         let rows = [&row[..], &row[..], &row[..]];
         let plan = build_batch_plan(JitWidth::Avx512, &rows, usize::MAX).unwrap();
         assert!(
@@ -1415,6 +1481,44 @@ mod tests {
             bound >= 49241,
             "bound {bound} regressed below the field arena"
         );
+    }
+
+    /// The pass-scoped cache builds one sealed batch per input batch and every
+    /// later stripe reuses it — the property the create path's arena-per-row
+    /// rebuild regression (c5, 60% of create time in construction) is fixed by.
+    #[test]
+    fn packed_cache_builds_once_per_input_batch() {
+        let mut cache = PackedJitCache::new();
+        let mut builds = 0usize;
+        for _stripe in 0..3 {
+            for (source_start, live_inputs) in [(0usize, 12usize), (12, 7)] {
+                let batch = cache
+                    .get_or_build(
+                        JitWidth::Avx2,
+                        source_start,
+                        live_inputs,
+                        usize::MAX,
+                        || {
+                            builds += 1;
+                            vec![vec![0x1AFF; 12], vec![0x0101; 12], vec![7; 12]]
+                        },
+                    )
+                    .unwrap();
+                assert!(batch.row(2).is_some());
+            }
+        }
+        assert_eq!(builds, 2, "one build per distinct input batch");
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// An over-budget shape is refused from the row bound, before any codegen,
+    /// and leaves the cache unchanged.
+    #[test]
+    fn packed_cache_budget_failure_leaves_no_entry() {
+        let mut cache = PackedJitCache::new();
+        let result = cache.get_or_build(JitWidth::Avx2, 0, 1, 1, || vec![vec![7u16]]);
+        assert!(matches!(result, Err(PackedBuildError::Resource { .. })));
+        assert!(cache.is_empty());
     }
 
     #[test]
