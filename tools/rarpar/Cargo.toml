@@ -12,7 +12,11 @@ name = "rarpar"
 path = "src/main.rs"
 
 [features]
-default = ["runtime"]
+# musl-allocator rides default: it is a provable no-op off musl (see the
+# feature's own comment), and on the musl channel — the only distribution
+# for true-portable and docker — mimalloc erases the mallocng fault-storm
+# tax (measured: channel gap +5.2% -> -2.1% wall geomean).
+default = ["runtime", "musl-allocator"]
 runtime = [
     "dep:serde",
     "dep:serde_json",
@@ -27,6 +31,11 @@ runtime = [
 ]
 wgpu = ["runtime", "par2-rs/wgpu"]
 metal = ["runtime", "par2-rs/metal"]
+# musl-only global allocator. The dependency is declared under a
+# `cfg(target_env = "musl")` target table, so enabling this feature is a
+# provable no-op for every non-musl target: glibc, macOS and Windows builds
+# never see the crate, never link it, and keep the system allocator.
+musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
 par2-rs = { path = "../../crates/weaver-par2", version = "0.4.0", default-features = false, optional = true }
@@ -38,3 +47,10 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# musl's mallocng is markedly weaker than glibc's malloc under the
+# multithreaded allocation churn rayon generates. Only the musl distribution
+# (docker + true-portable static) pays that cost, so only it links a
+# replacement.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }

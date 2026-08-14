@@ -17,6 +17,14 @@ use crate::error::{EXIT_SUCCESS, RarparError};
 use crate::password::PasswordResolver;
 use rarpar::cli::{Cli, Command, RarCommand};
 
+// Doubly gated on purpose: the `mimalloc` dependency only exists for
+// `cfg(target_env = "musl")` targets, and the `cfg` below repeats the
+// condition so a mis-specified feature flag cannot swap the allocator on
+// glibc, macOS or Windows. Those distributions keep the system allocator.
+#[cfg(all(feature = "musl-allocator", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     install_tracing();
 
