@@ -348,13 +348,23 @@ func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string
 	}
 	remote := ".rarpar-fleet-build/" + bundleName
 	bundler.log("bundle %s: building in %s (%s) on %s", bundleName, bundle.Image, bundle.RustTarget, host)
+	// The build container runs as root and leaves root-owned cargo/build
+	// caches in the remote workdir; a plain user rm -rf then fails EACCES on
+	// every run after the first. Clean via a root container first (same
+	// image, already pulled), falling back to plain rm for a fresh host.
+	clean := fmt.Sprintf(
+		"mkdir -p %s && docker run --rm -v \"$HOME/.rarpar-fleet-build\":/clean %s rm -rf /clean/%s >/dev/null 2>&1 || rm -rf %s",
+		remote, bundle.Image, bundleName, remote)
 	push := fmt.Sprintf("set -o pipefail; tar -C %s -cf - . | ssh -o BatchMode=yes %s %s",
 		shellQuote(work), shellQuote(host),
-		shellQuote(fmt.Sprintf("rm -rf %s && mkdir -p %s && tar -C %s -xf -", remote, remote, remote)))
+		shellQuote(fmt.Sprintf("%s; mkdir -p %s && tar -C %s -xf -", clean, remote, remote)))
 	if err := runShell(ctx, push); err != nil {
 		return fmt.Errorf("bundle %s: pushing sources to %s: %w", bundleName, host, err)
 	}
-	build := fmt.Sprintf("cd %s && docker run --rm -v \"$(pwd)\":/work -w /work %s sh /work/build-in-container.sh",
+	// chown the workdir back to the ssh user on success so the NEXT round's
+	// cache reuse and cleanup need no root path at all.
+	build := fmt.Sprintf(
+		"cd %s && docker run --rm -v \"$(pwd)\":/work -w /work %s sh -c 'sh /work/build-in-container.sh && chown -R '\"$(id -u)\":\"$(id -g)\"' /work'",
 		remote, bundle.Image)
 	if err := runShell(ctx, fmt.Sprintf("ssh -o BatchMode=yes %s %s", shellQuote(host), shellQuote(build))); err != nil {
 		return fmt.Errorf("bundle %s: remote container build on %s failed: %w", bundleName, host, err)

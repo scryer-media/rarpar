@@ -543,6 +543,17 @@ func validateBenchmarkOutput(stage string, manifest CorpusCaseManifest) error {
 	return validateExpected(stage, expected)
 }
 
+// perfOptionalEvents may legitimately be absent: virtualized PMUs (EC2 ARM
+// instances, for one) expose cycles/instructions but not the branch or cache
+// counters. `<not supported>` on these must not fail the whole collection —
+// a round's perf evidence is part of its spend.
+var perfOptionalEvents = map[string]bool{
+	"branches":         true,
+	"branch-misses":    true,
+	"cache-references": true,
+	"cache-misses":     true,
+}
+
 var perfEvents = []string{
 	"cycles",
 	"instructions",
@@ -705,6 +716,11 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 				// `<not counted>`; it contributes nothing to the sum.
 				continue
 			}
+			if perfOptionalEvents[event] && strings.Contains(value, "not supported") {
+				// The PMU does not expose this counter; record its absence
+				// instead of failing every sample.
+				continue
+			}
 			return nil, fmt.Errorf("%s reported %s", event, value)
 		}
 		if eventIndex+1 >= len(fields) {
@@ -738,11 +754,14 @@ func parsePerfStatOutput(output []byte) (*PerfCounters, error) {
 		}
 	}
 	for _, event := range perfEvents {
-		if !counted[event] {
+		if !counted[event] && !perfOptionalEvents[event] {
 			return nil, fmt.Errorf("%s was not reported", event)
 		}
 	}
 	uintValue := func(event string) *uint64 {
+		if !counted[event] {
+			return nil
+		}
 		value := uintSums[event]
 		return &value
 	}
