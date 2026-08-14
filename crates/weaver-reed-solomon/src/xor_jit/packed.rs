@@ -15,7 +15,6 @@ const CODE_ALIGNMENT: usize = 64;
 const MAPPING_ACCOUNT_ALIGNMENT: usize = 64 * 1024;
 const MISSING_CODEBOOK_ENTRY: u32 = u32::MAX;
 const AVX2_MAX_BODY_BYTES: usize = avx2_emitter::MAX_BODY_BYTES;
-const AVX512_MAX_BODY_BYTES: usize = 4096;
 
 struct Avx2Body {
     source: usize,
@@ -527,10 +526,38 @@ impl PackedJitBatch {
             JitWidth::Avx2 => row_count
                 .checked_mul(factors_per_row)?
                 .checked_mul(AVX2_MAX_BODY_BYTES),
-            JitWidth::Avx512 => row_count
-                .checked_mul(factors_per_row)?
-                .checked_mul(AVX512_MAX_BODY_BYTES),
+            // AVX512 is NOT linear in factors: each group of up to
+            // MAX_PACKED_REGIONS sources emits one body per prefix length
+            // (`build_batch_plan` pushes `generate_muladd_multi(chunk[..count])`
+            // for count in 1..=len, executed as `group.codes[count - 1]`), so
+            // source i's XOR chain is present in len-i bodies. A per-factor
+            // slot model undercounts that layout — it shipped a create failure
+            // on AVX-512-no-GFNI hosts (arena 49241 > 49152 at 12 factors).
+            JitWidth::Avx512 => {
+                let full_groups = factors_per_row / codegen512::MAX_PACKED_REGIONS;
+                let remainder = factors_per_row % codegen512::MAX_PACKED_REGIONS;
+                let per_row = full_groups
+                    .checked_mul(Self::avx512_group_arena_upper_bound(
+                        codegen512::MAX_PACKED_REGIONS,
+                    )?)?
+                    .checked_add(Self::avx512_group_arena_upper_bound(remainder)?)?;
+                row_count.checked_mul(per_row)
+            }
         }
+    }
+
+    /// Arena bytes one AVX512 group of `len` sources can need: every prefix
+    /// body at its factor-independent worst case, each aligned to
+    /// [`CODE_ALIGNMENT`] as `GeneratedBodies::push` lays them out.
+    fn avx512_group_arena_upper_bound(len: usize) -> Option<usize> {
+        let mut total = 0usize;
+        for count in 1..=len {
+            let body = codegen512::multi_body_bytes_upper_bound(count)
+                .checked_add(CODE_ALIGNMENT - 1)?
+                & !(CODE_ALIGNMENT - 1);
+            total = total.checked_add(body)?;
+        }
+        Some(total)
     }
 
     /// Estimate the complete peak for one active packed input group.
@@ -1350,6 +1377,44 @@ mod tests {
 
         let batch = PackedJitBatch::new(JitWidth::Avx2, &[&row]).unwrap();
         assert!(!batch_arena(&batch).is_empty());
+    }
+
+    /// Planning is pure codegen (no AVX512 hardware): the exact planned arena
+    /// must fit the bound for every group remainder, with the popcount-worst
+    /// factor 0x1AFF in every slot.
+    #[test]
+    fn packed_avx512_arena_bound_covers_the_prefix_family_layout() {
+        for len in 1..=(2 * codegen512::MAX_PACKED_REGIONS + 1) {
+            let row = vec![0x1AFFu16; len];
+            let plan = build_batch_plan(JitWidth::Avx512, &[&row[..]], usize::MAX).unwrap();
+            let bound = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx512, 1, len).unwrap();
+            assert!(
+                plan.size.arena_bytes <= bound,
+                "len {len}: planned {} > bound {bound}",
+                plan.size.arena_bytes
+            );
+        }
+
+        let row = vec![0x1AFFu16; 12];
+        let rows = [&row[..], &row[..], &row[..]];
+        let plan = build_batch_plan(JitWidth::Avx512, &rows, usize::MAX).unwrap();
+        assert!(
+            plan.size.arena_bytes
+                <= PackedJitBatch::active_arena_upper_bound(JitWidth::Avx512, 3, 12).unwrap()
+        );
+    }
+
+    /// The c5 field failure (run c5iso-20260814T194248Z): 12 exponent-1
+    /// factors planned a 49241-byte arena while the per-factor model granted
+    /// 49152, failing every real create on AVX-512-without-GFNI hosts. The
+    /// corrected bound must cover the recorded arena.
+    #[test]
+    fn packed_avx512_arena_bound_covers_the_c5_field_failure() {
+        let bound = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx512, 1, 12).unwrap();
+        assert!(
+            bound >= 49241,
+            "bound {bound} regressed below the field arena"
+        );
     }
 
     #[test]

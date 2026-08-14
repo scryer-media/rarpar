@@ -130,6 +130,47 @@ pub fn generate_muladd_with_prefetch(deps: &XorDeps, prefetch: bool) -> Vec<u8> 
 /// Maximum number of packed source regions handled by one AVX512 body.
 pub const MAX_PACKED_REGIONS: usize = 6;
 
+/// Largest total dependency-row popcount any factor can produce, i.e. the
+/// most `vpxord` instructions one source region can cost in
+/// [`generate_muladd_multi`]. This is the exact maximum over the full GF(2^16)
+/// factor domain (reached at factor `0x1AFF`), pinned by
+/// `max_deps_popcount_is_pinned`; it is a property of the field polynomial,
+/// not of any corpus.
+pub const MAX_DEPS_TOTAL_POPCOUNT: usize = 188;
+
+// Encoded instruction sizes the multi-body consists of, matching `emit`
+// byte-for-byte. `multi_body_len_is_exactly_the_size_formula` locks them: if
+// an emitter encoding changes, that test fails before any bound goes stale.
+const EVEX_XOR_BYTES: usize = 6; // vpxord zmm,zmm,zmm
+const PLANE_SET_BYTES: usize = 111; // 16 plane loads/stores: 6 + 15*7 (disp8)
+const ADD_RI_BYTES: usize = 7; // add r64, imm32
+const LOOP_TAIL_BYTES: usize = 10; // cmp_rr + jl_rel32 + ret
+
+/// Exact byte length of [`generate_muladd_multi`] for the given dependency
+/// list. The generator is a straight concatenation, so the length is a linear
+/// function of the per-source dependency popcounts.
+pub fn multi_body_len(deps: &[XorDeps]) -> usize {
+    let per_source: usize = deps
+        .iter()
+        .map(|dep| {
+            let popcount: usize = dep.rows.iter().map(|row| row.count_ones() as usize).sum();
+            ADD_RI_BYTES + PLANE_SET_BYTES + EVEX_XOR_BYTES * popcount
+        })
+        .sum();
+    ADD_RI_BYTES + PLANE_SET_BYTES + per_source + PLANE_SET_BYTES + LOOP_TAIL_BYTES
+}
+
+/// Upper bound on [`generate_muladd_multi`] output for `source_count` regions,
+/// valid for every factor assignment. `239 + 1246 * source_count` today.
+pub fn multi_body_bytes_upper_bound(source_count: usize) -> usize {
+    let per_source_max = ADD_RI_BYTES + PLANE_SET_BYTES + EVEX_XOR_BYTES * MAX_DEPS_TOTAL_POPCOUNT;
+    ADD_RI_BYTES
+        + PLANE_SET_BYTES
+        + PLANE_SET_BYTES
+        + LOOP_TAIL_BYTES
+        + source_count * per_source_max
+}
+
 #[inline]
 fn source_base(index: usize) -> u8 {
     match index {
@@ -216,6 +257,70 @@ mod tests {
                 code.len() < 4096,
                 "factor {factor:#06x}: {} bytes",
                 code.len()
+            );
+        }
+    }
+
+    /// The size formula must match the generator byte-for-byte: any emitter
+    /// encoding change that would silently invalidate
+    /// [`multi_body_bytes_upper_bound`] fails here first. Covers every prefix
+    /// length, dense and sparse factors, zero factors, and the popcount-worst
+    /// factor 0x1AFF.
+    #[test]
+    fn multi_body_len_is_exactly_the_size_formula() {
+        let pools: [&[u16]; 4] = [
+            &[0x1AFF, 0x1AFF, 0x1AFF, 0x1AFF, 0x1AFF, 0x1AFF],
+            &[1, 2, 3, 0x8000, 0xFFFF, 0x2F1D],
+            &[0, 1, 0, 0xABCD, 0, 0x0101],
+            &[0x1234, 0, 0x1AFF, 0x4000, 0xBEEF, 7],
+        ];
+        for pool in pools {
+            for count in 1..=pool.len() {
+                let deps = pool[..count]
+                    .iter()
+                    .copied()
+                    .map(compute_deps)
+                    .collect::<Vec<_>>();
+                let code = generate_muladd_multi(&deps);
+                assert_eq!(
+                    code.len(),
+                    multi_body_len(&deps),
+                    "prefix {count} of {pool:04X?}"
+                );
+                assert!(code.len() <= multi_body_bytes_upper_bound(count));
+            }
+        }
+    }
+
+    /// [`MAX_DEPS_TOTAL_POPCOUNT`] is the exact maximum over the whole factor
+    /// domain. Exhaustive and hardware-free; if the field polynomial or dep
+    /// computation ever changes, this reports the new maximum to re-pin.
+    #[test]
+    fn max_deps_popcount_is_pinned() {
+        let (max, argmax) = (1..=u16::MAX)
+            .map(|factor| {
+                let deps = compute_deps(factor);
+                let popcount: usize = deps.rows.iter().map(|row| row.count_ones() as usize).sum();
+                (popcount, factor)
+            })
+            .max()
+            .unwrap();
+        assert_eq!(
+            max, MAX_DEPS_TOTAL_POPCOUNT,
+            "true max popcount is {max} at factor {argmax:#06x}; re-pin MAX_DEPS_TOTAL_POPCOUNT"
+        );
+    }
+
+    /// Every single-source multi body honors the per-source bound — the
+    /// exhaustive anchor [`multi_body_bytes_upper_bound`] rests on, given the
+    /// exact-formula lock above (lengths compose additively per source).
+    #[test]
+    fn multi_body_single_source_bound_holds_for_all_factors() {
+        for factor in 1..=u16::MAX {
+            let deps = [compute_deps(factor)];
+            assert!(
+                multi_body_len(&deps) <= multi_body_bytes_upper_bound(1),
+                "factor {factor:#06x}"
             );
         }
     }
