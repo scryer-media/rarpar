@@ -238,9 +238,12 @@ trait Rar4Sink {
     /// `8 * i`, which is the byte order [`Window::put_literal_batch`] stores.
     fn put_literals(&mut self, packed: u64, n: usize);
 
-    /// Apply a match of `length` bytes at `distance`, of which the first
-    /// `visible` are inside the declared unpacked size.
-    fn copy_match(&mut self, distance: usize, length: usize, visible: usize) -> RarResult<()>;
+    /// Apply a match of `length` bytes at `distance`.
+    ///
+    /// Nothing here knows about the declared unpacked size: `Unpack29` copies
+    /// whole matches into the window and the write layer decides what of it
+    /// reaches the caller (unpack30.cpp:200-247, unpack50.cpp:538-548).
+    fn copy_match(&mut self, distance: usize, length: usize) -> RarResult<()>;
 
     /// Cheap pre-test: is the unflushed span (plus `pending_literals` still in
     /// the register run) at or past the caller's flush threshold?
@@ -268,8 +271,8 @@ impl Rar4Sink for Rar4WindowSink<'_> {
     }
 
     #[inline(always)]
-    fn copy_match(&mut self, distance: usize, length: usize, visible: usize) -> RarResult<()> {
-        self.window.copy_with_visible_len(distance, length, visible)
+    fn copy_match(&mut self, distance: usize, length: usize) -> RarResult<()> {
+        self.window.copy(distance, length)
     }
 
     #[inline(always)]
@@ -535,11 +538,9 @@ impl Rar4Sink for Rar4RecordSink {
     }
 
     #[inline(always)]
-    fn copy_match(&mut self, distance: usize, length: usize, _visible: usize) -> RarResult<()> {
+    fn copy_match(&mut self, distance: usize, length: usize) -> RarResult<()> {
         // A RAR4 match is at most LDECODE's 224 + 3 + 31 extra bits + 2 of
-        // distance adjustment, so `length` cannot reach `u32::MAX`; the apply
-        // side recomputes `visible` from its own running output size, which is
-        // in lockstep with the decode side's by construction.
+        // distance adjustment, so `length` cannot reach `u32::MAX`.
         debug_assert!(length <= u32::MAX as usize, "match length {length}");
         self.push(Rar4Item {
             literals: 0,
@@ -579,7 +580,7 @@ trait Rar4LeaseDriver {
         &mut self,
         decoder: &mut Rar4LzDecoder,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: &mut u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<Option<Rar4FastExit>>;
@@ -594,11 +595,11 @@ impl Rar4LeaseDriver for Rar4SerialLease {
         &mut self,
         decoder: &mut Rar4LzDecoder,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: &mut u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<Option<Rar4FastExit>> {
-        decoder.lease_fast_symbols(reader, unpacked_size, output_size, yield_threshold)
+        decoder.lease_fast_symbols(reader, decode_limit, output_size, yield_threshold)
     }
 }
 
@@ -613,13 +614,13 @@ impl<W: Write + ?Sized> Rar4LeaseDriver for Rar4ThreadedLease<'_, W> {
         &mut self,
         decoder: &mut Rar4LzDecoder,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: &mut u64,
         _yield_threshold: Option<usize>,
     ) -> RarResult<Option<Rar4FastExit>> {
         decoder.lease_fast_symbols_mt(
             reader,
-            unpacked_size,
+            decode_limit,
             output_size,
             self.flush_threshold,
             self.writer,
@@ -828,7 +829,7 @@ fn run_fast_symbols<S: Rar4Sink>(
     tables: &Rar4FastTables<'_>,
     state: &mut Rar4FastState,
     sink: &mut S,
-    unpacked_size: u64,
+    decode_limit: u64,
     output_size: &mut u64,
 ) -> (usize, RarResult<Rar4FastExit>) {
     let data = span.data;
@@ -866,18 +867,16 @@ fn run_fast_symbols<S: Rar4Sink>(
         ($distance:expr, $length:expr) => {{
             apply_literals!();
             let length = $length;
-            let remaining = (unpacked_size - out) as usize;
-            let visible_len = length.min(remaining);
-            if let Err(err) = sink.copy_match($distance, length, visible_len) {
+            if let Err(err) = sink.copy_match($distance, length) {
                 *output_size = out;
                 return (cursor.pos, Err(err));
             }
-            out += visible_len as u64;
+            out += length as u64;
         }};
     }
 
     let exit = loop {
-        if out >= unpacked_size {
+        if out >= decode_limit {
             break Rar4FastExit::Complete;
         }
         // UnRAR's `Inp.InAddr > ReadBorder` (unpack30.cpp:56), in bits.
@@ -945,21 +944,9 @@ fn run_fast_symbols<S: Rar4Sink>(
             let cache_idx = number - 259;
             let distance = state.dist_cache[cache_idx];
 
-            // Rotate cache with explicit fixed moves — a runtime-length shift
-            // loop lowers to a libc memmove via LLVM's loop-idiom pass (see
-            // lz/mod.rs promote_old_dist).
-            match cache_idx {
-                0 => {}
-                1 => state.dist_cache[1] = state.dist_cache[0],
-                2 => {
-                    state.dist_cache[2] = state.dist_cache[1];
-                    state.dist_cache[1] = state.dist_cache[0];
-                }
-                _ => {
-                    state.dist_cache[3] = state.dist_cache[2];
-                    state.dist_cache[2] = state.dist_cache[1];
-                    state.dist_cache[1] = state.dist_cache[0];
-                }
+            // Rotate cache.
+            for j in (1..=cache_idx).rev() {
+                state.dist_cache[j] = state.dist_cache[j - 1];
             }
             state.dist_cache[0] = distance;
 
@@ -1067,8 +1054,23 @@ pub struct Rar4LzDecoder {
     last_vm_filter: usize,
     /// Absolute window position where the current file started.
     current_file_base_total: u64,
-    /// Logical written-file size for RAR3 VM filter R6.
+    /// `Unpack::WrittenFileSize` for the member being decoded.
+    ///
+    /// This is the oracle's counter, not a count of emitted bytes:
+    /// `UnpWriteData` advances it by the *full* span it was handed even when it
+    /// clamped the write to the declared size, and stops advancing it once it
+    /// has reached that size (unpack50.cpp:538-548). It seeds the VM's `R[6]`
+    /// (unpack30.cpp:624-628) and it is what the decode loop's size stop tests
+    /// (unpack30.cpp:59-70).
     current_file_written_size: u64,
+    /// Bytes this member has actually handed to the writer.
+    ///
+    /// Distinct from `current_file_written_size` on exactly the streams this
+    /// module's size handling is about: a clamped raw span advances the counter
+    /// without emitting, and a filtered block emits without being clamped.
+    current_file_emitted: u64,
+    /// The member's declared unpacked size, i.e. the oracle's `DestUnpSize`.
+    current_file_unpacked_size: u64,
     /// Range coder registers saved when a solid member's output ends inside
     /// a PPMd block. One coder stays alive across solid members: only
     /// PPMd block headers re-initialize it, so the next member must resume
@@ -1148,6 +1150,8 @@ impl Rar4LzDecoder {
             last_vm_filter: 0,
             current_file_base_total: 0,
             current_file_written_size: 0,
+            current_file_emitted: 0,
+            current_file_unpacked_size: 0,
             ppm_rc_state: None,
             member_decode_done: false,
             filter_scratch: Vec::new(),
@@ -1190,7 +1194,7 @@ impl Rar4LzDecoder {
             .clamp(1, UNPACK_MAX_WRITE)
     }
 
-    fn begin_file_decode(&mut self) {
+    fn begin_file_decode(&mut self, unpacked_size: u64) {
         self.pending_vm_filters.clear();
         // Filter starts are only monotonic within one filter scope: a
         // non-solid member restarts both the window and the base, so the
@@ -1201,8 +1205,82 @@ impl Rar4LzDecoder {
         }
         self.current_file_base_total = self.window.total_written();
         self.current_file_written_size = 0;
+        self.current_file_emitted = 0;
+        self.current_file_unpacked_size = unpacked_size;
         self.member_decode_done = false;
         self.window.mark_flushed(self.current_file_base_total);
+    }
+
+    /// How far past the file start this member may decode.
+    ///
+    /// `Unpack29` has no size-driven loop bound at all: it decodes until the
+    /// end-of-file marker or the end of the packed area, and it stops early
+    /// only when a mid-loop flush has already pushed `WrittenFileSize` past
+    /// `DestUnpSize` (unpack30.cpp:59-70) -- which is [`Self::size_stop_reached`],
+    /// not this. That flush fires when the window's write border is about to be
+    /// overrun, i.e. once every [`Self::flush_threshold`] bytes, so the oracle
+    /// decodes up to one write window past the declared size and every VM
+    /// filter queued inside that window still runs. Filtered blocks are written
+    /// without a clamp (unpack30.cpp:597-599), so what it decodes there can
+    /// still reach the output.
+    ///
+    /// rarpar keeps the declared size as the bound, because everything the
+    /// oracle decodes past it that is *not* under a filter is dropped by
+    /// `UnpWriteData` and cannot change one output byte — and stopping there
+    /// keeps a corrupt stream from being decoded for output nobody will see.
+    /// What the bound has to add is the reach of the blocks already queued: a
+    /// block is written whole or not at all, so cutting the decode inside one
+    /// would drop it. The reach is capped one dictionary past the declared
+    /// size, which is the furthest the oracle can still apply a block — beyond
+    /// that the ring has overwritten the block's own bytes.
+    ///
+    /// The residual: a filter queued *entirely* past the declared size, with
+    /// nothing queued before it to carry the bound there, is never seen. The
+    /// oracle would reach it inside its write window. No writer emits one —
+    /// RAR queues a filter before the data it covers, which is exactly the
+    /// case the reach term keeps.
+    fn decode_limit(&self) -> u64 {
+        let base = self.current_file_base_total;
+        let declared = self.current_file_unpacked_size;
+        let mut limit = declared;
+        for filter in &self.pending_vm_filters {
+            let end = filter
+                .block_start_total
+                .saturating_add(filter.block_length as u64);
+            limit = limit.max(end.saturating_sub(base));
+        }
+        limit.min(declared.saturating_add(self.window.dict_size() as u64))
+    }
+
+    /// `UnpWriteData` over the window span `[total_flushed, advance_to)`
+    /// (unpack50.cpp:538-548, shared by the v29 and v5 write paths).
+    ///
+    /// Nothing is emitted once `WrittenFileSize` has reached the declared size,
+    /// the emitted part is clamped to what is left of it, and the counter
+    /// advances by the whole span either way. The window's own border always
+    /// advances by the whole span, because the oracle's `WrittenBorder` does.
+    fn write_raw_span<W: Write + ?Sized>(
+        &mut self,
+        advance_to: u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let border = self.window.total_flushed();
+        let advance_to = advance_to.min(self.window.total_written());
+        if advance_to <= border {
+            return Ok(());
+        }
+        let span = advance_to - border;
+        if self.current_file_written_size < self.current_file_unpacked_size {
+            let left = self.current_file_unpacked_size - self.current_file_written_size;
+            let emitted = self
+                .window
+                .flush_visible_until(border.saturating_add(span.min(left)), writer)
+                .map_err(RarError::Io)?;
+            self.current_file_emitted = self.current_file_emitted.saturating_add(emitted);
+            self.current_file_written_size = self.current_file_written_size.saturating_add(span);
+        }
+        self.window.mark_flushed(advance_to);
+        Ok(())
     }
 
     fn reset_vm_filter_state(&mut self) {
@@ -1830,9 +1908,21 @@ impl Rar4LzDecoder {
             let total_written = self.window.total_written();
 
             if self.pending_vm_filters.is_empty() {
-                let written = self.window.flush_to_writer(writer).map_err(RarError::Io)?;
-                self.current_file_written_size =
-                    self.current_file_written_size.saturating_add(written);
+                let total_written = self.window.total_written();
+                // Kept from the `flush_to_writer` this replaced: an unflushed
+                // span wider than the dictionary means the ring has already
+                // overwritten output nobody has read.
+                if total_written - written_border > self.window.dict_size() as u64 {
+                    return Err(RarError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "window overrun: {} unflushed bytes exceeds dictionary size {}",
+                            total_written - written_border,
+                            self.window.dict_size()
+                        ),
+                    )));
+                }
+                self.write_raw_span(total_written, writer)?;
                 return Ok(());
             }
 
@@ -1850,12 +1940,12 @@ impl Rar4LzDecoder {
                 if rar4_debug_filters_enabled() {
                     eprintln!("RAR4 flush prefix: [{written_border}, {next_start}) len={raw_len}");
                 }
-                let written = self
-                    .window
-                    .flush_visible_until(next_start, writer)
-                    .map_err(RarError::Io)?;
-                self.current_file_written_size =
-                    self.current_file_written_size.saturating_add(written);
+                self.write_raw_span(next_start, writer)?;
+                if self.window.total_flushed() == written_border {
+                    // The prefix is not in the window yet; nothing moved, so
+                    // looping again would spin.
+                    return Ok(());
+                }
                 continue;
             }
 
@@ -1950,9 +2040,16 @@ impl Rar4LzDecoder {
             if rar4_debug_filters_enabled() {
                 eprintln!("RAR4 flush filter: [{next_start}, {block_end}) chain_len={chain_len}");
             }
+            // No clamp: the oracle hands `FilteredDataSize` straight to
+            // `UnpWrite` and adds all of it to `WrittenFileSize`
+            // (unpack30.cpp:597-599), so a filtered block is emitted in full
+            // even when it carries the member past its declared size.
             writer
                 .write_all(&self.filter_scratch)
                 .map_err(RarError::Io)?;
+            self.current_file_emitted = self
+                .current_file_emitted
+                .saturating_add(self.filter_scratch.len() as u64);
             self.current_file_written_size = self
                 .current_file_written_size
                 .saturating_add(self.filter_scratch.len() as u64);
@@ -2056,7 +2153,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
-        self.begin_file_decode();
+        self.begin_file_decode(unpacked_size);
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         // Decided once per member, as the RAR5 controller decides its own
@@ -2068,62 +2165,80 @@ impl Rar4LzDecoder {
         // lead but the window itself — and the window is on this thread.
         let threaded = rar4_mt_admitted(unpacked_size);
 
-        while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
-                break;
-            }
-
-            match self.block_type {
-                // PPMd members stay serial. A mixed solid archive flips
-                // `block_type` at symbol 256, which ends the lease and hands the
-                // fully materialized window back before the PPMd round starts,
-                // so the transition is the same one the serial path makes.
-                BlockType::Lz if threaded => {
-                    let mut driver = Rar4ThreadedLease {
-                        writer: &mut *writer,
-                        flush_threshold,
-                    };
-                    output_size = self.decode_lz_symbols_with(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                        &mut driver,
-                    )?;
+        'member: loop {
+            while output_size < self.decode_limit() {
+                if reader.bits_remaining() < 1 {
+                    break;
                 }
-                BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                    )?;
+
+                match self.block_type {
+                    // PPMd members stay serial. A mixed solid archive flips
+                    // `block_type` at symbol 256, which ends the lease and hands the
+                    // fully materialized window back before the PPMd round starts,
+                    // so the transition is the same one the serial path makes.
+                    BlockType::Lz if threaded => {
+                        let mut driver = Rar4ThreadedLease {
+                            writer: &mut *writer,
+                            flush_threshold,
+                        };
+                        let limit = self.decode_limit();
+                        output_size = self.decode_lz_symbols_with(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                            &mut driver,
+                        )?;
+                    }
+                    BlockType::Lz => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_lz_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                        )?;
+                    }
+                    BlockType::Ppm => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_ppm_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                            writer,
+                        )?;
+                    }
                 }
-                BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                        writer,
-                    )?;
+
+                if self.window.unflushed_bytes() as usize >= flush_threshold {
+                    self.flush_ready_output_to_writer(writer, false)?;
+                }
+
+                if self.member_decode_done || self.size_stop_reached() {
+                    break;
                 }
             }
 
-            if self.window.unflushed_bytes() as usize >= flush_threshold {
-                self.flush_ready_output_to_writer(writer, false)?;
+            if self.member_decode_done || output_size < unpacked_size {
+                break 'member;
             }
-
-            if self.member_decode_done {
-                break;
+            if !self.consume_solid_end_marker(reader)? {
+                break 'member;
             }
-        }
-
-        if output_size >= unpacked_size {
-            self.consume_solid_end_marker(reader)?;
         }
         self.flush_ready_output_to_writer(writer, true)?;
-        Ok(output_size)
+        Ok(self.current_file_emitted)
+    }
+
+    /// The oracle's post-flush size stop: `WrittenFileSize > DestUnpSize`
+    /// ends the member's decode (unpack30.cpp:64-65).
+    ///
+    /// It is *strictly* greater, so a member whose output lands exactly on the
+    /// declared size keeps decoding and reaches its end-of-file marker, which
+    /// is what leaves `tables_read` right for the next solid member.
+    fn size_stop_reached(&self) -> bool {
+        self.current_file_written_size > self.current_file_unpacked_size
     }
 
     /// Chunked variant: decompress with output split at compressed byte boundaries.
@@ -2205,7 +2320,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
-        self.begin_file_decode();
+        self.begin_file_decode(unpacked_size);
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         let mut boundary_idx = 0;
@@ -2216,77 +2331,86 @@ impl Rar4LzDecoder {
         let mut chunk_bytes: u64 = 0;
         let mut pending_boundary_volume = None;
 
-        while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
-                break;
-            }
-
-            let prev_output = output_size;
-            match self.block_type {
-                BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                    )?;
+        'member: loop {
+            while output_size < self.decode_limit() {
+                if reader.bits_remaining() < 1 {
+                    break;
                 }
-                BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                        &mut *current_writer,
-                    )?;
+
+                let prev_emitted = self.current_file_emitted;
+                match self.block_type {
+                    BlockType::Lz => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_lz_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                        )?;
+                    }
+                    BlockType::Ppm => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_ppm_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                            &mut *current_writer,
+                        )?;
+                    }
+                }
+
+                let byte_pos = reader.byte_position() as u64;
+                if pending_boundary_volume.is_none()
+                    && boundary_idx < boundaries.len()
+                    && byte_pos >= boundaries[boundary_idx].compressed_offset
+                {
+                    pending_boundary_volume = Some(boundaries[boundary_idx].volume_index);
+                    boundary_idx += 1;
+                }
+
+                if pending_boundary_volume.is_some()
+                    || self.window.unflushed_bytes() as usize >= flush_threshold
+                {
+                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                        return Err(RarError::CorruptArchive {
+                            detail:
+                                "RAR4 pending VM filters exceeded dictionary window before flush"
+                                    .into(),
+                        });
+                    }
+                }
+                chunk_bytes += self.current_file_emitted - prev_emitted;
+
+                // VM filters can span a compressed-volume boundary, so only hand
+                // output to the next writer after the current chunk is fully
+                // materialized through the filter queue.
+                if let Some(next_vol) = pending_boundary_volume
+                    && self.window.total_flushed() == self.window.total_written()
+                {
+                    chunks.push((current_vol, chunk_bytes));
+                    current_vol = next_vol;
+                    current_writer = writer_factory(current_vol)?;
+                    chunk_bytes = 0;
+                    pending_boundary_volume = None;
+                }
+
+                if self.member_decode_done || self.size_stop_reached() {
+                    break;
                 }
             }
-            let decoded_this_round = output_size - prev_output;
-            chunk_bytes += decoded_this_round;
 
-            let byte_pos = reader.byte_position() as u64;
-            if pending_boundary_volume.is_none()
-                && boundary_idx < boundaries.len()
-                && byte_pos >= boundaries[boundary_idx].compressed_offset
+            if self.member_decode_done
+                || output_size < unpacked_size
+                || !self.consume_solid_end_marker(reader)?
             {
-                pending_boundary_volume = Some(boundaries[boundary_idx].volume_index);
-                boundary_idx += 1;
-            }
-
-            if pending_boundary_volume.is_some()
-                || self.window.unflushed_bytes() as usize >= flush_threshold
-            {
-                self.flush_ready_output_to_writer(&mut *current_writer, false)?;
-                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR4 pending VM filters exceeded dictionary window before flush"
-                            .into(),
-                    });
-                }
-            }
-
-            // VM filters can span a compressed-volume boundary, so only hand
-            // output to the next writer after the current chunk is fully
-            // materialized through the filter queue.
-            if let Some(next_vol) = pending_boundary_volume
-                && self.window.total_flushed() == self.window.total_written()
-            {
-                chunks.push((current_vol, chunk_bytes));
-                current_vol = next_vol;
-                current_writer = writer_factory(current_vol)?;
-                chunk_bytes = 0;
-                pending_boundary_volume = None;
-            }
-
-            if self.member_decode_done {
-                break;
+                break 'member;
             }
         }
-
-        if output_size >= unpacked_size {
-            self.consume_solid_end_marker(reader)?;
-        }
+        let prev_emitted = self.current_file_emitted;
         self.flush_ready_output_to_writer(&mut *current_writer, true)?;
+        chunk_bytes += self.current_file_emitted - prev_emitted;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -2313,7 +2437,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
-        self.begin_file_decode();
+        self.begin_file_decode(unpacked_size);
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         let mut boundary_idx = 0;
@@ -2324,83 +2448,93 @@ impl Rar4LzDecoder {
         let mut chunk_bytes: u64 = 0;
         let mut pending_boundary_volume = None;
 
-        while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
-                break;
-            }
-
-            let prev_output = output_size;
-            match self.block_type {
-                BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                    )?;
+        'member: loop {
+            while output_size < self.decode_limit() {
+                if reader.bits_remaining() < 1 {
+                    break;
                 }
-                BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(
-                        reader,
-                        unpacked_size,
-                        output_size,
-                        Some(flush_threshold),
-                        &mut *current_writer,
-                    )?;
+
+                let prev_emitted = self.current_file_emitted;
+                match self.block_type {
+                    BlockType::Lz => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_lz_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                        )?;
+                    }
+                    BlockType::Ppm => {
+                        let limit = self.decode_limit();
+                        output_size = self.decode_ppm_symbols(
+                            reader,
+                            limit,
+                            output_size,
+                            Some(flush_threshold),
+                            &mut *current_writer,
+                        )?;
+                    }
+                }
+
+                let byte_pos = reader.byte_position() as u64;
+                let next_boundary = {
+                    let guard =
+                        shared_transitions
+                            .lock()
+                            .map_err(|_| RarError::CorruptArchive {
+                                detail: "RAR4 volume transition state is poisoned".into(),
+                            })?;
+                    guard.get(boundary_idx).cloned()
+                };
+
+                if pending_boundary_volume.is_none()
+                    && let Some(boundary) = next_boundary
+                    && byte_pos >= boundary.compressed_offset
+                {
+                    pending_boundary_volume = Some(boundary.volume_index);
+                    boundary_idx += 1;
+                }
+
+                if pending_boundary_volume.is_some()
+                    || self.window.unflushed_bytes() as usize >= flush_threshold
+                {
+                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                        return Err(RarError::CorruptArchive {
+                            detail:
+                                "RAR4 pending VM filters exceeded dictionary window before flush"
+                                    .into(),
+                        });
+                    }
+                }
+                chunk_bytes += self.current_file_emitted - prev_emitted;
+
+                if let Some(next_vol) = pending_boundary_volume
+                    && self.window.total_flushed() == self.window.total_written()
+                {
+                    chunks.push((current_vol, chunk_bytes));
+                    current_vol = next_vol;
+                    current_writer = writer_factory(current_vol)?;
+                    chunk_bytes = 0;
+                    pending_boundary_volume = None;
+                }
+
+                if self.member_decode_done || self.size_stop_reached() {
+                    break;
                 }
             }
-            let decoded_this_round = output_size - prev_output;
-            chunk_bytes += decoded_this_round;
 
-            let byte_pos = reader.byte_position() as u64;
-            let next_boundary = {
-                let guard = shared_transitions
-                    .lock()
-                    .map_err(|_| RarError::CorruptArchive {
-                        detail: "RAR4 volume transition state is poisoned".into(),
-                    })?;
-                guard.get(boundary_idx).cloned()
-            };
-
-            if pending_boundary_volume.is_none()
-                && let Some(boundary) = next_boundary
-                && byte_pos >= boundary.compressed_offset
+            if self.member_decode_done
+                || output_size < unpacked_size
+                || !self.consume_solid_end_marker(reader)?
             {
-                pending_boundary_volume = Some(boundary.volume_index);
-                boundary_idx += 1;
-            }
-
-            if pending_boundary_volume.is_some()
-                || self.window.unflushed_bytes() as usize >= flush_threshold
-            {
-                self.flush_ready_output_to_writer(&mut *current_writer, false)?;
-                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR4 pending VM filters exceeded dictionary window before flush"
-                            .into(),
-                    });
-                }
-            }
-
-            if let Some(next_vol) = pending_boundary_volume
-                && self.window.total_flushed() == self.window.total_written()
-            {
-                chunks.push((current_vol, chunk_bytes));
-                current_vol = next_vol;
-                current_writer = writer_factory(current_vol)?;
-                chunk_bytes = 0;
-                pending_boundary_volume = None;
-            }
-
-            if self.member_decode_done {
-                break;
+                break 'member;
             }
         }
-
-        if output_size >= unpacked_size {
-            self.consume_solid_end_marker(reader)?;
-        }
+        let prev_emitted = self.current_file_emitted;
         self.flush_ready_output_to_writer(&mut *current_writer, true)?;
+        chunk_bytes += self.current_file_emitted - prev_emitted;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -2604,35 +2738,51 @@ impl Rar4LzDecoder {
         Ok(())
     }
 
-    /// Main decode loop — processes symbols until unpacked_size is reached
-    /// or end-of-block.
-    /// Consume the end-of-block marker that follows a member's last output
-    /// symbol.
+    /// Consume the code that follows a member's last output symbol.
     ///
-    /// The output check is strictly `WrittenFileSize > DestUnpSize`, so
-    /// after the final output symbol it still decodes the next code: for a
-    /// well-formed solid member that is code 256 whose new-file/new-table
-    /// flags decide whether the next member re-reads Huffman tables. Skipping
-    /// it leaves `tables_read` stale and desyncs every later solid member.
-    fn consume_solid_end_marker<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
+    /// The oracle's size check is strictly `WrittenFileSize > DestUnpSize`
+    /// (unpack30.cpp:64), so after the final output symbol it still decodes the
+    /// next code. Two things live there:
+    ///
+    /// * code 256, whose new-file/new-table flags decide whether the next
+    ///   member re-reads Huffman tables. Skipping it leaves `tables_read` stale
+    ///   and desyncs every later solid member.
+    /// * code 257, a VM filter packet. A block queued here covers data past the
+    ///   declared size, and the oracle still applies it, so the caller has to
+    ///   resume decoding far enough to complete the block.
+    ///
+    /// Returns whether that block moved the decode bound, i.e. whether the
+    /// caller should re-enter its decode loop. A failed decode is not an error:
+    /// at the true end of the stream there may be no code here at all.
+    fn consume_solid_end_marker<R: BitRead>(&mut self, reader: &mut R) -> RarResult<bool> {
         if !matches!(self.block_type, BlockType::Lz) || !self.tables_read {
-            return Ok(());
+            return Ok(false);
         }
         let number = {
             let Some(ld) = self.ld_table.as_ref() else {
-                return Ok(());
+                return Ok(false);
             };
-            // At the true end of the stream there may be no marker at all;
-            // a failed decode is not an error here.
             match ld.decode(reader) {
                 Ok(number) => number as usize,
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(false),
             }
         };
         if number == 256 {
             self.read_end_of_block(reader)?;
+            return Ok(false);
         }
-        Ok(())
+        if number == 257 {
+            let before = self.decode_limit();
+            if !self.read_vm_code(
+                reader,
+                self.window.total_written() - self.current_file_base_total,
+            )? {
+                self.member_decode_done = true;
+                return Ok(false);
+            }
+            return Ok(self.decode_limit() > before);
+        }
+        Ok(false)
     }
 
     /// Decode symbols out of one leased input span, if the reader can lend one.
@@ -2644,7 +2794,7 @@ impl Rar4LzDecoder {
     fn lease_fast_symbols<R: BitRead>(
         &mut self,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: &mut u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<Option<Rar4FastExit>> {
@@ -2692,7 +2842,7 @@ impl Rar4LzDecoder {
                     &tables,
                     &mut state,
                     &mut sink,
-                    unpacked_size,
+                    decode_limit,
                     output_size,
                 )
             };
@@ -2727,7 +2877,6 @@ impl Rar4LzDecoder {
     fn apply_lz_items<W: Write + ?Sized>(
         &mut self,
         items: &[Rar4Item],
-        unpacked_size: u64,
         output_size: &mut u64,
         flush_threshold: usize,
         writer: &mut W,
@@ -2740,11 +2889,8 @@ impl Rar4LzDecoder {
                 *output_size += n as u64;
             } else {
                 let length = item.length as usize;
-                let remaining = (unpacked_size - *output_size) as usize;
-                let visible_len = length.min(remaining);
-                self.window
-                    .copy_with_visible_len(item.payload as usize, length, visible_len)?;
-                *output_size += visible_len as u64;
+                self.window.copy(item.payload as usize, length)?;
+                *output_size += length as u64;
             }
 
             // The serial loop's `Rar4FastExit::Yield`, resolved in place. The
@@ -2779,7 +2925,7 @@ impl Rar4LzDecoder {
     fn lease_fast_symbols_mt<R: BitRead, W: Write + ?Sized>(
         &mut self,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: &mut u64,
         flush_threshold: usize,
         writer: &mut W,
@@ -2868,7 +3014,7 @@ impl Rar4LzDecoder {
                         tables,
                         &mut decode_state,
                         &mut sink,
-                        unpacked_size,
+                        decode_limit,
                         &mut out,
                     );
                     // Drops the item sender, which is what ends the apply loop
@@ -2879,13 +3025,8 @@ impl Rar4LzDecoder {
 
                 while let Ok(batch) = item_rx.recv() {
                     if apply_result.is_ok() {
-                        apply_result = self.apply_lz_items(
-                            &batch,
-                            unpacked_size,
-                            &mut applied_out,
-                            flush_threshold,
-                            writer,
-                        );
+                        apply_result =
+                            self.apply_lz_items(&batch, &mut applied_out, flush_threshold, writer);
                     }
                     // On failure the loop keeps draining rather than dropping
                     // the receiver: the decode thread runs the rest of the span
@@ -2999,23 +3140,26 @@ impl Rar4LzDecoder {
     fn decode_lz_symbols<R: BitRead>(
         &mut self,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         output_size: u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<u64> {
         self.decode_lz_symbols_with(
             reader,
-            unpacked_size,
+            decode_limit,
             output_size,
             yield_threshold,
             &mut Rar4SerialLease,
         )
     }
 
+    /// `output_size` is the oracle's `UnpPtr` measured from the file start, so
+    /// it counts every byte the match copies into the dictionary. What of it
+    /// reaches the caller is the write layer's decision, not this loop's.
     fn decode_lz_symbols_with<R: BitRead, L: Rar4LeaseDriver>(
         &mut self,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         mut output_size: u64,
         yield_threshold: Option<usize>,
         driver: &mut L,
@@ -3024,7 +3168,7 @@ impl Rar4LzDecoder {
         {
             self.decode_lz_calls += 1;
         }
-        'stream: while output_size < unpacked_size {
+        'stream: while output_size < decode_limit {
             // Fast path: decode as many symbols as the reader can lend input
             // for. The per-symbol path below runs only for the last
             // `LZ_SPAN_SLACK_BYTES` of each buffer fill and for readers that
@@ -3032,7 +3176,7 @@ impl Rar4LzDecoder {
             while let Some(exit) = driver.lease(
                 self,
                 reader,
-                unpacked_size,
+                decode_limit,
                 &mut output_size,
                 yield_threshold,
             )? {
@@ -3095,11 +3239,8 @@ impl Rar4LzDecoder {
 
                 self.insert_old_dist(distance);
                 self.last_length = length;
-                let remaining = (unpacked_size - output_size) as usize;
-                let visible_len = length.min(remaining);
-                self.window
-                    .copy_with_visible_len(distance, length, visible_len)?;
-                output_size += visible_len as u64;
+                self.window.copy(distance, length)?;
+                output_size += length as u64;
                 should_check_yield = true;
             } else if number == 256 || number == 257 {
                 // End of block and VM filter code; shared with the fast path.
@@ -3110,11 +3251,8 @@ impl Rar4LzDecoder {
                 // Repeat previous match.
                 if self.last_length != 0 {
                     let distance = self.dist_cache[0];
-                    let remaining = (unpacked_size - output_size) as usize;
-                    let visible_len = self.last_length.min(remaining);
-                    self.window
-                        .copy_with_visible_len(distance, self.last_length, visible_len)?;
-                    output_size += visible_len as u64;
+                    self.window.copy(distance, self.last_length)?;
+                    output_size += self.last_length as u64;
                     should_check_yield = true;
                 }
             } else if number < 263 {
@@ -3122,21 +3260,9 @@ impl Rar4LzDecoder {
                 let cache_idx = number - 259;
                 let distance = self.dist_cache[cache_idx];
 
-                // Rotate cache with explicit fixed moves — a runtime-length
-                // shift loop lowers to a libc memmove via LLVM's loop-idiom
-                // pass (see lz/mod.rs promote_old_dist).
-                match cache_idx {
-                    0 => {}
-                    1 => self.dist_cache[1] = self.dist_cache[0],
-                    2 => {
-                        self.dist_cache[2] = self.dist_cache[1];
-                        self.dist_cache[1] = self.dist_cache[0];
-                    }
-                    _ => {
-                        self.dist_cache[3] = self.dist_cache[2];
-                        self.dist_cache[2] = self.dist_cache[1];
-                        self.dist_cache[1] = self.dist_cache[0];
-                    }
+                // Rotate cache.
+                for j in (1..=cache_idx).rev() {
+                    self.dist_cache[j] = self.dist_cache[j - 1];
                 }
                 self.dist_cache[0] = distance;
 
@@ -3162,11 +3288,8 @@ impl Rar4LzDecoder {
                 }
 
                 self.last_length = length;
-                let remaining = (unpacked_size - output_size) as usize;
-                let visible_len = length.min(remaining);
-                self.window
-                    .copy_with_visible_len(distance, length, visible_len)?;
-                output_size += visible_len as u64;
+                self.window.copy(distance, length)?;
+                output_size += length as u64;
                 should_check_yield = true;
             } else if number < 272 {
                 // Short match (263-270): length=2, decode short distance.
@@ -3179,11 +3302,8 @@ impl Rar4LzDecoder {
 
                 self.insert_old_dist(distance);
                 self.last_length = 2;
-                let remaining = (unpacked_size - output_size) as usize;
-                let visible_len = 2usize.min(remaining);
-                self.window
-                    .copy_with_visible_len(distance, 2, visible_len)?;
-                output_size += visible_len as u64;
+                self.window.copy(distance, 2)?;
+                output_size += 2;
                 should_check_yield = true;
             } else {
                 // Unreachable: `number` is below the LD table's 299 symbols,
@@ -3461,7 +3581,7 @@ impl Rar4LzDecoder {
     fn decode_ppm_symbols<R: BitRead, W: Write + ?Sized>(
         &mut self,
         reader: &mut R,
-        unpacked_size: u64,
+        decode_limit: u64,
         mut output_size: u64,
         yield_threshold: Option<usize>,
         writer: &mut W,
@@ -3497,7 +3617,7 @@ impl Rar4LzDecoder {
                 };
             }
 
-            while output_size < unpacked_size {
+            while output_size < decode_limit {
                 if let Some(threshold) = yield_threshold
                     && self.window.unflushed_bytes() as usize + literal_len >= threshold
                 {
@@ -3580,7 +3700,13 @@ impl Rar4LzDecoder {
                             if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM end_of_file at output_size={output_size}");
                             }
+                            // "End of file in PPM mode" leaves `Unpack29`'s
+                            // main loop outright (unpack30.cpp:88-89), exactly
+                            // as symbol 256's new-file flag does on the LZ
+                            // side. This member is done; re-entering would
+                            // decode the next member's stream.
                             end_marker_seen = true;
+                            self.member_decode_done = true;
                             break;
                         }
                         3 => {
@@ -3623,11 +3749,8 @@ impl Rar4LzDecoder {
                             }
                             let copy_len = (length + 32) as usize;
                             let copy_dist = (distance + 2) as usize;
-                            let remaining_out = (unpacked_size - output_size) as usize;
-                            let actual = copy_len.min(remaining_out);
-                            self.window
-                                .copy_with_visible_len(copy_dist, copy_len, actual)?;
-                            output_size += actual as u64;
+                            self.window.copy(copy_dist, copy_len)?;
+                            output_size += copy_len as u64;
                         }
                         5 => {
                             let Some(len_byte) = ppm_model.decode_char_result(&mut rc)? else {
@@ -3644,10 +3767,8 @@ impl Rar4LzDecoder {
                                 );
                             }
                             let copy_len = usize::from(len_byte) + 4;
-                            let remaining_out = (unpacked_size - output_size) as usize;
-                            let actual = copy_len.min(remaining_out);
-                            self.window.copy_with_visible_len(1, copy_len, actual)?;
-                            output_size += actual as u64;
+                            self.window.copy(1, copy_len)?;
+                            output_size += copy_len as u64;
                         }
                         _ => {
                             literals[literal_len] = ch;
@@ -3687,7 +3808,7 @@ impl Rar4LzDecoder {
                 // the esc,2 end-of-file marker following a member's last
                 // output byte is consumed before its decode ends. Consume it
                 // here when the loop stopped on exact output completion.
-                if !end_marker_seen && output_size >= unpacked_size {
+                if !end_marker_seen && output_size >= self.current_file_unpacked_size {
                     let esc = self.ppm_esc_char;
                     if let Ok(Some(ch)) = ppm_model.decode_char_result(&mut rc) {
                         if rar4_debug_filters_enabled() {
@@ -4236,7 +4357,7 @@ mod tests {
     #[test]
     fn non_solid_member_restarts_the_window_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(0x40000);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"FIRST-MEMBER-DATA");
         decoder.tables_read = true;
         decoder.dist_cache = [7, 8, 9, 10];
@@ -4265,7 +4386,7 @@ mod tests {
 
         // The decisive check: a back-reference into the previous member's bytes
         // must zero-fill rather than resurrect them.
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.copy_with_visible_len(4, 4, 4).unwrap();
         assert_eq!(decoder.window.try_copy_output(0, 4).unwrap(), [0, 0, 0, 0]);
     }
@@ -4273,7 +4394,7 @@ mod tests {
     #[test]
     fn solid_member_keeps_the_window_and_low_dist_state_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(0x40000);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"ABCD");
         decoder.tables_read = true;
         decoder.low_dist_rep_count = 5;
@@ -4290,7 +4411,7 @@ mod tests {
         assert_eq!(decoder.prev_low_dist, 9);
 
         // The window history is still reachable from the next member.
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.copy_with_visible_len(4, 4, 4).unwrap();
         assert_eq!(decoder.window.try_copy_output(4, 4).unwrap(), b"ABCD");
     }
@@ -4314,7 +4435,7 @@ mod tests {
     #[test]
     fn vm_filter_block_of_exactly_vm_mem_size_emits_nothing_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(VM_MEM_SIZE * 2);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         let chunk = vec![0xE8u8; 4096];
         for _ in 0..(VM_MEM_SIZE / chunk.len()) {
             decoder.window.put_bytes(&chunk);
@@ -4348,7 +4469,7 @@ mod tests {
     #[test]
     fn queued_vm_filter_blocks_are_bounded_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.vm_filters.push(Rar4VmFilterDefinition {
             filter_type: Rar4StandardFilter::None,
             last_block_length: 1,
@@ -4556,7 +4677,7 @@ mod tests {
     #[test]
     fn test_flush_ready_output_to_writer_applies_e8_filter() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(&[0xAA, 0xBB, 0xE8, 100, 0, 0, 0]);
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::E8,
@@ -4579,7 +4700,7 @@ mod tests {
     #[test]
     fn test_filter_flush_respects_hidden_match_tail() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"ABCD");
         decoder.window.mark_flushed(4);
         // The test pre-marks ABCD as flushed, so mirror the logical
@@ -4599,7 +4720,13 @@ mod tests {
             .flush_ready_output_to_writer(&mut out, true)
             .unwrap();
 
-        assert_eq!(out, vec![b'A', b'B', 0xE8, 93, 0, 0, 0]);
+        // Two of the four prefix bytes are hidden, so only `AB` is emitted --
+        // but `WrittenFileSize` advances by the whole span the write layer was
+        // handed, not by the part that reached the writer (`WrittenFileSize+=Size`,
+        // unpack50.cpp:547). The filter behind the prefix therefore runs with
+        // `R[6] == 8`, and the E8 record at file offset 1 is rewritten to
+        // `100 - (1 + 8) == 91`.
+        assert_eq!(out, vec![b'A', b'B', 0xE8, 91, 0, 0, 0]);
         assert_eq!(
             decoder.window.total_flushed(),
             decoder.window.total_written()
@@ -4609,7 +4736,7 @@ mod tests {
     #[test]
     fn test_filterless_flush_respects_hidden_match_tail() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"ABCD");
         decoder.window.mark_flushed(4);
         decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
@@ -4629,7 +4756,7 @@ mod tests {
     #[test]
     fn test_incomplete_final_vm_filter_defers_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"abcdef");
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::E8,
@@ -4651,7 +4778,7 @@ mod tests {
     #[test]
     fn test_none_vm_filter_emits_zero_bytes_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::None,
@@ -4686,7 +4813,7 @@ mod tests {
         let mut ld_lengths = vec![0u8; NC];
         ld_lengths[0] = 1;
         decoder.ld_table = Some(HuffmanTable::build(&ld_lengths).unwrap());
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
 
         // The block starts exactly at the write border and ends past anything
         // this round can produce: the flush border cannot move until the whole
@@ -4754,7 +4881,7 @@ mod tests {
     #[test]
     fn out_of_order_filter_start_is_dropped_instead_of_panicking() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
 
         // Queued directly: `add_vm_code` cannot produce this order from a
@@ -4790,7 +4917,7 @@ mod tests {
     #[test]
     fn test_chunked_flush_applies_e8_filter() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(&[0xAA, 0xBB, 0xE8, 100, 0, 0, 0]);
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::E8,
@@ -4814,7 +4941,7 @@ mod tests {
     #[test]
     fn test_vm_none_filter_suppresses_block_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::None,
@@ -4837,7 +4964,7 @@ mod tests {
     #[test]
     fn test_vm_none_filter_discards_stale_same_start_filter_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
         decoder.pending_vm_filters.push(Rar4PendingVmFilter {
             filter_type: Rar4StandardFilter::None,
@@ -5025,7 +5152,7 @@ mod tests {
     #[test]
     fn test_vm_filter_rejects_oversized_block_before_copy() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
 
         let chunk = vec![0u8; 1024];
         for _ in 0..(VM_MEM_SIZE + 1).div_ceil(chunk.len()) {
@@ -5052,7 +5179,7 @@ mod tests {
     #[test]
     fn test_vm_filter_reset_clears_pending_state() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.vm_filters.push(Rar4VmFilterDefinition {
             filter_type: Rar4StandardFilter::Delta,
             last_block_length: 8,
@@ -5118,7 +5245,7 @@ mod tests {
     #[test]
     fn test_custom_vm_program_suppresses_filtered_block_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"ABCD");
 
         // Only recognized standard filters execute. Non-standard bytecode
@@ -5143,7 +5270,7 @@ mod tests {
     #[test]
     fn test_vm_filter_file_offset_uses_filtered_written_size_after_suppressed_block() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        decoder.begin_file_decode();
+        decoder.begin_file_decode(u64::MAX);
         decoder.window.put_bytes(b"XXXXX");
         decoder.window.put_bytes(&[0xE8, 100, 0, 0, 0]);
 
@@ -5319,6 +5446,137 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name} failed to decode: {err}"));
             assert_eq!(bytes.as_slice(), *expected, "{name}");
         }
+    }
+
+    const RAW_16: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x20, 0x21, 0x30, 0x31, 0x40, 0x41, 0xE8, 0xE9, 0x00,
+        0x01,
+    ];
+    const DELTA_64: [u8; 64] = [
+        0x00, 0xFF, 0xFD, 0xFA, 0xEA, 0xD9, 0xB9, 0x98, 0x68, 0x37, 0xF7, 0xB6, 0xCE, 0xE5, 0xE5,
+        0xE4, 0xE2, 0xDF, 0xCF, 0xBE, 0x9E, 0x7D, 0x4D, 0x1C, 0xDC, 0x9B, 0xB3, 0xCA, 0xCA, 0xC9,
+        0xC7, 0xC4, 0xB4, 0xA3, 0x83, 0x62, 0x32, 0x01, 0xC1, 0x80, 0x98, 0xAF, 0xAF, 0xAE, 0xAC,
+        0xA9, 0x99, 0x88, 0x68, 0x47, 0x17, 0xE6, 0xA6, 0x65, 0x7D, 0x94, 0x94, 0x93, 0x91, 0x8E,
+        0x7E, 0x6D, 0x4D, 0x2C,
+    ];
+    const DELTA_16: [u8; 16] = [
+        0xD0, 0x9F, 0x6F, 0x3E, 0x0E, 0xDD, 0xAD, 0x7C, 0x4C, 0x1B, 0xEB, 0xBA, 0x8A, 0x59, 0x29,
+        0xF8,
+    ];
+    const E8_64: [u8; 64] = [
+        0xE8, 0x0F, 0x20, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x07, 0x20, 0x03, 0x00, 0x41, 0x41,
+        0x41, 0xE8, 0xFF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xF7, 0x1F, 0x03, 0x00, 0x41,
+        0x41, 0x41, 0xE8, 0xEF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xE7, 0x1F, 0x03, 0x00,
+        0x41, 0x41, 0x41, 0xE8, 0xDF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xD7, 0x1F, 0x03,
+        0x00, 0x41, 0x41, 0x41,
+    ];
+    /// The same eight E8 records rewritten against file offset 64 instead of 0.
+    const E8_64_AT_OFFSET_64: [u8; 64] = [
+        0xE8, 0xCF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xC7, 0x1F, 0x03, 0x00, 0x41, 0x41,
+        0x41, 0xE8, 0xBF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xB7, 0x1F, 0x03, 0x00, 0x41,
+        0x41, 0x41, 0xE8, 0xAF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xA7, 0x1F, 0x03, 0x00,
+        0x41, 0x41, 0x41, 0xE8, 0x9F, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x97, 0x1F, 0x03,
+        0x00, 0x41, 0x41, 0x41,
+    ];
+
+    fn joined(head: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut out = head.to_vec();
+        out.extend_from_slice(tail);
+        out
+    }
+
+    /// rarpar bounds *writing* where the oracle bounds writing, instead of
+    /// bounding decoding by the declared size (review item O4/O5).
+    ///
+    /// Expected bytes come from the unrar 7.20 binary;
+    /// `tests/fixtures/generate_vm_output_bounds.py` assembles the archive and
+    /// stamps those same bytes' CRC32 into its file headers, so `unrar t`
+    /// passes on all nine members. Every member declares 16 bytes except
+    /// `filter-inside-size`, which declares 64:
+    ///
+    /// * `filter-overruns-size` — a filtered block over [0,64). The filtered
+    ///   write has no `DestUnpSize` clamp (unpack30.cpp:597-599), so all 64
+    ///   transformed bytes go out.
+    /// * `filter-then-dropped-tail` — the same block plus 16 raw bytes behind
+    ///   it. `WrittenFileSize` is 64 by then, so `UnpWriteData` returns without
+    ///   writing anything for the tail (unpack50.cpp:540).
+    /// * `raw-overrun-clamped` — no filter, 64 raw bytes, clamped to 16.
+    /// * `filter-inside-size` — the well-formed shape, untouched by any of this.
+    /// * `e8-overruns-size` — the same overrun through the E8/E9 filter, whose
+    ///   rewritten addresses show the transform really ran.
+    /// * `raw-clamped-then-e8` — 64 raw bytes (16 emitted) and an E8 block
+    ///   behind them. `ExecuteCode` seeds `InitR[6]` with `WrittenFileSize`
+    ///   (unpack30.cpp:626), and `UnpWriteData` advances that counter by the
+    ///   *full* span it was handed rather than the clamped part it wrote
+    ///   (unpack50.cpp:547), so the rewrite uses file offset 64. These bytes
+    ///   are what pins the counter's semantics.
+    /// * `chained-filters-past-size` — a second block queued behind the first,
+    ///   entirely past the declared size, and still emitted.
+    /// * `filter-reset-drops-pending` — a filter packet writing slot 0
+    ///   mid-member: `InitFilters30` clears `PrgStack` (unpack30.cpp:369-373),
+    ///   so the block queued before it is dropped and its bytes leave through
+    ///   the clamped raw path instead.
+    /// * `filter-start-past-window` — a block queued at [64,128) in a member
+    ///   that ends after 32 bytes. The oracle never matches the filter
+    ///   (unpack30.cpp:543) and falls through to
+    ///   `UnpWriteArea(WrittenBorder,UnpPtr)` (unpack30.cpp:619).
+    #[test]
+    fn vm_filtered_output_is_bounded_at_the_write_layer_like_rar_behavior() {
+        const FIXTURE: &str = "rar4_vm_output_bounds.rar";
+        if !fixtures_hydrated(&[FIXTURE]) {
+            return;
+        }
+
+        let expected: Vec<(&str, Vec<u8>)> = vec![
+            ("filter-overruns-size.bin", DELTA_64.to_vec()),
+            ("filter-then-dropped-tail.bin", DELTA_64.to_vec()),
+            ("raw-overrun-clamped.bin", RAW_16.to_vec()),
+            ("filter-inside-size.bin", DELTA_64.to_vec()),
+            ("e8-overruns-size.bin", E8_64.to_vec()),
+            (
+                "raw-clamped-then-e8.bin",
+                joined(&RAW_16, &E8_64_AT_OFFSET_64),
+            ),
+            (
+                "chained-filters-past-size.bin",
+                joined(&DELTA_64, &DELTA_16),
+            ),
+            ("filter-reset-drops-pending.bin", joined(&RAW_16, &DELTA_16)),
+            ("filter-start-past-window.bin", RAW_16.to_vec()),
+        ];
+
+        let members = decode_members(FIXTURE);
+        assert_eq!(members.len(), expected.len());
+        for (member, (name, want)) in members.iter().zip(&expected) {
+            let bytes = member
+                .as_ref()
+                .unwrap_or_else(|err| panic!("{name} failed to decode: {err}"));
+            assert_eq!(bytes.as_slice(), want.as_slice(), "{name}");
+        }
+    }
+
+    /// A queued filter block whose start is ahead of everything the window
+    /// holds must not stall the flush drain.
+    ///
+    /// `filter-start-past-window` queues a block at [64,128) and then ends its
+    /// member after 32 bytes. Draining it writes the 32 raw bytes and then has
+    /// nothing left to advance with, which is where the drain used to re-run
+    /// the same no-op prefix flush forever — the shape that froze extraction of
+    /// real archives carrying stacked delta and x86 filters, whose second
+    /// filter is queued ahead of the data it covers. Reaching the assertion at
+    /// all is the test.
+    #[test]
+    fn filter_queued_ahead_of_the_window_does_not_stall_the_flush() {
+        const FIXTURE: &str = "rar4_vm_output_bounds.rar";
+        if !fixtures_hydrated(&[FIXTURE]) {
+            return;
+        }
+        let members = decode_members(FIXTURE);
+        let last = members.last().expect("fixture has members");
+        assert_eq!(
+            last.as_ref().expect("decodes").as_slice(),
+            RAW_16.as_slice()
+        );
     }
 
     /// A solid member that changes unpack version keeps reading the previous
