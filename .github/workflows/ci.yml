@@ -244,7 +244,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -310,7 +310,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -364,7 +364,7 @@ jobs:
           restore-keys: |
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-arm-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -431,7 +431,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -497,7 +497,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -595,7 +595,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -692,7 +692,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Configure compiler flags (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -828,7 +828,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Configure compiler flags (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -920,7 +920,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1134,7 +1134,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1247,7 +1247,7 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Prime sccache server
         run: |
           sccache --start-server || true

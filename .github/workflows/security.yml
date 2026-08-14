@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-audit@0.22.2
 
@@ -34,6 +34,14 @@ jobs:
     name: zizmor
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # zizmor-action defaults to advanced-security: true, so it hands its SARIF
+    # to github/codeql-action/upload-sarif. That upload needs security-events:
+    # write; the workflow-level contents: read alone makes it fail the job with
+    # "Resource not accessible by integration" even when the audit itself is
+    # clean. Same grant CodeQL and Scorecard already carry.
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
