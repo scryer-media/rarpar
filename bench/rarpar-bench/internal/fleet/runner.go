@@ -20,7 +20,22 @@ type Options struct {
 	AllowFetch bool
 	Resume     bool
 	SkipRender bool
-	Log        io.Writer
+	// Hold names machines whose cloud host must survive collection instead of
+	// being terminated with it. Nothing else changes: the evidence is collected
+	// and verified exactly as always, only the terminate is deferred to
+	// `fleet teardown --run-id`.
+	Hold []string
+	Log  io.Writer
+}
+
+// holds reports whether this machine was named by --hold.
+func (orch *orchestrator) holds(name string) bool {
+	for _, held := range orch.options.Hold {
+		if held == name {
+			return true
+		}
+	}
+	return false
 }
 
 type orchestrator struct {

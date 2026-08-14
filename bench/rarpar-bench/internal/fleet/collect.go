@@ -113,7 +113,18 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 	orch.state.Record(hostState, "collect", "verified %d files against MANIFEST.json", len(manifest.Files))
 
 	if machine.Kind == KindAWSEC2 {
-		orch.teardownCloud(ctx, machine, hostState)
+		// --hold keeps a collected host alive for an operator-driven extra pass
+		// (an env A/B on the same silicon and the same binary). The evidence is
+		// already in hand, so this only defers the terminate; the user-data
+		// deadman and `fleet teardown --run-id` both still end the instance.
+		if orch.holds(machine.Name) {
+			orch.state.Record(hostState, "teardown", "HELD by --hold: instance %s is still running; `fleet teardown --run-id %s` ends it",
+				hostState.Cloud.InstanceID, orch.options.RunID)
+			orch.log("machine %s: HELD ALIVE by --hold (instance %s at %s); it is still billing",
+				machine.Name, hostState.Cloud.InstanceID, hostState.Cloud.PublicIP)
+		} else {
+			orch.teardownCloud(ctx, machine, hostState)
+		}
 	} else if machine.Paths.Cleanup {
 		if _, _, err := transport.RunScript(ctx, "rm -rf "+shellQuote(layout.Base)+" "+shellQuote(layout.Scratch)+"\n"); err != nil {
 			orch.log("machine %s: staging cleanup reported: %v", machine.Name, err)

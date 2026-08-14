@@ -661,6 +661,33 @@ func TestUserDataOpensThePerfCountersToTheBenchUser(t *testing.T) {
 	}
 }
 
+// --hold defers one host's terminate so an operator can run an extra pass (an
+// env A/B) on the same silicon and the same binary. The cost-safety property is
+// that it is opt-in per machine: an unnamed machine, and every machine when the
+// flag is absent, still tears down the moment its evidence is collected.
+func TestHoldIsOptInPerMachine(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		hold    []string
+		machine string
+		want    bool
+	}{
+		{name: "no flag holds nothing", hold: nil, machine: "ec2-c7a", want: false},
+		{name: "named machine is held", hold: []string{"ec2-c7a"}, machine: "ec2-c7a", want: true},
+		{name: "unnamed machine still tears down", hold: []string{"ec2-c7a"}, machine: "ec2-n1", want: false},
+		{name: "several machines held", hold: []string{"ec2-c7a", "ec2-c7i", "ec2-a72"}, machine: "ec2-a72", want: true},
+		{name: "no substring matching", hold: []string{"ec2-c7"}, machine: "ec2-c7a", want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			orch := &orchestrator{options: Options{Hold: testCase.hold}}
+			if got := orch.holds(testCase.machine); got != testCase.want {
+				t.Fatalf("holds(%q) with --hold %v = %t, want %t",
+					testCase.machine, testCase.hold, got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestWindowsRunScriptExecutesAFile(t *testing.T) {
 	config := loadExample(t)
 	var windows Machine

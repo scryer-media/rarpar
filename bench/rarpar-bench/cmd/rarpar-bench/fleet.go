@@ -53,6 +53,7 @@ type fleetFlags struct {
 	machines  repeatedFlag
 	suites    repeatedFlag
 	runID     string
+	hold      repeatedFlag
 	dryRunAWS bool
 	noFetch   bool
 	noRender  bool
@@ -119,6 +120,7 @@ func fleetRun(ctx context.Context, args []string) error {
 	var options fleetFlags
 	flags := fleetFlagSet("run", &options)
 	flags.StringVar(&options.runID, "run-id", "", "run id (default: a fresh time-ordered id)")
+	flags.Var(&options.hold, "hold", "keep this machine's cloud host alive after its evidence is collected (repeat for more); it keeps billing until `fleet teardown --run-id` runs")
 	flags.BoolVar(&options.dryRunAWS, "dry-run-aws", false, "exercise every AWS code path except the API mutations; reads still run live")
 	flags.BoolVar(&options.noFetch, "no-fetch", false, "fail instead of downloading a missing oracle artifact")
 	flags.BoolVar(&options.noRender, "no-render", false, "skip SVG rendering")
@@ -140,6 +142,7 @@ func fleetRun(ctx context.Context, args []string) error {
 		DryRunAWS:  options.dryRunAWS,
 		AllowFetch: !options.noFetch,
 		SkipRender: options.noRender,
+		Hold:       options.hold,
 		Log:        os.Stderr,
 	})
 	if err != nil {
