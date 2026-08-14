@@ -157,9 +157,18 @@ jobs:
           linux_home_root="/home"
           windows_home_root='C:\Users'
           personal_path_regex="(${mac_home_root}/[^[:space:]/]+|${linux_home_root}/[^[:space:]/]+|${windows_home_root}\\[^\\[:space:]]+)"
+          # The bench fleet ships example configs and their round-trip tests.
+          # Every home path in them is a deliberate placeholder for the operator
+          # to replace, or the staging root of a remote bench host -- never a
+          # local workstation path. The Go tests patch those same literals, so
+          # their strings have to match the examples byte for byte. Excluded by
+          # path so the regex itself stays strict everywhere else.
           if git grep -n -I -E "$personal_path_regex" -- . \
             ':!.git/**' \
-            ':!target/**'; then
+            ':!target/**' \
+            ':!bench/fleet.example.toml' \
+            ':!bench/rarpar-bench/config/hosts.example.json' \
+            ':!bench/rarpar-bench/internal/fleet/fleet_test.go'; then
             echo "::error::tracked files contain local personal paths"
             exit 1
           fi
