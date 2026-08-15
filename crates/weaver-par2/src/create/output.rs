@@ -530,13 +530,219 @@ struct StagedOutputs {
     volumes: Vec<VolumeState>,
     locations: Vec<RecoveryLocation>,
     planned_targets: Vec<TargetSnapshot>,
+    /// One pin per planned target that already existed when the transaction
+    /// started, `None` where the path was absent.
+    ///
+    /// The planning snapshot is compared again at commit time, and that
+    /// comparison is forgeable by inode reuse exactly like the rollback one: a
+    /// delete-and-replace between planning and commit reproduces
+    /// `(device, inode)` and the birth time on a recycling filesystem. Pinning
+    /// the planned object is what makes "unchanged since planning" mean the
+    /// same object rather than the same numbers.
+    planned_pins: Vec<Option<InodePin>>,
     committed: bool,
 }
 
-#[derive(Clone)]
+/// A retained open handle on a file this transaction owns.
+///
+/// # Why a handle and not a fingerprint
+///
+/// `(device, inode)` is forgeable by inode reuse: ext4 and overlayfs hand a
+/// just-freed inode to the very next creation, so a foreign file written over a
+/// removed target collides with the removed target's identity. Measured, not
+/// assumed: on overlayfs six delete+recreate rounds returned inode 100104 every
+/// time.
+///
+/// Timestamps cannot break the tie either. Birth time is the only field that
+/// survives the transaction's own renames — `ctime` moves on rename, and the
+/// post-rename comparison in [`quarantine_owned_target_with_hook`] is exactly
+/// where the check has to hold — but Linux stamps file times from a coarse
+/// clock, so a delete+recreate inside one tick reproduces the birth time as
+/// well. Measured: consecutive creations on overlayfs differed by 1-3 ms, and a
+/// `remove_file` immediately followed by a `write` lands well inside that.
+///
+/// An open handle settles it. The kernel cannot recycle an inode that is still
+/// referenced, so while this handle lives no other file can carry our inode
+/// number, and `(device, inode)` becomes unforgeable. The handle follows the
+/// file through renames, which is what makes it usable on both sides of the
+/// quarantine rename.
+///
+/// # Deliberately stronger than the reference tools
+///
+/// Neither reference implementation has any of this. par2cmdline repairs purely
+/// by name, and unrar creates with `O_CREAT|O_TRUNC` after an exists-prompt —
+/// both would happily write through an inode swap. This machinery exists to
+/// serve the never-lose-data invariant, not to match oracle shape, so do not
+/// "simplify" it back toward the reference behavior.
+#[derive(Debug)]
+struct InodePin {
+    #[cfg(unix)]
+    handle: File,
+}
+
+impl InodePin {
+    /// Pin the file at `path` by holding an open descriptor on it.
+    ///
+    /// `O_RDONLY` rather than `O_PATH`: `fstat` works on both, but `O_PATH`
+    /// is Linux-only, and the pin has to behave the same on macOS, the BSDs and
+    /// wasi-adjacent Unixes. A read handle costs the same one descriptor.
+    #[cfg(unix)]
+    fn open(path: &Path, set_size: usize) -> Result<Self> {
+        match File::open(path) {
+            Ok(handle) => Ok(Self { handle }),
+            Err(error) => Err(open_pin_error(path, set_size, &error)),
+        }
+    }
+
+    /// Adopt an already-open handle, which is what the staged outputs do: the
+    /// stage file is published with `hard_link`, so the write handle already
+    /// references the very inode the published target names.
+    #[cfg(unix)]
+    fn adopt(handle: File) -> Self {
+        Self { handle }
+    }
+
+    /// Is `path` still the object this pin holds?
+    ///
+    /// `fstat` on the pinned descriptor against `lstat` on the path. While the
+    /// pin lives its inode cannot be reused, so agreement here means the same
+    /// object and not merely the same numbers.
+    #[cfg(unix)]
+    fn still_at(&self, path: &Path) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let pinned = self.handle.metadata()?;
+        match fs::symlink_metadata(path) {
+            Ok(current) => Ok(current.is_file()
+                && current.dev() == pinned.dev()
+                && current.ino() == pinned.ino()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Non-Unix targets keep the previous behavior explicitly rather than by
+    /// accident.
+    ///
+    /// Windows does not transpose the hazard: an open handle blocks
+    /// delete-in-place under the default sharing mode, so a foreign file cannot
+    /// take the place of a file this transaction holds open, and the
+    /// `(volume, index)` pair stays sufficient there. wasip1 has no
+    /// `RLIMIT_NOFILE` and no stable descriptor-identity story, so it keeps the
+    /// `(device, inode)` check it already had. Neither is pinned this pass.
+    #[cfg(not(unix))]
+    fn open(_path: &Path, _set_size: usize) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    /// The handle is dropped here rather than retained: without the Unix
+    /// inode-reference guarantee there is nothing for it to pin, and holding it
+    /// would only keep a descriptor open for no benefit.
+    #[cfg(not(unix))]
+    fn adopt(_handle: File) -> Self {
+        Self {}
+    }
+
+    #[cfg(not(unix))]
+    fn still_at(&self, _path: &Path) -> std::io::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// EMFILE and friends are a loud refusal: a transaction that cannot pin every
+/// file it owns has no way to tell its own outputs from a foreign file that
+/// took their inode, and a partially pinned set is that bug wearing a
+/// different hat.
+#[cfg(unix)]
+fn open_pin_error(path: &Path, set_size: usize, error: &std::io::Error) -> Par2Error {
+    let limit = open_file_limit_description();
+    Par2Error::CreationValidation {
+        path: path.display().to_string(),
+        reason: format!(
+            "cannot pin output for the transaction ({error}); \
+             the transaction owns {set_size} files and needs one open descriptor per file, {limit}"
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn open_file_limit_description() -> String {
+    match open_file_limits() {
+        Some((soft, hard)) => {
+            format!("RLIMIT_NOFILE soft={soft} hard={hard}")
+        }
+        None => "RLIMIT_NOFILE could not be read".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn open_file_limits() -> Option<(u64, u64)> {
+    // SAFETY: `getrlimit` fills a caller-provided `rlimit` and reports failure
+    // through its return value; the struct is zeroed POD.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return None;
+        }
+        Some((limit.rlim_cur as u64, limit.rlim_max as u64))
+    }
+}
+
+/// Raise the soft descriptor limit toward the hard limit, once per process.
+///
+/// Standard practice for a process that holds one descriptor per owned file:
+/// the soft limit is a courtesy default (1024 on most Linux distributions, 256
+/// on macOS) while the hard limit is the real ceiling, and raising the soft
+/// limit needs no privilege. Failure is deliberately silent — the transaction
+/// still refuses loudly if a pin cannot be opened, which is the check that
+/// matters; this only widens the headroom before that happens.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    static RAISED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    RAISED.get_or_init(|| {
+        // SAFETY: both calls take a caller-provided `rlimit` and report failure
+        // through their return value.
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return;
+            }
+            if limit.rlim_cur >= limit.rlim_max {
+                return;
+            }
+            // `rlim_cur = rlim_max` is the obvious move and it is wrong on
+            // macOS, where the hard limit reads back as RLIM_INFINITY while the
+            // kernel still refuses anything above `kern.maxfilesperproc`
+            // (EINVAL, and no raise at all). Walk a ladder down from the hard
+            // limit instead and keep the first value the kernel accepts.
+            let hard = limit.rlim_max;
+            let start = limit.rlim_cur;
+            for candidate in [hard, 262_144, 65_536, 10_240, 4_096, 1_024] {
+                if candidate <= start {
+                    break;
+                }
+                let candidate = candidate.min(hard);
+                let mut attempt = limit;
+                attempt.rlim_cur = candidate;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &attempt) == 0 {
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 struct InstalledTarget {
     path: PathBuf,
     identity: Option<FileIdentity>,
+    /// The authority for "is this still our file". `None` only for targets
+    /// this transaction never managed to pin, which cannot happen on the
+    /// publish path -- a published target is a hard link to the staged inode
+    /// the transaction still holds open.
+    pin: Option<InodePin>,
 }
 
 struct BackupEntry {
@@ -544,6 +750,9 @@ struct BackupEntry {
     backup: PathBuf,
     namespace: PathBuf,
     identity: FileIdentity,
+    /// Pinned before the backup rename, so the restore can prove it is moving
+    /// back the same object it moved aside.
+    pin: InodePin,
 }
 
 #[derive(Debug)]
@@ -716,6 +925,22 @@ impl StagedOutputs {
         creator: &[u8],
         cancellation: &CancellationToken,
     ) -> Result<Self> {
+        // One descriptor per owned file is held for the whole transaction (see
+        // `InodePin`), so widen the soft limit toward the hard one before the
+        // first stage file is created.
+        raise_open_file_limit();
+        // Pinned before anything is staged: a target that vanishes between here
+        // and the commit check must not be able to hand its inode to a
+        // replacement that then reads as "unchanged since planning".
+        let planned_pins = plan
+            .output_paths
+            .iter()
+            .zip(plan.target_snapshots.iter())
+            .map(|(target, snapshot)| match snapshot {
+                TargetSnapshot::Absent => Ok(None),
+                _ => InodePin::open(target, plan.output_paths.len()).map(Some),
+            })
+            .collect::<Result<Vec<_>>>();
         let mut volumes: Vec<VolumeState> = Vec::with_capacity(plan.output_paths.len());
         for (index, target) in plan.output_paths.iter().enumerate() {
             if cancellation.is_cancelled() {
@@ -741,6 +966,7 @@ impl StagedOutputs {
             volumes,
             locations: Vec::with_capacity(plan.recovery_count as usize),
             planned_targets: plan.target_snapshots.clone(),
+            planned_pins: planned_pins?,
             committed: false,
         };
 
@@ -924,8 +1150,16 @@ impl StagedOutputs {
             .iter()
             .map(|volume| volume.target_path.clone())
             .collect::<Vec<_>>();
-        drop(volumes);
+        // The write handles are NOT dropped here any more. Publishing hard
+        // links the stage onto the target, so each of these handles already
+        // references the inode the published target names -- the pin the
+        // rollback path needs, for free, with no second open.
+        let mut stage_handles = volumes
+            .into_iter()
+            .map(|volume| Some(volume.file))
+            .collect::<Vec<_>>();
         let planned_targets = std::mem::take(&mut self.planned_targets);
+        let planned_pins = std::mem::take(&mut self.planned_pins);
 
         let mut backups = Vec::<BackupEntry>::new();
         let mut installed = Vec::<InstalledTarget>::new();
@@ -942,7 +1176,15 @@ impl StagedOutputs {
                     }
                     let planned = planned_targets[index];
                     let current = capture_target_snapshot(target).map_err(Par2Error::Io)?;
-                    if current != planned {
+                    // Numbers first, then the pin: the snapshot catches a
+                    // type change (file -> directory), and the pin catches a
+                    // same-numbers replacement the snapshot cannot see.
+                    let pinned_object_intact =
+                        match planned_pins.get(index).and_then(Option::as_ref) {
+                            Some(pin) => pin.still_at(target).map_err(Par2Error::Io)?,
+                            None => true,
+                        };
+                    if current != planned || !pinned_object_intact {
                         return Err(Par2Error::CreationValidation {
                             path: target.display().to_string(),
                             reason: "output target changed after planning".to_string(),
@@ -963,6 +1205,10 @@ impl StagedOutputs {
                             reason: "output path is not a regular file".to_string(),
                         });
                     };
+                    // Pinned before the rename, so the handle follows the file
+                    // into the backup name and the restore can prove it is
+                    // moving back the same object.
+                    let pin = InodePin::open(target, targets.len())?;
                     let (namespace, backup) = reserve_backup_namespace(target, index)?;
                     before_backup_rename(target, &backup);
                     if let Err(error) = fs::rename(target, &backup) {
@@ -1012,13 +1258,18 @@ impl StagedOutputs {
                         backup,
                         namespace,
                         identity,
+                        pin,
                     });
                 }
             }
-            for (stage, target) in stage_paths.iter().zip(targets.iter()) {
+            for (index, (stage, target)) in stage_paths.iter().zip(targets.iter()).enumerate() {
                 if cancellation.is_cancelled() {
                     return Err(Par2Error::Cancelled);
                 }
+                let pin = stage_handles
+                    .get_mut(index)
+                    .and_then(|slot| slot.take())
+                    .map(InodePin::adopt);
                 let identity = match publish_no_replace_with_tracking(stage, target, || {
                     before_publish(stage, target)
                 }) {
@@ -1027,6 +1278,7 @@ impl StagedOutputs {
                         installed.push(InstalledTarget {
                             path: target.clone(),
                             identity: Some(identity),
+                            pin,
                         });
                         return Err(Par2Error::Io(error));
                     }
@@ -1042,6 +1294,7 @@ impl StagedOutputs {
                 installed.push(InstalledTarget {
                     path: target.clone(),
                     identity: Some(identity),
+                    pin,
                 });
             }
             sync_parent_directories(&targets)?;
@@ -1077,8 +1330,16 @@ impl StagedOutputs {
                         // Restore without replacement. Rollback keeps the
                         // private backup recoverable because stable Rust has
                         // no cross-platform handle-bound unlink primitive.
+                        // Pin first, recorded identity second: the pin cannot
+                        // be fooled by a foreign file that inherited the
+                        // backup's inode number.
+                        let backup_is_ours = backup_entry
+                            .pin
+                            .still_at(&backup_entry.backup)
+                            .unwrap_or(false);
                         let identity = target_file_identity(&backup_entry.backup);
-                        if !matches!(identity, Ok(Some(identity)) if identity == backup_entry.identity)
+                        if !backup_is_ours
+                            || !matches!(identity, Ok(Some(identity)) if identity == backup_entry.identity)
                         {
                             if rollback_error.is_none() {
                                 rollback_error = Some(match identity {
@@ -1763,25 +2024,43 @@ fn quarantine_owned_target_with_hook<F: FnOnce()>(
         return Ok(RollbackTarget::Unchanged);
     };
     let (namespace, quarantine) = reserve_quarantine_namespace(&target.path, 0)?;
-    match target_file_identity(&target.path).map_err(Par2Error::Io)? {
-        Some(identity) if identity == expected => {}
-        None => {
-            let _ = fs::remove_dir(&namespace);
-            return Ok(RollbackTarget::Missing);
-        }
-        Some(_) => {
-            let _ = fs::remove_dir(&namespace);
-            return Err(Par2Error::CreationValidation {
+    // The pin is the authority; the recorded `FileIdentity` is kept for the
+    // diagnostic and for platforms with no pinning. `still_at` cannot be fooled
+    // by inode reuse, because the reused inode is the one this handle holds.
+    let still_ours = match target.pin.as_ref() {
+        Some(pin) => pin.still_at(&target.path).map_err(Par2Error::Io)?,
+        None => matches!(
+            target_file_identity(&target.path).map_err(Par2Error::Io)?,
+            Some(identity) if identity == expected
+        ),
+    };
+    if !still_ours {
+        let _ = fs::remove_dir(&namespace);
+        return match fs::symlink_metadata(&target.path) {
+            // Gone entirely: nothing of ours to quarantine.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(RollbackTarget::Missing)
+            }
+            Err(error) => Err(Par2Error::Io(error)),
+            // Something else occupies the path. Never touch it.
+            Ok(_) => Err(Par2Error::CreationValidation {
                 path: target.path.display().to_string(),
                 reason: "installed output identity changed before rollback".to_string(),
-            });
-        }
+            }),
+        };
     }
     before_move();
     match fs::rename(&target.path, &quarantine) {
         Ok(()) => {
-            let identity = target_file_identity(&quarantine).map_err(Par2Error::Io)?;
-            if identity == Some(expected) {
+            // The same question on the far side of the rename, which is the
+            // site no timestamp scheme could serve: `ctime` moves on rename and
+            // birth time repeats inside one coarse clock tick. The pinned
+            // handle followed the file, so it answers here unchanged.
+            let moved_is_ours = match target.pin.as_ref() {
+                Some(pin) => pin.still_at(&quarantine).map_err(Par2Error::Io)?,
+                None => target_file_identity(&quarantine).map_err(Par2Error::Io)? == Some(expected),
+            };
+            if moved_is_ours {
                 // The owned object remains recoverable in its private
                 // namespace. Stable Rust has no cross-platform handle-bound
                 // unlink primitive that can safely delete it after a race.
@@ -2268,8 +2547,12 @@ mod tests {
         let installed = InstalledTarget {
             path: target.clone(),
             identity: Some(identity),
+            pin: Some(InodePin::open(&target, 1).unwrap()),
         };
 
+        // Delete and recreate inside one clock tick. On an inode-recycling
+        // filesystem the foreign file inherits the removed file's inode number
+        // *and* its birth time, so only the pinned handle can tell them apart.
         let error = quarantine_owned_target_with_hook(&installed, || {
             fs::remove_file(&target).unwrap();
             fs::write(&target, b"foreign").unwrap();
@@ -2284,6 +2567,115 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".par2-create-quarantine-")
         }));
+    }
+
+    /// Inode reuse cannot forge a pinned identity, and the test does not
+    /// depend on the filesystem actually reusing the inode.
+    ///
+    /// The pin makes the answer the same either way: while the handle lives the
+    /// kernel cannot hand its inode to the replacement, so a recycling
+    /// filesystem (overlayfs, ext4) and a non-recycling one (APFS) both end at
+    /// "not our file". The diagnostic line records which case ran, so a
+    /// container run can show the hostile one was really exercised.
+    #[test]
+    fn pinned_identity_refuses_a_recreated_file_even_when_the_inode_is_reused() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // Control first: the same delete+recreate with nothing pinned, which is
+        // what the pre-fix check faced. On a recycling filesystem the
+        // replacement inherits the inode number outright, so `(device, inode)`
+        // -- and the birth time, stamped from the same coarse clock tick --
+        // report the foreign file as ours.
+        let control = directory.path().join("unpinned.par2");
+        fs::write(&control, b"ours").unwrap();
+        let control_before = file_identity_numbers(&control);
+        fs::remove_file(&control).unwrap();
+        fs::write(&control, b"foreign").unwrap();
+        let control_after = file_identity_numbers(&control);
+        eprintln!(
+            "unpinned reuse: {} (before={control_before:?} after={control_after:?})",
+            if control_before == control_after {
+                "YES -- the pre-fix identity was forged"
+            } else {
+                "no -- this filesystem did not recycle here"
+            }
+        );
+
+        let path = directory.path().join("owned.par2");
+        fs::write(&path, b"ours").unwrap();
+        let before = file_identity_numbers(&path);
+        let pin = InodePin::open(&path, 1).unwrap();
+        assert!(pin.still_at(&path).unwrap());
+
+        // Same tick, same directory, same filesystem -- but pinned.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        let after = file_identity_numbers(&path);
+
+        // The pin is why this reads "no" on a filesystem that recycled in the
+        // control above: a referenced inode cannot be handed to a new file.
+        eprintln!(
+            "pinned reuse:   {} (before={before:?} after={after:?})",
+            if before == after { "YES" } else { "no" }
+        );
+        assert!(
+            !pin.still_at(&path).unwrap(),
+            "a recreated file must never satisfy the pin"
+        );
+    }
+
+    /// The same scenario through the rollback entry point, which is where a
+    /// wrong answer would move a foreign file into quarantine.
+    #[test]
+    fn rollback_refuses_a_recreated_target_on_a_recycling_filesystem() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("set.par2");
+        fs::write(&path, b"ours").unwrap();
+        let identity = target_file_identity(&path).unwrap().unwrap();
+        let before = file_identity_numbers(&path);
+        let installed = InstalledTarget {
+            path: path.clone(),
+            identity: Some(identity),
+            pin: Some(InodePin::open(&path, 1).unwrap()),
+        };
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        eprintln!(
+            "inode reuse: {}",
+            if before == file_identity_numbers(&path) {
+                "YES"
+            } else {
+                "no"
+            }
+        );
+
+        let error = quarantine_owned_target(&installed).unwrap_err();
+        assert!(matches!(error, Par2Error::CreationValidation { .. }));
+        // The foreign file is left exactly where it was.
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".par2-create-quarantine-")
+        }));
+    }
+
+    /// `(device, inode)` for the diagnostic in the two tests above.
+    #[cfg(unix)]
+    fn file_identity_numbers(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    #[cfg(not(unix))]
+    fn file_identity_numbers(_path: &Path) -> Option<(u64, u64)> {
+        None
     }
 
     #[test]
@@ -2385,14 +2777,25 @@ mod tests {
                 }
             })
             .collect();
-        let planned_targets = volumes
+        let planned_targets: Vec<TargetSnapshot> = volumes
             .iter()
             .map(|volume| capture_target_snapshot(&volume.target_path).unwrap())
+            .collect();
+        // Same pinning the production constructor does, so the tests exercise
+        // the shipped comparison and not a weaker one.
+        let planned_pins = volumes
+            .iter()
+            .zip(planned_targets.iter())
+            .map(|(volume, snapshot)| match snapshot {
+                TargetSnapshot::Absent => None,
+                _ => Some(InodePin::open(&volume.target_path, volumes.len()).unwrap()),
+            })
             .collect();
         StagedOutputs {
             volumes,
             locations: Vec::new(),
             planned_targets,
+            planned_pins,
             committed: false,
         }
     }
