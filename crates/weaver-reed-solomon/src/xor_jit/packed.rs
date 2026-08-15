@@ -516,8 +516,15 @@ impl PackedJitBatch {
         factors_per_row: usize,
     ) -> Option<usize> {
         match width {
+            // One aligned slot per DISTINCT coefficient: the planner
+            // deduplicates bodies by factor within a build, and the factor
+            // domain is u16, so a build can never retain more than 65535
+            // bodies no matter how many rows it spans. Without this cap a
+            // 65535-row multi-row build bounds at ~1 GiB while its actual
+            // arena cannot exceed ~84 MiB, and admission over-reserves.
             JitWidth::Avx2 => row_count
                 .checked_mul(factors_per_row)?
+                .min(usize::from(u16::MAX))
                 .checked_mul(AVX2_MAX_BODY_BYTES),
         }
     }
@@ -1272,6 +1279,19 @@ mod tests {
             assert!(batch.row(3).is_none());
             workspace.recycle(batch).unwrap();
         }
+    }
+
+    /// The bound honors the u16 dedup ceiling: a build spanning more rows
+    /// than there are distinct coefficients reserves the coefficient-domain
+    /// cap, not rows x factors (c5 pass 3 taught what unbounded reservation
+    /// models do to admission).
+    #[test]
+    fn avx2_arena_bound_is_capped_by_the_factor_domain() {
+        let capped =
+            PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 65535, 12).unwrap();
+        assert_eq!(capped, usize::from(u16::MAX) * AVX2_MAX_BODY_BYTES);
+        let small = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 3, 12).unwrap();
+        assert_eq!(small, 3 * 12 * AVX2_MAX_BODY_BYTES);
     }
 
     #[test]
