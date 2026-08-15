@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
 )
 
 // Options drive `fleet run` and `fleet collect --resume`.
@@ -47,6 +49,37 @@ type orchestrator struct {
 	session   *SessionResources
 	sessionMu sync.Mutex
 	logMu     sync.Mutex
+	// ECR pull tokens by region, minted once and reused across machines.
+	// Tokens live 12 hours, comfortably past any allowed round length.
+	ecrTokens   map[string]string
+	ecrTokensMu sync.Mutex
+}
+
+// ecrToken returns a cached pull token for the image's registry region,
+// minting it on first use.
+func (orch *orchestrator) ecrToken(ctx context.Context, image string) (string, error) {
+	ref, err := oci.ParseImageRef(image)
+	if err != nil {
+		return "", err
+	}
+	region, err := oci.ECRRegion(ref.Registry)
+	if err != nil {
+		return "", err
+	}
+	orch.ecrTokensMu.Lock()
+	defer orch.ecrTokensMu.Unlock()
+	if token, ok := orch.ecrTokens[region]; ok {
+		return token, nil
+	}
+	token, err := orch.aws.ECRAuthToken(ctx, region)
+	if err != nil {
+		return "", err
+	}
+	if orch.ecrTokens == nil {
+		orch.ecrTokens = map[string]string{}
+	}
+	orch.ecrTokens[region] = token
+	return token, nil
 }
 
 func (orch *orchestrator) log(format string, args ...any) {
@@ -187,6 +220,30 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		}
 	}
 	orch.prepareAWS()
+	// Same fail-before-spend rule for corpus images: a tag missing from ECR
+	// would otherwise only surface as an on-instance fetch failure.
+	for _, machine := range orch.options.Config.Machines {
+		if machine.EC2 == nil || machine.EC2.CorpusImage == "" {
+			continue
+		}
+		token, err := orch.ecrToken(ctx, machine.EC2.CorpusImage)
+		if err != nil {
+			return fmt.Errorf("machine %s: %w", machine.Name, err)
+		}
+		ref, err := oci.ParseImageRef(machine.EC2.CorpusImage)
+		if err != nil {
+			return fmt.Errorf("machine %s: %w", machine.Name, err)
+		}
+		client := &oci.Client{Ref: ref, Token: token}
+		exists, err := client.ManifestExists(ctx)
+		if err != nil {
+			return fmt.Errorf("machine %s: checking corpus image: %w", machine.Name, err)
+		}
+		if !exists {
+			return fmt.Errorf("machine %s: corpus image %s is not in the registry; push it first with `rarpar-bench corpus push`", machine.Name, ref)
+		}
+		orch.log("preflight: corpus image %s present", ref)
+	}
 	if orch.hasCloud() {
 		orch.log("preflight: AWS credentials")
 		if _, err := orch.aws.CheckCredentials(ctx, orch.options.Config.Fleet.AWS.Account); err != nil {
@@ -505,6 +562,13 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 		corpusUpload = machine.EC2.CorpusSource
 		machine.Paths.Corpus = joinPosix(layout.Base, "corpus")
 	}
+	// corpus_image pulls in-region on the instance itself; the orchestrator
+	// contributes only a pull token. $CORPUS points at where the fetch lands.
+	corpusImage := ""
+	if machine.EC2 != nil && machine.EC2.CorpusImage != "" && machine.Paths.Corpus == "" {
+		corpusImage = machine.EC2.CorpusImage
+		machine.Paths.Corpus = joinPosix(layout.Base, "corpus")
+	}
 	oracleTargets := map[string]string{}
 	for role, resolution := range hostState.Oracles {
 		oracleTargets[role] = resolution.RemotePath
@@ -528,6 +592,22 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 	}
 	if err := transport.UploadDir(ctx, upload, layout.Base); err != nil {
 		return err
+	}
+
+	if corpusImage != "" {
+		// The token is staged BEFORE the run starts so the script can never
+		// race it, and it rides this transient command rather than the run
+		// script, which is archived with the results.
+		token, err := orch.ecrToken(ctx, corpusImage)
+		if err != nil {
+			return err
+		}
+		orch.log("machine %s: staging ECR pull token; corpus %s pulls in-region on the instance", machine.Name, corpusImage)
+		stage := fmt.Sprintf("umask 077 && printf '%%s' %s > %s\n",
+			shellQuote(token), shellQuote(joinPosix(layout.Base, "ecr-token")))
+		if _, _, err := transport.RunScript(ctx, stage); err != nil {
+			return err
+		}
 	}
 
 	// Detached on purpose: once started, a dropped SSH session, a sleeping

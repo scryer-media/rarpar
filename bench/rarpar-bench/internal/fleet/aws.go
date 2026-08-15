@@ -94,6 +94,38 @@ func (aws *AWS) mutate(ctx context.Context, what string, args ...string) ([]byte
 	return aws.run(ctx, args...)
 }
 
+// ECRAuthToken mints a registry pull token for the given region. It is a
+// read (nothing in the account changes), so dry-run still mints it — the
+// corpus-image preflight depends on the token to prove the image exists.
+// The region comes from the image ref's registry host, not aws.Region, so a
+// corpus image can live in a different region than the fleet if it must.
+func (aws *AWS) ECRAuthToken(ctx context.Context, region string) (string, error) {
+	command := exec.CommandContext(ctx, aws.CLI, "ecr", "get-authorization-token",
+		"--region", region, "--output", "json")
+	command.Env = os.Environ()
+	if aws.Profile != "" {
+		command.Env = append(command.Env, "AWS_PROFILE="+aws.Profile)
+	}
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return "", fmt.Errorf("ecr get-authorization-token (%s): %w: %s", region, err, strings.TrimSpace(stderr.String()))
+	}
+	var payload struct {
+		AuthorizationData []struct {
+			AuthorizationToken string `json:"authorizationToken"`
+		} `json:"authorizationData"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		return "", fmt.Errorf("cannot read the ECR token response: %w", err)
+	}
+	if len(payload.AuthorizationData) == 0 || payload.AuthorizationData[0].AuthorizationToken == "" {
+		return "", fmt.Errorf("ECR returned no authorization token for region %s", region)
+	}
+	return payload.AuthorizationData[0].AuthorizationToken, nil
+}
+
 // CheckCredentials runs first, before anything is launched or built. Expired
 // credentials mid-launch are how a fleet ends up with orphaned instances.
 func (aws *AWS) CheckCredentials(ctx context.Context, expectedAccount string) (string, error) {

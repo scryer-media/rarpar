@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
 )
 
 const ConfigSchemaVersion = 1
@@ -223,6 +225,13 @@ type EC2 struct {
 	MaxHours       float64 `json:"max_hours"`
 	HourlyUSD      float64 `json:"hourly_usd"`
 	CorpusSource   string  `json:"corpus_source,omitempty"`
+	// CorpusImage is an OCI image ref (<registry>/<repo>:<tag>, ECR in
+	// practice) holding the corpus as a single tar layer. The instance pulls
+	// it in-region with the bench binary itself, so the orchestrator's uplink
+	// carries no corpus bytes at all — the failure mode that repeatedly
+	// wedged c4 rounds. Tags are corpus-generation digests, so a ref pins
+	// exactly one corpus tree.
+	CorpusImage string `json:"corpus_image,omitempty"`
 }
 
 // LoadConfig reads, decodes, and validates a fleet configuration.
@@ -452,6 +461,7 @@ func decodeMachine(item *section, settings Settings) Machine {
 			MaxHours:       ec2.float("max_hours", 2),
 			HourlyUSD:      ec2.float("hourly_usd", 0),
 			CorpusSource:   ec2.str("corpus_source", ""),
+			CorpusImage:    ec2.str("corpus_image", ""),
 		}
 		ec2.finish()
 	}
@@ -580,11 +590,29 @@ func validate(state *decodeState, config *Config) {
 		if machine.Paths.Corpus != "" {
 			validateHostPath(state, prefix, "paths.corpus", machine.Paths.Corpus, windows)
 		}
-		if machine.needsCorpus() && machine.Paths.Corpus == "" && (machine.EC2 == nil || machine.EC2.CorpusSource == "") {
+		if machine.needsCorpus() && machine.Paths.Corpus == "" && (machine.EC2 == nil || (machine.EC2.CorpusSource == "" && machine.EC2.CorpusImage == "")) {
 			state.fail("%s: paths.corpus is required for the macro suites", prefix)
 		}
 		if machine.EC2 != nil && machine.EC2.CorpusSource != "" && machine.Paths.Corpus != "" {
 			state.fail("%s: ec2.corpus_source and paths.corpus are mutually exclusive; corpus_source uploads into the run root", prefix)
+		}
+		if machine.EC2 != nil && machine.EC2.CorpusImage != "" {
+			// Exactly one corpus delivery mode per machine: a pre-baked host
+			// path, an orchestrator upload, or an in-region registry pull.
+			if machine.EC2.CorpusSource != "" {
+				state.fail("%s: ec2.corpus_image and ec2.corpus_source are mutually exclusive", prefix)
+			}
+			if machine.Paths.Corpus != "" {
+				state.fail("%s: ec2.corpus_image and paths.corpus are mutually exclusive; the image is pulled into the run root", prefix)
+			}
+			ref, err := oci.ParseImageRef(machine.EC2.CorpusImage)
+			if err != nil {
+				state.fail("%s: ec2.corpus_image: %v", prefix, err)
+			} else if _, err := oci.ECRRegion(ref.Registry); err != nil {
+				// Token minting is the orchestrator's job and it only knows
+				// how to mint for ECR; reject anything else before spend.
+				state.fail("%s: ec2.corpus_image: %v", prefix, err)
+			}
 		}
 
 		switch machine.Capabilities.Perf {

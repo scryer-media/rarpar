@@ -325,6 +325,14 @@ hourly_usd = 0.1440
 # run root so $CORPUS is never empty on a fresh instance. Mutually exclusive
 # with paths.corpus; preflight refuses to launch anything if it is missing.
 corpus_source = "/Users/you/rarpar/target/bench/corpus"
+# Alternative to corpus_source: an ECR image holding the corpus as one tar
+# layer, published once with `rarpar-bench corpus push`. The instance pulls it
+# in-region with the bench binary (digest-verified, no docker involved), so
+# the orchestrator's uplink carries no corpus bytes — the tag should be the
+# corpus generation digest so a ref pins exactly one corpus tree. Mutually
+# exclusive with corpus_source and paths.corpus; preflight refuses to launch
+# if the tag is not in the registry.
+# corpus_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus:dca3e362"
 
 # ------------------------------------------------- machine: Windows (dGPU) ----
 # UNVALIDATED PATH. The runner uploads and executes a .ps1 file (never an inline

@@ -71,6 +71,12 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 		corpusSentinel = joinPosix(layout.Base, "CORPUS-UPLOADED")
 	}
 	write("CORPUS_READY=%s", shellQuote(corpusSentinel))
+	corpusImage := ""
+	if machine.EC2 != nil && machine.EC2.CorpusImage != "" {
+		corpusImage = machine.EC2.CorpusImage
+	}
+	write("CORPUS_IMAGE=%s", shellQuote(corpusImage))
+	write("ECR_TOKEN_FILE=%s", shellQuote(joinPosix(layout.Base, "ecr-token")))
 	write("BENCH=\"$BIN/rarpar-bench\"")
 	write("CANDIDATE=\"$BIN/rarpar\"")
 	write("ORACLE_RAR=%s", shellQuote(oracles["rar"]))
@@ -206,6 +212,14 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	// ---- macro suites ----------------------------------------------------
 	if len(families) > 0 {
 		write("# ---- macro suites: the standard report.json protocol")
+		write("if [ -n \"$CORPUS_IMAGE\" ]; then")
+		write("  # In-region registry pull; the orchestrator's uplink carries no corpus bytes.")
+		write("  log \"fetching corpus image $CORPUS_IMAGE\"")
+		write("  if [ ! -f \"$ECR_TOKEN_FILE\" ]; then fail corpus-token-missing; fi")
+		write("  \"$BENCH\" corpus fetch --image \"$CORPUS_IMAGE\" --token-file \"$ECR_TOKEN_FILE\" --out \"$CORPUS\" > \"$R/corpus-fetch.txt\" 2>&1")
+		write("  if [ $? -ne 0 ]; then fail corpus-fetch; fi")
+		write("  log \"corpus fetch: $(tail -1 \"$R/corpus-fetch.txt\")\"")
+		write("fi")
 		write("if [ -n \"$CORPUS_READY\" ]; then")
 		write("  # The corpus uploads while the candidate builds; wait for its sentinel.")
 		write("  log 'waiting for the corpus upload to land'")

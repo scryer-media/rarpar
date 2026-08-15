@@ -128,6 +128,24 @@ func TestConfigValidation(t *testing.T) {
 			want: "mutually exclusive",
 		},
 		{
+			name: "corpus_image excludes corpus_source",
+			old:  "corpus_source = \"/Users/you/rarpar/target/bench/corpus\"",
+			new:  "corpus_source = \"/Users/you/rarpar/target/bench/corpus\"\ncorpus_image = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus:dca3e362\"",
+			want: "mutually exclusive",
+		},
+		{
+			name: "corpus_image must be an ECR ref (token minting is ECR-only)",
+			old:  "corpus_source = \"/Users/you/rarpar/target/bench/corpus\"",
+			new:  "corpus_image = \"ghcr.io/example/rarpar-corpus:dca3e362\"",
+			want: "not an ECR host",
+		},
+		{
+			name: "corpus_image must carry an explicit tag",
+			old:  "corpus_source = \"/Users/you/rarpar/target/bench/corpus\"",
+			new:  "corpus_image = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus\"",
+			want: "missing an explicit :tag",
+		},
+		{
 			name: "schema version pinned",
 			old:  "schema_version = 1",
 			new:  "schema_version = 2",
@@ -431,6 +449,78 @@ func TestBuildPlan(t *testing.T) {
 	for _, expected := range []string{"PREFLIGHT", "AWS QUOTA AND COST", "teardown:", "linux-atom-c3538-noavx"} {
 		if !strings.Contains(text.String(), expected) {
 			t.Fatalf("plan text is missing %q", expected)
+		}
+	}
+}
+
+func TestContainerBuildAliasesTheRarparPathForWeaver(t *testing.T) {
+	machine := Machine{
+		Suites: []string{SuiteYencMicro},
+		Bundle: Bundle{RustTarget: "x86_64-unknown-linux-musl"},
+	}
+	rarpar := "/Users/example/dev/scryer-media/rarpar"
+	script := containerBuildScript(machine, "RUSTFLAGS", "", true, rarpar)
+	// weaver's [patch.crates-io] names the orchestrator's rarpar checkout by
+	// absolute path; the alias to the staged snapshot is what lets the first
+	// weaver build resolve at all (measured failure: yenc-micro's dev-dep on
+	// par2-rs, cargo rc=101 without it).
+	alias := "if [ ! -e '" + rarpar + "' ]; then mkdir -p '/Users/example/dev/scryer-media' && ln -s /work/rarpar '" + rarpar + "'; fi"
+	if !strings.Contains(script, alias) {
+		t.Fatalf("weaver container build is missing the rarpar path alias; script:\n%s", script)
+	}
+	if strings.Index(script, alias) > strings.Index(script, "cd /work/weaver") {
+		t.Fatal("the alias must be created before the weaver build starts")
+	}
+	// A rarpar-only bundle must not conjure host paths inside its container.
+	bare := containerBuildScript(machine, "RUSTFLAGS", "", false, rarpar)
+	if strings.Contains(bare, "ln -s /work/rarpar") {
+		t.Fatal("non-weaver container builds must not create the alias")
+	}
+}
+
+func TestRunScriptCorpusImageFetch(t *testing.T) {
+	config := loadExample(t)
+	var cloud Machine
+	for _, machine := range config.Machines {
+		if machine.Name == "ec2-graviton4" {
+			cloud = machine
+		}
+	}
+	cloud.EC2.CorpusSource = ""
+	cloud.EC2.CorpusImage = "123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus:dca3e362"
+	layout := LayoutFor(cloud, "fleet-testrun")
+	cloud.Paths.Corpus = joinPosix(layout.Base, "corpus")
+	script := RunScript(cloud, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{})
+	for _, expected := range []string{
+		"CORPUS_IMAGE='123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus:dca3e362'",
+		"corpus fetch --image \"$CORPUS_IMAGE\" --token-file \"$ECR_TOKEN_FILE\" --out \"$CORPUS\"",
+		"fail corpus-token-missing", // a missing token must be its own failure marker
+		"fail corpus-fetch",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("corpus_image run script is missing %q", expected)
+		}
+	}
+	// Image mode has no orchestrator upload, so it must not wait on the
+	// upload sentinel: CORPUS_READY stays empty and the wait is skipped.
+	if !strings.Contains(script, "CORPUS_READY=''") {
+		t.Fatal("corpus_image mode must not arm the upload sentinel")
+	}
+
+	// And the upload mode keeps its sentinel while never invoking a fetch.
+	config = loadExample(t)
+	for _, machine := range config.Machines {
+		if machine.Name != "ec2-graviton4" {
+			continue
+		}
+		layout := LayoutFor(machine, "fleet-testrun")
+		machine.Paths.Corpus = joinPosix(layout.Base, "corpus")
+		script := RunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{})
+		if !strings.Contains(script, "CORPUS_READY='"+joinPosix(layout.Base, "CORPUS-UPLOADED")+"'") {
+			t.Fatal("corpus_source mode must keep the upload sentinel")
+		}
+		if !strings.Contains(script, "CORPUS_IMAGE=''") {
+			t.Fatal("corpus_source mode must leave CORPUS_IMAGE empty")
 		}
 	}
 }

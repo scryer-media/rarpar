@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"strings"
+
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
 )
 
 func main() {
@@ -54,6 +57,8 @@ func usage() {
   rarpar-bench toolchains validate|build [--config PATH] [--docker PATH]
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
+  rarpar-bench corpus push --root DIR --image REGISTRY/REPO:TAG [--token-file PATH]
+  rarpar-bench corpus fetch --image REGISTRY/REPO:TAG --out DIR [--token-file PATH]
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
@@ -94,7 +99,7 @@ func runToolchains(ctx context.Context, args []string) error {
 
 func runCorpus(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("corpus requires generate or verify")
+		return fmt.Errorf("corpus requires generate, verify, push, or fetch")
 	}
 	flags := flag.NewFlagSet("corpus "+args[0], flag.ContinueOnError)
 	root := flags.String("root", "", "corpus directory")
@@ -102,10 +107,14 @@ func runCorpus(ctx context.Context, args []string) error {
 	config := flags.String("config", defaultPath("config/corpus.json"), "corpus configuration")
 	toolchains := flags.String("toolchains", defaultPath("config/toolchains.json"), "toolchain lock")
 	docker := flags.String("docker", "docker", "Docker executable")
+	image := flags.String("image", "", "OCI image ref: <registry>/<repo>:<tag>")
+	tokenFile := flags.String("token-file", "", "file holding a registry basic-auth token (ECR authorizationToken)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	switch args[0] {
+	case "push", "fetch":
+		return runCorpusImage(ctx, args[0], *root, *out, *image, *tokenFile)
 	case "verify":
 		if *root == "" {
 			return fmt.Errorf("--root is required")
@@ -126,6 +135,50 @@ func runCorpus(ctx context.Context, args []string) error {
 		return bench.GenerateCorpus(ctx, *docker, harnessRoot(), workspacePath(*out), lock, config)
 	default:
 		return fmt.Errorf("unknown corpus command %q", args[0])
+	}
+}
+
+// runCorpusImage moves a corpus through an OCI registry: push publishes a
+// local corpus root once, fetch pulls it onto a bench host (in-region and
+// digest-verified when the registry is ECR). Both sides are pure registry
+// HTTP — no docker daemon involved.
+func runCorpusImage(ctx context.Context, verb, root, out, image, tokenFile string) error {
+	if image == "" {
+		return fmt.Errorf("--image is required")
+	}
+	ref, err := oci.ParseImageRef(image)
+	if err != nil {
+		return err
+	}
+	token := ""
+	if tokenFile != "" {
+		raw, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return fmt.Errorf("read token file: %w", err)
+		}
+		token = strings.TrimSpace(string(raw))
+	}
+	client := &oci.Client{Ref: ref, Token: token}
+	logf := func(format string, args ...any) { fmt.Printf(format+"\n", args...) }
+	switch verb {
+	case "push":
+		if root == "" {
+			return fmt.Errorf("--root is required")
+		}
+		// Refuse to publish anything that is not a corpus root; the manifest
+		// check mirrors the fleet's corpus_source preflight.
+		if _, err := os.Stat(filepath.Join(workspacePath(root), "corpus.json")); err != nil {
+			return fmt.Errorf("--root is not a corpus root: %w", err)
+		}
+		_, err := client.PushDir(ctx, workspacePath(root), logf)
+		return err
+	case "fetch":
+		if out == "" {
+			return fmt.Errorf("--out is required")
+		}
+		return client.FetchDir(ctx, workspacePath(out), logf)
+	default:
+		return fmt.Errorf("unknown corpus image verb %q", verb)
 	}
 }
 
