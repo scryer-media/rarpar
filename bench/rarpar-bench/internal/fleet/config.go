@@ -331,7 +331,12 @@ func decodeSettings(item *section) Settings {
 			"dig +short -4 txt ch whoami.cloudflare @1.0.0.1",
 			"dig +short -4 myip.opendns.com @resolver1.opendns.com",
 		}),
-		SSHIngressPort:  aws.integer("ssh_ingress_port", 22),
+		// Deliberately not 22: fleet boxes are internet-facing for their whole
+		// (short) lives, and port 22 attracts both scanner noise and provider
+		// interference. User-data moves sshd to this port before the security
+		// group ever admits a connection; 22 stays closed unless an operator
+		// pins it back explicitly.
+		SSHIngressPort:  aws.integer("ssh_ingress_port", 22022),
 		MaxSessionHours: aws.float("max_session_hours", 3),
 	}
 	aws.finish()
@@ -354,9 +359,17 @@ func decodeMachine(item *section, settings Settings) Machine {
 	}
 
 	connection := item.requiredChild("connection")
+	// Cloud machines inherit fleet.aws.ssh_ingress_port unless this block pins
+	// a per-machine port; the same resolved value then drives the security
+	// group rule, the instance's sshd relocation, and every dial. Local
+	// machines default to plain 22.
+	defaultPort := 22
+	if machine.Kind == KindAWSEC2 {
+		defaultPort = settings.AWS.SSHIngressPort
+	}
 	machine.Connection = Connection{
 		Host:          connection.str("host", ""),
-		Port:          connection.integer("port", 22),
+		Port:          connection.integer("port", defaultPort),
 		User:          connection.requiredStr("user"),
 		Auth:          connection.str("auth", "key"),
 		KeyPath:       connection.str("key_path", ""),
@@ -498,6 +511,9 @@ func validate(state *decodeState, config *Config) {
 	}
 	if len(defaults.QuietLoadProcessNames) == 0 {
 		state.fail("fleet.defaults.quiet_load_process_names must not be empty; the load gate is what keeps a timed pass off a busy box")
+	}
+	if settings.AWS.SSHIngressPort < 1 || settings.AWS.SSHIngressPort > 65535 {
+		state.fail("fleet.aws.ssh_ingress_port must be 1-65535")
 	}
 
 	names := map[string]bool{}

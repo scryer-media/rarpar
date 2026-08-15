@@ -1156,15 +1156,29 @@ impl Rar29Sha1 {
                 return unsafe { sha1_hw::transform_block(&mut self.state, block) };
             }
         }
-        // No vector tier below the SHA-extension line, and that is a MEASURED
-        // decision, not an omission: an SSSE3 variant with the message
-        // schedule computed 4-wide up front (Intel's technique, sans
-        // interleaving) lost to this unrolled scalar on native x86 — 0.788x
-        // on Golden Cove, 0.860x on Gracemont (i5-1240P, 400k-block probe,
-        // 2026-08-15). The scalar's schedule work already rides in the round
-        // chain's ILP slack; hoisting it into vector registers only added
-        // domain-crossing overhead. Any revisit must be the fully
-        // interleaved OpenSSL shape, and must bring measurements.
+        // Below the SHA-extension line x86-64 gets the interleaved vector
+        // schedule ported from AWS-LC (see `sha1_x86_vec`). The shape is
+        // load-bearing: an earlier SSSE3 variant with the schedule computed
+        // 4-wide *up front* lost to this unrolled scalar on native x86 —
+        // 0.788x on Golden Cove, 0.860x on Gracemont (i5-1240P, 400k-block
+        // probe, 2026-08-15) — because the scalar's schedule work already
+        // rides in the round chain's ILP slack, so hoisting it into vector
+        // registers only added domain-crossing overhead with nothing to
+        // overlap. Do not rebuild that shape.
+        #[cfg(target_arch = "x86_64")]
+        {
+            match sha1_x86_vec::tier() {
+                // SAFETY: `tier()` proved the CPU carries the exact feature
+                // set each entry point is declared with.
+                sha1_x86_vec::Tier::Avx2 => {
+                    return unsafe { sha1_x86_vec::transform_block_avx2(&mut self.state, block) };
+                }
+                sha1_x86_vec::Tier::Ssse3 => {
+                    return unsafe { sha1_x86_vec::transform_block_ssse3(&mut self.state, block) };
+                }
+                sha1_x86_vec::Tier::None => {}
+            }
+        }
         self.transform_block_scalar(block)
     }
 
@@ -1402,12 +1416,19 @@ fn sha1_hw_enabled() -> bool {
 }
 
 /// Setting `WEAVER_UNRAR_SHA1_HW=0` pins the scalar fallback so SHA-capable
-/// hardware can A/B the no-SHA-NI tier without a rebuild.
+/// hardware can A/B the no-SHA-NI tier without a rebuild. Setting
+/// `WEAVER_UNRAR_SHA1_X86` to a tier name stands this path down too — without
+/// that, the vector tiers below would be unmeasurable end to end on exactly
+/// the hosts most likely to be doing the measuring, since SHA-NI would always
+/// take the block first.
 #[cfg(target_arch = "x86_64")]
 fn sha1_hw_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         if std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|v| v == "0") {
+            return false;
+        }
+        if std::env::var_os("WEAVER_UNRAR_SHA1_X86").is_some_and(|v| v == "ssse3" || v == "avx2") {
             return false;
         }
         std::arch::is_x86_feature_detected!("sha")
@@ -1601,6 +1622,539 @@ mod sha1_hw {
             _mm_storeu_si128(out.add(3), _mm_shuffle_epi32::<0x1B>(m3));
             workspace
         }
+    }
+}
+
+/// SSSE3 / AVX2 SHA-1 block transform for x86-64 hosts below the
+/// SHA-extension line.
+///
+/// # Provenance
+///
+/// Ported from `crypto/fipsmodule/sha/asm/sha1-x86_64.pl` in the AWS-LC tree
+/// vendored by `aws-lc-sys` — Andy Polyakov's OpenSSL perlasm, carried there
+/// under `SPDX-License-Identifier: Apache-2.0`, so portable with attribution.
+/// What is taken is the message-schedule structure: the
+/// `Xupdate_ssse3_16_31` and `Xupdate_ssse3_32_79` recurrences, the lane-3
+/// fixup that makes the 1-step recurrence computable four wide, and the
+/// interleaving of one schedule group against one quad of rounds through a
+/// rotating 16-word W+K frame. The round bodies, the tier gate, the
+/// W[64..80) return contract, and the tests are this tree's own.
+///
+/// Calling AWS-LC's SHA-1 instead is not an option, which is why this is a
+/// port and not a dependency: every AWS-LC entry point yields digest state
+/// only, and RAR29 needs the final schedule words W[64..80) — WinRAR writes
+/// them back over the input, and no public API can hand them out. That is the
+/// same "UnRAR-specific legacy algorithm AWS-LC does not provide" carve-out
+/// the rest of `Rar29Sha1` already stands on.
+///
+/// AWS-LC's own header table, cycles per byte, lower is better:
+///
+/// ```text
+///                 scalar    SSSE3          AVX2+BMI
+/// Haswell         5.45      4.15 (+31%)    3.57 (+53%)
+/// Skylake         5.18      4.06 (+28%)    3.54 (+46%)
+/// ```
+///
+/// # Why interleaved, and why the earlier attempt lost
+///
+/// SHA-1's round chain is strictly serial and short per round, so a wide
+/// machine spends most of a round waiting. The schedule is the only work
+/// available to fill that slack. A vector schedule computed *up front* takes
+/// the slack away instead of filling it — which is exactly what the deleted
+/// 0.788x/0.860x variant did (see the note in
+/// `Rar29Sha1::transform_block`). Every group here is therefore emitted
+/// against the four rounds it runs beside, and the group is written to the
+/// frame slot the same quad has just finished reading, so the read-then-write
+/// order is what keeps a 16-word frame sufficient.
+///
+/// # Why AVX2 is the same 128-bit kernel and not a 256-bit one
+///
+/// `W[i]` depends on `W[i-3]`, so at most three words are independent; the
+/// 2-step form `W[i] = rol2(W[i-6] ^ W[i-16] ^ W[i-28] ^ W[i-32])` reaches
+/// six, which is what makes the four-wide step above legal. Eight-wide would
+/// need the 4-step form, whose shortest back-reference is `W[i-12]` and which
+/// is only reachable from `W[64]` on — too late to pay for itself. AWS-LC
+/// gets its 256 bits the only other way there is: by scheduling *two blocks*
+/// at once, one per 128-bit lane. That needs two blocks in hand, and the sole
+/// consumer of this transform is the RAR3/RAR4 KDF: its fast path absorbs
+/// 1..63 bytes per round, so a block can only ever complete inside the
+/// buffered path, one at a time. (The long-password path can present a
+/// multi-block absorb, but only from about 61 password units up, which is not
+/// the shape to build a second kernel around. Batching the fast path's
+/// absorbs would change that, and *is* the prerequisite for porting AWS-LC's
+/// two-block shape — a separate change, with its own equivalence argument and
+/// its own measurements.) So the AVX2 tier here is the same kernel
+/// codegenned against a richer ISA, which is exactly the two levers AWS-LC
+/// pulls in the same file: its AVX path is the SSSE3 kernel re-encoded VEX,
+/// and its AVX2 path is the one that also switches the round bodies to BMI.
+/// Both fall out of the target features here, and the emitted difference is
+/// real — per block, `71 movdqa` register copies go to zero under VEX,
+/// `160 roll` becomes `160 rorx` (non-destructive), and one and/xor pair per
+/// section-1 round becomes `andn`. Neither instantiation issues anything
+/// wider than 128 bits, so there is no AVX-SSE transition penalty and no
+/// `vzeroupper` obligation either way. Which tier wins by how much is a
+/// hardware question, and `rar29_sha1_scalar_vs_x86_vector_throughput` is the
+/// probe that answers it; the ordering below is by ISA, not by measurement.
+///
+/// # Tier policy
+///
+/// * SHA extensions present — this module stands aside;
+///   the `sha1_hw` module is strictly better.
+/// * AVX2 + BMI1 + BMI2 — [`Tier::Avx2`].
+/// * SSSE3 — [`Tier::Ssse3`].
+/// * Otherwise — [`Tier::None`], and the unrolled scalar runs. That is the
+///   x86-64 parts predating SSSE3: Intel before Core 2, AMD before K10.
+///
+/// `WEAVER_UNRAR_SHA1_HW=0` keeps its existing whole-ladder meaning and pins
+/// plain scalar. `WEAVER_UNRAR_SHA1_X86` selects within this module: `0`
+/// stands the module down, `ssse3` and `avx2` force one tier so a single
+/// binary can A/B them — and a named tier also stands the SHA-extension path
+/// down, so the A/B works on a SHA-capable host instead of being silently
+/// overridden by it. The ISA probe is never bypassed in either direction —
+/// forcing a tier the CPU cannot execute would be an undefined opcode, so the
+/// override widens the *policy* and leaves the *capability* check intact.
+/// Same `OnceLock` + `WEAVER_*` shape as [`crate::crc_simd`].
+#[cfg(target_arch = "x86_64")]
+mod sha1_x86_vec {
+    // Each kernel is one contiguous unsafe region under a single precondition
+    // (the target features proved by `tier`). Per-intrinsic `unsafe` blocks
+    // would add hundreds of tokens without adding a distinct safety
+    // obligation, so the module opts out of the per-operation requirement and
+    // documents the one obligation at each `#[target_feature]` entry point
+    // instead. Same convention as `crate::crc_simd::x86_vpclmul`.
+    #![allow(unsafe_op_in_unsafe_fn)]
+
+    use std::arch::x86_64::*;
+    use std::sync::OnceLock;
+
+    /// The four SHA-1 section constants, folded into the schedule here rather
+    /// than added per round.
+    const K: [u32; 4] = [0x5a82_7999, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c1d6];
+
+    /// Override knob for the tier gate, read once. See the module docs.
+    const FORCE_ENV: &str = "WEAVER_UNRAR_SHA1_X86";
+
+    /// The selected vector tier for this process.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Tier {
+        /// No vector tier; the caller runs the unrolled scalar.
+        None,
+        /// [`transform_block_ssse3`].
+        Ssse3,
+        /// [`transform_block_avx2`].
+        Avx2,
+    }
+
+    /// Resolve the tier once and cache it.
+    pub(super) fn tier() -> Tier {
+        static TIER: OnceLock<Tier> = OnceLock::new();
+        *TIER.get_or_init(|| {
+            let hw_pinned_off =
+                std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|value| value == "0");
+            let forced = std::env::var_os(FORCE_ENV);
+
+            // Capability floor. Never widened by the override below: these
+            // are the instructions the kernels actually issue.
+            let ssse3 = is_x86_feature_detected!("ssse3");
+            let avx2 = ssse3
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2");
+
+            select_tier(
+                hw_pinned_off,
+                forced.as_deref().and_then(|value| value.to_str()),
+                ssse3,
+                avx2,
+            )
+        })
+    }
+
+    /// The tier policy, split out from the environment and the CPUID probe so
+    /// the matrix is testable on any host.
+    ///
+    /// `hw_pinned_off` is `WEAVER_UNRAR_SHA1_HW=0`, which predates this module
+    /// and means "plain scalar" — not "one tier down" — so it wins over
+    /// everything. `forced` is `WEAVER_UNRAR_SHA1_X86`. An unknown value is
+    /// ignored rather than fatal, and a forced tier the CPU cannot execute
+    /// stands the module down instead of issuing an undefined opcode.
+    fn select_tier(hw_pinned_off: bool, forced: Option<&str>, ssse3: bool, avx2: bool) -> Tier {
+        if hw_pinned_off || forced == Some("0") {
+            return Tier::None;
+        }
+
+        match forced {
+            Some("ssse3") => return if ssse3 { Tier::Ssse3 } else { Tier::None },
+            Some("avx2") => return if avx2 { Tier::Avx2 } else { Tier::None },
+            _ => {}
+        }
+
+        if avx2 {
+            Tier::Avx2
+        } else if ssse3 {
+            Tier::Ssse3
+        } else {
+            Tier::None
+        }
+    }
+
+    #[cfg(test)]
+    mod tier_tests {
+        use super::{Tier, select_tier};
+
+        #[test]
+        fn hw_pin_wins_over_every_capability_and_override() {
+            for forced in [None, Some("0"), Some("ssse3"), Some("avx2"), Some("junk")] {
+                assert_eq!(select_tier(true, forced, true, true), Tier::None);
+            }
+        }
+
+        #[test]
+        fn default_policy_takes_the_widest_capable_tier() {
+            assert_eq!(select_tier(false, None, true, true), Tier::Avx2);
+            assert_eq!(select_tier(false, None, true, false), Tier::Ssse3);
+            assert_eq!(select_tier(false, None, false, false), Tier::None);
+        }
+
+        #[test]
+        fn override_forces_one_tier_but_never_past_the_capability_floor() {
+            assert_eq!(select_tier(false, Some("ssse3"), true, true), Tier::Ssse3);
+            assert_eq!(select_tier(false, Some("avx2"), true, true), Tier::Avx2);
+            // Capability floor holds: forcing a tier the CPU lacks stands the
+            // module down rather than issuing an undefined opcode.
+            assert_eq!(select_tier(false, Some("avx2"), true, false), Tier::None);
+            assert_eq!(select_tier(false, Some("ssse3"), false, false), Tier::None);
+        }
+
+        #[test]
+        fn zero_stands_down_and_an_unknown_value_is_ignored() {
+            assert_eq!(select_tier(false, Some("0"), true, true), Tier::None);
+            assert_eq!(select_tier(false, Some("junk"), true, true), Tier::Avx2);
+        }
+    }
+
+    /// Four rounds of section 1, `f = (b & (c ^ d)) ^ d`.
+    ///
+    /// `wk` carries W+K for the four rounds, so no round constant is added
+    /// here. The four-position rotation SHA-1 applies to `a..e` is absorbed by
+    /// static argument order exactly as in `Rar29Sha1::transform_block_scalar`
+    /// — the returned array is the canonical `[a, b, c, d, e]` again, because
+    /// four rounds rotate the five roles by four.
+    #[inline(always)]
+    fn quad_choose(v: [u32; 5], wk: [u32; 4]) -> [u32; 5] {
+        let [mut a, mut b, mut c, mut d, mut e] = v;
+        e = e
+            .wrapping_add(a.rotate_left(5))
+            .wrapping_add((b & (c ^ d)) ^ d)
+            .wrapping_add(wk[0]);
+        b = b.rotate_left(30);
+        d = d
+            .wrapping_add(e.rotate_left(5))
+            .wrapping_add((a & (b ^ c)) ^ c)
+            .wrapping_add(wk[1]);
+        a = a.rotate_left(30);
+        c = c
+            .wrapping_add(d.rotate_left(5))
+            .wrapping_add((e & (a ^ b)) ^ b)
+            .wrapping_add(wk[2]);
+        e = e.rotate_left(30);
+        b = b
+            .wrapping_add(c.rotate_left(5))
+            .wrapping_add((d & (e ^ a)) ^ a)
+            .wrapping_add(wk[3]);
+        d = d.rotate_left(30);
+        [b, c, d, e, a]
+    }
+
+    /// Four rounds of sections 2 and 4, `f = b ^ c ^ d`. The two sections
+    /// differ only in their constant, and the constant is already in `wk`.
+    #[inline(always)]
+    fn quad_parity(v: [u32; 5], wk: [u32; 4]) -> [u32; 5] {
+        let [mut a, mut b, mut c, mut d, mut e] = v;
+        e = e
+            .wrapping_add(a.rotate_left(5))
+            .wrapping_add(b ^ c ^ d)
+            .wrapping_add(wk[0]);
+        b = b.rotate_left(30);
+        d = d
+            .wrapping_add(e.rotate_left(5))
+            .wrapping_add(a ^ b ^ c)
+            .wrapping_add(wk[1]);
+        a = a.rotate_left(30);
+        c = c
+            .wrapping_add(d.rotate_left(5))
+            .wrapping_add(e ^ a ^ b)
+            .wrapping_add(wk[2]);
+        e = e.rotate_left(30);
+        b = b
+            .wrapping_add(c.rotate_left(5))
+            .wrapping_add(d ^ e ^ a)
+            .wrapping_add(wk[3]);
+        d = d.rotate_left(30);
+        [b, c, d, e, a]
+    }
+
+    /// Four rounds of section 3, `f = ((b | c) & d) | (b & c)`.
+    #[inline(always)]
+    fn quad_majority(v: [u32; 5], wk: [u32; 4]) -> [u32; 5] {
+        let [mut a, mut b, mut c, mut d, mut e] = v;
+        e = e
+            .wrapping_add(a.rotate_left(5))
+            .wrapping_add(((b | c) & d) | (b & c))
+            .wrapping_add(wk[0]);
+        b = b.rotate_left(30);
+        d = d
+            .wrapping_add(e.rotate_left(5))
+            .wrapping_add(((a | b) & c) | (a & b))
+            .wrapping_add(wk[1]);
+        a = a.rotate_left(30);
+        c = c
+            .wrapping_add(d.rotate_left(5))
+            .wrapping_add(((e | a) & b) | (e & a))
+            .wrapping_add(wk[2]);
+        e = e.rotate_left(30);
+        b = b
+            .wrapping_add(c.rotate_left(5))
+            .wrapping_add(((d | e) & a) | (d & e))
+            .wrapping_add(wk[3]);
+        d = d.rotate_left(30);
+        [b, c, d, e, a]
+    }
+
+    /// Schedule group for W[16..32): the 1-step recurrence
+    /// `W[i] = rol1(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16])`.
+    ///
+    /// Lane 3 wants `W[i+3-3] = W[i]`, which this very group produces, so it
+    /// is computed short and repaired: `rol1` distributes over xor, so the
+    /// missing term is `rol1(W[i])`, and `W[i]` is `rol1` of the pre-rotate
+    /// lane 0 — hence folding `rol2` of the pre-rotate lane 0 into lane 3.
+    /// `$gi` is the group index over the whole 20-group schedule, so group
+    /// `$gi` covers W[4*$gi..4*$gi+4).
+    macro_rules! sched_16_31 {
+        ($x:ident, $gi:literal) => {{
+            let xm4 = $x[($gi - 4) & 7];
+            let xm3 = $x[($gi - 3) & 7];
+            let xm2 = $x[($gi - 2) & 7];
+            let xm1 = $x[($gi - 1) & 7];
+
+            // "X[-14]" = [W[i-14], W[i-13], W[i-12], W[i-11]].
+            let m14 = _mm_alignr_epi8::<8>(xm3, xm4);
+            // "X[-3]" with lane 3 zeroed: W[i] is not known yet.
+            let mut t = _mm_srli_si128::<4>(xm1);
+            let mut xn = _mm_xor_si128(m14, xm4);
+            t = _mm_xor_si128(t, xm2);
+            xn = _mm_xor_si128(xn, t);
+
+            let carry = _mm_srli_epi32::<31>(xn);
+            let lane0 = _mm_slli_si128::<12>(xn);
+            xn = _mm_add_epi32(xn, xn);
+            xn = _mm_or_si128(xn, carry);
+            xn = _mm_xor_si128(xn, _mm_srli_epi32::<30>(lane0));
+            xn = _mm_xor_si128(xn, _mm_slli_epi32::<2>(lane0));
+
+            $x[$gi & 7] = xn;
+            xn
+        }};
+    }
+
+    /// Schedule group for W[32..80): the 2-step recurrence
+    /// `W[i] = rol2(W[i-6] ^ W[i-16] ^ W[i-28] ^ W[i-32])`, whose six-word
+    /// back-reference leaves all four lanes independent — no fixup.
+    ///
+    /// The slot about to receive group `$gi` still holds group `$gi - 8`,
+    /// which is `W[i-32..i-28)`, so the ring supplies that term for free.
+    macro_rules! sched_32_79 {
+        ($x:ident, $gi:literal) => {{
+            let xm8 = $x[$gi & 7];
+            let xm7 = $x[($gi - 7) & 7];
+            let xm4 = $x[($gi - 4) & 7];
+            let xm2 = $x[($gi - 2) & 7];
+            let xm1 = $x[($gi - 1) & 7];
+
+            // "X[-6]" = [W[i-6], W[i-5], W[i-4], W[i-3]].
+            let m6 = _mm_alignr_epi8::<8>(xm1, xm2);
+            let mut xn = _mm_xor_si128(xm8, xm4);
+            xn = _mm_xor_si128(xn, xm7);
+            xn = _mm_xor_si128(xn, m6);
+
+            let spill = _mm_srli_epi32::<30>(xn);
+            xn = _mm_slli_epi32::<2>(xn);
+            xn = _mm_or_si128(xn, spill);
+
+            $x[$gi & 7] = xn;
+            xn
+        }};
+    }
+
+    /// One interleaved step: read the frame slot the quad consumes, emit the
+    /// schedule group beside the quad, then refill that same slot.
+    ///
+    /// The read-before-write order is the whole reason a 16-word frame is
+    /// enough: quad `g` reads slot `g & 3`, and the group it is emitting
+    /// beside — W[16+4g..20+4g) — lands in that same slot sixteen rounds
+    /// later.
+    ///
+    /// `$wk` is a raw pointer, not the array, and that is load-bearing — see
+    /// the note on the frame in `transform_block_kernel`.
+    macro_rules! step {
+        ($x:ident, $wk:ident, $v:ident, $slot:literal, $quad:ident, $sched:ident, $gi:literal, $k:expr) => {{
+            let base = $slot * 4;
+            let wq = [
+                *$wk.add(base),
+                *$wk.add(base + 1),
+                *$wk.add(base + 2),
+                *$wk.add(base + 3),
+            ];
+            let xn = $sched!($x, $gi);
+            $v = $quad($v, wq);
+            _mm_storeu_si128($wk.add(base) as *mut __m128i, _mm_add_epi32(xn, $k));
+        }};
+    }
+
+    /// One of the last four quads, which have no schedule work left to do.
+    macro_rules! tail_step {
+        ($wk:ident, $v:ident, $slot:literal, $quad:ident) => {{
+            let base = $slot * 4;
+            $v = $quad(
+                $v,
+                [
+                    *$wk.add(base),
+                    *$wk.add(base + 1),
+                    *$wk.add(base + 2),
+                    *$wk.add(base + 3),
+                ],
+            );
+        }};
+    }
+
+    /// The single-block kernel, instantiated once per ISA tier.
+    ///
+    /// A macro and not a shared function because `#[target_feature]` does not
+    /// compose: the body has to be *codegenned* twice, once per feature set,
+    /// for the AVX2 instantiation to get VEX encodings and BMI2 round bodies
+    /// at all. The scalar quads above are ordinary `#[inline(always)]`
+    /// functions and need no duplication — they carry no intrinsics, so they
+    /// inherit whichever instantiation inlines them.
+    macro_rules! transform_block_kernel {
+        ($state:ident, $block:ident) => {{
+            // Byte-reverse within each dword: SHA-1 words are big-endian.
+            let bswap = _mm_set_epi64x(
+                0x0c0d_0e0f_0809_0a0bu64 as i64,
+                0x0405_0607_0001_0203u64 as i64,
+            );
+            let k0 = _mm_set1_epi32(K[0] as i32);
+            let k1 = _mm_set1_epi32(K[1] as i32);
+            let k2 = _mm_set1_epi32(K[2] as i32);
+            let k3 = _mm_set1_epi32(K[3] as i32);
+
+            // Ring of the last eight schedule groups; group `gi` lives at
+            // `x[gi & 7]`.
+            let mut x = [_mm_setzero_si128(); 8];
+            let src = $block.as_ptr() as *const __m128i;
+            x[0] = _mm_shuffle_epi8(_mm_loadu_si128(src), bswap);
+            x[1] = _mm_shuffle_epi8(_mm_loadu_si128(src.add(1)), bswap);
+            x[2] = _mm_shuffle_epi8(_mm_loadu_si128(src.add(2)), bswap);
+            x[3] = _mm_shuffle_epi8(_mm_loadu_si128(src.add(3)), bswap);
+
+            // Rotating W+K frame the rounds read from.
+            //
+            // The frame is reached through a deliberately opaque pointer, and
+            // that is the single most load-bearing line in this module. Left
+            // as a plain local array it never reaches memory at all: LLVM
+            // promotes it, forwards each vector store into the loads that
+            // follow, and hands the rounds their W+K word by extracting it
+            // from a vector register — `pshufd` + `movd` per word on SSSE3,
+            // `vpextrd` on AVX2. That is 140 extra operations per block on
+            // the same execution ports the schedule itself is competing for,
+            // and it is very probably what sank the earlier SSSE3 attempt.
+            // AWS-LC does not do that: its round bodies read the frame with
+            // a memory operand ("X[]+K xfer to IALU"), which spends the
+            // otherwise-idle load ports instead. Escaping the pointer is what
+            // reproduces that. Measured on the same source, per block:
+            // SSSE3 1245 -> 1110 instructions with the vector-to-GPR
+            // extractions gone entirely (140 -> 17), AVX2 trading 81
+            // `vpextrd`/`vmovd` for loads that no longer contend with the ALU
+            // ports. `black_box` is documented as best-effort, so if a future
+            // toolchain sees through it this silently reverts to the shape
+            // that loses; `rar29_sha1_scalar_vs_x86_vector_throughput` is the
+            // tripwire.
+            let mut wk_frame = [0u32; 16];
+            let wk = std::hint::black_box(wk_frame.as_mut_ptr());
+            _mm_storeu_si128(wk as *mut __m128i, _mm_add_epi32(x[0], k0));
+            _mm_storeu_si128(wk.add(4) as *mut __m128i, _mm_add_epi32(x[1], k0));
+            _mm_storeu_si128(wk.add(8) as *mut __m128i, _mm_add_epi32(x[2], k0));
+            _mm_storeu_si128(wk.add(12) as *mut __m128i, _mm_add_epi32(x[3], k0));
+
+            let mut v = *$state;
+
+            // Sixteen interleaved steps: quads 0..16 beside groups 4..20.
+            // The constant a group is paid is the one its rounds use, so the
+            // section boundaries land at groups 5, 10 and 15.
+            step!(x, wk, v, 0, quad_choose, sched_16_31, 4, k0);
+            step!(x, wk, v, 1, quad_choose, sched_16_31, 5, k1);
+            step!(x, wk, v, 2, quad_choose, sched_16_31, 6, k1);
+            step!(x, wk, v, 3, quad_choose, sched_16_31, 7, k1);
+            step!(x, wk, v, 0, quad_choose, sched_32_79, 8, k1);
+            step!(x, wk, v, 1, quad_parity, sched_32_79, 9, k1);
+            step!(x, wk, v, 2, quad_parity, sched_32_79, 10, k2);
+            step!(x, wk, v, 3, quad_parity, sched_32_79, 11, k2);
+            step!(x, wk, v, 0, quad_parity, sched_32_79, 12, k2);
+            step!(x, wk, v, 1, quad_parity, sched_32_79, 13, k2);
+            step!(x, wk, v, 2, quad_majority, sched_32_79, 14, k2);
+            step!(x, wk, v, 3, quad_majority, sched_32_79, 15, k3);
+            step!(x, wk, v, 0, quad_majority, sched_32_79, 16, k3);
+            step!(x, wk, v, 1, quad_majority, sched_32_79, 17, k3);
+            step!(x, wk, v, 2, quad_majority, sched_32_79, 18, k3);
+            step!(x, wk, v, 3, quad_parity, sched_32_79, 19, k3);
+
+            // Rounds 64..79 consume the last four groups.
+            tail_step!(wk, v, 0, quad_parity);
+            tail_step!(wk, v, 1, quad_parity);
+            tail_step!(wk, v, 2, quad_parity);
+            tail_step!(wk, v, 3, quad_parity);
+
+            $state[0] = $state[0].wrapping_add(v[0]);
+            $state[1] = $state[1].wrapping_add(v[1]);
+            $state[2] = $state[2].wrapping_add(v[2]);
+            $state[3] = $state[3].wrapping_add(v[3]);
+            $state[4] = $state[4].wrapping_add(v[4]);
+
+            // Groups 16..19 are W[64..80), and they are exactly ring slots
+            // 0..3 — the RAR29 write-back contract, in raw W and not W+K.
+            let mut workspace = [0u32; 16];
+            let out = workspace.as_mut_ptr() as *mut __m128i;
+            _mm_storeu_si128(out, x[0]);
+            _mm_storeu_si128(out.add(1), x[1]);
+            _mm_storeu_si128(out.add(2), x[2]);
+            _mm_storeu_si128(out.add(3), x[3]);
+
+            workspace
+        }};
+    }
+
+    /// Process one 64-byte block, updating `state` and returning the final 16
+    /// message-schedule words W[64..80).
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSSE3. [`tier`] establishes exactly that.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn transform_block_ssse3(
+        state: &mut [u32; 5],
+        block: &[u8; 64],
+    ) -> [u32; 16] {
+        transform_block_kernel!(state, block)
+    }
+
+    /// The same kernel under VEX encodings and BMI2 round bodies.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2, BMI1 and BMI2. [`tier`] establishes exactly
+    /// that.
+    #[target_feature(enable = "avx2,bmi1,bmi2")]
+    pub(super) unsafe fn transform_block_avx2(state: &mut [u32; 5], block: &[u8; 64]) -> [u32; 16] {
+        transform_block_kernel!(state, block)
     }
 }
 
@@ -2482,6 +3036,160 @@ mod tests {
 
             assert_eq!(scalar.state, hw.state, "state diverged at round {round}");
             assert_eq!(ws_scalar, ws_hw, "schedule diverged at round {round}");
+        }
+    }
+
+    /// Both x86 vector tiers must match the scalar transform exactly — digest
+    /// state and the returned final schedule words that feed the RAR29
+    /// in-place corruption.
+    ///
+    /// Each kernel is probed for and entered directly rather than through
+    /// `sha1_x86_vec::tier()`, so a host carrying both runs both, and a
+    /// process-wide tier pin cannot silently reduce this to one arm. The tier
+    /// the dispatch would actually pick is asserted alongside, so a gate that
+    /// drifts from the kernels it selects fails here too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rar29_sha1_x86_vector_transforms_match_scalar() {
+        let ssse3 = is_x86_feature_detected!("ssse3");
+        let avx2 = ssse3
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("bmi1")
+            && is_x86_feature_detected!("bmi2");
+
+        if !ssse3 {
+            eprintln!("skipping: no SSSE3 on this host");
+            return;
+        }
+
+        let mut seed = 0x0bad_c0de_1337_f00du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for round in 0..4096 {
+            let mut block = [0u8; 64];
+            for chunk in block.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&next().to_le_bytes());
+            }
+            let mut state = [0u32; 5];
+            for word in &mut state {
+                *word = next() as u32;
+            }
+
+            let mut scalar = Rar29Sha1::new();
+            scalar.state = state;
+            let ws_scalar = scalar.transform_block_scalar(&block);
+
+            let mut vector = Rar29Sha1::new();
+            vector.state = state;
+            // SAFETY: SSSE3 availability checked above.
+            let ws_vector =
+                unsafe { sha1_x86_vec::transform_block_ssse3(&mut vector.state, &block) };
+            assert_eq!(
+                scalar.state, vector.state,
+                "ssse3 state diverged at round {round}"
+            );
+            assert_eq!(
+                ws_scalar, ws_vector,
+                "ssse3 schedule diverged at round {round}"
+            );
+
+            if avx2 {
+                let mut wide = Rar29Sha1::new();
+                wide.state = state;
+                // SAFETY: AVX2 + BMI1 + BMI2 availability checked above.
+                let ws_wide =
+                    unsafe { sha1_x86_vec::transform_block_avx2(&mut wide.state, &block) };
+                assert_eq!(
+                    scalar.state, wide.state,
+                    "avx2 state diverged at round {round}"
+                );
+                assert_eq!(
+                    ws_scalar, ws_wide,
+                    "avx2 schedule diverged at round {round}"
+                );
+            }
+        }
+
+        // The gate and the kernels must agree about what this host can run.
+        // Only meaningful when nothing is pinning the ladder off.
+        let pinned = std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|value| value == "0")
+            || std::env::var_os("WEAVER_UNRAR_SHA1_X86").is_some();
+        if !pinned {
+            let expected = if avx2 {
+                sha1_x86_vec::Tier::Avx2
+            } else {
+                sha1_x86_vec::Tier::Ssse3
+            };
+            assert_eq!(sha1_x86_vec::tier(), expected);
+        }
+
+        eprintln!("NOTE: rar29-sha1 x86 differential ran ssse3=true avx2={avx2}");
+    }
+
+    /// Informational probe of each x86 vector tier against the unrolled
+    /// scalar; run explicitly with `--ignored` on a real x86 host. Prints
+    /// NOTE lines rather than asserting ratios — timings belong to bench
+    /// hosts, and an emulated or shared host will lie about them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "timing probe; run explicitly"]
+    fn rar29_sha1_scalar_vs_x86_vector_throughput() {
+        const BLOCKS: u32 = 400_000;
+        let block = [0xa5u8; 64];
+
+        let ssse3 = is_x86_feature_detected!("ssse3");
+        let avx2 = ssse3
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("bmi1")
+            && is_x86_feature_detected!("bmi2");
+        if !ssse3 {
+            eprintln!("skipping: no SSSE3 on this host");
+            return;
+        }
+
+        let mut scalar = Rar29Sha1::new();
+        let start = std::time::Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(scalar.transform_block_scalar(std::hint::black_box(&block)));
+        }
+        let scalar_elapsed = start.elapsed();
+
+        let mut state = Rar29Sha1::new().state;
+        let start = std::time::Instant::now();
+        for _ in 0..BLOCKS {
+            // SAFETY: SSSE3 availability checked above.
+            std::hint::black_box(unsafe {
+                sha1_x86_vec::transform_block_ssse3(&mut state, std::hint::black_box(&block))
+            });
+        }
+        let ssse3_elapsed = start.elapsed();
+
+        eprintln!(
+            "NOTE: rar29-sha1 {BLOCKS} blocks: scalar {scalar_elapsed:?}, ssse3 {ssse3_elapsed:?}, scalar/ssse3 = {:.3}",
+            scalar_elapsed.as_secs_f64() / ssse3_elapsed.as_secs_f64()
+        );
+
+        if avx2 {
+            let mut state = Rar29Sha1::new().state;
+            let start = std::time::Instant::now();
+            for _ in 0..BLOCKS {
+                // SAFETY: AVX2 + BMI1 + BMI2 availability checked above.
+                std::hint::black_box(unsafe {
+                    sha1_x86_vec::transform_block_avx2(&mut state, std::hint::black_box(&block))
+                });
+            }
+            let avx2_elapsed = start.elapsed();
+            eprintln!(
+                "NOTE: rar29-sha1 {BLOCKS} blocks: scalar {scalar_elapsed:?}, avx2 {avx2_elapsed:?}, scalar/avx2 = {:.3}",
+                scalar_elapsed.as_secs_f64() / avx2_elapsed.as_secs_f64()
+            );
+        } else {
+            eprintln!("NOTE: no AVX2+BMI on this host; avx2 arm skipped");
         }
     }
 

@@ -521,7 +521,7 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 			return err
 		}
 		userDataPath := filepath.Join(orch.runDir, "userdata-"+machine.Name+".sh")
-		if err := os.WriteFile(userDataPath, []byte(UserData(machine.EC2.DeadmanMinutes)), 0o644); err != nil {
+		if err := os.WriteFile(userDataPath, []byte(UserData(machine.EC2.DeadmanMinutes, machine.Connection.Port)), 0o644); err != nil {
 			return err
 		}
 		cloud, err := orch.aws.Launch(ctx, machine, *session, userDataPath)
@@ -656,7 +656,17 @@ func (orch *orchestrator) ensureSession(ctx context.Context) (*SessionResources,
 		return nil, err
 	}
 	orch.log("session: this machine's public address is %s/32", publicIP)
-	session, err := orch.aws.CreateSession(ctx, settings.ResourcePrefix, publicIP, orch.runDir, settings.SSHIngressPort)
+	// Open exactly the ports this run's cloud machines dial and nothing else.
+	// Connection.Port is already resolved at decode time (per-machine override
+	// or the fleet.aws.ssh_ingress_port default), so this is the same value the
+	// transport uses and the same value user-data moves sshd onto.
+	sshPorts := make([]int, 0, len(orch.options.Machines))
+	for _, machine := range orch.options.Machines {
+		if machine.Kind == KindAWSEC2 {
+			sshPorts = append(sshPorts, machine.Connection.Port)
+		}
+	}
+	session, err := orch.aws.CreateSession(ctx, settings.ResourcePrefix, publicIP, orch.runDir, sshPorts)
 	if err != nil {
 		return nil, err
 	}

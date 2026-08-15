@@ -84,7 +84,13 @@ resource_prefix = "rarpar-fleet"
 # Discovery is DNS-based because HTTP echo services are blocked on this network;
 # if none of these commands returns an IPv4, the run refuses to open a group.
 public_ip_lookup = ["dig +short -4 txt ch whoami.cloudflare @1.0.0.1", "dig +short -4 myip.opendns.com @resolver1.opendns.com"]
-ssh_ingress_port = 22
+# The SSH port every cloud host uses, and the only port the security group
+# opens. Instance user-data relocates sshd here at boot (port 22 is closed,
+# not supplemented), so nothing ever answers on 22. A machine can pin its own
+# port in its [machines.connection] block; this is the default for the rest.
+# Deliberately not 22: fleet boxes are internet-facing for their whole lives
+# and 22 attracts scanner noise and provider interference.
+ssh_ingress_port = 22022
 # Ceiling for any single machine's ec2.max_hours.
 max_session_hours = 3
 
@@ -252,8 +258,10 @@ suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
 
 [machines.connection]
 # host is filled in from the launched instance; only the login user matters.
+# No port here: a cloud machine inherits fleet.aws.ssh_ingress_port, which is
+# also where user-data relocates the instance's sshd. Set one to pin this
+# machine to its own port (the security group opens each configured port).
 user = "ubuntu"
-port = 22
 auth = "key"                             # always the ephemeral session keypair
 shell = "sh"
 

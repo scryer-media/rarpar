@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -186,8 +187,11 @@ func PublicIP(ctx context.Context, commands []string) (string, error) {
 }
 
 // CreateSession makes the ephemeral keypair and the session security group that
-// every cloud host in this run shares.
-func (aws *AWS) CreateSession(ctx context.Context, prefix, publicIP, keyDir string, sshPort int) (SessionResources, error) {
+// every cloud host in this run shares. sshPorts is the set of SSH ports the
+// run's machines actually dial; each is opened to the orchestrator's /32 and
+// nothing else is opened at all — port 22 is reachable only if some machine
+// explicitly configured it.
+func (aws *AWS) CreateSession(ctx context.Context, prefix, publicIP, keyDir string, sshPorts []int) (SessionResources, error) {
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 	session := SessionResources{
 		Prefix:     prefix,
@@ -222,22 +226,69 @@ func (aws *AWS) CreateSession(ctx context.Context, prefix, publicIP, keyDir stri
 	} else {
 		session.SecurityGroupID = strings.TrimSpace(string(output))
 	}
-	if _, err := aws.mutate(ctx, "scope SSH ingress to this machine only", "ec2", "authorize-security-group-ingress",
-		"--group-id", session.SecurityGroupID,
-		"--protocol", "tcp", "--port", fmt.Sprint(sshPort), "--cidr", session.PublicCIDR); err != nil {
-		return session, err
+	authorized := map[int]bool{}
+	for _, sshPort := range sshPorts {
+		if authorized[sshPort] {
+			continue
+		}
+		authorized[sshPort] = true
+		if _, err := aws.mutate(ctx, fmt.Sprintf("scope SSH ingress on port %d to this machine only", sshPort),
+			"ec2", "authorize-security-group-ingress",
+			"--group-id", session.SecurityGroupID,
+			"--protocol", "tcp", "--port", fmt.Sprint(sshPort), "--cidr", session.PublicCIDR); err != nil {
+			return session, err
+		}
 	}
-	aws.log("session resources: keypair=%s sg=%s ingress=%s", session.KeyName, session.SecurityGroupID, session.PublicCIDR)
+	ports := make([]int, 0, len(authorized))
+	for port := range authorized {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+	labels := make([]string, len(ports))
+	for index, port := range ports {
+		labels[index] = fmt.Sprint(port)
+	}
+	aws.log("session resources: keypair=%s sg=%s ingress=%s ports=%s",
+		session.KeyName, session.SecurityGroupID, session.PublicCIDR, strings.Join(labels, ","))
 	return session, nil
 }
 
-// UserData is the deadman plus quiet-box hygiene applied to every cloud host.
-func UserData(deadmanMinutes int) string {
+// UserData is the deadman plus quiet-box hygiene applied to every cloud host,
+// plus the sshd relocation that pairs with the session security group when the
+// machine's SSH port is not 22.
+func UserData(deadmanMinutes, sshPort int) string {
+	relocate := ""
+	if sshPort != 22 {
+		// Reachability, not just hygiene: the security group only opens the
+		// configured port, so until sshd moves, nothing connects at all. Both
+		// listener mechanisms are handled -- classic sshd_config on
+		// service-managed images, and the socket-activated ssh.socket that owns
+		// the listener on Ubuntu 22.10+ (where sshd_config Port lines bind
+		// nothing). The /etc socket override outranks Ubuntu's
+		// sshd-socket-generator output, and clearing ListenStream before setting
+		// it means 22 is closed, not supplemented. The Port line is prepended to
+		// sshd_config rather than dropped into sshd_config.d so it works even on
+		// images whose config lacks the Include directive, and top-of-file keeps
+		// it outside any Match block.
+		relocate = fmt.Sprintf(`# Relocate sshd off port 22; the security group only admits the new port.
+sed -i 's/^Port /#Port /' /etc/ssh/sshd_config
+sed -i '1i Port %d' /etc/ssh/sshd_config
+mkdir -p /etc/systemd/system/ssh.socket.d
+printf '[Socket]\nListenStream=\nListenStream=%d\n' > /etc/systemd/system/ssh.socket.d/50-bench-port.conf
+systemctl daemon-reload
+if systemctl is-active --quiet ssh.socket; then
+  systemctl stop ssh.service 2>/dev/null || true
+  systemctl restart ssh.socket
+else
+  systemctl try-restart ssh.service 2>/dev/null || systemctl try-restart sshd.service 2>/dev/null || true
+fi
+`, sshPort, sshPort)
+	}
 	return fmt.Sprintf(`#!/bin/bash
 # Deadman. instance-initiated-shutdown-behavior=terminate makes this a hard cap:
 # if the orchestrator dies, the box still disappears.
 shutdown -h +%d
-# Quiet-box hygiene: nothing may wake up mid-measurement.
+%s# Quiet-box hygiene: nothing may wake up mid-measurement.
 systemctl disable --now unattended-upgrades.service >/dev/null 2>&1
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
 systemctl disable --now snapd.service snapd.socket snapd.seeded.service >/dev/null 2>&1
@@ -249,7 +300,7 @@ systemctl disable --now motd-news.timer man-db.timer >/dev/null 2>&1
 echo 'kernel.perf_event_paranoid=1' > /etc/sysctl.d/99-bench-perf.conf
 sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1
 touch /var/lib/cloud/instance/BENCH_USERDATA_DONE
-`, deadmanMinutes)
+`, deadmanMinutes, relocate)
 }
 
 func (aws *AWS) Launch(ctx context.Context, machine Machine, session SessionResources, userDataPath string) (*CloudState, error) {

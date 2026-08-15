@@ -59,7 +59,12 @@ rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite crc-
 3. **Spawns everything in parallel.** EC2 instances launch concurrently against a
    session security group scoped to your address and an ephemeral keypair, with
    `DeleteOnTermination`, terminate-on-shutdown, and a deadman shutdown inside
-   the instance. Local hosts get their staging directory prepared.
+   the instance. SSH never runs on port 22: the security group opens only the
+   configured ports (`fleet.aws.ssh_ingress_port`, default 22022, per-machine
+   overridable via `connection.port`) and user-data relocates each instance's
+   sshd there at boot — including on socket-activated Ubuntu, where
+   `ssh.socket` owns the listener. Local hosts get their staging directory
+   prepared.
 4. **Runs each host fully detached.** The bundle and a generated self-contained
    run script go up by tar-over-ssh; the script is started with
    `setsid`/`nohup` and needs no further orchestrator contact. On the host it

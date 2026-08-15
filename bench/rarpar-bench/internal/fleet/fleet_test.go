@@ -1,6 +1,8 @@
 package fleet
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -150,6 +152,12 @@ func TestConfigValidation(t *testing.T) {
 			old:  "schema_version = 1",
 			new:  "schema_version = 2",
 			want: "schema_version must be 1",
+		},
+		{
+			name: "ssh_ingress_port must be a real port",
+			old:  "ssh_ingress_port = 22022",
+			new:  "ssh_ingress_port = 0",
+			want: "ssh_ingress_port must be 1-65535",
 		},
 		{
 			name: "unknown key is refused, not ignored",
@@ -804,7 +812,7 @@ name = "second"
 }
 
 func TestUserDataAlwaysCarriesADeadman(t *testing.T) {
-	script := UserData(180)
+	script := UserData(180, 22022)
 	if !strings.Contains(script, "shutdown -h +180") {
 		t.Fatal("every cloud host must get a deadman shutdown")
 	}
@@ -816,12 +824,105 @@ func TestUserDataAlwaysCarriesADeadman(t *testing.T) {
 // Round 1 lost perf on four of five boxes because the stock Ubuntu AMIs ship
 // kernel.perf_event_paranoid=4 and perf refuses to count for an unprivileged user.
 func TestUserDataOpensThePerfCountersToTheBenchUser(t *testing.T) {
-	script := UserData(180)
+	script := UserData(180, 22022)
 	if !strings.Contains(script, "sysctl -w kernel.perf_event_paranoid=1") {
 		t.Fatal("user-data must relax perf_event_paranoid for the running boot")
 	}
 	if !strings.Contains(script, "/etc/sysctl.d/99-bench-perf.conf") {
 		t.Fatal("the perf_event_paranoid relaxation must survive a reboot via a sysctl.d drop-in")
+	}
+}
+
+// The security group only opens the configured port, so sshd must move there
+// or the box is unreachable. Both listener mechanisms have to be covered:
+// classic sshd_config on service-managed images, and Ubuntu 22.10+ socket
+// activation, where ssh.socket owns the listener and sshd_config Port lines
+// bind nothing.
+func TestUserDataRelocatesSSHDOntoTheConfiguredPort(t *testing.T) {
+	script := UserData(180, 22022)
+	for _, needed := range []string{
+		// Existing Port lines are neutralised, so 22 is closed, not supplemented.
+		`sed -i 's/^Port /#Port /' /etc/ssh/sshd_config`,
+		// Prepended, not dropped into sshd_config.d: works without an Include
+		// directive and stays outside any Match block.
+		`sed -i '1i Port 22022' /etc/ssh/sshd_config`,
+		`/etc/systemd/system/ssh.socket.d/50-bench-port.conf`,
+		// ListenStream= first: clears 22 before adding the new port.
+		`printf '[Socket]\nListenStream=\nListenStream=22022\n'`,
+		`systemctl daemon-reload`,
+		`systemctl restart ssh.socket`,
+	} {
+		if !strings.Contains(script, needed) {
+			t.Fatalf("user-data must contain %q:\n%s", needed, script)
+		}
+	}
+	if strings.Index(script, "shutdown -h") > strings.Index(script, "Relocate sshd") {
+		t.Fatal("the deadman must be scheduled before anything else, including the sshd relocation")
+	}
+}
+
+// Explicit port 22 is the operator saying "stock behavior"; user-data must not
+// touch sshd at all in that case.
+func TestUserDataLeavesSSHDAloneOnPort22(t *testing.T) {
+	script := UserData(180, 22)
+	for _, forbidden := range []string{"ssh.socket", "sshd_config", "Relocate sshd"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("port 22 must leave stock sshd untouched; found %q in:\n%s", forbidden, script)
+		}
+	}
+}
+
+// The security group is the run's only network exposure, so the rule set is
+// asserted directly: one ingress rule per distinct configured port, scoped to
+// the orchestrator's /32, and nothing else — 22 is reachable only if some
+// machine explicitly configured it.
+func TestCreateSessionOpensExactlyTheConfiguredPorts(t *testing.T) {
+	var lines []string
+	aws := &AWS{CLI: "aws", Region: "us-east-1", DryRun: true, Log: func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}}
+	session, err := aws.CreateSession(context.Background(), "rarpar-fleet", "198.51.100.7", t.TempDir(), []int{22022, 2200, 22022})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := strings.Join(lines, "\n")
+	if got := strings.Count(log, "authorize-security-group-ingress"); got != 2 {
+		t.Fatalf("distinct ports must be authorized exactly once each; got %d rules:\n%s", got, log)
+	}
+	for _, needed := range []string{"--port 2200", "--port 22022", "--cidr 198.51.100.7/32", "ports=2200,22022"} {
+		if !strings.Contains(log, needed) {
+			t.Fatalf("session log must contain %q:\n%s", needed, log)
+		}
+	}
+	if strings.Contains(log, "--port 22 ") {
+		t.Fatalf("port 22 must never be opened unless configured:\n%s", log)
+	}
+	if session.PublicCIDR != "198.51.100.7/32" {
+		t.Fatalf("ingress must be scoped to the orchestrator's /32, got %s", session.PublicCIDR)
+	}
+}
+
+// Cloud machines resolve their SSH port at decode time — per-machine override
+// or the fleet.aws.ssh_ingress_port default — so the security group rule, the
+// sshd relocation, and every dial all share one value.
+func TestCloudSSHPortInheritsTheFleetIngressPort(t *testing.T) {
+	config := loadExample(t)
+	for _, machine := range config.Machines {
+		if machine.Kind == KindAWSEC2 && machine.Connection.Port != 22022 {
+			t.Fatalf("machine %s: port = %d, want the fleet.aws.ssh_ingress_port value 22022", machine.Name, machine.Connection.Port)
+		}
+	}
+}
+
+func TestCloudSSHPortCanBePinnedPerMachine(t *testing.T) {
+	config, err := DecodeConfig("fleet.toml", mutate(t, "user = \"ubuntu\"", "port = 2200\nuser = \"ubuntu\""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, machine := range config.Machines {
+		if machine.Kind == KindAWSEC2 && machine.Connection.Port != 2200 {
+			t.Fatalf("machine %s: port = %d, want the per-machine pin 2200", machine.Name, machine.Connection.Port)
+		}
 	}
 }
 
