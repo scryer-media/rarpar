@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -191,10 +192,87 @@ func buildKey(machine Machine) string {
 	}, "|")
 }
 
-// sharedBundleName is the stable directory name for one build key.
-func sharedBundleName(machine Machine) string {
-	sum := sha256.Sum256([]byte(buildKey(machine)))
+// sharedBundleName is the stable directory name for one build key AND one
+// candidate tree. The tree digest is part of the name on purpose: two
+// concurrent runs with identical bundle configuration but different
+// candidates once resolved to the same remote build directory, where one
+// run's destructive clean deleted the other's in-progress build (loud,
+// $0 — build precedes launch), and where timing alone could have made a run
+// build and ship the OTHER run's source while reporting its own candidate
+// in BUILDINFO (silent). Content-addressing the name closes both for
+// different trees; the per-run remote directory closes the clean race for
+// identical ones.
+func sharedBundleName(machine Machine, treeID string) string {
+	sum := sha256.Sum256([]byte(buildKey(machine) + "|tree=" + treeID))
 	return "shared-" + machine.Bundle.RustTarget + "-" + hex.EncodeToString(sum[:4])
+}
+
+// bundleTreeID content-digests the candidate tree that will be pushed to
+// build hosts: every regular file's relative path and bytes, in sorted
+// order, with VCS and build-output directories skipped. Unlike
+// [`describeTree`] this needs no git metadata, so snapshot trees digest the
+// same as checkouts.
+func bundleTreeID(root string) (string, error) {
+	digest := sha256.New()
+	skip := map[string]bool{".git": true, "target": true, "results": true, "bundles": true}
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if skip[entry.Name()] && path != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type().IsRegular() || entry.Type()&os.ModeSymlink != 0 {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("digesting candidate tree %s: %w", root, err)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return "", err
+		}
+		digest.Write([]byte(relative))
+		digest.Write([]byte{0})
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return "", err
+			}
+			digest.Write([]byte("->" + link))
+			digest.Write([]byte{0})
+			continue
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.Copy(digest, file)
+		file.Close()
+		if err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil)[:8]), nil
+}
+
+// remoteBuildDir is per run as well as per bundle name: even two runs
+// building the IDENTICAL tree and configuration must never share a remote
+// workspace, because the pre-build clean is destructive.
+func remoteBuildDir(bundleName, runID string) string {
+	return ".rarpar-fleet-build/" + bundleName + "-" + runID
 }
 
 // rustTargetGoArch maps a Rust target triple to the GOARCH of the silicon it
@@ -339,9 +417,11 @@ func (bundler *Bundler) buildHarness(ctx context.Context, bundleName string, bun
 }
 
 // remoteDockerBuild runs the same pinned container recipe on a native remote
-// host over ssh (BatchMode — it must never prompt). The remote workspace under
-// ~/.rarpar-fleet-build/<bundle> is left in place on purpose: the cargo caches
-// there make the next round's build incremental.
+// host over ssh (BatchMode — it must never prompt). The remote workspace is
+// per bundle name AND per run id (see [`remoteBuildDir`]), and is removed
+// after a successful pull: the pre-build clean below is destructive, so no
+// two runs may ever share a workspace, and nothing is cached between rounds
+// (the clean always wiped it anyway).
 func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string, bundle Bundle, work, targetArch string) error {
 	host := bundle.BuildHost
 	uname, err := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "uname", "-m").Output()
@@ -352,15 +432,16 @@ func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string
 		return fmt.Errorf("bundle %s: build host %s is %s silicon but rust target %s needs %s — emulated builds are refused everywhere",
 			bundleName, host, got, bundle.RustTarget, targetArch)
 	}
-	remote := ".rarpar-fleet-build/" + bundleName
+	remote := remoteBuildDir(bundleName, filepath.Base(bundler.RunDir))
 	bundler.log("bundle %s: building in %s (%s) on %s", bundleName, bundle.Image, bundle.RustTarget, host)
 	// The build container runs as root and leaves root-owned cargo/build
 	// caches in the remote workdir; a plain user rm -rf then fails EACCES on
 	// every run after the first. Clean via a root container first (same
 	// image, already pulled), falling back to plain rm for a fresh host.
+	remoteName := path.Base(remote)
 	clean := fmt.Sprintf(
 		"mkdir -p %s && docker run --rm -v \"$HOME/.rarpar-fleet-build\":/clean %s rm -rf /clean/%s >/dev/null 2>&1 || rm -rf %s",
-		remote, bundle.Image, bundleName, remote)
+		remote, bundle.Image, remoteName, remote)
 	push := fmt.Sprintf("set -o pipefail; tar -C %s -cf - . | ssh -o BatchMode=yes %s %s",
 		shellQuote(work), shellQuote(host),
 		shellQuote(fmt.Sprintf("%s; mkdir -p %s && tar -C %s -xf -", clean, remote, remote)))
@@ -380,6 +461,14 @@ func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string
 		shellQuote(filepath.Join(work, "out")))
 	if err := runShell(ctx, pull); err != nil {
 		return fmt.Errorf("bundle %s: pulling the bundle back from %s: %w", bundleName, host, err)
+	}
+	// Best-effort removal of the per-run workspace; root-owned cache files
+	// need the container, a fresh tree does not. Failure only costs disk.
+	tidy := fmt.Sprintf(
+		"docker run --rm -v \"$HOME/.rarpar-fleet-build\":/clean %s rm -rf /clean/%s >/dev/null 2>&1 || rm -rf %s || true",
+		bundle.Image, remoteName, remote)
+	if err := runShell(ctx, fmt.Sprintf("ssh -o BatchMode=yes %s %s", shellQuote(host), shellQuote(tidy))); err != nil {
+		bundler.log("bundle %s: leftover workspace on %s not removed (harmless): %v", bundleName, host, err)
 	}
 	return nil
 }

@@ -326,13 +326,17 @@ func (orch *orchestrator) build(ctx context.Context) error {
 		name     string
 		machines []Machine
 	}
+	treeID, err := bundleTreeID(bundler.rarparPath())
+	if err != nil {
+		return err
+	}
 	byKey := map[string]*buildGroup{}
 	groups := []*buildGroup{}
 	for _, machine := range orch.options.Machines {
 		key := buildKey(machine)
 		entry, ok := byKey[key]
 		if !ok {
-			entry = &buildGroup{name: sharedBundleName(machine)}
+			entry = &buildGroup{name: sharedBundleName(machine, treeID)}
 			byKey[key] = entry
 			groups = append(groups, entry)
 		}

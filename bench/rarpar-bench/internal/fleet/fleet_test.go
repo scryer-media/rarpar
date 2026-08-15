@@ -777,8 +777,11 @@ func TestBuildKeyGroupsIdenticalBundles(t *testing.T) {
 	if buildKey(base) == buildKey(other) {
 		t.Fatal("different rust targets must not share a build")
 	}
-	if sharedBundleName(base) == sharedBundleName(other) {
+	if sharedBundleName(base, "tree0") == sharedBundleName(other, "tree0") {
 		t.Fatal("shared bundle names must differ per key")
+	}
+	if sharedBundleName(base, "tree0") == sharedBundleName(base, "tree1") {
+		t.Fatal("shared bundle names must differ per candidate tree")
 	}
 	wider := base
 	wider.Name = "d"
