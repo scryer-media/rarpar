@@ -346,11 +346,19 @@ func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, mach
 	if err := os.MkdirAll(filepath.Join(work, "out"), 0o755); err != nil {
 		return err
 	}
-	rarparAbs, err := filepath.Abs(bundler.rarparPath())
+	// The alias targets must come from weaver's OWN manifest, not from this
+	// harness's rarpar_path: a round that snapshots rarpar (rarpar_path under
+	// a scratch tree) still builds a weaver whose [patch.crates-io] names the
+	// canonical checkout. Aliasing the config path instead of the manifest
+	// path is exactly how the first live fire of this fix failed.
+	aliasRoots, err := weaverPatchRarparRoots(bundler.Settings.WeaverPath)
 	if err != nil {
-		return fmt.Errorf("bundle %s: resolving the rarpar checkout path: %w", bundleName, err)
+		return fmt.Errorf("bundle %s: reading weaver's patch paths: %w", bundleName, err)
 	}
-	script := containerBuildScript(machine, rustFlagVar, rustFlags, bundler.Settings.WeaverPath != "", rarparAbs)
+	if rarparAbs, err := filepath.Abs(bundler.rarparPath()); err == nil && !contains(aliasRoots, rarparAbs) {
+		aliasRoots = append(aliasRoots, rarparAbs)
+	}
+	script := containerBuildScript(machine, rustFlagVar, rustFlags, bundler.Settings.WeaverPath != "", aliasRoots)
 	scriptPath := filepath.Join(work, "build-in-container.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		return err
@@ -491,7 +499,49 @@ func goamd64Flag(bundle Bundle) string {
 	return "GOAMD64=" + bundle.GOAMD64
 }
 
-func containerBuildScript(machine Machine, rustFlagVar, rustFlags string, weaver bool, rarparHostPath string) string {
+// weaverPatchRarparRoots extracts the rarpar checkout roots that weaver's
+// [patch.crates-io] block names by absolute path (each entry points at
+// <root>/crates/<crate>). A weaver tree with no patch block yields no roots
+// and no aliases — published crates resolve on their own.
+func weaverPatchRarparRoots(weaverPath string) ([]string, error) {
+	if weaverPath == "" {
+		return nil, nil
+	}
+	manifest, err := os.ReadFile(filepath.Join(weaverPath, "Cargo.toml"))
+	if err != nil {
+		return nil, err
+	}
+	var roots []string
+	inPatch := false
+	for _, line := range strings.Split(string(manifest), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inPatch = trimmed == "[patch.crates-io]"
+			continue
+		}
+		if !inPatch {
+			continue
+		}
+		_, rest, found := strings.Cut(trimmed, `path = "`)
+		if !found {
+			continue
+		}
+		entry, _, found := strings.Cut(rest, `"`)
+		if !found || !filepath.IsAbs(entry) {
+			continue
+		}
+		root := entry
+		if idx := strings.LastIndex(filepath.ToSlash(entry), "/crates/"); idx > 0 {
+			root = entry[:idx]
+		}
+		if !contains(roots, root) {
+			roots = append(roots, root)
+		}
+	}
+	return roots, nil
+}
+
+func containerBuildScript(machine Machine, rustFlagVar, rustFlags string, weaver bool, rarparHostPaths []string) string {
 	var script strings.Builder
 	script.WriteString("#!/bin/sh\nset -eu\n")
 	script.WriteString("apk add --no-cache musl-dev g++ make cmake clang clang-dev llvm-dev linux-headers perl pkgconfig git bash file >/dev/null 2>&1\n")
@@ -513,16 +563,18 @@ func containerBuildScript(machine Machine, rustFlagVar, rustFlags string, weaver
 	if weaver && (machine.hasSuite(SuiteYencMicro) || machine.hasSuite(SuiteCRCProbe)) {
 		script.WriteString("if [ -d /work/rapidyenc ]; then export WEAVER_RAPIDYENC_SRC=/work/rapidyenc; fi\n")
 		// weaver's workspace root carries a [patch.crates-io] block pinning
-		// par2-rs/unrar-rs/reedsolomon-rs to the orchestrator's rarpar
-		// checkout by ABSOLUTE path, which exists in no build container —
-		// resolution dies loudly on the first weaver build (measured:
-		// yenc-micro's dev-dep on par2-rs). The bundle already stages rarpar
-		// sources at /work/rarpar, so alias the host path to the snapshot.
-		// This is better than a host mount even where one is possible: the
-		// build then consumes the bundle's own content-addressed rarpar tree
-		// on ANY build host, keeping provenance exact.
-		fmt.Fprintf(&script, "if [ ! -e %s ]; then mkdir -p %s && ln -s /work/rarpar %s; fi\n",
-			shellQuote(rarparHostPath), shellQuote(path.Dir(filepath.ToSlash(rarparHostPath))), shellQuote(rarparHostPath))
+		// par2-rs/unrar-rs/reedsolomon-rs to a rarpar checkout by ABSOLUTE
+		// path, which exists in no build container — resolution dies loudly
+		// on the first weaver build (measured: yenc-micro's dev-dep on
+		// par2-rs). The bundle already stages rarpar sources at /work/rarpar,
+		// so alias every root the manifest names (plus the harness's own
+		// rarpar_path) to the snapshot. This is better than a host mount even
+		// where one is possible: the build consumes the bundle's own
+		// content-addressed rarpar tree on ANY build host.
+		for _, hostPath := range rarparHostPaths {
+			fmt.Fprintf(&script, "if [ ! -e %s ]; then mkdir -p %s && ln -s /work/rarpar %s; fi\n",
+				shellQuote(hostPath), shellQuote(path.Dir(filepath.ToSlash(hostPath))), shellQuote(hostPath))
+		}
 		script.WriteString("cd /work/weaver\n")
 		if machine.hasSuite(SuiteYencMicro) {
 			fmt.Fprintf(&script, "cargo build --release --target %s -p weaver-yenc --example decode_timing --example searchend_timing\n", machine.Bundle.RustTarget)

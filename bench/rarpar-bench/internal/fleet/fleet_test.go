@@ -453,28 +453,57 @@ func TestBuildPlan(t *testing.T) {
 	}
 }
 
-func TestContainerBuildAliasesTheRarparPathForWeaver(t *testing.T) {
+func TestContainerBuildAliasesTheManifestRarparPathForWeaver(t *testing.T) {
+	// The roots MUST come from weaver's own manifest: the first live fire of
+	// this fix aliased the harness's rarpar_path (a scratch snapshot) while
+	// the manifest named the canonical checkout, and the build died on the
+	// same rc=101 the alias exists to prevent.
+	weaverDir := t.TempDir()
+	manifest := `[workspace]
+members = ["server/crates/weaver-yenc"]
+
+[patch.crates-io]
+par2-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-par2" }
+unrar-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-unrar" }
+reedsolomon-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-reed-solomon" }
+`
+	if err := os.WriteFile(filepath.Join(weaverDir, "Cargo.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := weaverPatchRarparRoots(weaverDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0] != "/Users/example/dev/scryer-media/rarpar" {
+		t.Fatalf("three same-root patch entries must collapse to that one root, got %v", roots)
+	}
+
 	machine := Machine{
 		Suites: []string{SuiteYencMicro},
 		Bundle: Bundle{RustTarget: "x86_64-unknown-linux-musl"},
 	}
-	rarpar := "/Users/example/dev/scryer-media/rarpar"
-	script := containerBuildScript(machine, "RUSTFLAGS", "", true, rarpar)
-	// weaver's [patch.crates-io] names the orchestrator's rarpar checkout by
-	// absolute path; the alias to the staged snapshot is what lets the first
-	// weaver build resolve at all (measured failure: yenc-micro's dev-dep on
-	// par2-rs, cargo rc=101 without it).
-	alias := "if [ ! -e '" + rarpar + "' ]; then mkdir -p '/Users/example/dev/scryer-media' && ln -s /work/rarpar '" + rarpar + "'; fi"
-	if !strings.Contains(script, alias) {
-		t.Fatalf("weaver container build is missing the rarpar path alias; script:\n%s", script)
-	}
-	if strings.Index(script, alias) > strings.Index(script, "cd /work/weaver") {
-		t.Fatal("the alias must be created before the weaver build starts")
+	snapshot := "/scratch/round/tree"
+	script := containerBuildScript(machine, "RUSTFLAGS", "", true, append(roots, snapshot))
+	for _, root := range []string{roots[0], snapshot} {
+		alias := "ln -s /work/rarpar '" + root + "'"
+		if !strings.Contains(script, alias) {
+			t.Fatalf("weaver container build is missing the alias for %s; script:\n%s", root, script)
+		}
+		if strings.Index(script, alias) > strings.Index(script, "cd /work/weaver") {
+			t.Fatalf("the alias for %s must be created before the weaver build starts", root)
+		}
 	}
 	// A rarpar-only bundle must not conjure host paths inside its container.
-	bare := containerBuildScript(machine, "RUSTFLAGS", "", false, rarpar)
+	bare := containerBuildScript(machine, "RUSTFLAGS", "", false, roots)
 	if strings.Contains(bare, "ln -s /work/rarpar") {
 		t.Fatal("non-weaver container builds must not create the alias")
+	}
+	// No patch block -> no roots -> nothing to alias.
+	if err := os.WriteFile(filepath.Join(weaverDir, "Cargo.toml"), []byte("[workspace]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if roots, err := weaverPatchRarparRoots(weaverDir); err != nil || len(roots) != 0 {
+		t.Fatalf("patch-free manifest must yield no roots, got %v, %v", roots, err)
 	}
 }
 
