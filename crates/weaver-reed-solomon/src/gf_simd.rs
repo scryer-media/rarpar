@@ -704,6 +704,28 @@ fn folded_avx512_enabled() -> bool {
     })
 }
 
+/// Whether the 512-bit shuffle2x kernel can run. Setting
+/// `WEAVER_GF16_SHUFFLE2X_AVX512=0` pins the 256-bit kernel so wide hardware
+/// can A/B the two widths without a rebuild.
+///
+/// **Oracle alignment.** ParPar's `default_method` picks `GF16_SHUFFLE_AVX512`
+/// on every AVX512BW/VL machine without GFNI (`gf16mul.cpp:1559-1564`) — the
+/// tier c5-class Skylake/Cascade Lake silicon lands on. GFNI machines never
+/// reach this gate: the create path routes them to the affine folded kernels
+/// first, exactly as the oracle prefers affine over every shuffle.
+#[cfg(target_arch = "x86_64")]
+fn shuffle2x_avx512_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var_os("WEAVER_GF16_SHUFFLE2X_AVX512").is_some_and(|v| v == "0") {
+            return false;
+        }
+        is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+    })
+}
+
 /// Bytes per split-layout block: one 256-bit register holding 16 GF(2^16)
 /// words as [16 low bytes | 16 high bytes].
 pub const SPLIT_BLOCK_BYTES: usize = 32;
@@ -1099,8 +1121,14 @@ pub fn mul_acc_shuffle2x_batch(
         }
         debug_assert!(altmap_supported());
         if altmap_uses_avx2() {
-            for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
-                unsafe { mul_acc_shuffle2x_group_avx2(dst, staging, group_tables) };
+            if shuffle2x_avx512_enabled() {
+                for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                    unsafe { mul_acc_shuffle2x_group_avx512(dst, staging, group_tables) };
+                }
+            } else {
+                for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                    unsafe { mul_acc_shuffle2x_group_avx2(dst, staging, group_tables) };
+                }
             }
         } else {
             for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
@@ -1304,6 +1332,108 @@ unsafe fn mul_acc_shuffle2x_group_avx2(
 
             offset += SPLIT_BLOCK_BYTES;
             src += stride;
+        }
+    }
+}
+
+/// Multiply one interleaved six-source group into a split-layout destination
+/// with the 512-bit shuffle2x kernel — two destination blocks per iteration.
+///
+/// **Oracle port.** ParPar's `default_method` selects `GF16_SHUFFLE_AVX512`
+/// for every AVX512BW/VL machine without GFNI (`gf16mul.cpp:1559-1564`); this
+/// is that tier expressed over rarpar's split layout. A zmm destination load
+/// covers two consecutive 32-byte split blocks, so its four 128-bit lanes are
+/// `[lo_a | hi_a | lo_b | hi_b]`. Each [`Shuffle2xTables`] field is already
+/// the `[low-plane table | high-plane table]` pair the ymm kernel uses;
+/// duplicating it into both zmm halves makes every lane meet the table its
+/// plane needs, so the arithmetic per block is instruction-identical to
+/// [`mul_acc_shuffle2x_group_avx2`] at half the shuffle/XOR count per byte
+/// and half the destination traffic. The cross-plane fold widens the same
+/// way: `permute2x128` becomes a `shuffle_i32x4` swapping lanes pairwise
+/// (`[1,0,3,2]`, imm `0xB1`).
+///
+/// The staging interleave places lane `l`'s blocks 192 bytes apart, so the
+/// two blocks feeding one zmm are loaded as two ymm halves and joined with
+/// one insert — the only instruction the widening adds per source. All 24
+/// table registers for the group stay resident (6 sources x 4 tables), which
+/// is exactly why this kernel is single-group where the GFNI pair kernel is
+/// two-group: affine needs 2 matrix registers per source, shuffle needs 4.
+/// An odd trailing 32-byte block runs one ymm iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]
+unsafe fn mul_acc_shuffle2x_group_avx512(
+    dst: &mut [u8],
+    staging: &[u8],
+    tables: &[&Shuffle2xTables; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        // Duplicate a 32-byte [low | high] table pair into both zmm halves.
+        let widen = |field: &[u8; 32]| {
+            let half = _mm256_loadu_si256(field.as_ptr() as *const __m256i);
+            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(half), half)
+        };
+        let mut table_regs = [[_mm512_setzero_si512(); 4]; FOLDED_GROUP];
+        for (regs, lane_tables) in table_regs.iter_mut().zip(tables.iter()) {
+            *regs = [
+                widen(&lane_tables.norm_lo),
+                widen(&lane_tables.swap_lo),
+                widen(&lane_tables.norm_hi),
+                widen(&lane_tables.swap_hi),
+            ];
+        }
+
+        let mask = _mm512_set1_epi8(0x0f);
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let wide_len = len & !(2 * SPLIT_BLOCK_BYTES - 1);
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < wide_len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 256) as *const i8);
+
+            let mut result = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+            let mut swapped = _mm512_setzero_si512();
+
+            macro_rules! lane {
+                ($idx:literal) => {
+                    let low_block = _mm256_loadu_si256(
+                        staging.as_ptr().add(src + $idx * SPLIT_BLOCK_BYTES) as *const __m256i,
+                    );
+                    let high_block = _mm256_loadu_si256(
+                        staging
+                            .as_ptr()
+                            .add(src + stride + $idx * SPLIT_BLOCK_BYTES) as *const __m256i,
+                    );
+                    let data =
+                        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low_block), high_block);
+                    let lo = _mm512_and_si512(data, mask);
+                    let hi = _mm512_and_si512(_mm512_srli_epi16::<4>(data), mask);
+                    let [nl, sl, nh, sh] = table_regs[$idx];
+                    result = _mm512_xor_si512(result, _mm512_shuffle_epi8(nl, lo));
+                    swapped = _mm512_xor_si512(swapped, _mm512_shuffle_epi8(sl, lo));
+                    result = _mm512_xor_si512(result, _mm512_shuffle_epi8(nh, hi));
+                    swapped = _mm512_xor_si512(swapped, _mm512_shuffle_epi8(sh, hi));
+                };
+            }
+            lane!(0);
+            lane!(1);
+            lane!(2);
+            lane!(3);
+            lane!(4);
+            lane!(5);
+
+            // Pairwise 128-bit lane swap: [1, 0, 3, 2].
+            let crossed = _mm512_shuffle_i32x4::<0xB1>(swapped, swapped);
+            result = _mm512_xor_si512(result, crossed);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+
+            offset += 2 * SPLIT_BLOCK_BYTES;
+            src += 2 * stride;
+        }
+        if offset < len {
+            mul_acc_shuffle2x_group_avx2(&mut dst[offset..], &staging[src..], tables);
         }
     }
 }
@@ -6113,6 +6243,58 @@ mod tests {
                     "shuffle2x batch mismatch groups={groups} len={len}"
                 );
             }
+        }
+    }
+
+    /// Direct 512-vs-256 differential for the widened shuffle2x kernel,
+    /// isolating odd-block tails and short regions. NOTE-skips on hardware
+    /// without AVX-512; the c5-class fleet leg executes it for real.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn shuffle2x_group_avx512_matches_avx2() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP shuffle2x_group_avx512_matches_avx2: host lacks avx2");
+            return;
+        }
+        if !(is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl"))
+        {
+            eprintln!(
+                "NOTE shuffle2x_group_avx512_matches_avx2: host lacks \
+                 avx512f+avx512bw+avx512vl, 512-bit arm skipped"
+            );
+            return;
+        }
+        let factors: [u16; FOLDED_GROUP] = [0x0000, 0x0001, 0x2F1D, 0xABCD, 0x0101, 0xFFFF];
+        let tables_owned: Vec<Shuffle2xTables> = factors
+            .iter()
+            .map(|&f| precompute_shuffle2x_tables(f))
+            .collect();
+        let tables: [&Shuffle2xTables; FOLDED_GROUP] = [
+            &tables_owned[0],
+            &tables_owned[1],
+            &tables_owned[2],
+            &tables_owned[3],
+            &tables_owned[4],
+            &tables_owned[5],
+        ];
+        // Even block counts, a single-block tail-only region, and odd block
+        // counts whose last 32 bytes take the ymm tail arm.
+        for len in [32usize, 64, 96, 4096, 4128] {
+            let inputs: Vec<Vec<u8>> = (0..FOLDED_GROUP)
+                .map(|l| (0..len).map(|i| ((i * (l + 3) + 41) % 256) as u8).collect())
+                .collect();
+            let mut staging = vec![0u8; len * FOLDED_GROUP];
+            for (lane, input) in inputs.iter().enumerate() {
+                split_encode_scatter(input, &mut staging, lane);
+            }
+            let mut narrow = vec![0x5Au8; len];
+            altmap_encode(&mut narrow);
+            let mut wide = narrow.clone();
+            unsafe { mul_acc_shuffle2x_group_avx2(&mut narrow, &staging, &tables) };
+            unsafe { mul_acc_shuffle2x_group_avx512(&mut wide, &staging, &tables) };
+            assert_eq!(narrow, wide, "shuffle2x width mismatch len={len}");
         }
     }
 

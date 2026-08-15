@@ -68,7 +68,6 @@ struct ParCreateMemoryReport {
     processing_peak_bytes: usize,
     total_creation_peak_bytes: usize,
     factor_workspace_bytes: usize,
-    jit_workspace_bytes: usize,
     stripe_buffer_bytes: usize,
     controller_overhead_blocks: usize,
 }
@@ -143,7 +142,6 @@ impl ParCreatePlanReport {
                 processing_peak_bytes: plan.memory.processing_peak_bytes,
                 total_creation_peak_bytes: plan.memory.total_creation_peak_bytes,
                 factor_workspace_bytes: plan.memory.factor_workspace_bytes,
-                jit_workspace_bytes: plan.memory.jit_workspace_bytes,
                 stripe_buffer_bytes: plan.memory.stripe_buffer_bytes,
                 controller_overhead_blocks: plan.memory.controller_overhead_blocks,
             },

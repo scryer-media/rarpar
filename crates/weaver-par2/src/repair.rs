@@ -630,8 +630,6 @@ fn neon_packed_enabled() -> bool {
 }
 #[cfg(target_arch = "x86_64")]
 const XORJIT_AVX2_IDEAL_CHUNK_BYTES: usize = 128 * 1024;
-#[cfg(target_arch = "x86_64")]
-const XORJIT_AVX512_IDEAL_CHUNK_BYTES: usize = 48 * 1024;
 
 /// 64-byte-aligned backing for the folded staging streams so every 32-byte
 /// block sits cache-line aligned.
@@ -991,19 +989,10 @@ impl CpuKernelKind {
             #[cfg(target_arch = "x86_64")]
             Self::XorJit(width) => CpuMethodContract {
                 stride: width.block_bytes(),
-                alignment: match width {
-                    reedsolomon_rs::xor_jit::JitWidth::Avx2 => 32,
-                    reedsolomon_rs::xor_jit::JitWidth::Avx512 => 64,
-                },
-                ideal_input_multiple: match width {
-                    reedsolomon_rs::xor_jit::JitWidth::Avx2 => 1,
-                    reedsolomon_rs::xor_jit::JitWidth::Avx512 => 6,
-                },
+                alignment: 32,
+                ideal_input_multiple: 1,
                 staging_multiple: 1,
-                ideal_chunk_size: match width {
-                    reedsolomon_rs::xor_jit::JitWidth::Avx2 => XORJIT_AVX2_IDEAL_CHUNK_BYTES,
-                    reedsolomon_rs::xor_jit::JitWidth::Avx512 => XORJIT_AVX512_IDEAL_CHUNK_BYTES,
-                },
+                ideal_chunk_size: XORJIT_AVX2_IDEAL_CHUNK_BYTES,
                 checksum_width: width.block_bytes() / 16,
                 prefetch: CpuPrefetch {
                     inputs_per_invoke: 1,

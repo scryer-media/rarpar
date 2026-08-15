@@ -13,21 +13,21 @@
 
 mod avx2_emitter;
 pub mod codegen;
-pub mod codegen512;
 pub mod deps;
 pub mod emit;
 pub mod memory;
 pub mod packed;
 pub mod transpose;
-pub mod transpose512;
 
-/// JIT tier width: the AVX2 512-byte-block tier or the AVX512 1024-byte-block
-/// tier ([`codegen512`]). Consumers (par2-rs's streaming tier) hold one of
-/// these and use its methods so the tier plumbing stays width-generic.
+/// JIT tier width. Only the AVX2 512-byte-block tier exists: the AVX-512
+/// JIT was removed after c5 hardware measurement — the oracle never
+/// default-selects an XOR-JIT above the AVX2 line, and 512-bit shuffle beats
+/// it on the only silicon that could run it (git history preserves the
+/// implementation). The enum stays so width-generic consumers keep their
+/// shape.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JitWidth {
     Avx2,
-    Avx512,
 }
 
 impl JitWidth {
@@ -48,7 +48,6 @@ impl JitWidth {
     pub const fn block_bytes(self) -> usize {
         match self {
             JitWidth::Avx2 => transpose::BLOCK_BYTES,
-            JitWidth::Avx512 => transpose512::BLOCK_BYTES,
         }
     }
 
@@ -56,7 +55,6 @@ impl JitWidth {
     pub fn build_muladd(self, factor: u16) -> std::io::Result<Option<memory::JitCode>> {
         match self {
             JitWidth::Avx2 => build_muladd(factor),
-            JitWidth::Avx512 => build_muladd_512(factor),
         }
     }
 
@@ -73,7 +71,6 @@ impl JitWidth {
             .filter(|&factor| factor != 0)
             .map(|factor| match self {
                 JitWidth::Avx2 => generate_avx2_body(factor, false),
-                JitWidth::Avx512 => Ok(codegen512::generate_muladd(&deps::compute_deps(factor))),
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut built = memory::JitCode::new_batch(&generated)?.into_iter();
@@ -135,10 +132,6 @@ impl JitWidth {
                     src.first_chunk().expect("src block size"),
                     dst.first_chunk_mut().expect("dst block size"),
                 ),
-                JitWidth::Avx512 => transpose512::prepare_block(
-                    src.first_chunk().expect("src block size"),
-                    dst.first_chunk_mut().expect("dst block size"),
-                ),
             }
         }
     }
@@ -152,9 +145,6 @@ impl JitWidth {
             match self {
                 JitWidth::Avx2 => {
                     transpose::finish_block(buf.first_chunk_mut().expect("block size"))
-                }
-                JitWidth::Avx512 => {
-                    transpose512::finish_block(buf.first_chunk_mut().expect("block size"))
                 }
             }
         }
@@ -178,7 +168,6 @@ impl JitWidth {
         unsafe {
             match self {
                 JitWidth::Avx2 => code.run_muladd(src, dst, len),
-                JitWidth::Avx512 => code.run_muladd_512(src, dst, len),
             }
         }
     }
@@ -190,9 +179,6 @@ impl JitWidth {
         }
         let code = match self {
             JitWidth::Avx2 => generate_avx2_body(factor, true)?,
-            JitWidth::Avx512 => {
-                codegen512::generate_muladd_with_prefetch(&deps::compute_deps(factor), true)
-            }
         };
         Ok(Some(memory::JitCode::new(&code)?))
     }
@@ -217,7 +203,6 @@ impl JitWidth {
         unsafe {
             match self {
                 JitWidth::Avx2 => code.run_muladd_prefetch(src, dst, len, prefetch),
-                JitWidth::Avx512 => code.run_muladd_prefetch_512(src, dst, len, prefetch),
             }
         }
     }
@@ -253,32 +238,6 @@ impl JitWidth {
         debug_assert_eq!(self, code.width());
         unsafe { code.try_run_with_scratch(scratch, run) }
     }
-}
-
-/// Whether the AVX512 XOR-JIT tier should run: AVX512BW+VL present, GFNI
-/// absent (GFNI boxes use the affine kernels, which beat every XOR tier), not
-/// under binary translation. This reports explicit method availability; the
-/// repair-side/internal automatic selector does not choose this tier, while
-/// callers such as creation Auto may explicitly prioritize it.
-pub fn supported_512() -> bool {
-    // BW+VL is deliberately stricter than the kernel's AVX512F-only needs:
-    // it matches the crate's other AVX512 gates and scopes the tier to
-    // Skylake-X-class silicon (excluding AVX512F-only KNL/KNM, where this
-    // schedule is untuned).
-    std::is_x86_feature_detected!("avx512bw")
-        && std::is_x86_feature_detected!("avx512vl")
-        && !std::is_x86_feature_detected!("gfni")
-        && !running_translated()
-        && strict_wx_available()
-}
-
-/// Build the AVX512 JIT'd muladd code for `factor` (`None` for factor 0).
-pub fn build_muladd_512(factor: u16) -> std::io::Result<Option<memory::JitCode>> {
-    if factor == 0 {
-        return Ok(None);
-    }
-    let code = codegen512::generate_muladd(&deps::compute_deps(factor));
-    Ok(Some(memory::JitCode::new(&code)?))
 }
 
 /// Whether the AVX2 XOR-JIT method is available: AVX2 present, GFNI absent,

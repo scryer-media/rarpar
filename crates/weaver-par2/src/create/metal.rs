@@ -360,7 +360,6 @@ fn estimate_metal_memory(
     if output_count == 0 {
         return Ok(ForwardMemoryEstimate {
             factor_workspace_bytes: 0,
-            jit_workspace_bytes: 0,
             stripe_buffer_bytes: 0,
             processing_peak_bytes: 0,
         });
@@ -368,7 +367,6 @@ fn estimate_metal_memory(
     let shape = choose_shape(slice_size, source_count, output_count, memory_limit)?;
     Ok(ForwardMemoryEstimate {
         factor_workspace_bytes: shape.factor_workspace_bytes,
-        jit_workspace_bytes: 0,
         stripe_buffer_bytes: shape.stripe_buffer_bytes,
         processing_peak_bytes: shape.combined_bytes,
     })
@@ -606,7 +604,6 @@ mod auto_tests {
     fn auto_planning_uses_cpu_memory_below_work_boundary() {
         let cpu_memory = ForwardMemoryEstimate {
             factor_workspace_bytes: 11,
-            jit_workspace_bytes: 22,
             stripe_buffer_bytes: 33,
             processing_peak_bytes: 44,
         };
