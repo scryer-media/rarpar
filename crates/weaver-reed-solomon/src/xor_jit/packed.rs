@@ -1287,8 +1287,7 @@ mod tests {
     /// models do to admission).
     #[test]
     fn avx2_arena_bound_is_capped_by_the_factor_domain() {
-        let capped =
-            PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 65535, 12).unwrap();
+        let capped = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 65535, 12).unwrap();
         assert_eq!(capped, usize::from(u16::MAX) * AVX2_MAX_BODY_BYTES);
         let small = PackedJitBatch::active_arena_upper_bound(JitWidth::Avx2, 3, 12).unwrap();
         assert_eq!(small, 3 * 12 * AVX2_MAX_BODY_BYTES);
