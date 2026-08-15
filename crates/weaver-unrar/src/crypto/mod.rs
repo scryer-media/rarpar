@@ -1156,13 +1156,15 @@ impl Rar29Sha1 {
                 return unsafe { sha1_hw::transform_block(&mut self.state, block) };
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if sha1_ssse3_enabled() {
-                // SAFETY: ssse3 availability was verified at runtime.
-                return unsafe { sha1_ssse3::transform_block(&mut self.state, block) };
-            }
-        }
+        // No vector tier below the SHA-extension line, and that is a MEASURED
+        // decision, not an omission: an SSSE3 variant with the message
+        // schedule computed 4-wide up front (Intel's technique, sans
+        // interleaving) lost to this unrolled scalar on native x86 — 0.788x
+        // on Golden Cove, 0.860x on Gracemont (i5-1240P, 400k-block probe,
+        // 2026-08-15). The scalar's schedule work already rides in the round
+        // chain's ILP slack; hoisting it into vector registers only added
+        // domain-crossing overhead. Any revisit must be the fully
+        // interleaved OpenSSL shape, and must bring measurements.
         self.transform_block_scalar(block)
     }
 
@@ -1599,226 +1601,6 @@ mod sha1_hw {
             _mm_storeu_si128(out.add(3), _mm_shuffle_epi32::<0x1B>(m3));
             workspace
         }
-    }
-}
-
-/// Whether the SSSE3 vector-schedule SHA-1 tier can run. Setting
-/// `WEAVER_UNRAR_SHA1_SSSE3=0` pins the plain unrolled scalar so the two
-/// no-SHA-NI shapes can be A/B'd without a rebuild.
-#[cfg(target_arch = "x86_64")]
-fn sha1_ssse3_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if std::env::var_os("WEAVER_UNRAR_SHA1_SSSE3").is_some_and(|v| v == "0") {
-            return false;
-        }
-        std::arch::is_x86_feature_detected!("ssse3")
-    })
-}
-
-/// SSSE3 SHA-1 for x86 hosts without SHA extensions (Intel's vectorized
-/// message schedule, the same technique OpenSSL uses pre-SHA-NI, which the
-/// reference unrar's plain unrolled C does NOT use — this is the tier that
-/// can beat it rather than tie it).
-///
-/// The 64 scheduled words are produced four at a time in vector registers
-/// into a flat W[80], so the strictly serial a..e round chain runs with its
-/// schedule work lifted off the dependency path. The recurrence has a
-/// distance-3 dependency inside each 4-lane group; the group is computed
-/// with the W[t] term zeroed in lane 3 and the missing rotl1(W[t])
-/// contribution is patched in afterwards (the standard two-instruction fix).
-///
-/// RAR29 contract: returns raw W[64..80) exactly as the scalar path does —
-/// the flat array makes that a plain copy of its tail.
-#[cfg(target_arch = "x86_64")]
-mod sha1_ssse3 {
-    use std::arch::x86_64::*;
-
-    #[inline]
-    unsafe fn rotl1_epi32(v: __m128i) -> __m128i {
-        unsafe { _mm_or_si128(_mm_slli_epi32::<1>(v), _mm_srli_epi32::<31>(v)) }
-    }
-
-    /// Process one 64-byte block, updating `state` and returning the final
-    /// 16 message-schedule words W[64..80).
-    #[target_feature(enable = "ssse3")]
-    pub fn transform_block(state: &mut [u32; 5], block: &[u8; 64]) -> [u32; 16] {
-        let mut w80 = [0u32; 80];
-        unsafe {
-            // Big-endian message words, four per register, W[t] in lane t&3.
-            let bswap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0bu64 as i64, 0x0405_0607_0001_0203);
-            let ptr = block.as_ptr() as *const __m128i;
-            let mut w0 = _mm_shuffle_epi8(_mm_loadu_si128(ptr), bswap);
-            let mut w1 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(1)), bswap);
-            let mut w2 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(2)), bswap);
-            let mut w3 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(3)), bswap);
-            let out = w80.as_mut_ptr() as *mut __m128i;
-            _mm_storeu_si128(out, w0);
-            _mm_storeu_si128(out.add(1), w1);
-            _mm_storeu_si128(out.add(2), w2);
-            _mm_storeu_si128(out.add(3), w3);
-
-            for group in 4..20 {
-                // Lanes t..t+3, t = group*4:
-                //   W[t] = rotl1(W[t-3] ^ W[t-8] ^ W[t-14] ^ W[t-16])
-                let a = w0; // W[t-16..t-13]
-                let b = _mm_alignr_epi8::<8>(w1, w0); // W[t-14..t-11]
-                let c = w2; // W[t-8..t-5]
-                let d = _mm_srli_si128::<4>(w3); // W[t-3], W[t-2], W[t-1], 0
-                let x = _mm_xor_si128(_mm_xor_si128(a, b), _mm_xor_si128(c, d));
-                let mut r = rotl1_epi32(x);
-                // Lane 3's W[t] term was the zero above; patch rotl1(W[t]) in.
-                r = _mm_xor_si128(r, rotl1_epi32(_mm_slli_si128::<12>(r)));
-                _mm_storeu_si128(out.add(group), r);
-                w0 = w1;
-                w1 = w2;
-                w2 = w3;
-                w3 = r;
-            }
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e] = *state;
-
-        macro_rules! rnd {
-            ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:expr, $k:literal, $i:literal) => {{
-                $e = $e
-                    .wrapping_add($a.rotate_left(5))
-                    .wrapping_add($f)
-                    .wrapping_add($k)
-                    .wrapping_add(w80[$i]);
-                $b = $b.rotate_left(30);
-            }};
-        }
-        macro_rules! r1 {
-            ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $i:literal) => {
-                rnd!(
-                    $a,
-                    $b,
-                    $c,
-                    $d,
-                    $e,
-                    ($b & ($c ^ $d)) ^ $d,
-                    0x5a82_7999u32,
-                    $i
-                )
-            };
-        }
-        macro_rules! r2 {
-            ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $i:literal) => {
-                rnd!($a, $b, $c, $d, $e, $b ^ $c ^ $d, 0x6ed9_eba1u32, $i)
-            };
-        }
-        macro_rules! r3 {
-            ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $i:literal) => {
-                rnd!(
-                    $a,
-                    $b,
-                    $c,
-                    $d,
-                    $e,
-                    (($b | $c) & $d) | ($b & $c),
-                    0x8f1b_bcdcu32,
-                    $i
-                )
-            };
-        }
-        macro_rules! r4 {
-            ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $i:literal) => {
-                rnd!($a, $b, $c, $d, $e, $b ^ $c ^ $d, 0xca62_c1d6u32, $i)
-            };
-        }
-
-        r1!(a, b, c, d, e, 0);
-        r1!(e, a, b, c, d, 1);
-        r1!(d, e, a, b, c, 2);
-        r1!(c, d, e, a, b, 3);
-        r1!(b, c, d, e, a, 4);
-        r1!(a, b, c, d, e, 5);
-        r1!(e, a, b, c, d, 6);
-        r1!(d, e, a, b, c, 7);
-        r1!(c, d, e, a, b, 8);
-        r1!(b, c, d, e, a, 9);
-        r1!(a, b, c, d, e, 10);
-        r1!(e, a, b, c, d, 11);
-        r1!(d, e, a, b, c, 12);
-        r1!(c, d, e, a, b, 13);
-        r1!(b, c, d, e, a, 14);
-        r1!(a, b, c, d, e, 15);
-        r1!(e, a, b, c, d, 16);
-        r1!(d, e, a, b, c, 17);
-        r1!(c, d, e, a, b, 18);
-        r1!(b, c, d, e, a, 19);
-
-        r2!(a, b, c, d, e, 20);
-        r2!(e, a, b, c, d, 21);
-        r2!(d, e, a, b, c, 22);
-        r2!(c, d, e, a, b, 23);
-        r2!(b, c, d, e, a, 24);
-        r2!(a, b, c, d, e, 25);
-        r2!(e, a, b, c, d, 26);
-        r2!(d, e, a, b, c, 27);
-        r2!(c, d, e, a, b, 28);
-        r2!(b, c, d, e, a, 29);
-        r2!(a, b, c, d, e, 30);
-        r2!(e, a, b, c, d, 31);
-        r2!(d, e, a, b, c, 32);
-        r2!(c, d, e, a, b, 33);
-        r2!(b, c, d, e, a, 34);
-        r2!(a, b, c, d, e, 35);
-        r2!(e, a, b, c, d, 36);
-        r2!(d, e, a, b, c, 37);
-        r2!(c, d, e, a, b, 38);
-        r2!(b, c, d, e, a, 39);
-
-        r3!(a, b, c, d, e, 40);
-        r3!(e, a, b, c, d, 41);
-        r3!(d, e, a, b, c, 42);
-        r3!(c, d, e, a, b, 43);
-        r3!(b, c, d, e, a, 44);
-        r3!(a, b, c, d, e, 45);
-        r3!(e, a, b, c, d, 46);
-        r3!(d, e, a, b, c, 47);
-        r3!(c, d, e, a, b, 48);
-        r3!(b, c, d, e, a, 49);
-        r3!(a, b, c, d, e, 50);
-        r3!(e, a, b, c, d, 51);
-        r3!(d, e, a, b, c, 52);
-        r3!(c, d, e, a, b, 53);
-        r3!(b, c, d, e, a, 54);
-        r3!(a, b, c, d, e, 55);
-        r3!(e, a, b, c, d, 56);
-        r3!(d, e, a, b, c, 57);
-        r3!(c, d, e, a, b, 58);
-        r3!(b, c, d, e, a, 59);
-
-        r4!(a, b, c, d, e, 60);
-        r4!(e, a, b, c, d, 61);
-        r4!(d, e, a, b, c, 62);
-        r4!(c, d, e, a, b, 63);
-        r4!(b, c, d, e, a, 64);
-        r4!(a, b, c, d, e, 65);
-        r4!(e, a, b, c, d, 66);
-        r4!(d, e, a, b, c, 67);
-        r4!(c, d, e, a, b, 68);
-        r4!(b, c, d, e, a, 69);
-        r4!(a, b, c, d, e, 70);
-        r4!(e, a, b, c, d, 71);
-        r4!(d, e, a, b, c, 72);
-        r4!(c, d, e, a, b, 73);
-        r4!(b, c, d, e, a, 74);
-        r4!(a, b, c, d, e, 75);
-        r4!(e, a, b, c, d, 76);
-        r4!(d, e, a, b, c, 77);
-        r4!(c, d, e, a, b, 78);
-        r4!(b, c, d, e, a, 79);
-
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-
-        w80[64..80].try_into().unwrap()
     }
 }
 
@@ -2745,88 +2527,36 @@ mod tests {
         }
     }
 
-    /// The SSSE3 vector-schedule transform must match the scalar path bit
-    /// for bit — state and the RAR29 W[64..80) return both. Gated on the CPU
-    /// feature directly (not the env-pinnable dispatch gate) so a pin can
-    /// never silently skip the differential.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn rar29_sha1_ssse3_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("ssse3") {
-            eprintln!("skipping: SSSE3 not available");
-            return;
-        }
-
-        let mut seed = 0x0dd0_5ea1_5ca1_a12du64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-
-        for round in 0..4096 {
-            let mut block = [0u8; 64];
-            for chunk in block.chunks_exact_mut(8) {
-                chunk.copy_from_slice(&next().to_le_bytes());
-            }
-            let mut state = [0u32; 5];
-            for word in &mut state {
-                *word = next() as u32;
-            }
-
-            let mut scalar = Rar29Sha1::new();
-            scalar.state = state;
-            let mut vector_state = state;
-
-            let ws_scalar = scalar.transform_block_scalar(&block);
-            // SAFETY: ssse3 availability checked above.
-            let ws_vector = unsafe { sha1_ssse3::transform_block(&mut vector_state, &block) };
-
-            assert_eq!(
-                scalar.state, vector_state,
-                "state diverged at round {round}"
-            );
-            assert_eq!(ws_scalar, ws_vector, "schedule diverged at round {round}");
-        }
-    }
-
-    /// Informational shape comparison for the two no-SHA-NI tiers; run
-    /// explicitly with `--ignored`. Prints a NOTE line rather than asserting
-    /// a ratio — relative timings belong to real bench hosts.
-    #[cfg(target_arch = "x86_64")]
+    /// Informational probe of the unroll's magnitude versus the pre-unroll
+    /// rolled loop; run explicitly with `--ignored`. Prints a NOTE line
+    /// rather than asserting a ratio — timings belong to real bench hosts.
     #[test]
     #[ignore = "timing probe; run explicitly"]
-    fn rar29_sha1_scalar_vs_ssse3_throughput() {
-        if !std::arch::is_x86_feature_detected!("ssse3") {
-            eprintln!("skipping: SSSE3 not available");
-            return;
-        }
+    fn rar29_sha1_rolled_vs_unrolled_throughput() {
         const BLOCKS: u32 = 400_000;
         let block = [0xa5u8; 64];
 
-        let mut scalar = Rar29Sha1::new();
+        let mut rolled = Rar29Sha1::new();
         let start = std::time::Instant::now();
         for _ in 0..BLOCKS {
-            std::hint::black_box(scalar.transform_block_scalar(std::hint::black_box(&block)));
+            std::hint::black_box(
+                rolled.transform_block_scalar_reference(std::hint::black_box(&block)),
+            );
         }
-        let scalar_elapsed = start.elapsed();
+        let rolled_elapsed = start.elapsed();
 
-        let mut vector_state = [0u32; 5];
+        let mut unrolled = Rar29Sha1::new();
         let start = std::time::Instant::now();
         for _ in 0..BLOCKS {
-            // SAFETY: ssse3 availability checked above.
-            std::hint::black_box(unsafe {
-                sha1_ssse3::transform_block(&mut vector_state, std::hint::black_box(&block))
-            });
+            std::hint::black_box(unrolled.transform_block_scalar(std::hint::black_box(&block)));
         }
-        let vector_elapsed = start.elapsed();
+        let unrolled_elapsed = start.elapsed();
 
         eprintln!(
-            "NOTE: rar29-sha1 {BLOCKS} blocks: scalar {:?}, ssse3 {:?}, scalar/ssse3 = {:.3}",
-            scalar_elapsed,
-            vector_elapsed,
-            scalar_elapsed.as_secs_f64() / vector_elapsed.as_secs_f64()
+            "NOTE: rar29-sha1 {BLOCKS} blocks: rolled {:?}, unrolled {:?}, rolled/unrolled = {:.3}",
+            rolled_elapsed,
+            unrolled_elapsed,
+            rolled_elapsed.as_secs_f64() / unrolled_elapsed.as_secs_f64()
         );
     }
 
