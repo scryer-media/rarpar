@@ -1037,41 +1037,6 @@ impl Window {
         Ok(written)
     }
 
-    /// Return visible subranges within `[start_total, start_total + len)`.
-    ///
-    /// Each tuple is `(offset_inside_range, visible_len)`. Hidden bytes are
-    /// dictionary-only advancement and must not be emitted to callers.
-    pub(crate) fn visible_subranges(&self, start_total: u64, len: usize) -> Vec<(usize, usize)> {
-        let end_total = start_total
-            .saturating_add(len as u64)
-            .min(self.total_written);
-        let mut ranges = Vec::new();
-        let mut cursor = start_total;
-
-        for &(inv_start, inv_len) in &self.invisible_ranges {
-            let inv_end = inv_start.saturating_add(inv_len);
-            if inv_end <= cursor {
-                continue;
-            }
-            if inv_start >= end_total {
-                break;
-            }
-            if inv_start > cursor {
-                let gap_end = inv_start.min(end_total);
-                ranges.push(((cursor - start_total) as usize, (gap_end - cursor) as usize));
-            }
-            cursor = cursor.max(inv_end.min(end_total));
-        }
-        if cursor < end_total {
-            ranges.push((
-                (cursor - start_total) as usize,
-                (end_total - cursor) as usize,
-            ));
-        }
-
-        ranges
-    }
-
     /// Number of unflushed bytes currently in the window.
     pub fn unflushed_bytes(&self) -> u64 {
         let span = self.total_written.saturating_sub(self.total_flushed);
@@ -1926,19 +1891,6 @@ mod tests {
         assert_eq!(w.flush_to_writer(&mut emitted).unwrap(), 3);
         assert_eq!(emitted, b"ABZ");
         assert_eq!(w.total_flushed(), w.total_written());
-    }
-
-    #[test]
-    fn visible_subranges_reports_only_visible_parts_inside_range() {
-        let mut w = Window::new(16);
-        w.put_bytes(b"ABCD");
-        w.mark_flushed(4);
-        w.copy_with_visible_len(4, 4, 2).unwrap();
-        w.put_bytes(b"Z");
-
-        assert_eq!(w.visible_subranges(4, 5), vec![(0, 2), (4, 1)]);
-        assert_eq!(w.visible_subranges(6, 3), vec![(2, 1)]);
-        assert!(w.visible_subranges(6, 2).is_empty());
     }
 
     #[test]

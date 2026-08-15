@@ -2000,13 +2000,7 @@ impl LzDecoder {
                 if self.parallel_mode_exhausted {
                     // Inline decode writes straight into the window, so the
                     // pending batch has to land first.
-                    self.drain_pending_batch(
-                        &mut pending,
-                        &front_set,
-                        unpacked_size,
-                        output_size,
-                        writer,
-                    )?;
+                    self.drain_pending_batch(&mut pending, &front_set, output_size, writer)?;
                     if *output_size >= unpacked_size {
                         break;
                     }
@@ -2030,7 +2024,6 @@ impl LzDecoder {
                             input,
                             blocks,
                             block_index..batch_end,
-                            unpacked_size,
                             output_size,
                             writer,
                         )?;
@@ -2043,13 +2036,7 @@ impl LzDecoder {
                         .as_ref()
                         .is_some_and(|batch| batch.failure.is_some())
                     {
-                        self.drain_pending_batch(
-                            &mut pending,
-                            &front_set,
-                            unpacked_size,
-                            output_size,
-                            writer,
-                        )?;
+                        self.drain_pending_batch(&mut pending, &front_set, output_size, writer)?;
                     }
                     match pending.take() {
                         Some(batch) => {
@@ -2082,13 +2069,7 @@ impl LzDecoder {
                     }
                     block_index = batch_end;
                 } else {
-                    self.drain_pending_batch(
-                        &mut pending,
-                        &front_set,
-                        unpacked_size,
-                        output_size,
-                        writer,
-                    )?;
+                    self.drain_pending_batch(&mut pending, &front_set, output_size, writer)?;
                     if *output_size >= unpacked_size {
                         break;
                     }
@@ -2110,7 +2091,7 @@ impl LzDecoder {
                 }
             }
             // The last batch of the round has no successor to hide behind.
-            self.drain_pending_batch(&mut pending, &front_set, unpacked_size, output_size, writer)
+            self.drain_pending_batch(&mut pending, &front_set, output_size, writer)
         })();
 
         if pipelined {
@@ -2132,7 +2113,6 @@ impl LzDecoder {
         &mut self,
         pending: &mut Option<PendingBatch>,
         items: &[Vec<DecodedItem>],
-        unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
@@ -2140,12 +2120,7 @@ impl LzDecoder {
             return Ok(());
         };
         phase_diagnostics::measure(Phase::SerialApply, || {
-            self.apply_decoded_items_parallel(
-                &items[..batch.apply_len],
-                unpacked_size,
-                output_size,
-                writer,
-            )
+            self.apply_decoded_items_parallel(&items[..batch.apply_len], output_size, writer)
         })?;
         match batch.failure {
             Some(failure) => Err(failure.error),
@@ -2271,13 +2246,7 @@ impl LzDecoder {
             Ok(pool) => pool,
             Err(error) => {
                 let mut pending = Some(pending);
-                self.drain_pending_batch(
-                    &mut pending,
-                    pending_items,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )?;
+                self.drain_pending_batch(&mut pending, pending_items, output_size, writer)?;
                 return Err(error);
             }
         };
@@ -2322,7 +2291,7 @@ impl LzDecoder {
             // The overlap: workers are already running on the pool while this
             // thread walks the previous batch's items into the window.
             apply_result = phase_diagnostics::measure(Phase::SerialApply, || {
-                self.apply_decoded_items_parallel(apply_items, unpacked_size, output_size, writer)
+                self.apply_decoded_items_parallel(apply_items, output_size, writer)
             });
         });
         scope_timer.finish();
@@ -2437,7 +2406,6 @@ impl LzDecoder {
         input: &[u8],
         blocks: &[BlockInfo],
         range: std::ops::Range<usize>,
-        unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
@@ -2477,7 +2445,6 @@ impl LzDecoder {
             let apply_result = phase_diagnostics::measure(Phase::SerialApply, || {
                 self.apply_decoded_items_parallel(
                     &active[..apply_end - range.start],
-                    unpacked_size,
                     output_size,
                     writer,
                 )
@@ -2536,16 +2503,20 @@ impl LzDecoder {
         self.decode_block(&mut reader, unpacked_size, output_size, writer)
     }
 
+    /// `output_size` is the oracle's `UnpPtr` measured from the file start, so
+    /// it counts every byte a match copies into the dictionary. What of it
+    /// reaches the caller is the write layer's decision, not this loop's — the
+    /// bound comes from `decode_limit`, which the serial loop uses too.
     fn apply_decoded_items_parallel<W: std::io::Write>(
         &mut self,
         all_items: &[Vec<DecodedItem>],
-        unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
+        let mut decode_limit = self.decode_limit();
         for block_items in all_items {
             for item in block_items {
-                if *output_size >= unpacked_size {
+                if *output_size >= decode_limit {
                     return Ok(());
                 }
                 // One comparison per item against the precomputed border, the
@@ -2557,42 +2528,35 @@ impl LzDecoder {
 
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
-                        let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
+                        let n = count as usize + 1;
                         self.window.put_literal_batch(&bytes, n);
                         *output_size += n as u64;
                     }
                     DecodedItem::Match { length, distance } => {
-                        let remaining = (unpacked_size - *output_size) as usize;
                         let full_len = length as usize;
-                        let len = full_len.min(remaining);
 
                         self.insert_old_dist(distance as usize);
 
                         self.last_length = full_len;
-                        self.window
-                            .copy_with_visible_len(distance as usize, full_len, len)?;
-                        *output_size += len as u64;
+                        self.window.copy(distance as usize, full_len)?;
+                        *output_size += full_len as u64;
                     }
                     DecodedItem::RepeatPrev => {
                         if self.last_length != 0 {
                             let distance = self.dist_cache[0];
-                            let remaining = (unpacked_size - *output_size) as usize;
                             let full_len = self.last_length;
-                            let len = full_len.min(remaining);
-                            self.window.copy_with_visible_len(distance, full_len, len)?;
-                            *output_size += len as u64;
+                            self.window.copy(distance, full_len)?;
+                            *output_size += full_len as u64;
                         }
                     }
                     DecodedItem::CacheRef { cache_idx, length } => {
                         let idx = cache_idx as usize;
                         let distance = self.promote_old_dist(idx)?;
 
-                        let remaining = (unpacked_size - *output_size) as usize;
                         let full_len = length as usize;
-                        let len = full_len.min(remaining);
                         self.last_length = full_len;
-                        self.window.copy_with_visible_len(distance, full_len, len)?;
-                        *output_size += len as u64;
+                        self.window.copy(distance, full_len)?;
+                        *output_size += full_len as u64;
                     }
                     DecodedItem::Filter {
                         filter_type,
@@ -2613,6 +2577,9 @@ impl LzDecoder {
                             },
                             writer,
                         )?;
+                        // Same refresh as the serial loop's filter arm: only a
+                        // newly queued block can move the bound.
+                        decode_limit = self.decode_limit();
                     }
                 }
             }
@@ -3260,7 +3227,7 @@ mod tests {
         ]];
 
         decoder
-            .apply_decoded_items_parallel(&all_items, 1, &mut output_size, &mut out)
+            .apply_decoded_items_parallel(&all_items, &mut output_size, &mut out)
             .unwrap();
 
         // Registration queues only: the filter is still pending and no byte has
@@ -3319,7 +3286,7 @@ mod tests {
         let produced = 64 * 512 * 8;
 
         decoder
-            .apply_decoded_items_parallel(&blocks, produced, &mut output_size, &mut writer)
+            .apply_decoded_items_parallel(&blocks, &mut output_size, &mut writer)
             .unwrap();
         decoder.flush_filters_and_write(&mut writer).unwrap();
 
@@ -3351,7 +3318,7 @@ mod tests {
         }]];
 
         decoder
-            .apply_decoded_items_parallel(&all_items, 20, &mut output_size, &mut out)
+            .apply_decoded_items_parallel(&all_items, &mut output_size, &mut out)
             .unwrap();
 
         assert!(out.is_empty());
@@ -3375,7 +3342,6 @@ mod tests {
                     length: 3,
                     distance: 1,
                 }]],
-                9,
                 &mut output_size,
                 &mut out,
             )
@@ -3547,7 +3513,6 @@ mod tests {
                 &input,
                 &blocks,
                 0..blocks.len(),
-                2,
                 &mut output_size,
                 &mut output,
             )
