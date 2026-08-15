@@ -209,13 +209,17 @@ type PerfPlan struct {
 }
 
 type EC2 struct {
-	InstanceType   string  `json:"instance_type"`
-	Region         string  `json:"region"`
-	AMI            string  `json:"ami"`
-	VCPUs          int     `json:"vcpus"`
-	VolumeGB       int     `json:"volume_gb"`
-	Subnet         string  `json:"subnet,omitempty"`
-	DeadmanMinutes int     `json:"deadman_minutes"`
+	InstanceType   string `json:"instance_type"`
+	Region         string `json:"region"`
+	AMI            string `json:"ami"`
+	VCPUs          int    `json:"vcpus"`
+	VolumeGB       int    `json:"volume_gb"`
+	Subnet         string `json:"subnet,omitempty"`
+	DeadmanMinutes int    `json:"deadman_minutes"`
+	// Minutes to wait for SSH after launch. Nitro-class instances answer in
+	// 1-2 minutes; previous-generation Xen types (c4/m4) measure 5-11 minutes
+	// boot-to-SSH and straddle a 10-minute wait, so they need this raised.
+	SSHWaitMinutes int     `json:"ssh_wait_minutes"`
 	MaxHours       float64 `json:"max_hours"`
 	HourlyUSD      float64 `json:"hourly_usd"`
 	CorpusSource   string  `json:"corpus_source,omitempty"`
@@ -444,6 +448,7 @@ func decodeMachine(item *section, settings Settings) Machine {
 			VolumeGB:       ec2.integer("volume_gb", 30),
 			Subnet:         ec2.str("subnet", ""),
 			DeadmanMinutes: ec2.integer("deadman_minutes", 180),
+			SSHWaitMinutes: ec2.integer("ssh_wait_minutes", 10),
 			MaxHours:       ec2.float("max_hours", 2),
 			HourlyUSD:      ec2.float("hourly_usd", 0),
 			CorpusSource:   ec2.str("corpus_source", ""),
@@ -782,6 +787,12 @@ func validateEC2(state *decodeState, prefix string, machine *Machine, settings *
 	}
 	if ec2.MaxHours <= 0 {
 		state.fail("%s: ec2.max_hours must be positive; it is the cost cap that terminates a hung host", prefix)
+	}
+	if ec2.SSHWaitMinutes < 1 {
+		state.fail("%s: ec2.ssh_wait_minutes must be positive", prefix)
+	}
+	if ec2.SSHWaitMinutes >= ec2.DeadmanMinutes {
+		state.fail("%s: ec2.ssh_wait_minutes must be below ec2.deadman_minutes", prefix)
 	}
 	if ec2.DeadmanMinutes < 1 {
 		state.fail("%s: ec2.deadman_minutes must be positive; every cloud host gets a deadman shutdown", prefix)

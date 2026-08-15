@@ -591,7 +591,14 @@ func (orch *orchestrator) waitForSSH(ctx context.Context, machine Machine) error
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(10 * time.Minute)
+	// Per-machine: previous-generation Xen instance types measure 5-11 minute
+	// boots (c4 straddled a fixed 10-minute wait roughly one launch in three,
+	// each miss costing a terminated instance), while Nitro answers in 1-2.
+	wait := 10 * time.Minute
+	if machine.EC2 != nil && machine.EC2.SSHWaitMinutes > 0 {
+		wait = time.Duration(machine.EC2.SSHWaitMinutes) * time.Minute
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
 		_, probeErr := transport.Probe(attempt)
