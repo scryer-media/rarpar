@@ -677,6 +677,19 @@ pub fn altmap_uses_avx2() -> bool {
 /// Whether the folded split-layout path should use the GFNI affine kernel
 /// (`gfni`+`avx2`) rather than the non-GFNI shuffle2x kernel. Only meaningful
 /// when [`altmap_supported`] is true.
+/// Whether the folded path's non-GFNI arm runs the 512-bit shuffle2x kernel
+/// (see [`shuffle2x_avx512_enabled`], including its env pin). Kernel ladders
+/// use this to place the folded family the way the oracle places
+/// `SHUFFLE_AVX512`: ahead of the AVX2-line XOR-JIT on wide silicon.
+pub fn folded_wide_shuffle_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return shuffle2x_avx512_enabled() && altmap_uses_avx2();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 pub fn folded_uses_gfni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {

@@ -410,7 +410,9 @@ fn creation_uses_bounded_disk_backed_stripes_for_large_sources() {
     assert!(plan.memory.processing_peak_bytes <= plan.memory.processing_buffer_limit_bytes);
     assert_eq!(
         plan.memory.processing_peak_bytes,
-        plan.memory.factor_workspace_bytes + plan.memory.stripe_buffer_bytes
+        plan.memory.factor_workspace_bytes
+            + plan.memory.jit_workspace_bytes
+            + plan.memory.stripe_buffer_bytes
     );
     assert!(
         plan.memory.total_creation_peak_bytes

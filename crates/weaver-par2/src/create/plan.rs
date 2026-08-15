@@ -124,6 +124,8 @@ pub struct Par2MemoryPlan {
     /// temporaries; those are deliberately excluded so this value never
     /// scales with recovery-row or thread count.
     pub factor_workspace_bytes: usize,
+    /// Peak executable-code and JIT build bookkeeping storage.
+    pub jit_workspace_bytes: usize,
     /// Stripe staging, transfer, and recovery-output buffers.
     pub stripe_buffer_bytes: usize,
     /// Controller buffer units used by the creation memory calculation.
@@ -442,6 +444,7 @@ fn memory_plan_for(
         processing_peak_bytes: forward_memory.processing_peak_bytes,
         total_creation_peak_bytes: plan_phase.max(create_phase).max(validation_phase),
         factor_workspace_bytes: forward_memory.factor_workspace_bytes,
+        jit_workspace_bytes: forward_memory.jit_workspace_bytes,
         stripe_buffer_bytes: forward_memory.stripe_buffer_bytes,
         controller_overhead_blocks: controller_overhead_blocks(source_slice_count),
     })
