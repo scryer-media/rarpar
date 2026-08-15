@@ -104,7 +104,7 @@ tracing-subscriber.workspace = true
 # reference AES) are native-only tooling for that harness and, like criterion,
 # MUST stay off the wasm example build — hence this same non-wasm target gate.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 wasmtime = "47"
 wasmtime-wasi = "47"
 aes = { workspace = true }

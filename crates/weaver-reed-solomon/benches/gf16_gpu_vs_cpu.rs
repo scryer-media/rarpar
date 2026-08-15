@@ -32,9 +32,10 @@
 //! Vulkan device with `VK_DRIVER_FILES=<icd.json>` (e.g. to keep wgpu off the
 //! llvmpipe software rasterizer, whose numbers mean nothing).
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 use reedsolomon_rs::gf_simd::{FactorSrc, mul_acc_input_batch};
 use reedsolomon_rs::wgpu_gf16::WgpuGf16Session;

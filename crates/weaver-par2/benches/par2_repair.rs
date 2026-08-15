@@ -4,10 +4,11 @@ mod benchmark_support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use benchmark_support::{crate_bench_scenarios, select_scenarios, stage_scenario};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use md5::{Digest, Md5};
 use par2_rs::{
     DiskFileAccess, FactorDst, FileDescription, FileId, Par2FileSet, Par2RepairStatus,

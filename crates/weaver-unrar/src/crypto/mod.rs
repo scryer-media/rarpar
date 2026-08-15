@@ -1694,14 +1694,18 @@ mod sha1_hw {
 /// wider than 128 bits, so there is no AVX-SSE transition penalty and no
 /// `vzeroupper` obligation either way. Which tier wins by how much is a
 /// hardware question, and `rar29_sha1_scalar_vs_x86_vector_throughput` is the
-/// probe that answers it; the ordering below is by ISA, not by measurement.
+/// probe that answers it; the default ordering below is by measurement, not
+/// ISA width — the evidence is cited at the decision point in `select_tier`.
 ///
 /// # Tier policy
 ///
 /// * SHA extensions present — this module stands aside;
 ///   the `sha1_hw` module is strictly better.
-/// * AVX2 + BMI1 + BMI2 — [`Tier::Avx2`].
-/// * SSSE3 — [`Tier::Ssse3`].
+/// * SSSE3 — [`Tier::Ssse3`]. Preferred over AVX2 by measurement on every
+///   no-SHA-NI x86 part tested to date (Alder Lake P+E, Haswell).
+/// * AVX2 + BMI1 + BMI2 — [`Tier::Avx2`], reachable through the override
+///   below (and as the default only on an AVX2-without-SSSE3 part, which
+///   does not exist in practice).
 /// * Otherwise — [`Tier::None`], and the unrolled scalar runs. That is the
 ///   x86-64 parts predating SSSE3: Intel before Core 2, AMD before K10.
 ///
@@ -1789,10 +1793,18 @@ mod sha1_x86_vec {
             _ => {}
         }
 
-        if avx2 {
-            Tier::Avx2
-        } else if ssse3 {
+        // Measured preference, not widest-first: on every no-SHA-NI x86 part
+        // measured so far the SSSE3 kernel outruns the AVX2 one on this
+        // workload — Alder Lake P/E cores (codex-x86, 2026-08-15: AVX2
+        // 1.002x/1.20-1.24x vs SSSE3 1.265x/1.37-1.38x) and Haswell (fleet
+        // run c4reval-20260815T200644Z: SSSE3 1.284-1.335 vs AVX2
+        // 1.211-1.247 against the oracle, all four encrypted cases). The
+        // AVX2 kernel stays selectable via WEAVER_UNRAR_SHA1_X86=avx2 for
+        // silicon that upends this ordering.
+        if ssse3 {
             Tier::Ssse3
+        } else if avx2 {
+            Tier::Avx2
         } else {
             Tier::None
         }
@@ -1810,8 +1822,10 @@ mod sha1_x86_vec {
         }
 
         #[test]
-        fn default_policy_takes_the_widest_capable_tier() {
-            assert_eq!(select_tier(false, None, true, true), Tier::Avx2);
+        fn default_policy_prefers_the_measured_faster_tier() {
+            // SSSE3 outruns AVX2 on every no-SHA-NI x86 measured (Alder Lake
+            // and Haswell); AVX2 is reachable only through the override.
+            assert_eq!(select_tier(false, None, true, true), Tier::Ssse3);
             assert_eq!(select_tier(false, None, true, false), Tier::Ssse3);
             assert_eq!(select_tier(false, None, false, false), Tier::None);
         }
@@ -1829,7 +1843,9 @@ mod sha1_x86_vec {
         #[test]
         fn zero_stands_down_and_an_unknown_value_is_ignored() {
             assert_eq!(select_tier(false, Some("0"), true, true), Tier::None);
-            assert_eq!(select_tier(false, Some("junk"), true, true), Tier::Avx2);
+            // Unknown values fall through to the default ladder, which
+            // prefers SSSE3 by measurement.
+            assert_eq!(select_tier(false, Some("junk"), true, true), Tier::Ssse3);
         }
     }
 
