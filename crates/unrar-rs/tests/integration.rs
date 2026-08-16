@@ -2668,25 +2668,60 @@ fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() 
     );
 }
 
-fn first_regular_file_under(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let metadata = entry.metadata().ok()?;
-            if metadata.is_file() {
-                return Some(path);
-            }
-            if metadata.is_dir() {
-                pending.push(path);
-            }
-        }
-    }
-    None
+/// The member key both sides of the oracle comparison are indexed by: the path
+/// relative to the extraction root, always `/`-separated so a RAR header's
+/// backslashes and the host separator agree.
+fn member_key(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-fn extract_old_rar_fixture_with_unrar(unrar_bin: &str, archive_path: &std::path::Path) -> Vec<u8> {
+/// Every regular file below `root`, keyed by [`member_key`].
+///
+/// Deliberately not "the first file `read_dir` hands back": these fixtures hold
+/// more than one member, `read_dir` order is unspecified, and picking one file
+/// per side made "first" mean two different things on the two sides.
+fn regular_files_under(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("failed to list {}: {err}", dir.display()));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|err| panic!("failed to walk {}: {err}", dir.display()));
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .unwrap_or_else(|err| panic!("failed to stat {}: {err}", path.display()));
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let key = member_key(root, &path);
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            assert!(
+                files.insert(key.clone(), bytes).is_none(),
+                "two extracted files under {} share the key {key}",
+                root.display()
+            );
+        }
+    }
+    files
+}
+
+fn extract_old_rar_fixture_with_unrar(
+    unrar_bin: &str,
+    archive_path: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
     let output_dir = tempfile::tempdir().unwrap();
     let destination = format!(
         "{}{}",
@@ -2711,37 +2746,55 @@ fn extract_old_rar_fixture_with_unrar(unrar_bin: &str, archive_path: &std::path:
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let output_file = first_regular_file_under(output_dir.path()).unwrap_or_else(|| {
-        panic!(
-            "unrar extracted {} without producing a regular file",
-            archive_path.display()
-        )
-    });
-    std::fs::read(&output_file)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", output_file.display()))
+    let extracted = regular_files_under(output_dir.path());
+    assert!(
+        !extracted.is_empty(),
+        "unrar extracted {} without producing a regular file",
+        archive_path.display()
+    );
+    extracted
 }
 
-fn extract_first_regular_member_with_weaver(archive_path: &std::path::Path) -> Vec<u8> {
+fn extract_regular_members_with_weaver(
+    archive_path: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
     let file = std::fs::File::open(archive_path)
         .unwrap_or_else(|err| panic!("failed to open {}: {err}", archive_path.display()));
     let mut archive = unrar_rs::RarArchive::open(file)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", archive_path.display()));
-    let metadata = archive.metadata();
-    let member_index = metadata
+    let regular = archive
+        .metadata()
         .members
         .iter()
-        .position(|member| !member.is_directory)
-        .unwrap_or_else(|| panic!("{} has no regular members", archive_path.display()));
+        .enumerate()
+        .filter(|(_, member)| !member.is_directory)
+        .map(|(index, member)| (index, member.name.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        !regular.is_empty(),
+        "{} has no regular members",
+        archive_path.display()
+    );
 
-    archive
-        .extract_member(member_index, &unrar_rs::ExtractOptions::default(), None)
-        .and_then(|member| member.into_bytes())
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to extract {} with Weaver: {err}",
-                archive_path.display()
-            )
-        })
+    let mut members = std::collections::BTreeMap::new();
+    for (index, name) in regular {
+        let bytes = archive
+            .extract_member(index, &unrar_rs::ExtractOptions::default(), None)
+            .and_then(|member| member.into_bytes())
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to extract {name} from {} with Weaver: {err}",
+                    archive_path.display()
+                )
+            });
+        let key = name.replace('\\', "/");
+        assert!(
+            members.insert(key.clone(), bytes).is_none(),
+            "{} has two members keyed {key}",
+            archive_path.display()
+        );
+    }
+    members
 }
 
 #[test]
@@ -2774,7 +2827,20 @@ fn test_old_rar_oracle_fixtures_match_unrar_when_available() {
         .is_ok_and(|value| value == "1" || value == "true");
     let fixture_dir =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4");
-    let expected = ["rar15_lz.rar", "rar20_lz.rar", "rar20_audio_text.rar"];
+    // Every member of every fixture is compared, keyed by name. `unrar x` with
+    // no file mask writes all of them into the destination, so pairing them up
+    // positionally against Weaver's member order is not a comparison at all --
+    // it used to hold a 56 KiB WAV against a 107-byte licence file whenever the
+    // filesystem's `read_dir` order disagreed with archive order.
+    let fixtures: [(&str, [&str; 2]); 3] = [
+        ("rar15_lz.rar", ["BOATMO~1.WAV", "LICENSE.TXT"]),
+        ("rar20_lz.rar", ["BoatModernEnglish.wav", "LICENSE.txt"]),
+        (
+            "rar20_audio_text.rar",
+            ["BoatModernEnglish.wav", "LICENSE.txt"],
+        ),
+    ];
+    let expected = fixtures.map(|(name, _)| name);
     let missing = expected
         .iter()
         .copied()
@@ -2812,16 +2878,41 @@ fn test_old_rar_oracle_fixtures_match_unrar_when_available() {
         return;
     };
 
-    for fixture in expected {
+    for (fixture, members) in fixtures {
         let archive_path = fixture_dir.join(fixture);
-        let unrar_bytes = extract_old_rar_fixture_with_unrar(&unrar_bin, &archive_path);
-        let weaver_bytes = extract_first_regular_member_with_weaver(&archive_path);
+        let unrar_members = extract_old_rar_fixture_with_unrar(&unrar_bin, &archive_path);
+        let weaver_members = extract_regular_members_with_weaver(&archive_path);
+
+        // Pin both key sets. Comparing two maps proves nothing if the maps are
+        // not the ones this test means to compare -- empty against empty is
+        // equal, and so is a run that quietly dropped a member from both sides.
         assert_eq!(
-            weaver_bytes,
-            unrar_bytes,
-            "Weaver extraction diverged from local unrar for {}",
-            archive_path.display()
+            weaver_members
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            members,
+            "unexpected Weaver member set for {fixture}"
         );
+        assert_eq!(
+            unrar_members.keys().map(String::as_str).collect::<Vec<_>>(),
+            members,
+            "unexpected unrar member set for {fixture}"
+        );
+
+        for name in members {
+            let weaver_bytes = &weaver_members[name];
+            let unrar_bytes = &unrar_members[name];
+            // Compared by hand rather than with assert_eq! so a mismatch
+            // reports sizes instead of dumping two 56 KiB byte vectors.
+            assert!(
+                weaver_bytes == unrar_bytes,
+                "Weaver extraction diverged from local unrar for {fixture} member {name} \
+                 (Weaver {} bytes, unrar {} bytes)",
+                weaver_bytes.len(),
+                unrar_bytes.len()
+            );
+        }
     }
 }
 
@@ -4708,74 +4799,6 @@ fn test_rar4_fixture_multivolume_video_batch() {
     assert_eq!(result, original("test_clip.mkv"));
 }
 
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_video_batch() {
-    let vol_names = [
-        "rar5_enc_mv_video.part1.rar",
-        "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar",
-        "rar5_enc_mv_video.part4.rar",
-        "rar5_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("test_clip.mkv"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_video_streaming() {
-    let vol_names = [
-        "rar5_enc_mv_video.part1.rar",
-        "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar",
-        "rar5_enc_mv_video.part4.rar",
-        "rar5_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("test_clip.mkv"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_multivolume_video_batch() {
-    let vol_names = [
-        "rar4_enc_mv_video.part1.rar",
-        "rar4_enc_mv_video.part2.rar",
-        "rar4_enc_mv_video.part3.rar",
-        "rar4_enc_mv_video.part4.rar",
-        "rar4_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar4", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("test_clip.mkv"));
-}
-
 // -- RAR5 encrypted (slow — gated behind `slow-tests` feature) ----------------
 
 #[test]
@@ -4791,119 +4814,6 @@ fn test_rar5_encrypted_no_password_fails() {
         result.is_err(),
         "no password should fail for encrypted archive"
     );
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_store_batch() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_store_streaming() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let provider =
-        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_store.rar")]);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_lz_batch() {
-    let mut archive = open_single("rar5", "rar5_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_lz_streaming() {
-    let mut archive = open_single("rar5", "rar5_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let provider =
-        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_store_batch() {
-    let vol_names = [
-        "rar5_enc_mv_store.part1.rar",
-        "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar",
-        "rar5_enc_mv_store.part4.rar",
-        "rar5_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("binary.bin"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_store_streaming() {
-    let vol_names = [
-        "rar5_enc_mv_store.part1.rar",
-        "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar",
-        "rar5_enc_mv_store.part4.rar",
-        "rar5_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("binary.bin"));
 }
 
 #[test]
@@ -4990,19 +4900,6 @@ fn test_cached_headers_reverse_volume_arrival_merges_without_panicking() {
     assert_eq!(member.volumes.first_volume, 0);
     assert_eq!(member.volumes.last_volume, 4);
     assert_eq!(restored.metadata().volume_count, Some(5));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_wrong_password_fails() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some("wrongpassword".into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None);
-    assert!(result.is_err(), "wrong password should fail");
 }
 
 // -- RAR4 encrypted (slow — gated behind `slow-tests` feature) ----------------
@@ -5163,55 +5060,6 @@ fn test_rar5_hp_encrypted_large_disk_open_to_file() {
     archive
         .extract_member_to_file(0, &opts, None, &out_path)
         .unwrap();
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_store_batch() {
-    let mut archive = open_single("rar4", "rar4_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_lz_batch() {
-    let mut archive = open_single("rar4", "rar4_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_multivolume_store_batch() {
-    let vol_names = [
-        "rar4_enc_mv_store.part1.rar",
-        "rar4_enc_mv_store.part2.rar",
-        "rar4_enc_mv_store.part3.rar",
-        "rar4_enc_mv_store.part4.rar",
-        "rar4_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar4", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("binary.bin"));
 }
 
 // =============================================================================
