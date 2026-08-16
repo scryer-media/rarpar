@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // generatePar2Captures rebuilds the five testNN-generated.tar.gz captures.
@@ -187,18 +188,36 @@ func extractTarGz(archive, destination string) error {
 		if header.Typeflag != tar.TypeReg {
 			continue
 		}
-		name := filepath.Base(filepath.Clean(filepath.FromSlash(header.Name)))
-		if name == "." || name == string(filepath.Separator) {
-			continue
+		target, err := flatEntryPath(destination, header.Name)
+		if err != nil {
+			return err
 		}
 		data := make([]byte, header.Size)
 		if _, err := io.ReadFull(reader, data); err != nil {
 			return err
 		}
-		if err := writeFile(filepath.Join(destination, name), data); err != nil {
+		if err := writeFile(target, data); err != nil {
 			return err
 		}
 	}
+}
+
+// flatEntryPath maps a tar entry name onto a file directly under destination.
+// Only the entry's final path element is kept, and an element that is empty,
+// `.`/`..`, or would otherwise resolve outside destination is an error rather
+// than a skip: the upstream data tarballs are known-good, so anything else is
+// a corrupt or hostile archive, not a variation to tolerate.
+func flatEntryPath(destination, entryName string) (string, error) {
+	name := filepath.Base(filepath.Clean(filepath.FromSlash(entryName)))
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) || strings.ContainsAny(name, `/\`) {
+		return "", fmt.Errorf("refusing tar entry %q: not a plain file name", entryName)
+	}
+	target := filepath.Join(destination, name)
+	relative, err := filepath.Rel(destination, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("refusing tar entry %q: resolves outside the extraction directory", entryName)
+	}
+	return target, nil
 }
 
 // packCapture writes one case directory as a deterministic tarball: regular
