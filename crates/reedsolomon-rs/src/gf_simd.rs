@@ -739,6 +739,18 @@ fn shuffle2x_avx512_enabled() -> bool {
     })
 }
 
+/// Whether the 512-bit shuffle2x path pairs adjacent groups into a single
+/// twelve-source destination pass ([`mul_acc_shuffle2x_pair_avx512`]) rather
+/// than one pass per six-source group. Setting `WEAVER_GF16_SHUFFLE2X_PAIR=0`
+/// pins the single-group loop shape so hardware that runs this tier can A/B
+/// the two shapes — same width, same arithmetic — without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn shuffle2x_pair_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("WEAVER_GF16_SHUFFLE2X_PAIR").is_some_and(|v| v == "0"))
+}
+
 /// Bytes per split-layout block: one 256-bit register holding 16 GF(2^16)
 /// words as [16 low bytes | 16 high bytes].
 pub const SPLIT_BLOCK_BYTES: usize = 32;
@@ -1135,7 +1147,28 @@ pub fn mul_acc_shuffle2x_batch(
         debug_assert!(altmap_supported());
         if altmap_uses_avx2() {
             if shuffle2x_avx512_enabled() {
-                for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                // Adjacent groups run fused twelve sources at a time: lane
+                // pairing frees enough table registers to hold both groups, so
+                // each destination block is read and written once per twelve
+                // sources instead of once per six. An odd trailing group falls
+                // back to the single-group kernel.
+                let mut group = 0usize;
+                if shuffle2x_pair_enabled() {
+                    while group + 1 < stagings.len() {
+                        unsafe {
+                            mul_acc_shuffle2x_pair_avx512(
+                                dst,
+                                stagings[group],
+                                stagings[group + 1],
+                                &tables[group],
+                                &tables[group + 1],
+                            )
+                        };
+                        group += 2;
+                    }
+                }
+                for (staging, group_tables) in stagings[group..].iter().zip(tables[group..].iter())
+                {
                     unsafe { mul_acc_shuffle2x_group_avx512(dst, staging, group_tables) };
                 }
             } else {
@@ -1447,6 +1480,168 @@ unsafe fn mul_acc_shuffle2x_group_avx512(
         }
         if offset < len {
             mul_acc_shuffle2x_group_avx2(&mut dst[offset..], &staging[src..], tables);
+        }
+    }
+}
+
+/// Multiply two interleaved six-source groups into a split-layout destination
+/// with one pass over `dst` — twelve sources per destination load/store.
+///
+/// **Oracle alignment.** ParPar's multi-region controller applies several
+/// source regions per destination pass (`gf16_muladd_multi.h`), sized by each
+/// method's `idealInputMultiple`: 3 for `SHUFFLE_AVX512`, 6 for
+/// `SHUFFLE2X_AVX512`. This is that shape for rarpar's split layout, at twelve
+/// regions — the whole `DEFAULT_INPUT_GROUPING` row lands in a single
+/// destination read-modify-write instead of one per six-source group.
+///
+/// **Lane pairing is what pays for it.** `vpshufb` looks up inside each
+/// 128-bit lane independently, so a zmm table register does not have to hold
+/// one source's table twice (what [`mul_acc_shuffle2x_group_avx512`] does with
+/// its `widen`): it can hold *two* sources' tables, `[x's 32 bytes | y's 32
+/// bytes]`. The staging interleave already places lane `l`'s block at
+/// `(block * FOLDED_GROUP + l) * 32`, so a single 64-byte load at an even lane
+/// is exactly `[lane 2i's block | lane 2i+1's block]` of the same destination
+/// block, in the lane order those joined tables expect. Two consequences, both
+/// of them the point of this kernel:
+///
+/// - four table registers now cover a source *pair*, so twelve sources fit in
+///   the same 24 zmm the single-group kernel spends on six, and one
+///   destination read-modify-write serves twelve sources instead of six;
+/// - the per-source `vinserti64x4` that kernel needs to build a zmm from two
+///   32-byte blocks disappears. On Skylake-SP that insert issues on port 5,
+///   the same port every `vpshufb` needs, and it was 19% of the single-group
+///   loop's port-5 traffic.
+///
+/// Measured on the emitted assembly, per twelve source-block-into-destination-
+/// block operations — the same unit of work for both kernels, and neither
+/// spills: 62 vector ALU ops of which 31 are port-5-only for the single-group
+/// kernel, 58 of which 26 for this one. The XOR reduction is *not* where the
+/// difference comes from: LLVM already contracts the single-group kernel's XOR
+/// chains into `vpternlog`, so both loops issue eleven of them. Writing the
+/// ternary logic explicitly here only makes the reference's reduction
+/// (`gf16_shuffle2x_avx512_round`, imm 0x96) legible in the source.
+///
+/// The reduction mirrors [`mul_acc_folded_pair_gfni_avx512`]: `vpermq 0x4e`
+/// swaps the two 128-bit halves inside each 256-bit lane (the ymm kernel's
+/// `permute2x128<0x01>` plane swap applied to both sources at once), then the
+/// two halves — which accumulate into the *same* 32-byte destination block —
+/// fold together with the prior destination bytes in one ternary-logic op.
+/// Every XOR term per output byte is unchanged; only their association order
+/// differs, so the bytes are identical to the 256-bit kernel's.
+///
+/// `dst.len()` must be a multiple of [`SPLIT_BLOCK_BYTES`] and each staging
+/// must span `dst.len() * FOLDED_GROUP` bytes; both hold for every caller
+/// through [`mul_acc_shuffle2x_batch`]. There is no tail: the kernel steps one
+/// 32-byte destination block per iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]
+unsafe fn mul_acc_shuffle2x_pair_avx512(
+    dst: &mut [u8],
+    staging_a: &[u8],
+    staging_b: &[u8],
+    tables_a: &[&Shuffle2xTables; FOLDED_GROUP],
+    tables_b: &[&Shuffle2xTables; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!(dst.len().is_multiple_of(SPLIT_BLOCK_BYTES));
+    debug_assert!(staging_a.len() >= dst.len() * FOLDED_GROUP);
+    debug_assert!(staging_b.len() >= dst.len() * FOLDED_GROUP);
+
+    unsafe {
+        // Join two sources' 32-byte `[low-plane | high-plane]` tables into one
+        // zmm: lanes 0-1 serve source `x`, lanes 2-3 source `y`.
+        let join = |x: &[u8; 32], y: &[u8; 32]| {
+            _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_loadu_si256(x.as_ptr() as *const __m256i)),
+                _mm256_loadu_si256(y.as_ptr() as *const __m256i),
+            )
+        };
+        // Six source pairs: three from each group, in the order the loads walk
+        // them. 6 x 4 = 24 table registers, the whole twelve-source row.
+        const PAIRS: usize = FOLDED_GROUP / 2;
+        let mut table_regs = [[_mm512_setzero_si512(); 4]; 2 * PAIRS];
+        for (pair, regs) in table_regs.iter_mut().enumerate() {
+            let tables = if pair < PAIRS { tables_a } else { tables_b };
+            let lane = (pair % PAIRS) * 2;
+            let (x, y) = (tables[lane], tables[lane + 1]);
+            *regs = [
+                join(&x.norm_lo, &y.norm_lo),
+                join(&x.swap_lo, &y.swap_lo),
+                join(&x.norm_hi, &y.norm_hi),
+                join(&x.swap_hi, &y.swap_hi),
+            ];
+        }
+
+        let mask = _mm512_set1_epi8(0x0f);
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
+
+            // One 64-byte load covers source pair `$pair` of `$staging` for
+            // this destination block; the two nibble indices feed all four of
+            // that pair's tables.
+            macro_rules! nibbles {
+                ($staging:expr, $pair:literal) => {{
+                    let data = _mm512_loadu_si512(
+                        $staging.as_ptr().add(src + $pair * 2 * SPLIT_BLOCK_BYTES)
+                            as *const __m512i,
+                    );
+                    (
+                        _mm512_and_si512(data, mask),
+                        _mm512_and_si512(_mm512_srli_epi16::<4>(data), mask),
+                    )
+                }};
+            }
+
+            // First pair seeds both accumulators, so neither needs a zeroing
+            // XOR nor a dependency on the previous iteration.
+            let (lo, hi) = nibbles!(staging_a, 0);
+            let [nl, sl, nh, sh] = table_regs[0];
+            let mut result =
+                _mm512_xor_si512(_mm512_shuffle_epi8(nl, lo), _mm512_shuffle_epi8(nh, hi));
+            let mut swapped =
+                _mm512_xor_si512(_mm512_shuffle_epi8(sl, lo), _mm512_shuffle_epi8(sh, hi));
+
+            // `acc = acc ^ p ^ q` in one ternary-logic op per nibble pair —
+            // the reference's `_mm512_ternarylogic_epi32(..., 0x96)` reduction.
+            macro_rules! pair {
+                ($staging:expr, $pair:literal, $regs:literal) => {
+                    let (lo, hi) = nibbles!($staging, $pair);
+                    let [nl, sl, nh, sh] = table_regs[$regs];
+                    result = _mm512_ternarylogic_epi64::<0x96>(
+                        result,
+                        _mm512_shuffle_epi8(nl, lo),
+                        _mm512_shuffle_epi8(nh, hi),
+                    );
+                    swapped = _mm512_ternarylogic_epi64::<0x96>(
+                        swapped,
+                        _mm512_shuffle_epi8(sl, lo),
+                        _mm512_shuffle_epi8(sh, hi),
+                    );
+                };
+            }
+            pair!(staging_a, 1, 1);
+            pair!(staging_a, 2, 2);
+            pair!(staging_b, 0, 3);
+            pair!(staging_b, 1, 4);
+            pair!(staging_b, 2, 5);
+
+            let crossed = _mm512_permutex_epi64::<0x4e>(swapped);
+            result = _mm512_xor_si512(result, crossed);
+            let prior = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let mixed = _mm256_ternarylogic_epi64::<0x96>(
+                prior,
+                _mm512_castsi512_si256(result),
+                _mm512_extracti64x4_epi64::<1>(result),
+            );
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, mixed);
+
+            offset += SPLIT_BLOCK_BYTES;
+            src += stride;
         }
     }
 }
@@ -6182,8 +6377,9 @@ mod tests {
             return;
         }
         // Odd and even group counts, and factors mixing zero (padding lanes),
-        // one (XOR passthrough), and arbitrary values.
-        for groups in [1usize, 2, 3, 5] {
+        // one (XOR passthrough), and arbitrary values. Even counts exercise the
+        // 512-bit paired arm end to end, odd counts its single-group remainder.
+        for groups in [1usize, 2, 3, 4, 5] {
             for len in [32usize, 4096, 21824] {
                 let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
                     .map(|g| {
@@ -6308,6 +6504,137 @@ mod tests {
             unsafe { mul_acc_shuffle2x_group_avx2(&mut narrow, &staging, &tables) };
             unsafe { mul_acc_shuffle2x_group_avx512(&mut wide, &staging, &tables) };
             assert_eq!(narrow, wide, "shuffle2x width mismatch len={len}");
+        }
+    }
+
+    /// The layout invariant [`mul_acc_shuffle2x_pair_avx512`] rests on: inside
+    /// the interleaved staging stream, lane `2i` and lane `2i+1` of the same
+    /// destination block are *adjacent* 32-byte blocks in that order, so the
+    /// pair kernel's single 64-byte load is exactly the two blocks the
+    /// single-group kernels load separately. Runs on any x86 host — no AVX-512
+    /// needed — so a future change to the interleave granularity or lane order
+    /// fails here rather than silently corrupting the twelve-source arm on
+    /// hardware nobody in the loop owns.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn split_staging_pairs_adjacent_lanes() {
+        if !altmap_supported() {
+            return;
+        }
+        for len in [32usize, 64, 4096] {
+            let inputs: Vec<Vec<u8>> = (0..FOLDED_GROUP)
+                .map(|l| (0..len).map(|i| ((i * (l + 5) + 11) % 256) as u8).collect())
+                .collect();
+            let mut staging = vec![0u8; len * FOLDED_GROUP];
+            for (lane, input) in inputs.iter().enumerate() {
+                split_encode_scatter(input, &mut staging, lane);
+            }
+            // Independent expectation: each lane's own split-layout bytes.
+            let encoded: Vec<Vec<u8>> = inputs
+                .iter()
+                .map(|input| {
+                    let mut buf = input.clone();
+                    altmap_encode(&mut buf);
+                    buf
+                })
+                .collect();
+
+            for block in 0..len / SPLIT_BLOCK_BYTES {
+                for pair in 0..FOLDED_GROUP / 2 {
+                    let lane = pair * 2;
+                    let wide = (block * FOLDED_GROUP + lane) * SPLIT_BLOCK_BYTES;
+                    let block_bytes = block * SPLIT_BLOCK_BYTES..(block + 1) * SPLIT_BLOCK_BYTES;
+                    assert_eq!(
+                        &staging[wide..wide + SPLIT_BLOCK_BYTES],
+                        &encoded[lane][block_bytes.clone()],
+                        "low half of the pair load is not lane {lane} \
+                         (len={len} block={block})"
+                    );
+                    assert_eq!(
+                        &staging[wide + SPLIT_BLOCK_BYTES..wide + 2 * SPLIT_BLOCK_BYTES],
+                        &encoded[lane + 1][block_bytes],
+                        "high half of the pair load is not lane {} (len={len} block={block})",
+                        lane + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Differential for the twelve-source paired kernel: two groups fused into
+    /// one destination pass must be byte-identical both to the 256-bit kernel
+    /// run twice (the arithmetic reference) and to the shipped single-group
+    /// 512-bit kernel run twice (the tier this replaces). NOTE-skips on
+    /// hardware without AVX-512; the c5-class leg executes it for real.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn shuffle2x_pair_avx512_matches_group() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP shuffle2x_pair_avx512_matches_group: host lacks avx2");
+            return;
+        }
+        if !(is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl"))
+        {
+            eprintln!(
+                "NOTE shuffle2x_pair_avx512_matches_group: host lacks \
+                 avx512f+avx512bw+avx512vl, paired 512-bit arm skipped"
+            );
+            return;
+        }
+        // Zero (padding lanes), one (XOR passthrough) and arbitrary factors,
+        // placed so both groups and both halves of a pair see each kind.
+        let factors: [u16; 2 * FOLDED_GROUP] = [
+            0x0000, 0x0001, 0x2F1D, 0xABCD, 0x0101, 0xFFFF, 0x0001, 0x0000, 0x8000, 0x1234, 0x9E37,
+            0x0002,
+        ];
+        let owned: Vec<Shuffle2xTables> = factors
+            .iter()
+            .map(|&f| precompute_shuffle2x_tables(f))
+            .collect();
+        let tables_a: [&Shuffle2xTables; FOLDED_GROUP] = std::array::from_fn(|l| &owned[l]);
+        let tables_b: [&Shuffle2xTables; FOLDED_GROUP] =
+            std::array::from_fn(|l| &owned[FOLDED_GROUP + l]);
+
+        // Even and odd block counts, a single-block region, and sizes past the
+        // 8 KiB create tile.
+        for len in [32usize, 64, 96, 4096, 4128, 21824] {
+            let stagings: Vec<Vec<u8>> = (0..2)
+                .map(|g| {
+                    let mut staging = vec![0u8; len * FOLDED_GROUP];
+                    for lane in 0..FOLDED_GROUP {
+                        let input: Vec<u8> = (0..len)
+                            .map(|i| ((i * (g * 6 + lane + 3) + 41) % 256) as u8)
+                            .collect();
+                        split_encode_scatter(&input, &mut staging, lane);
+                    }
+                    staging
+                })
+                .collect();
+
+            let mut narrow = vec![0x5Au8; len];
+            altmap_encode(&mut narrow);
+            let mut wide = narrow.clone();
+            let mut grouped = narrow.clone();
+            unsafe {
+                mul_acc_shuffle2x_group_avx2(&mut narrow, &stagings[0], &tables_a);
+                mul_acc_shuffle2x_group_avx2(&mut narrow, &stagings[1], &tables_b);
+                mul_acc_shuffle2x_group_avx512(&mut grouped, &stagings[0], &tables_a);
+                mul_acc_shuffle2x_group_avx512(&mut grouped, &stagings[1], &tables_b);
+                mul_acc_shuffle2x_pair_avx512(
+                    &mut wide,
+                    &stagings[0],
+                    &stagings[1],
+                    &tables_a,
+                    &tables_b,
+                );
+            }
+            assert_eq!(narrow, wide, "pair kernel differs from 256-bit len={len}");
+            assert_eq!(
+                grouped, wide,
+                "pair kernel differs from single-group 512 len={len}"
+            );
         }
     }
 

@@ -17,9 +17,21 @@ changed shape, so it stays inside the 0.4.x compatibility range.
   measured badly on AVX-512-without-GFNI hosts.
 - The new 512-bit shuffle2x kernel is the split-layout shuffle widened to
   zmm: two destination blocks per iteration with all 24 table registers
-  resident and a pairwise lane-swap fold, single-group by register math (the
-  shuffle needs 4 table registers per source where affine needs 2, so the
-  GFNI pair shape cannot fit).
+  resident and a pairwise lane-swap fold. It remains the arm for an odd
+  trailing group.
+- Adjacent groups now fuse into a single twelve-source destination pass on
+  AVX512BW/VL-without-GFNI silicon, mirroring the reference's multi-region
+  shape (`idealInputMultiple` 3 for `SHUFFLE_AVX512`, 6 for
+  `SHUFFLE2X_AVX512`) at twelve regions. `vpshufb` looks up per 128-bit lane,
+  so one table register can serve *two* sources rather than holding one
+  source's table twice — four registers per source pair, twelve sources in
+  the same 24 zmm the single-group kernel spends on six. The per-source
+  `vinserti64x4` that built a zmm from two 32-byte staging blocks is gone
+  with it: 62 vector ALU ops (31 port-5-only) per twelve source-block
+  operations become 58 (26), and each destination block is read and written
+  once per twelve sources instead of once per six. Same arithmetic, same
+  bytes; `WEAVER_GF16_SHUFFLE2X_PAIR=0` pins the previous single-group loop
+  shape for A/B.
 - The AVX2 XOR-JIT builds ONE sealed multi-row batch per input batch and
   recycles it across stripes — never a build per output row. The coefficient
   rows depend only on the input batch and the recovery exponents, never the
