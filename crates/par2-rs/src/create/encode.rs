@@ -12,8 +12,6 @@
 
 use std::mem::size_of;
 
-use rayon::prelude::*;
-
 use crate::error::{Par2Error, Result};
 use crate::gf;
 use crate::types::{
@@ -44,12 +42,18 @@ const CLMUL_INPUT_GROUPING: usize = 16;
 const MAX_INPUT_GROUPING: usize = 16;
 const _: () = assert!(DEFAULT_INPUT_GROUPING <= MAX_INPUT_GROUPING);
 const _: () = assert!(CLMUL_INPUT_GROUPING <= MAX_INPUT_GROUPING);
+/// Staging areas in the per-stripe hand-off ring.
+///
+/// The ring is general in the code below — the producer fills area
+/// `batch_index % STAGING_AREA_COUNT` and may run `STAGING_AREA_COUNT - 1`
+/// batches ahead of the slowest band — but two is what [`BufferPlan`] admits
+/// and therefore what [`Par2MemoryPlan`](super::plan::Par2MemoryPlan)
+/// describes, so the constant and the accounting move together. Two is also
+/// the reference's own depth. One area would serialize the fill behind the
+/// arithmetic, which is the whole point of the pipeline.
 const STAGING_AREA_COUNT: usize = 2;
 const TRANSFER_BUFFER_COUNT: usize = 2;
-// The stripe pipeline's split_at_mut parity selection and the per-stripe
-// prefill of staging[0] are written for exactly two areas; a wider pipeline
-// would silently accumulate from the wrong area.
-const _: () = assert!(STAGING_AREA_COUNT == 2);
+const _: () = assert!(STAGING_AREA_COUNT >= 2);
 
 /// Folded coefficient groups covered by one output row, bounding the stack
 /// reference tables in `accumulate_band`. The folded family's
@@ -68,8 +72,14 @@ const MAX_FOLDED_GROUPS: usize = DEFAULT_INPUT_GROUPING / gf_simd::FOLDED_GROUP;
 /// make the plan's memory accounting differ between a caller's rayon worker
 /// and the main thread (breaking `Par2CreatePlan` equality), and whose first
 /// call would eagerly spawn the global pool from plan-only paths. Bands
-/// therefore follow `available_parallelism`; execution still lands on
-/// whatever rayon pool is current, which is correct at any width.
+/// therefore follow `available_parallelism`.
+///
+/// Forward accumulation now runs one scoped OS thread per band (see
+/// [`encode_stripe_banded`] for why a work-stealing pool cannot host a
+/// blocking producer/consumer ring), so this is literally the worker count of
+/// a create pass rather than only a partitioning width — a deliberately huge
+/// `WEAVER_PAR2_CREATE_THREADS` now costs that many threads per stripe.
+/// Source hashing and staged-volume validation still run on rayon.
 pub(crate) fn configured_create_threads() -> usize {
     static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
@@ -371,14 +381,16 @@ impl ForwardEncoder {
 
         let factors = FactorSource::new(provider.source_count());
 
-        let mut staging = [
-            AlignedBuffer::new(buffers.staging_bytes),
-            AlignedBuffer::new(buffers.staging_bytes),
-        ];
-        let mut transfers = [
-            AlignedBuffer::new(buffers.aligned_chunk_len),
-            AlignedBuffer::new(buffers.aligned_chunk_len),
-        ];
+        // Held behind `Arc` so one filled area can be handed to every band
+        // worker for the duration of a batch and reclaimed for refilling by
+        // `Arc::get_mut` once they have all let go — the hand-off is the
+        // ownership, with no aliasing of a mutable buffer anywhere.
+        let mut staging: Vec<std::sync::Arc<AlignedBuffer>> = (0..STAGING_AREA_COUNT)
+            .map(|_| std::sync::Arc::new(AlignedBuffer::new(buffers.staging_bytes)))
+            .collect();
+        let mut transfers: Vec<AlignedBuffer> = (0..TRANSFER_BUFFER_COUNT)
+            .map(|_| AlignedBuffer::new(buffers.aligned_chunk_len))
+            .collect();
         let mut output = AlignedBuffer::new(buffers.output_bytes);
 
         let (band_size, band_count) = create_band_shape(self.recovery_exponents.len());
@@ -397,18 +409,23 @@ impl ForwardEncoder {
             .checked_mul(self.slice_size as u64)
             .ok_or_else(|| resource_limit("progress byte count overflow"))?;
 
-        // The two staging areas run as a two-stage pipeline: while the
-        // rayon bands accumulate batch N from one area, this thread fills
-        // batch N+1 into the other, hiding source reads and split-layout
-        // conversion behind the GF16 math. `overlap` is false exactly when
-        // banding is off (wasm and the WEAVER_PAR2_CREATE_THREADS=1 escape
-        // hatch), and the sequential arm performs the identical operation
-        // order without rayon, so the produced bytes cannot differ between
-        // the arms.
+        // One dispatch per stripe. The band workers are started once for the
+        // stripe and walk every input batch themselves; this thread is the
+        // producer, filling the staging ring ahead of them. The ring is what
+        // bounds the hand-off: the producer may run `STAGING_AREA_COUNT - 1`
+        // batches ahead of the slowest band and no further, which is the same
+        // two-stage overlap the previous per-batch `rayon::in_place_scope`
+        // gave, minus one scope entry and one band fan-out per input batch
+        // (342 of each per stripe on the 4096-source create shape).
+        //
+        // `banded` is false exactly when banding is off (single-threaded wasm
+        // and the `WEAVER_PAR2_CREATE_THREADS=1` escape hatch); the sequential
+        // arm performs the identical operation order on one thread, so the
+        // produced bytes cannot differ between the arms.
         let batch_starts: Vec<usize> = (0..provider.source_count())
             .step_by(contract.input_grouping)
             .collect();
-        let overlap = band_size < self.recovery_exponents.len();
+        let banded = band_size < self.recovery_exponents.len();
 
         let mut stripe_offset = 0usize;
         let mut stripe_index = 0usize;
@@ -416,81 +433,59 @@ impl ForwardEncoder {
             check_cancel(options)?;
             let actual_len = (self.slice_size - stripe_offset).min(buffers.chunk_len);
             let aligned_len = round_up(actual_len, contract.stride)?;
-            output.as_bytes_mut()[..buffers.output_bytes].fill(0);
-            if let Some(&first_start) = batch_starts.first() {
-                fill_staging(
+            if banded {
+                encode_stripe_banded(
                     kernel,
-                    &mut staging[0],
-                    &mut transfers[0],
                     provider,
-                    first_start,
-                    stripe_offset,
-                    actual_len,
-                    aligned_len,
+                    options,
                     contract,
-                )?;
-            }
-            for (batch_index, &source_start) in batch_starts.iter().enumerate() {
-                check_cancel(options)?;
-                let live_inputs = provider
-                    .source_count()
-                    .saturating_sub(source_start)
-                    .min(contract.input_grouping);
-                let next_start = batch_starts.get(batch_index + 1).copied();
-                let (left, right) = staging.split_at_mut(1);
-                let (current_staging, next_staging) = if batch_index % STAGING_AREA_COUNT == 0 {
-                    (&left[0], &mut right[0])
-                } else {
-                    (&right[0], &mut left[0])
-                };
-                let output_bytes = &mut output.as_bytes_mut()[..buffers.output_bytes];
-                let mut accumulate_result: Result<()> = Ok(());
-                let mut fill_result: Result<()> = Ok(());
-                if overlap {
-                    let accumulate_slot = &mut accumulate_result;
+                    &factors,
+                    &self.recovery_exponents,
+                    &mut staging,
+                    &mut transfers[0],
+                    &mut output.as_bytes_mut()[..buffers.output_bytes],
+                    &batch_starts,
+                    StripeGeometry {
+                        stripe_offset,
+                        actual_len,
+                        aligned_len,
+                        output_stride: buffers.row_stride,
+                    },
+                    band_size,
                     #[cfg(target_arch = "x86_64")]
-                    let jit_workspaces = &mut jit_workspaces;
-                    let exponents = &self.recovery_exponents;
-                    let factors = &factors;
-                    rayon::in_place_scope(|scope| {
-                        scope.spawn(move |_| {
-                            *accumulate_slot = accumulate_batch(
-                                kernel,
-                                output_bytes,
-                                current_staging,
-                                factors,
-                                exponents,
-                                source_start,
-                                live_inputs,
-                                aligned_len,
-                                buffers.row_stride,
-                                contract,
-                                band_size,
-                                #[cfg(target_arch = "x86_64")]
-                                jit_workspaces,
-                                #[cfg(target_arch = "x86_64")]
-                                jit_code_budget,
-                            );
-                        });
-                        if let Some(next_start) = next_start {
-                            fill_result = fill_staging(
-                                kernel,
-                                next_staging,
-                                &mut transfers[(batch_index + 1) % TRANSFER_BUFFER_COUNT],
-                                provider,
-                                next_start,
-                                stripe_offset,
-                                actual_len,
-                                aligned_len,
-                                contract,
-                            );
-                        }
-                    });
-                } else {
-                    accumulate_result = accumulate_batch(
+                    &mut jit_workspaces,
+                    #[cfg(target_arch = "x86_64")]
+                    jit_code_budget,
+                )?;
+            } else {
+                output.as_bytes_mut()[..buffers.output_bytes].fill(0);
+                if let Some(&first_start) = batch_starts.first() {
+                    fill_staging(
                         kernel,
-                        output_bytes,
-                        current_staging,
+                        std::sync::Arc::get_mut(&mut staging[0])
+                            .ok_or_else(|| resource_limit("staging area is still in use"))?,
+                        &mut transfers[0],
+                        provider,
+                        first_start,
+                        stripe_offset,
+                        actual_len,
+                        aligned_len,
+                        contract,
+                    )?;
+                }
+                for (batch_index, &source_start) in batch_starts.iter().enumerate() {
+                    check_cancel(options)?;
+                    let live_inputs = provider
+                        .source_count()
+                        .saturating_sub(source_start)
+                        .min(contract.input_grouping);
+                    let next_start = batch_starts.get(batch_index + 1).copied();
+                    let current_area = batch_index % STAGING_AREA_COUNT;
+                    let next_area = (batch_index + 1) % STAGING_AREA_COUNT;
+                    accumulate_batch(
+                        kernel,
+                        &mut output.as_bytes_mut()[..buffers.output_bytes],
+                        &staging[current_area],
                         &factors,
                         &self.recovery_exponents,
                         source_start,
@@ -503,11 +498,12 @@ impl ForwardEncoder {
                         &mut jit_workspaces,
                         #[cfg(target_arch = "x86_64")]
                         jit_code_budget,
-                    );
+                    )?;
                     if let Some(next_start) = next_start {
-                        fill_result = fill_staging(
+                        fill_staging(
                             kernel,
-                            next_staging,
+                            std::sync::Arc::get_mut(&mut staging[next_area])
+                                .ok_or_else(|| resource_limit("staging area is still in use"))?,
                             &mut transfers[(batch_index + 1) % TRANSFER_BUFFER_COUNT],
                             provider,
                             next_start,
@@ -515,21 +511,18 @@ impl ForwardEncoder {
                             actual_len,
                             aligned_len,
                             contract,
-                        );
+                        )?;
                     }
                 }
-                accumulate_result?;
-                fill_result?;
-            }
 
-            finish_output(
-                kernel,
-                &mut output.as_bytes_mut()[..buffers.output_bytes],
-                buffers.row_stride,
-                aligned_len,
-                self.recovery_exponents.len(),
-                band_size,
-            )?;
+                finish_output(
+                    kernel,
+                    &mut output.as_bytes_mut()[..buffers.output_bytes],
+                    buffers.row_stride,
+                    aligned_len,
+                    self.recovery_exponents.len(),
+                )?;
+            }
 
             for (output_index, &exponent) in self.recovery_exponents.iter().enumerate() {
                 let start = output_index
@@ -566,6 +559,360 @@ impl ForwardEncoder {
 
         check_cancel(options)
     }
+}
+
+/// The per-stripe quantities every band worker and the producer share.
+#[derive(Clone, Copy)]
+struct StripeGeometry {
+    stripe_offset: usize,
+    actual_len: usize,
+    aligned_len: usize,
+    output_stride: usize,
+}
+
+/// One filled staging area handed from the producer to the band workers.
+///
+/// The `Arc` is the hand-off: the producer cannot refill an area until every
+/// band has dropped its clone, which is exactly the condition
+/// [`StripeFeed`] tracks, and `Arc::get_mut` then proves it rather than
+/// trusting it.
+#[derive(Clone)]
+struct BatchTicket {
+    staging: std::sync::Arc<AlignedBuffer>,
+    source_start: usize,
+    live_inputs: usize,
+}
+
+struct FeedState {
+    tickets: [Option<BatchTicket>; STAGING_AREA_COUNT],
+    /// Batches published so far; a band may consume batch `index` once
+    /// `published > index`.
+    published: usize,
+    /// Batches every band has finished; the producer may refill the area of
+    /// batch `index` once `completed + STAGING_AREA_COUNT > index`.
+    completed: usize,
+    /// Bands that have finished the batch currently resident in each area.
+    /// Unambiguous because a band can never be more than one batch ahead of
+    /// the slowest: reaching batch `b + 2` needs `published > b + 2`, which
+    /// needs `completed > b`, which needs every band to have finished `b`.
+    done: [usize; STAGING_AREA_COUNT],
+    /// Set by whichever side failed first (producer error, cancellation, or a
+    /// band's error) so the other side stops waiting instead of deadlocking.
+    failed: bool,
+}
+
+/// The bounded producer/consumer hand-off for one stripe.
+struct StripeFeed {
+    state: std::sync::Mutex<FeedState>,
+    ready: std::sync::Condvar,
+    free: std::sync::Condvar,
+    band_count: usize,
+}
+
+impl StripeFeed {
+    fn new(band_count: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(FeedState {
+                tickets: std::array::from_fn(|_| None),
+                published: 0,
+                completed: 0,
+                done: [0; STAGING_AREA_COUNT],
+                failed: false,
+            }),
+            ready: std::sync::Condvar::new(),
+            free: std::sync::Condvar::new(),
+            band_count,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FeedState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Producer: block until the area for `batch_index` may be refilled, and
+    /// release the producer-side ticket clone that pins it. `false` means the
+    /// pass has already failed and the producer must stop.
+    fn wait_for_area(&self, batch_index: usize) -> bool {
+        let mut state = self.lock();
+        while !state.failed && state.completed + STAGING_AREA_COUNT <= batch_index {
+            state = self
+                .free
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if state.failed {
+            return false;
+        }
+        state.tickets[batch_index % STAGING_AREA_COUNT] = None;
+        true
+    }
+
+    /// Producer: hand a filled area to the bands.
+    fn publish(&self, batch_index: usize, ticket: BatchTicket) {
+        let mut state = self.lock();
+        state.tickets[batch_index % STAGING_AREA_COUNT] = Some(ticket);
+        state.published = batch_index + 1;
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    /// Band: block until batch `batch_index` is available. `None` means the
+    /// pass failed elsewhere and this band must stop.
+    fn acquire(&self, batch_index: usize) -> Option<BatchTicket> {
+        let mut state = self.lock();
+        while !state.failed && state.published <= batch_index {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if state.failed {
+            return None;
+        }
+        state.tickets[batch_index % STAGING_AREA_COUNT].clone()
+    }
+
+    /// Band: record that this band is done with `batch_index`. Must be called
+    /// only after the band's own ticket clone has been dropped.
+    fn release(&self, batch_index: usize) {
+        let mut state = self.lock();
+        let area = batch_index % STAGING_AREA_COUNT;
+        state.done[area] += 1;
+        if state.done[area] == self.band_count {
+            state.done[area] = 0;
+            state.completed = batch_index + 1;
+            drop(state);
+            self.free.notify_all();
+        }
+    }
+
+    /// Stop both sides. Idempotent, and safe to call from either side.
+    fn fail(&self) {
+        let mut state = self.lock();
+        state.failed = true;
+        // Dropping the parked tickets here would race a band that still holds
+        // its clone; the areas are reclaimed when the whole feed is dropped.
+        drop(state);
+        self.ready.notify_all();
+        self.free.notify_all();
+    }
+}
+
+/// Accumulate one stripe with the band workers dispatched once, fed by this
+/// thread through [`StripeFeed`].
+///
+/// The workers are plain scoped OS threads rather than rayon tasks on purpose:
+/// a band that waits for the producer, and a producer that waits for the
+/// slowest band, are blocking waits, and blocking waits inside a work-stealing
+/// pool deadlock as soon as the pool is narrower than the band count (a queued
+/// band would never run, so the ring would never drain). The band count is the
+/// process-stable [`configured_create_threads`] value the memory plan is
+/// already built on, so this creates exactly the workers the plan admits.
+#[allow(clippy::too_many_arguments)]
+fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
+    kernel: ResolvedKernel,
+    provider: &mut P,
+    options: &ForwardEncoderOptions,
+    contract: KernelContract,
+    factors: &FactorSource,
+    exponents: &[RecoveryExponent],
+    staging: &mut [std::sync::Arc<AlignedBuffer>],
+    transfer: &mut AlignedBuffer,
+    output: &mut [u8],
+    batch_starts: &[usize],
+    geometry: StripeGeometry,
+    band_size: usize,
+    #[cfg(target_arch = "x86_64")]
+    jit_workspaces: &mut [reedsolomon_rs::xor_jit::packed::PackedJitWorkspace],
+    #[cfg(target_arch = "x86_64")] jit_code_budget: usize,
+) -> Result<()> {
+    debug_assert_eq!(output.len(), exponents.len() * geometry.output_stride);
+    let band_bytes = checked_mul(
+        band_size,
+        geometry.output_stride,
+        "band byte range overflow",
+    )?;
+    let band_count = exponents.len().div_ceil(band_size);
+    #[cfg(target_arch = "x86_64")]
+    debug_assert_eq!(jit_workspaces.len(), band_count);
+    let batch_count = batch_starts.len();
+    let feed = StripeFeed::new(band_count);
+    let feed = &feed;
+    let source_count = provider.source_count();
+
+    let mut band_results: Vec<Result<()>> = Vec::with_capacity(band_count);
+    let produced = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(band_count);
+        let bands = output
+            .chunks_mut(band_bytes)
+            .zip(exponents.chunks(band_size));
+        #[cfg(target_arch = "x86_64")]
+        let bands = bands.zip(jit_workspaces.iter_mut());
+        for band in bands {
+            #[cfg(target_arch = "x86_64")]
+            let ((band_output, band_exponents), jit_workspace) = band;
+            #[cfg(not(target_arch = "x86_64"))]
+            let (band_output, band_exponents) = band;
+            handles.push(scope.spawn(move || {
+                accumulate_band_stream(
+                    feed,
+                    kernel,
+                    band_output,
+                    band_exponents,
+                    factors,
+                    contract,
+                    geometry,
+                    batch_count,
+                    #[cfg(target_arch = "x86_64")]
+                    jit_workspace,
+                    #[cfg(target_arch = "x86_64")]
+                    jit_code_budget,
+                )
+            }));
+        }
+
+        let produced = produce_stripe(
+            kernel,
+            provider,
+            options,
+            contract,
+            staging,
+            transfer,
+            batch_starts,
+            geometry,
+            source_count,
+            feed,
+        );
+        if produced.is_err() {
+            feed.fail();
+        }
+        band_results.extend(handles.into_iter().map(|handle| {
+            handle.join().unwrap_or_else(|payload| {
+                // `panic = "abort"` in release makes this unreachable
+                // there; under a unwinding test profile the band's panic
+                // must surface as a panic, not as a silent short pass.
+                std::panic::resume_unwind(payload)
+            })
+        }));
+        produced
+    });
+
+    produced?;
+    for result in band_results {
+        result?;
+    }
+    Ok(())
+}
+
+/// The producer half of [`encode_stripe_banded`]: fill one staging area per
+/// input batch, in increasing source order, and hand it to the bands.
+#[allow(clippy::too_many_arguments)]
+fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
+    kernel: ResolvedKernel,
+    provider: &mut P,
+    options: &ForwardEncoderOptions,
+    contract: KernelContract,
+    staging: &mut [std::sync::Arc<AlignedBuffer>],
+    transfer: &mut AlignedBuffer,
+    batch_starts: &[usize],
+    geometry: StripeGeometry,
+    source_count: usize,
+    feed: &StripeFeed,
+) -> Result<()> {
+    for (batch_index, &source_start) in batch_starts.iter().enumerate() {
+        check_cancel(options)?;
+        if !feed.wait_for_area(batch_index) {
+            // A band already failed; its error is the one that surfaces.
+            return Ok(());
+        }
+        let area = batch_index % STAGING_AREA_COUNT;
+        let buffer = std::sync::Arc::get_mut(&mut staging[area])
+            .ok_or_else(|| resource_limit("staging area is still in use"))?;
+        fill_staging(
+            kernel,
+            buffer,
+            transfer,
+            provider,
+            source_start,
+            geometry.stripe_offset,
+            geometry.actual_len,
+            geometry.aligned_len,
+            contract,
+        )?;
+        let live_inputs = source_count
+            .saturating_sub(source_start)
+            .min(contract.input_grouping);
+        feed.publish(
+            batch_index,
+            BatchTicket {
+                staging: std::sync::Arc::clone(&staging[area]),
+                source_start,
+                live_inputs,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// One band worker: zero its own output rows, accumulate every input batch of
+/// the stripe from the feed, then finish its rows.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_band_stream(
+    feed: &StripeFeed,
+    kernel: ResolvedKernel,
+    band_output: &mut [u8],
+    band_exponents: &[RecoveryExponent],
+    factors: &FactorSource,
+    contract: KernelContract,
+    geometry: StripeGeometry,
+    batch_count: usize,
+    #[cfg(target_arch = "x86_64")]
+    jit_workspace: &mut reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+    #[cfg(target_arch = "x86_64")] jit_code_budget: usize,
+) -> Result<()> {
+    // Each band zeroes exactly its own rows, and the bands partition the
+    // output buffer, so the union is the whole-buffer clear the per-batch
+    // shape did on the calling thread.
+    band_output.fill(0);
+    for batch_index in 0..batch_count {
+        let Some(ticket) = feed.acquire(batch_index) else {
+            return Ok(());
+        };
+        let accumulated = accumulate_band(
+            kernel,
+            band_output,
+            &ticket.staging,
+            factors,
+            band_exponents,
+            ticket.source_start,
+            ticket.live_inputs,
+            geometry.aligned_len,
+            geometry.output_stride,
+            contract,
+            #[cfg(target_arch = "x86_64")]
+            jit_workspace,
+            #[cfg(target_arch = "x86_64")]
+            jit_code_budget,
+        );
+        // Released before the completion is recorded: the producer treats the
+        // recorded completion as proof that no band still holds the area.
+        drop(ticket);
+        if let Err(error) = accumulated {
+            feed.fail();
+            return Err(error);
+        }
+        feed.release(batch_index);
+    }
+    finish_band_rows(
+        kernel,
+        band_output,
+        geometry.output_stride,
+        geometry.aligned_len,
+        band_exponents.len(),
+    )
+    .inspect_err(|_| feed.fail())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1540,52 +1887,39 @@ fn accumulate_batch(
     }
 
     // Contiguous exponent bands map to contiguous output-major byte ranges,
-    // so the chunked splits below hand each task a disjoint destination.
+    // so the chunked splits below hand each call a disjoint destination. The
+    // split is walked in order here; the parallel pass drives the same
+    // per-band function from [`encode_stripe_banded`], which is why the two
+    // cannot produce different bytes.
     let band_bytes = checked_mul(band_size, output_stride, "band byte range overflow")?;
-
+    let bands = output
+        .chunks_mut(band_bytes)
+        .zip(exponents.chunks(band_size));
     #[cfg(target_arch = "x86_64")]
-    {
-        output
-            .par_chunks_mut(band_bytes)
-            .zip(exponents.par_chunks(band_size))
-            .zip(jit_workspaces.par_iter_mut())
-            .try_for_each(|((band_output, band_exponents), jit_workspace)| {
-                accumulate_band(
-                    kernel,
-                    band_output,
-                    staging,
-                    factors,
-                    band_exponents,
-                    source_start,
-                    live_inputs,
-                    aligned_len,
-                    output_stride,
-                    contract,
-                    jit_workspace,
-                    jit_code_budget,
-                )
-            })
+    let bands = bands.zip(jit_workspaces.iter_mut());
+    for band in bands {
+        #[cfg(target_arch = "x86_64")]
+        let ((band_output, band_exponents), jit_workspace) = band;
+        #[cfg(not(target_arch = "x86_64"))]
+        let (band_output, band_exponents) = band;
+        accumulate_band(
+            kernel,
+            band_output,
+            staging,
+            factors,
+            band_exponents,
+            source_start,
+            live_inputs,
+            aligned_len,
+            output_stride,
+            contract,
+            #[cfg(target_arch = "x86_64")]
+            jit_workspace,
+            #[cfg(target_arch = "x86_64")]
+            jit_code_budget,
+        )?;
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        output
-            .par_chunks_mut(band_bytes)
-            .zip(exponents.par_chunks(band_size))
-            .try_for_each(|(band_output, band_exponents)| {
-                accumulate_band(
-                    kernel,
-                    band_output,
-                    staging,
-                    factors,
-                    band_exponents,
-                    source_start,
-                    live_inputs,
-                    aligned_len,
-                    output_stride,
-                    contract,
-                )
-            })
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1872,45 +2206,34 @@ fn finish_output(
     output_stride: usize,
     aligned_len: usize,
     output_count: usize,
-    band_size: usize,
+) -> Result<()> {
+    debug_assert_eq!(output.len(), output_count * output_stride);
+    finish_band_rows(kernel, output, output_stride, aligned_len, output_count)
+}
+
+/// Finish one contiguous run of output rows.
+///
+/// Row-local by construction on every family that needs it, which is what
+/// lets each band worker finish its own rows at the end of a stripe instead of
+/// a second banded pass over the whole output.
+fn finish_band_rows(
+    kernel: ResolvedKernel,
+    output: &mut [u8],
+    output_stride: usize,
+    aligned_len: usize,
+    output_count: usize,
 ) -> Result<()> {
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (
-            kernel,
-            output,
-            output_stride,
-            aligned_len,
-            output_count,
-            band_size,
-        );
+        let _ = (kernel, output, output_stride, aligned_len, output_count);
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Whole-number-of-outputs chunking below relies on an exact slice.
-        debug_assert_eq!(output.len(), output_count * output_stride);
         if matches!(kernel, ResolvedKernel::Portable | ResolvedKernel::Simd) {
             return Ok(());
         }
-        if band_size >= output_count || output_count <= 1 {
-            return finish_band(kernel, output, output_stride, aligned_len, output_count);
-        }
-        let band_bytes = checked_mul(band_size, output_stride, "band byte range overflow")?;
-        return output
-            .par_chunks_mut(band_bytes)
-            .try_for_each(|band_output| {
-                // The output buffer is exactly output_count * output_stride
-                // bytes, so every chunk holds a whole number of outputs.
-                let band_outputs = band_output.len() / output_stride;
-                finish_band(
-                    kernel,
-                    band_output,
-                    output_stride,
-                    aligned_len,
-                    band_outputs,
-                )
-            });
+        return finish_band(kernel, output, output_stride, aligned_len, output_count);
     }
     #[allow(unreachable_code)]
     Ok(())
@@ -2184,6 +2507,73 @@ mod tests {
         assert!(parse_kernel_override("").is_err());
     }
 
+    /// The stripe hand-off must give every band every batch, in order, and
+    /// must not let the producer refill an area a band is still reading.
+    ///
+    /// The marker byte is the witness: the producer stamps the batch index
+    /// into the area it just filled, and every band asserts the stamp it sees
+    /// is the batch it asked for. A ring that reclaimed an area early would
+    /// overwrite a live area with the *next* batch's stamp, which is exactly
+    /// the failure this catches; `Arc::get_mut` on the producer side is the
+    /// same reclaim proof the encoder relies on.
+    #[test]
+    fn the_stripe_feed_reclaims_an_area_only_after_every_band_is_done() {
+        const BATCHES: usize = 37;
+        for band_count in [1usize, 2, 5] {
+            let feed = StripeFeed::new(band_count);
+            let feed = &feed;
+            let mut areas: Vec<std::sync::Arc<AlignedBuffer>> = (0..STAGING_AREA_COUNT)
+                .map(|_| std::sync::Arc::new(AlignedBuffer::new(64)))
+                .collect();
+            std::thread::scope(|scope| {
+                for _ in 0..band_count {
+                    scope.spawn(move || {
+                        for batch in 0..BATCHES {
+                            let ticket = feed.acquire(batch).expect("no failure is injected");
+                            assert_eq!(ticket.source_start, batch * 7, "batch order");
+                            assert_eq!(
+                                ticket.staging.as_bytes()[0],
+                                (batch % 251) as u8,
+                                "area was refilled while a band still held it"
+                            );
+                            drop(ticket);
+                            feed.release(batch);
+                        }
+                    });
+                }
+                for batch in 0..BATCHES {
+                    assert!(feed.wait_for_area(batch));
+                    let area = batch % STAGING_AREA_COUNT;
+                    let buffer = std::sync::Arc::get_mut(&mut areas[area])
+                        .expect("every band released the area before it was reclaimed");
+                    buffer.as_bytes_mut()[0] = (batch % 251) as u8;
+                    feed.publish(
+                        batch,
+                        BatchTicket {
+                            staging: std::sync::Arc::clone(&areas[area]),
+                            source_start: batch * 7,
+                            live_inputs: 1,
+                        },
+                    );
+                }
+            });
+        }
+    }
+
+    /// A failed pass must release both sides of the hand-off. Without the
+    /// flag, `acquire` waits for a publish that will never come and
+    /// `wait_for_area` waits for a completion that will never come.
+    #[test]
+    fn a_failed_pass_releases_both_sides_of_the_feed() {
+        let feed = StripeFeed::new(2);
+        feed.fail();
+        assert!(feed.acquire(0).is_none(), "a band must stop on failure");
+        assert!(
+            !feed.wait_for_area(STAGING_AREA_COUNT),
+            "the producer must stop on failure"
+        );
+    }
+
     /// The banded accumulate/finish split must be byte-identical to the
     /// sequential pass for every runtime kernel, including an uneven trailing
     /// band (seven outputs over three bands).
@@ -2252,7 +2642,6 @@ mod tests {
                     aligned_len,
                     aligned_len,
                     exponents.len(),
-                    band_size,
                 )
                 .unwrap();
                 passes.push(output.as_bytes().to_vec());
@@ -2366,7 +2755,6 @@ mod tests {
                     output.as_bytes_mut(),
                     aligned_len,
                     aligned_len,
-                    exponents.len(),
                     exponents.len(),
                 )
                 .unwrap();
