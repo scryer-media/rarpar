@@ -212,8 +212,14 @@ func flatEntryPath(destination, entryName string) (string, error) {
 	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) || strings.ContainsAny(name, `/\`) {
 		return "", fmt.Errorf("refusing tar entry %q: not a plain file name", entryName)
 	}
-	target := filepath.Join(destination, name)
-	relative, err := filepath.Rel(destination, target)
+	root := filepath.Clean(destination)
+	target := filepath.Join(root, name)
+	// Containment is checked on the resolved path itself: it must sit strictly
+	// under the extraction directory.
+	if !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("refusing tar entry %q: resolves outside the extraction directory", entryName)
+	}
+	relative, err := filepath.Rel(root, target)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", fmt.Errorf("refusing tar entry %q: resolves outside the extraction directory", entryName)
 	}

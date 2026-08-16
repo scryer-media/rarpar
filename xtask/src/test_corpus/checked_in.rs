@@ -52,7 +52,11 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
     assert_eq!(ledger.files.len(), 369, "the corpus has 369 fixture paths");
     // The ledger's on-disk layout is the canonical one, so `--update-ledger`
     // never reformats a reviewed file.
-    let on_disk = std::fs::read_to_string(repo_path(&root(), LEDGER_FILE)).unwrap();
+    // Compared with line endings normalised: a Windows checkout with
+    // core.autocrlf rewrites the file to CRLF, which is not a layout change.
+    let on_disk = std::fs::read_to_string(repo_path(&root(), LEDGER_FILE))
+        .unwrap()
+        .replace("\r\n", "\n");
     assert_eq!(
         on_disk,
         ledger.render().unwrap(),
