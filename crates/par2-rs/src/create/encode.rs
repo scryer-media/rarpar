@@ -616,14 +616,26 @@ fn resolve_kernel_with_capabilities(
         }
         ForwardKernel::Auto => {
             // The oracle's ladder, arm for arm (`default_method`,
-            // gf16mul.cpp:1550-1572): affine when GFNI exists, 512-bit
-            // shuffle when AVX512BW/VL exists, and only then — at the AVX2
-            // line — the XOR-JIT behind the fast-JIT CPU gate, with the
-            // 256-bit shuffle as the remaining AVX2 fallback. The AVX-512
-            // JIT is gone entirely (c5-measured; git history preserves it).
+            // gf16mul.cpp:1550-1572) — affine when GFNI exists, 512-bit
+            // shuffle when AVX512BW/VL exists, 256-bit shuffle otherwise —
+            // with one measured departure at the AVX2 line: the oracle puts
+            // its XOR-JIT there behind the fast-JIT CPU gate, but for CREATE
+            // our split-layout 256-bit shuffle beats our packed XOR-JIT on
+            // that exact host class (Zen 2, 3 interleaved reps per cell):
+            // 1.32x at 64 KiB slices, 2.85x at 16 KiB, 4.4x at 8 KiB. The JIT
+            // builds one multi-row batch per input batch, and that build is
+            // the whole gap once slices shrink; the shuffle builds nothing.
+            // So the folded family (GFNI affine, 512-bit shuffle, or 256-bit
+            // shuffle by capability) is the automatic choice wherever it
+            // exists, and the packed XOR-JIT stays an explicit request
+            // (`WEAVER_PAR2_CREATE_KERNEL=xor-jit-avx2`) so it can be A/B'd
+            // any time. This is create only: the repair side keeps its own
+            // AVX2 codebook behind the same gate, where it is measured to
+            // win. The AVX-512 JIT is gone entirely (c5-measured; git
+            // history preserves it).
             #[cfg(target_arch = "x86_64")]
             {
-                if capabilities.folded && (capabilities.folded_wide || !capabilities.avx2_jit) {
+                if capabilities.folded {
                     return Ok(ResolvedKernel::Folded);
                 }
                 if capabilities.avx2_jit {
@@ -2526,6 +2538,47 @@ mod tests {
         assert_eq!(
             auto_kernel_candidates(direct_simd_only),
             vec![ResolvedKernel::Simd, ResolvedKernel::Portable]
+        );
+    }
+
+    /// A fast-JIT AVX2 host (Zen 2 class: AVX2, no GFNI, no AVX-512) auto-
+    /// selects the split-layout shuffle for create; the packed XOR-JIT is
+    /// still an explicit request and still the first admission fallback.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn create_auto_ladder_prefers_shuffle_over_jit_on_fast_jit_hosts() {
+        let fast_jit_avx2 = KernelCapabilities {
+            folded: true,
+            folded_wide: false,
+            avx2_jit: true,
+        };
+        assert_eq!(
+            resolve_kernel_with_capabilities(ForwardKernel::Auto, fast_jit_avx2).unwrap(),
+            ResolvedKernel::Folded
+        );
+        assert_eq!(
+            resolve_kernel_with_capabilities(ForwardKernel::XorJitAvx2, fast_jit_avx2).unwrap(),
+            ResolvedKernel::XorJitAvx2
+        );
+        assert_eq!(
+            auto_kernel_candidates(fast_jit_avx2),
+            vec![
+                ResolvedKernel::Folded,
+                ResolvedKernel::XorJitAvx2,
+                ResolvedKernel::Simd,
+                ResolvedKernel::Portable,
+            ]
+        );
+        // Without the folded family (no AVX2 or SSSE3 altmap at all) the JIT
+        // gate cannot be open either; the ladder degrades to the direct SIMD.
+        let jit_without_folded = KernelCapabilities {
+            folded: false,
+            folded_wide: false,
+            avx2_jit: true,
+        };
+        assert_eq!(
+            resolve_kernel_with_capabilities(ForwardKernel::Auto, jit_without_folded).unwrap(),
+            ResolvedKernel::XorJitAvx2
         );
     }
 
