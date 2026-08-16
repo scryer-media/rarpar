@@ -417,13 +417,7 @@ fn par_create_rejects_existing_outputs_without_overwrite() {
 #[test]
 fn par_canonical_placement_does_not_scan_for_renamed_files() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::rename(
@@ -663,13 +657,7 @@ fn auto_extracts_classic_multivolume_ppmd_set() {
 #[test]
 fn auto_rediscovers_rar_volumes_after_par2_repair() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let missing_volume = work_dir.join("fixture_rar5_lz_plain.part2.rar");
@@ -692,13 +680,7 @@ fn auto_rediscovers_rar_volumes_after_par2_repair() {
 #[test]
 fn par_repair_dry_run_does_not_create_missing_file() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let missing_volume = work_dir.join("fixture_rar5_lz_plain.part2.rar");
@@ -726,13 +708,7 @@ fn par_repair_dry_run_does_not_create_missing_file() {
 #[test]
 fn par_repair_accepts_relative_par2_file_and_emits_json() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
 
@@ -762,13 +738,7 @@ fn par_repair_accepts_relative_par2_file_and_emits_json() {
 #[test]
 fn sab_par2_repair_invocation_accepts_a_healthy_set() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");
@@ -795,13 +765,7 @@ fn sab_par2_repair_invocation_accepts_a_healthy_set() {
 #[test]
 fn sab_par2_repair_invocation_accepts_a_recovery_volume_as_parfile() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
@@ -830,13 +794,7 @@ fn sab_par2_repair_invocation_accepts_a_recovery_volume_as_parfile() {
 #[test]
 fn sab_par2_repair_invocation_requests_missing_recovery_blocks() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
@@ -1631,13 +1589,7 @@ fn compat_unrar_rejects_every_unsupported_modifying_command() {
 #[test]
 fn compat_par2_repair_honors_base_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "par2-rs",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");
