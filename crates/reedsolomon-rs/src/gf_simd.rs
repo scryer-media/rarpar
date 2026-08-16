@@ -4214,19 +4214,74 @@ unsafe fn clmul_load_planes(src: *const u8) -> ClmulSrcPlanes {
     }
 }
 
+/// `PMULL` on the low halves, as one asm instruction.
+///
+/// Paired with [`pmull_high`] below; see that function for why the intrinsics
+/// are not used here.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_low(
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull {r:v}.8h, {a:v}.8b, {b:v}.8b",
+            r = lateout(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
+/// `PMULL2` on the high halves, as one asm instruction.
+///
+/// `vmull_high_p8(x, c)` looks like the obvious spelling, but every `c` here is
+/// a `vdupq_n_p8` broadcast, so LLVM sees that the coefficient's high half
+/// equals its low half and rewrites the multiply as `ext c,c,#8` + `pmull` —
+/// two instructions where one would do, on every high product of every source
+/// of every block. That is 24 extra instructions per 32-byte block on an
+/// eight-source pass (measured: 191 vs the reference's 159 for the plain NEON
+/// flavor). Emitting the instruction directly is how the reference kernel
+/// (`parpar/gf16/gf16_clmul_neon.h`, `pmull_low`/`pmull_high`) avoids the same
+/// rewrite. `lateout` lets the result share a register with an input: the
+/// operands are read before the destination is written.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_high(
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull2 {r:v}.8h, {a:v}.16b, {b:v}.16b",
+            r = lateout(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
 /// The six Karatsuba products of loaded planes and broadcast coefficients.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_partials(d: ClmulSrcPlanes, c: &ClmulBatchCoeff) -> ClmulPartials {
-    use std::arch::aarch64::*;
     unsafe {
         ClmulPartials {
-            low1: vmull_p8(vget_low_p8(d.lo), vget_low_p8(c.lo)),
-            low2: vmull_high_p8(d.lo, c.lo),
-            mid1: vmull_p8(vget_low_p8(d.mid), vget_low_p8(c.mid)),
-            mid2: vmull_high_p8(d.mid, c.mid),
-            high1: vmull_p8(vget_low_p8(d.hi), vget_low_p8(c.hi)),
-            high2: vmull_high_p8(d.hi, c.hi),
+            low1: pmull_low(d.lo, c.lo),
+            low2: pmull_high(d.lo, c.lo),
+            mid1: pmull_low(d.mid, c.mid),
+            mid2: pmull_high(d.mid, c.mid),
+            high1: pmull_low(d.hi, c.hi),
+            high2: pmull_high(d.hi, c.hi),
         }
     }
 }
@@ -4526,6 +4581,14 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
 ) {
     use std::arch::aarch64::*;
     unsafe {
+        // A shared byte offset, not a walking cursor per source: `LD2` has no
+        // register-offset addressing mode either way, so both shapes pay one
+        // address `add` per source per block, but eight loop-carried cursors
+        // cost twelve `mov`s per block in register-copy traffic on the fused
+        // flavor (measured 147 -> 160 instructions per block at eight
+        // sources). LLVM will not fold the increments into `ld2 {..}, [x], #32`
+        // from either spelling, and inline asm cannot express the consecutive
+        // register pair `LD2` needs.
         let mut offset = 0usize;
         while offset < vec_len {
             macro_rules! prefetch_lane {
