@@ -117,7 +117,7 @@ jobs:
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           expected_requirements = {
               "par2-rs": "^0.4.1",
-              "unrar-rs": "^0.5.1",
+              "unrar-rs": "^0.5.2",
           }
           for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)

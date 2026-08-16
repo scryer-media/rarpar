@@ -5966,29 +5966,45 @@ mod tests {
     /// thread against a window the previous LZ round left fully materialized.
     /// If the split ever returned with records still in flight, a following
     /// PPMd member would read a short window and this would diverge.
-    #[test]
-    fn mixed_lz_and_ppmd_solid_members_agree_on_every_path() {
-        if !fixtures_hydrated(&[
-            "test_read_format_rar_ppmd_lzss_conversion.rar",
-            "rar4_ppm_solid_mv.rar",
-            "rar4_ppm_solid_restart.rar",
-            "rar4_ppm_order16_32m.rar",
-        ]) {
+    ///
+    /// `rar4_ppm_order16_32m.rar` is deliberately not in this sweep. It is a
+    /// single pure-PPMd member (the 32 MiB order-16 performance corpus), so it
+    /// has no LZ round to hand a window from and no member to hand it to: on
+    /// every one of the eight decodes `assert_paths_agree` performs, the
+    /// split never engages and the comparison cannot disagree. Those eight
+    /// serial 32 MiB PPMd decodes were most of the crate's CI wall clock, for
+    /// no shape this test is about — the same reason the LZ sweeps leave
+    /// `rar4_solid.rar` out. Its bytes stay pinned by
+    /// `test_rar4_ppmd_order16_32m_payload` in `tests/integration.rs`.
+    ///
+    /// One `#[test]` per fixture rather than one loop: each fixture is eight
+    /// serial PPMd decodes, so as separate tests they run on separate test
+    /// threads and the sweep costs one fixture's time instead of three.
+    fn assert_mixed_lz_and_ppmd_paths_agree(filename: &str) {
+        if !fixtures_hydrated(&[filename]) {
             return;
         }
-        for filename in [
-            // Switches between PPMd and LZ blocks inside one stream.
-            "test_read_format_rar_ppmd_lzss_conversion.rar",
-            "rar4_ppm_solid_mv.rar",
-            "rar4_ppm_solid_restart.rar",
-            "rar4_ppm_order16_32m.rar",
-        ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/rar4")
-                .join(filename);
-            assert!(path.exists(), "missing fixture {filename}");
-            assert_paths_agree(filename, "mixed LZ/PPMd solid");
-        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar4")
+            .join(filename);
+        assert!(path.exists(), "missing fixture {filename}");
+        assert_paths_agree(filename, "mixed LZ/PPMd solid");
+    }
+
+    /// Switches between PPMd and LZ blocks inside one stream.
+    #[test]
+    fn mixed_lz_and_ppmd_conversion_stream_agrees_on_every_path() {
+        assert_mixed_lz_and_ppmd_paths_agree("test_read_format_rar_ppmd_lzss_conversion.rar");
+    }
+
+    #[test]
+    fn mixed_lz_and_ppmd_solid_multivolume_agrees_on_every_path() {
+        assert_mixed_lz_and_ppmd_paths_agree("rar4_ppm_solid_mv.rar");
+    }
+
+    #[test]
+    fn mixed_lz_and_ppmd_solid_restart_agrees_on_every_path() {
+        assert_mixed_lz_and_ppmd_paths_agree("rar4_ppm_solid_restart.rar");
     }
 
     /// The split must engage on its own on the arc's own reference shapes.

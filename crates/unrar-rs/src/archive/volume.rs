@@ -57,11 +57,10 @@ impl RarArchive {
             &self.kdf_cache,
         )?;
 
-        let vol_num = parsed
-            .main
-            .as_ref()
-            .and_then(|m| m.volume_number)
-            .unwrap_or(index as u64) as usize;
+        let vol_num = match parsed.main.as_ref().and_then(|m| m.volume_number) {
+            Some(declared) => crate::limits::checked_volume_number(declared)?,
+            None => index,
+        };
         self.ensure_volume_header_encryption_matches(vol_num, parsed.is_encrypted)?;
 
         // Register this volume.
@@ -212,12 +211,10 @@ impl RarArchive {
         parsed: crate::rar4::Rar4ParsedVolume,
     ) -> RarResult<()> {
         // Use volume number from ENDARC header if available, otherwise fall back to index.
-        let vol_num = parsed
-            .end
-            .as_ref()
-            .and_then(|e| e.volume_number)
-            .map(|v| v as usize)
-            .unwrap_or(index);
+        let vol_num = match parsed.end.as_ref().and_then(|e| e.volume_number) {
+            Some(declared) => crate::limits::checked_volume_number(u64::from(declared))?,
+            None => index,
+        };
         self.ensure_volume_header_encryption_matches(vol_num, parsed.archive_header.is_encrypted)?;
         self.volume_set.add_volume(vol_num);
 

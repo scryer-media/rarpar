@@ -134,11 +134,46 @@ jobs:
               print(f"rarpar must have publish=false, got {rarpar}", file=sys.stderr)
               sys.exit(1)
           PY
+      # The workspace suite and clippy already ran on this exact commit in `ci`
+      # (it triggers on pushes to main and on every pull request). Re-running
+      # them here cost ~30 minutes per publish and could only ever reproduce a
+      # result we already have, so verify the recorded conclusions instead.
+      # `unrar-tests` and `par2-tests` are the lanes that run those two crates'
+      # complete suites (`fixture-tests` covers the rest of the workspace), so
+      # a library publish is gated on its own crate's tests, not just the CLI's.
+      # This is a gate, not a formality: a commit whose `ci` lanes did not pass
+      # cannot be published. Named lanes rather than the run's overall
+      # conclusion, because lanes outside the publishable code — ClusterFuzzLite
+      # on its own nightly, for one — must not be able to block a release.
+      - name: Verify this commit already passed CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          required="fmt clippy clippy-aarch64 unit-tests fixture-tests unrar-tests par2-tests"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
+            --jq '.check_runs[] | "\(.name)\t\(.conclusion)"' > "$RUNNER_TEMP/checks.tsv"
+          echo "recorded check runs for ${COMMIT_SHA}:"
+          cat "$RUNNER_TEMP/checks.tsv"
+          missing=""
+          for lane in $required; do
+            conclusion="$(awk -F'\t' -v l="$lane" '$1 == l {print $2; exit}' "$RUNNER_TEMP/checks.tsv")"
+            if [ -z "$conclusion" ]; then
+              missing="${missing} ${lane}(absent)"
+            elif [ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ]; then
+              missing="${missing} ${lane}(${conclusion})"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::refusing to publish ${COMMIT_SHA}: required CI lanes not green:${missing}"
+            exit 1
+          fi
+          echo "all required lanes green for ${COMMIT_SHA}"
+      # Kept: cheap, and specific to packaging rather than to the code.
       - name: Run publish preflight checks
         run: |
           cargo fmt --check --all
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace --no-fail-fast
       - name: Verify package contents
         env:
           PUBLISH_PACKAGE: ${{ inputs.package }}

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.2
+
+Security patch from 0.5.1. No public item changed shape.
+
+### Fixed
+
+- **Reject header-declared volume numbers above a sane ceiling instead of
+  sizing an allocation with them.** RAR5 encodes the main header's volume
+  number as an unbounded vint, and it was cast straight to `usize` and used to
+  fill a dense volume vector one entry at a time. A 130-byte archive declaring
+  volume 508_427_613_235_168_135 made `RarArchive::open` request roughly
+  462,000 TiB before reading a single member byte — an allocation failure that
+  aborts the process rather than unwinding, so a caller cannot contain it with
+  `catch_unwind`. Availability only: no `unsafe` lies on that path. Found by
+  the crate's `rar_headers` fuzz target; present since the first release.
+  `RAR_MAX_VOLUME_NUMBER` (1 << 20) now bounds every header-declared volume
+  number — RAR5 open, RAR5 incremental volume registration, and the RAR4/RAR14
+  ENDARC number, the last already bounded by the format but routed through the
+  same check so the invariant holds uniformly. Rejected rather than clamped:
+  the reference implementation only ever displays this field, it never sizes a
+  table with it. The ceiling cannot refuse a real set — 500 GiB of member data
+  split into 512 KiB volumes is still under 1M parts.
+
 ## 0.5.1
 
 This is a patch release from 0.5.0: additive and internal only, no public

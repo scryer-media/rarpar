@@ -1389,22 +1389,6 @@ fn imported_filesystem_outputs_match_unrar_when_available() {
     );
 }
 
-#[cfg(feature = "slow-tests")]
-#[test]
-fn imported_ppmd_transition_fixture_extracts_successfully() {
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        corpus_outcome("rar4", "test_read_format_rar_ppmd_lzss_conversion.rar")
-    }))
-    .unwrap_or_else(|_| {
-        panic!("fixture panicked during decode: rar4/test_read_format_rar_ppmd_lzss_conversion.rar")
-    });
-    assert_eq!(
-        outcome,
-        CorpusOutcome::Completed,
-        "expected successful extract for rar4/test_read_format_rar_ppmd_lzss_conversion.rar"
-    );
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CorpusOutcome {
     RejectedOnOpen,

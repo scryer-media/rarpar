@@ -422,8 +422,29 @@ jobs:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify the corpus against its ledger, lock and signature
         run: cargo run --locked -p xtask -- test-corpus verify --all-present --require-signature
-      - name: Run workspace fixture tests
-        run: cargo test --locked --workspace --no-fail-fast
+      - name: Run the workspace fixture tests outside unrar-rs and par2-rs
+        run: |
+          set -euo pipefail
+
+          # `unrar-rs` and `par2-rs` are deliberately NOT here: each of those
+          # crates runs its complete suite exactly once, in `unrar-tests` and
+          # `par2-tests` respectively (with `slow-tests` on, and with the UnRAR
+          # oracle installed for unrar-rs). Running them here as well used to
+          # cost a second full pass over the two heaviest suites in the
+          # workspace on every CI run. What remains is everything else that
+          # needs the hydrated corpora — chiefly the `rarpar` CLI suite, which
+          # extracts fixtures from both — plus reedsolomon-rs, xtask, and their
+          # doctests.
+          #
+          # cargo only *warns* about an `--exclude` name that no longer matches
+          # (a rename would silently turn this back into a second full pass over
+          # that crate), whereas the crate lanes' `-p` hard-errors. Pin both
+          # names first so a rename fails here too instead of just getting slow.
+          cargo pkgid unrar-rs >/dev/null
+          cargo pkgid par2-rs >/dev/null
+          cargo test --locked --workspace --no-fail-fast \
+            --exclude unrar-rs \
+            --exclude par2-rs
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -434,8 +455,8 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  par2-slow-tests:
-    name: par2-slow-tests
+  par2-tests:
+    name: par2-tests
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ubuntu-24.04
@@ -464,9 +485,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-${{ github.run_id }}
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-${{ github.run_id }}
           restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-slow-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -476,8 +497,20 @@ jobs:
           sccache --zero-stats || true
       - name: Hydrate the test corpus (par2)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par2
-      - name: Run PAR2 slow tests
-        run: cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+      - name: Run the par2-rs suite
+        run: |
+          set -euo pipefail
+
+          # The whole crate, once: lib, every `tests/` target, and doctests.
+          # `fixture-tests` excludes par2-rs, so nothing here is a repeat.
+          # `--features slow-tests` brings the gated coverage along in the same
+          # build and the same pass — the three fully-gated targets
+          # (`real_world_generated`, `repair_stress`,
+          # `par2cmdline_turbo_functional`) and the two gated unit tests inside
+          # `src/repairer.rs` — instead of a second, separately-compiled lane.
+          # A feature name that stops existing is a hard cargo error, not a
+          # silent zero.
+          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -488,12 +521,12 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  unrar-slow-tests:
-    name: unrar-slow-tests
+  unrar-tests:
+    name: unrar-tests
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -550,9 +583,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-${{ github.run_id }}
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-${{ github.run_id }}
           restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-slow-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -562,8 +595,26 @@ jobs:
           sccache --zero-stats || true
       - name: Hydrate the test corpus (unrar)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unrar
-      - name: Run UnRAR slow tests
-        run: cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
+      - name: Run the unrar-rs suite
+        run: |
+          set -euo pipefail
+
+          # The whole crate, once: lib (the fixture-driven half of the suite is
+          # here), every `tests/` target, and doctests. `fixture-tests` excludes
+          # unrar-rs, so nothing here is a repeat of another lane. This is also
+          # the only lane that installs RARLAB's unrar, so the oracle
+          # differentials in `integration` run here with UNRAR_BIN set rather
+          # than skipping themselves as they do everywhere else.
+          #
+          # `--features slow-tests` brings the gated coverage along in the same
+          # build and the same pass: the five targets that are
+          # `#![cfg(feature = "slow-tests")]` in their entirety (`api_parity`,
+          # `failure_paths`, `generated_multivolume_matrix`, `slow_encrypted`,
+          # `slow_imported_corpus`) instead of a second, separately-compiled
+          # lane. This crate's lib has no gated tests, so the feature changes
+          # nothing about the lib run. A feature name that stops existing is a
+          # hard cargo error, not a silent zero.
+          cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -1540,8 +1591,8 @@ jobs:
       - clippy
       - unit-tests
       - fixture-tests
-      - par2-slow-tests
-      - unrar-slow-tests
+      - par2-tests
+      - unrar-tests
       - platform-tests
       - target-checks
       - package
