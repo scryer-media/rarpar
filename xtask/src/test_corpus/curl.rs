@@ -7,6 +7,12 @@
 //! natively (`--aws-sigv4`), so this crate carries no HTTP stack and no
 //! request signing of its own. Credentials are handed to curl on stdin as a
 //! config file, never on the command line.
+//!
+//! SHA-256 appears here only inside SigV4 (`AWS4-HMAC-SHA256`,
+//! `x-amz-content-sha256`), because AWS Signature Version 4 specifies that
+//! hash. It is curl's computation, it never leaves the request, and it says
+//! nothing about how the corpus addresses or verifies an object — that is
+//! BLAKE3 throughout.
 
 use std::fs;
 use std::io::Write as _;

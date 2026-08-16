@@ -69,7 +69,7 @@ Usage:
   cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST
   cargo run -p xtask -- bench <toolchains|corpus|payload|plan|preflight|run|report|render> [OPTIONS]
   cargo run -p xtask -- bench all-hosts [--config PATH] [--jobs N]
-  cargo run -p xtask -- test-corpus <build|verify|fetch|hydrate|sign|publish> [OPTIONS]"
+  cargo run -p xtask -- test-corpus <generate|bench-pins|build|verify|fetch|hydrate|sign|publish> [OPTIONS]"
     );
 }
 

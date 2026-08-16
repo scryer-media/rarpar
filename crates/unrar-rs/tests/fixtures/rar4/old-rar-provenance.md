@@ -18,9 +18,11 @@ An earlier revision of this note said Apache-2.0; that was wrong.
 These RAR 1.5 / 2.0 archives are immutable imports: they predate every writer
 in the shared toolchain lock and are never assigned a RARLAB writer.
 
-SHA-256:
+BLAKE3 (the digest `test-corpus/sources.json` records; these replace the SHA-256
+values this note carried before the corpus moved to BLAKE3, and describe exactly
+the same bytes):
 
-- `rar15_lz.rar`: `9c1deb8e11baa6fa1658c453b26a128a8437cefcbdeef3f4bcc499f6f7720a98`
-- `rar20_lz.rar`: `3baa87e8e4f44628655d64954a03e79b28abf84261eba6b21e7244f27c104b79`
-- `rar20_audio_text.rar`: `4144b4063f2f7c997b28b0bf42dc16cdb42ec913f271eecc47cd07b71335396e`
-- `../originals/boat_modern_english.wav`: `0aeeb3c12f01d7089ca83eb321d5a54673ba0e6011231f5bc1fa10102ea3d797`
+- `rar15_lz.rar`: `e1bde199511d2ba4bcd099dff28766fef1a008b3fb47a8aa6008fc967d8cfb6b`
+- `rar20_lz.rar`: `41687f8e8d2800926fa4e1fe437f74c658ba34b43be31075e619126ce115a798`
+- `rar20_audio_text.rar`: `6e3ae224c6b075b6ba170d6b7e2da02fd6db4978cc788526cf52a0ce7441bf54`
+- `../originals/boat_modern_english.wav`: `a69aeb9dfaaf0abb93fe4cecb32a549f0faf237fe4a5bcb24c5e8a6ca0327ec1`

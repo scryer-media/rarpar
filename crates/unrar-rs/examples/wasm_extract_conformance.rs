@@ -41,8 +41,9 @@ use std::path::{Path, PathBuf};
 
 use unrar_rs::{ExtractOptions, MemberInfo, RarArchive};
 
-/// The encrypted fixture password (see tests/fixtures/generate_encrypted.sh and
-/// generate_generated_matrix.sh — all encrypted fixtures share it).
+/// The encrypted fixture password (see the `encrypted` and `generated_matrix`
+/// recipes in bench/rarpar-bench/internal/testcorpus — all encrypted fixtures
+/// share it).
 const PW: &str = "testpass123";
 
 /// One encrypted fixture in the conformance matrix. `original` is the basename

@@ -1,17 +1,19 @@
 //! `cargo xtask test-corpus`: the signed, content-addressed test corpus.
 //!
 //! The binary fixtures under `crates/*/tests/fixtures/` are published to R2 as
-//! per-file objects addressed by SHA-256, described by a canonical manifest
+//! per-file objects addressed by BLAKE3, described by a canonical manifest
 //! that is a pure function of the checked-in ledger (`test-corpus/sources.json`),
 //! the profile table (`test-corpus/profiles.json`) and the shared toolchain lock.
 //! `test-corpus/lock.json` pins the one manifest a checkout hydrates from.
 //!
 //! See `docs/test-corpus.md` for the contract. Nothing here implements crypto:
-//! digests come from `sha2`, transport from `curl`, signatures from `cosign`.
+//! digests come from `blake3`, transport from `curl`, signatures from `cosign`.
 
+mod bench_pins;
 mod checked_in;
 mod commands;
 mod curl;
+mod generate;
 mod glob;
 mod ledger;
 mod lock;
@@ -25,8 +27,6 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 pub(crate) use commands::run;
 
 pub(crate) const LEDGER_FILE: &str = "test-corpus/sources.json";
@@ -35,11 +35,15 @@ pub(crate) const LOCK_FILE: &str = "test-corpus/lock.json";
 pub(crate) const TOOLCHAINS_FILE: &str = "bench/rarpar-bench/config/toolchains.json";
 
 /// Object key prefixes in the bucket. Content-addressed, never rewritten.
-pub(crate) const OBJECTS_PREFIX: &str = "test-corpus/objects/sha256/";
-pub(crate) const MANIFESTS_PREFIX: &str = "test-corpus/manifests/sha256/";
+pub(crate) const OBJECTS_PREFIX: &str = "test-corpus/objects/blake3/";
+pub(crate) const MANIFESTS_PREFIX: &str = "test-corpus/manifests/blake3/";
 
 /// The Git LFS pointer preamble. Bytes that start with this are not fixture
 /// bytes, and every command here treats them as an error, never as content.
+///
+/// SHA-256 by specification: the pointer's `oid sha256:` line is the Git LFS
+/// v1 pointer format, not a digest this tool chooses. Only the preamble is
+/// matched here, so nothing downstream depends on the oid's algorithm.
 const LFS_POINTER_PREFIX: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -62,21 +66,23 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-pub(crate) fn is_sha256_hex(value: &str) -> bool {
+/// A 32-byte BLAKE3 digest in lowercase hex, which is the one digest form the
+/// corpus records: ledger entries, manifest entries, object keys and lock pins.
+pub(crate) fn is_blake3_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+pub(crate) fn blake3_bytes(bytes: &[u8]) -> String {
+    hex(blake3::hash(bytes).as_bytes())
 }
 
 /// Digest and size of a file, plus whether it is a Git LFS pointer rather than
 /// content. Streams so the 100 MiB fixtures never sit in memory twice.
 pub(crate) struct FileDigest {
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
     pub(crate) size: u64,
     pub(crate) lfs_pointer: bool,
 }
@@ -84,7 +90,7 @@ pub(crate) struct FileDigest {
 pub(crate) fn digest_file(path: &Path) -> Result<FileDigest> {
     let mut file = fs::File::open(path)
         .map_err(|source| error(format!("open {}: {source}", path.display())))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 1 << 20];
     let mut size = 0u64;
     let mut head: Vec<u8> = Vec::with_capacity(LFS_POINTER_PREFIX.len());
@@ -103,7 +109,7 @@ pub(crate) fn digest_file(path: &Path) -> Result<FileDigest> {
         size += read as u64;
     }
     Ok(FileDigest {
-        sha256: hex(&hasher.finalize()),
+        blake3: hex(hasher.finalize().as_bytes()),
         size,
         lfs_pointer: head.starts_with(LFS_POINTER_PREFIX),
     })
@@ -233,19 +239,20 @@ mod tests {
     #[test]
     fn hex_and_digest_agree_with_known_answers() {
         assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+        // The BLAKE3 reference vectors for the empty input and "abc".
         assert_eq!(
-            sha256_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            blake3_bytes(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
         assert_eq!(
-            sha256_bytes(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            blake3_bytes(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
-        assert!(is_sha256_hex(&sha256_bytes(b"abc")));
-        assert!(!is_sha256_hex(
-            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        assert!(is_blake3_hex(&blake3_bytes(b"abc")));
+        assert!(!is_blake3_hex(
+            "6437B3AC38465133FFB63B75273A8DB548C558465D79DB03FD359C6CD5BD9D85"
         ));
-        assert!(!is_sha256_hex("abc"));
+        assert!(!is_blake3_hex("abc"));
     }
 
     #[test]
@@ -257,8 +264,8 @@ mod tests {
         let digest = digest_file(&content).unwrap();
         assert_eq!(digest.size, 3);
         assert_eq!(
-            digest.sha256,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            digest.blake3,
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
         assert!(!digest.lfs_pointer);
 

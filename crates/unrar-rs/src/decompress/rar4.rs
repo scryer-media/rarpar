@@ -5448,136 +5448,16 @@ mod tests {
         }
     }
 
-    const RAW_16: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x20, 0x21, 0x30, 0x31, 0x40, 0x41, 0xE8, 0xE9, 0x00,
-        0x01,
-    ];
-    const DELTA_64: [u8; 64] = [
-        0x00, 0xFF, 0xFD, 0xFA, 0xEA, 0xD9, 0xB9, 0x98, 0x68, 0x37, 0xF7, 0xB6, 0xCE, 0xE5, 0xE5,
-        0xE4, 0xE2, 0xDF, 0xCF, 0xBE, 0x9E, 0x7D, 0x4D, 0x1C, 0xDC, 0x9B, 0xB3, 0xCA, 0xCA, 0xC9,
-        0xC7, 0xC4, 0xB4, 0xA3, 0x83, 0x62, 0x32, 0x01, 0xC1, 0x80, 0x98, 0xAF, 0xAF, 0xAE, 0xAC,
-        0xA9, 0x99, 0x88, 0x68, 0x47, 0x17, 0xE6, 0xA6, 0x65, 0x7D, 0x94, 0x94, 0x93, 0x91, 0x8E,
-        0x7E, 0x6D, 0x4D, 0x2C,
-    ];
-    const DELTA_16: [u8; 16] = [
-        0xD0, 0x9F, 0x6F, 0x3E, 0x0E, 0xDD, 0xAD, 0x7C, 0x4C, 0x1B, 0xEB, 0xBA, 0x8A, 0x59, 0x29,
-        0xF8,
-    ];
-    const E8_64: [u8; 64] = [
-        0xE8, 0x0F, 0x20, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x07, 0x20, 0x03, 0x00, 0x41, 0x41,
-        0x41, 0xE8, 0xFF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xF7, 0x1F, 0x03, 0x00, 0x41,
-        0x41, 0x41, 0xE8, 0xEF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xE7, 0x1F, 0x03, 0x00,
-        0x41, 0x41, 0x41, 0xE8, 0xDF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xD7, 0x1F, 0x03,
-        0x00, 0x41, 0x41, 0x41,
-    ];
-    /// The same eight E8 records rewritten against file offset 64 instead of 0.
-    const E8_64_AT_OFFSET_64: [u8; 64] = [
-        0xE8, 0xCF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xC7, 0x1F, 0x03, 0x00, 0x41, 0x41,
-        0x41, 0xE8, 0xBF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xB7, 0x1F, 0x03, 0x00, 0x41,
-        0x41, 0x41, 0xE8, 0xAF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xA7, 0x1F, 0x03, 0x00,
-        0x41, 0x41, 0x41, 0xE8, 0x9F, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x97, 0x1F, 0x03,
-        0x00, 0x41, 0x41, 0x41,
-    ];
-
-    fn joined(head: &[u8], tail: &[u8]) -> Vec<u8> {
-        let mut out = head.to_vec();
-        out.extend_from_slice(tail);
-        out
-    }
-
-    /// rarpar bounds *writing* where the oracle bounds writing, instead of
-    /// bounding decoding by the declared size (review item O4/O5).
-    ///
-    /// Expected bytes come from the unrar 7.20 binary;
-    /// `tests/fixtures/generate_vm_output_bounds.py` assembles the archive and
-    /// stamps those same bytes' CRC32 into its file headers, so `unrar t`
-    /// passes on all nine members. Every member declares 16 bytes except
-    /// `filter-inside-size`, which declares 64:
-    ///
-    /// * `filter-overruns-size` — a filtered block over [0,64). The filtered
-    ///   write has no `DestUnpSize` clamp (unpack30.cpp:597-599), so all 64
-    ///   transformed bytes go out.
-    /// * `filter-then-dropped-tail` — the same block plus 16 raw bytes behind
-    ///   it. `WrittenFileSize` is 64 by then, so `UnpWriteData` returns without
-    ///   writing anything for the tail (unpack50.cpp:540).
-    /// * `raw-overrun-clamped` — no filter, 64 raw bytes, clamped to 16.
-    /// * `filter-inside-size` — the well-formed shape, untouched by any of this.
-    /// * `e8-overruns-size` — the same overrun through the E8/E9 filter, whose
-    ///   rewritten addresses show the transform really ran.
-    /// * `raw-clamped-then-e8` — 64 raw bytes (16 emitted) and an E8 block
-    ///   behind them. `ExecuteCode` seeds `InitR[6]` with `WrittenFileSize`
-    ///   (unpack30.cpp:626), and `UnpWriteData` advances that counter by the
-    ///   *full* span it was handed rather than the clamped part it wrote
-    ///   (unpack50.cpp:547), so the rewrite uses file offset 64. These bytes
-    ///   are what pins the counter's semantics.
-    /// * `chained-filters-past-size` — a second block queued behind the first,
-    ///   entirely past the declared size, and still emitted.
-    /// * `filter-reset-drops-pending` — a filter packet writing slot 0
-    ///   mid-member: `InitFilters30` clears `PrgStack` (unpack30.cpp:369-373),
-    ///   so the block queued before it is dropped and its bytes leave through
-    ///   the clamped raw path instead.
-    /// * `filter-start-past-window` — a block queued at [64,128) in a member
-    ///   that ends after 32 bytes. The oracle never matches the filter
-    ///   (unpack30.cpp:543) and falls through to
-    ///   `UnpWriteArea(WrittenBorder,UnpPtr)` (unpack30.cpp:619).
-    #[test]
-    fn vm_filtered_output_is_bounded_at_the_write_layer_like_rar_behavior() {
-        const FIXTURE: &str = "rar4_vm_output_bounds.rar";
-        if !fixtures_hydrated(&[FIXTURE]) {
-            return;
-        }
-
-        let expected: Vec<(&str, Vec<u8>)> = vec![
-            ("filter-overruns-size.bin", DELTA_64.to_vec()),
-            ("filter-then-dropped-tail.bin", DELTA_64.to_vec()),
-            ("raw-overrun-clamped.bin", RAW_16.to_vec()),
-            ("filter-inside-size.bin", DELTA_64.to_vec()),
-            ("e8-overruns-size.bin", E8_64.to_vec()),
-            (
-                "raw-clamped-then-e8.bin",
-                joined(&RAW_16, &E8_64_AT_OFFSET_64),
-            ),
-            (
-                "chained-filters-past-size.bin",
-                joined(&DELTA_64, &DELTA_16),
-            ),
-            ("filter-reset-drops-pending.bin", joined(&RAW_16, &DELTA_16)),
-            ("filter-start-past-window.bin", RAW_16.to_vec()),
-        ];
-
-        let members = decode_members(FIXTURE);
-        assert_eq!(members.len(), expected.len());
-        for (member, (name, want)) in members.iter().zip(&expected) {
-            let bytes = member
-                .as_ref()
-                .unwrap_or_else(|err| panic!("{name} failed to decode: {err}"));
-            assert_eq!(bytes.as_slice(), want.as_slice(), "{name}");
-        }
-    }
-
-    /// A queued filter block whose start is ahead of everything the window
-    /// holds must not stall the flush drain.
-    ///
-    /// `filter-start-past-window` queues a block at [64,128) and then ends its
-    /// member after 32 bytes. Draining it writes the 32 raw bytes and then has
-    /// nothing left to advance with, which is where the drain used to re-run
-    /// the same no-op prefix flush forever — the shape that froze extraction of
-    /// real archives carrying stacked delta and x86 filters, whose second
-    /// filter is queued ahead of the data it covers. Reaching the assertion at
-    /// all is the test.
-    #[test]
-    fn filter_queued_ahead_of_the_window_does_not_stall_the_flush() {
-        const FIXTURE: &str = "rar4_vm_output_bounds.rar";
-        if !fixtures_hydrated(&[FIXTURE]) {
-            return;
-        }
-        let members = decode_members(FIXTURE);
-        let last = members.last().expect("fixture has members");
-        assert_eq!(
-            last.as_ref().expect("decodes").as_slice(),
-            RAW_16.as_slice()
-        );
-    }
+    // The `rar4_vm_output_bounds.rar` fixture that drove
+    // `vm_filtered_output_is_bounded_at_the_write_layer_like_rar_behavior` and
+    // `filter_queued_ahead_of_the_window_does_not_stall_the_flush` was
+    // hand-assembled: RARLAB's writer never emits a filter block that overruns
+    // the declared member size, so no legitimate tool could produce it. Fixtures
+    // are created by RARLAB tooling or imported unmodified from a public
+    // upstream, and nothing else, so the fixture and both tests are gone. The
+    // write-layer bounds and the flush drain they covered are still exercised by
+    // the VM tests above and by the real filtered archives in the imported
+    // corpus.
 
     /// A solid member that changes unpack version keeps reading the previous
     /// member's dictionary (review item G5).

@@ -13,7 +13,7 @@ use super::profiles::ProfilesFile;
 use super::sigstore;
 use super::{
     LEDGER_FILE, LOCK_FILE, MANIFESTS_PREFIX, OBJECTS_PREFIX, PROFILES_FILE, Result,
-    TOOLCHAINS_FILE, digest_file, fail, next_path, next_string, repo_path, sha256_bytes,
+    TOOLCHAINS_FILE, blake3_bytes, digest_file, fail, next_path, next_string, repo_path,
     write_atomic,
 };
 
@@ -23,6 +23,8 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<()> {
     let command = args.next().and_then(|arg| arg.into_string().ok());
     match command.as_deref() {
         Some("build") => build(&root, args.collect()),
+        Some("generate") => super::generate::run(&root, args.collect()),
+        Some("bench-pins") => super::bench_pins::run(&root, args.collect()),
         Some("verify") => verify(&root, args.collect()),
         Some("fetch") => fetch(&root, args.collect()),
         Some("hydrate") => hydrate(&root, args.collect()),
@@ -40,9 +42,21 @@ pub(crate) fn print_usage() {
     eprintln!(
         "\
 Usage:
+  cargo run -p xtask -- test-corpus generate [--jobs N] [--only GENERATOR]...
+      Produce the whole corpus from its recipes: run every generator on the
+      pinned toolchain images, fetch every upstream import at its pinned commit,
+      require the produced tree to be exactly the ledger's path set, and refresh
+      the ledger's sizes and digests. REWRITES the fixture tree and
+      test-corpus/sources.json. --only runs named generators and skips the
+      upstreams, the path-set check and the ledger refresh.
+  cargo run -p xtask -- test-corpus bench-pins [--out FILE]
+      Recompute the benchmark corpus's fixture_sha256 pins the way the Go
+      harness does — SHA-256, because that is what the benchmark corpus's own
+      contract specifies — and print old -> new for
+      bench/rarpar-bench/config/corpus.json. Reads the fixture bytes.
   cargo run -p xtask -- test-corpus build [--out DIR] [--update-ledger]
       Validate test-corpus/sources.json against the tree and the toolchain lock,
-      resolve profiles, and write DIR/manifest.json, DIR/manifest.sha256,
+      resolve profiles, and write DIR/manifest.json, DIR/manifest.blake3,
       DIR/provenance.json and DIR/objects.tsv (default DIR: target/test-corpus/build).
       --update-ledger refreshes sizes/digests of paths already in the ledger.
   cargo run -p xtask -- test-corpus verify [--require-signature] [--offline] [--all-present] [--upstreams]
@@ -155,10 +169,10 @@ fn hydrate(root: &Path, args: Vec<OsString>) -> Result<()> {
             Ok(digest) if digest.lfs_pointer => {
                 failures.push(format!("{path}: still a Git LFS pointer after pull"))
             }
-            Ok(digest) if digest.sha256 != entry.sha256 || digest.size != entry.size => failures
+            Ok(digest) if digest.blake3 != entry.blake3 || digest.size != entry.size => failures
                 .push(format!(
                     "{path}: hydrated bytes hash to {} ({} bytes), ledger says {} ({} bytes)",
-                    digest.sha256, digest.size, entry.sha256, entry.size
+                    digest.blake3, digest.size, entry.blake3, entry.size
                 )),
             Ok(_) => {}
         }
@@ -221,12 +235,12 @@ fn sign(args: Vec<OsString>) -> Result<()> {
     if !sigstore::cosign_available() {
         return fail("cosign is not installed (install cosign, or set RARPAR_COSIGN)");
     }
-    let manifest_sha256 = fs::read_to_string(dir.join("manifest.sha256"))?
+    let manifest_blake3 = fs::read_to_string(dir.join("manifest.blake3"))?
         .trim()
         .to_owned();
     let manifest_bytes = fs::read(dir.join("manifest.json"))?;
-    if sha256_bytes(&manifest_bytes) != manifest_sha256 {
-        return fail("manifest.json does not hash to manifest.sha256; rebuild before signing");
+    if blake3_bytes(&manifest_bytes) != manifest_blake3 {
+        return fail("manifest.json does not hash to manifest.blake3; rebuild before signing");
     }
     for document in ["manifest.json", "provenance.json"] {
         let blob = dir.join(document);
@@ -241,7 +255,7 @@ fn sign(args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
-fn report(findings: &[Finding], what: &str) -> Result<()> {
+pub(crate) fn report(findings: &[Finding], what: &str) -> Result<()> {
     if findings.is_empty() {
         return Ok(());
     }
@@ -260,11 +274,11 @@ struct Inputs {
     ledger: Ledger,
     profiles: ProfilesFile,
     lock: ToolchainLock,
-    lock_sha256: String,
+    lock_blake3: String,
 }
 
 fn load_inputs(root: &Path) -> Result<Inputs> {
-    let (lock, lock_sha256) = ToolchainLock::load(&repo_path(root, TOOLCHAINS_FILE))?;
+    let (lock, lock_blake3) = ToolchainLock::load(&repo_path(root, TOOLCHAINS_FILE))?;
     let ledger = Ledger::load(&repo_path(root, LEDGER_FILE))?;
     let profiles = ProfilesFile::load(&repo_path(root, PROFILES_FILE))?;
     report(
@@ -275,7 +289,7 @@ fn load_inputs(root: &Path) -> Result<Inputs> {
         ledger,
         profiles,
         lock,
-        lock_sha256,
+        lock_blake3,
     })
 }
 
@@ -313,26 +327,26 @@ fn build(root: &Path, args: Vec<OsString>) -> Result<()> {
         &inputs.ledger,
         &inputs.profiles,
         &inputs.lock,
-        &inputs.lock_sha256,
+        &inputs.lock_blake3,
     )?;
     let bytes = manifest.canonical_bytes()?;
-    let digest = sha256_bytes(&bytes);
-    let provenance = Provenance::from_environment(&manifest, &digest, &inputs.lock_sha256);
+    let digest = blake3_bytes(&bytes);
+    let provenance = Provenance::from_environment(&manifest, &digest, &inputs.lock_blake3);
     let mut provenance_bytes = serde_json::to_vec_pretty(&provenance)?;
     provenance_bytes.push(b'\n');
 
     fs::create_dir_all(&out)?;
     write_atomic(&out.join("manifest.json"), &bytes)?;
     write_atomic(
-        &out.join("manifest.sha256"),
+        &out.join("manifest.blake3"),
         format!("{digest}\n").as_bytes(),
     )?;
     write_atomic(&out.join("provenance.json"), &provenance_bytes)?;
-    // objects.tsv: "<sha256>\t<repo path>" for every file, so the publisher and
+    // objects.tsv: "<blake3>\t<repo path>" for every file, so the publisher and
     // a human can see exactly what a publication uploads.
     let mut objects = String::new();
     for file in &manifest.files {
-        objects.push_str(&file.sha256);
+        objects.push_str(&file.blake3);
         objects.push('\t');
         objects.push_str(&file.path);
         objects.push('\n');
@@ -412,10 +426,10 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
         &inputs.ledger,
         &inputs.profiles,
         &inputs.lock,
-        &inputs.lock_sha256,
+        &inputs.lock_blake3,
     )?;
     let bytes = manifest.canonical_bytes()?;
-    let digest = sha256_bytes(&bytes);
+    let digest = blake3_bytes(&bytes);
     println!("test-corpus: manifest recomputed from the tree: {digest}");
 
     if lock.is_unpublished() {
@@ -431,21 +445,21 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
             }
         );
     } else {
-        if lock.manifest.sha256 != digest {
+        if lock.manifest.blake3 != digest {
             problems.push(format!(
                 "lock.json pins manifest {} but the tree recomputes {digest}; republish and re-pin, or restore the ledger",
-                lock.manifest.sha256
+                lock.manifest.blake3
             ));
         }
         if !offline {
             match curl::get_to_vec(&lock.manifest.url) {
                 Err(err) => problems.push(format!("published manifest unavailable: {err}")),
                 Ok(published) => {
-                    let published_digest = sha256_bytes(&published);
-                    if published_digest != lock.manifest.sha256 {
+                    let published_digest = blake3_bytes(&published);
+                    if published_digest != lock.manifest.blake3 {
                         problems.push(format!(
                             "published manifest at {} hashes to {published_digest}, lock pins {}",
-                            lock.manifest.url, lock.manifest.sha256
+                            lock.manifest.url, lock.manifest.blake3
                         ));
                     } else if published != bytes {
                         problems.push("published manifest bytes differ from the recomputed manifest despite equal digest".to_owned());
@@ -555,7 +569,7 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
         let destination = repo_path(root, &file.path);
         if destination.is_file() {
             let digest = digest_file(&destination)?;
-            if !digest.lfs_pointer && digest.sha256 == file.sha256 && digest.size == file.size {
+            if !digest.lfs_pointer && digest.blake3 == file.blake3 && digest.size == file.size {
                 present += 1;
                 continue;
             }
@@ -566,10 +580,10 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
     let mut downloads: Vec<Download> = Vec::new();
     let mut by_digest: BTreeMap<String, PathBuf> = BTreeMap::new();
     for file in &missing {
-        by_digest.entry(file.sha256.clone()).or_insert_with(|| {
-            let temp = scratch.join(format!("{}.{}.part", file.sha256, std::process::id()));
+        by_digest.entry(file.blake3.clone()).or_insert_with(|| {
+            let temp = scratch.join(format!("{}.{}.part", file.blake3, std::process::id()));
             downloads.push(Download {
-                url: lock.object_url(&file.sha256),
+                url: lock.object_url(&file.blake3),
                 destination: temp.clone(),
             });
             temp
@@ -600,8 +614,8 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
     let transfers = curl::get_many(&downloads, parallel)?;
     // Verify every downloaded object once, by digest.
     let mut verified: BTreeMap<&String, std::result::Result<(), String>> = BTreeMap::new();
-    for (sha256, temp) in &by_digest {
-        let url = lock.object_url(sha256);
+    for (blake3, temp) in &by_digest {
+        let url = lock.object_url(blake3);
         let status = transfers
             .iter()
             .find(|transfer| transfer.url == url)
@@ -613,10 +627,10 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
                 None => return fail(format!("no transfer result for {url}")),
             }
             let digest = digest_file(temp)?;
-            if digest.sha256 != *sha256 {
+            if digest.blake3 != *blake3 {
                 return fail(format!(
-                    "object {url} hashed to {} ({} bytes), manifest says {sha256}",
-                    digest.sha256, digest.size
+                    "object {url} hashed to {} ({} bytes), manifest says {blake3}",
+                    digest.blake3, digest.size
                 ));
             }
             Ok(())
@@ -624,22 +638,22 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
         if outcome.is_err() {
             let _ = fs::remove_file(temp);
         }
-        verified.insert(sha256, outcome.map_err(|err| err.to_string()));
+        verified.insert(blake3, outcome.map_err(|err| err.to_string()));
     }
     // Place each path: the last path for a digest takes the temp file, the
     // others copy it, all through the atomic write path.
     let mut failures = Vec::new();
     let mut remaining: BTreeMap<&String, usize> = BTreeMap::new();
     for file in &missing {
-        *remaining.entry(&file.sha256).or_default() += 1;
+        *remaining.entry(&file.blake3).or_default() += 1;
     }
     for file in &missing {
         let destination = repo_path(root, &file.path);
-        let temp = &by_digest[&file.sha256];
-        let outcome = match &verified[&file.sha256] {
+        let temp = &by_digest[&file.blake3];
+        let outcome = match &verified[&file.blake3] {
             Err(err) => Err(err.clone()),
             Ok(()) => {
-                let left = remaining.get_mut(&file.sha256).expect("counted");
+                let left = remaining.get_mut(&file.blake3).expect("counted");
                 *left -= 1;
                 let result = if *left == 0 {
                     match destination.parent() {
@@ -660,10 +674,10 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
                     // Size is checked on the placed file: the digest was
                     // checked on the object, and a copy is only a copy.
                     let placed = digest_file(&destination).map_err(|err| err.to_string())?;
-                    if placed.sha256 != file.sha256 || placed.size != file.size {
+                    if placed.blake3 != file.blake3 || placed.size != file.size {
                         return Err(format!(
                             "placed file hashes to {} ({} bytes), manifest says {} ({} bytes)",
-                            placed.sha256, placed.size, file.sha256, file.size
+                            placed.blake3, placed.size, file.blake3, file.size
                         ));
                     }
                     Ok(())
@@ -701,20 +715,20 @@ fn locked_manifest(root: &Path, lock: &Lock) -> Result<Manifest> {
         .join("target")
         .join("test-corpus")
         .join("manifests")
-        .join(format!("{}.json", lock.manifest.sha256));
+        .join(format!("{}.json", lock.manifest.blake3));
     if cache.is_file() {
         let bytes = fs::read(&cache)?;
-        if sha256_bytes(&bytes) == lock.manifest.sha256 {
+        if blake3_bytes(&bytes) == lock.manifest.blake3 {
             return Manifest::parse(&bytes);
         }
         let _ = fs::remove_file(&cache);
     }
     let bytes = curl::get_to_vec(&lock.manifest.url)?;
-    let digest = sha256_bytes(&bytes);
-    if digest != lock.manifest.sha256 {
+    let digest = blake3_bytes(&bytes);
+    if digest != lock.manifest.blake3 {
         return fail(format!(
             "manifest at {} hashes to {digest}, lock pins {}",
-            lock.manifest.url, lock.manifest.sha256
+            lock.manifest.url, lock.manifest.blake3
         ));
     }
     let manifest = Manifest::parse(&bytes)?;
@@ -773,22 +787,22 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     };
 
     // What is being published, re-verified from the build directory rather
-    // than trusted: manifest bytes hash to manifest.sha256, provenance names
+    // than trusted: manifest bytes hash to manifest.blake3, provenance names
     // that digest, and both bundles exist.
     let manifest_bytes = fs::read(dir.join("manifest.json"))?;
-    let manifest_sha256 = fs::read_to_string(dir.join("manifest.sha256"))?
+    let manifest_blake3 = fs::read_to_string(dir.join("manifest.blake3"))?
         .trim()
         .to_owned();
-    if sha256_bytes(&manifest_bytes) != manifest_sha256 {
-        return fail("manifest.json does not hash to manifest.sha256 in the build directory");
+    if blake3_bytes(&manifest_bytes) != manifest_blake3 {
+        return fail("manifest.json does not hash to manifest.blake3 in the build directory");
     }
     let manifest = Manifest::parse(&manifest_bytes)?;
     let provenance_bytes = fs::read(dir.join("provenance.json"))?;
     let provenance: Provenance = serde_json::from_slice(&provenance_bytes)?;
-    if provenance.manifest_sha256 != manifest_sha256 {
+    if provenance.manifest_blake3 != manifest_blake3 {
         return fail("provenance.json names a different manifest digest");
     }
-    let provenance_sha256 = sha256_bytes(&provenance_bytes);
+    let provenance_blake3 = blake3_bytes(&provenance_bytes);
     for bundle in [
         "manifest.json.sigstore.json",
         "provenance.json.sigstore.json",
@@ -804,8 +818,8 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     // commit, no run) is not publishable.
     let lock = Lock::published(
         &publisher.base_url,
-        &manifest_sha256,
-        &provenance_sha256,
+        &manifest_blake3,
+        &provenance_blake3,
         &provenance.source.commit,
         &provenance.source.run_url,
     );
@@ -820,13 +834,13 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
         let path = repo_path(root, &file.path);
         let digest =
             digest_file(&path).map_err(|err| super::error(format!("{}: {err}", file.path)))?;
-        if digest.lfs_pointer || digest.sha256 != file.sha256 || digest.size != file.size {
+        if digest.lfs_pointer || digest.blake3 != file.blake3 || digest.size != file.size {
             return fail(format!(
                 "{}: tree bytes do not match the manifest; refusing to publish",
                 file.path
             ));
         }
-        objects.push((file.sha256.clone(), path, file.size));
+        objects.push((file.blake3.clone(), path, file.size));
     }
     // Content-addressed keys dedupe identical bytes.
     objects.sort();
@@ -867,8 +881,8 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     // signing keys), so a manifest that is already published keeps its first
     // publication's provenance and signatures: this run is then an idempotent
     // re-verification, never a rewrite.
-    let manifest_key = format!("{MANIFESTS_PREFIX}{manifest_sha256}.json");
-    let provenance_key = format!("{MANIFESTS_PREFIX}{manifest_sha256}.provenance.json");
+    let manifest_key = format!("{MANIFESTS_PREFIX}{manifest_blake3}.json");
+    let provenance_key = format!("{MANIFESTS_PREFIX}{manifest_blake3}.provenance.json");
     let lock = match publisher.already_published(&manifest_key, &manifest_bytes)? {
         Some(()) => {
             let existing = curl::get_to_vec(&publisher.public_url(&provenance_key))?;
@@ -876,10 +890,10 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 serde_json::from_slice(&existing).map_err(|err| {
                     super::error(format!("published provenance is unreadable: {err}"))
                 })?;
-            if existing_provenance.manifest_sha256 != manifest_sha256 {
+            if existing_provenance.manifest_blake3 != manifest_blake3 {
                 return fail(format!(
-                    "published provenance at {provenance_key} names manifest {}, not {manifest_sha256}; failing closed",
-                    existing_provenance.manifest_sha256
+                    "published provenance at {provenance_key} names manifest {}, not {manifest_blake3}; failing closed",
+                    existing_provenance.manifest_blake3
                 ));
             }
             for bundle in [
@@ -891,13 +905,13 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 })?;
             }
             println!(
-                "test-corpus publish: manifest {manifest_sha256} was already published by {}; keeping its provenance and signatures",
+                "test-corpus publish: manifest {manifest_blake3} was already published by {}; keeping its provenance and signatures",
                 existing_provenance.source.run_url
             );
             Lock::published(
                 &publisher.base_url,
-                &manifest_sha256,
-                &sha256_bytes(&existing),
+                &manifest_blake3,
+                &blake3_bytes(&existing),
                 &existing_provenance.source.commit,
                 &existing_provenance.source.run_url,
             )
@@ -907,7 +921,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 &dir.join("manifest.json"),
                 &manifest_key,
                 "application/json",
-                Some(&manifest_sha256),
+                Some(&manifest_blake3),
             )?;
             publisher.put_document(
                 &dir.join("manifest.json.sigstore.json"),
@@ -919,7 +933,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 &dir.join("provenance.json"),
                 &provenance_key,
                 "application/json",
-                Some(&provenance_sha256),
+                Some(&provenance_blake3),
             )?;
             publisher.put_document(
                 &dir.join("provenance.json.sigstore.json"),
@@ -963,8 +977,8 @@ impl Publisher {
     /// Conditional PUT of one object; on 412 the public copy is read back and
     /// must hash to the same digest, otherwise this is an error, never a
     /// replacement.
-    fn put_object(&self, sha256: &str, path: &Path, size: u64) -> Result<PutOutcome> {
-        let key = format!("{OBJECTS_PREFIX}{sha256}");
+    fn put_object(&self, blake3: &str, path: &Path, size: u64) -> Result<PutOutcome> {
+        let key = format!("{OBJECTS_PREFIX}{blake3}");
         match curl::put_conditional(
             path,
             &self.write_url(&key),
@@ -972,30 +986,30 @@ impl Publisher {
             &self.credentials,
         )? {
             status if (200..300).contains(&status) => {
-                self.read_back(&key, sha256, size)?;
+                self.read_back(&key, blake3, size)?;
                 Ok(PutOutcome::Created)
             }
             412 => {
-                self.read_back(&key, sha256, size)?;
+                self.read_back(&key, blake3, size)?;
                 Ok(PutOutcome::AlreadyPresent)
             }
             status => fail(format!("PUT {key}: HTTP {status}")),
         }
     }
 
-    fn read_back(&self, key: &str, sha256: &str, size: u64) -> Result<()> {
+    fn read_back(&self, key: &str, blake3: &str, size: u64) -> Result<()> {
         let temp = std::env::temp_dir().join(format!(
-            "rarpar-corpus-readback-{}-{sha256}",
+            "rarpar-corpus-readback-{}-{blake3}",
             std::process::id()
         ));
         curl::get_to_file(&self.public_url(key), &temp)?;
         let digest = digest_file(&temp);
         let _ = fs::remove_file(&temp);
         let digest = digest?;
-        if digest.sha256 != sha256 || digest.size != size {
+        if digest.blake3 != blake3 || digest.size != size {
             return fail(format!(
-                "read-back of {key} hashed to {} ({} bytes), expected {sha256} ({size} bytes): the stored object is not the one being published; failing closed",
-                digest.sha256, digest.size
+                "read-back of {key} hashed to {} ({} bytes), expected {blake3} ({size} bytes): the stored object is not the one being published; failing closed",
+                digest.blake3, digest.size
             ));
         }
         Ok(())
@@ -1008,7 +1022,7 @@ impl Publisher {
         let temp = std::env::temp_dir().join(format!(
             "rarpar-corpus-published-{}-{}",
             std::process::id(),
-            sha256_bytes(key.as_bytes())
+            blake3_bytes(key.as_bytes())
         ));
         match curl::get_to_file(&self.public_url(key), &temp) {
             Err(_) => Ok(None),
@@ -1019,8 +1033,8 @@ impl Publisher {
                     Ok(Some(()))
                 } else {
                     fail(format!(
-                        "{key} is already published with different bytes (sha256 {}); failing closed",
-                        sha256_bytes(&existing)
+                        "{key} is already published with different bytes (blake3 {}); failing closed",
+                        blake3_bytes(&existing)
                     ))
                 }
             }
@@ -1032,11 +1046,11 @@ impl Publisher {
         path: &Path,
         key: &str,
         content_type: &str,
-        expected_sha256: Option<&str>,
+        expected_blake3: Option<&str>,
     ) -> Result<()> {
         let bytes = fs::read(path)?;
-        let digest = sha256_bytes(&bytes);
-        if let Some(expected) = expected_sha256
+        let digest = blake3_bytes(&bytes);
+        if let Some(expected) = expected_blake3
             && digest != expected
         {
             return fail(format!("{} does not hash to {expected}", path.display()));
@@ -1078,10 +1092,10 @@ impl Publisher {
                         if index >= objects.len() {
                             return;
                         }
-                        let (sha256, path, size) = &objects[index];
+                        let (blake3, path, size) = &objects[index];
                         let outcome = self
-                            .put_object(sha256, path, *size)
-                            .map_err(|err| format!("{sha256} ({}): {err}", path.display()));
+                            .put_object(blake3, path, *size)
+                            .map_err(|err| format!("{blake3} ({}): {err}", path.display()));
                         slots.lock().expect("publish result lock")[index] = Some(outcome);
                     }
                 });
@@ -1101,9 +1115,9 @@ impl Publisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_corpus::blake3_bytes;
     use crate::test_corpus::curl::CURL_PROTO_ENV;
     use crate::test_corpus::curl::tests::{ENV_LOCK, FakeServer};
-    use crate::test_corpus::sha256_bytes;
 
     /// A miniature repository: a ledger with three fixtures (two of them
     /// byte-identical), the checked-in toolchain lock, one profile per file
@@ -1121,16 +1135,16 @@ mod tests {
         .unwrap();
         fs::create_dir_all(root.join("gen")).unwrap();
         fs::write(root.join("gen/gen.sh"), "#!/bin/sh\n").unwrap();
-        let alpha = sha256_bytes(b"alpha-bytes");
-        let beta = sha256_bytes(b"beta-bytes");
+        let alpha = blake3_bytes(b"alpha-bytes");
+        let beta = blake3_bytes(b"beta-bytes");
         let ledger = format!(
             r#"{{"schema_version":1,"toolchains":"{TOOLCHAINS_FILE}",
                 "generators":{{"gen.sh":{{"path":"gen/gen.sh","toolchains":["rarlab-7.20"],"byte_reproducible":false}}}},
                 "upstreams":{{}},
                 "files":[
-                 {{"path":"crates/unrar-rs/tests/fixtures/rar5/a.rar","size":11,"sha256":"{alpha}","format":"rar5","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}},
-                 {{"path":"crates/unrar-rs/tests/fixtures/rar5/a-twin.rar","size":11,"sha256":"{alpha}","format":"rar5","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}},
-                 {{"path":"crates/par2-rs/tests/fixtures/b.par2","size":10,"sha256":"{beta}","format":"par2","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}}
+                 {{"path":"crates/unrar-rs/tests/fixtures/rar5/a.rar","size":11,"blake3":"{alpha}","format":"rar5","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}},
+                 {{"path":"crates/unrar-rs/tests/fixtures/rar5/a-twin.rar","size":11,"blake3":"{alpha}","format":"rar5","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}},
+                 {{"path":"crates/par2-rs/tests/fixtures/b.par2","size":10,"blake3":"{beta}","format":"par2","source":{{"kind":"generated","generator":"gen.sh","toolchains":["rarlab-7.20"]}}}}
                 ]}}"#
         );
         fs::write(root.join(LEDGER_FILE), ledger).unwrap();
@@ -1145,12 +1159,12 @@ mod tests {
     }
 
     fn manifest_for(root: &Path) -> (Vec<u8>, String) {
-        let (lock, lock_sha256) = ToolchainLock::load(&repo_path(root, TOOLCHAINS_FILE)).unwrap();
+        let (lock, lock_blake3) = ToolchainLock::load(&repo_path(root, TOOLCHAINS_FILE)).unwrap();
         let ledger = Ledger::load(&repo_path(root, LEDGER_FILE)).unwrap();
         let profiles = ProfilesFile::load(&repo_path(root, PROFILES_FILE)).unwrap();
-        let manifest = Manifest::build(&ledger, &profiles, &lock, &lock_sha256).unwrap();
+        let manifest = Manifest::build(&ledger, &profiles, &lock, &lock_blake3).unwrap();
         let bytes = manifest.canonical_bytes().unwrap();
-        let digest = sha256_bytes(&bytes);
+        let digest = blake3_bytes(&bytes);
         (bytes, digest)
     }
 
@@ -1200,10 +1214,10 @@ mod tests {
     fn fetch_hydrates_verifies_dedupes_and_fails_closed() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = scaffold("fetch");
-        let (manifest_bytes, manifest_sha256) = manifest_for(&root);
-        let alpha = sha256_bytes(b"alpha-bytes");
-        let beta = sha256_bytes(b"beta-bytes");
-        let manifest_key = format!("/{MANIFESTS_PREFIX}{manifest_sha256}.json");
+        let (manifest_bytes, manifest_blake3) = manifest_for(&root);
+        let alpha = blake3_bytes(b"alpha-bytes");
+        let beta = blake3_bytes(b"beta-bytes");
+        let manifest_key = format!("/{MANIFESTS_PREFIX}{manifest_blake3}.json");
         let alpha_key = format!("/{OBJECTS_PREFIX}{alpha}");
         let beta_key = format!("/{OBJECTS_PREFIX}{beta}");
         // beta is served corrupted: the fetch must refuse it and still place alpha.
@@ -1225,8 +1239,8 @@ mod tests {
         unsafe { std::env::set_var(CURL_PROTO_ENV, "=http,https") };
         let lock = Lock::published(
             &server.base_url,
-            &manifest_sha256,
-            &sha256_bytes(b"provenance"),
+            &manifest_blake3,
+            &blake3_bytes(b"provenance"),
             "0123456789abcdef0123456789abcdef01234567",
             "https://github.com/scryer-media/rarpar/actions/runs/1",
         );
@@ -1284,7 +1298,7 @@ mod tests {
         hydrate(&root, vec!["--profile".into(), "unrar".into()]).unwrap();
         // A tampered manifest (digest mismatch) is refused before anything is read.
         let mut tampered = lock.clone();
-        tampered.manifest.sha256 = sha256_bytes(b"other").clone();
+        tampered.manifest.blake3 = blake3_bytes(b"other").clone();
         tampered.manifest.url = tampered.manifest_url();
         tampered.signature.bundle_url = format!("{}.sigstore.json", tampered.manifest_url());
         tampered.provenance.url = tampered.provenance_url();
@@ -1323,7 +1337,7 @@ mod tests {
         let (bytes, digest) = manifest_for(&root);
         assert_eq!(fs::read(out.join("manifest.json")).unwrap(), bytes);
         assert_eq!(
-            fs::read_to_string(out.join("manifest.sha256"))
+            fs::read_to_string(out.join("manifest.blake3"))
                 .unwrap()
                 .trim(),
             digest
@@ -1332,7 +1346,7 @@ mod tests {
         assert_eq!(objects.lines().count(), 3);
         let provenance: Provenance =
             serde_json::from_slice(&fs::read(out.join("provenance.json")).unwrap()).unwrap();
-        assert_eq!(provenance.manifest_sha256, digest);
+        assert_eq!(provenance.manifest_blake3, digest);
         // Corrupt one fixture: build refuses (tree disagrees with ledger).
         fs::write(
             repo_path(&root, "crates/par2-rs/tests/fixtures/b.par2"),
@@ -1426,12 +1440,12 @@ mod tests {
         ] {
             fs::write(out.join(bundle), format!("{{\"fake\":\"{bundle}\"}}")).unwrap();
         }
-        let manifest_sha256 = fs::read_to_string(out.join("manifest.sha256"))
+        let manifest_blake3 = fs::read_to_string(out.join("manifest.blake3"))
             .unwrap()
             .trim()
             .to_owned();
-        let alpha = sha256_bytes(b"alpha-bytes");
-        let beta = sha256_bytes(b"beta-bytes");
+        let alpha = blake3_bytes(b"alpha-bytes");
+        let beta = blake3_bytes(b"beta-bytes");
         let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
         // alpha already exists on the bucket (412) and reads back identical;
         // beta and every document are new: their PUTs land in the store and the
@@ -1468,7 +1482,7 @@ mod tests {
         };
         publish(&root, args(&server.base_url)).unwrap();
         let lock = Lock::load(&out.join("lock.json")).unwrap();
-        assert_eq!(lock.manifest.sha256, manifest_sha256);
+        assert_eq!(lock.manifest.blake3, manifest_blake3);
         assert_eq!(lock.base_url, server.base_url);
         {
             let requests = server.requests.lock().unwrap();
@@ -1518,7 +1532,7 @@ mod tests {
             );
         }
         let again = Lock::load(&out.join("lock.json")).unwrap();
-        assert_eq!(again.manifest.sha256, manifest_sha256);
+        assert_eq!(again.manifest.blake3, manifest_blake3);
         assert_eq!(again.published_from.run, lock.published_from.run);
         drop(server);
 

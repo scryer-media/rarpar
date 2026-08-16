@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "docker_base": "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
   "rar_writers": [
     {
@@ -7,7 +7,7 @@
       "image": "rarpar-bench-rarlab:3.93",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-3.9.3.tar.gz",
-      "sha256": "55122286a2a72ccc2b866c5a0e415c05638dfe99cebb5f2ef036784387a8eff8",
+      "blake3": "dd0983972c9366c70dfdbf0cf83c349aef54e4043ad5c67ff9523868385fa8d1",
       "binary": "rar_static"
     },
     {
@@ -15,7 +15,7 @@
       "image": "rarpar-bench-rarlab:4.20",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-4.2.0.tar.gz",
-      "sha256": "6826646bc9620055689f465e61f7d4a86e6ccc66940178d24f48d01734968eb5",
+      "blake3": "2c20396f156f9fc51e4cc21c8c65731050d5177bea51b7382ac5a0c8c0b23a9f",
       "binary": "rar_static"
     },
     {
@@ -23,7 +23,7 @@
       "image": "rarpar-bench-rarlab:5.00",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-5.0.0.tar.gz",
-      "sha256": "4f942d79bb16dc1981ccb52893e4a24dbee908089d783d766ac45cd4f2c78610",
+      "blake3": "11646d1201e20670d42ee14051950cf73ead7480f93d12323e0b7ff70d7de2bd",
       "binary": "rar_static"
     },
     {
@@ -31,7 +31,7 @@
       "image": "rarpar-bench-rarlab:6.24",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
-      "sha256": "88e22a8e84125c947637bbf28c746e338a0a63279d80f9f9d7373603875db1eb",
+      "blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
       "binary": "rar"
     },
     {
@@ -39,7 +39,7 @@
       "image": "rarpar-bench-rarlab:7.20",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz",
-      "sha256": "d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46",
+      "blake3": "9e04f9f9749e08422705f0b2e9246609ed03d056774f7453787dc5d3466565d1",
       "binary": "rar"
     },
     {
@@ -47,7 +47,7 @@
       "image": "rarpar-bench-rarlab:7.23",
       "platform": "linux/amd64",
       "url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
-      "sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
+      "blake3": "edc2f6074771680eed9317fc8288c027c6b0a550201ac1889e3ea8a478d66784",
       "binary": "rar"
     }
   ],
@@ -61,6 +61,6 @@
     "image": "rarpar-bench-par2:1.4.0",
     "platform": "linux/amd64",
     "url": "https://github.com/animetosho/par2cmdline-turbo/archive/refs/tags/v1.4.0.tar.gz",
-    "sha256": "6f2cb042f23d9b0c93f14cc0e16de5bd6e98bf36d8be1f8f2e886fa85ad1b972"
+    "blake3": "c4042f01797d7e9095ea1b0537483e4057ac621d67c51124a12fd48b8320372a"
   }
 }

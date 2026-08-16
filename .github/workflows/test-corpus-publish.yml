@@ -6,6 +6,12 @@ name: test-corpus-publish
 # an operator decision. It never creates a branch, commit or pull request —
 # pinning the published manifest in test-corpus/lock.json is a reviewed PR.
 #
+# The corpus is **generated**, never carried forward: the run builds the pinned
+# toolchain images, runs every checked-in recipe against them, and fetches every
+# upstream import at its pinned commit. Nothing comes out of Git LFS, and the
+# suites are run against the tree that was just produced before any of it is
+# published.
+#
 # See docs/test-corpus.md.
 
 on:
@@ -16,7 +22,7 @@ on:
         required: true
         type: string
       dry_run:
-        description: 'Reconstruct, verify, build and sign, but upload nothing'
+        description: 'Generate, verify, validate, build and sign, but upload nothing'
         required: false
         type: boolean
         default: false
@@ -30,6 +36,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every fixture byte in this run is produced by a recipe or fetched from a
+  # pinned upstream, so the checkout never needs the LFS payloads: the pointers
+  # it leaves behind are overwritten before anything reads them.
   GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
   # Pinned: signature bundles are only comparable if every publication used the
@@ -40,7 +49,9 @@ jobs:
   publish:
     name: publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # Image builds + generation + the three suites (the unrar-rs suite alone is
+    # budgeted 120 minutes in ci.yml) do not fit in the old 180.
+    timeout-minutes: 300
     # The protected environment holds the R2 secrets and gates the run on its
     # reviewers; the corpus variables live beside it.
     environment: test-corpus-publish
@@ -121,18 +132,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
 
-      # Reconstruct the corpus tree on a clean checkout through the one path
-      # every CI lane uses: `hydrate` pulls through Git LFS while
-      # test-corpus/lock.json pins nothing, and fetches the pinned corpus from R2
-      # once it does — either way every file is verified against the ledger.
-      - name: Reconstruct the fixture tree
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
-
-      # Every path present, no blocked provenance, every public upstream import
-      # re-fetched byte-identical at its pinned commit.
-      - name: Verify the corpus against its ledger and upstreams
-        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
-
       - name: Validate the shared toolchain lock
         working-directory: bench/rarpar-bench
         run: |
@@ -140,15 +139,63 @@ jobs:
           go test ./...
           go run ./cmd/rarpar-bench toolchains validate
 
+      # The writers, the encoder and the parity tool the recipes run on. The
+      # mirror is read first and falls back to the official URLs when it holds
+      # nothing yet; either way each archive has to match the reviewed BLAKE3
+      # digest before an image is built from it. The runner is amd64, so the
+      # images run natively.
+      - name: Build the pinned toolchain images
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- bench toolchains build \
+            --mirror-base "${R2_CORPUS_PUBLIC_URL:-}" \
+            --cache "$RUNNER_TEMP/tool-cache"
+
+      # The corpus itself: every recipe run on those images, every upstream
+      # import fetched at its pinned commit, the produced tree required to be
+      # exactly the ledger's path set, and the ledger's sizes and digests
+      # refreshed to match. Nothing is carried forward from Git LFS.
+      #
+      # The recipes are Go (bench/rarpar-bench/internal/testcorpus) and xtask
+      # delegates to them, so this step needs the Go toolchain set up above.
+      - name: Generate the corpus
+        run: cargo run --locked -p xtask -- test-corpus generate --jobs 4
+
+      # Every path present, no blocked provenance, every public upstream import
+      # re-fetched byte-identical at its pinned commit.
+      - name: Verify the corpus against its ledger and upstreams
+        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
+
+      # The corpus exists to be read by the suites, so the suites are what
+      # validates it — against the tree this run produced, not against a
+      # remembered one. No UnRAR oracle is configured: the tests that want one
+      # skip without UNRAR_BIN.
+      - name: Validate the suites against the generated corpus
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --no-fail-fast
+          cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
+          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+
       - name: Build the manifest and provenance
         run: |
           set -euo pipefail
           cargo run --locked -p xtask -- test-corpus build --out target/test-corpus/build
-          cat target/test-corpus/build/manifest.sha256
+          cat target/test-corpus/build/manifest.blake3
+
+      # Six benchmark cases import a fixture set by digest, so a corpus revision
+      # moves those pins. They are SHA-256 — the benchmark corpus's own contract
+      # — while everything else here is BLAKE3. The lock-pin PR commits
+      # sources.json, lock.json and these corpus.json pins together.
+      - name: Recompute the benchmark fixture pins
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus bench-pins \
+            --out target/test-corpus/build/bench-pins.tsv
 
       # Original RARLAB and par2cmdline-turbo archives: R2-first, official
-      # fallback, reviewed SHA-256 required, signed and conditionally mirrored,
-      # read back before anything continues.
+      # fallback, reviewed BLAKE3 digest required, signed and conditionally
+      # mirrored, read back before anything continues.
       - name: Resolve and mirror the toolchain sources
         working-directory: bench/rarpar-bench
         run: |
@@ -196,8 +243,18 @@ jobs:
             echo
             echo "- ref: \`$GITHUB_REF\` @ \`$GITHUB_SHA\`"
             echo "- dry run: \`$DRY_RUN\`"
-            if [ -f target/test-corpus/build/manifest.sha256 ]; then
-              echo "- manifest: \`$(cat target/test-corpus/build/manifest.sha256)\`"
+            if [ -f target/test-corpus/build/manifest.blake3 ]; then
+              echo "- manifest: \`$(cat target/test-corpus/build/manifest.blake3)\`"
+            fi
+            if [ -f target/test-corpus/build/bench-pins.tsv ]; then
+              echo
+              echo "Benchmark fixture pins for \`bench/rarpar-bench/config/corpus.json\`:"
+              echo
+              echo '```'
+              cat target/test-corpus/build/bench-pins.tsv
+              echo '```'
+              echo
+              echo "The refreshed \`test-corpus/sources.json\` is in the run artifact; the lock-pin PR commits it with \`lock.json\` and these \`fixture_sha256\` values."
             fi
             if [ -f target/test-corpus/build/lock.json ]; then
               echo
@@ -216,11 +273,13 @@ jobs:
           name: test-corpus-build-${{ github.run_id }}
           path: |
             target/test-corpus/build/manifest.json
-            target/test-corpus/build/manifest.sha256
+            target/test-corpus/build/manifest.blake3
             target/test-corpus/build/manifest.json.sigstore.json
             target/test-corpus/build/provenance.json
             target/test-corpus/build/provenance.json.sigstore.json
             target/test-corpus/build/objects.tsv
+            target/test-corpus/build/bench-pins.tsv
             target/test-corpus/build/lock.json
+            test-corpus/sources.json
           if-no-files-found: warn
           retention-days: 90

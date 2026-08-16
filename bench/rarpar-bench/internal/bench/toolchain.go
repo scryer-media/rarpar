@@ -12,7 +12,10 @@ import (
 	"strings"
 )
 
-var sha256Pattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+// digestPattern is the lowercase 32-byte hex every archive digest in the lock
+// has: BLAKE3 for the source archives, and the same shape the OCI `@sha256:`
+// references below happen to use.
+var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // RequiredRARWriters is the complete shared writer set: the benchmark's
 // historical writers (3.93, 4.20, 5.00), the writers the test corpus was
@@ -41,21 +44,26 @@ func LoadToolchains(path string) (ToolchainLock, error) {
 }
 
 func (lock ToolchainLock) Validate() error {
-	if lock.SchemaVersion != 1 {
+	// Schema 2 is the BLAKE3 field set. Schema 1 pinned each archive by
+	// SHA-256 under a `sha256` key, so it is a different contract, not an
+	// older spelling of this one.
+	if lock.SchemaVersion != 2 {
 		return fmt.Errorf("unsupported toolchain schema version %d", lock.SchemaVersion)
 	}
+	// SHA-256 by specification: `@sha256:` is how an OCI reference pins an
+	// image manifest, which is the registry's digest, not this lock's.
 	if lock.DockerBase == "" || !regexp.MustCompile(`@sha256:[a-f0-9]{64}$`).MatchString(lock.DockerBase) {
 		return fmt.Errorf("toolchain docker_base must be digest pinned")
 	}
 	seen := map[string]bool{}
 	seenURL := map[string]bool{}
-	seenSHA := map[string]bool{}
+	seenDigest := map[string]bool{}
 	seenImage := map[string]bool{}
 	for _, writer := range lock.RARWriters {
 		if writer.ID == "" || writer.Image == "" || writer.URL == "" || writer.Binary == "" || seen[writer.ID] {
 			return fmt.Errorf("invalid or duplicate RAR writer %q", writer.ID)
 		}
-		if writer.Platform != "linux/amd64" || !sha256Pattern.MatchString(writer.SHA256) {
+		if writer.Platform != "linux/amd64" || !digestPattern.MatchString(writer.BLAKE3) {
 			return fmt.Errorf("RAR writer %q is not source locked for linux/amd64", writer.ID)
 		}
 		if err := writer.validateSource(); err != nil {
@@ -63,12 +71,12 @@ func (lock ToolchainLock) Validate() error {
 		}
 		// Two writers sharing a URL, digest, or image tag would be one writer
 		// under two names: the second could never be the release its id claims.
-		if seenURL[writer.URL] || seenSHA[writer.SHA256] || seenImage[writer.Image] {
+		if seenURL[writer.URL] || seenDigest[writer.BLAKE3] || seenImage[writer.Image] {
 			return fmt.Errorf("RAR writer %q duplicates another writer's source or image", writer.ID)
 		}
 		seen[writer.ID] = true
 		seenURL[writer.URL] = true
-		seenSHA[writer.SHA256] = true
+		seenDigest[writer.BLAKE3] = true
 		seenImage[writer.Image] = true
 	}
 	for _, required := range RequiredRARWriters {
@@ -77,7 +85,7 @@ func (lock ToolchainLock) Validate() error {
 		}
 	}
 	par2 := lock.PAR2Generator
-	if par2.ID == "" || par2.Image == "" || par2.URL == "" || par2.Platform != "linux/amd64" || !sha256Pattern.MatchString(par2.SHA256) {
+	if par2.ID == "" || par2.Image == "" || par2.URL == "" || par2.Platform != "linux/amd64" || !digestPattern.MatchString(par2.BLAKE3) {
 		return fmt.Errorf("PAR2 generator is not source locked for linux/amd64")
 	}
 	if encoder := lock.VideoEncoder; encoder.ID != "" || encoder.Image != "" {
@@ -91,6 +99,8 @@ func (lock ToolchainLock) Validate() error {
 	return nil
 }
 
+// digestPinnedImage checks the OCI `@sha256:` reference form the registry
+// specifies for a pulled image; the lock's own archive digests are BLAKE3.
 func digestPinnedImage(image string) bool {
 	return regexp.MustCompile(`@sha256:[a-f0-9]{64}$`).MatchString(image)
 }
@@ -210,7 +220,7 @@ var dockerfileContract = []struct{ path, staged string }{
 	{"docker/par2/Dockerfile", "COPY par2.tar.gz"},
 }
 
-var dockerfileForbidden = []string{"curl ", "wget ", "RAR_URL", "PAR2_URL", "RAR_SHA256", "PAR2_SHA256"}
+var dockerfileForbidden = []string{"curl ", "wget ", "RAR_URL", "PAR2_URL", "RAR_SHA256", "PAR2_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3"}
 
 func verifyDockerfiles(root, base string) error {
 	for _, contract := range dockerfileContract {

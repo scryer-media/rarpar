@@ -87,7 +87,7 @@ func newMirrorFixture(t *testing.T) *mirrorFixture {
 		Kind:   ArchiveKindRARLAB,
 		Name:   "rarlinux-x64-720.tar.gz",
 		URL:    official.URL + "/rar/rarlinux-x64-720.tar.gz",
-		SHA256: bytesSHA256(fixture.archive),
+		BLAKE3: bytesBLAKE3(fixture.archive),
 	}
 	fixture.official["/rar/rarlinux-x64-720.tar.gz"] = fixture.archive
 
@@ -240,7 +240,7 @@ func (f *mirrorFixture) provenanceFor(source ArchiveSource, archive []byte, muta
 		Kind:          source.Kind,
 		Name:          source.Name,
 		URL:           source.URL,
-		SHA256:        bytesSHA256(archive),
+		BLAKE3:        bytesBLAKE3(archive),
 		Size:          int64(len(archive)),
 		MirroredAt:    "2026-08-16T00:00:00Z",
 		Source:        ProvenanceSource{Repository: "scryer-media/rarpar", Commit: strings.Repeat("a", 40)},
@@ -398,12 +398,12 @@ func TestResolveUsesTheVerifiedMirrorObject(t *testing.T) {
 	if resolved.Origin != OriginMirror {
 		t.Fatalf("origin = %q, want %q", resolved.Origin, OriginMirror)
 	}
-	digest, err := fileSHA256(resolved.Path)
+	digest, err := fileBLAKE3(resolved.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if digest != fixture.source.SHA256 {
-		t.Fatalf("resolved archive sha256 = %s, want %s", digest, fixture.source.SHA256)
+	if digest != fixture.source.BLAKE3 {
+		t.Fatalf("resolved archive blake3 = %s, want %s", digest, fixture.source.BLAKE3)
 	}
 	if got := fixture.officialHits(); got != 0 {
 		t.Fatalf("official upstream was contacted %d times for a mirrored archive", got)
@@ -497,7 +497,7 @@ func TestResolvePublishesTheOfficialDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	if provenance.SchemaVersion != 1 || provenance.Kind != fixture.source.Kind || provenance.Name != fixture.source.Name ||
-		provenance.URL != fixture.source.URL || provenance.SHA256 != fixture.source.SHA256 ||
+		provenance.URL != fixture.source.URL || provenance.BLAKE3 != fixture.source.BLAKE3 ||
 		provenance.Size != int64(len(fixture.archive)) {
 		t.Fatalf("published provenance does not describe the archive: %+v", provenance)
 	}
@@ -603,7 +603,7 @@ func TestResolveRejectsBytesThatDoNotMatchTheLock(t *testing.T) {
 
 		if _, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir); err == nil {
 			t.Fatal("a mismatched official download was accepted")
-		} else if !strings.Contains(err.Error(), fixture.source.SHA256) {
+		} else if !strings.Contains(err.Error(), fixture.source.BLAKE3) {
 			t.Fatalf("error does not name the pinned digest: %v", err)
 		}
 		if entries := fixture.cacheEntries(); len(entries) != 0 {
@@ -699,7 +699,7 @@ func TestResolveRejectsAMissingCompanionObject(t *testing.T) {
 func TestResolveRejectsProvenanceThatDisagreesWithTheLock(t *testing.T) {
 	for name, mutate := range map[string]func(*ArchiveProvenance){
 		"url":    func(p *ArchiveProvenance) { p.URL = "https://mirror.example.test/rarlinux-x64-720.tar.gz" },
-		"sha256": func(p *ArchiveProvenance) { p.SHA256 = strings.Repeat("c", 64) },
+		"blake3": func(p *ArchiveProvenance) { p.BLAKE3 = strings.Repeat("c", 64) },
 		"name":   func(p *ArchiveProvenance) { p.Name = "rarlinux-x64-723.tar.gz" },
 		"kind":   func(p *ArchiveProvenance) { p.Kind = ArchiveKindPAR2 },
 		"size":   func(p *ArchiveProvenance) { p.Size = 1 },
@@ -795,7 +795,7 @@ func TestSourceMirrorRejectsPlainHTTPEndpoints(t *testing.T) {
 		Kind:   ArchiveKindRARLAB,
 		Name:   "rarlinux-x64-720.tar.gz",
 		URL:    "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz",
-		SHA256: strings.Repeat("d", 64),
+		BLAKE3: strings.Repeat("d", 64),
 	}
 	insecureSource := source
 	insecureSource.URL = "http://www.rarlab.com/rar/rarlinux-x64-720.tar.gz"
@@ -823,7 +823,7 @@ func TestSourceMirrorRejectsPlainHTTPEndpoints(t *testing.T) {
 // Publishing without a public read base could never prove what it stored.
 func TestPublishingRequiresAPublicReadBase(t *testing.T) {
 	mirror := &SourceMirror{Publish: &MirrorPublisher{WriteBase: "https://account.r2.cloudflarestorage.com/bucket", AccessKeyID: "id", SecretAccessKey: "secret"}}
-	source := ArchiveSource{Kind: ArchiveKindRARLAB, Name: "rarlinux-x64-720.tar.gz", URL: "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", SHA256: strings.Repeat("d", 64)}
+	source := ArchiveSource{Kind: ArchiveKindRARLAB, Name: "rarlinux-x64-720.tar.gz", URL: "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", BLAKE3: strings.Repeat("d", 64)}
 	_, err := mirror.Resolve(context.Background(), source, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "public read base") {
 		t.Fatalf("err = %v, want the missing read base", err)
@@ -833,9 +833,9 @@ func TestPublishingRequiresAPublicReadBase(t *testing.T) {
 // The object layout is the published contract; it is derived from the reviewed
 // digest so one key can hold exactly one byte sequence.
 func TestMirrorKeysAreContentAddressed(t *testing.T) {
-	source := ArchiveSource{Kind: ArchiveKindRARLAB, Name: "rarlinux-x64-720.tar.gz", URL: "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", SHA256: strings.Repeat("e", 64)}
+	source := ArchiveSource{Kind: ArchiveKindRARLAB, Name: "rarlinux-x64-720.tar.gz", URL: "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", BLAKE3: strings.Repeat("e", 64)}
 	keys := source.keys()
-	prefix := "tools/rarlab/sha256/" + source.SHA256 + "/"
+	prefix := "tools/rarlab/blake3/" + source.BLAKE3 + "/"
 	for got, want := range map[string]string{
 		keys.archive:          prefix + "rarlinux-x64-720.tar.gz",
 		keys.archiveBundle:    prefix + "rarlinux-x64-720.tar.gz.sigstore.json",
@@ -885,7 +885,7 @@ func mirroredToolchainLock(t *testing.T, fixture *mirrorFixture) ToolchainLock {
 	}
 	for index := range lock.RARWriters {
 		archive := []byte("archive for " + lock.RARWriters[index].ID)
-		lock.RARWriters[index].SHA256 = bytesSHA256(archive)
+		lock.RARWriters[index].BLAKE3 = bytesBLAKE3(archive)
 		source, err := WriterArchiveSource(lock.RARWriters[index])
 		if err != nil {
 			t.Fatal(err)
@@ -893,7 +893,7 @@ func mirroredToolchainLock(t *testing.T, fixture *mirrorFixture) ToolchainLock {
 		fixture.mirrorObjects(source, archive, nil)
 	}
 	archive := []byte("archive for " + lock.PAR2Generator.ID)
-	lock.PAR2Generator.SHA256 = bytesSHA256(archive)
+	lock.PAR2Generator.BLAKE3 = bytesBLAKE3(archive)
 	source, err := PAR2ArchiveSource(lock.PAR2Generator)
 	if err != nil {
 		t.Fatal(err)
@@ -940,12 +940,12 @@ cp -R "$context" "$directory/context"
 		if !argvHasPair(argv, "--build-arg", "RAR_BINARY="+writer.Binary) {
 			t.Errorf("%s: build does not pass RAR_BINARY=%s: %v", writer.ID, writer.Binary, argv)
 		}
-		assertStagedContext(t, writer.ID, filepath.Join(directory, "context"), "rar.tar.gz", writer.SHA256)
+		assertStagedContext(t, writer.ID, filepath.Join(directory, "context"), "rar.tar.gz", writer.BLAKE3)
 	}
 	par2Directory := filepath.Join(record, fmt.Sprintf("build-%d", len(lock.RARWriters)))
 	argv := readArgv(t, filepath.Join(par2Directory, "argv"))
 	assertNoUpstreamArguments(t, lock.PAR2Generator.ID, argv)
-	assertStagedContext(t, lock.PAR2Generator.ID, filepath.Join(par2Directory, "context"), "par2.tar.gz", lock.PAR2Generator.SHA256)
+	assertStagedContext(t, lock.PAR2Generator.ID, filepath.Join(par2Directory, "context"), "par2.tar.gz", lock.PAR2Generator.BLAKE3)
 }
 
 func readArgv(t *testing.T, path string) []string {
@@ -969,7 +969,7 @@ func argvHasPair(argv []string, flag, value string) bool {
 func assertNoUpstreamArguments(t *testing.T, id string, argv []string) {
 	t.Helper()
 	for _, argument := range argv {
-		for _, forbidden := range []string{"RAR_URL", "RAR_SHA256", "PAR2_URL", "PAR2_SHA256"} {
+		for _, forbidden := range []string{"RAR_URL", "RAR_SHA256", "PAR2_URL", "PAR2_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3"} {
 			if strings.Contains(argument, forbidden) {
 				t.Errorf("%s: build still passes %s (%q)", id, forbidden, argument)
 			}
@@ -993,7 +993,7 @@ func assertStagedContext(t *testing.T, id, context, archiveName, digest string) 
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("%s: build context holds %v, want exactly %v", id, names, want)
 	}
-	staged, err := fileSHA256(filepath.Join(context, archiveName))
+	staged, err := fileBLAKE3(filepath.Join(context, archiveName))
 	if err != nil {
 		t.Fatal(err)
 	}

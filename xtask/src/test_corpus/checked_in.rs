@@ -6,41 +6,24 @@
 #![cfg(test)]
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use super::generate::{FIXTURE_ROOTS, corpus_paths_on_disk};
 use super::ledger::{Ledger, Source};
 use super::lock::{GITHUB_OIDC_ISSUER, Lock, PUBLISH_WORKFLOW_IDENTITY};
 use super::manifest::{Manifest, ToolchainLock};
 use super::profiles::ProfilesFile;
 use super::{LEDGER_FILE, LOCK_FILE, PROFILES_FILE, TOOLCHAINS_FILE, repo_path};
 
-const FIXTURE_ROOTS: [&str; 2] = [
-    "crates/unrar-rs/tests/fixtures",
-    "crates/par2-rs/tests/fixtures",
-];
-/// Text that lives beside the fixtures but is not corpus content.
-const NON_CORPUS_SUFFIXES: [&str; 4] = [".md", ".sh", ".py", ".txt"];
-
 fn root() -> PathBuf {
     crate::workspace_root()
 }
 
 fn load() -> (Ledger, ProfilesFile, ToolchainLock, String) {
-    let (lock, lock_sha256) = ToolchainLock::load(&repo_path(&root(), TOOLCHAINS_FILE)).unwrap();
+    let (lock, lock_blake3) = ToolchainLock::load(&repo_path(&root(), TOOLCHAINS_FILE)).unwrap();
     let ledger = Ledger::load(&repo_path(&root(), LEDGER_FILE)).unwrap();
     let profiles = ProfilesFile::load(&repo_path(&root(), PROFILES_FILE)).unwrap();
-    (ledger, profiles, lock, lock_sha256)
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
+    (ledger, profiles, lock, lock_blake3)
 }
 
 #[test]
@@ -66,7 +49,7 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
         "blocked paths would stop publication:\n{}",
         blocked.join("\n")
     );
-    assert_eq!(ledger.files.len(), 371, "the corpus has 371 fixture paths");
+    assert_eq!(ledger.files.len(), 369, "the corpus has 369 fixture paths");
     // The ledger's on-disk layout is the canonical one, so `--update-ledger`
     // never reformats a reviewed file.
     let on_disk = std::fs::read_to_string(repo_path(&root(), LEDGER_FILE)).unwrap();
@@ -80,27 +63,7 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
 #[test]
 fn every_fixture_path_in_the_tree_is_in_the_ledger_and_nothing_else_is() {
     let (ledger, _, _, _) = load();
-    let mut on_disk = BTreeSet::new();
-    for fixture_root in FIXTURE_ROOTS {
-        let mut paths = Vec::new();
-        walk(&repo_path(&root(), fixture_root), &mut paths);
-        for path in paths {
-            let relative = path
-                .strip_prefix(root())
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let name = relative.rsplit('/').next().unwrap();
-            if NON_CORPUS_SUFFIXES
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-                || name.starts_with('.')
-            {
-                continue;
-            }
-            on_disk.insert(relative);
-        }
-    }
+    let on_disk = corpus_paths_on_disk(&root()).unwrap();
     let listed = ledger.paths();
     let missing: Vec<&String> = on_disk.difference(&listed).collect();
     let extra: Vec<&String> = listed.difference(&on_disk).collect();
@@ -125,6 +88,44 @@ fn every_fixture_path_in_the_tree_is_in_the_ledger_and_nothing_else_is() {
             !path.starts_with("bench/") && !path.contains("/target/"),
             "{path} looks like benchmark output"
         );
+    }
+}
+
+/// The corpus is generated, not carried forward, and that has two checkable
+/// consequences here: nothing may come from an upstream the publish workflow
+/// cannot re-fetch, and every generated entry's recipe has to exist in the tree.
+///
+/// The third — that every recipe the ledger declares is one `generate` actually
+/// runs — is checked on the Go side, in
+/// `bench/rarpar-bench/internal/testcorpus`, because that is where the
+/// orchestrator's table lives. It is the seam that would rot silently: a
+/// generator added to the ledger and not to the orchestrator produces nothing,
+/// and the corpus would simply be short a fixture.
+#[test]
+fn every_fixture_is_reproducible_and_names_a_recipe_that_exists() {
+    let (ledger, _, _, _) = load();
+
+    for (name, upstream) in &ledger.upstreams {
+        assert!(
+            !upstream.private,
+            "upstream {name} is private: the publish workflow cannot re-fetch it, so the corpus \
+             cannot be generated from it"
+        );
+    }
+
+    for entry in &ledger.files {
+        if let Source::Generated { generator, .. } = &entry.source {
+            let declared = ledger
+                .generators
+                .get(generator)
+                .unwrap_or_else(|| panic!("{}: generator {generator} is not declared", entry.path));
+            assert!(
+                repo_path(&root(), &declared.path).is_file(),
+                "{}: generator script {} is missing from the tree",
+                entry.path,
+                declared.path
+            );
+        }
     }
 }
 
@@ -171,8 +172,8 @@ fn the_rar_15_and_20_oracles_are_immutable_imports_without_a_rarlab_writer() {
 
 #[test]
 fn era_profiles_partition_the_rar_fixtures_by_format() {
-    let (ledger, profiles, lock, lock_sha256) = load();
-    let manifest = Manifest::build(&ledger, &profiles, &lock, &lock_sha256).unwrap();
+    let (ledger, profiles, lock, lock_blake3) = load();
+    let manifest = Manifest::build(&ledger, &profiles, &lock, &lock_blake3).unwrap();
     let format_of = |path: &str| manifest.file(path).unwrap().format.clone();
     let members = |name: &str| {
         manifest

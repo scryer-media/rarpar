@@ -6,10 +6,10 @@ package bench
 // tarballs and the par2cmdline-turbo source tarball — is resolved to a verified
 // local file before anything is built from it. The mirror is a public,
 // content-addressed object set on R2 whose keys are derived from the reviewed
-// SHA-256, and it fails closed: an object that is present but does not verify is
-// an error, never a cache miss. Only absence (HTTP 404) or retry-exhausted
-// unavailability may fall back to the official URL, and that download must still
-// match the reviewed digest before it is used.
+// BLAKE3 digest, and it fails closed: an object that is present but does not
+// verify is an error, never a cache miss. Only absence (HTTP 404) or
+// retry-exhausted unavailability may fall back to the official URL, and that
+// download must still match the reviewed digest before it is used.
 
 import (
 	"bytes"
@@ -130,7 +130,7 @@ type ArchiveSource struct {
 	Kind   string
 	Name   string
 	URL    string
-	SHA256 string
+	BLAKE3 string
 }
 
 // ResolvedArchive is a verified local copy of an ArchiveSource.
@@ -147,7 +147,7 @@ type ArchiveProvenance struct {
 	Kind          string           `json:"kind"`
 	Name          string           `json:"name"`
 	URL           string           `json:"url"`
-	SHA256        string           `json:"sha256"`
+	BLAKE3        string           `json:"blake3"`
 	Size          int64            `json:"size"`
 	MirroredAt    string           `json:"mirrored_at"`
 	Source        ProvenanceSource `json:"source"`
@@ -171,7 +171,7 @@ type mirrorKeys struct {
 }
 
 func (source ArchiveSource) keys() mirrorKeys {
-	prefix := path.Join("tools", source.Kind, "sha256", source.SHA256)
+	prefix := path.Join("tools", source.Kind, "blake3", source.BLAKE3)
 	return mirrorKeys{
 		archive:          path.Join(prefix, source.Name),
 		archiveBundle:    path.Join(prefix, source.Name+".sigstore.json"),
@@ -189,8 +189,8 @@ func (source ArchiveSource) validate(allowInsecure bool) error {
 	if source.Name == "" || source.Name == "." || source.Name == ".." || strings.ContainsAny(source.Name, `/\`) {
 		return fmt.Errorf("archive name %q is not a plain file name", source.Name)
 	}
-	if !sha256Pattern.MatchString(source.SHA256) {
-		return fmt.Errorf("archive %s is not pinned to a lowercase sha256", source.Name)
+	if !digestPattern.MatchString(source.BLAKE3) {
+		return fmt.Errorf("archive %s is not pinned to a lowercase blake3", source.Name)
 	}
 	return checkTransport("archive URL", source.URL, allowInsecure)
 }
@@ -202,7 +202,7 @@ func WriterArchiveSource(writer RARWriter) (ArchiveSource, error) {
 	if name == "" {
 		return ArchiveSource{}, fmt.Errorf("RAR writer %q does not name a distribution archive", writer.ID)
 	}
-	return ArchiveSource{Kind: ArchiveKindRARLAB, Name: name, URL: writer.URL, SHA256: writer.SHA256}, nil
+	return ArchiveSource{Kind: ArchiveKindRARLAB, Name: name, URL: writer.URL, BLAKE3: writer.BLAKE3}, nil
 }
 
 // PAR2ArchiveSource is the par2cmdline-turbo source tarball the generator image
@@ -216,7 +216,7 @@ func PAR2ArchiveSource(generator PAR2Generator) (ArchiveSource, error) {
 	if name == "" || name == "." || name == "/" {
 		return ArchiveSource{}, fmt.Errorf("PAR2 generator URL %q does not name an archive", generator.URL)
 	}
-	return ArchiveSource{Kind: ArchiveKindPAR2, Name: name, URL: generator.URL, SHA256: generator.SHA256}, nil
+	return ArchiveSource{Kind: ArchiveKindPAR2, Name: name, URL: generator.URL, BLAKE3: generator.BLAKE3}, nil
 }
 
 // ToolchainSources is every original distribution archive the lock pins, in
@@ -251,7 +251,8 @@ func ResolveToolchainSources(ctx context.Context, lock ToolchainLock, mirror *So
 		if err != nil {
 			return fmt.Errorf("resolve %s: %w", source.Name, err)
 		}
-		if _, err := fmt.Fprintf(out, "%s %s %s %s\n", source.Kind, source.Name, source.SHA256, resolved.Origin); err != nil {
+		// One line per archive: kind, name, blake3 digest, origin.
+		if _, err := fmt.Fprintf(out, "%s %s blake3:%s %s\n", source.Kind, source.Name, source.BLAKE3, resolved.Origin); err != nil {
 			return err
 		}
 	}
@@ -414,8 +415,8 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 	}
 	// A digest that does not match the reviewed lock is never stored and never
 	// executed, whatever served it.
-	if digest := bytesSHA256(data); digest != source.SHA256 {
-		return ResolvedArchive{}, fmt.Errorf("%s served sha256 %s, the lock pins %s", source.URL, digest, source.SHA256)
+	if digest := bytesBLAKE3(data); digest != source.BLAKE3 {
+		return ResolvedArchive{}, fmt.Errorf("%s served blake3 %s, the lock pins %s", source.URL, digest, source.BLAKE3)
 	}
 
 	origin := OriginOfficial
@@ -451,8 +452,8 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 		// that is not the object, so nothing may be assumed about it.
 		return nil, fmt.Errorf("mirror GET %s: HTTP %d", keys.archive, status)
 	}
-	if digest := bytesSHA256(data); digest != source.SHA256 {
-		return nil, fmt.Errorf("the mirror holds a different object under this digest key %s: sha256 %s", keys.archive, digest)
+	if digest := bytesBLAKE3(data); digest != source.BLAKE3 {
+		return nil, fmt.Errorf("the mirror holds a different object under this digest key %s: blake3 %s", keys.archive, digest)
 	}
 	archiveBundle, err := m.companion(ctx, keys.archiveBundle)
 	if err != nil {
@@ -530,7 +531,7 @@ func (provenance ArchiveProvenance) check(source ArchiveSource, size int64) erro
 		{"kind", provenance.Kind, source.Kind},
 		{"name", provenance.Name, source.Name},
 		{"url", provenance.URL, source.URL},
-		{"sha256", provenance.SHA256, source.SHA256},
+		{"blake3", provenance.BLAKE3, source.BLAKE3},
 	} {
 		if field.published != field.expected {
 			return fmt.Errorf("provenance %s is %q, the lock pins %q", field.name, field.published, field.expected)
@@ -559,7 +560,7 @@ func (m *SourceMirror) publish(ctx context.Context, source ArchiveSource, data [
 		Kind:          source.Kind,
 		Name:          source.Name,
 		URL:           source.URL,
-		SHA256:        source.SHA256,
+		BLAKE3:        source.BLAKE3,
 		Size:          int64(len(data)),
 		MirroredAt:    time.Now().UTC().Format(time.RFC3339),
 		Source: ProvenanceSource{
@@ -625,6 +626,10 @@ func (m *SourceMirror) signBlob(ctx context.Context, blob, bundle string) error 
 // content-addressed, so If-None-Match: * is the whole concurrency story: either
 // this writer created the key, or another writer already did and the read-back
 // has to agree with what this one would have written.
+//
+// `--aws-sigv4` signs the request with SHA-256 because AWS Signature Version 4
+// specifies that hash; it is curl's business and says nothing about how the
+// object itself is addressed or verified.
 func (m *SourceMirror) put(ctx context.Context, key, file, mediaType string) error {
 	args := []string{
 		"--silent", "--show-error",
