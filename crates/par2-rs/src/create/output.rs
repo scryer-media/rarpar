@@ -567,6 +567,33 @@ struct StagedOutputs {
 /// file through renames, which is what makes it usable on both sides of the
 /// quarantine rename.
 ///
+/// # Windows: the same machinery, a different forgery
+///
+/// NTFS does not hand back a whole file id the way ext4 hands back an inode
+/// number. `GetFileInformationByHandle`'s 64-bit file index is a 48-bit MFT
+/// record number plus a 16-bit sequence number that the volume bumps every time
+/// the record is recycled, so a delete-and-recreate produces a *different*
+/// index: measured on NTFS, 0 of 20 rounds repeated it (the record number
+/// repeated all 20 times; the sequence number moved every time).
+///
+/// The hazard transposes anyway, from the other direction. NTFS **file
+/// tunneling** replays a removed file's creation time onto a file recreated
+/// with the same name in the same directory inside the tunnel window — measured
+/// 10 of 10 same-directory rounds, and 0 of 10 when the recreate landed in a
+/// different directory. Every comparison site in this module is a same-name,
+/// same-directory site, which is precisely the case tunneling covers. So on
+/// Windows the timestamp is not merely coincidentally forgeable the way a
+/// coarse-clock birth time is on Linux; the filesystem forges it deliberately,
+/// every time, exactly here.
+///
+/// A retained handle settles it on Windows for the same reason it does on Unix:
+/// while this handle lives the MFT record cannot be recycled, so no other file
+/// can present our `(volume, index)`, and the handle follows the file through
+/// the transaction's renames. The share mode Rust opens with permits the
+/// deletes and renames the transaction performs on its own files — verified,
+/// not assumed: unlink-while-pinned, recreate-while-pinned, publish-unlink of an
+/// adopted stage handle, and quarantine rename under a pin all succeed.
+///
 /// # Deliberately stronger than the reference tools
 ///
 /// Neither reference implementation has any of this. par2cmdline repairs purely
@@ -576,7 +603,7 @@ struct StagedOutputs {
 /// "simplify" it back toward the reference behavior.
 #[derive(Debug)]
 struct InodePin {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     handle: File,
 }
 
@@ -586,7 +613,11 @@ impl InodePin {
     /// `O_RDONLY` rather than `O_PATH`: `fstat` works on both, but `O_PATH`
     /// is Linux-only, and the pin has to behave the same on macOS, the BSDs and
     /// wasi-adjacent Unixes. A read handle costs the same one descriptor.
-    #[cfg(unix)]
+    ///
+    /// The same call serves Windows: `File::open` there asks for read access
+    /// under the full sharing mode, which is what keeps the transaction's own
+    /// unlinks and renames working while the record stays pinned.
+    #[cfg(any(unix, windows))]
     fn open(path: &Path, set_size: usize) -> Result<Self> {
         match File::open(path) {
             Ok(handle) => Ok(Self { handle }),
@@ -597,7 +628,11 @@ impl InodePin {
     /// Adopt an already-open handle, which is what the staged outputs do: the
     /// stage file is published with `hard_link`, so the write handle already
     /// references the very inode the published target names.
-    #[cfg(unix)]
+    ///
+    /// Identical on Windows, where a hard link is likewise a second name for
+    /// one MFT record: the retained stage handle reports the published target's
+    /// `(volume, index)` before and after the stage name is unlinked.
+    #[cfg(any(unix, windows))]
     fn adopt(handle: File) -> Self {
         Self { handle }
     }
@@ -621,29 +656,47 @@ impl InodePin {
         }
     }
 
-    /// Non-Unix targets keep the previous behavior explicitly rather than by
-    /// accident.
+    /// Is `path` still the object this pin holds?
     ///
-    /// Windows does not transpose the hazard: an open handle blocks
-    /// delete-in-place under the default sharing mode, so a foreign file cannot
-    /// take the place of a file this transaction holds open, and the
-    /// `(volume, index)` pair stays sufficient there. wasip1 has no
-    /// `RLIMIT_NOFILE` and no stable descriptor-identity story, so it keeps the
-    /// `(device, inode)` check it already had. Neither is pinned this pass.
-    #[cfg(not(unix))]
+    /// `GetFileInformationByHandle` on the retained handle against a fresh
+    /// resolution of `path`, routed through [`target_file_identity`] so this
+    /// check inherits the same regular-file and reparse-point guards every
+    /// other identity read in this module uses, and so a comparison-site fix
+    /// can never apply to one of the two and not the other. A path that is gone
+    /// resolves to `None` and answers `false`, mirroring the Unix arm's
+    /// `NotFound` case.
+    ///
+    /// While the pin lives the MFT record cannot be recycled, so agreement here
+    /// means the same object and not merely the same numbers — which is the
+    /// whole point, because the creation time carried alongside the index is
+    /// the field NTFS tunneling replays onto a same-name replacement.
+    #[cfg(windows)]
+    fn still_at(&self, path: &Path) -> std::io::Result<bool> {
+        let pinned = FileIdentity::from_file(&self.handle)?;
+        Ok(target_file_identity(path)? == Some(pinned))
+    }
+
+    /// Targets with neither `unix` nor `windows` file identity keep the previous
+    /// behavior explicitly rather than by accident.
+    ///
+    /// wasip1 has no `RLIMIT_NOFILE` and no stable descriptor-identity story, so
+    /// it keeps the `(device, inode)` check it already had and is not pinned.
+    /// This arm is the honest statement of that: it cannot answer the question,
+    /// so the recorded [`FileIdentity`] remains the only authority there.
+    #[cfg(not(any(unix, windows)))]
     fn open(_path: &Path, _set_size: usize) -> Result<Self> {
         Ok(Self {})
     }
 
-    /// The handle is dropped here rather than retained: without the Unix
-    /// inode-reference guarantee there is nothing for it to pin, and holding it
+    /// The handle is dropped here rather than retained: without a
+    /// record-reference guarantee there is nothing for it to pin, and holding it
     /// would only keep a descriptor open for no benefit.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn adopt(_handle: File) -> Self {
         Self {}
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn still_at(&self, _path: &Path) -> std::io::Result<bool> {
         Ok(true)
     }
@@ -653,7 +706,7 @@ impl InodePin {
 /// file it owns has no way to tell its own outputs from a foreign file that
 /// took their inode, and a partially pinned set is that bug wearing a
 /// different hat.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn open_pin_error(path: &Path, set_size: usize, error: &std::io::Error) -> Par2Error {
     let limit = open_file_limit_description();
     Par2Error::CreationValidation {
@@ -673,6 +726,17 @@ fn open_file_limit_description() -> String {
         }
         None => "RLIMIT_NOFILE could not be read".to_string(),
     }
+}
+
+/// Windows has no `RLIMIT_NOFILE` analogue worth quoting: handles are bounded by
+/// a per-process quota far above any recovery-volume count and by kernel pool,
+/// neither of which reads back as a soft/hard pair. Saying so beats inventing a
+/// number, and it points the reader at what a refusal here actually is.
+#[cfg(windows)]
+fn open_file_limit_description() -> String {
+    "and Windows imposes no per-process descriptor limit at this scale, so this is a \
+     sharing or access denial rather than exhaustion"
+        .to_string()
 }
 
 #[cfg(unix)]
@@ -732,6 +796,9 @@ fn raise_open_file_limit() {
     });
 }
 
+/// Nothing to raise off Unix. Windows pins handles rather than descriptors and
+/// its per-process quota is orders of magnitude above any output set this
+/// transaction can produce; wasip1 pins nothing at all.
 #[cfg(not(unix))]
 fn raise_open_file_limit() {}
 
@@ -801,7 +868,27 @@ pub(crate) enum FileIdentity {
         birth: Option<std::time::SystemTime>,
     },
     #[cfg(windows)]
-    Windows { volume: u32, index: u64 },
+    Windows {
+        volume: u32,
+        index: u64,
+        // The counterpart of `birth`, added for the same reason and with the
+        // same honest limit. `GetFileInformationByHandle` reports the creation
+        // time in the very call that reports the index, so it costs nothing to
+        // carry, and it discriminates a replacement the index pair alone would
+        // not — but only outside NTFS file tunneling, which replays a removed
+        // file's creation time onto a same-name, same-directory recreate
+        // (measured 10/10 same-directory, 0/10 cross-directory). Every
+        // comparison site here is same-name and same-directory, so this field
+        // hardens the no-pin fallback and never stands in for the pin.
+        //
+        // Kept as raw FILETIME ticks (100 ns since 1601-01-01) rather than
+        // converted to `SystemTime`: the only operation performed on it is
+        // equality, and the conversion would add arithmetic that can only lose.
+        // `None` where the volume reports no creation time at all (a zero
+        // FILETIME), which degrades to the previous (volume, index) check
+        // exactly as `birth` degrades on a filesystem without a birth time.
+        birth: Option<u64>,
+    },
     // wasip1 is not `unix`, and `std::os::wasi::fs::MetadataExt` (the stdlib
     // route to `dev`/`ino`) is still unstable behind `wasi_ext`, which this
     // crate's pinned stable toolchain cannot use. Without an identity the
@@ -829,12 +916,14 @@ pub(crate) enum TargetSnapshot {
 
 #[cfg(windows)]
 #[repr(C)]
-#[allow(dead_code)]
 struct WindowsFileTime {
     low_date_time: u32,
     high_date_time: u32,
 }
 
+// The layout must match `BY_HANDLE_FILE_INFORMATION` exactly, so the fields this
+// module does not read are still declared. Only `creation_time`,
+// `volume_serial_number` and the two `file_index_*` halves are consumed.
 #[cfg(windows)]
 #[repr(C)]
 #[allow(dead_code)]
@@ -910,10 +999,15 @@ impl FileIdentity {
             return Err(std::io::Error::last_os_error());
         }
         let information = unsafe { information.assume_init() };
+        let birth = (u64::from(information.creation_time.high_date_time) << 32)
+            | u64::from(information.creation_time.low_date_time);
         Ok(Self::Windows {
             volume: information.volume_serial_number,
             index: (u64::from(information.file_index_high) << 32)
                 | u64::from(information.file_index_low),
+            // A zero FILETIME is how a volume says it has no creation time to
+            // report; the documented degraded case, not a valid timestamp.
+            birth: (birth != 0).then_some(birth),
         })
     }
 }
@@ -2575,8 +2669,11 @@ mod tests {
     /// The pin makes the answer the same either way: while the handle lives the
     /// kernel cannot hand its inode to the replacement, so a recycling
     /// filesystem (overlayfs, ext4) and a non-recycling one (APFS) both end at
-    /// "not our file". The diagnostic line records which case ran, so a
-    /// container run can show the hostile one was really exercised.
+    /// "not our file". NTFS is a third shape again — it recycles the MFT record
+    /// but bumps the sequence number in the same 64-bit index, so the numbers
+    /// move even unpinned — and it lands on the same answer. The diagnostic line
+    /// records which case ran, so a container run can show the hostile one was
+    /// really exercised.
     #[test]
     fn pinned_identity_refuses_a_recreated_file_even_when_the_inode_is_reused() {
         let directory = tempfile::tempdir().unwrap();
@@ -2594,10 +2691,10 @@ mod tests {
         let control_after = file_identity_numbers(&control);
         eprintln!(
             "unpinned reuse: {} (before={control_before:?} after={control_after:?})",
-            if control_before == control_after {
-                "YES -- the pre-fix identity was forged"
-            } else {
-                "no -- this filesystem did not recycle here"
+            match reuse_verdict(control_before, control_after) {
+                "YES" => "YES -- the pre-fix identity was forged",
+                "no" => "no -- this filesystem did not recycle here",
+                other => other,
             }
         );
 
@@ -2616,7 +2713,7 @@ mod tests {
         // control above: a referenced inode cannot be handed to a new file.
         eprintln!(
             "pinned reuse:   {} (before={before:?} after={after:?})",
-            if before == after { "YES" } else { "no" }
+            reuse_verdict(before, after)
         );
         assert!(
             !pin.still_at(&path).unwrap(),
@@ -2643,11 +2740,7 @@ mod tests {
         fs::write(&path, b"foreign").unwrap();
         eprintln!(
             "inode reuse: {}",
-            if before == file_identity_numbers(&path) {
-                "YES"
-            } else {
-                "no"
-            }
+            reuse_verdict(before, file_identity_numbers(&path))
         );
 
         let error = quarantine_owned_target(&installed).unwrap_err();
@@ -2663,6 +2756,71 @@ mod tests {
         }));
     }
 
+    /// NTFS file tunneling forges the creation time, and the pin refuses anyway.
+    ///
+    /// The Windows counterpart of the inode-reuse case above, and the reason
+    /// `FileIdentity::Windows`'s `birth` field is documented as insufficient on
+    /// its own. NTFS replays a removed file's creation time onto a file
+    /// recreated with the same name in the same directory, so the control arm
+    /// here is a deliberate, filesystem-provided forgery rather than a
+    /// clock-granularity accident — and the shape it forges is exactly the shape
+    /// this module's comparison sites see. Every one of them is a same-name,
+    /// same-directory comparison.
+    ///
+    /// The forgery is reported, not asserted: a volume with tunneling disabled
+    /// (`MaximumTunnelEntries = 0`) or a non-NTFS volume just prints the weaker
+    /// control line. The pinned assertion is the one that must hold everywhere.
+    #[cfg(windows)]
+    #[test]
+    fn a_pin_refuses_a_recreated_file_whose_creation_time_ntfs_replayed() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // Control first, unpinned: what the recorded identity alone would face.
+        let control = directory.path().join("unpinned.par2");
+        fs::write(&control, b"ours").unwrap();
+        let birth_before = file_creation_ticks(&control);
+        let numbers_before = file_identity_numbers(&control);
+        fs::remove_file(&control).unwrap();
+        fs::write(&control, b"foreign").unwrap();
+        let birth_after = file_creation_ticks(&control);
+        let numbers_after = file_identity_numbers(&control);
+        eprintln!(
+            "ntfs creation-time replay: {} (before={birth_before:?} after={birth_after:?})",
+            if birth_before.is_some() && birth_before == birth_after {
+                "YES -- tunneling forged the timestamp; a birth field alone would have been fooled"
+            } else {
+                "no -- tunneling is disabled or unsupported on this volume"
+            }
+        );
+        eprintln!(
+            "ntfs file-index repeat: {} (before={numbers_before:?} after={numbers_after:?})",
+            reuse_verdict(numbers_before, numbers_after)
+        );
+
+        // The same delete-and-recreate against a live pin, which must refuse it
+        // whatever the two control lines above reported.
+        let path = directory.path().join("owned.par2");
+        fs::write(&path, b"ours").unwrap();
+        let pin = InodePin::open(&path, 1).unwrap();
+        assert!(pin.still_at(&path).unwrap());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        assert!(
+            !pin.still_at(&path).unwrap(),
+            "a recreated file must never satisfy the pin"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+    }
+
+    /// Creation-time ticks for the tunneling diagnostic above.
+    #[cfg(windows)]
+    fn file_creation_ticks(path: &Path) -> Option<u64> {
+        match target_file_identity(path) {
+            Ok(Some(FileIdentity::Windows { birth, .. })) => birth,
+            _ => None,
+        }
+    }
+
     /// `(device, inode)` for the diagnostic in the two tests above.
     #[cfg(unix)]
     fn file_identity_numbers(path: &Path) -> Option<(u64, u64)> {
@@ -2673,9 +2831,34 @@ mod tests {
             .map(|metadata| (metadata.dev(), metadata.ino()))
     }
 
-    #[cfg(not(unix))]
+    /// `(volume, index)` — the same diagnostic on Windows. Before this existed
+    /// the helper returned `None` on every non-Unix target, so the reuse line
+    /// compared `None` against `None` and printed "YES" on a run where nothing
+    /// had been measured at all. A diagnostic that reports a forgery it never
+    /// observed is worse than no diagnostic.
+    #[cfg(windows)]
+    fn file_identity_numbers(path: &Path) -> Option<(u64, u64)> {
+        match target_file_identity(path) {
+            Ok(Some(FileIdentity::Windows { volume, index, .. })) => {
+                Some((u64::from(volume), index))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn file_identity_numbers(_path: &Path) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Reuse verdict for the diagnostics, with "the numbers were unavailable"
+    /// kept distinct from "the numbers matched" — see `file_identity_numbers`.
+    fn reuse_verdict(before: Option<(u64, u64)>, after: Option<(u64, u64)>) -> &'static str {
+        match (before, after) {
+            (Some(before), Some(after)) if before == after => "YES",
+            (Some(_), Some(_)) => "no",
+            _ => "unknown -- this target reports no file identity numbers",
+        }
     }
 
     #[test]

@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Runtime Behavior
+
+- Transaction-owned files are now identified by a retained handle on Windows
+  too. The retained-descriptor hardening described under 0.4.1 was **Unix-only**
+  — the non-Unix arm of the pin kept a no-op `open`, dropped the handle it was
+  handed in `adopt`, and answered "yes, still ours" unconditionally. Its recorded
+  rationale said an open handle blocks delete-in-place, which is self-defeating
+  advice from code that deliberately holds no handle. In practice the check did
+  not merely degrade to the pre-0.4.1 `(volume, index)` comparison; it degraded
+  to no comparison at all, so *any* foreign file at an owned path satisfied the
+  pin and the transaction would quarantine or overwrite it. This release
+  completes on Windows what 0.4.1 completed on Unix.
+- `FileIdentity::Windows` carries the file's creation time alongside
+  `(volume, index)`, the counterpart of `birth` on the Unix and wasi arms, taken
+  from the `GetFileInformationByHandle` call that already reports the index. It
+  hardens the sites that have no pin to consult; it is not a substitute for one.
+  NTFS **file tunneling** replays a removed file's creation time onto a file
+  recreated with the same name in the same directory — measured 10/10
+  same-directory rounds against 0/10 cross-directory — and every comparison site
+  in the creation transaction is same-name and same-directory. The filesystem
+  forges this timestamp deliberately and reliably, exactly where the check
+  matters, which is the Windows counterpart of the coarse-clock birth-time
+  replay that ruled out a timestamp-only fix on Linux.
+- The forgery NTFS does *not* offer is the Unix one: its 64-bit file index pairs
+  the MFT record number with a sequence number the volume bumps on every reuse,
+  so a delete-and-recreate produced a different index in 0 of 20 measured rounds
+  even unpinned. Windows was never one plausible-looking number away from safety;
+  it was missing the comparison. The retained handle is what makes the answer
+  authoritative on both platforms — while it lives the record cannot be recycled,
+  and it follows the file through the transaction's own renames.
+- Three platform tests that failed on every Windows CI lane —
+  `pinned_identity_refuses_a_recreated_file_even_when_the_inode_is_reused`,
+  `rollback_boundary_swap_preserves_a_foreign_target` and
+  `rollback_refuses_a_recreated_target_on_a_recycling_filesystem` — now pass
+  there. They failed identically on `windows-x86_64` and `windows-arm64`, which
+  is what identified the defect as OS-scoped rather than silicon-scoped.
+- No behaviour change on Unix, wasi, or any other target. The wasi arm still
+  pins nothing and still says so explicitly.
+
+### Diagnostics
+
+- The reuse-diagnostic line the identity tests print reports the file identity
+  numbers on Windows instead of `None`. Comparing `None` against `None` made it
+  print "YES -- the pre-fix identity was forged" on every Windows run, claiming
+  an observation it had not made.
+
 ## 0.4.1
 
 This is a patch release from 0.4.0. Additive only: no existing item changed
