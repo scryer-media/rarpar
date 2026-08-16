@@ -7,18 +7,18 @@ rarpar's normal CLI behavior or use the repository's test-fixture corpus.
 ## Corpus
 
 The corpus begins with deterministic synthetic payload bytes. Its source lock
-pins each archive writer and the PAR2 generator by URL, SHA-256, Docker image
-identity, and platform. Docker is needed only to build those generators and
+pins each archive writer and the PAR2 generator by URL, BLAKE3 digest, Docker
+image identity, and platform. Docker is needed only to build those generators and
 materialize a corpus.
 
 `toolchains build` resolves every original distribution archive before Docker
 starts. Each archive is fetched from the public tool mirror first — the
-content-addressed `tools/<kind>/sha256/<digest>/` objects on R2, whose Sigstore
+content-addressed `tools/<kind>/blake3/<digest>/` objects on R2, whose Sigstore
 bundles must verify under the publish workflow's exact identity and whose
 provenance must agree with the lock — and falls back to RARLAB or GitHub only
 when the mirror does not hold it or cannot be reached; a mirrored object that
 does not verify is an error, never a fallback. Either way the bytes must match
-the SHA-256 in `config/toolchains.json` before anything uses them. The image is
+the BLAKE3 digest in `config/toolchains.json` before anything uses them. The image is
 then built from a temporary context holding only the Dockerfile and that
 verified archive, so the build itself downloads no tool. Set
 `RARPAR_TOOL_MIRROR_BASE` (or `--mirror-base URL`) to the mirror's public read

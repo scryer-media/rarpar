@@ -101,11 +101,13 @@ Apple Silicon, and blocks WGPU from every shipped `rarpar` artifact.
 
 Required repository configuration:
 
-- `CARGO_REGISTRY_TOKEN`: crates.io token with publish access to the three
-  library packages. The publish workflow reads it from
-  `secrets.CARGO_REGISTRY_TOKEN`.
-- `crates-io` environment: recommended for required reviewer protection around
-  the real publish job.
+- crates.io Trusted Publishing: `reedsolomon-rs`, `unrar-rs` and `par2-rs`
+  each list this repository, `publish-crates.yml` and the `crates-io`
+  environment as a Trusted Publisher. The publish job exchanges its OIDC
+  identity for a short-lived token (`rust-lang/crates-io-auth-action`); no
+  long-lived registry token is stored in the repository.
+- `crates-io` environment: the identity Trusted Publishing is scoped to, and
+  the place for required-reviewer protection around the real publish job.
 - `TAP_PUSH_TOKEN`: GitHub token that can push to the
   `scryer-media/homebrew-rarpar` repository backing the `scryer-media/rarpar`
   Homebrew tap. The release workflow skips the tap update when this secret is

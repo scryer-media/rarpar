@@ -2547,135 +2547,15 @@ mod tests {
         assert_eq!(decoder.block_bits_remaining, 42);
     }
 
-    /// Expected bytes for `rar5_filter_bounds.rar`, straight from the unrar
-    /// 7.20 binary (`tests/fixtures/generate_rar5_filter_bounds.py` assembles
-    /// the archive and stamps those same bytes' CRC32 into its file headers, so
-    /// `unrar t` passes on every member).
-    ///
-    /// v5 shares `UnpWriteData` with v29 (unpack50.cpp:538-548), so it carries
-    /// the same write-side contract the RAR4 fixture pins, and the same three
-    /// pieces of it are exercised here. Every member declares 16 bytes except
-    /// `filter-inside-size`, which declares 64:
-    ///
-    /// * `filter-overruns-size` — a delta block over [0,64). The filtered write
-    ///   has no clamp (unpack50.cpp:355-358), so all 64 bytes go out.
-    /// * `e8-overruns-size` — the same overrun through the E8 filter, whose
-    ///   rewritten addresses show the transform really ran.
-    /// * `raw-overrun-clamped` — no filter, 64 raw bytes, clamped to 16.
-    /// * `filter-inside-size` — the well-formed shape, untouched by any of this.
-    /// * `raw-clamped-then-e8` — 64 raw bytes (16 emitted) and an E8 block
-    ///   queued ahead of them. `WrittenFileSize` advances by the *full* span
-    ///   `UnpWriteData` was handed, not the clamped part (unpack50.cpp:547), and
-    ///   the E8 filter takes its file offset from that counter, so the rewrite
-    ///   uses offset 64. These bytes pin the counter's semantics.
-    /// * `filter-start-past-window` — a block queued at [64,128) in a member
-    ///   that ends after 32 bytes. The oracle never matches the filter
-    ///   (unpack50.cpp:315) and falls through to
-    ///   `UnpWriteArea(WrittenBorder,UnpPtr)` (unpack50.cpp:405). This is the
-    ///   geometry that hung the RAR4 drain; reaching the assertion at all is
-    ///   the other half of the test.
-    fn rar5_filter_bounds_expected() -> Vec<(&'static str, Vec<u8>)> {
-        const RAW_16: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x20, 0x21, 0x30, 0x31, 0x40, 0x41, 0x42, 0xE8,
-            0xE9, 0x00,
-        ];
-        const DELTA_64: [u8; 64] = [
-            0x00, 0xFF, 0xFD, 0xFA, 0xEA, 0xD9, 0xB9, 0x98, 0x68, 0x37, 0xF7, 0xB6, 0x74, 0x8C,
-            0xA3, 0xA3, 0xA2, 0xA0, 0x9D, 0x8D, 0x7C, 0x5C, 0x3B, 0x0B, 0xDA, 0x9A, 0x59, 0x17,
-            0x2F, 0x46, 0x46, 0x45, 0x43, 0x40, 0x30, 0x1F, 0xFF, 0xDE, 0xAE, 0x7D, 0x3D, 0xFC,
-            0xBA, 0xD2, 0xE9, 0xE9, 0xE8, 0xE6, 0xE3, 0xD3, 0xC2, 0xA2, 0x81, 0x51, 0x20, 0xE0,
-            0x9F, 0x5D, 0x75, 0x8C, 0x8C, 0x8B, 0x89, 0x86,
-        ];
-        const E8_64: [u8; 64] = [
-            0xE8, 0x0F, 0x20, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x07, 0x20, 0x03, 0x00, 0x41,
-            0x41, 0x41, 0xE8, 0xFF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xF7, 0x1F, 0x03,
-            0x00, 0x41, 0x41, 0x41, 0xE8, 0xEF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xE7,
-            0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xDF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41,
-            0xE8, 0xD7, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41,
-        ];
-        /// The same eight E8 records rewritten against file offset 64.
-        const E8_64_AT_OFFSET_64: [u8; 64] = [
-            0xE8, 0xCF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xC7, 0x1F, 0x03, 0x00, 0x41,
-            0x41, 0x41, 0xE8, 0xBF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xB7, 0x1F, 0x03,
-            0x00, 0x41, 0x41, 0x41, 0xE8, 0xAF, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0xA7,
-            0x1F, 0x03, 0x00, 0x41, 0x41, 0x41, 0xE8, 0x9F, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41,
-            0xE8, 0x97, 0x1F, 0x03, 0x00, 0x41, 0x41, 0x41,
-        ];
-
-        let joined = |head: &[u8], tail: &[u8]| {
-            let mut out = head.to_vec();
-            out.extend_from_slice(tail);
-            out
-        };
-
-        vec![
-            ("filter-overruns-size.bin", DELTA_64.to_vec()),
-            ("e8-overruns-size.bin", E8_64.to_vec()),
-            ("raw-overrun-clamped.bin", RAW_16.to_vec()),
-            ("filter-inside-size.bin", DELTA_64.to_vec()),
-            (
-                "raw-clamped-then-e8.bin",
-                joined(&RAW_16, &E8_64_AT_OFFSET_64),
-            ),
-            ("filter-start-past-window.bin", RAW_16.to_vec()),
-        ]
-    }
-
-    fn decode_rar5_fixture_members(fixture: &str) -> Option<Vec<(String, Vec<u8>)>> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/rar5")
-            .join(fixture);
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("skipping test: {fixture} fixture not present");
-            return None;
-        };
-        if !bytes.starts_with(b"Rar!") {
-            eprintln!("skipping test: {fixture} fixture not hydrated (LFS pointer)");
-            return None;
-        }
-        let mut archive =
-            crate::RarArchive::open(std::io::Cursor::new(bytes)).expect("fixture parses");
-        // Verification off deliberately: these members legitimately carry more
-        // bytes than they declare, so the comparison is on the bytes.
-        let options = crate::ExtractOptions {
-            verify: false,
-            ..Default::default()
-        };
-        let names: Vec<String> = archive
-            .metadata()
-            .members
-            .iter()
-            .map(|member| member.name.clone())
-            .collect();
-        Some(
-            names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    let bytes = archive
-                        .extract_member(index, &options, None)
-                        .and_then(|member| member.into_bytes())
-                        .unwrap_or_else(|err| panic!("{name} failed to decode: {err}"));
-                    (name.clone(), bytes)
-                })
-                .collect(),
-        )
-    }
-
-    /// RAR5 bounds *writing* where the oracle bounds writing, instead of
-    /// bounding decoding by the declared size.
-    #[test]
-    fn rar5_filtered_output_is_bounded_at_the_write_layer_like_rar_behavior() {
-        let Some(members) = decode_rar5_fixture_members("rar5_filter_bounds.rar") else {
-            return;
-        };
-        let expected = rar5_filter_bounds_expected();
-        assert_eq!(members.len(), expected.len());
-        for ((name, bytes), (want_name, want)) in members.iter().zip(&expected) {
-            assert_eq!(name, want_name);
-            assert_eq!(bytes.as_slice(), want.as_slice(), "{name}");
-        }
-    }
+    // The `rar5_filter_bounds.rar` fixture that drove
+    // `rar5_filtered_output_is_bounded_at_the_write_layer_like_rar_behavior`
+    // was hand-assembled: RARLAB's writer never emits a filter block that
+    // overruns the declared member size, so no legitimate tool could produce
+    // it. Fixtures are created by RARLAB tooling or imported unmodified from a
+    // public upstream, and nothing else, so the fixture, its expectation table
+    // and the test are gone. `UnpWriteData`'s write-side contract is still
+    // covered by the unit tests above and by the real filtered archives in the
+    // imported corpus.
 
     struct FixtureMember {
         packed: Vec<u8>,

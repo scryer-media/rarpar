@@ -10,6 +10,10 @@ const (
 	ReportSchemaVersion = 1
 )
 
+// ToolchainLock is the shared generator-toolchain lock. Schema 2 pins the
+// source archives by BLAKE3; schema 1 pinned them by SHA-256 and is not read.
+// DockerBase and VideoEncoder.Image stay `@sha256:` — that is the OCI image
+// digest form, fixed by the registry specification, not a digest chosen here.
 type ToolchainLock struct {
 	SchemaVersion int         `json:"schema_version"`
 	DockerBase    string      `json:"docker_base"`
@@ -32,7 +36,7 @@ type RARWriter struct {
 	Image    string `json:"image"`
 	Platform string `json:"platform"`
 	URL      string `json:"url"`
-	SHA256   string `json:"sha256"`
+	BLAKE3   string `json:"blake3"`
 	Binary   string `json:"binary"`
 }
 
@@ -41,7 +45,7 @@ type PAR2Generator struct {
 	Image    string `json:"image"`
 	Platform string `json:"platform"`
 	URL      string `json:"url"`
-	SHA256   string `json:"sha256"`
+	BLAKE3   string `json:"blake3"`
 }
 
 type CorpusConfig struct {

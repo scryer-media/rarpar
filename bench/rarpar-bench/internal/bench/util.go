@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/zeebo/blake3"
 )
 
 func readJSON(path string, value any) error {
@@ -41,6 +43,11 @@ func writeJSON(path string, value any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// fileSHA256 and bytesSHA256 serve the benchmark corpus's own contract — the
+// corpus, plan, run and report digests, and the `fixture_sha256` pins fleet
+// evidence already exists against. They are SHA-256 by that specification, not
+// by choice; everything the toolchain lock and the tool mirror digest is
+// BLAKE3.
 func fileSHA256(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -56,6 +63,26 @@ func fileSHA256(path string) (string, error) {
 
 func bytesSHA256(data []byte) string {
 	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// fileBLAKE3 and bytesBLAKE3 are the digests the shared toolchain lock and the
+// tool-source mirror are addressed and verified by.
+func fileBLAKE3(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := blake3.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func bytesBLAKE3(data []byte) string {
+	sum := blake3.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 

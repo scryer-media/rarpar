@@ -13,6 +13,7 @@ import (
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/testcorpus"
 )
 
 func main() {
@@ -34,6 +35,8 @@ func run(ctx context.Context, args []string) error {
 		return runCorpus(ctx, args[1:])
 	case "payload":
 		return runPayload(ctx, args[1:], os.Stdout)
+	case "testcorpus":
+		return runTestCorpus(ctx, args[1:])
 	case "plan":
 		return runPlan(args[1:])
 	case "preflight":
@@ -62,6 +65,8 @@ func usage() {
   rarpar-bench corpus push --root DIR --image REGISTRY/REPO:TAG [--token-file PATH]
   rarpar-bench corpus fetch --image REGISTRY/REPO:TAG --out DIR [--token-file PATH]
   rarpar-bench payload video --profile ffmpeg-video|ffmpeg-video-hevc --target-bytes BYTES --out PATH [--toolchains PATH] [--docker PATH]
+  rarpar-bench testcorpus generate [--only NAME]... [--jobs N] [--toolchains PATH] [--docker PATH]
+  rarpar-bench testcorpus list
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
@@ -76,11 +81,12 @@ intentionally external to source control; use target/bench by convention.
 Toolchain archives resolve from the public tool mirror first (--mirror-base,
 default $RARPAR_TOOL_MIRROR_BASE; empty means official URLs only) and fall back
 to their official URLs only when the mirror does not hold them. Every archive is
-verified against config/toolchains.json before Docker sees it. --publish mirrors
+verified against the BLAKE3 digest config/toolchains.json pins before Docker
+sees it, and the mirror keys are derived from that digest. --publish mirrors
 what the bucket does not hold yet; it needs --s3-endpoint, --bucket and
 R2_CORPUS_ACCESS_KEY_ID/R2_CORPUS_SECRET_ACCESS_KEY, and is for the protected
 publish workflow. resolve does the resolving (and publishing) alone, without
-building any image.
+building any image, printing "<kind> <name> blake3:<digest> <origin>".
 `)
 }
 
@@ -450,4 +456,64 @@ func writeJSONTo(writer io.Writer, value any) error {
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
+}
+
+// runTestCorpus produces the repository's test corpus: every checked-in recipe
+// run on the pinned toolchain images, and every upstream import fetched at its
+// pinned commit. `cargo run -p xtask -- test-corpus generate` delegates here and
+// then does the ledger-side work — the path-set check against
+// test-corpus/sources.json, the digest refresh, and the benchmark pin report.
+func runTestCorpus(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("testcorpus requires generate or list")
+	}
+	flags := flag.NewFlagSet("testcorpus "+args[0], flag.ContinueOnError)
+	toolchains := flags.String("toolchains", defaultPath("config/toolchains.json"), "toolchain lock")
+	docker := flags.String("docker", "docker", "Docker executable")
+	jobs := flags.Int("jobs", 1, "recipes to run at once within a stage")
+	var only stringList
+	flags.Var(&only, "only", "run only this recipe (repeatable); skips the upstream imports")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	switch args[0] {
+	case "list":
+		for _, unit := range testcorpus.Units() {
+			fmt.Printf("%s\t%d\t%s\n", unit.Name, unit.Stage, unit.Source)
+		}
+		return nil
+	case "generate":
+		root := os.Getenv("RARPAR_BENCH_WORKSPACE_ROOT")
+		if root == "" {
+			// The harness lives two levels under the repository root.
+			absolute, err := filepath.Abs(filepath.Join("..", ".."))
+			if err != nil {
+				return err
+			}
+			root = absolute
+		}
+		return testcorpus.Generate(ctx, testcorpus.Options{
+			RepoRoot:   root,
+			Toolchains: *toolchains,
+			Docker:     *docker,
+			Only:       only,
+			Jobs:       *jobs,
+			Log:        os.Stdout,
+		})
+	default:
+		return fmt.Errorf("unknown testcorpus command %q", args[0])
+	}
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (list *stringList) String() string { return strings.Join(*list, ",") }
+
+func (list *stringList) Set(value string) error {
+	*list = append(*list, value)
+	return nil
 }

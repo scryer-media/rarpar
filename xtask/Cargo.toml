@@ -5,10 +5,14 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+blake3 = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
 clap_mangen = "0.3"
 rarpar = { path = "../tools/rarpar", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# SHA-256 is still needed for exactly one thing: `test-corpus bench-pins`
+# reproduces the benchmark harness's `fixture_sha256` contract, which is
+# SHA-256 by specification of that corpus. Everything else digests with blake3.
 sha2 = { workspace = true }

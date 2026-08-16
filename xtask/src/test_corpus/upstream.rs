@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::ledger::{Ledger, Source, Upstream};
-use super::{Result, curl, fail, sha256_bytes};
+use super::{Result, blake3_bytes, curl, fail};
 
 /// The raw-content URL for a file at a pinned commit of a GitHub repository.
 pub(crate) fn raw_url(upstream: &Upstream, path: &str) -> Result<String> {
@@ -119,12 +119,12 @@ pub(crate) fn verify_public_upstreams(ledger: &Ledger) -> Vec<UpstreamCheck> {
                     ));
                 }
             };
-            let digest = sha256_bytes(&bytes);
-            if digest != entry.sha256 || bytes.len() as u64 != entry.size {
+            let digest = blake3_bytes(&bytes);
+            if digest != entry.blake3 || bytes.len() as u64 != entry.size {
                 return fail(format!(
                     "upstream bytes at {url} hash to {digest} ({} bytes); ledger says {} ({} bytes)",
                     bytes.len(),
-                    entry.sha256,
+                    entry.blake3,
                     entry.size
                 ));
             }

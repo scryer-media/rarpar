@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Generate the deterministic large RAR4 PPMd performance fixture.
+"""Generate the deterministic large RAR4 PPMd performance corpora.
 
-Requires the RARLAB rar 6.24 executable because current rar releases no longer
-write RAR4 archives. The generated payload is temporary; only the RAR fixture
-is retained in Git LFS.
+Two sets come out of here: the 32 MiB order-16 member
+(``rar4/rar4_ppm_order16_32m.rar``) and the classic-volume set
+(``rar4/rar4_ppm_oldmv.rar`` plus ``.r00``/``.r01``/``.r02``). ``--all`` writes
+both at their ledger paths, which is what ``xtask test-corpus generate`` runs.
+
+The writer is RARLAB rar 6.24: current rar releases no longer write RAR4
+archives, and 6.24 is the last one that also still has ``-vn`` for classic
+volume names. By default it comes from the pinned ``rarpar-bench-rarlab:6.24``
+image (bench/rarpar-bench/config/toolchains.json); ``--rar-bin`` (or ``RAR_BIN``)
+runs a local 6.24 binary instead, which is how this script was originally
+driven.
+
+The generated payload is deterministic and temporary; only the RAR fixtures are
+retained.
 """
 
 from __future__ import annotations
@@ -13,6 +24,7 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -22,8 +34,24 @@ PAYLOAD_NAME = "ppmd-order16-32m.txt"
 FIXED_MTIME = 1_700_000_000
 SEED = b"rarpar/unrar-rs deterministic RAR4 PPMd order-16 corpus v1"
 
+FIXTURE_DIR = Path(__file__).resolve().parent
+# Image tag as pinned in bench/rarpar-bench/config/toolchains.json.
+DEFAULT_IMAGE = "rarpar-bench-rarlab:6.24"
+
+# The classic-volume set: the first 262 144 bytes of the same payload over
+# 64 KiB volumes with old-style (.rar/.r00/.r01) names.
+OLDMV_PAYLOAD_SIZE = 262_144
+OLDMV_PAYLOAD_NAME = "ppmd-oldmv.txt"
+OLDMV_VOLUME_SIZE = "64k"
+
 
 def write_payload(path: Path, payload_size: int = PAYLOAD_SIZE) -> str:
+    # SHA-256 twice over, and deliberately: the payload stream is base64 over a
+    # fixed SHA-256 counter sequence, which is what the checked-in fixture bytes
+    # are; and the digest reported for it is the SHA-256 known-answer vector
+    # tests/integration.rs pins. The corpus ledger digests the *archives* with
+    # BLAKE3; Python has no BLAKE3 in its standard library, and moving either of
+    # these would move the fixture or the pinned answer for no gain.
     digest = hashlib.sha256()
     written = 0
     counter = 0
@@ -52,19 +80,110 @@ def require_rar_624(rar_bin: Path) -> None:
         raise SystemExit(f"{rar_bin} is not the required RARLAB rar 6.24")
 
 
+def rar_arguments(
+    archive_name: str,
+    payload_name: str,
+    volume_size: str | None,
+    old_volume_names: bool,
+) -> list[str]:
+    """The `rar` argument vector, without the executable."""
+    command = ["a", "-idq", "-ma4", "-m5", "-mc16:16t+", "-md4m", "-ep", "-o+"]
+    if volume_size:
+        command.append(f"-v{volume_size}")
+    if old_volume_names:
+        command.append("-vn")
+    command.extend([archive_name, payload_name])
+    return command
+
+
+def build_set(
+    run_rar,
+    work_dir: Path,
+    archive_name: str,
+    payload_name: str,
+    payload_size: int,
+    destination: Path,
+    volume_size: str | None = None,
+    old_volume_names: bool = False,
+) -> tuple[str, list[Path]]:
+    """Write one archive set into `destination`'s directory, replacing it."""
+    payload = work_dir / payload_name
+    payload_sha256 = write_payload(payload, payload_size)
+    run_rar(work_dir, rar_arguments(archive_name, payload_name, volume_size, old_volume_names))
+    payload.unlink()
+
+    stem = archive_name[: -len(".rar")] if archive_name.endswith(".rar") else archive_name
+    produced = sorted(
+        path
+        for path in work_dir.iterdir()
+        if path.is_file() and path.name.startswith(stem)
+    )
+    if not produced:
+        raise SystemExit(f"rar produced no output for {archive_name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for stale in sorted(destination.parent.glob(f"{stem}.*")):
+        stale.unlink()
+    written = []
+    for path in produced:
+        target = destination.parent / path.name
+        shutil.copyfile(path, target)
+        path.unlink()
+        written.append(target)
+    return payload_sha256, written
+
+
+def local_runner(rar_bin: Path):
+    def run(work_dir: Path, command: list[str]) -> None:
+        subprocess.run([str(rar_bin), *command], cwd=work_dir, check=True)
+
+    return run
+
+
+def docker_runner(docker: str, image: str):
+    def run(work_dir: Path, command: list[str]) -> None:
+        subprocess.run(
+            [
+                docker,
+                "run",
+                "--rm",
+                "--platform",
+                "linux/amd64",
+                "-v",
+                f"{work_dir}:/work",
+                "-w",
+                "/work",
+                image,
+                *command,
+            ],
+            check=True,
+        )
+
+    return run
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--rar-bin",
         type=Path,
         default=os.environ.get("RAR_BIN"),
-        required="RAR_BIN" not in os.environ,
-        help="path to the RARLAB rar 6.24 executable (or set RAR_BIN)",
+        help="path to a local RARLAB rar 6.24 executable (default: the pinned Docker image)",
+    )
+    parser.add_argument("--docker", default="docker", help="Docker executable")
+    parser.add_argument(
+        "--image",
+        default=DEFAULT_IMAGE,
+        help=f"pinned RAR 6.24 image (default: {DEFAULT_IMAGE})",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="write both the order-16 corpus and the classic-volume set at their ledger paths",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).parent / "rar4" / "rar4_ppm_order16_32m.rar",
+        default=FIXTURE_DIR / "rar4" / "rar4_ppm_order16_32m.rar",
     )
     parser.add_argument("--payload-size", type=int, default=PAYLOAD_SIZE)
     parser.add_argument("--payload-name", default=PAYLOAD_NAME)
@@ -78,41 +197,65 @@ def main() -> None:
         help="use classic .rar/.r00 volume names",
     )
     args = parser.parse_args()
-    rar_bin = args.rar_bin.resolve()
-    output = args.output.resolve()
-    require_rar_624(rar_bin)
-    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.rar_bin is not None:
+        rar_bin = Path(args.rar_bin).resolve()
+        require_rar_624(rar_bin)
+        run_rar = local_runner(rar_bin)
+    else:
+        run_rar = docker_runner(args.docker, args.image)
+
+    if args.all:
+        sets = [
+            (
+                "rar4_ppm_order16_32m.rar",
+                PAYLOAD_NAME,
+                PAYLOAD_SIZE,
+                FIXTURE_DIR / "rar4" / "rar4_ppm_order16_32m.rar",
+                None,
+                False,
+            ),
+            (
+                "rar4_ppm_oldmv.rar",
+                OLDMV_PAYLOAD_NAME,
+                OLDMV_PAYLOAD_SIZE,
+                FIXTURE_DIR / "rar4" / "rar4_ppm_oldmv.rar",
+                OLDMV_VOLUME_SIZE,
+                True,
+            ),
+        ]
+    else:
+        output = args.output.resolve()
+        sets = [
+            (
+                output.name,
+                args.payload_name,
+                args.payload_size,
+                output,
+                args.volume_size,
+                args.old_volume_names,
+            )
+        ]
 
     with tempfile.TemporaryDirectory(prefix="rarpar-ppmd-perf-") as temp_dir:
-        payload = Path(temp_dir) / args.payload_name
-        payload_sha256 = write_payload(payload, args.payload_size)
-        output.unlink(missing_ok=True)
-        command = [
-            rar_bin,
-            "a",
-            "-idq",
-            "-ma4",
-            "-m5",
-            "-mc16:16t+",
-            "-md4m",
-            "-ep",
-            "-o+",
-        ]
-        if args.volume_size:
-            command.append(f"-v{args.volume_size}")
-        if args.old_volume_names:
-            command.append("-vn")
-        command.extend([output, payload])
-        subprocess.run(
-            command,
-            check=True,
-        )
-
-    archive_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
-    print(f"payload_size={args.payload_size}")
-    print(f"payload_sha256={payload_sha256}")
-    print(f"archive_sha256={archive_sha256}")
-    print(f"archive={output}")
+        work_dir = Path(temp_dir)
+        for archive_name, payload_name, payload_size, destination, volume_size, old_names in sets:
+            payload_sha256, written = build_set(
+                run_rar,
+                work_dir,
+                archive_name,
+                payload_name,
+                payload_size,
+                destination,
+                volume_size,
+                old_names,
+            )
+            print(f"payload_size={payload_size}")
+            print(f"payload_sha256={payload_sha256}")
+            for path in written:
+                archive_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+                print(f"archive_sha256={archive_sha256}")
+                print(f"archive={path}")
 
 
 if __name__ == "__main__":

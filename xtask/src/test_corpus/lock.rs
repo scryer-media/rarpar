@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MANIFESTS_PREFIX, OBJECTS_PREFIX, Result, error, fail, is_sha256_hex, read_to_string};
+use super::{MANIFESTS_PREFIX, OBJECTS_PREFIX, Result, error, fail, is_blake3_hex, read_to_string};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -21,7 +21,7 @@ pub(crate) struct Lock {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pinned {
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
     pub(crate) url: String,
 }
 
@@ -56,7 +56,7 @@ impl Lock {
     /// True until an operator has published a corpus and a reviewed PR pinned
     /// it. While unpublished, `fetch` refuses and CI keeps its LFS hydration.
     pub(crate) fn is_unpublished(&self) -> bool {
-        self.manifest.sha256.is_empty()
+        self.manifest.blake3.is_empty()
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -83,7 +83,7 @@ impl Lock {
             // are how a stale URL sneaks past review.
             if !self.base_url.is_empty()
                 || !self.manifest.url.is_empty()
-                || !self.provenance.sha256.is_empty()
+                || !self.provenance.blake3.is_empty()
                 || !self.provenance.url.is_empty()
                 || !self.signature.bundle_url.is_empty()
                 || !self.published_from.commit.is_empty()
@@ -103,8 +103,8 @@ impl Lock {
                 self.base_url
             ));
         }
-        if !is_sha256_hex(&self.manifest.sha256) || !is_sha256_hex(&self.provenance.sha256) {
-            return fail("lock manifest/provenance sha256 must be lowercase 64-hex");
+        if !is_blake3_hex(&self.manifest.blake3) || !is_blake3_hex(&self.provenance.blake3) {
+            return fail("lock manifest/provenance blake3 must be lowercase 64-hex");
         }
         let expected_manifest = self.manifest_url();
         if self.manifest.url != expected_manifest {
@@ -145,26 +145,26 @@ impl Lock {
     pub(crate) fn manifest_url(&self) -> String {
         format!(
             "{}/{MANIFESTS_PREFIX}{}.json",
-            self.base_url, self.manifest.sha256
+            self.base_url, self.manifest.blake3
         )
     }
 
     pub(crate) fn provenance_url(&self) -> String {
         format!(
             "{}/{MANIFESTS_PREFIX}{}.provenance.json",
-            self.base_url, self.manifest.sha256
+            self.base_url, self.manifest.blake3
         )
     }
 
-    pub(crate) fn object_url(&self, sha256: &str) -> String {
-        format!("{}/{OBJECTS_PREFIX}{sha256}", self.base_url)
+    pub(crate) fn object_url(&self, blake3: &str) -> String {
+        format!("{}/{OBJECTS_PREFIX}{blake3}", self.base_url)
     }
 
     /// The lock entry a publication produces, ready to paste.
     pub(crate) fn published(
         base_url: &str,
-        manifest_sha256: &str,
-        provenance_sha256: &str,
+        manifest_blake3: &str,
+        provenance_blake3: &str,
         commit: &str,
         run: &str,
     ) -> Self {
@@ -172,7 +172,7 @@ impl Lock {
             schema_version: 1,
             base_url: base_url.trim_end_matches('/').to_owned(),
             manifest: Pinned {
-                sha256: manifest_sha256.to_owned(),
+                blake3: manifest_blake3.to_owned(),
                 url: String::new(),
             },
             signature: Signature {
@@ -181,7 +181,7 @@ impl Lock {
                 certificate_oidc_issuer: GITHUB_OIDC_ISSUER.to_owned(),
             },
             provenance: Pinned {
-                sha256: provenance_sha256.to_owned(),
+                blake3: provenance_blake3.to_owned(),
                 url: String::new(),
             },
             published_from: PublishedFrom {
@@ -206,8 +206,8 @@ impl Lock {
 mod tests {
     use super::*;
 
-    const DIGEST: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    const OTHER: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const DIGEST: &str = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+    const OTHER: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
     #[test]
     fn a_published_lock_derives_and_checks_its_urls() {
@@ -222,7 +222,7 @@ mod tests {
         assert!(!lock.is_unpublished());
         assert_eq!(
             lock.manifest.url,
-            format!("https://corpus.example.net/test-corpus/manifests/sha256/{DIGEST}.json")
+            format!("https://corpus.example.net/test-corpus/manifests/blake3/{DIGEST}.json")
         );
         assert_eq!(
             lock.signature.bundle_url,
@@ -231,12 +231,12 @@ mod tests {
         assert_eq!(
             lock.provenance.url,
             format!(
-                "https://corpus.example.net/test-corpus/manifests/sha256/{DIGEST}.provenance.json"
+                "https://corpus.example.net/test-corpus/manifests/blake3/{DIGEST}.provenance.json"
             )
         );
         assert_eq!(
             lock.object_url(OTHER),
-            format!("https://corpus.example.net/test-corpus/objects/sha256/{OTHER}")
+            format!("https://corpus.example.net/test-corpus/objects/blake3/{OTHER}")
         );
         let reparsed: Lock = serde_json::from_str(&lock.render().unwrap()).unwrap();
         assert_eq!(reparsed, lock);
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn an_unpublished_lock_is_empty_and_only_empty() {
         let text = format!(
-            r#"{{"schema_version":1,"base_url":"","manifest":{{"sha256":"","url":""}},"signature":{{"bundle_url":"","certificate_identity":"{PUBLISH_WORKFLOW_IDENTITY}","certificate_oidc_issuer":"{GITHUB_OIDC_ISSUER}"}},"provenance":{{"sha256":"","url":""}},"published_from":{{"commit":"","run":""}}}}"#
+            r#"{{"schema_version":1,"base_url":"","manifest":{{"blake3":"","url":""}},"signature":{{"bundle_url":"","certificate_identity":"{PUBLISH_WORKFLOW_IDENTITY}","certificate_oidc_issuer":"{GITHUB_OIDC_ISSUER}"}},"provenance":{{"blake3":"","url":""}},"published_from":{{"commit":"","run":""}}}}"#
         );
         let lock: Lock = serde_json::from_str(&text).unwrap();
         lock.validate().unwrap();

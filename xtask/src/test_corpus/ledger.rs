@@ -1,6 +1,6 @@
 //! `test-corpus/sources.json`: the provenance ledger.
 //!
-//! One entry per fixture path with its size, SHA-256, and *source*: generated
+//! One entry per fixture path with its size, BLAKE3 digest, and *source*: generated
 //! on the shared pinned toolchain, imported byte-identically from a pinned
 //! upstream commit, or blocked because its provenance is incomplete. The ledger
 //! is hand-maintained (only `build --update-ledger` rewrites it, and then only
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::manifest::ToolchainLock;
 use super::{
-    Result, digest_file, fail, is_sha256_hex, read_to_string, repo_path, valid_repo_relative,
+    Result, digest_file, fail, is_blake3_hex, read_to_string, repo_path, valid_repo_relative,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -56,7 +56,7 @@ pub(crate) struct Upstream {
     pub(crate) license_path: String,
     /// How the bytes are stored upstream: `raw`, `uuencode` (libarchive keeps
     /// its test archives uuencoded), or `git-lfs` (the pointer's oid is the
-    /// SHA-256 of the bytes).
+    /// SHA-256 of the bytes, by the Git LFS pointer specification).
     pub(crate) encoding: String,
     /// A private upstream cannot be re-fetched by the public publish workflow;
     /// its imports are verified against the pinned commit's LFS oids instead.
@@ -71,7 +71,7 @@ pub(crate) struct Upstream {
 pub(crate) struct FileEntry {
     pub(crate) path: String,
     pub(crate) size: u64,
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
     /// Container/format label (`rar4`, `rar5`, `rar15`, `par2`, `mkv`, …).
     /// Informational, but the era profiles are checked against it.
     pub(crate) format: String,
@@ -124,6 +124,22 @@ pub(crate) const SUPPORTED_ENCODINGS: [&str; 3] = ["raw", "uuencode", "git-lfs"]
 pub(crate) const TOOL_FORMATS: [&str; 10] = [
     "rar15", "rar20", "rar4", "rar5", "rar4-rev", "rar5-rev", "sfx-rar4", "sfx-rar5", "par2", "mkv",
 ];
+
+/// The RAR container formats, which carry a rule of their own.
+///
+/// The UnRAR license permits unrar's code and the knowledge of it to be used to
+/// *read* RAR archives, never to create them. A hand-assembled RAR — bytes
+/// emitted by a script that knows the format — is therefore not something this
+/// corpus may hold, however deterministic it is. Every RAR fixture is written by
+/// a pinned RARLAB writer or imported unmodified from a public upstream, and
+/// nothing else; there is no byte-reproducible exemption. Other formats are
+/// open and keep the ordinary rules above.
+pub(crate) const RAR_FORMATS: [&str; 8] = [
+    "rar15", "rar20", "rar4", "rar5", "rar4-rev", "rar5-rev", "sfx-rar4", "sfx-rar5",
+];
+
+/// The toolchain-id prefix a RAR writer has.
+pub(crate) const RAR_WRITER_PREFIX: &str = "rarlab-";
 
 impl Ledger {
     pub(crate) fn load(path: &Path) -> Result<Self> {
@@ -237,10 +253,10 @@ impl Ledger {
             if !seen.insert(entry.path.clone()) {
                 finding(&entry.path, "path is listed twice".to_owned());
             }
-            if !is_sha256_hex(&entry.sha256) {
+            if !is_blake3_hex(&entry.blake3) {
                 finding(
                     &entry.path,
-                    format!("sha256 {:?} is not lowercase 64-hex", entry.sha256),
+                    format!("blake3 {:?} is not lowercase 64-hex", entry.blake3),
                 );
             }
             if entry.format.trim().is_empty() {
@@ -266,6 +282,25 @@ impl Ledger {
                                 &entry.path,
                                 format!(
                                     "a generated {} file must name the toolchain that wrote it",
+                                    entry.format
+                                ),
+                            );
+                        }
+                        // RAR archives may only be written by a RARLAB writer:
+                        // the UnRAR license forbids using unrar or knowledge of
+                        // it to create RAR files, so a hand-assembled RAR is not
+                        // something the corpus may hold. Unlike the rule above
+                        // this one has no byte-reproducible exemption, and it
+                        // applies to RAR containers only.
+                        if RAR_FORMATS.contains(&entry.format.as_str())
+                            && !toolchains
+                                .iter()
+                                .any(|id| id.starts_with(RAR_WRITER_PREFIX))
+                        {
+                            finding(
+                                &entry.path,
+                                format!(
+                                    "a generated {} file must name the RARLAB writer that wrote it; RAR archives are never hand-assembled",
                                     entry.format
                                 ),
                             );
@@ -351,12 +386,12 @@ impl Ledger {
                             path: entry.path.clone(),
                             message: "is a Git LFS pointer, not fixture bytes".to_owned(),
                         });
-                    } else if digest.sha256 != entry.sha256 || digest.size != entry.size {
+                    } else if digest.blake3 != entry.blake3 || digest.size != entry.size {
                         findings.push(Finding {
                             path: entry.path.clone(),
                             message: format!(
-                                "tree has sha256 {} ({} bytes), ledger says {} ({} bytes)",
-                                digest.sha256, digest.size, entry.sha256, entry.size
+                                "tree has blake3 {} ({} bytes), ledger says {} ({} bytes)",
+                                digest.blake3, digest.size, entry.blake3, entry.size
                             ),
                         });
                     }
@@ -396,8 +431,8 @@ impl Ledger {
                     entry.path
                 ));
             }
-            if digest.sha256 != entry.sha256 || digest.size != entry.size {
-                entry.sha256 = digest.sha256;
+            if digest.blake3 != entry.blake3 || digest.size != entry.size {
+                entry.blake3 = digest.blake3;
                 entry.size = digest.size;
                 changed += 1;
             }
@@ -461,14 +496,14 @@ pub(crate) mod tests {
     pub(crate) fn sample_lock() -> ToolchainLock {
         serde_json::from_str(
             r#"{
-              "schema_version": 1,
+              "schema_version": 2,
               "docker_base": "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
               "rar_writers": [
-                {"id":"rarlab-6.24","image":"i6","platform":"linux/amd64","url":"https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz","sha256":"88e22a8e84125c947637bbf28c746e338a0a63279d80f9f9d7373603875db1eb","binary":"rar"},
-                {"id":"rarlab-7.20","image":"i7","platform":"linux/amd64","url":"https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz","sha256":"d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46","binary":"rar"}
+                {"id":"rarlab-6.24","image":"i6","platform":"linux/amd64","url":"https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz","blake3":"1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2","binary":"rar"},
+                {"id":"rarlab-7.20","image":"i7","platform":"linux/amd64","url":"https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz","blake3":"9e04f9f9749e08422705f0b2e9246609ed03d056774f7453787dc5d3466565d1","binary":"rar"}
               ],
               "video_encoder": {"id":"ffmpeg-7.1-ubuntu2404","image":"jrottenberg/ffmpeg@sha256:292a972c60356abd651d9a4f9c808c13e7473f65ad400b7eb99215f4e571931d","platform":"linux/amd64"},
-              "par2_generator": {"id":"par2cmdline-turbo-1.4.0","image":"p","platform":"linux/amd64","url":"https://example.test/p.tar.gz","sha256":"6f2cb042f23d9b0c93f14cc0e16de5bd6e98bf36d8be1f8f2e886fa85ad1b972"}
+              "par2_generator": {"id":"par2cmdline-turbo-1.4.0","image":"p","platform":"linux/amd64","url":"https://example.test/p.tar.gz","blake3":"c4042f01797d7e9095ea1b0537483e4057ac621d67c51124a12fd48b8320372a"}
             }"#,
         )
         .unwrap()
@@ -486,9 +521,9 @@ pub(crate) mod tests {
                 "junrar": {"repository": "https://github.com/junrar/junrar", "commit": "0123456789abcdef0123456789abcdef01234567", "license": "Apache-2.0", "license_path": "LICENSE", "encoding": "raw"}
               },
               "files": [
-                {"path": "f/rar5/a.rar", "size": 3, "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "format": "rar5",
+                {"path": "f/rar5/a.rar", "size": 3, "blake3": "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85", "format": "rar5",
                  "source": {"kind": "generated", "generator": "gen.sh", "toolchains": ["rarlab-7.20"], "inputs": ["f/originals/small.txt"]}},
-                {"path": "f/rar4/rar15_lz.rar", "size": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "format": "rar15",
+                {"path": "f/rar4/rar15_lz.rar", "size": 0, "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262", "format": "rar15",
                  "source": {"kind": "upstream", "upstream": "junrar", "path": "src/test/resources/x.rar"}}
               ]
             }"#,
@@ -524,7 +559,7 @@ pub(crate) mod tests {
         ledger.files.push(FileEntry {
             path: "f/rar5/a.rar".into(),
             size: 1,
-            sha256: "zz".into(),
+            blake3: "zz".into(),
             format: "".into(),
             source: Source::Generated {
                 generator: "missing.sh".into(),
@@ -536,7 +571,7 @@ pub(crate) mod tests {
         ledger.files.push(FileEntry {
             path: "f/rar4/x.rar".into(),
             size: 1,
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            blake3: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
             format: "rar4".into(),
             source: Source::Upstream {
                 upstream: "nope".into(),
@@ -547,7 +582,7 @@ pub(crate) mod tests {
         ledger.files.push(FileEntry {
             path: "f/rar4/y.rar".into(),
             size: 1,
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            blake3: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
             format: "rar4".into(),
             source: Source::Blocked { reason: " ".into() },
         });
@@ -577,6 +612,93 @@ pub(crate) mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
+    }
+
+    /// The RAR-only rule: a RAR fixture names a RARLAB writer, always. A
+    /// hand-assembler is an acceptable generator for other formats and is never
+    /// one for a RAR archive.
+    #[test]
+    fn a_rar_fixture_must_name_a_rarlab_writer() {
+        let mut ledger = sample_ledger();
+        ledger.generators.insert(
+            "assemble.py".into(),
+            Generator {
+                path: "gen/assemble.py".into(),
+                toolchains: Vec::new(),
+                byte_reproducible: true,
+                notes: String::new(),
+            },
+        );
+        // A hand-assembled RAR5 archive: refused, byte-reproducible or not.
+        ledger.files.push(FileEntry {
+            path: "f/rar5/hand.rar".into(),
+            size: 1,
+            blake3: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+            format: "rar5".into(),
+            source: Source::Generated {
+                generator: "assemble.py".into(),
+                toolchains: Vec::new(),
+                inputs: Vec::new(),
+                notes: String::new(),
+            },
+        });
+        // A hand-assembled PAR2 set: an open format, so the existing rules
+        // stand and this is fine.
+        ledger.files.push(FileEntry {
+            path: "f/par2/hand.par2".into(),
+            size: 1,
+            blake3: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+            format: "par2".into(),
+            source: Source::Generated {
+                generator: "assemble.py".into(),
+                toolchains: Vec::new(),
+                inputs: Vec::new(),
+                notes: String::new(),
+            },
+        });
+        let findings = ledger.validate(&sample_lock());
+        let text = findings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("f/rar5/hand.rar: a generated rar5 file must name the RARLAB writer"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("f/par2/hand.par2"),
+            "an open format keeps the ordinary rules: {text}"
+        );
+
+        // A RAR file may name the encoder that made its *input* — the large
+        // video-member sets do — as long as a RARLAB writer is in the list too.
+        ledger.generators.get_mut("gen.sh").unwrap().toolchains =
+            vec!["ffmpeg-7.1-ubuntu2404".into(), "rarlab-7.20".into()];
+        if let Source::Generated { toolchains, .. } = &mut ledger.files[0].source {
+            *toolchains = vec!["ffmpeg-7.1-ubuntu2404".into(), "rarlab-7.20".into()];
+        }
+        assert!(
+            ledger
+                .validate(&sample_lock())
+                .iter()
+                .all(|finding| finding.path != "f/rar5/a.rar"),
+            "the encoder that produced a RAR member's input is not a problem"
+        );
+        // The encoder alone is: nothing in that list wrote the archive.
+        if let Source::Generated { toolchains, .. } = &mut ledger.files[0].source {
+            *toolchains = vec!["ffmpeg-7.1-ubuntu2404".into()];
+        }
+        let text = ledger
+            .validate(&sample_lock())
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("f/rar5/a.rar: a generated rar5 file must name the RARLAB writer"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -613,7 +735,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("f/rar5/a.rar"), "abcd").unwrap();
         let findings = ledger.check_tree(&root, true);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("tree has sha256"));
+        assert!(findings[0].message.contains("tree has blake3"));
 
         std::fs::write(
             root.join("f/rar5/a.rar"),

@@ -1,5 +1,5 @@
 //! The published manifest: a pure function of the ledger, the profiles and the
-//! toolchain lock, in canonical JSON, addressed by its own SHA-256.
+//! toolchain lock, in canonical JSON, addressed by its own BLAKE3 digest.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ledger::{Ledger, Source};
 use super::profiles::ProfilesFile;
-use super::{Result, error, fail, is_sha256_hex, read_to_string, sha256_bytes};
+use super::{Result, blake3_bytes, error, fail, is_blake3_hex, read_to_string};
 
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub(crate) const CORPUS_NAME: &str = "rarpar-test-corpus";
@@ -30,7 +30,7 @@ pub(crate) struct RarWriter {
     pub(crate) image: String,
     pub(crate) platform: String,
     pub(crate) url: String,
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
     pub(crate) binary: String,
 }
 
@@ -47,7 +47,7 @@ pub(crate) struct Par2Generator {
     pub(crate) image: String,
     pub(crate) platform: String,
     pub(crate) url: String,
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
 }
 
 impl ToolchainLock {
@@ -55,21 +55,25 @@ impl ToolchainLock {
         let text = read_to_string(path)?;
         let lock: ToolchainLock = serde_json::from_str(&text)
             .map_err(|source| error(format!("decode {}: {source}", path.display())))?;
-        if lock.schema_version != 1 {
+        // Schema 2 is the blake3 field set; schema 1 pinned the archives by
+        // SHA-256 and cannot be read here.
+        if lock.schema_version != 2 {
             return fail(format!(
-                "toolchain lock schema_version must be 1, got {}",
+                "toolchain lock schema_version must be 2, got {}",
                 lock.schema_version
             ));
         }
         for writer in &lock.rar_writers {
-            if !is_sha256_hex(&writer.sha256) || !writer.url.starts_with("https://") {
+            if !is_blake3_hex(&writer.blake3) || !writer.url.starts_with("https://") {
                 return fail(format!("toolchain lock writer {} is not pinned", writer.id));
             }
         }
+        // SHA-256 by specification: an OCI image reference pins its manifest
+        // with `@sha256:<hex>`, which is the registry's digest form, not ours.
         if !lock.video_encoder.image.contains("@sha256:") {
             return fail("toolchain lock video encoder is not digest pinned");
         }
-        Ok((lock, sha256_bytes(text.as_bytes())))
+        Ok((lock, blake3_bytes(text.as_bytes())))
     }
 
     pub(crate) fn ids(&self) -> BTreeSet<String> {
@@ -89,7 +93,7 @@ impl ToolchainLock {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ManifestToolchains {
     pub(crate) lock_path: String,
-    pub(crate) lock_sha256: String,
+    pub(crate) lock_blake3: String,
     pub(crate) docker_base: String,
     pub(crate) rar_writers: BTreeMap<String, PinnedSource>,
     pub(crate) video_encoder: BTreeMap<String, String>,
@@ -100,7 +104,7 @@ pub(crate) struct ManifestToolchains {
 pub(crate) struct PinnedSource {
     pub(crate) id: String,
     pub(crate) url: String,
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -123,7 +127,7 @@ pub(crate) struct ManifestUpstream {
 pub(crate) struct ManifestFile {
     pub(crate) path: String,
     pub(crate) size: u64,
-    pub(crate) sha256: String,
+    pub(crate) blake3: String,
     pub(crate) format: String,
     /// `generated` or `upstream`; a `blocked` ledger entry never reaches a manifest.
     pub(crate) source_group: String,
@@ -160,7 +164,7 @@ impl Manifest {
         ledger: &Ledger,
         profiles: &ProfilesFile,
         lock: &ToolchainLock,
-        lock_sha256: &str,
+        lock_blake3: &str,
     ) -> Result<Self> {
         let blocked = ledger.blocked();
         if !blocked.is_empty() {
@@ -202,7 +206,7 @@ impl Manifest {
                 ManifestFile {
                     path: entry.path.clone(),
                     size: entry.size,
-                    sha256: entry.sha256.clone(),
+                    blake3: entry.blake3.clone(),
                     format: entry.format.clone(),
                     source_group: source_group.to_owned(),
                     generator,
@@ -218,7 +222,7 @@ impl Manifest {
             object_key_prefix: super::OBJECTS_PREFIX.to_owned(),
             toolchains: ManifestToolchains {
                 lock_path: ledger.toolchains.clone(),
-                lock_sha256: lock_sha256.to_owned(),
+                lock_blake3: lock_blake3.to_owned(),
                 docker_base: lock.docker_base.clone(),
                 rar_writers: lock
                     .rar_writers
@@ -229,7 +233,7 @@ impl Manifest {
                             PinnedSource {
                                 id: writer.id.clone(),
                                 url: writer.url.clone(),
-                                sha256: writer.sha256.clone(),
+                                blake3: writer.blake3.clone(),
                             },
                         )
                     })
@@ -242,7 +246,7 @@ impl Manifest {
                 par2_generator: PinnedSource {
                     id: lock.par2_generator.id.clone(),
                     url: lock.par2_generator.url.clone(),
-                    sha256: lock.par2_generator.sha256.clone(),
+                    blake3: lock.par2_generator.blake3.clone(),
                 },
             },
             generators: ledger
@@ -318,7 +322,7 @@ impl Manifest {
         for file in &manifest.files {
             if !super::valid_repo_relative(&file.path)
                 || !seen.insert(file.path.clone())
-                || !is_sha256_hex(&file.sha256)
+                || !is_blake3_hex(&file.blake3)
             {
                 return fail(format!(
                     "manifest entry {:?} is malformed or duplicated",
@@ -373,8 +377,8 @@ impl Manifest {
 pub(crate) struct Provenance {
     pub(crate) schema_version: u32,
     pub(crate) corpus: String,
-    pub(crate) manifest_sha256: String,
-    pub(crate) toolchain_lock_sha256: String,
+    pub(crate) manifest_blake3: String,
+    pub(crate) toolchain_lock_blake3: String,
     pub(crate) built_at: String,
     pub(crate) source: ProvenanceSource,
     pub(crate) file_count: usize,
@@ -397,8 +401,8 @@ impl Provenance {
     /// records `local` so it can never be mistaken for a workflow publication.
     pub(crate) fn from_environment(
         manifest: &Manifest,
-        manifest_sha256: &str,
-        lock_sha256: &str,
+        manifest_blake3: &str,
+        lock_blake3: &str,
     ) -> Self {
         let env = |name: &str| std::env::var(name).unwrap_or_default();
         let server = if env("GITHUB_SERVER_URL").is_empty() {
@@ -423,8 +427,8 @@ impl Provenance {
         Provenance {
             schema_version: 1,
             corpus: CORPUS_NAME.to_owned(),
-            manifest_sha256: manifest_sha256.to_owned(),
-            toolchain_lock_sha256: lock_sha256.to_owned(),
+            manifest_blake3: manifest_blake3.to_owned(),
+            toolchain_lock_blake3: lock_blake3.to_owned(),
             built_at: super::utc_now_rfc3339(),
             source: ProvenanceSource {
                 repository: or_local(repository),
@@ -472,11 +476,11 @@ mod tests {
             !text.contains(": "),
             "canonical JSON has no insignificant whitespace"
         );
-        // Sorted keys at every level: "corpus" precedes "files", "path" precedes "sha256".
+        // Sorted keys at every level: "blake3" precedes "path" inside a file entry.
         assert!(text.find("\"corpus\"").unwrap() < text.find("\"files\"").unwrap());
         assert!(
-            text.find("\"path\":\"f/rar4/rar15_lz.rar\"").unwrap()
-                < text.find("\"sha256\":\"e3b0").unwrap()
+            text.find("\"blake3\":\"af13").unwrap()
+                < text.find("\"path\":\"f/rar4/rar15_lz.rar\"").unwrap()
         );
         let parsed = Manifest::parse(&bytes).unwrap();
         assert_eq!(parsed, first);
@@ -500,7 +504,7 @@ mod tests {
             bytes
         );
         let mut changed = ledger.clone();
-        changed.files[0].sha256 =
+        changed.files[0].blake3 =
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
         assert_ne!(
             Manifest::build(&changed, &sample_profiles(), &lock, "ab")
@@ -527,7 +531,7 @@ mod tests {
         assert_eq!(manifest.profiles["rar12"], vec!["f/rar4/rar15_lz.rar"]);
         assert_eq!(manifest.profiles["all"].len(), 2);
         assert_eq!(manifest.toolchains.rar_writers.len(), 2);
-        assert_eq!(manifest.toolchains.lock_sha256, "ab");
+        assert_eq!(manifest.toolchains.lock_blake3, "ab");
         let selected = manifest.select(&["rar12".into(), "rar57".into()]).unwrap();
         assert_eq!(selected.len(), 2);
         assert!(manifest.select(&["nope".into()]).is_err());
@@ -567,7 +571,7 @@ mod tests {
             Manifest::build(&sample_ledger(), &sample_profiles(), &sample_lock(), "ab").unwrap();
         // Tests may run inside Actions; only assert the shape and the counts.
         let provenance = Provenance::from_environment(&manifest, "cd", "ab");
-        assert_eq!(provenance.manifest_sha256, "cd");
+        assert_eq!(provenance.manifest_blake3, "cd");
         assert_eq!(provenance.file_count, 2);
         assert_eq!(provenance.total_bytes, 3);
         assert!(!provenance.source.run_url.is_empty());
