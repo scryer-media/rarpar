@@ -640,18 +640,27 @@ jobs:
           # alone re-runs the entire package on top of `fixture-tests`, and this
           # crate's lib has NO gated tests at all — that duplicated lib run was
           # ~31 minutes of this lane. Every target below is
-          # `#![cfg(feature = "slow-tests")]` in its entirety, so `--test`
-          # selects exactly the gated set (22 tests) and a stale target name is
-          # a hard cargo error rather than a silent zero.
+          # `#![cfg(feature = "slow-tests")]` in its entirety apart from
+          # `integration` (see below), so `--test` selects the gated set (22
+          # tests) plus that one target, and a stale target name is a hard cargo
+          # error rather than a silent zero.
           #
           # `slow_encrypted` and `slow_imported_corpus` hold the blocks that used
           # to be `#[cfg(feature = "slow-tests")]` islands inside
           # `integration.rs` and `imported_corpus.rs`; they were split out so
           # those two large targets no longer have to run at all here.
+          #
+          # `integration` is the one ungated target this lane still needs, and it
+          # is here for UNRAR_BIN, not for the feature: the two tests that
+          # differential Weaver against RARLAB's unrar live in it, and this is
+          # the only lane that installs the oracle. Everywhere else they see no
+          # UNRAR_BIN and skip themselves, so dropping the target would retire
+          # the differential rather than deduplicate it. It costs ~6s.
           cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast \
             --test api_parity \
             --test failure_paths \
             --test generated_multivolume_matrix \
+            --test integration \
             --test slow_encrypted \
             --test slow_imported_corpus
       - name: Show sccache stats
