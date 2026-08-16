@@ -1810,45 +1810,6 @@ mod sha1_x86_vec {
         }
     }
 
-    #[cfg(test)]
-    mod tier_tests {
-        use super::{Tier, select_tier};
-
-        #[test]
-        fn hw_pin_wins_over_every_capability_and_override() {
-            for forced in [None, Some("0"), Some("ssse3"), Some("avx2"), Some("junk")] {
-                assert_eq!(select_tier(true, forced, true, true), Tier::None);
-            }
-        }
-
-        #[test]
-        fn default_policy_prefers_the_measured_faster_tier() {
-            // SSSE3 outruns AVX2 on every no-SHA-NI x86 measured (Alder Lake
-            // and Haswell); AVX2 is reachable only through the override.
-            assert_eq!(select_tier(false, None, true, true), Tier::Ssse3);
-            assert_eq!(select_tier(false, None, true, false), Tier::Ssse3);
-            assert_eq!(select_tier(false, None, false, false), Tier::None);
-        }
-
-        #[test]
-        fn override_forces_one_tier_but_never_past_the_capability_floor() {
-            assert_eq!(select_tier(false, Some("ssse3"), true, true), Tier::Ssse3);
-            assert_eq!(select_tier(false, Some("avx2"), true, true), Tier::Avx2);
-            // Capability floor holds: forcing a tier the CPU lacks stands the
-            // module down rather than issuing an undefined opcode.
-            assert_eq!(select_tier(false, Some("avx2"), true, false), Tier::None);
-            assert_eq!(select_tier(false, Some("ssse3"), false, false), Tier::None);
-        }
-
-        #[test]
-        fn zero_stands_down_and_an_unknown_value_is_ignored() {
-            assert_eq!(select_tier(false, Some("0"), true, true), Tier::None);
-            // Unknown values fall through to the default ladder, which
-            // prefers SSSE3 by measurement.
-            assert_eq!(select_tier(false, Some("junk"), true, true), Tier::Ssse3);
-        }
-    }
-
     /// Four rounds of section 1, `f = (b & (c ^ d)) ^ d`.
     ///
     /// `wk` carries W+K for the four rounds, so no round constant is added
@@ -2171,6 +2132,45 @@ mod sha1_x86_vec {
     #[target_feature(enable = "avx2,bmi1,bmi2")]
     pub(super) unsafe fn transform_block_avx2(state: &mut [u32; 5], block: &[u8; 64]) -> [u32; 16] {
         transform_block_kernel!(state, block)
+    }
+
+    #[cfg(test)]
+    mod tier_tests {
+        use super::{Tier, select_tier};
+
+        #[test]
+        fn hw_pin_wins_over_every_capability_and_override() {
+            for forced in [None, Some("0"), Some("ssse3"), Some("avx2"), Some("junk")] {
+                assert_eq!(select_tier(true, forced, true, true), Tier::None);
+            }
+        }
+
+        #[test]
+        fn default_policy_prefers_the_measured_faster_tier() {
+            // SSSE3 outruns AVX2 on every no-SHA-NI x86 measured (Alder Lake
+            // and Haswell); AVX2 is reachable only through the override.
+            assert_eq!(select_tier(false, None, true, true), Tier::Ssse3);
+            assert_eq!(select_tier(false, None, true, false), Tier::Ssse3);
+            assert_eq!(select_tier(false, None, false, false), Tier::None);
+        }
+
+        #[test]
+        fn override_forces_one_tier_but_never_past_the_capability_floor() {
+            assert_eq!(select_tier(false, Some("ssse3"), true, true), Tier::Ssse3);
+            assert_eq!(select_tier(false, Some("avx2"), true, true), Tier::Avx2);
+            // Capability floor holds: forcing a tier the CPU lacks stands the
+            // module down rather than issuing an undefined opcode.
+            assert_eq!(select_tier(false, Some("avx2"), true, false), Tier::None);
+            assert_eq!(select_tier(false, Some("ssse3"), false, false), Tier::None);
+        }
+
+        #[test]
+        fn zero_stands_down_and_an_unknown_value_is_ignored() {
+            assert_eq!(select_tier(false, Some("0"), true, true), Tier::None);
+            // Unknown values fall through to the default ladder, which
+            // prefers SSSE3 by measurement.
+            assert_eq!(select_tier(false, Some("junk"), true, true), Tier::Ssse3);
+        }
     }
 }
 
@@ -3136,12 +3136,14 @@ mod tests {
         let pinned = std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|value| value == "0")
             || std::env::var_os("WEAVER_UNRAR_SHA1_X86").is_some();
         if !pinned {
-            let expected = if avx2 {
-                sha1_x86_vec::Tier::Avx2
-            } else {
-                sha1_x86_vec::Tier::Ssse3
-            };
-            assert_eq!(sha1_x86_vec::tier(), expected);
+            // Measured preference, not widest-first: the default ladder takes
+            // SSSE3 whenever the CPU has it, including on AVX2-capable parts —
+            // see the benchmark rationale at `select_tier`, which the sibling
+            // unit test `tier_tests::default_policy_prefers_the_measured_faster_tier`
+            // pins directly. AVX2 is reachable only through
+            // WEAVER_UNRAR_SHA1_X86=avx2, which `pinned` already excludes, and
+            // SSSE3 is guaranteed here by the early return above.
+            assert_eq!(sha1_x86_vec::tier(), sha1_x86_vec::Tier::Ssse3);
         }
 
         eprintln!("NOTE: rar29-sha1 x86 differential ran ssse3=true avx2={avx2}");
