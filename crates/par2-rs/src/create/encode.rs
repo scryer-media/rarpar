@@ -422,7 +422,7 @@ impl ForwardEncoder {
                                 source_start,
                                 live_inputs,
                                 aligned_len,
-                                buffers.aligned_chunk_len,
+                                buffers.row_stride,
                                 contract,
                                 band_size,
                                 #[cfg(target_arch = "x86_64")]
@@ -455,7 +455,7 @@ impl ForwardEncoder {
                         source_start,
                         live_inputs,
                         aligned_len,
-                        buffers.aligned_chunk_len,
+                        buffers.row_stride,
                         contract,
                         band_size,
                         #[cfg(target_arch = "x86_64")]
@@ -484,7 +484,7 @@ impl ForwardEncoder {
             finish_output(
                 kernel,
                 &mut output.as_bytes_mut()[..buffers.output_bytes],
-                buffers.aligned_chunk_len,
+                buffers.row_stride,
                 aligned_len,
                 self.recovery_exponents.len(),
                 band_size,
@@ -492,7 +492,7 @@ impl ForwardEncoder {
 
             for (output_index, &exponent) in self.recovery_exponents.iter().enumerate() {
                 let start = output_index
-                    .checked_mul(buffers.aligned_chunk_len)
+                    .checked_mul(buffers.row_stride)
                     .ok_or_else(|| resource_limit("output stripe offset overflow"))?;
                 let end = start
                     .checked_add(actual_len)
@@ -680,6 +680,62 @@ fn family_tile_bytes(default_bytes: usize, stride: usize) -> usize {
         .saturating_mul(stride)
 }
 
+/// Largest skew inserted between consecutive staging lanes and between
+/// consecutive output rows, in bytes.
+///
+/// A stripe of `aligned_len` bytes per lane used to place input lane `l` at
+/// `l * aligned_len` and output row `r` at `r * aligned_len`. For the
+/// power-of-two stripes real jobs run (64 KiB slices), every lane and the row a
+/// kernel pass reads at one offset then map to the *same* L1D set: the CLMUL
+/// arm's 8-source pass plus its destination is 9 lines competing for a 4-way
+/// (Neoverse N1/V2) or 2-way (Cortex-A72) set, and every block refills. The
+/// fleet's own counters showed it — 35 L1D refills per thousand instructions
+/// against the reference's 1.6–2.5 on the same create at near-equal
+/// instruction counts (fullround-20260815T215405Z, v2/n1) — and a code-free
+/// A/B reproduced the mechanism on x86 (Alder Lake `simd` arm: 8.47% → 4.45%
+/// L1D misses, cycles −4.2%, when the slice moved from 65,536 to 66,560 bytes
+/// and nothing else changed). The split-layout folded family interleaves six
+/// lanes per stream and was flat in the same A/B, which is the control.
+///
+/// The skew makes the lane and row stride land at `1 KiB (mod 4 KiB)`. Every
+/// stride that is a multiple of 4 KiB puts consecutive lanes in the same set
+/// group of every common L1D (4 KiB, 8 KiB and 16 KiB way sizes), and a
+/// 2 KiB residue only halves that; a 1 KiB residue gives four lane groups on a
+/// 4 KiB way size and, because 5 is coprime to 16, twelve distinct 16-set
+/// windows on a 16 KiB way size — with room for the prefetch window in both.
+/// The same x86 A/B measured all four residues: 0 → 8.47% misses, 2 KiB →
+/// 6.85%, 1 KiB → 4.4% (twice, from either side). The skew is capped at 1/8 of
+/// the stripe so short stripes never pay more than 12.5% extra memory, and a
+/// stripe whose stride already has the residue pays none. This is a fixed rule
+/// of the stripe length — no cache probe, no topology input — and it changes
+/// no arithmetic: only where bytes sit.
+const SKEW_PERIOD_BYTES: usize = 4096;
+const SKEW_TARGET_RESIDUE_BYTES: usize = 1024;
+
+/// Bytes of skew between consecutive lanes/rows of a stripe of `aligned_len`
+/// bytes: the smallest amount that moves the stride to
+/// [`SKEW_TARGET_RESIDUE_BYTES`] modulo [`SKEW_PERIOD_BYTES`], capped at
+/// `aligned_len / 8` and rounded down to whole 64-byte lines so every lane and
+/// row start keeps the alignment the stripe itself has.
+fn stripe_skew_bytes(aligned_len: usize) -> usize {
+    let residue = aligned_len % SKEW_PERIOD_BYTES;
+    let wanted = (SKEW_TARGET_RESIDUE_BYTES + SKEW_PERIOD_BYTES - residue) % SKEW_PERIOD_BYTES;
+    let cap = aligned_len / 8;
+    wanted.min(cap) / 64 * 64
+}
+
+/// Distance between consecutive staging lanes for one stripe: skewed for the
+/// families whose kernels take one slice per source, and exactly `aligned_len`
+/// for the packed XOR-JIT family, whose `PackedRun` addresses source region
+/// `r` at `src + r * len` by contract.
+fn lane_stride(contract: KernelContract, aligned_len: usize) -> usize {
+    if contract.skewed_lanes {
+        aligned_len + stripe_skew_bytes(aligned_len)
+    } else {
+        aligned_len
+    }
+}
+
 /// Output rows whose coefficient state is built in one step.
 ///
 /// The tile loop runs *inside* this, which is what keeps a row's coefficients
@@ -709,6 +765,9 @@ struct KernelContract {
     stride: usize,
     input_grouping: usize,
     tile_bytes: usize,
+    /// Whether staging lanes sit `lane_stride` apart (skewed) rather than
+    /// exactly `aligned_len` apart. See [`SKEW_PERIOD_BYTES`].
+    skewed_lanes: bool,
 }
 
 impl KernelContract {
@@ -718,6 +777,7 @@ impl KernelContract {
                 stride: 2,
                 input_grouping: DEFAULT_INPUT_GROUPING,
                 tile_bytes: family_tile_bytes(TABLE_TILE_BYTES, 2),
+                skewed_lanes: true,
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::Folded => Self {
@@ -735,6 +795,10 @@ impl KernelContract {
                     },
                     gf_simd::SPLIT_BLOCK_BYTES,
                 ),
+                // Six lanes share one interleaved stream here, so the skew
+                // separates the two group streams; harmless, and it keeps one
+                // layout rule for every slice-per-source family.
+                skewed_lanes: true,
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::XorJitAvx2 => Self {
@@ -744,6 +808,9 @@ impl KernelContract {
                 // region `r` at `src + r * len`, so a sub-range of the stripe
                 // is not expressible without re-laying-out staging.
                 tile_bytes: UNTILED,
+                // The same contract fixes the lane stride at `len`; the skew
+                // for this family needs a `PackedRun` source stride first.
+                skewed_lanes: false,
             },
         }
     }
@@ -957,6 +1024,10 @@ fn configured_stripe_cap_bytes() -> Option<usize> {
 struct BufferPlan {
     chunk_len: usize,
     aligned_chunk_len: usize,
+    /// Distance between consecutive output rows in the output buffer:
+    /// `aligned_chunk_len` plus the stripe skew (see [`SKEW_PERIOD_BYTES`]).
+    /// Every row still holds exactly `aligned_chunk_len` payload bytes.
+    row_stride: usize,
     staging_bytes: usize,
     output_bytes: usize,
     data_bytes: usize,
@@ -1008,19 +1079,27 @@ impl BufferPlan {
 
         loop {
             let aligned_chunk_len = round_up(chunk_len.min(slice_size), contract.stride)?;
+            // Staging is sized for the skewed lane stride whatever the family:
+            // the packed XOR-JIT family lays its lanes exactly `aligned_len`
+            // apart and simply leaves the tail unused, which keeps one plan
+            // shape per stripe length instead of one per family.
+            let skew = stripe_skew_bytes(aligned_chunk_len);
+            let lane_alloc = checked_add(aligned_chunk_len, skew, "staging lane overflow")?;
+            let row_stride = lane_alloc;
             let staging_bytes = checked_mul(
                 contract.input_grouping,
-                aligned_chunk_len,
+                lane_alloc,
                 "staging allocation overflow",
             )?;
-            let output_bytes = checked_mul(
-                output_count,
-                aligned_chunk_len,
-                "output allocation overflow",
-            )?;
+            let output_bytes = checked_mul(output_count, row_stride, "output allocation overflow")?;
             let aligned_allocation_bytes = checked_mul(
                 aligned_chunk_len.div_ceil(64),
                 64,
+                "aligned buffer allocation overflow",
+            )?;
+            let skewed_allocation_bytes = checked_add(
+                aligned_allocation_bytes,
+                skew,
                 "aligned buffer allocation overflow",
             )?;
             let data_bytes = checked_add(
@@ -1028,7 +1107,7 @@ impl BufferPlan {
                     STAGING_AREA_COUNT,
                     checked_mul(
                         contract.input_grouping,
-                        aligned_allocation_bytes,
+                        skewed_allocation_bytes,
                         "staging allocation overflow",
                     )?,
                     "staging allocation overflow",
@@ -1036,7 +1115,7 @@ impl BufferPlan {
                 checked_add(
                     checked_mul(
                         output_count,
-                        aligned_allocation_bytes,
+                        skewed_allocation_bytes,
                         "output allocation overflow",
                     )?,
                     checked_mul(
@@ -1054,6 +1133,7 @@ impl BufferPlan {
                 return Ok(Self {
                     chunk_len: chunk_len.min(slice_size),
                     aligned_chunk_len,
+                    row_stride,
                     staging_bytes,
                     output_bytes,
                     data_bytes,
@@ -1313,6 +1393,7 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
             "transfer buffer is shorter than aligned stripe",
         ));
     }
+    let lane_stride = lane_stride(contract, aligned_len);
 
     for lane in 0..contract.input_grouping {
         transfer_bytes[..aligned_len].fill(0);
@@ -1328,7 +1409,7 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
         match kernel {
             ResolvedKernel::Portable | ResolvedKernel::Simd => {
                 let start = lane
-                    .checked_mul(aligned_len)
+                    .checked_mul(lane_stride)
                     .ok_or_else(|| resource_limit("staging lane offset overflow"))?;
                 staging_bytes[start..start + aligned_len]
                     .copy_from_slice(&transfer_bytes[..aligned_len]);
@@ -1339,7 +1420,7 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
                 let group_lane = lane % gf_simd::FOLDED_GROUP;
                 let group_start = group
                     .checked_mul(gf_simd::FOLDED_GROUP)
-                    .and_then(|value| value.checked_mul(aligned_len))
+                    .and_then(|value| value.checked_mul(lane_stride))
                     .ok_or_else(|| resource_limit("folded staging offset overflow"))?;
                 gf_simd::split_encode_scatter(
                     &transfer_bytes[..aligned_len],
@@ -1353,8 +1434,10 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
                 let width = reedsolomon_rs::xor_jit::JitWidth::Avx2;
                 let block = width.block_bytes();
                 debug_assert_eq!(aligned_len % block, 0);
+                // `PackedRun` reads region `r` at `src + r * len`.
+                debug_assert_eq!(lane_stride, aligned_len);
                 let lane_start = lane
-                    .checked_mul(aligned_len)
+                    .checked_mul(lane_stride)
                     .ok_or_else(|| resource_limit("packed staging offset overflow"))?;
                 for offset in (0..aligned_len).step_by(block) {
                     unsafe {
@@ -1487,6 +1570,7 @@ fn accumulate_band(
     if live_inputs == 0 {
         return Ok(());
     }
+    let lane_stride = lane_stride(contract, aligned_len);
     let mut row = [0u16; DEFAULT_INPUT_GROUPING];
     match kernel {
         ResolvedKernel::Portable => {
@@ -1503,7 +1587,7 @@ fn accumulate_band(
                         scalar_accumulate(
                             &mut output[dst_start..dst_start + tile_len],
                             &staging_bytes[tile_start..],
-                            aligned_len,
+                            lane_stride,
                             row,
                             live_inputs,
                             tile_len,
@@ -1541,7 +1625,7 @@ fn accumulate_band(
                         let inputs: [PreparedFactorSrc<'_>; DEFAULT_INPUT_GROUPING] =
                             std::array::from_fn(|lane| {
                                 let clamped = lane.min(live_inputs - 1);
-                                let source_start_bytes = clamped * aligned_len + tile_start;
+                                let source_start_bytes = clamped * lane_stride + tile_start;
                                 PreparedFactorSrc {
                                     prepared: &prepared[row_base + clamped],
                                     src: &staging_bytes
@@ -1599,7 +1683,7 @@ fn accumulate_band(
                         // `SPLIT_BLOCK_BYTES` blocks, so the tile that starts at
                         // logical byte `tile_start` of every lane starts at
                         // `tile_start * FOLDED_GROUP` of the interleaved stream.
-                        let start = group * gf_simd::FOLDED_GROUP * aligned_len
+                        let start = group * gf_simd::FOLDED_GROUP * lane_stride
                             + tile_start * gf_simd::FOLDED_GROUP;
                         &staging_bytes[start..start + gf_simd::FOLDED_GROUP * tile_len]
                     }));
@@ -1664,6 +1748,7 @@ fn accumulate_band(
             // `src + r * len`, so the family consumes the whole stripe per
             // call by contract.
             debug_assert_eq!(contract.tile_bytes, UNTILED);
+            debug_assert_eq!(lane_stride, aligned_len);
             let width = reedsolomon_rs::xor_jit::JitWidth::Avx2;
             let row_factors = factors.row_factors(source_start, live_inputs);
             let rows: Vec<[u16; DEFAULT_INPUT_GROUPING]> = exponents
@@ -2073,7 +2158,9 @@ mod tests {
             // banding (bands of 3, 3, 1 outputs).
             for band_size in [7usize, 3] {
                 let mut provider = InMemorySourceProvider { sources: &refs };
-                let mut staging = AlignedBuffer::new(contract.input_grouping * aligned_len);
+                let mut staging = AlignedBuffer::new(
+                    contract.input_grouping * lane_stride(contract, aligned_len),
+                );
                 let mut transfer = AlignedBuffer::new(aligned_len);
                 fill_staging(
                     resolved,
@@ -2188,7 +2275,9 @@ mod tests {
             for tile_bytes in [UNTILED, 8192, 4096, 96, base.stride] {
                 let contract = KernelContract { tile_bytes, ..base };
                 let mut provider = InMemorySourceProvider { sources: &refs };
-                let mut staging = AlignedBuffer::new(contract.input_grouping * aligned_len);
+                let mut staging = AlignedBuffer::new(
+                    contract.input_grouping * lane_stride(contract, aligned_len),
+                );
                 let mut transfer = AlignedBuffer::new(aligned_len);
                 fill_staging(
                     resolved,
@@ -2696,6 +2785,7 @@ mod tests {
                 stride: 32,
                 input_grouping: DEFAULT_INPUT_GROUPING,
                 tile_bytes: TABLE_TILE_BYTES,
+                skewed_lanes: true,
             },
             1,
             0,
@@ -2766,6 +2856,7 @@ mod tests {
                 stride: 2,
                 input_grouping: DEFAULT_INPUT_GROUPING,
                 tile_bytes: TABLE_TILE_BYTES,
+                skewed_lanes: true,
             },
         )
         .unwrap();
@@ -2828,6 +2919,119 @@ mod tests {
                 }
             }
             assert_eq!(actual[output].data, expected);
+        }
+    }
+
+    /// The stripe skew is a fixed rule of the stripe length: it moves the
+    /// stride to 1 KiB modulo 4 KiB, capped at 1/8 of the stripe, and is zero
+    /// when the stripe already sits at that residue.
+    #[test]
+    fn stripe_skew_follows_the_stripe_length() {
+        assert_eq!(stripe_skew_bytes(2), 0);
+        assert_eq!(stripe_skew_bytes(256), 0);
+        assert_eq!(stripe_skew_bytes(1023), 0);
+        assert_eq!(stripe_skew_bytes(1024), 0, "already 1 KiB mod 4 KiB");
+        assert_eq!(stripe_skew_bytes(2048), 256, "wants 3 KiB, capped at 1/8");
+        assert_eq!(stripe_skew_bytes(4096), 512, "wants 1 KiB, capped at 1/8");
+        assert_eq!(stripe_skew_bytes(40_960), 1024);
+        assert_eq!(stripe_skew_bytes(65_536), 1024);
+        assert_eq!(stripe_skew_bytes(66_560), 0, "already 1 KiB mod 4 KiB");
+        assert_eq!(
+            stripe_skew_bytes(67_584),
+            3072,
+            "2 KiB residue moves to 1 KiB"
+        );
+        assert_eq!(stripe_skew_bytes(1 << 20), 1024);
+        // Uncapped cases land exactly on the target residue.
+        for aligned_len in [8192usize, 40_960, 65_536, 67_584, 1 << 20] {
+            let stride = aligned_len + stripe_skew_bytes(aligned_len);
+            assert_eq!(stride % 4096, 1024, "stride residue for {aligned_len}");
+        }
+        // The plan carries the skew into both strides at the shape the
+        // benchmark corpus uses (64 KiB slices, 12-lane staging).
+        let contract = KernelContract {
+            stride: 2,
+            input_grouping: DEFAULT_INPUT_GROUPING,
+            tile_bytes: TABLE_TILE_BYTES,
+            skewed_lanes: true,
+        };
+        let plan =
+            BufferPlan::new_with_reserved(65_536, 820, contract, usize::MAX, 0, 0, 0).unwrap();
+        assert_eq!(plan.aligned_chunk_len, 65_536);
+        assert_eq!(plan.row_stride, 65_536 + 1024);
+        assert_eq!(plan.staging_bytes, DEFAULT_INPUT_GROUPING * (65_536 + 1024));
+        assert_eq!(plan.output_bytes, 820 * (65_536 + 1024));
+        assert_eq!(lane_stride(contract, 65_536), 65_536 + 1024);
+        assert_eq!(
+            lane_stride(
+                KernelContract {
+                    skewed_lanes: false,
+                    ..contract
+                },
+                65_536
+            ),
+            65_536
+        );
+    }
+
+    /// With the skew live (a 4 KiB stripe skews lanes and rows by 512 bytes),
+    /// every runtime kernel must still produce exactly the Vandermonde
+    /// definition — the layout moves bytes, never arithmetic. Sources are
+    /// deliberately of unequal lengths so lane tails and the zero padding sit
+    /// in the skewed positions too.
+    #[test]
+    fn skewed_stripe_layout_matches_vandermonde_definition_on_every_kernel() {
+        const SLICE: usize = 4096;
+        assert_eq!(stripe_skew_bytes(SLICE), 512, "the skew must be live here");
+        let sources: Vec<Vec<u8>> = (0..27usize)
+            .map(|source| {
+                (0..(SLICE - source * 97))
+                    .map(|index| (index.wrapping_mul(31) ^ (source * 53) ^ (index >> 7)) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let exponents: [RecoveryExponent; 4] = [0, 1, 31, 100];
+        let constants = gf::input_slice_constants(refs.len());
+        let mut expected = Vec::new();
+        for &exponent in &exponents {
+            let mut block = vec![0u8; SLICE];
+            for (source_index, source) in refs.iter().enumerate() {
+                let factor = gf::pow(constants[source_index], exponent);
+                for word in 0..SLICE / 2 {
+                    let offset = word * 2;
+                    let source_word = if offset < source.len() {
+                        u16::from_le_bytes([
+                            source[offset],
+                            source.get(offset + 1).map_or(0, |byte| *byte),
+                        ])
+                    } else {
+                        0
+                    };
+                    let output_word = u16::from_le_bytes([block[offset], block[offset + 1]])
+                        ^ gf::mul(source_word, factor);
+                    block[offset..offset + 2].copy_from_slice(&output_word.to_le_bytes());
+                }
+            }
+            expected.push(block);
+        }
+        for kernel in ForwardEncoder::available_kernels() {
+            let encoder = ForwardEncoder::new(SLICE, exponents.to_vec()).unwrap();
+            let actual = encoder
+                .encode(
+                    &refs,
+                    &ForwardEncoderOptions {
+                        kernel,
+                        ..ForwardEncoderOptions::default()
+                    },
+                )
+                .unwrap();
+            for (output, block) in expected.iter().enumerate() {
+                assert_eq!(
+                    &actual[output].data, block,
+                    "kernel {kernel:?} output {output} diverged from the definition"
+                );
+            }
         }
     }
 
