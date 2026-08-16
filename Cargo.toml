@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "crates/weaver-reed-solomon",
-    "crates/weaver-unrar",
-    "crates/weaver-par2",
+    "crates/reedsolomon-rs",
+    "crates/unrar-rs",
+    "crates/par2-rs",
     "tools/rarpar",
     "xtask",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-or-later"

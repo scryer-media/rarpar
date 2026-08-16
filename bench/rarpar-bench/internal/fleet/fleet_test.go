@@ -471,9 +471,9 @@ func TestContainerBuildAliasesTheManifestRarparPathForWeaver(t *testing.T) {
 members = ["server/crates/weaver-yenc"]
 
 [patch.crates-io]
-par2-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-par2" }
-unrar-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-unrar" }
-reedsolomon-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/weaver-reed-solomon" }
+par2-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/par2-rs" }
+unrar-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/unrar-rs" }
+reedsolomon-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/reedsolomon-rs" }
 `
 	if err := os.WriteFile(filepath.Join(weaverDir, "Cargo.toml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)

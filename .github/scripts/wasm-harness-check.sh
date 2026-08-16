@@ -4,8 +4,8 @@
 #
 #   usage: wasm-harness-check.sh <par2|unrar> <report-file> <canon-out-file>
 #
-# The harnesses (`crates/weaver-par2/examples/wasm_par2_check.rs`,
-# `crates/weaver-unrar/examples/wasm_extract_check.rs`) already exit non-zero
+# The harnesses (`crates/par2-rs/examples/wasm_par2_check.rs`,
+# `crates/unrar-rs/examples/wasm_extract_check.rs`) already exit non-zero
 # when a case fails. That alone is a weak CI gate: a harness that silently ran
 # *zero* cases — wrong fixture root, unhydrated LFS pointers, a case list
 # accidentally filtered by `WEAVER_WASM_CASES`, a lane that never got built —

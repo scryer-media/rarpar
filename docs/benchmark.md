@@ -52,7 +52,7 @@ hardware, so the Linux rows are, if anything, conservative.
   `macos-arm64` `par2cmdline-turbo` binary — the same reference role as every
   other row, taken from the project's own release. That binary is markedly
   slower on macOS than the Linux and Windows builds of the same version, which
-  lifts every macOS PAR2 ratio here, including the 7.1× heavy-repair figure.
+  lifts every macOS PAR2 ratio here, including the 7.2× heavy-repair figure.
   It is an honest comparison against what a macOS user would actually install;
   it is not a claim that the PAR2 engine is five times faster on Apple Silicon
   than on x86-64.
@@ -63,11 +63,13 @@ hardware, so the Linux rows are, if anything, conservative.
 - *Windows CPU time.* The Windows machine's CPU-time counter is quantized to
   roughly 15.6 ms, so short cases report zero CPU seconds there. Every figure
   on this page is wall-clock and is unaffected.
-- *Shapes that lose.* RAR4 PPMd trails the reference decoder on every machine
-  (0.72×–0.98×) and is counted in the compressed-extraction class anyway. PAR2
-  generation trails `par2cmdline-turbo` on x86-64 and Windows, because
+- *Shapes that lose.* RAR4 PPMd trails the reference decoder on every x86-64
+  machine (0.72×–0.84× as a class) and is counted in the compressed-extraction
+  class anyway; on the Arm cores it has reached roughly parity (0.95×–1.02×).
+  PAR2 generation still trails `par2cmdline-turbo` on most machines, because
   `rarpar` flushes and re-validates every written recovery volume before
-  commit; it is charted per machine but is not part of the heavy-repair class.
+  commit; it is now ahead on Zen 4 (1.13×) and Haswell (1.05×). It is charted
+  per machine but is not part of the heavy-repair class.
 
 ### Workload classes
 
@@ -79,7 +81,8 @@ hardware, so the Linux rows are, if anything, conservative.
 
 `unrar (text)` **includes PPMd.** PPMd is an archaic RAR4 mode that is
 deliberately left unoptimized, and it drags the compressed-extraction geomean
-down on every machine; it is counted regardless.
+down on every x86-64 machine (it now sits at roughly parity on the Arm
+cores); it is counted regardless.
 
 Six of the 43 cases sit outside these three classes. They are charted but not
 aggregated: `rar5-v5-recovery-volume` and `rar5-v7-recovery-volume` (recovery
@@ -96,10 +99,9 @@ refresh.
 
 | Component | Version |
 |---|---|
-| `rarpar` CLI | 0.3.0, workspace commit `dc5e1f2` |
-| `par2-rs` | 0.4.0 |
-| `unrar-rs` | 0.5.0 |
-| `reedsolomon-rs` | 0.4.0 |
+| `rarpar` CLI | 0.3.1, workspace commit `64f5957` |
+| `par2-rs` | 0.4.1 |
+| `unrar-rs` | 0.5.1 |
 | Rust toolchain | 1.97.1 |
 | Corpus | `rarpar-bench`, 43 cases, digest `59f46fa58f65…` |
 | RAR plan / PAR2 plan | `plan-e4222071b3f06c00` / `plan-900b3c52bca9463e` (Metal lane `plan-e9c4aa7366c941c8`) |
@@ -129,15 +131,18 @@ Geometric mean per class, one decimal. Per-class breakouts follow each machine.
 
 | CPU | Arch | Dispatch tier | unrar (binary) | unrar (text) | par2 (heavy) |
 |---|---|---|---:|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 1.8× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× | 1.7× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× | 1.9× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.5× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.3× |
-| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× | 7.1× |
-| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× | 1.2× |
-| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× | 1.4× |
-| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× | 1.5× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.7× | 1.7× | 2.3× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.1× | 1.4× | 1.9× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.7× | 1.3× | 2.3× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.5× | 1.2× | 1.8× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.5× | 1.2× | 1.9× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
+| Apple M5 Max | arm64 | NEON | 1.3× | 1.4× | 7.2× |
+| Arm Cortex-A72 | arm64 | NEON | 2.3× | 1.6× | 1.2× |
+| Arm Neoverse N1 | arm64 | NEON | 3.1× | 1.7× | 1.5× |
+| Arm Neoverse V2 | arm64 | NEON | 3.8× | 1.8× | 1.5× |
+
 
 ---
 
@@ -155,30 +160,30 @@ vectors.
 ### AMD EPYC 9R14 (Zen 4)
 
 4 vCPU · Ubuntu 24.04, Linux 6.17 · dispatch tier GFNI + AVX-512 · candidate
-`rarpar 0.3.0`, static-musl x86-64 build `496609e8…` · references `UnRAR 7.23`
+`rarpar 0.3.1`, static-musl x86-64 build `7f53547d…` · references `UnRAR 7.23`
 (`926d3a00…`) and `par2cmdline-turbo 1.4.0` (`9e65a4bb…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 1.76× | 2.89× | 1.37× | 2.20× | 0.78× | 1.77× |
+| 2.40× | 3.83× | 1.67× | 2.48× | 0.81× | 2.34× |
 
-[![RAR workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)
+[![RAR workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)
 
-[![PAR2 workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)
+[![PAR2 workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)
 
 ### Intel Xeon Platinum 8488C (Sapphire Rapids)
 
 4 vCPU · Ubuntu 24.04, Linux 6.17 · dispatch tier GFNI + AVX-512 · candidate
-`rarpar 0.3.0`, static-musl x86-64 build `496609e8…` · references `UnRAR 7.23`
+`rarpar 0.3.1`, static-musl x86-64 build `7f53547d…` · references `UnRAR 7.23`
 (`926d3a00…`) and `par2cmdline-turbo 1.4.0` (`9e65a4bb…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 1.72× | 2.56× | 1.29× | 2.09× | 0.80× | 1.65× |
+| 1.85× | 2.81× | 1.29× | 2.07× | 0.80× | 1.91× |
 
-[![RAR workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)
+[![RAR workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)
 
-[![PAR2 workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)
+[![PAR2 workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)
 
 ## GFNI + AVX2
 
@@ -187,86 +192,68 @@ GFNI without AVX-512: the same affine-transform multiply, 256 bits wide.
 ### Intel Core i5-1240P (Alder Lake)
 
 12 cores / 16 threads · Ubuntu 26.04, Linux 7.0 · dispatch tier GFNI + AVX2 ·
-candidate `rarpar 0.3.0`, static-musl x86-64 build `496609e8…` · references
+candidate `rarpar 0.3.1`, static-musl x86-64 build `f796ac3b…` · references
 `UnRAR 7.23` (`926d3a00…`) and `par2cmdline-turbo 1.4.0` (`2c3ba0c5…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 1.35× | 1.96× | 1.06× | 2.00× | 0.82× | 1.91× |
+| 1.50× | 2.27× | 1.14× | 1.98× | 0.83× | 2.30× |
 
-[![RAR workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
+[![RAR workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-[![PAR2 workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+[![PAR2 workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+
+## AVX-512
+
+AVX-512 without GFNI: the GF(2¹⁶) multiply uses the folded 512-bit shuffle
+kernel rather than `GF2P8AFFINEQB`.
+
+### Intel Xeon Platinum 8124M (Skylake-SP)
+
+[![RAR workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)
+
+[![PAR2 workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)
+
 
 ## AVX2
 
 No GFNI: the multiply falls back to the split-table `VPSHUFB` kernel.
 
+### Intel Xeon E5-2666 v3 (Haswell)
+
+[![RAR workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)
+
+[![PAR2 workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)
+
+
 ### AMD Ryzen 5 3600 (Zen 2)
 
-6 cores / 12 threads · Windows 11 (10.0.22621) · dispatch tier AVX2 ·
-candidate `rarpar 0.3.0`, native MSVC build `b9f25334…` · references
-`UnRAR 7.23 x64` (`0d371500…`) and `par2cmdline-turbo 1.4.0` (`43779727…`).
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
-|---:|---:|---:|---:|---:|---:|
-| 1.41× | 2.07× | 1.44× | 2.21× | 0.85× | 1.54× |
+[![RAR workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-windows-x86_64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-[![RAR workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+[![PAR2 workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-windows-x86_64.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-windows-x86_64.svg)
 
-[![PAR2 workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
-
-This is the only Windows machine in the set, and the only one whose PAR2
-generation case falls far below parity — the write-and-revalidate commit path
-costs the most there.
 
 ## SSSE3 (no AVX)
 
-The floor: four Atom cores with no AVX at all, running the same portable
-release artifact. This rung exists because low-power NAS hardware is a real
-deployment target.
-
 ### Intel Atom C3538 (Denverton)
 
-4 cores · Linux 4.4 · dispatch tier SSSE3 · candidate `rarpar 0.3.0`,
-static-musl x86-64 build `496609e8…` · references `UnRAR 7.23` (`926d3a00…`)
-and `par2cmdline-turbo 1.4.0` (`2c3ba0c5…`).
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
-|---:|---:|---:|---:|---:|---:|
-| 1.05× | 2.07× | 1.01× | 2.76× | 0.72× | 1.34× |
+[![RAR workloads on Intel Atom C3538, Denverton, SSSE3](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
 
-[![RAR workloads on Intel Atom C3538, Denverton, SSSE3](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
+[![PAR2 workloads on Intel Atom C3538, Denverton, SSSE3](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
 
-[![PAR2 workloads on Intel Atom C3538, Denverton, SSSE3](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
-
-Plain store-mode and plain compressed extraction sit at parity here — this is
-the one tier where `rarpar`'s wider kernels have nothing to work with. The
-encrypted classes still win by a wide margin, because AES runs through AWS-LC
-against the reference's own AES path.
 
 ---
 
 # arm64
 
-AArch64 builds use the NEON kernel family; the PMULL carry-less multiply path
-and the EOR3 three-way XOR are picked up at runtime where the CPU exposes
-them. There is no separate SVE tier.
-
 ## Apple M5 Max (macOS)
 
-18 cores · macOS, Darwin 25.5 · dispatch tier NEON · candidates `rarpar
-0.3.0`, native arm64 builds `a8d2a5e3…` (CPU lane) and `a44e4db6…` (Metal
-lane) · references `UnRAR 7.23` (`99720d63…`) and `par2cmdline-turbo 1.4.0`
-(`32ab46c2…`).
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy (CPU) | PAR2 heavy (Metal) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1.12× | 2.71× | 1.24× | 2.48× | 0.96× | 7.15× | 6.09× |
+[![RAR workloads on Apple M5 Max, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)
 
-[![RAR workloads on Apple M5 Max, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
-
-[![PAR2 CPU-lane workloads on Apple M5 Max, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
+[![PAR2 CPU-lane workloads on Apple M5 Max, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
 
 The PAR2 column is the one to read with the macOS caveat above in mind: the
 macOS reference binary is slow, and it lifts all six PAR2 cases here.
@@ -279,7 +266,7 @@ override. Only the two heavy-repair cases qualified and ran on the GPU;
 verification, byte-damage, missing-volume, and generation stayed on CPU in
 this lane too.
 
-[![PAR2 Metal-lane workloads on Apple M5 Max](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+[![PAR2 Metal-lane workloads on Apple M5 Max](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
 
 On this corpus Metal is slightly *slower* in wall time than the NEON path
 (`par2-heavy-damage-250`: 286 ms on Metal against 262 ms on CPU) while using
@@ -289,48 +276,19 @@ NEON kernels already saturate the useful parallelism.
 
 ## Arm Cortex-A72
 
-4 vCPU · Ubuntu 24.04, Linux 6.17 · dispatch tier NEON · candidate `rarpar
-0.3.0`, static-musl arm64 build `48807104…` · references `UnRAR 7.23` (source build)
-(`34175fab…`) and `par2cmdline-turbo 1.4.0` (`df2884ca…`).
+[![RAR workloads on Arm Cortex-A72, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
-|---:|---:|---:|---:|---:|---:|
-| 1.47× | 6.07× | 1.17× | 2.62× | 0.92× | 1.21× |
-
-[![RAR workloads on Arm Cortex-A72, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)
-
-[![PAR2 workloads on Arm Cortex-A72, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)
+[![PAR2 workloads on Arm Cortex-A72, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)
 
 ## Arm Neoverse N1
 
-4 vCPU · Ubuntu 24.04, Linux 6.17 · dispatch tier NEON · candidate `rarpar
-0.3.0`, static-musl arm64 build `48807104…` · references `UnRAR 7.23` (source build)
-(`34175fab…`) and `par2cmdline-turbo 1.4.0` (`df2884ca…`).
+[![RAR workloads on Arm Neoverse N1, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
-|---:|---:|---:|---:|---:|---:|
-| 1.79× | 7.46× | 1.21× | 2.90× | 0.92× | 1.40× |
-
-[![RAR workloads on Arm Neoverse N1, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)
-
-[![PAR2 workloads on Arm Neoverse N1, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)
+[![PAR2 workloads on Arm Neoverse N1, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)
 
 ## Arm Neoverse V2
 
-4 vCPU · Ubuntu 24.04, Linux 6.17 · dispatch tier NEON · candidate `rarpar
-0.3.0`, static-musl arm64 build `48807104…` · references `UnRAR 7.23` (source build)
-(`34175fab…`) and `par2cmdline-turbo 1.4.0` (`df2884ca…`).
+[![RAR workloads on Arm Neoverse V2, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)
 
-| Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
-|---:|---:|---:|---:|---:|---:|
-| 2.01× | 10.69× | 1.34× | 2.98× | 0.98× | 1.47× |
+[![PAR2 workloads on Arm Neoverse V2, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)
 
-[![RAR workloads on Arm Neoverse V2, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)
-
-[![PAR2 workloads on Arm Neoverse V2, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)
-
-The encrypted store-mode ratios on these three machines are the largest on the
-page by a wide margin. They are genuine same-version comparisons: the
-reference runs its decryption serially (its CPU time roughly equals its wall
-time on these cases), while `rarpar` pipelines decryption with verification —
-an advantage that pays most on many-core Arm.

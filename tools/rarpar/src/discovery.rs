@@ -852,7 +852,7 @@ mod tests {
 
     fn rar4_fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/weaver-unrar/tests/fixtures/rar4")
+            .join("../../crates/unrar-rs/tests/fixtures/rar4")
             .join(name)
     }
 

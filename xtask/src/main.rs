@@ -1150,7 +1150,7 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
     copy_into_root(
         out,
         Path::new("usr/share/licenses/rarpar/LICENSE.unrar-rs"),
-        &root.join("crates/weaver-unrar/LICENSE"),
+        &root.join("crates/unrar-rs/LICENSE"),
         0o644,
     )?;
 

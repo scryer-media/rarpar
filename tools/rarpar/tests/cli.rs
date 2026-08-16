@@ -417,13 +417,7 @@ fn par_create_rejects_existing_outputs_without_overwrite() {
 #[test]
 fn par_canonical_placement_does_not_scan_for_renamed_files() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::rename(
@@ -466,7 +460,7 @@ fn inspect_detects_obfuscated_rar_by_magic_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -498,7 +492,7 @@ fn rar_extract_writes_outputs_and_rejects_overwrite() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -534,7 +528,7 @@ fn rar_extract_accepts_password_file() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -566,7 +560,7 @@ fn auto_permanent_delete_removes_consumed_sources_after_success() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -596,7 +590,7 @@ fn auto_json_outputs_single_final_report() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -630,7 +624,7 @@ fn auto_json_outputs_single_final_report() {
 #[test]
 fn auto_extracts_classic_multivolume_ppmd_set() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let download_dir = temp.path().join("download");
     let out_dir = temp.path().join("out");
     std::fs::create_dir_all(&download_dir).unwrap();
@@ -663,13 +657,7 @@ fn auto_extracts_classic_multivolume_ppmd_set() {
 #[test]
 fn auto_rediscovers_rar_volumes_after_par2_repair() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let missing_volume = work_dir.join("fixture_rar5_lz_plain.part2.rar");
@@ -692,13 +680,7 @@ fn auto_rediscovers_rar_volumes_after_par2_repair() {
 #[test]
 fn par_repair_dry_run_does_not_create_missing_file() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let missing_volume = work_dir.join("fixture_rar5_lz_plain.part2.rar");
@@ -726,13 +708,7 @@ fn par_repair_dry_run_does_not_create_missing_file() {
 #[test]
 fn par_repair_accepts_relative_par2_file_and_emits_json() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
 
@@ -762,13 +738,7 @@ fn par_repair_accepts_relative_par2_file_and_emits_json() {
 #[test]
 fn sab_par2_repair_invocation_accepts_a_healthy_set() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");
@@ -795,13 +765,7 @@ fn sab_par2_repair_invocation_accepts_a_healthy_set() {
 #[test]
 fn sab_par2_repair_invocation_accepts_a_recovery_volume_as_parfile() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
@@ -830,13 +794,7 @@ fn sab_par2_repair_invocation_accepts_a_recovery_volume_as_parfile() {
 #[test]
 fn sab_par2_repair_invocation_requests_missing_recovery_blocks() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     std::fs::remove_file(work_dir.join("fixture_rar5_lz_plain.part2.rar")).unwrap();
@@ -883,7 +841,7 @@ fn rar_extract_retries_member_wrong_password_candidates() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -916,7 +874,7 @@ fn cleanup_rejects_wrong_symlink_output() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -981,7 +939,7 @@ fn compat_unrar_extract_emits_downloader_contract() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1018,7 +976,7 @@ fn compat_unrar_extract_emits_downloader_contract() {
 #[test]
 fn compat_unrar_extract_accepts_relative_archive_path() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
     for volume in 1..=5 {
@@ -1048,7 +1006,7 @@ fn compat_unrar_extract_accepts_relative_archive_path() {
 #[test]
 fn compat_unrar_extract_accepts_bare_relative_wildcard() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
     for volume in 1..=5 {
@@ -1078,7 +1036,7 @@ fn compat_unrar_extract_accepts_bare_relative_wildcard() {
 #[test]
 fn compat_unrar_extracts_header_encrypted_multivolume_set() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
     for volume in 1..=5 {
@@ -1107,7 +1065,7 @@ fn compat_unrar_extracts_header_encrypted_multivolume_set() {
 #[test]
 fn compat_unrar_extract_restores_missing_recovery_volume() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
     let present = [
@@ -1150,7 +1108,7 @@ fn compat_unrar_extract_restores_missing_recovery_volume() {
 fn compat_unrar_lb_lists_bare_member_names() {
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1172,7 +1130,7 @@ fn compat_unrar_overwrite_skip_preserves_existing_file() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1206,7 +1164,7 @@ fn compat_unrar_wrong_password_uses_unrar_exit_code() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1236,7 +1194,7 @@ fn compat_unrar_incremental_vp_continue_extracts_after_later_volumes_arrive() {
     let out_dir = temp.path().join("out");
     std::fs::create_dir_all(&download_dir).unwrap();
 
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let first = download_dir.join("rar4_tiny_volumes.part1.rar");
     std::fs::copy(fixture_dir.join("rar4_tiny_volumes.part1.rar"), &first).unwrap();
 
@@ -1289,7 +1247,7 @@ fn compat_unrar_incremental_vp_quit_exits_fatal() {
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
 
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar4"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let first = download_dir.join("rar4_tiny_volumes.part1.rar");
     std::fs::copy(fixture_dir.join("rar4_tiny_volumes.part1.rar"), &first).unwrap();
 
@@ -1321,7 +1279,7 @@ fn default_path_invocation_runs_auto_workflow() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1344,7 +1302,7 @@ fn default_path_invocation_runs_auto_workflow() {
 fn rar_list_and_test_validate_a_real_archive() {
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1371,7 +1329,7 @@ fn rar_list_and_test_validate_a_real_archive() {
 #[test]
 fn rar_restore_volumes_restores_a_missing_volume_explicitly() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&["crates", "weaver-unrar", "tests", "fixtures", "rar5"]);
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
     let download_dir = temp.path().join("download");
     std::fs::create_dir_all(&download_dir).unwrap();
     for name in [
@@ -1411,7 +1369,7 @@ fn cleanup_deletes_validated_sources_after_explicit_extraction() {
     let temp = tempfile::tempdir().unwrap();
     let source = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1447,7 +1405,7 @@ fn compat_unrar_e_flattens_member_paths() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1476,7 +1434,7 @@ fn compat_unrar_e_flattens_member_paths() {
 fn compat_unrar_test_and_list_cover_operational_commands() {
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1511,7 +1469,7 @@ fn compat_unrar_auto_rename_and_suppression_switches_are_honored() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1584,7 +1542,7 @@ fn compat_unrar_password_disabled_returns_password_exit() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(&[
         "crates",
-        "weaver-unrar",
+        "unrar-rs",
         "tests",
         "fixtures",
         "rar5",
@@ -1631,13 +1589,7 @@ fn compat_unrar_rejects_every_unsupported_modifying_command() {
 #[test]
 fn compat_par2_repair_honors_base_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let fixture_dir = fixture(&[
-        "crates",
-        "weaver-par2",
-        "tests",
-        "fixtures",
-        "rar5_lz_plain",
-    ]);
+    let fixture_dir = fixture(&["crates", "par2-rs", "tests", "fixtures", "rar5_lz_plain"]);
     let work_dir = temp.path().join("rar5_lz_plain");
     copy_dir_recursive(&fixture_dir, &work_dir);
     let par2_path = work_dir.join("fixture_rar5_lz_plain_repair.par2");

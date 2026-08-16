@@ -1,0 +1,84 @@
+[package]
+name = "par2-rs"
+description = "PAR2 parity verification and repair"
+readme = "README.md"
+version = "0.4.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude = ["tests/fixtures/**", "fuzz/**"]
+
+[features]
+default = ["native-crypto"]
+native-crypto = ["dep:aws-lc-sys"]
+slow-tests = []
+# Opt-in Apple-GPU (Metal) acceleration for repair and creation. Off by
+# default: repair may fall back to CPU, while creation follows its explicit
+# backend policy and admits Metal only when this feature is enabled on Apple
+# Silicon.
+# Forwards to reedsolomon-rs's `metal` backend.
+metal = ["reedsolomon-rs/metal"]
+# Opt-in portable-GPU (wgpu: Vulkan/DX12/Metal) streaming-repair arm for the
+# platforms the native Metal backend does not cover. Off by default (wgpu is a
+# heavy dependency tree); the session engages under the same size gating as
+# Metal, and `WEAVER_GF16_WGPU=1` forces it. Forwards to reedsolomon-rs's
+# `wgpu` backend.
+wgpu = ["reedsolomon-rs/wgpu"]
+
+[dependencies]
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.1", default-features = false }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crc-fast = { workspace = true }
+md-5 = { workspace = true }
+rayon = { workspace = true, default-features = false }
+libc = { workspace = true }
+
+# Native-only dependencies.
+#
+# `memmap2` backs the mmap scanner in `repairer.rs`; wasip1 has no `mmap`, so
+# the scanner takes a compile-time buffered `std::fs` fallback there (see
+# `MappedFile` in `repairer.rs`) and the crate must not even link memmap2 on
+# wasm. `aws-lc-sys` (the native-crypto MD5 backend) is unavailable on wasm and
+# is only reachable through the `native-crypto` feature, which is off for wasm
+# builds (`--no-default-features` selects the RustCrypto `md-5` fallback); the
+# target gate keeps it out even if the feature is force-enabled on a wasm build.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2 = { workspace = true, default-features = false }
+aws-lc-sys = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Capability-relative path resolution prevents repair destinations from
+# escaping the caller-selected working directory through Windows reparse
+# points while preserving support for a caller-selected symlinked root.
+cap-std = "4.0.2"
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
+
+# Native-only dev-dependencies.
+#
+# `criterion` hard-`compile_error!`s on wasm (wasi) targets, and building the
+# `wasm_par2_check` example for wasm compiles the crate's dev-dependencies, so
+# it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
+# `unrar-rs` is native test-suite tooling (differential RAR extraction
+# checks) and is not needed by the wasm harness, so it stays off the wasm build.
+# Deliberately path-only (no `version`): cargo strips path-only
+# dev-dependencies from the published manifest, so the crates.io package
+# carries no unrar-rs (and no UnRAR license-restriction) reference.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+unrar-rs = { path = "../unrar-rs", default-features = false, features = [
+    "native-crypto",
+] }
+criterion = "0.8"
+# Lets the bench surface the crate's own tier logs under `RUST_LOG` — the only
+# way to confirm which compute tier (streaming vs in-memory, CPU vs GPU) a
+# workflow A/B actually exercised.
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "par2_repair"
+path = "benches/par2_repair.rs"
+harness = false
