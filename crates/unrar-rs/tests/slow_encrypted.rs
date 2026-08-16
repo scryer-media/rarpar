@@ -4,9 +4,10 @@
 //!
 //! Every test here runs the archive KDF, which is deliberately expensive — that
 //! is what put them behind `slow-tests` in the first place. They live in their
-//! own target so CI's `unrar-slow-tests` lane can select the feature-gated delta
-//! with `--test slow_encrypted` instead of re-running the whole package on top of
-//! what `fixture-tests` already ran.
+//! own target so the KDF-heavy set can be selected on its own with
+//! `--test slow_encrypted --features slow-tests`, and so `integration.rs`
+//! stays a plain, always-on target. CI's `unrar-tests` lane runs the whole
+//! crate once with the feature on, so this target runs there alongside it.
 //!
 //! The four helpers below are deliberate small copies of `integration.rs`'s, so
 //! that this target stays independent of that 6.6k-line file.

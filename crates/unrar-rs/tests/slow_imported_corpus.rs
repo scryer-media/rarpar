@@ -2,9 +2,10 @@
 
 //! The `slow-tests` half of the imported-corpus coverage.
 //!
-//! Split out of `imported_corpus.rs` so CI's `unrar-slow-tests` lane can select
-//! the feature-gated delta with `--test slow_imported_corpus` instead of
-//! re-running that target's other eleven tests, which `fixture-tests` already ran.
+//! Split out of `imported_corpus.rs` so the gated half can be selected on its
+//! own with `--test slow_imported_corpus --features slow-tests`, and so
+//! `imported_corpus.rs` stays a plain, always-on target. CI's `unrar-tests` lane
+//! runs the whole crate once with the feature on, so both targets run there.
 //!
 //! `corpus_outcome` and its enum are small deliberate copies of
 //! `imported_corpus.rs`'s, which still needs them for its ungated tests.
