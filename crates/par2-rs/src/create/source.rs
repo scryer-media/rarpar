@@ -15,7 +15,7 @@ use crate::types::{
     ProgressCallback, ProgressStage, SliceChecksum,
 };
 
-use super::encode::ForwardSourceProvider;
+use super::encode::{ForwardSourceObserver, ForwardSourceProvider};
 
 const FIRST_HASH_BYTES: u64 = 16 * 1024;
 const READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -43,6 +43,27 @@ pub(crate) fn create_md5_batch_lanes(block_size: usize) -> usize {
 
 /// A validated explicit source file and the metadata needed by critical PAR2
 /// packets.
+///
+/// # What a planned source has, and what only a created one has
+///
+/// Planning needs a file's identity — path, PAR2 name, length, the 16 KiB
+/// digest, the [`FileId`] derived from them, and how many slices the file
+/// occupies. It does not need the file's *contents*: `hash_full` and the
+/// per-slice checksums are read by exactly one place, the FileDesc and IFSC
+/// bodies in `output.rs`, and those are only written when outputs are.
+///
+/// So [`collect_sources`] fills only the identity, leaving `hash_full` zero
+/// and one zeroed [`SliceChecksum`] per slice — correctly *sized*, so every
+/// quantity derived from a source (packet lengths, the memory plan, the
+/// staged packet layout) is already final at planning time — and creation
+/// fills the contents in, either from the encoder's own feed
+/// ([`FusedSourceHasher`], the fast path: the bytes are hashed as the
+/// arithmetic reads them, so there is no separate hashing pass at all) or
+/// from [`hydrate_source_hashes`] where the feed cannot serve them.
+///
+/// A source held by a [`Par2CreatePlan`](super::plan::Par2CreatePlan)
+/// therefore carries placeholder content hashes; the sources handed to
+/// packet building never do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreationSource {
     /// Canonical path read during creation.
@@ -53,13 +74,21 @@ pub struct CreationSource {
     pub file_id: FileId,
     /// Source length in bytes.
     pub file_length: u64,
-    /// MD5 of the complete source file.
+    /// MD5 of the complete source file. Zero until creation fills it; see the
+    /// type's note on planned versus created sources.
     pub hash_full: [u8; 16],
     /// MD5 of the first 16KiB, or the complete file when shorter.
     pub hash_16k: [u8; 16],
-    /// Zero-padded per-slice CRC32 and MD5 pairs.
+    /// Zero-padded per-slice CRC32 and MD5 pairs. One entry per slice from
+    /// planning onward; the entries are zero until creation fills them.
     pub slice_checksums: Vec<SliceChecksum>,
 }
+
+/// The placeholder a planned source carries until creation hashes the bytes.
+const DEFERRED_SLICE_CHECKSUM: SliceChecksum = SliceChecksum {
+    crc32: 0,
+    md5: [0; 16],
+};
 
 impl CreationSource {
     /// Number of source slices represented by this source.
@@ -164,7 +193,12 @@ impl SourceFingerprint {
     }
 }
 
-/// Resolve, validate, and hash explicit source files in input order.
+/// Resolve and validate explicit source files in input order, reading each
+/// file's identity (length, 16 KiB digest, [`FileId`], slice count).
+///
+/// The whole-file digest and the per-slice checksums are deliberately NOT read
+/// here — see [`CreationSource`] for what a planned source carries and who
+/// fills the rest in.
 pub(crate) fn collect_sources(
     base_path: &Path,
     inputs: &[PathBuf],
@@ -238,7 +272,7 @@ pub(crate) fn collect_sources(
         if cancellation.is_cancelled() {
             return Err(Par2Error::Cancelled);
         }
-        resolve_and_hash_source(
+        resolve_source_identity(
             &base,
             input,
             block_size,
@@ -541,7 +575,7 @@ impl ForwardSourceProvider for DiskSourceProvider<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_and_hash_source(
+fn resolve_source_identity(
     base: &Path,
     input: &Path,
     block_size: u64,
@@ -558,11 +592,6 @@ fn resolve_and_hash_source(
             reason: format!("source block size {block_size} is not a positive multiple of four"),
         });
     }
-    let block_size_usize =
-        usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
-            reason: format!("source block size {block_size} exceeds addressable memory"),
-        })?;
-
     let path = resolve_input_path(base, input)?;
     let metadata = fs::metadata(&path).map_err(Par2Error::Io)?;
     if !metadata.is_file() {
@@ -610,24 +639,19 @@ fn resolve_and_hash_source(
     // depend on which read the hashes came from.
     if let Some(source) = cache.and_then(|cache| cache.take(&path, &fingerprint, block_size)) {
         debug_assert_eq!(source.par2_name, par2_name);
-        let mut remaining = fingerprint.length;
-        for _ in 0..source.slice_checksums.len() {
-            if cancellation.is_cancelled() {
-                return Err(Par2Error::Cancelled);
-            }
-            let step = remaining.min(block_size);
-            remaining -= step;
-            let processed_total = bytes_processed
-                .fetch_add(step, Ordering::Relaxed)
-                .saturating_add(step);
-            report_progress(
+        report_scan_progress(
+            ScanProgress {
                 progress,
                 file_index,
                 file_total,
-                processed_total,
+                bytes_processed,
                 total_bytes,
-            );
-        }
+            },
+            fingerprint.length,
+            block_size,
+            source.slice_checksums.len(),
+            cancellation,
+        )?;
         return Ok(source);
     }
 
@@ -653,136 +677,21 @@ fn resolve_and_hash_source(
             reason: "source slice count exceeds addressable memory".to_string(),
         })?;
 
-    let mut full_hash = FileHashState::new();
+    // Identity only: the first 16 KiB (or the whole file when shorter) is
+    // what the FileId is derived from, and the FileId is what planning needs.
+    // The rest of the file is read exactly once, by the encoder, and hashed
+    // there — see `CreationSource`.
+    let head_len = usize::try_from(FIRST_HASH_BYTES.min(fingerprint.length)).map_err(|_| {
+        Par2Error::ResourceLimitExceeded {
+            reason: "source head length exceeds addressable memory".to_string(),
+        }
+    })?;
+    let mut head = vec![0u8; head_len];
+    read_exact_or_changed(&mut file, &mut head, input)?;
     let mut first_hash = Md5State::new();
-    let mut first_bytes = 0u64;
-    let mut checksums = Vec::with_capacity(slice_count_usize);
+    first_hash.update(&head);
+    drop(head);
 
-    // Per-slice length, shared by both scan shapes: every slice is a full
-    // block except the file's last, which is short and zero-padded to the
-    // block size for checksum purposes.
-    let slice_len = |slice_index: usize| -> Result<usize> {
-        let offset = (slice_index as u64)
-            .checked_mul(block_size)
-            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
-                reason: "source slice offset overflows".to_string(),
-            })?;
-        usize::try_from(fingerprint.length.saturating_sub(offset).min(block_size)).map_err(|_| {
-            Par2Error::ResourceLimitExceeded {
-                reason: "source slice length exceeds addressable memory".to_string(),
-            }
-        })
-    };
-
-    let lanes = create_md5_batch_lanes(block_size_usize);
-    if lanes >= 2 {
-        // Batched scan. Consecutive slices are independent MD5 messages, so a
-        // batch of them goes through the multi-buffer kernel in one pass. The
-        // whole-file MD5 stays a single serial stream over the same bytes: it
-        // is a different message and cannot be laned within one file (see the
-        // module note on why it is also not laned *across* files).
-        let mut batch = vec![0u8; lanes * block_size_usize];
-        let mut digests = vec![[0u8; 16]; lanes];
-        let mut lens = vec![0usize; lanes];
-        let mut crcs = vec![0u32; lanes];
-        let mut slice_index = 0usize;
-
-        while slice_index < slice_count_usize {
-            let batch_slices = lanes.min(slice_count_usize - slice_index);
-
-            for lane in 0..batch_slices {
-                if cancellation.is_cancelled() {
-                    return Err(Par2Error::Cancelled);
-                }
-                let actual_len = slice_len(slice_index + lane)?;
-                let start = lane * block_size_usize;
-                let slice = &mut batch[start..start + actual_len];
-                read_exact_or_changed(&mut file, slice, input)?;
-                lens[lane] = actual_len;
-
-                // Both single-stream digests run here, while this slice is
-                // still in the cache the read just filled, instead of after a
-                // second whole-batch walk. Only the file's final slice can be
-                // short, so lane order within a batch is file order and the
-                // serial stream sees exactly the bytes — and the byte order —
-                // that one `batch[..batch_bytes]` absorb produced.
-                let slice = &batch[start..start + actual_len];
-                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, slice);
-                crcs[lane] = checksum::crc32_padded(slice, block_size);
-
-                let processed_total = bytes_processed
-                    .fetch_add(actual_len as u64, Ordering::Relaxed)
-                    .saturating_add(actual_len as u64);
-                report_progress(
-                    progress,
-                    file_index,
-                    file_total,
-                    processed_total,
-                    total_bytes,
-                );
-            }
-
-            let inputs = (0..batch_slices)
-                .map(|lane| {
-                    let start = lane * block_size_usize;
-                    &batch[start..start + lens[lane]]
-                })
-                .collect::<Vec<_>>();
-            md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
-
-            for lane in 0..batch_slices {
-                checksums.push(SliceChecksum {
-                    crc32: crcs[lane],
-                    md5: digests[lane],
-                });
-            }
-
-            slice_index += batch_slices;
-        }
-    } else {
-        // Streaming scan: one slice at a time through a single read buffer.
-        // Selected when one block already fills the staging budget, so there
-        // is no second lane to fill anyway.
-        let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
-        for slice_index in 0..slice_count_usize {
-            if cancellation.is_cancelled() {
-                return Err(Par2Error::Cancelled);
-            }
-            let actual_len = slice_len(slice_index)?;
-            let mut remaining = actual_len;
-            let mut slice_hash = SliceChecksumState::new();
-            while remaining > 0 {
-                if cancellation.is_cancelled() {
-                    return Err(Par2Error::Cancelled);
-                }
-                let take = remaining.min(buffer.len());
-                read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
-                let chunk = &buffer[..take];
-                slice_hash.update(chunk);
-                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, chunk);
-                remaining -= take;
-                let processed_total = bytes_processed
-                    .fetch_add(take as u64, Ordering::Relaxed)
-                    .saturating_add(take as u64);
-                report_progress(
-                    progress,
-                    file_index,
-                    file_total,
-                    processed_total,
-                    total_bytes,
-                );
-            }
-            let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
-            let (crc32, md5) = slice_hash.finalize(pad_to);
-            checksums.push(SliceChecksum { crc32, md5 });
-        }
-    }
-
-    if full_hash.bytes_fed() != fingerprint.length {
-        return Err(Par2Error::CreationSourceChanged {
-            path: input.display().to_string(),
-        });
-    }
     let after = fs::metadata(&path).map_err(Par2Error::Io)?;
     if SourceFingerprint::from_metadata(&after) != fingerprint {
         return Err(Par2Error::CreationSourceChanged {
@@ -790,22 +699,37 @@ fn resolve_and_hash_source(
         });
     }
 
-    let hash_full = full_hash.finalize();
     let hash_16k = first_hash.finalize();
     let mut file_id_hash = Md5State::new();
     file_id_hash.update(&hash_16k);
     file_id_hash.update(&fingerprint.length.to_le_bytes());
     file_id_hash.update(par2_name.as_bytes());
     let file_id = FileId::from_bytes(file_id_hash.finalize());
+    // The same per-slice byte steps a content scan of this file would emit, so
+    // the callback stream a caller sees does not depend on which pass the
+    // hashes come from (the memo-hit arm above reports identically).
+    report_scan_progress(
+        ScanProgress {
+            progress,
+            file_index,
+            file_total,
+            bytes_processed,
+            total_bytes,
+        },
+        fingerprint.length,
+        block_size,
+        slice_count_usize,
+        cancellation,
+    )?;
 
     let source = CreationSource {
         path,
         par2_name,
         file_id,
         file_length: fingerprint.length,
-        hash_full,
+        hash_full: [0; 16],
         hash_16k,
-        slice_checksums: checksums,
+        slice_checksums: vec![DEFERRED_SLICE_CHECKSUM; slice_count_usize],
     };
     if let Some(cache) = cache {
         cache.store(fingerprint, block_size, &source);
@@ -836,6 +760,429 @@ fn validate_relative_path(relative: &Path, input: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// The progress-reporting context of one source-scan task.
+struct ScanProgress<'a> {
+    progress: Option<&'a ProgressCallback>,
+    file_index: u32,
+    file_total: u32,
+    bytes_processed: &'a AtomicU64,
+    total_bytes: u64,
+}
+
+/// Emit one source-scan progress step per slice of one file.
+fn report_scan_progress(
+    context: ScanProgress<'_>,
+    file_length: u64,
+    block_size: u64,
+    slice_count: usize,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut remaining = file_length;
+    for _ in 0..slice_count {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let step = remaining.min(block_size);
+        remaining -= step;
+        let processed_total = context
+            .bytes_processed
+            .fetch_add(step, Ordering::Relaxed)
+            .saturating_add(step);
+        report_progress(
+            context.progress,
+            context.file_index,
+            context.file_total,
+            processed_total,
+            context.total_bytes,
+        );
+    }
+    Ok(())
+}
+
+/// The content hashes of one source file: what [`CreationSource`] leaves
+/// deferred until creation.
+pub(crate) struct SourceContentHashes {
+    pub(crate) hash_full: [u8; 16],
+    pub(crate) hash_16k: [u8; 16],
+    pub(crate) slice_checksums: Vec<SliceChecksum>,
+}
+
+/// Read one source file end to end and produce its content hashes.
+///
+/// This is the fallback: it runs only when the encoder's feed cannot serve the
+/// hashes (a non-CPU backend, a pass with no recovery blocks, or a stripe
+/// schedule that visits a file's bytes out of file order). The fast path is
+/// [`FusedSourceHasher`], which sees the same bytes for free.
+fn hash_source_contents(
+    path: &Path,
+    input: &Path,
+    file_length: u64,
+    block_size: u64,
+    slice_count: usize,
+    cancellation: &CancellationToken,
+) -> Result<SourceContentHashes> {
+    let block_size_usize =
+        usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: format!("source block size {block_size} exceeds addressable memory"),
+        })?;
+    let mut file = File::open(path).map_err(Par2Error::Io)?;
+    let mut full_hash = FileHashState::new();
+    let mut first_hash = Md5State::new();
+    let mut first_bytes = 0u64;
+    let mut checksums = Vec::with_capacity(slice_count);
+
+    // Per-slice length: every slice is a full block except the file's last,
+    // which is short and zero-padded to the block size for checksum purposes.
+    let slice_len = |slice_index: usize| -> Result<usize> {
+        let offset = (slice_index as u64)
+            .checked_mul(block_size)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "source slice offset overflows".to_string(),
+            })?;
+        usize::try_from(file_length.saturating_sub(offset).min(block_size)).map_err(|_| {
+            Par2Error::ResourceLimitExceeded {
+                reason: "source slice length exceeds addressable memory".to_string(),
+            }
+        })
+    };
+
+    let lanes = create_md5_batch_lanes(block_size_usize);
+    if lanes >= 2 {
+        // Batched scan. Consecutive slices are independent MD5 messages, so a
+        // batch of them goes through the multi-buffer kernel in one pass. The
+        // whole-file MD5 stays a single serial stream over the same bytes: it
+        // is a different message and cannot be laned within one file (see the
+        // module note on why it is also not laned *across* files).
+        let mut batch = vec![0u8; lanes * block_size_usize];
+        let mut digests = vec![[0u8; 16]; lanes];
+        let mut lens = vec![0usize; lanes];
+        let mut crcs = vec![0u32; lanes];
+        let mut slice_index = 0usize;
+
+        while slice_index < slice_count {
+            let batch_slices = lanes.min(slice_count - slice_index);
+
+            for lane in 0..batch_slices {
+                if cancellation.is_cancelled() {
+                    return Err(Par2Error::Cancelled);
+                }
+                let actual_len = slice_len(slice_index + lane)?;
+                let start = lane * block_size_usize;
+                let slice = &mut batch[start..start + actual_len];
+                read_exact_or_changed(&mut file, slice, input)?;
+                lens[lane] = actual_len;
+
+                // Both single-stream digests run here, while this slice is
+                // still in the cache the read just filled, instead of after a
+                // second whole-batch walk. Only the file's final slice can be
+                // short, so lane order within a batch is file order and the
+                // serial stream sees exactly the bytes -- and the byte order --
+                // that one `batch[..batch_bytes]` absorb produced.
+                let slice = &batch[start..start + actual_len];
+                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, slice);
+                crcs[lane] = checksum::crc32_padded(slice, block_size);
+            }
+
+            let inputs = (0..batch_slices)
+                .map(|lane| {
+                    let start = lane * block_size_usize;
+                    &batch[start..start + lens[lane]]
+                })
+                .collect::<Vec<_>>();
+            md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
+
+            for lane in 0..batch_slices {
+                checksums.push(SliceChecksum {
+                    crc32: crcs[lane],
+                    md5: digests[lane],
+                });
+            }
+
+            slice_index += batch_slices;
+        }
+    } else {
+        // Streaming scan: one slice at a time through a single read buffer.
+        // Selected when one block already fills the staging budget, so there
+        // is no second lane to fill anyway.
+        let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
+        for slice_index in 0..slice_count {
+            if cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            let actual_len = slice_len(slice_index)?;
+            let mut remaining = actual_len;
+            let mut slice_hash = SliceChecksumState::new();
+            while remaining > 0 {
+                if cancellation.is_cancelled() {
+                    return Err(Par2Error::Cancelled);
+                }
+                let take = remaining.min(buffer.len());
+                read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
+                let chunk = &buffer[..take];
+                slice_hash.update(chunk);
+                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, chunk);
+                remaining -= take;
+            }
+            let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
+            let (crc32, md5) = slice_hash.finalize(pad_to);
+            checksums.push(SliceChecksum { crc32, md5 });
+        }
+    }
+
+    if full_hash.bytes_fed() != file_length {
+        return Err(Par2Error::CreationSourceChanged {
+            path: input.display().to_string(),
+        });
+    }
+    Ok(SourceContentHashes {
+        hash_full: full_hash.finalize(),
+        hash_16k: first_hash.finalize(),
+        slice_checksums: checksums,
+    })
+}
+
+/// Fill in the deferred content hashes of already-identified sources by
+/// reading them.
+///
+/// Creation's fallback when the encoder feed cannot serve them; see
+/// [`CreationSource`]. Every file is re-validated against the identity the
+/// plan was built on, so a file that changed between planning and creation is
+/// rejected here rather than silently written into a packet.
+pub(crate) fn hydrate_source_hashes(
+    sources: &mut [CreationSource],
+    block_size: u64,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let hash_one = |source: &mut CreationSource| -> Result<()> {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let metadata = fs::metadata(&source.path).map_err(Par2Error::Io)?;
+        if !metadata.is_file() || metadata.len() != source.file_length {
+            return Err(Par2Error::CreationSourceChanged {
+                path: source.path.display().to_string(),
+            });
+        }
+        let hashes = hash_source_contents(
+            &source.path,
+            &source.path,
+            source.file_length,
+            block_size,
+            source.slice_checksums.len(),
+            cancellation,
+        )?;
+        if hashes.hash_16k != source.hash_16k {
+            return Err(Par2Error::CreationSourceChanged {
+                path: source.path.display().to_string(),
+            });
+        }
+        source.hash_full = hashes.hash_full;
+        source.slice_checksums = hashes.slice_checksums;
+        Ok(())
+    };
+    // Same split, and the same first-error-by-input-order rule, as the
+    // identity scan above.
+    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
+        && sources.len() > 1
+        && super::encode::configured_create_threads() != 1;
+    if scan_parallel {
+        sources
+            .par_iter_mut()
+            .map(hash_one)
+            .collect::<Vec<Result<()>>>()
+            .into_iter()
+            .collect::<Result<Vec<()>>>()?;
+    } else {
+        for source in sources.iter_mut() {
+            hash_one(source)?;
+        }
+    }
+    Ok(())
+}
+
+/// The deferred content hashes of a whole recovery set, ready to be applied.
+pub(crate) struct FusedSourceHashes {
+    hash_full: Vec<[u8; 16]>,
+    slice_checksums: Vec<Vec<SliceChecksum>>,
+}
+
+impl FusedSourceHashes {
+    /// Move the hashes onto the sources they were computed from.
+    pub(crate) fn apply(self, sources: &mut [CreationSource]) -> Result<()> {
+        if self.hash_full.len() != sources.len() || self.slice_checksums.len() != sources.len() {
+            return Err(Par2Error::InvalidCreationOptions {
+                reason: "fused source hashes do not cover the recovery set".to_string(),
+            });
+        }
+        for ((source, hash_full), checksums) in sources
+            .iter_mut()
+            .zip(self.hash_full)
+            .zip(self.slice_checksums)
+        {
+            if checksums.len() != source.slice_checksums.len() {
+                return Err(Par2Error::CreationSourceChanged {
+                    path: source.path.display().to_string(),
+                });
+            }
+            source.hash_full = hash_full;
+            source.slice_checksums = checksums;
+        }
+        Ok(())
+    }
+}
+
+/// Drives a recovery set's deferred content hashes from the encoder's own
+/// source feed, so the bytes are hashed while they are still in the cache the
+/// arithmetic just pulled them into and are never read a second time.
+///
+/// Correct only while the feed is single-stripe: the whole-file MD5 is one
+/// serial message over a file's bytes in file order, and a stripe-major feed
+/// does not deliver them that way. The caller decides; this type refuses an
+/// out-of-order feed rather than producing a wrong digest, and cross-checks
+/// each file's length and 16 KiB digest against the identity the plan was
+/// built on, so a source that changed between planning and creation is
+/// rejected instead of silently written into a packet.
+pub(crate) struct FusedSourceHasher<'a> {
+    sources: &'a [CreationSource],
+    /// Exclusive end of each file's slice range in encoder source order.
+    slice_ends: Vec<usize>,
+    block_size: u64,
+    next_source_index: usize,
+    file_index: usize,
+    full_hash: FileHashState,
+    first_hash: Md5State,
+    first_bytes: u64,
+    hash_full: Vec<[u8; 16]>,
+    slice_checksums: Vec<Vec<SliceChecksum>>,
+    digests: Vec<[u8; 16]>,
+}
+
+impl<'a> FusedSourceHasher<'a> {
+    pub(crate) fn new(sources: &'a [CreationSource], block_size: u64) -> Result<Self> {
+        if block_size == 0 {
+            return Err(Par2Error::InvalidCreationOptions {
+                reason: "fused source hashing needs a positive block size".to_string(),
+            });
+        }
+        let mut slice_ends = Vec::with_capacity(sources.len());
+        let mut end = 0usize;
+        for source in sources {
+            end = end
+                .checked_add(source.slice_checksums.len())
+                .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                    reason: "source slice index overflows".to_string(),
+                })?;
+            slice_ends.push(end);
+        }
+        Ok(Self {
+            sources,
+            slice_ends,
+            block_size,
+            next_source_index: 0,
+            file_index: 0,
+            full_hash: FileHashState::new(),
+            first_hash: Md5State::new(),
+            first_bytes: 0,
+            hash_full: Vec::with_capacity(sources.len()),
+            slice_checksums: sources
+                .iter()
+                .map(|source| Vec::with_capacity(source.slice_checksums.len()))
+                .collect(),
+            digests: Vec::new(),
+        })
+    }
+
+    fn finish_file(&mut self) -> Result<()> {
+        let source =
+            self.sources
+                .get(self.file_index)
+                .ok_or_else(|| Par2Error::InvalidCreationOptions {
+                    reason: "fused source hashing ran past the recovery set".to_string(),
+                })?;
+        if self.full_hash.bytes_fed() != source.file_length {
+            return Err(Par2Error::CreationSourceChanged {
+                path: source.path.display().to_string(),
+            });
+        }
+        let hash_16k = std::mem::replace(&mut self.first_hash, Md5State::new()).finalize();
+        if hash_16k != source.hash_16k {
+            return Err(Par2Error::CreationSourceChanged {
+                path: source.path.display().to_string(),
+            });
+        }
+        self.hash_full
+            .push(std::mem::take(&mut self.full_hash).finalize());
+        self.first_bytes = 0;
+        self.file_index += 1;
+        Ok(())
+    }
+
+    /// Finalize every file and hand back the hashes.
+    pub(crate) fn finish(mut self) -> Result<FusedSourceHashes> {
+        while self.file_index < self.sources.len() {
+            self.finish_file()?;
+        }
+        if self.next_source_index != self.slice_ends.last().copied().unwrap_or(0) {
+            return Err(Par2Error::InvalidCreationOptions {
+                reason: "fused source hashing did not see every source slice".to_string(),
+            });
+        }
+        Ok(FusedSourceHashes {
+            hash_full: self.hash_full,
+            slice_checksums: self.slice_checksums,
+        })
+    }
+}
+
+impl ForwardSourceObserver for FusedSourceHasher<'_> {
+    fn observe_slices(&mut self, first_source_index: usize, slices: &[&[u8]]) -> Result<()> {
+        if first_source_index != self.next_source_index {
+            return Err(Par2Error::InvalidCreationOptions {
+                reason: "fused source hashing needs the feed in source order".to_string(),
+            });
+        }
+        if slices.len() > self.digests.len() {
+            self.digests.resize(slices.len(), [0u8; 16]);
+        }
+        // The whole run is one multi-buffer pass: consecutive slices are
+        // independent, zero-padded messages, which is exactly what the kernel
+        // lanes. The whole-file stream below cannot be laned and stays serial.
+        md5_simd::md5_multi_into(
+            slices,
+            Some(self.block_size),
+            &mut self.digests[..slices.len()],
+        );
+        for (offset, bytes) in slices.iter().enumerate() {
+            let index = first_source_index + offset;
+            while self
+                .slice_ends
+                .get(self.file_index)
+                .is_some_and(|&end| index >= end)
+            {
+                self.finish_file()?;
+            }
+            if self.file_index >= self.sources.len() {
+                return Err(Par2Error::InvalidCreationOptions {
+                    reason: "fused source hashing ran past the recovery set".to_string(),
+                });
+            }
+            absorb_file_stream(
+                &mut self.full_hash,
+                &mut self.first_hash,
+                &mut self.first_bytes,
+                bytes,
+            );
+            let crc32 = checksum::crc32_padded(bytes, self.block_size);
+            self.slice_checksums[self.file_index].push(SliceChecksum {
+                crc32,
+                md5: self.digests[offset],
+            });
+        }
+        self.next_source_index = first_source_index + slices.len();
+        Ok(())
+    }
 }
 
 /// Feed one contiguous, in-file-order run of source bytes to the two
@@ -893,6 +1240,86 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planned_source(
+        par2_name: &str,
+        file_length: u64,
+        block_size: u64,
+        head: &[u8],
+    ) -> CreationSource {
+        let mut first = Md5State::new();
+        first.update(head);
+        let hash_16k = first.finalize();
+        let mut file_id_hash = Md5State::new();
+        file_id_hash.update(&hash_16k);
+        file_id_hash.update(&file_length.to_le_bytes());
+        file_id_hash.update(par2_name.as_bytes());
+        let slice_count = usize::try_from(file_length.div_ceil(block_size)).unwrap();
+        CreationSource {
+            path: PathBuf::from(par2_name),
+            par2_name: par2_name.to_string(),
+            file_id: FileId::from_bytes(file_id_hash.finalize()),
+            file_length,
+            hash_full: [0; 16],
+            hash_16k,
+            slice_checksums: vec![DEFERRED_SLICE_CHECKSUM; slice_count],
+        }
+    }
+
+    /// The whole-file digest is a serial message over a file's bytes in file
+    /// order, so a feed that skips or reorders sources must be refused rather
+    /// than producing a digest of the wrong byte sequence.
+    #[test]
+    fn the_fused_hasher_refuses_a_feed_that_is_not_in_source_order() {
+        let payload = [7u8; 16];
+        let sources = [planned_source("a.bin", 16, 8, &payload)];
+        let mut hasher = FusedSourceHasher::new(&sources, 8).unwrap();
+        assert!(matches!(
+            hasher.observe_slices(1, &[&payload[8..]]),
+            Err(Par2Error::InvalidCreationOptions { .. })
+        ));
+    }
+
+    /// The feed's bytes are cross-checked against the identity the plan was
+    /// built on, so a source that changed between planning and creation is
+    /// rejected instead of being written into a packet.
+    #[test]
+    fn the_fused_hasher_rejects_bytes_that_differ_from_the_planned_identity() {
+        let payload = [7u8; 16];
+        let sources = [planned_source("a.bin", 16, 8, &payload)];
+        let mut hasher = FusedSourceHasher::new(&sources, 8).unwrap();
+        let changed = [9u8; 16];
+        hasher
+            .observe_slices(0, &[&changed[..8], &changed[8..]])
+            .unwrap();
+        assert!(matches!(
+            hasher.finish(),
+            Err(Par2Error::CreationSourceChanged { .. })
+        ));
+    }
+
+    /// An unchanged feed produces exactly the digests a separate read does.
+    #[test]
+    fn the_fused_hasher_matches_a_direct_read_of_the_same_bytes() {
+        let payload: Vec<u8> = (0..20u8).collect();
+        let sources = [planned_source("a.bin", payload.len() as u64, 8, &payload)];
+        let mut hasher = FusedSourceHasher::new(&sources, 8).unwrap();
+        hasher
+            .observe_slices(0, &[&payload[0..8], &payload[8..16], &payload[16..20]])
+            .unwrap();
+        let mut hydrated = sources.to_vec();
+        hasher.finish().unwrap().apply(&mut hydrated).unwrap();
+        assert_eq!(hydrated[0].hash_full, checksum::md5(&payload));
+        assert_eq!(hydrated[0].slice_checksums.len(), 3);
+        assert_eq!(
+            hydrated[0].slice_checksums[2].md5,
+            md5_simd::md5_multi(&[&payload[16..20]], Some(8))[0]
+        );
+        assert_eq!(
+            hydrated[0].slice_checksums[2].crc32,
+            checksum::crc32_padded(&payload[16..20], 8)
+        );
+    }
 
     #[test]
     fn main_file_count_boundary_matches_parser_limit() {

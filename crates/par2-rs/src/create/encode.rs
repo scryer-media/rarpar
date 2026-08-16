@@ -42,18 +42,70 @@ const CLMUL_INPUT_GROUPING: usize = 16;
 const MAX_INPUT_GROUPING: usize = 16;
 const _: () = assert!(DEFAULT_INPUT_GROUPING <= MAX_INPUT_GROUPING);
 const _: () = assert!(CLMUL_INPUT_GROUPING <= MAX_INPUT_GROUPING);
-/// Staging areas in the per-stripe hand-off ring.
+/// Default depth of the per-stripe staging hand-off ring.
 ///
-/// The ring is general in the code below — the producer fills area
-/// `batch_index % STAGING_AREA_COUNT` and may run `STAGING_AREA_COUNT - 1`
-/// batches ahead of the slowest band — but two is what [`BufferPlan`] admits
-/// and therefore what [`Par2MemoryPlan`](super::plan::Par2MemoryPlan)
-/// describes, so the constant and the accounting move together. Two is also
-/// the reference's own depth. One area would serialize the fill behind the
-/// arithmetic, which is the whole point of the pipeline.
-const STAGING_AREA_COUNT: usize = 2;
-const TRANSFER_BUFFER_COUNT: usize = 2;
-const _: () = assert!(STAGING_AREA_COUNT >= 2);
+/// The producer fills area `batch_index % depth` and may run `depth - 1`
+/// batches ahead of the slowest band. Two is the minimum that overlaps the
+/// fill with the arithmetic at all, and was the shipped depth while the fill
+/// was only a read and a layout conversion.
+///
+/// It is no longer enough. The fill now also hashes the bytes it reads (the
+/// source digests the critical packets need), which makes the producer a
+/// thread with real work on it, and the pass runs one band worker per host
+/// thread — so the producer is the `+1` on a saturated machine and gets
+/// descheduled. At depth two a descheduled producer starves every band
+/// immediately, because the one area it has not filled is the one they need
+/// next. Measured on an 18-thread host, 256 MiB over 4096 sources: the fused
+/// hashing costs 0.51 s on one thread and the bands 4.3 ms per batch, so the
+/// producer is four times faster than it needs to be — yet at depth two the
+/// pass paid 0.32 s of it, and at six bands (no oversubscription, same
+/// producer, same hashing) it paid 0.02-0.07 s. Depth is the difference: with
+/// slack the bands ride through a preemption instead of stopping at it.
+///
+/// Each extra area costs one input batch of staging (about 1 MiB at the
+/// 64 KiB-slice create shape, against a ~53 MiB recovery stripe), and
+/// `Par2MemoryPlan` counts every one of them.
+const DEFAULT_STAGING_AREA_COUNT: usize = 4;
+/// Bound on the ring depth, so a hatch value cannot turn the staging plan into
+/// an unbounded multiple of the stripe.
+const MAX_STAGING_AREA_COUNT: usize = 8;
+const _: () = assert!(DEFAULT_STAGING_AREA_COUNT >= 2);
+const _: () = assert!(DEFAULT_STAGING_AREA_COUNT <= MAX_STAGING_AREA_COUNT);
+
+/// Depth of the staging hand-off ring. `WEAVER_PAR2_CREATE_AREAS=N` (2..=8)
+/// pins it so the depths can be A/B'd from one binary (same escape-hatch
+/// pattern as `WEAVER_PAR2_CREATE_THREADS`); unset, `0`, or out of range means
+/// [`DEFAULT_STAGING_AREA_COUNT`].
+///
+/// Process-stable by construction, and read through this one function by both
+/// [`BufferPlan`] and the encoder, so the memory a plan admits is the memory
+/// the pass allocates.
+fn configured_staging_areas() -> usize {
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("WEAVER_PAR2_CREATE_AREAS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&areas| (2..=MAX_STAGING_AREA_COUNT).contains(&areas))
+            .unwrap_or(DEFAULT_STAGING_AREA_COUNT)
+    })
+}
+
+/// Consecutive sources staged into the transfer buffer at once, and therefore
+/// the widest multi-buffer digest a [`ForwardSourceObserver`] can run over the
+/// feed.
+///
+/// The multi-buffer MD5 kernel's own lane count, clamped to one input batch:
+/// staging a wider run than the kernel can hash buys nothing, and staging a
+/// narrower one would make the fused source hashing fall back to one message
+/// per pass — measured on x86 as roughly a 4x difference in per-slice digest
+/// cost. Process-stable (the detection is cached per ISA) and read through
+/// this one function by both [`BufferPlan`] and [`fill_staging`], so the plan
+/// and the pass it admits always size the buffer the same way.
+fn transfer_group_lanes() -> usize {
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| crate::md5_simd::max_lanes().clamp(1, MAX_INPUT_GROUPING))
+}
 
 /// Folded coefficient groups covered by one output row, bounding the stack
 /// reference tables in `accumulate_band`. The folded family's
@@ -238,6 +290,26 @@ pub(crate) trait ForwardSourceProvider {
     ) -> Result<usize>;
 }
 
+/// Observer of the exact source bytes the encode feed reads, in feed order.
+///
+/// The feed walks sources in increasing index and hands each source's bytes to
+/// the arithmetic exactly once per stripe, so a digest driven from here costs
+/// no second read of the file. Runs of consecutive slices arrive together so
+/// the observer can lane them through a multi-buffer kernel; the run is the
+/// encoder's own transfer group, never split across a call.
+///
+/// A per-file digest is only correct from here while the pass is
+/// single-stripe: with more than one stripe the feed is stripe-major, not file
+/// order (pinned by
+/// `the_feed_is_stripe_major_once_a_slice_needs_more_than_one_stripe`). The
+/// caller decides; the observer is told the source index and may reject an
+/// order it cannot serve.
+pub(crate) trait ForwardSourceObserver: Send {
+    /// One run of consecutive source slices, in increasing index, each with
+    /// its real (unpadded) bytes for this stripe.
+    fn observe_slices(&mut self, first_source_index: usize, slices: &[&[u8]]) -> Result<()>;
+}
+
 #[cfg(test)]
 struct InMemorySourceProvider<'a> {
     sources: &'a [&'a [u8]],
@@ -362,6 +434,21 @@ impl ForwardEncoder {
         options: &ForwardEncoderOptions,
         sink: &mut S,
     ) -> Result<()> {
+        self.encode_to_observed(provider, options, sink, None)
+    }
+
+    /// Encode as [`Self::encode_to`], driving `observer` from the same source
+    /// bytes the arithmetic reads. See [`ForwardSourceObserver`] for what the
+    /// feed order does and does not allow an observer to compute.
+    pub(crate) fn encode_to_observed<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
+        &self,
+        provider: &mut P,
+        options: &ForwardEncoderOptions,
+        sink: &mut S,
+        observer: Option<&mut dyn ForwardSourceObserver>,
+    ) -> Result<()> {
+        let mut observer = observer;
+        let observer = &mut observer;
         validate_provider(provider, self.slice_size)?;
         check_cancel(options)?;
 
@@ -385,11 +472,15 @@ impl ForwardEncoder {
         // worker for the duration of a batch and reclaimed for refilling by
         // `Arc::get_mut` once they have all let go — the hand-off is the
         // ownership, with no aliasing of a mutable buffer anywhere.
-        let mut staging: Vec<std::sync::Arc<AlignedBuffer>> = (0..STAGING_AREA_COUNT)
+        let staging_areas = configured_staging_areas();
+        let mut staging: Vec<std::sync::Arc<AlignedBuffer>> = (0..staging_areas)
             .map(|_| std::sync::Arc::new(AlignedBuffer::new(buffers.staging_bytes)))
             .collect();
-        let mut transfers: Vec<AlignedBuffer> = (0..TRANSFER_BUFFER_COUNT)
-            .map(|_| AlignedBuffer::new(buffers.aligned_chunk_len))
+        // One raw batch per ring slot: the hasher consumes them behind the
+        // bands, so a buffer must stay live until it has been both staged and
+        // hashed.
+        let mut transfers: Vec<AlignedBuffer> = (0..staging_areas)
+            .map(|_| AlignedBuffer::new(buffers.transfer_bytes))
             .collect();
         let mut output = AlignedBuffer::new(buffers.output_bytes);
 
@@ -412,7 +503,7 @@ impl ForwardEncoder {
         // One dispatch per stripe. The band workers are started once for the
         // stripe and walk every input batch themselves; this thread is the
         // producer, filling the staging ring ahead of them. The ring is what
-        // bounds the hand-off: the producer may run `STAGING_AREA_COUNT - 1`
+        // bounds the hand-off: the producer may run `staging_areas - 1`
         // batches ahead of the slowest band and no further, which is the same
         // two-stage overlap the previous per-batch `rayon::in_place_scope`
         // gave, minus one scope entry and one band fan-out per input batch
@@ -442,7 +533,7 @@ impl ForwardEncoder {
                     &factors,
                     &self.recovery_exponents,
                     &mut staging,
-                    &mut transfers[0],
+                    &mut transfers,
                     &mut output.as_bytes_mut()[..buffers.output_bytes],
                     &batch_starts,
                     StripeGeometry {
@@ -456,9 +547,15 @@ impl ForwardEncoder {
                     &mut jit_workspaces,
                     #[cfg(target_arch = "x86_64")]
                     jit_code_budget,
+                    match observer.as_mut() {
+                        Some(observer) => Some(&mut **observer),
+                        None => None,
+                    },
                 )?;
             } else {
                 output.as_bytes_mut()[..buffers.output_bytes].fill(0);
+                let mut slice_lens = [0usize; MAX_INPUT_GROUPING];
+                let source_count = provider.source_count();
                 if let Some(&first_start) = batch_starts.first() {
                     fill_staging(
                         kernel,
@@ -471,17 +568,25 @@ impl ForwardEncoder {
                         actual_len,
                         aligned_len,
                         contract,
+                        &mut slice_lens,
                     )?;
+                    if let Some(observer) = observer.as_mut() {
+                        observe_batch(
+                            &mut **observer,
+                            transfers[0].as_bytes(),
+                            first_start,
+                            live_batch_inputs(source_count, first_start, contract),
+                            transfer_slot_stride(aligned_len)?,
+                            &slice_lens,
+                        )?;
+                    }
                 }
                 for (batch_index, &source_start) in batch_starts.iter().enumerate() {
                     check_cancel(options)?;
-                    let live_inputs = provider
-                        .source_count()
-                        .saturating_sub(source_start)
-                        .min(contract.input_grouping);
+                    let live_inputs = live_batch_inputs(source_count, source_start, contract);
                     let next_start = batch_starts.get(batch_index + 1).copied();
-                    let current_area = batch_index % STAGING_AREA_COUNT;
-                    let next_area = (batch_index + 1) % STAGING_AREA_COUNT;
+                    let current_area = batch_index % staging_areas;
+                    let next_area = (batch_index + 1) % staging_areas;
                     accumulate_batch(
                         kernel,
                         &mut output.as_bytes_mut()[..buffers.output_bytes],
@@ -504,14 +609,25 @@ impl ForwardEncoder {
                             kernel,
                             std::sync::Arc::get_mut(&mut staging[next_area])
                                 .ok_or_else(|| resource_limit("staging area is still in use"))?,
-                            &mut transfers[(batch_index + 1) % TRANSFER_BUFFER_COUNT],
+                            &mut transfers[next_area],
                             provider,
                             next_start,
                             stripe_offset,
                             actual_len,
                             aligned_len,
                             contract,
+                            &mut slice_lens,
                         )?;
+                        if let Some(observer) = observer.as_mut() {
+                            observe_batch(
+                                &mut **observer,
+                                transfers[next_area].as_bytes(),
+                                next_start,
+                                live_batch_inputs(source_count, next_start, contract),
+                                transfer_slot_stride(aligned_len)?,
+                                &slice_lens,
+                            )?;
+                        }
                     }
                 }
 
@@ -584,18 +700,18 @@ struct BatchTicket {
 }
 
 struct FeedState {
-    tickets: [Option<BatchTicket>; STAGING_AREA_COUNT],
+    tickets: Vec<Option<BatchTicket>>,
     /// Batches published so far; a band may consume batch `index` once
     /// `published > index`.
     published: usize,
     /// Batches every band has finished; the producer may refill the area of
-    /// batch `index` once `completed + STAGING_AREA_COUNT > index`.
+    /// batch `index` once `completed + areas > index`.
     completed: usize,
     /// Bands that have finished the batch currently resident in each area.
     /// Unambiguous because a band can never be more than one batch ahead of
     /// the slowest: reaching batch `b + 2` needs `published > b + 2`, which
     /// needs `completed > b`, which needs every band to have finished `b`.
-    done: [usize; STAGING_AREA_COUNT],
+    done: Vec<usize>,
     /// Set by whichever side failed first (producer error, cancellation, or a
     /// band's error) so the other side stops waiting instead of deadlocking.
     failed: bool,
@@ -603,6 +719,7 @@ struct FeedState {
 
 /// The bounded producer/consumer hand-off for one stripe.
 struct StripeFeed {
+    areas: usize,
     state: std::sync::Mutex<FeedState>,
     ready: std::sync::Condvar,
     free: std::sync::Condvar,
@@ -610,13 +727,14 @@ struct StripeFeed {
 }
 
 impl StripeFeed {
-    fn new(band_count: usize) -> Self {
+    fn new(band_count: usize, areas: usize) -> Self {
         Self {
+            areas,
             state: std::sync::Mutex::new(FeedState {
-                tickets: std::array::from_fn(|_| None),
+                tickets: vec![None; areas],
                 published: 0,
                 completed: 0,
-                done: [0; STAGING_AREA_COUNT],
+                done: vec![0; areas],
                 failed: false,
             }),
             ready: std::sync::Condvar::new(),
@@ -636,7 +754,7 @@ impl StripeFeed {
     /// pass has already failed and the producer must stop.
     fn wait_for_area(&self, batch_index: usize) -> bool {
         let mut state = self.lock();
-        while !state.failed && state.completed + STAGING_AREA_COUNT <= batch_index {
+        while !state.failed && state.completed + self.areas <= batch_index {
             state = self
                 .free
                 .wait(state)
@@ -645,14 +763,14 @@ impl StripeFeed {
         if state.failed {
             return false;
         }
-        state.tickets[batch_index % STAGING_AREA_COUNT] = None;
+        state.tickets[batch_index % self.areas] = None;
         true
     }
 
     /// Producer: hand a filled area to the bands.
     fn publish(&self, batch_index: usize, ticket: BatchTicket) {
         let mut state = self.lock();
-        state.tickets[batch_index % STAGING_AREA_COUNT] = Some(ticket);
+        state.tickets[batch_index % self.areas] = Some(ticket);
         state.published = batch_index + 1;
         drop(state);
         self.ready.notify_all();
@@ -671,14 +789,14 @@ impl StripeFeed {
         if state.failed {
             return None;
         }
-        state.tickets[batch_index % STAGING_AREA_COUNT].clone()
+        state.tickets[batch_index % self.areas].clone()
     }
 
     /// Band: record that this band is done with `batch_index`. Must be called
     /// only after the band's own ticket clone has been dropped.
     fn release(&self, batch_index: usize) {
         let mut state = self.lock();
-        let area = batch_index % STAGING_AREA_COUNT;
+        let area = batch_index % self.areas;
         state.done[area] += 1;
         if state.done[area] == self.band_count {
             state.done[area] = 0;
@@ -719,7 +837,7 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
     factors: &FactorSource,
     exponents: &[RecoveryExponent],
     staging: &mut [std::sync::Arc<AlignedBuffer>],
-    transfer: &mut AlignedBuffer,
+    transfers: &mut Vec<AlignedBuffer>,
     output: &mut [u8],
     batch_starts: &[usize],
     geometry: StripeGeometry,
@@ -727,6 +845,7 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
     #[cfg(target_arch = "x86_64")]
     jit_workspaces: &mut [reedsolomon_rs::xor_jit::packed::PackedJitWorkspace],
     #[cfg(target_arch = "x86_64")] jit_code_budget: usize,
+    observer: Option<&mut dyn ForwardSourceObserver>,
 ) -> Result<()> {
     debug_assert_eq!(output.len(), exponents.len() * geometry.output_stride);
     let band_bytes = checked_mul(
@@ -738,11 +857,28 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
     #[cfg(target_arch = "x86_64")]
     debug_assert_eq!(jit_workspaces.len(), band_count);
     let batch_count = batch_starts.len();
-    let feed = StripeFeed::new(band_count);
+    let feed = StripeFeed::new(band_count, configured_staging_areas());
     let feed = &feed;
     let source_count = provider.source_count();
 
+    // The source hasher gets its own thread and its own queue of raw batches.
+    // It could run on the producer instead — it is the thread that just read
+    // the bytes — but then the bands could not start a batch until it had been
+    // hashed as well as staged, which puts a per-batch deadline on a digest
+    // that only has to keep up ON AVERAGE. Measured on an 18-thread host,
+    // 256 MiB over 4096 sources: hashing on the producer cost 0.32 s of wall
+    // where the same hashing on the same host cost 0.02-0.07 s once the bands
+    // were slow enough (six of them) to hide it. Decoupled, the bands wait
+    // only for the read and the layout conversion, and the hasher may lag by
+    // as many batches as the transfer pool is deep.
+    let mut hasher_result: Option<Result<()>> = None;
     let mut band_results: Vec<Result<()>> = Vec::with_capacity(band_count);
+    let (free_sender, free_receiver) = std::sync::mpsc::channel::<AlignedBuffer>();
+    let (job_sender, job_receiver) = std::sync::mpsc::channel::<HashJob>();
+    for buffer in transfers.drain(..) {
+        let _ = free_sender.send(buffer);
+    }
+
     let produced = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(band_count);
         let bands = output
@@ -772,6 +908,13 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
                 )
             }));
         }
+        let hasher = observer.map(|observer| {
+            let free_sender = free_sender.clone();
+            scope.spawn(move || run_source_hasher(observer, job_receiver, free_sender))
+        });
+        // With no hasher on this pass nothing would ever drain the queue, so
+        // the producer recycles its own buffers instead of posting jobs.
+        let hash_jobs = hasher.is_some().then_some(&job_sender);
 
         let produced = produce_stripe(
             kernel,
@@ -779,7 +922,9 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
             options,
             contract,
             staging,
-            transfer,
+            &free_receiver,
+            &free_sender,
+            hash_jobs,
             batch_starts,
             geometry,
             source_count,
@@ -788,26 +933,64 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
         if produced.is_err() {
             feed.fail();
         }
+        // Closing the queue is what tells the hasher the stripe is over.
+        drop(job_sender);
+        if let Some(hasher) = hasher {
+            hasher_result = Some(
+                hasher
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+            );
+        }
         band_results.extend(handles.into_iter().map(|handle| {
-            handle.join().unwrap_or_else(|payload| {
-                // `panic = "abort"` in release makes this unreachable
-                // there; under a unwinding test profile the band's panic
-                // must surface as a panic, not as a silent short pass.
-                std::panic::resume_unwind(payload)
-            })
+            handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
         }));
         produced
     });
 
+    // A hasher error is the specific one; the producer's is a bare "the queue
+    // closed", so report the hasher's first.
+    if let Some(result) = hasher_result {
+        result?;
+    }
     produced?;
     for result in band_results {
         result?;
+    }
+    // Reclaim the pool for the next stripe. Both the hasher and the producer
+    // have finished, so every buffer is back on the free channel.
+    transfers.extend(free_receiver.try_iter());
+    Ok(())
+}
+
+/// The source hasher half of [`encode_stripe_banded`]: hash each staged batch
+/// and return its buffer to the producer's pool.
+fn run_source_hasher(
+    observer: &mut dyn ForwardSourceObserver,
+    jobs: std::sync::mpsc::Receiver<HashJob>,
+    free: std::sync::mpsc::Sender<AlignedBuffer>,
+) -> Result<()> {
+    while let Ok(job) = jobs.recv() {
+        observe_batch(
+            observer,
+            job.buffer.as_bytes(),
+            job.first_source_index,
+            job.live_inputs,
+            job.slot_stride,
+            &job.slice_lens,
+        )?;
+        // A closed free channel means the producer is already gone; the stripe
+        // is ending either way, so the buffer simply drops.
+        let _ = free.send(job.buffer);
     }
     Ok(())
 }
 
 /// The producer half of [`encode_stripe_banded`]: fill one staging area per
-/// input batch, in increasing source order, and hand it to the bands.
+/// input batch, in increasing source order, hand it to the bands, and queue
+/// its raw bytes for the source hasher.
 #[allow(clippy::too_many_arguments)]
 fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
     kernel: ResolvedKernel,
@@ -815,35 +998,41 @@ fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
     options: &ForwardEncoderOptions,
     contract: KernelContract,
     staging: &mut [std::sync::Arc<AlignedBuffer>],
-    transfer: &mut AlignedBuffer,
+    free: &std::sync::mpsc::Receiver<AlignedBuffer>,
+    recycle: &std::sync::mpsc::Sender<AlignedBuffer>,
+    jobs: Option<&std::sync::mpsc::Sender<HashJob>>,
     batch_starts: &[usize],
     geometry: StripeGeometry,
     source_count: usize,
     feed: &StripeFeed,
 ) -> Result<()> {
+    let slot_stride = transfer_slot_stride(geometry.aligned_len)?;
     for (batch_index, &source_start) in batch_starts.iter().enumerate() {
         check_cancel(options)?;
         if !feed.wait_for_area(batch_index) {
             // A band already failed; its error is the one that surfaces.
             return Ok(());
         }
-        let area = batch_index % STAGING_AREA_COUNT;
-        let buffer = std::sync::Arc::get_mut(&mut staging[area])
+        let mut buffer = free
+            .recv()
+            .map_err(|_| resource_limit("source hashing stopped before the stripe finished"))?;
+        let mut slice_lens = [0usize; MAX_INPUT_GROUPING];
+        let area = batch_index % feed.areas;
+        let staged = std::sync::Arc::get_mut(&mut staging[area])
             .ok_or_else(|| resource_limit("staging area is still in use"))?;
         fill_staging(
             kernel,
-            buffer,
-            transfer,
+            staged,
+            &mut buffer,
             provider,
             source_start,
             geometry.stripe_offset,
             geometry.actual_len,
             geometry.aligned_len,
             contract,
+            &mut slice_lens,
         )?;
-        let live_inputs = source_count
-            .saturating_sub(source_start)
-            .min(contract.input_grouping);
+        let live_inputs = live_batch_inputs(source_count, source_start, contract);
         feed.publish(
             batch_index,
             BatchTicket {
@@ -852,6 +1041,26 @@ fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
                 live_inputs,
             },
         );
+        match jobs {
+            Some(jobs) => {
+                if jobs
+                    .send(HashJob {
+                        buffer,
+                        first_source_index: source_start,
+                        live_inputs,
+                        slot_stride,
+                        slice_lens,
+                    })
+                    .is_err()
+                {
+                    // The hasher stopped; its error is the one that surfaces.
+                    return Ok(());
+                }
+            }
+            None => {
+                let _ = recycle.send(buffer);
+            }
+        }
     }
     Ok(())
 }
@@ -1410,6 +1619,9 @@ fn configured_stripe_cap_bytes() -> Option<usize> {
 
 struct BufferPlan {
     chunk_len: usize,
+    /// The stride-aligned stripe length the buffers are sized for. Read by the
+    /// plan-shape tests; every runtime use derives its own from `chunk_len`.
+    #[cfg_attr(not(test), allow(dead_code))]
     aligned_chunk_len: usize,
     /// Distance between consecutive output rows in the output buffer:
     /// `aligned_chunk_len` plus the stripe skew (see [`SKEW_PERIOD_BYTES`]).
@@ -1417,6 +1629,8 @@ struct BufferPlan {
     row_stride: usize,
     staging_bytes: usize,
     output_bytes: usize,
+    /// One staged source group, held once (the producer is a single thread).
+    transfer_bytes: usize,
     data_bytes: usize,
     memory_bytes: usize,
     // Read only by the x86 accumulate path; other arches plan it but never
@@ -1489,9 +1703,17 @@ impl BufferPlan {
                 skew,
                 "aligned buffer allocation overflow",
             )?;
+            // One transfer buffer per ring slot, each holding a whole input
+            // batch of raw source bytes: the producer fills one while the
+            // source hasher still holds the ones behind it.
+            let transfer_bytes = checked_mul(
+                contract.input_grouping,
+                aligned_allocation_bytes,
+                "transfer allocation overflow",
+            )?;
             let data_bytes = checked_add(
                 checked_mul(
-                    STAGING_AREA_COUNT,
+                    configured_staging_areas(),
                     checked_mul(
                         contract.input_grouping,
                         skewed_allocation_bytes,
@@ -1506,8 +1728,8 @@ impl BufferPlan {
                         "output allocation overflow",
                     )?,
                     checked_mul(
-                        TRANSFER_BUFFER_COUNT,
-                        aligned_allocation_bytes,
+                        configured_staging_areas(),
+                        transfer_bytes,
                         "transfer allocation overflow",
                     )?,
                     "forward buffer allocation overflow",
@@ -1523,6 +1745,7 @@ impl BufferPlan {
                     row_stride,
                     staging_bytes,
                     output_bytes,
+                    transfer_bytes,
                     data_bytes,
                     memory_bytes: reserved_bytes + data_bytes,
                     jit_build_limit_bytes,
@@ -1681,6 +1904,36 @@ impl RowFactors {
     }
 }
 
+/// Stripes one forward pass will walk under the same budget the pass itself
+/// resolves.
+///
+/// Creation asks this to decide whether a whole-file digest can be driven from
+/// the encode feed: one stripe means the feed visits each file's bytes in file
+/// order, more than one means it is stripe-major and cannot. Funnels through
+/// `select_kernel_for_memory` exactly as `estimate_forward_memory` does, so
+/// the answer is the shape the pass will actually take.
+pub(crate) fn forward_stripe_count(
+    slice_size: u64,
+    source_count: usize,
+    output_count: usize,
+    memory_limit: usize,
+    requested_kernel: ForwardKernel,
+) -> Result<usize> {
+    if output_count == 0 {
+        return Ok(0);
+    }
+    let slice_size = usize::try_from(slice_size)
+        .map_err(|_| resource_limit("slice size exceeds addressable memory"))?;
+    let (_, buffers) = select_kernel_for_memory(
+        slice_size,
+        output_count,
+        source_count,
+        memory_limit,
+        requested_kernel,
+    )?;
+    Ok(slice_size.div_ceil(buffers.chunk_len))
+}
+
 pub(crate) fn estimate_forward_memory(
     slice_size: u64,
     source_count: usize,
@@ -1771,25 +2024,36 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
     actual_len: usize,
     aligned_len: usize,
     contract: KernelContract,
+    slice_lens: &mut [usize; MAX_INPUT_GROUPING],
 ) -> Result<()> {
     let staging_bytes = staging.as_bytes_mut();
     staging_bytes.fill(0);
+    // The transfer buffer holds the whole batch in its raw, unconverted form,
+    // one 64-byte-aligned slot per source, so it can be handed to the source
+    // hasher after the batch is staged instead of being hashed on this thread.
+    // The staged layouts are no help to a hasher: the folded family scatters
+    // six lanes into one interleaved stream and the packed family rewrites
+    // every block, so only the transfer buffer still holds PAR2's own bytes.
+    let slot_stride = transfer_slot_stride(aligned_len)?;
     let transfer_bytes = transfer.as_bytes_mut();
-    if transfer_bytes.len() < aligned_len {
+    if transfer_bytes.len() < contract.input_grouping.saturating_mul(slot_stride) {
         return Err(resource_limit(
-            "transfer buffer is shorter than aligned stripe",
+            "transfer buffer is shorter than one input batch",
         ));
     }
     let lane_stride = lane_stride(contract, aligned_len);
+    let source_count = provider.source_count();
+    *slice_lens = [0; MAX_INPUT_GROUPING];
 
-    for lane in 0..contract.input_grouping {
-        transfer_bytes[..aligned_len].fill(0);
+    for (lane, slice_len) in slice_lens[..contract.input_grouping].iter_mut().enumerate() {
+        let slot_start = lane * slot_stride;
+        transfer_bytes[slot_start..slot_start + aligned_len].fill(0);
         let source_index = source_start + lane;
-        if source_index < provider.source_count() {
-            provider.read_source_chunk(
+        if source_index < source_count {
+            *slice_len = provider.read_source_chunk(
                 source_index,
                 stripe_offset,
-                &mut transfer_bytes[..actual_len],
+                &mut transfer_bytes[slot_start..slot_start + actual_len],
             )?;
         }
 
@@ -1799,18 +2063,18 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
                     .checked_mul(lane_stride)
                     .ok_or_else(|| resource_limit("staging lane offset overflow"))?;
                 staging_bytes[start..start + aligned_len]
-                    .copy_from_slice(&transfer_bytes[..aligned_len]);
+                    .copy_from_slice(&transfer_bytes[slot_start..slot_start + aligned_len]);
             }
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::Folded => {
-                let group = lane / gf_simd::FOLDED_GROUP;
+                let fold_group = lane / gf_simd::FOLDED_GROUP;
                 let group_lane = lane % gf_simd::FOLDED_GROUP;
-                let group_start = group
+                let group_start = fold_group
                     .checked_mul(gf_simd::FOLDED_GROUP)
                     .and_then(|value| value.checked_mul(lane_stride))
                     .ok_or_else(|| resource_limit("folded staging offset overflow"))?;
                 gf_simd::split_encode_scatter(
-                    &transfer_bytes[..aligned_len],
+                    &transfer_bytes[slot_start..slot_start + aligned_len],
                     &mut staging_bytes
                         [group_start..group_start + aligned_len * gf_simd::FOLDED_GROUP],
                     group_lane,
@@ -1829,7 +2093,7 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
                 for offset in (0..aligned_len).step_by(block) {
                     unsafe {
                         width.prepare_block(
-                            &transfer_bytes[offset..offset + block],
+                            &transfer_bytes[slot_start + offset..slot_start + offset + block],
                             &mut staging_bytes[lane_start + offset..lane_start + offset + block],
                         );
                     }
@@ -1838,6 +2102,54 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// Distance between consecutive raw source slots in the transfer buffer: the
+/// stripe rounded up to a whole cache line, so every slot keeps the alignment
+/// the buffer base has and the split-layout scatter reads an aligned source.
+fn transfer_slot_stride(aligned_len: usize) -> Result<usize> {
+    round_up(aligned_len, 64)
+}
+
+/// One staged batch's raw bytes, on their way to the source hasher.
+struct HashJob {
+    buffer: AlignedBuffer,
+    first_source_index: usize,
+    live_inputs: usize,
+    slot_stride: usize,
+    slice_lens: [usize; MAX_INPUT_GROUPING],
+}
+
+/// Hand one staged batch's raw slices to the observer, in runs the
+/// multi-buffer digest kernel can lane.
+fn observe_batch(
+    observer: &mut dyn ForwardSourceObserver,
+    bytes: &[u8],
+    first_source_index: usize,
+    live_inputs: usize,
+    slot_stride: usize,
+    slice_lens: &[usize; MAX_INPUT_GROUPING],
+) -> Result<()> {
+    let run_len = transfer_group_lanes().clamp(1, MAX_INPUT_GROUPING);
+    let mut index = 0usize;
+    while index < live_inputs {
+        let run = run_len.min(live_inputs - index);
+        let mut views: [&[u8]; MAX_INPUT_GROUPING] = [&[][..]; MAX_INPUT_GROUPING];
+        for (slot, view) in views[..run].iter_mut().enumerate() {
+            let start = (index + slot) * slot_stride;
+            *view = &bytes[start..start + slice_lens[index + slot]];
+        }
+        observer.observe_slices(first_source_index + index, &views[..run])?;
+        index += run;
+    }
+    Ok(())
+}
+
+/// Sources actually present in the batch that starts at `source_start`.
+fn live_batch_inputs(source_count: usize, source_start: usize, contract: KernelContract) -> usize {
+    source_count
+        .saturating_sub(source_start)
+        .min(contract.input_grouping)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2520,9 +2832,10 @@ mod tests {
     fn the_stripe_feed_reclaims_an_area_only_after_every_band_is_done() {
         const BATCHES: usize = 37;
         for band_count in [1usize, 2, 5] {
-            let feed = StripeFeed::new(band_count);
+            let depth = configured_staging_areas();
+            let feed = StripeFeed::new(band_count, depth);
             let feed = &feed;
-            let mut areas: Vec<std::sync::Arc<AlignedBuffer>> = (0..STAGING_AREA_COUNT)
+            let mut areas: Vec<std::sync::Arc<AlignedBuffer>> = (0..depth)
                 .map(|_| std::sync::Arc::new(AlignedBuffer::new(64)))
                 .collect();
             std::thread::scope(|scope| {
@@ -2543,7 +2856,7 @@ mod tests {
                 }
                 for batch in 0..BATCHES {
                     assert!(feed.wait_for_area(batch));
-                    let area = batch % STAGING_AREA_COUNT;
+                    let area = batch % depth;
                     let buffer = std::sync::Arc::get_mut(&mut areas[area])
                         .expect("every band released the area before it was reclaimed");
                     buffer.as_bytes_mut()[0] = (batch % 251) as u8;
@@ -2565,11 +2878,11 @@ mod tests {
     /// `wait_for_area` waits for a completion that will never come.
     #[test]
     fn a_failed_pass_releases_both_sides_of_the_feed() {
-        let feed = StripeFeed::new(2);
+        let feed = StripeFeed::new(2, configured_staging_areas());
         feed.fail();
         assert!(feed.acquire(0).is_none(), "a band must stop on failure");
         assert!(
-            !feed.wait_for_area(STAGING_AREA_COUNT),
+            !feed.wait_for_area(configured_staging_areas()),
             "the producer must stop on failure"
         );
     }
@@ -2597,7 +2910,9 @@ mod tests {
                 let mut staging = AlignedBuffer::new(
                     contract.input_grouping * lane_stride(contract, aligned_len),
                 );
-                let mut transfer = AlignedBuffer::new(aligned_len);
+                let mut transfer = AlignedBuffer::new(
+                    contract.input_grouping * transfer_slot_stride(aligned_len).unwrap(),
+                );
                 fill_staging(
                     resolved,
                     &mut staging,
@@ -2608,6 +2923,7 @@ mod tests {
                     256,
                     aligned_len,
                     contract,
+                    &mut [0usize; MAX_INPUT_GROUPING],
                 )
                 .unwrap();
                 let factors = FactorSource::new(refs.len());
@@ -2713,7 +3029,9 @@ mod tests {
                 let mut staging = AlignedBuffer::new(
                     contract.input_grouping * lane_stride(contract, aligned_len),
                 );
-                let mut transfer = AlignedBuffer::new(aligned_len);
+                let mut transfer = AlignedBuffer::new(
+                    contract.input_grouping * transfer_slot_stride(aligned_len).unwrap(),
+                );
                 fill_staging(
                     resolved,
                     &mut staging,
@@ -2724,6 +3042,7 @@ mod tests {
                     SLICE,
                     aligned_len,
                     contract,
+                    &mut [0usize; MAX_INPUT_GROUPING],
                 )
                 .unwrap();
                 let factors = FactorSource::new(refs.len());
@@ -3287,7 +3606,7 @@ mod tests {
         let refs = [source.as_slice()];
         let mut provider = InMemorySourceProvider { sources: &refs };
         let mut staging = AlignedBuffer::new(DEFAULT_INPUT_GROUPING * 4);
-        let mut transfer = AlignedBuffer::new(4);
+        let mut transfer = AlignedBuffer::new(DEFAULT_INPUT_GROUPING * 64);
         fill_staging(
             ResolvedKernel::Portable,
             &mut staging,
@@ -3303,6 +3622,7 @@ mod tests {
                 tile_bytes: TABLE_TILE_BYTES,
                 skewed_lanes: true,
             },
+            &mut [0usize; MAX_INPUT_GROUPING],
         )
         .unwrap();
         assert_eq!(&staging.as_bytes()[..4], &[0x11, 0x22, 0x33, 0]);
