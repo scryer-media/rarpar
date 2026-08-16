@@ -76,19 +76,22 @@ than adding it.
 
 | CPU | Arch | Instruction set | unrar (binary) | unrar (text) |
 |---|---|---|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.7× | 1.7× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.1× | 1.4× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.7× | 1.3× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.5× | 1.2× |
 | AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.5× | 1.2× |
 | Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× |
-| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× |
-| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× |
-| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× |
-| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× |
+| Apple M5 Max | arm64 | NEON | 1.3× | 1.4× |
+| Arm Cortex-A72 | arm64 | NEON | 2.3× | 1.6× |
+| Arm Neoverse N1 | arm64 | NEON | 3.1× | 1.7× |
+| Arm Neoverse V2 | arm64 | NEON | 3.8× | 1.8× |
+
 
 `binary` is store-mode extraction (uncompressible media payloads, encrypted
 variants included); `text` is compressed extraction (LZ and PPMd). Encrypted
-extraction is the widest win: 2.0×–10.7× depending on silicon.
+extraction is the widest win: 1.2×–13.4× depending on silicon and shape.
 
 Per-case charts for every machine, the full methodology, and the versions
 these numbers were measured with:

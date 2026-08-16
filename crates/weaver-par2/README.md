@@ -55,15 +55,18 @@ source with no file paths at all.
 
 | CPU | Arch | Instruction set | par2 (heavy) |
 |---|---|---|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 1.8× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.7× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.9× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.5× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.3× |
-| Apple M5 Max | arm64 | NEON | 7.1× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.3× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 2.3× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.8× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.9× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.4× |
+| Apple M5 Max | arm64 | NEON | 7.2× |
 | Arm Cortex-A72 | arm64 | NEON | 1.2× |
-| Arm Neoverse N1 | arm64 | NEON | 1.4× |
+| Arm Neoverse N1 | arm64 | NEON | 1.5× |
 | Arm Neoverse V2 | arm64 | NEON | 1.5× |
+
 
 Per-case charts for every machine, the full methodology, and the versions
 these numbers were measured with:

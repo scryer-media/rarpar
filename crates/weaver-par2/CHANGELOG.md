@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
-Additive only: no existing item changed shape or meaning, so this stays inside
-the 0.4.x compatibility range.
+This is a patch release from 0.4.0. Additive only: no existing item changed
+shape or meaning, so it stays inside the 0.4.x compatibility range.
 
 ### Public API
 
@@ -47,6 +47,14 @@ the 0.4.x compatibility range.
   the IFSC CRC32 and MD5 over every byte it consumes, so a mistaken attestation
   fails the repair loudly rather than installing wrong bytes, and an attested
   verdict never promotes a file to a whole-file match.
+- Transaction-owned files are identified by a retained open descriptor, not by
+  `(device, inode, birth)` alone. That triple is forgeable on inode-recycling
+  filesystems — overlayfs hands a freed inode straight back (measured 9/9
+  deterministic), and file times come off a coarse clock, so a delete+recreate
+  inside one tick could make a foreign file read as ours and the transaction
+  would quarantine or overwrite someone else's data. While the pin lives the
+  kernel cannot recycle a referenced inode, so no other file can carry our
+  identity, and the handle follows the file through the quarantine rename.
 
 ### Performance
 
@@ -98,6 +106,27 @@ the 0.4.x compatibility range.
     64, seven initial values across nineteen length classes, and 64 randomized
     streaming-split trials), and the seam is checked at every prefix of update
     sequences that cross the tier threshold in both directions.
+- PAR2 creation got a round of structural work, and the sum crossed a line:
+  create now beats `par2cmdline-turbo` outright on Zen 4 (1.13×) and Haswell
+  (1.05×) in the current benchmark round (>1 = this crate is faster), while
+  still flushing and re-validating every written recovery volume before
+  commit, which the reference tool does not do.
+  - The source scan no longer hashes every file twice: the plan rebuild
+    reuses the scan's digests instead of re-reading the sources.
+  - The recovery feed is chunk-tiled with per-kernel tile constants,
+    default-on. `WEAVER_PAR2_CREATE_STRIPE_MIB` additionally caps the stripe
+    working set; it ships default-off as a documented hatch because its win
+    is microarchitecture-dependent.
+  - GF(2¹⁶) kernel selection for create follows the reference tool's ladder
+    arm for arm (see the `reedsolomon-rs` changelog for the ladder and the
+    new 512-bit shuffle kernel). `WEAVER_PAR2_CREATE_KERNEL` overrides the
+    arm for single-binary A/Bs; the capability probe is never bypassed.
+  - The XOR-JIT arm builds its packed code once per input batch and reuses it
+    across every stripe. The per-row rebuild it replaces — codegen, mapping,
+    and both W^X transitions per output row per stripe — measured at 60% of
+    create wall time on AVX-512-without-GFNI silicon. Admission reserves the
+    whole store up front, so a cache miss can never allocate past what the
+    plan admitted.
 
 ## 0.4.0
 

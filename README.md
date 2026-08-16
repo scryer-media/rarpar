@@ -43,48 +43,51 @@ time.
 
 | CPU | Arch | Instruction set | unrar (binary) | unrar (text) | par2 (heavy) |
 |---|---|---|---:|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 1.8× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× | 1.7× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× | 1.9× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.5× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.3× |
-| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× | 7.1× |
-| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× | 1.2× |
-| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× | 1.4× |
-| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× | 1.5× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.7× | 1.7× | 2.3× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.1× | 1.4× | 1.9× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.7× | 1.3× | 2.3× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.5× | 1.2× | 1.8× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.5× | 1.2× | 1.9× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
+| Apple M5 Max | arm64 | NEON | 1.3× | 1.4× | 7.2× |
+| Arm Cortex-A72 | arm64 | NEON | 2.3× | 1.6× | 1.2× |
+| Arm Neoverse N1 | arm64 | NEON | 3.1× | 1.7× | 1.5× |
+| Arm Neoverse V2 | arm64 | NEON | 3.8× | 1.8× | 1.5× |
 
 **unrar (binary)** is store-mode extraction — uncompressible media payloads,
 including the encrypted and BLAKE2sp variants; this is the dominant
 real-world shape by data volume. **unrar (text)** is compressed extraction
 across the LZ and PPMd decode paths, including compressed machine code and
 the encrypted compressed cases; it includes PPMd, an archaic RAR4 mode that
-is deliberately left unoptimized and loses on every machine. **par2 (heavy)**
+is deliberately left unoptimized and still trails the reference decoder on
+x86-64. **par2 (heavy)**
 is the two heavy-repair cases. The Apple row is the CPU lane; the optional
 Metal lane is charted in the deep dive.
 
 The class geomeans above blend quiet cases with `rarpar`'s widest wins:
-**encrypted extraction runs 2.0×–10.7×** depending on silicon (encrypted
-store-mode reaches 6.1×–10.7× on Arm), inside classes that average lower.
-Per-case charts for every machine are in the
-[benchmark deep dive](docs/benchmark.md).
+**encrypted extraction runs 1.2×–13.4×** depending on silicon and shape
+(encrypted store-mode, the dominant large-release shape, reaches 6.0×–13.4×
+on Arm), inside classes that average lower. Per-case charts for every machine
+are in the [benchmark deep dive](docs/benchmark.md).
 
 One caveat travels with this table: the macOS PAR2 figure is measured against
 upstream's published macOS arm64 reference binary, which is much slower than
 the same version's Linux and Windows builds. The deep dive explains it.
 
 Known weaker shapes remain: RAR4 PPMd and dense compressible-text archives
-trail the reference decoder, and PAR2 generation trails `par2cmdline-turbo`
-— most visibly on Windows — because `rarpar` flushes and re-validates every
-written recovery volume before commit, which the reference tool does not do.
-`rarpar` verifies repaired and extracted output rather than trusting
-timing-only success.
+trail the reference decoder, and PAR2 generation still trails
+`par2cmdline-turbo` on most machines — it is now ahead on Zen 4 and Haswell —
+because `rarpar` flushes and re-validates every written recovery volume
+before commit, which the reference tool does not do. `rarpar` verifies
+repaired and extracted output rather than trusting timing-only success.
 
 Release builds use AWS-LC-backed native crypto and CPU execution only, which
 keeps startup behavior consistent across supported platforms; `rarpar`
 deliberately does not enable optional GPU backends from its underlying PAR2
 library.
 
-**Per-case charts for all nine machines, the full methodology, and the
+**Per-case charts for all machines, the full methodology, and the
 versions these numbers were measured with are in
 [docs/benchmark.md](docs/benchmark.md).**
 
