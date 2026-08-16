@@ -5068,7 +5068,7 @@ fn test_rar4_hp_long_password_fixture_gate() {
     let path = fixture("rar4", "rar4_hp_long_password.rar");
     assert!(
         path.exists(),
-        "missing real RAR4 long-password fixture; generate with engines/weaver-unrar/tests/fixtures/generate_edge_cases.sh"
+        "missing real RAR4 long-password fixture; generate with crates/unrar-rs/tests/fixtures/generate_edge_cases.sh"
     );
 
     let password = "abcdefghijklmnopqrstuvwxyzabcdef";

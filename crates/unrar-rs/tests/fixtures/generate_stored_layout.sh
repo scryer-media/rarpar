@@ -17,7 +17,7 @@
 #   or old-style (.r00) volume names; the RAR4 sets come from `rar:4` via
 #   generate_edge_cases.sh.
 #
-# Usage: bash crates/weaver-unrar/tests/fixtures/generate_stored_layout.sh
+# Usage: bash crates/unrar-rs/tests/fixtures/generate_stored_layout.sh
 #
 # Output is not byte-reproducible: RAR stamps archive and file times into the
 # headers. The header *shapes* the tests assert are stable.

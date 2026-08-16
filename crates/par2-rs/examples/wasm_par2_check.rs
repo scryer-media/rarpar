@@ -63,7 +63,7 @@
 //!
 //! Run (wasmtime 47; host::guest preopens):
 //!   wasmtime run \
-//!     --dir crates/weaver-par2/tests/fixtures::/fixtures \
+//!     --dir crates/par2-rs/tests/fixtures::/fixtures \
 //!     --dir <writable-scratch>::/scratch \
 //!     target/wasm32-wasip1/release/examples/wasm_par2_check.wasm /fixtures /scratch
 //!
@@ -80,7 +80,7 @@
 //!
 //! Also runs natively for parity debugging:
 //!   cargo run --release -p par2-rs --example wasm_par2_check -- \
-//!     crates/weaver-par2/tests/fixtures <scratch>
+//!     crates/par2-rs/tests/fixtures <scratch>
 //!
 //! Environment knobs (all optional):
 //!   * `WEAVER_WASM_BENCH=N` — timing mode: run each phase N times and report

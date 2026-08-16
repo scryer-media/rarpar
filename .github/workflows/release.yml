@@ -21,8 +21,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  RARPAR_LFS_TEST_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar,crates/weaver-unrar/tests/fixtures/rar5/rar5_recovery_volumes.part*,crates/weaver-unrar/tests/fixtures/rar4/rar4_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_oldmv*,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**
-  RARPAR_LFS_SMOKE_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar
+  RARPAR_LFS_TEST_FIXTURES: crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_symlink.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_recovery_volumes.part*,crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar,crates/unrar-rs/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_oldmv*,crates/par2-rs/tests/fixtures/rar5_lz_plain/**
+  RARPAR_LFS_SMOKE_FIXTURES: crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
@@ -452,7 +452,7 @@ jobs:
           "$exe" --help > "logs/rarpar-${{ matrix.platform }}-help.log"
           "$exe" --version > "logs/rarpar-${{ matrix.platform }}-version.log"
           grep -Fxq "rarpar ${RELEASE_TAG#rarpar-v}" "logs/rarpar-${{ matrix.platform }}-version.log"
-          "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar \
+          "$exe" lb crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar \
             > "logs/rarpar-${{ matrix.platform }}-lb.log"
           grep -Fxq small.txt "logs/rarpar-${{ matrix.platform }}-lb.log"
       - name: Smoke test release binary (Windows)
@@ -467,7 +467,7 @@ jobs:
           if ($version.Trim() -ne "rarpar $($env:RELEASE_TAG -replace '^rarpar-v', '')") {
             throw "rarpar --version output did not match release tag"
           }
-          & $exe lb crates\weaver-unrar\tests\fixtures\rar5\rar5_store.rar `
+          & $exe lb crates\unrar-rs\tests\fixtures\rar5\rar5_store.rar `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-lb.log"
           if (-not (Select-String -Path "logs\rarpar-${{ matrix.platform }}-lb.log" -Pattern '^small\.txt$' -Quiet)) {
             throw "rarpar lb smoke test did not list small.txt"
@@ -484,7 +484,7 @@ jobs:
           cp README.md package/
           cp tools/rarpar/LICENSE package/LICENSE
           cp LICENSE package/LICENSE.GPL-3.0-or-later
-          cp crates/weaver-unrar/LICENSE package/LICENSE.unrar-rs
+          cp crates/unrar-rs/LICENSE package/LICENSE.unrar-rs
           cp -R target/dist/docs/share package/share
           tar -czf "$archive" -C package .
           mv "$archive" dist/
@@ -500,7 +500,7 @@ jobs:
           Copy-Item README.md package\
           Copy-Item tools\rarpar\LICENSE package\LICENSE
           Copy-Item LICENSE package\LICENSE.GPL-3.0-or-later
-          Copy-Item crates\weaver-unrar\LICENSE package\LICENSE.unrar-rs
+          Copy-Item crates\unrar-rs\LICENSE package\LICENSE.unrar-rs
           Copy-Item target\dist\docs\share package\share -Recurse
           Compress-Archive -Path package\* -DestinationPath $archive
           Move-Item $archive dist\

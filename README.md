@@ -322,11 +322,11 @@ the archive set; it waits for each later volume instead.
 
 ## Workspace Packages
 
-- `crates/weaver-reed-solomon`: Reed-Solomon finite-field kernels shared by
+- `crates/reedsolomon-rs`: Reed-Solomon finite-field kernels shared by
   RAR recovery and PAR2 repair. Licensed GPL-3.0-or-later.
-- `crates/weaver-unrar`: RAR reading, probing, extraction, and recovery only.
+- `crates/unrar-rs`: RAR reading, probing, extraction, and recovery only.
   Licensed GPL-3.0-or-later with the additional UnRAR source-code restriction.
-- `crates/weaver-par2`: PAR2 packet loading, creation, verification,
+- `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Source is GPL-3.0-or-later. Normal
@@ -367,7 +367,7 @@ The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
 - `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
   GPL-3.0-or-later.
 - `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
-  restriction documented in `crates/weaver-unrar/LICENSE`.
+  restriction documented in `crates/unrar-rs/LICENSE`.
 - `rarpar` binary releases link `unrar-rs` and therefore carry that
   additional restriction too. Release archives include `LICENSE`,
   `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.

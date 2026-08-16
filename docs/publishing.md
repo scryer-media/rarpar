@@ -46,8 +46,8 @@ it does not automatically keep files out of the `.crate` upload.
 The large local fixture corpora stay in this repository for parity and
 regression testing, but they are excluded from published library packages:
 
-- `crates/weaver-unrar/tests/fixtures/**`
-- `crates/weaver-par2/tests/fixtures/**`
+- `crates/unrar-rs/tests/fixtures/**`
+- `crates/par2-rs/tests/fixtures/**`
 
 Before publishing, check the package output and file lists. The expected package
 sizes should stay in the low MiB/KiB range, not hundreds of MiB.

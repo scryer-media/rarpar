@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/weaver-reed-solomon",
-    "crates/weaver-unrar",
-    "crates/weaver-par2",
+    "crates/reedsolomon-rs",
+    "crates/unrar-rs",
+    "crates/par2-rs",
     "tools/rarpar",
     "xtask",
 ]

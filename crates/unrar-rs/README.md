@@ -122,4 +122,4 @@ GPL-3.0-or-later, with the additional UnRAR source-code restriction:
 > resulting package.
 
 This restriction is why the crate provides no compression or archive-writing
-API, and it applies to anything that links this crate. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-unrar/LICENSE).
+API, and it applies to anything that links this crate. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/unrar-rs/LICENSE).

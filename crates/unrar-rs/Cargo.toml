@@ -51,7 +51,7 @@ slow-tests = []
 ppmd-debug = []
 
 [dependencies]
-reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.4.0", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc-fast = { workspace = true }

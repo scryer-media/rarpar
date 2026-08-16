@@ -30,9 +30,9 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       PPMD_FIXTURES: >-
-        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_restart.rar,
-        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_mv.rar,
-        crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_order16_32m.rar
+        crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_restart.rar,
+        crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_mv.rar,
+        crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_order16_32m.rar
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

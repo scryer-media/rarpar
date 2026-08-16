@@ -15,7 +15,7 @@ Binary release archives include:
 
 Source checkouts include the full GNU GPL version 3 text in the workspace root
 `LICENSE` file and the complete unrar-rs license in
-`crates/weaver-unrar/LICENSE`.
+`crates/unrar-rs/LICENSE`.
 
 ## UnRAR Source-Code Restriction
 

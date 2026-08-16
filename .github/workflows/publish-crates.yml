@@ -33,7 +33,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_ALL_FIXTURES: crates/unrar-rs/tests/fixtures/**,crates/par2-rs/tests/fixtures/**
 
 jobs:
   preflight:
@@ -176,9 +176,9 @@ jobs:
 
           manifest_for_crate() {
             case "$1" in
-              reedsolomon-rs) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
-              unrar-rs) echo "crates/weaver-unrar/Cargo.toml" ;;
-              par2-rs) echo "crates/weaver-par2/Cargo.toml" ;;
+              reedsolomon-rs) echo "crates/reedsolomon-rs/Cargo.toml" ;;
+              unrar-rs) echo "crates/unrar-rs/Cargo.toml" ;;
+              par2-rs) echo "crates/par2-rs/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
           }

@@ -27,7 +27,7 @@ metal = ["reedsolomon-rs/metal"]
 wgpu = ["reedsolomon-rs/wgpu"]
 
 [dependencies]
-reedsolomon-rs = { path = "../weaver-reed-solomon", version = "0.4.0", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
@@ -69,7 +69,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # dev-dependencies from the published manifest, so the crates.io package
 # carries no unrar-rs (and no UnRAR license-restriction) reference.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-unrar-rs = { path = "../weaver-unrar", default-features = false, features = [
+unrar-rs = { path = "../unrar-rs", default-features = false, features = [
     "native-crypto",
 ] }
 criterion = "0.8"

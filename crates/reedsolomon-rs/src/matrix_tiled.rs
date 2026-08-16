@@ -42,7 +42,7 @@ use rayon::prelude::*;
 pub const TILE_GROUP: usize = 8;
 
 // Row-batching / parallelism thresholds mirror `par2-rs`'s rank-1 path
-// (`crates/weaver-par2/src/matrix.rs`) so both elimination strategies schedule
+// (`crates/par2-rs/src/matrix.rs`) so both elimination strategies schedule
 // identically.
 const SIMD_ELIMINATION_ROWS: usize = 16;
 const PARALLEL_ELIMINATION_ROWS: usize = 128;

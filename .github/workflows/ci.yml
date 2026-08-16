@@ -23,10 +23,10 @@ env:
   # Pinned: the wasm harness lanes are only comparable with each other if they
   # all executed on the same runtime. Bump deliberately, not incidentally.
   WASMTIME_VERSION: 47.0.3
-  WEAVER_LFS_ALL_FIXTURES: crates/weaver-unrar/tests/fixtures/**,crates/weaver-par2/tests/fixtures/**
-  WEAVER_LFS_PAR2_FIXTURES: crates/weaver-par2/tests/fixtures/**
-  WEAVER_LFS_UNIT_FIXTURES: crates/weaver-unrar/tests/fixtures/rar5/rar5_hp_store.rar,crates/weaver-unrar/tests/fixtures/rar4/rar4_hp_large.rar
-  WEAVER_LFS_UNRAR_FIXTURES: crates/weaver-unrar/tests/fixtures/**
+  WEAVER_LFS_ALL_FIXTURES: crates/unrar-rs/tests/fixtures/**,crates/par2-rs/tests/fixtures/**
+  WEAVER_LFS_PAR2_FIXTURES: crates/par2-rs/tests/fixtures/**
+  WEAVER_LFS_UNIT_FIXTURES: crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar,crates/unrar-rs/tests/fixtures/rar4/rar4_hp_large.rar
+  WEAVER_LFS_UNRAR_FIXTURES: crates/unrar-rs/tests/fixtures/**
 
 jobs:
   changes:
@@ -190,7 +190,7 @@ jobs:
           # Directory paths, not package names. The crates were renamed in their
           # manifests but their directories were deliberately left in place, and
           # every other path in this workflow reflects that.
-          if grep -Ev '^crates/(weaver-unrar|weaver-par2)/tests/fixtures/' .ci-lfs-files.txt; then
+          if grep -Ev '^crates/(unrar-rs|par2-rs)/tests/fixtures/' .ci-lfs-files.txt; then
             echo "::error::unexpected Git LFS path outside fixture corpora"
             exit 1
           fi
@@ -952,9 +952,9 @@ jobs:
 
           manifest_for_crate() {
             case "$1" in
-              reedsolomon-rs) echo "crates/weaver-reed-solomon/Cargo.toml" ;;
-              unrar-rs) echo "crates/weaver-unrar/Cargo.toml" ;;
-              par2-rs) echo "crates/weaver-par2/Cargo.toml" ;;
+              reedsolomon-rs) echo "crates/reedsolomon-rs/Cargo.toml" ;;
+              unrar-rs) echo "crates/unrar-rs/Cargo.toml" ;;
+              par2-rs) echo "crates/par2-rs/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
           }
@@ -1223,7 +1223,7 @@ jobs:
       - name: Hydrate smoke fixtures
         run: |
           set -euo pipefail
-          include="crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar,crates/weaver-par2/tests/fixtures/rar5_lz_plain/**"
+          include="crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar,crates/par2-rs/tests/fixtures/rar5_lz_plain/**"
           git lfs install --local
           git lfs pull --include="$include" --exclude=""
           git lfs fsck --pointers
@@ -1270,8 +1270,8 @@ jobs:
               python3 -c 'import json,sys; print(next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "rarpar")["version"])'
           )"
           grep -Fxq "rarpar ${expected_version}" .ci-rarpar-version.txt
-          "$exe" inspect --json crates/weaver-par2/tests/fixtures/rar5_lz_plain > .ci-rarpar-inspect.json
-          "$exe" lb crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar > .ci-rarpar-lb.txt
+          "$exe" inspect --json crates/par2-rs/tests/fixtures/rar5_lz_plain > .ci-rarpar-inspect.json
+          "$exe" lb crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar > .ci-rarpar-lb.txt
           grep -Fxq small.txt .ci-rarpar-lb.txt
           python3 -m json.tool .ci-rarpar-inspect.json >/dev/null
       - name: Show sccache stats
@@ -1387,7 +1387,7 @@ jobs:
       - name: Run the PAR2 harness natively, then on every wasm lane
         run: |
           set -euo pipefail
-          fixtures="$PWD/crates/weaver-par2/tests/fixtures"
+          fixtures="$PWD/crates/par2-rs/tests/fixtures"
           check="$PWD/.github/scripts/wasm-harness-check.sh"
           reports="$RUNNER_TEMP/par2-reports"
           mkdir -p "$reports"
@@ -1498,27 +1498,27 @@ jobs:
           # gains a case that is not covered here the missing file stays an LFS
           # pointer and the harness fails loudly on it.
           include="$(paste -sd, - <<'GLOBS'
-          crates/weaver-unrar/tests/fixtures/rar4/generated_matrix_rar4_lz_enc.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar4/generated_matrix_rar4_lz_plain.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_lz.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_mv_store.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_enc_store.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_lz.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_lz_solid_mv.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_mv_store.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_mv.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_ppm_solid_restart.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_solid.rar
-          crates/weaver-unrar/tests/fixtures/rar4/rar4_store.rar
-          crates/weaver-unrar/tests/fixtures/rar5/generated_matrix_rar5_lz_enc.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar5/generated_matrix_rar5_lz_plain.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_lz.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_enc_store.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_lz.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_mv_store.part*.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_solid.rar
-          crates/weaver-unrar/tests/fixtures/rar5/rar5_store.rar
+          crates/unrar-rs/tests/fixtures/rar4/generated_matrix_rar4_lz_enc.part*.rar
+          crates/unrar-rs/tests/fixtures/rar4/generated_matrix_rar4_lz_plain.part*.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_enc_lz.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_enc_mv_store.part*.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_enc_store.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_lz.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_lz_solid_mv.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_mv_store.part*.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_mv.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_restart.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_solid.rar
+          crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar
+          crates/unrar-rs/tests/fixtures/rar5/generated_matrix_rar5_lz_enc.part*.rar
+          crates/unrar-rs/tests/fixtures/rar5/generated_matrix_rar5_lz_plain.part*.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_enc_lz.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_lz.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_mv_store.part*.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_solid.rar
+          crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar
           GLOBS
           )"
           git lfs install --local
@@ -1582,7 +1582,7 @@ jobs:
       - name: Run the UnRAR harness natively, then on every wasm lane
         run: |
           set -euo pipefail
-          fixtures="$PWD/crates/weaver-unrar/tests/fixtures"
+          fixtures="$PWD/crates/unrar-rs/tests/fixtures"
           check="$PWD/.github/scripts/wasm-harness-check.sh"
           reports="$RUNNER_TEMP/unrar-reports"
           mkdir -p "$reports"

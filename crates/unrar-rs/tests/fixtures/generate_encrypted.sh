@@ -7,7 +7,7 @@
 #
 # Requirements: docker images `rar:latest` (RAR5/7.x) and `rar:4` (RAR4/6.x)
 #
-# Usage: cd engines/weaver-unrar/tests/fixtures && bash generate_encrypted.sh
+# Usage: cd crates/unrar-rs/tests/fixtures && bash generate_encrypted.sh
 set -euo pipefail
 
 FIXTURE_DIR="$(cd "$(dirname "$0")" && pwd)"

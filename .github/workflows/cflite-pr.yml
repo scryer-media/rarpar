@@ -3,8 +3,8 @@ name: ClusterFuzzLite PR fuzzing
 on:
   pull_request:
     paths:
-      - 'crates/weaver-unrar/**'
-      - 'crates/weaver-par2/**'
+      - 'crates/unrar-rs/**'
+      - 'crates/par2-rs/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
 

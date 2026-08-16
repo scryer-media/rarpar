@@ -4,7 +4,7 @@
 # Requirements: docker images `rar:latest` (RAR5/7.20) and `rar:4` (RAR4/6.24)
 # Both images have `rar` as their Docker ENTRYPOINT, so we pass args directly.
 #
-# Usage: cd engines/weaver-unrar/tests/fixtures && bash generate_edge_cases.sh
+# Usage: cd crates/unrar-rs/tests/fixtures && bash generate_edge_cases.sh
 set -euo pipefail
 
 FIXTURE_DIR="$(cd "$(dirname "$0")" && pwd)"

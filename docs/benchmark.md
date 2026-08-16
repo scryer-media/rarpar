@@ -167,9 +167,9 @@ vectors.
 |---:|---:|---:|---:|---:|---:|
 | 2.40× | 3.83× | 1.67× | 2.48× | 0.81× | 2.34× |
 
-[![RAR workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)
+[![RAR workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-zen4-avx512.svg)
 
-[![PAR2 workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)
+[![PAR2 workloads on AMD EPYC 9R14, Zen 4, GFNI + AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-zen4-avx512.svg)
 
 ### Intel Xeon Platinum 8488C (Sapphire Rapids)
 
@@ -181,9 +181,9 @@ vectors.
 |---:|---:|---:|---:|---:|---:|
 | 1.85× | 2.81× | 1.29× | 2.07× | 0.80× | 1.91× |
 
-[![RAR workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)
+[![RAR workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-spr-avx512.svg)
 
-[![PAR2 workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)
+[![PAR2 workloads on Intel Xeon Platinum 8488C, Sapphire Rapids, GFNI + AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-spr-avx512.svg)
 
 ## GFNI + AVX2
 
@@ -199,9 +199,9 @@ candidate `rarpar 0.3.1`, static-musl x86-64 build `f796ac3b…` · references
 |---:|---:|---:|---:|---:|---:|
 | 1.50× | 2.27× | 1.14× | 1.98× | 0.83× | 2.30× |
 
-[![RAR workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64.svg)
+[![RAR workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
-[![PAR2 workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64.svg)
+[![PAR2 workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64.svg)
 
 ## AVX-512
 
@@ -210,9 +210,9 @@ kernel rather than `GF2P8AFFINEQB`.
 
 ### Intel Xeon Platinum 8124M (Skylake-SP)
 
-[![RAR workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)
+[![RAR workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-skx-avx512.svg)
 
-[![PAR2 workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)
+[![PAR2 workloads on Intel Xeon Platinum 8124M, Skylake-SP, AVX-512](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-skx-avx512.svg)
 
 
 ## AVX2
@@ -221,17 +221,17 @@ No GFNI: the multiply falls back to the split-table `VPSHUFB` kernel.
 
 ### Intel Xeon E5-2666 v3 (Haswell)
 
-[![RAR workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)
+[![RAR workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-hsw-avx2.svg)
 
-[![PAR2 workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)
+[![PAR2 workloads on Intel Xeon E5-2666 v3, Haswell, AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-hsw-avx2.svg)
 
 
 ### AMD Ryzen 5 3600 (Zen 2)
 
 
-[![RAR workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-windows-x86_64.svg)
+[![RAR workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-windows-x86_64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-windows-x86_64.svg)
 
-[![PAR2 workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-windows-x86_64.svg)
+[![PAR2 workloads on AMD Ryzen 5 3600, Zen 2, AVX2](../crates/par2-rs/docs/rarpar-par2-benchmark-windows-x86_64.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-windows-x86_64.svg)
 
 
 ## SSSE3 (no AVX)
@@ -239,9 +239,9 @@ No GFNI: the multiply falls back to the split-table `VPSHUFB` kernel.
 ### Intel Atom C3538 (Denverton)
 
 
-[![RAR workloads on Intel Atom C3538, Denverton, SSSE3](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
+[![RAR workloads on Intel Atom C3538, Denverton, SSSE3](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
 
-[![PAR2 workloads on Intel Atom C3538, Denverton, SSSE3](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
+[![PAR2 workloads on Intel Atom C3538, Denverton, SSSE3](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-x86_64-noavx.svg)
 
 
 ---
@@ -251,9 +251,9 @@ No GFNI: the multiply falls back to the split-table `VPSHUFB` kernel.
 ## Apple M5 Max (macOS)
 
 
-[![RAR workloads on Apple M5 Max, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-macos-arm64.svg)
+[![RAR workloads on Apple M5 Max, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)
 
-[![PAR2 CPU-lane workloads on Apple M5 Max, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
+[![PAR2 CPU-lane workloads on Apple M5 Max, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-cpu.svg)
 
 The PAR2 column is the one to read with the macOS caveat above in mind: the
 macOS reference binary is slow, and it lifts all six PAR2 cases here.
@@ -266,7 +266,7 @@ override. Only the two heavy-repair cases qualified and ran on the GPU;
 verification, byte-damage, missing-volume, and generation stayed on CPU in
 this lane too.
 
-[![PAR2 Metal-lane workloads on Apple M5 Max](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
+[![PAR2 Metal-lane workloads on Apple M5 Max](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
 
 On this corpus Metal is slightly *slower* in wall time than the NEON path
 (`par2-heavy-damage-250`: 286 ms on Metal against 262 ms on CPU) while using
@@ -276,19 +276,19 @@ NEON kernels already saturate the useful parallelism.
 
 ## Arm Cortex-A72
 
-[![RAR workloads on Arm Cortex-A72, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)
+[![RAR workloads on Arm Cortex-A72, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-a72.svg)
 
-[![PAR2 workloads on Arm Cortex-A72, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)
+[![PAR2 workloads on Arm Cortex-A72, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-a72.svg)
 
 ## Arm Neoverse N1
 
-[![RAR workloads on Arm Neoverse N1, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)
+[![RAR workloads on Arm Neoverse N1, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-n1.svg)
 
-[![PAR2 workloads on Arm Neoverse N1, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)
+[![PAR2 workloads on Arm Neoverse N1, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-n1.svg)
 
 ## Arm Neoverse V2
 
-[![RAR workloads on Arm Neoverse V2, NEON](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)](../crates/weaver-unrar/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)
+[![RAR workloads on Arm Neoverse V2, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-arm64-v2.svg)
 
-[![PAR2 workloads on Arm Neoverse V2, NEON](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)](../crates/weaver-par2/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)
+[![PAR2 workloads on Arm Neoverse V2, NEON](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-linux-arm64-v2.svg)
 

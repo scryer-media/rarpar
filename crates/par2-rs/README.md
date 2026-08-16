@@ -84,10 +84,10 @@ measured against.
 The PAR2 format itself is specified in the
 [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
-Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-par2/CHANGELOG.md).
+Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/CHANGELOG.md).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-par2/LICENSE).
+GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/LICENSE).
 
 [`reedsolomon-rs`]: https://crates.io/crates/reedsolomon-rs

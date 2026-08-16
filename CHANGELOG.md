@@ -34,11 +34,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 ### Libraries
 
 - `reedsolomon-rs` moves to 0.4.1. See
-  [its changelog](crates/weaver-reed-solomon/CHANGELOG.md).
+  [its changelog](crates/reedsolomon-rs/CHANGELOG.md).
 - `unrar-rs` moves to 0.5.1. See
-  [its changelog](crates/weaver-unrar/CHANGELOG.md).
+  [its changelog](crates/unrar-rs/CHANGELOG.md).
 - `par2-rs` moves to 0.4.1. See
-  [its changelog](crates/weaver-par2/CHANGELOG.md).
+  [its changelog](crates/par2-rs/CHANGELOG.md).
 - `aws-lc-rs`/`aws-lc-sys` and the rest of the dependency tree were swept to
   current; the full workspace test matrix (1840 tests plus the slow-test
   corpus lanes) ran green on the swept tree.
@@ -72,8 +72,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 ### Libraries
 
 - `reedsolomon-rs` moves to 0.3.0. See
-  [its changelog](crates/weaver-reed-solomon/CHANGELOG.md).
+  [its changelog](crates/reedsolomon-rs/CHANGELOG.md).
 - `unrar-rs` moves to 0.4.0. See
-  [its changelog](crates/weaver-unrar/CHANGELOG.md).
+  [its changelog](crates/unrar-rs/CHANGELOG.md).
 - `par2-rs` moves to 0.3.0. See
-  [its changelog](crates/weaver-par2/CHANGELOG.md).
+  [its changelog](crates/par2-rs/CHANGELOG.md).

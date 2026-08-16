@@ -1,7 +1,7 @@
 //! SIMD CRC-32/ISO-HDLC tiers that fill the gaps `crc-fast` leaves.
 //!
-//! [`crate::checksum`] delegates the per-slice IFSC checksum to `crc-fast`,
-//! whose runtime dispatch is the right choice almost everywhere. It has one hole on
+//! [`crate::crc`] delegates the bulk member-data checksum to `crc-fast`, whose
+//! runtime dispatch is the right choice almost everywhere. It has one hole on
 //! x86-64, and this module fills exactly that hole and nothing else.
 //!
 //! # The hole
@@ -65,8 +65,7 @@
 /// Smallest `update` the accelerated tier is entered for.
 ///
 /// Below this the fixed cost of leaving and re-entering the `crc-fast` digest
-/// (see [`crate::checksum::Crc32Hasher`]) outweighs the fold's throughput
-/// advantage, and
+/// (see [`crate::crc::Crc32`]) outweighs the fold's throughput advantage, and
 /// `crc-fast`'s SSE tier is already good at short buffers. The kernel itself is
 /// correct at every length from 0 up — the threshold is purely an economic
 /// gate, and the test matrix drives the kernel directly at all lengths so the
@@ -76,8 +75,7 @@ pub(crate) const MIN_UPDATE: usize = 256;
 /// Whether an accelerated CRC tier is active for this build on this host.
 ///
 /// Resolved once and cached. On targets with no tier this is a compile-time
-/// `false`, so the dispatch in [`crate::checksum::Crc32Hasher::update`] folds
-/// away.
+/// `false`, so the dispatch in [`crate::crc::Crc32::update`] folds away.
 #[inline]
 pub(crate) fn available() -> bool {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
@@ -136,11 +134,11 @@ pub(crate) fn crc32_resume_reference(initial: u32, data: &[u8]) -> u32 {
 // ===========================================================================
 // x86-64: 2x256-bit VPCLMULQDQ fold.
 //
-// The kernel below is duplicated verbatim into `unrar-rs`'s `src/crc_simd.rs`.
+// The kernel below is duplicated verbatim into `par2-rs`'s `src/crc_simd.rs`.
 // Both crates are published separately and CI enumerates the publishable crates
 // by name, so a shared internal crate is not available to hold it once; the two
 // copies are held byte-identical instead, by
-// `shared_kernel_region_matches_the_unrar_copy` in this module's tests. Edit one
+// `shared_kernel_region_matches_the_par2_copy` in this module's tests. Edit one
 // copy and that test fails until the other matches.
 //
 // Only the region between the two markers is compared, so the prose outside
@@ -431,7 +429,7 @@ mod tests {
     use super::*;
 
     /// Deterministic xorshift64* — reproducible, adds no dependency. Same
-    /// generator as `crate::checksum`'s tests.
+    /// generator as `crate::crc`'s tests.
     struct XorShift64 {
         state: u64,
     }
@@ -699,15 +697,15 @@ mod tests {
     /// internal crate, because both consumers are separately published and CI
     /// enumerates the publishable crates by name. That is only safe if the
     /// copies cannot drift, which is what this checks: the `SHARED-KERNEL`
-    /// region of this file must match the same region of `unrar-rs`'s copy,
+    /// region of this file must match the same region of `par2-rs`'s copy,
     /// character for character.
     ///
     /// The sibling is read at run time through `CARGO_MANIFEST_DIR` rather than
     /// `include_str!`, so that a `.crate` tarball (which contains no sibling)
     /// still builds and this simply reports a visible skip. It skips the same
-    /// way while the `unrar-rs` copy has not landed yet.
+    /// way while the `par2-rs` copy has not landed yet.
     #[test]
-    fn shared_kernel_region_matches_the_unrar_copy() {
+    fn shared_kernel_region_matches_the_par2_copy() {
         const BEGIN: &str = "// SHARED-KERNEL-BEGIN";
         const END: &str = "// SHARED-KERNEL-END";
 
@@ -742,22 +740,22 @@ mod tests {
         let sibling = manifest
             .parent()
             .expect("crate dir has a parent")
-            .join("weaver-unrar/src/crc_simd.rs");
+            .join("par2-rs/src/crc_simd.rs");
 
         let Ok(sibling_source) = std::fs::read_to_string(&sibling) else {
             eprintln!(
-                "skipping shared_kernel_region_matches_the_unrar_copy: no sibling copy at \
-                 {} (expected inside a packaged .crate)",
+                "skipping shared_kernel_region_matches_the_par2_copy: no sibling copy at \
+                 {} (expected inside a packaged .crate, or before the par2-rs wiring lands)",
                 sibling.display()
             );
             return;
         };
 
-        let ours = shared_region(include_str!("crc_simd.rs"), "the par2-rs copy");
-        let theirs = shared_region(&sibling_source, "the unrar-rs copy");
+        let ours = shared_region(include_str!("crc_simd.rs"), "the unrar-rs copy");
+        let theirs = shared_region(&sibling_source, "the par2-rs copy");
         assert_eq!(
             ours, theirs,
-            "the shared CRC kernel has drifted between par2-rs and unrar-rs; \
+            "the shared CRC kernel has drifted between unrar-rs and par2-rs; \
              the two SHARED-KERNEL regions must stay byte-identical"
         );
     }

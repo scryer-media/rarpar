@@ -55,10 +55,10 @@ constraints. Higher-level callers such as [`par2-rs`] can use that result to
 stay on CPU. The admission threshold is an implementation policy, not a
 performance guarantee.
 
-Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-reed-solomon/CHANGELOG.md).
+Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/CHANGELOG.md).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/weaver-reed-solomon/LICENSE).
+GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/LICENSE).
 
 [`par2-rs`]: https://crates.io/crates/par2-rs
