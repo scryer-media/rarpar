@@ -508,7 +508,34 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run PAR2 slow tests
-        run: cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+        run: |
+          set -euo pipefail
+
+          # Only the `slow-tests` delta. Turning the feature on and running the
+          # whole package re-runs every ungated par2 test that `fixture-tests`
+          # already ran, which is the two slowest suites in the workspace twice
+          # per CI run. These three targets are `#![cfg(feature = "slow-tests")]`
+          # in their entirety, so `--test` selects exactly the gated set (41
+          # tests) and a typo here is a hard cargo error, not a silent zero.
+          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast \
+            --test real_world_generated \
+            --test repair_stress \
+            --test par2cmdline_turbo_functional
+
+          # The remaining two gated tests are unit tests inside
+          # `src/repairer.rs`; moving them to an integration target would mean
+          # making repairer internals public, so they stay put and a name filter
+          # selects them. A name filter that stops matching runs zero tests and
+          # still exits 0, so assert the count rather than trusting the exit
+          # code.
+          cargo test --locked -p par2-rs --features slow-tests --lib -- --exact \
+            repairer::tests::carried_scan_execute_repairs_and_reverifies_clean \
+            repairer::tests::crate_fixture_missing_volume_repairs_and_reverifies_clean \
+            | tee "$RUNNER_TEMP/par2-slow-lib.log"
+          if ! grep -qE '^test result: ok\. 2 passed;' "$RUNNER_TEMP/par2-slow-lib.log"; then
+            echo "::error::expected exactly 2 gated par2 lib tests; the name filter has gone stale"
+            exit 1
+          fi
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -524,7 +551,7 @@ jobs:
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -606,7 +633,27 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run UnRAR slow tests
-        run: cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
+        run: |
+          set -euo pipefail
+
+          # Only the `slow-tests` delta. `-p unrar-rs --features slow-tests`
+          # alone re-runs the entire package on top of `fixture-tests`, and this
+          # crate's lib has NO gated tests at all — that duplicated lib run was
+          # ~31 minutes of this lane. Every target below is
+          # `#![cfg(feature = "slow-tests")]` in its entirety, so `--test`
+          # selects exactly the gated set (22 tests) and a stale target name is
+          # a hard cargo error rather than a silent zero.
+          #
+          # `slow_encrypted` and `slow_imported_corpus` hold the blocks that used
+          # to be `#[cfg(feature = "slow-tests")]` islands inside
+          # `integration.rs` and `imported_corpus.rs`; they were split out so
+          # those two large targets no longer have to run at all here.
+          cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast \
+            --test api_parity \
+            --test failure_paths \
+            --test generated_multivolume_matrix \
+            --test slow_encrypted \
+            --test slow_imported_corpus
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true

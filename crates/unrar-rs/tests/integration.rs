@@ -4708,74 +4708,6 @@ fn test_rar4_fixture_multivolume_video_batch() {
     assert_eq!(result, original("test_clip.mkv"));
 }
 
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_video_batch() {
-    let vol_names = [
-        "rar5_enc_mv_video.part1.rar",
-        "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar",
-        "rar5_enc_mv_video.part4.rar",
-        "rar5_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("test_clip.mkv"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_video_streaming() {
-    let vol_names = [
-        "rar5_enc_mv_video.part1.rar",
-        "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar",
-        "rar5_enc_mv_video.part4.rar",
-        "rar5_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("test_clip.mkv"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_multivolume_video_batch() {
-    let vol_names = [
-        "rar4_enc_mv_video.part1.rar",
-        "rar4_enc_mv_video.part2.rar",
-        "rar4_enc_mv_video.part3.rar",
-        "rar4_enc_mv_video.part4.rar",
-        "rar4_enc_mv_video.part5.rar",
-    ];
-    let mut archive = open_multi("rar4", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("test_clip.mkv"));
-}
-
 // -- RAR5 encrypted (slow — gated behind `slow-tests` feature) ----------------
 
 #[test]
@@ -4791,119 +4723,6 @@ fn test_rar5_encrypted_no_password_fails() {
         result.is_err(),
         "no password should fail for encrypted archive"
     );
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_store_batch() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_store_streaming() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let provider =
-        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_store.rar")]);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_lz_batch() {
-    let mut archive = open_single("rar5", "rar5_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_lz_streaming() {
-    let mut archive = open_single("rar5", "rar5_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let provider =
-        unrar_rs::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_store_batch() {
-    let vol_names = [
-        "rar5_enc_mv_store.part1.rar",
-        "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar",
-        "rar5_enc_mv_store.part4.rar",
-        "rar5_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("binary.bin"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_multivolume_store_streaming() {
-    let vol_names = [
-        "rar5_enc_mv_store.part1.rar",
-        "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar",
-        "rar5_enc_mv_store.part4.rar",
-        "rar5_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar5", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
-    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(0, &opts, &provider, &mut out)
-        .unwrap();
-    assert_eq!(out, original("binary.bin"));
 }
 
 #[test]
@@ -4990,19 +4809,6 @@ fn test_cached_headers_reverse_volume_arrival_merges_without_panicking() {
     assert_eq!(member.volumes.first_volume, 0);
     assert_eq!(member.volumes.last_volume, 4);
     assert_eq!(restored.metadata().volume_count, Some(5));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar5_encrypted_wrong_password_fails() {
-    let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some("wrongpassword".into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None);
-    assert!(result.is_err(), "wrong password should fail");
 }
 
 // -- RAR4 encrypted (slow — gated behind `slow-tests` feature) ----------------
@@ -5163,55 +4969,6 @@ fn test_rar5_hp_encrypted_large_disk_open_to_file() {
     archive
         .extract_member_to_file(0, &opts, None, &out_path)
         .unwrap();
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_store_batch() {
-    let mut archive = open_single("rar4", "rar4_enc_store.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("small.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_lz_batch() {
-    let mut archive = open_single("rar4", "rar4_enc_lz.rar");
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("compressible.txt"));
-}
-
-#[test]
-#[cfg(feature = "slow-tests")]
-fn test_rar4_encrypted_multivolume_store_batch() {
-    let vol_names = [
-        "rar4_enc_mv_store.part1.rar",
-        "rar4_enc_mv_store.part2.rar",
-        "rar4_enc_mv_store.part3.rar",
-        "rar4_enc_mv_store.part4.rar",
-        "rar4_enc_mv_store.part5.rar",
-    ];
-    let mut archive = open_multi("rar4", &vol_names);
-    archive.set_password(TEST_PASSWORD);
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: Some(TEST_PASSWORD.into()),
-        restore_owners: false,
-    };
-    let result = archive.extract_member(0, &opts, None).unwrap();
-    assert_eq!(result, original("binary.bin"));
 }
 
 // =============================================================================
