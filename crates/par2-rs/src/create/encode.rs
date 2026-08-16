@@ -24,7 +24,26 @@ use reedsolomon_rs::gf_simd::{self, PreparedFactorSrc};
 
 use super::plan::default_memory_limit;
 
+/// Sources per input batch for the families whose kernels take one slice per
+/// source in fixed-size groups on x86 (the folded pair kernels take two groups
+/// of six; the packed XOR-JIT is built for twelve regions).
 const DEFAULT_INPUT_GROUPING: usize = 12;
+/// Sources per input batch for the aarch64 CLMUL family. Its kernel folds
+/// eight sources into the destination per pass, so twelve inputs cost a full
+/// pass plus a half-empty one whose per-block reduction and destination
+/// traffic are amortized over only four sources; sixteen is two full passes.
+/// This is the reference's own batching rule (`inputBatchSize = 12 +
+/// idealInputMultiple/2`, rounded down to a multiple of `idealInputMultiple`,
+/// which is 8 for CLMUL_NEON/SHA3) — a fact about the kernel's group shape,
+/// not about any core.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const CLMUL_INPUT_GROUPING: usize = 16;
+/// Upper bound on any family's input grouping: sizes the fixed per-row arrays
+/// (coefficient rows, prepared-source descriptors) that must not touch the
+/// heap per output row.
+const MAX_INPUT_GROUPING: usize = 16;
+const _: () = assert!(DEFAULT_INPUT_GROUPING <= MAX_INPUT_GROUPING);
+const _: () = assert!(CLMUL_INPUT_GROUPING <= MAX_INPUT_GROUPING);
 const STAGING_AREA_COUNT: usize = 2;
 const TRANSFER_BUFFER_COUNT: usize = 2;
 // The stripe pipeline's split_at_mut parity selection and the per-stripe
@@ -33,9 +52,9 @@ const TRANSFER_BUFFER_COUNT: usize = 2;
 const _: () = assert!(STAGING_AREA_COUNT == 2);
 
 /// Folded coefficient groups covered by one output row, bounding the stack
-/// reference tables in `accumulate_band`. Every [`KernelContract`] uses
-/// [`DEFAULT_INPUT_GROUPING`], so this is the exact group count, not a
-/// worst case; the arm still checks before slicing.
+/// reference tables in `accumulate_band`. The folded family's
+/// [`KernelContract`] always uses [`DEFAULT_INPUT_GROUPING`], so this is the
+/// exact group count, not a worst case; the arm still checks before slicing.
 #[cfg(target_arch = "x86_64")]
 const MAX_FOLDED_GROUPS: usize = DEFAULT_INPUT_GROUPING / gf_simd::FOLDED_GROUP;
 
@@ -74,6 +93,28 @@ pub(crate) fn configured_create_threads() -> usize {
                     .map(std::num::NonZeroUsize::get)
                     .unwrap_or(1)
             })
+    })
+}
+
+/// Input grouping for the slice-per-source families that have no structural
+/// group size (`Portable`, `Simd`): the CLMUL grouping on aarch64, the default
+/// elsewhere. `WEAVER_PAR2_CREATE_GROUPING=N` (1..=16) pins it so the two
+/// batch shapes can be A/B'd from one binary (same escape-hatch pattern as
+/// `WEAVER_PAR2_CREATE_THREADS`); unset, `0`, or out of range means the
+/// family default. Process-stable by construction: the staging plan and the
+/// batch loop must agree.
+fn configured_input_grouping() -> usize {
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        let family_default = CLMUL_INPUT_GROUPING;
+        #[cfg(not(target_arch = "aarch64"))]
+        let family_default = DEFAULT_INPUT_GROUPING;
+        std::env::var("WEAVER_PAR2_CREATE_GROUPING")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&grouping| (1..=MAX_INPUT_GROUPING).contains(&grouping))
+            .unwrap_or(family_default)
     })
 }
 
@@ -775,7 +816,7 @@ impl KernelContract {
         match kernel {
             ResolvedKernel::Portable | ResolvedKernel::Simd => Self {
                 stride: 2,
-                input_grouping: DEFAULT_INPUT_GROUPING,
+                input_grouping: configured_input_grouping(),
                 tile_bytes: family_tile_bytes(TABLE_TILE_BYTES, 2),
                 skewed_lanes: true,
             },
@@ -822,8 +863,11 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
         size_of::<u16>(),
         "factor constant allocation overflow",
     )?;
+    // The per-row arrays are sized for the widest grouping; the per-chunk
+    // vectors below follow the family's actual grouping.
+    let grouping = KernelContract::for_kernel(kernel).input_grouping;
     let row = checked_mul(
-        DEFAULT_INPUT_GROUPING,
+        MAX_INPUT_GROUPING,
         size_of::<u16>(),
         "factor row allocation overflow",
     )?;
@@ -837,16 +881,12 @@ fn factor_workspace_bytes(kernel: ResolvedKernel, source_count: usize) -> Result
                     // loop runs inside a chunk of `COEFF_ROWS` rows so no row's
                     // coefficients are rebuilt per tile. A compile-time count,
                     // so this still scales with neither rows nor threads.
-                    checked_mul(
-                        COEFF_ROWS,
-                        DEFAULT_INPUT_GROUPING,
-                        "prepared factor allocation overflow",
-                    )?,
+                    checked_mul(COEFF_ROWS, grouping, "prepared factor allocation overflow")?,
                     size_of::<gf_simd::PreparedInputFactor>(),
                     "prepared factor allocation overflow",
                 )?,
                 checked_mul(
-                    DEFAULT_INPUT_GROUPING,
+                    MAX_INPUT_GROUPING,
                     size_of::<PreparedFactorSrc>(),
                     "prepared source allocation overflow",
                 )?,
@@ -1266,7 +1306,7 @@ impl FactorSource {
     /// from every output row — table traffic that also evicts the streaming
     /// kernel's working set.
     fn row_factors(&self, source_start: usize, live_inputs: usize) -> RowFactors {
-        let mut logs = [0u16; DEFAULT_INPUT_GROUPING];
+        let mut logs = [0u16; MAX_INPUT_GROUPING];
         for (lane, log) in logs[..live_inputs].iter_mut().enumerate() {
             let constant = self.constants[source_start + lane];
             debug_assert_ne!(constant, 0, "input slice constants are never zero");
@@ -1278,12 +1318,12 @@ impl FactorSource {
 
 /// One input group's per-source discrete logs, reused across a band's rows.
 struct RowFactors {
-    logs: [u16; DEFAULT_INPUT_GROUPING],
+    logs: [u16; MAX_INPUT_GROUPING],
     live_inputs: usize,
 }
 
 impl RowFactors {
-    fn fill_row(&self, exponent: RecoveryExponent, row: &mut [u16; DEFAULT_INPUT_GROUPING]) {
+    fn fill_row(&self, exponent: RecoveryExponent, row: &mut [u16; MAX_INPUT_GROUPING]) {
         row.fill(0);
         for (factor, &log) in row[..self.live_inputs]
             .iter_mut()
@@ -1571,11 +1611,11 @@ fn accumulate_band(
         return Ok(());
     }
     let lane_stride = lane_stride(contract, aligned_len);
-    let mut row = [0u16; DEFAULT_INPUT_GROUPING];
+    let mut row = [0u16; MAX_INPUT_GROUPING];
     match kernel {
         ResolvedKernel::Portable => {
             let row_factors = factors.row_factors(source_start, live_inputs);
-            let mut rows = [[0u16; DEFAULT_INPUT_GROUPING]; COEFF_ROWS];
+            let mut rows = [[0u16; MAX_INPUT_GROUPING]; COEFF_ROWS];
             for (chunk_index, chunk) in exponents.chunks(COEFF_ROWS).enumerate() {
                 for (slot, &exponent) in rows.iter_mut().zip(chunk) {
                     row_factors.fill_row(exponent, slot);
@@ -1618,11 +1658,11 @@ fn accumulate_band(
                         let dst_start = (first_output + offset) * output_stride + tile_start;
                         let row_base = offset * live_inputs;
                         // Stack-resident: `live_inputs <=
-                        // DEFAULT_INPUT_GROUPING`, so the descriptor list never
+                        // MAX_INPUT_GROUPING`, so the descriptor list never
                         // needs the heap. Building it per row used to cost one
                         // allocate/free pair per (output row, input group) —
                         // 3.3M of them on the 4096×819 create shape.
-                        let inputs: [PreparedFactorSrc<'_>; DEFAULT_INPUT_GROUPING] =
+                        let inputs: [PreparedFactorSrc<'_>; MAX_INPUT_GROUPING] =
                             std::array::from_fn(|lane| {
                                 let clamped = lane.min(live_inputs - 1);
                                 let source_start_bytes = clamped * lane_stride + tile_start;
@@ -1642,6 +1682,7 @@ fn accumulate_band(
         }
         #[cfg(target_arch = "x86_64")]
         ResolvedKernel::Folded => {
+            debug_assert_eq!(contract.input_grouping, DEFAULT_INPUT_GROUPING);
             let groups = contract.input_grouping / gf_simd::FOLDED_GROUP;
             if groups > MAX_FOLDED_GROUPS {
                 return Err(invalid_input(
@@ -1749,15 +1790,20 @@ fn accumulate_band(
             // call by contract.
             debug_assert_eq!(contract.tile_bytes, UNTILED);
             debug_assert_eq!(lane_stride, aligned_len);
+            debug_assert_eq!(contract.input_grouping, DEFAULT_INPUT_GROUPING);
             let width = reedsolomon_rs::xor_jit::JitWidth::Avx2;
             let row_factors = factors.row_factors(source_start, live_inputs);
             let rows: Vec<[u16; DEFAULT_INPUT_GROUPING]> = exponents
                 .iter()
                 .map(|&exponent| {
                     // Full-width row: zero tail factors keep their source
-                    // positions for the packed group shape.
+                    // positions for the packed group shape. The family's
+                    // grouping is the packed width, so the wide row's tail
+                    // beyond it is always zero.
+                    let mut wide = [0u16; MAX_INPUT_GROUPING];
+                    row_factors.fill_row(exponent, &mut wide);
                     let mut row = [0u16; DEFAULT_INPUT_GROUPING];
-                    row_factors.fill_row(exponent, &mut row);
+                    row.copy_from_slice(&wide[..DEFAULT_INPUT_GROUPING]);
                     row
                 })
                 .collect();
@@ -2621,9 +2667,20 @@ mod tests {
             )
             .unwrap();
         assert!(sink.chunks.iter().all(|(_, _, _, data)| data.len() <= 260));
-        assert_eq!(sink.chunks.last().unwrap().2, 256);
-        assert_eq!(sink.chunks.last().unwrap().3.len(), 4);
-        assert_eq!(sink.chunks.len(), 4);
+        // The stripe length is whatever the 8,800-byte budget admits for the
+        // family's staging shape (256 with twelve lanes, 188 with sixteen);
+        // what must hold regardless is that the final stripe carries exactly
+        // the slice remainder and nothing after it.
+        let stripe = sink.chunks[0].3.len();
+        assert!(
+            (2..260).contains(&stripe),
+            "the memory limit must force a multi-stripe plan, got stripe {stripe}"
+        );
+        let stripes = 260usize.div_ceil(stripe);
+        assert_eq!(sink.chunks.len(), 2 * stripes);
+        let last = sink.chunks.last().unwrap();
+        assert_eq!(last.2 as usize, (stripes - 1) * stripe);
+        assert_eq!(last.3.len(), 260 - (stripes - 1) * stripe);
     }
 
     #[test]
@@ -2972,6 +3029,37 @@ mod tests {
             ),
             65_536
         );
+    }
+
+    /// The slice-per-source families batch by kernel shape: sixteen on the
+    /// aarch64 CLMUL family (two full eight-source passes), twelve elsewhere;
+    /// the folded and packed XOR-JIT families are structurally twelve.
+    #[test]
+    fn input_grouping_follows_the_kernel_family() {
+        let simd = KernelContract::for_kernel(ResolvedKernel::Simd);
+        let portable = KernelContract::for_kernel(ResolvedKernel::Portable);
+        assert_eq!(simd.input_grouping, portable.input_grouping);
+        assert!((1..=MAX_INPUT_GROUPING).contains(&simd.input_grouping));
+        if std::env::var_os("WEAVER_PAR2_CREATE_GROUPING").is_none() {
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(simd.input_grouping, CLMUL_INPUT_GROUPING);
+            #[cfg(not(target_arch = "aarch64"))]
+            assert_eq!(simd.input_grouping, DEFAULT_INPUT_GROUPING);
+        }
+        #[cfg(target_arch = "x86_64")]
+        for kernel in ForwardEncoder::available_kernels() {
+            let resolved =
+                resolve_kernel_with_capabilities(kernel, runtime_kernel_capabilities()).unwrap();
+            if matches!(
+                resolved,
+                ResolvedKernel::Folded | ResolvedKernel::XorJitAvx2
+            ) {
+                assert_eq!(
+                    KernelContract::for_kernel(resolved).input_grouping,
+                    DEFAULT_INPUT_GROUPING
+                );
+            }
+        }
     }
 
     /// With the skew live (a 4 KiB stripe skews lanes and rows by 512 bytes),
