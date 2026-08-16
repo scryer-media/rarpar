@@ -35,7 +35,6 @@ env:
   # Pinned: signature bundles are only comparable if every publication used the
   # same signer. Bump deliberately.
   COSIGN_VERSION: v3.1.3
-  ALL_FIXTURES: crates/unrar-rs/tests/fixtures/**,crates/par2-rs/tests/fixtures/**
 
 jobs:
   publish:
@@ -103,26 +102,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # Reconstruct the corpus tree from a clean checkout: Git LFS while it is
-      # still the transport, the published corpus once the lock is pinned.
-      - name: Reconstruct the fixture tree
-        run: |
-          set -euo pipefail
-          if git lfs ls-files --name-only 2>/dev/null | grep -q .; then
-            git lfs install --local
-            git lfs pull --include="$ALL_FIXTURES" --exclude=""
-            git lfs fsck --pointers
-            while IFS= read -r path; do
-              if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
-                echo "::error::LFS file was not hydrated: $path"
-                exit 1
-              fi
-            done < <(git lfs ls-files --name-only --include="$ALL_FIXTURES")
-            echo "reconstructed from Git LFS"
-          else
-            echo "no Git LFS fixtures; the pinned corpus is hydrated below"
-          fi
-
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -142,13 +121,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
 
-      - name: Hydrate the pinned corpus when LFS is gone
-        run: |
-          set -euo pipefail
-          if git lfs ls-files --name-only 2>/dev/null | grep -q .; then
-            exit 0
-          fi
-          cargo run --locked -p xtask -- test-corpus fetch --profile all
+      # Reconstruct the corpus tree on a clean checkout through the one path
+      # every CI lane uses: `hydrate` pulls through Git LFS while
+      # test-corpus/lock.json pins nothing, and fetches the pinned corpus from R2
+      # once it does — either way every file is verified against the ledger.
+      - name: Reconstruct the fixture tree
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
 
       # Every path present, no blocked provenance, every public upstream import
       # re-fetched byte-identical at its pinned commit.

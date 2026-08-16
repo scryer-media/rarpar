@@ -490,6 +490,9 @@ pub(crate) mod tests {
 
     #[test]
     fn put_arguments_are_conditional_sigv4_and_carry_no_secret() {
+        // put_args reads the protocol override; hold the env lock so a
+        // concurrent loopback test's `=http,https` cannot leak in.
+        let _guard = ENV_LOCK.lock().unwrap();
         let args = put_args(
             Path::new("/tmp/object"),
             "https://acct.r2.cloudflarestorage.com/bucket/key",
