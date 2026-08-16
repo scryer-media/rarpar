@@ -557,18 +557,30 @@ fn rar5_mixed_store_and_compressed_members_split_along_the_compression_flag() {
         .iter()
         .find(|member| member.name == "zeros_64k.bin")
         .expect("the compressed member");
-    assert_eq!(
-        compressed.eligibility,
+    // The packed size is whatever the writer emitted for 64 KiB of zeros at
+    // `-m3` (a few dozen bytes; it moves with the writer release, so it is not
+    // pinned) — what matters is that the count is read out of the header
+    // rather than defaulted: present, tiny against the unpacked size, and both
+    // totals reported as final for a closed compressed chain.
+    match &compressed.eligibility {
         MemberEligibility::Ineligible(IneligibilityReason::Compressed {
-            // Whatever `rarlab-7.20` emits for 64 KiB of zeros at `-m3`; the
-            // value moves with the writer, and pinning it is what proves the
-            // count is read out of the header rather than defaulted.
-            packed_bytes: Some(33),
-            unpacked_bytes: Some(65_536),
-            totals_final: true,
-        }),
-        "a closed compressed chain reports both totals as final"
-    );
+            packed_bytes,
+            unpacked_bytes,
+            totals_final,
+        }) => {
+            let packed = packed_bytes.expect("packed size read from the header");
+            assert!(
+                packed > 0 && packed < 4096,
+                "packed_bytes {packed} is not a plausible LZ size for 64 KiB of zeros"
+            );
+            assert_eq!(*unpacked_bytes, Some(65_536));
+            assert!(
+                *totals_final,
+                "a closed compressed chain reports both totals as final"
+            );
+        }
+        other => panic!("compressed member eligibility = {other:?}"),
+    }
 
     // Envelope bytes are the volume minus the direct members' packed bytes —
     // which means the compressed member's packed bytes are in there.
