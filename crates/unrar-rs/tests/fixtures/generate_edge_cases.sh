@@ -1,10 +1,18 @@
 #!/bin/bash
-# Generate edge-case RAR test fixtures using Docker RAR images.
+# Generate edge-case RAR test fixtures with the shared pinned RARLAB writers
+# (bench/rarpar-bench/config/toolchains.json): RAR5 sets from the rarlab-7.20
+# image, RAR4 sets from the rarlab-6.24 image. Both images have `rar` as their
+# Docker ENTRYPOINT, so we pass args directly.
 #
-# Requirements: docker images `rar:latest` (RAR5/7.20) and `rar:4` (RAR4/6.24)
-# Both images have `rar` as their Docker ENTRYPOINT, so we pass args directly.
+# Requirements: docker on PATH, with the toolchain images built:
+#     cargo run --locked -p xtask -- bench toolchains build
 #
 # Usage: cd crates/unrar-rs/tests/fixtures && bash generate_edge_cases.sh
+#
+# Regenerating is a corpus revision (docs/test-corpus.md): rar stamps times into
+# the headers, so the output is shape-identical, never byte-identical, and the
+# random inputs below (random_512.bin, random_4k.bin) are redrawn. Refresh
+# test-corpus/sources.json afterwards.
 set -euo pipefail
 
 FIXTURE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,16 +20,20 @@ RAR5_DIR="$FIXTURE_DIR/rar5"
 RAR4_DIR="$FIXTURE_DIR/rar4"
 RAR4_LONG_PASSWORD="abcdefghijklmnopqrstuvwxyzabcdef"
 
+# Image tags as pinned in bench/rarpar-bench/config/toolchains.json.
+RAR5_IMAGE="rarpar-bench-rarlab:7.20"
+RAR4_IMAGE="rarpar-bench-rarlab:6.24"
+
 mkdir -p "$RAR5_DIR" "$RAR4_DIR"
 
 # Helper: run RAR5 (7.20) inside Docker (entrypoint = rar)
 rar5() {
-    docker run --rm --platform linux/amd64 -v "$FIXTURE_DIR:/work" -w /work rar:latest "$@"
+    docker run --rm --platform linux/amd64 -v "$FIXTURE_DIR:/work" -w /work "$RAR5_IMAGE" "$@"
 }
 
 # Helper: run RAR4 (6.24) inside Docker (entrypoint = rar)
 rar4() {
-    docker run --rm --platform linux/amd64 -v "$FIXTURE_DIR:/work" -w /work rar:4 "$@"
+    docker run --rm --platform linux/amd64 -v "$FIXTURE_DIR:/work" -w /work "$RAR4_IMAGE" "$@"
 }
 
 # Create source files for edge cases inside a temp dir that Docker can see
@@ -73,8 +85,8 @@ rar5 a -m0 -ep1 rar5/rar5_empty_member.rar _edge_src/empty.txt _edge_src/hello.t
 echo "  [5/12] unicode filenames (RAR5 only — RAR4 Docker locale breaks unicode)"
 rar5 a -m0 -ep1 rar5/rar5_unicode.rar "_edge_src/日本語ファイル.txt" "_edge_src/café-résumé.txt"
 
-echo "  [6/12] solid archive"
-rar5 a -m3 -s -ep1 rar5/rar5_solid.rar _edge_src/hello.txt _edge_src/second.txt _edge_src/zeros_64k.bin _edge_src/random_512.bin
+# (rar5/rar5_solid.rar is a Scryer e2e import — see README.md "Imported
+# corpora" — and is deliberately not written here.)
 
 echo "  [7/12] recovery record"
 rar5 a -m0 -rr5p -ep1 rar5/rar5_recovery.rar _edge_src/hello.txt _edge_src/second.txt
@@ -109,8 +121,8 @@ rar4 a -ma4 -m0 -r rar4/rar4_dirs.rar _edge_src/subdir/
 echo "  [4/9] empty file member"
 rar4 a -ma4 -m0 -ep1 rar4/rar4_empty_member.rar _edge_src/empty.txt _edge_src/hello.txt
 
-echo "  [5/9] solid archive"
-rar4 a -ma4 -m3 -s -ep1 rar4/rar4_solid.rar _edge_src/hello.txt _edge_src/second.txt _edge_src/zeros_64k.bin _edge_src/random_512.bin
+# (rar4/rar4_solid.rar is a Scryer e2e import — see README.md "Imported
+# corpora" — and is deliberately not written here.)
 
 echo "  [6/9] recovery record"
 rar4 a -ma4 -m0 -rr5p -ep1 rar4/rar4_recovery.rar _edge_src/hello.txt _edge_src/second.txt

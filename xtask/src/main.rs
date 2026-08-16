@@ -18,6 +18,8 @@ use clap_mangen::Man;
 use rarpar::cli::Cli;
 use serde::Deserialize;
 
+mod test_corpus;
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const BIN_NAME: &str = "rarpar";
@@ -48,6 +50,7 @@ fn run() -> Result<()> {
         Some("package-root") => run_package_root(args.collect()),
         Some("feature-audit") => run_feature_audit(args.collect()),
         Some("bench") => run_bench(args.collect()),
+        Some("test-corpus") => test_corpus::run(args.collect()),
         Some("-h" | "--help") | None => {
             print_usage();
             Ok(())
@@ -64,8 +67,9 @@ Usage:
   cargo run -p xtask -- docs --check
   cargo run -p xtask -- package-root --binary PATH --out DIR [--docs DIR] [--target TRIPLE]
   cargo run -p xtask -- feature-audit --manifest PATH --target TRIPLE --features LIST
-  cargo run -p xtask -- bench <toolchains|corpus|plan|preflight|run|report|render> [OPTIONS]
-  cargo run -p xtask -- bench all-hosts [--config PATH] [--jobs N]"
+  cargo run -p xtask -- bench <toolchains|corpus|payload|plan|preflight|run|report|render> [OPTIONS]
+  cargo run -p xtask -- bench all-hosts [--config PATH] [--jobs N]
+  cargo run -p xtask -- test-corpus <build|verify|fetch|hydrate|sign|publish> [OPTIONS]"
     );
 }
 

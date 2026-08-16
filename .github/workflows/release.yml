@@ -21,8 +21,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  RARPAR_LFS_TEST_FIXTURES: crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_symlink.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar,crates/unrar-rs/tests/fixtures/rar5/rar5_recovery_volumes.part*,crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar,crates/unrar-rs/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar,crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_oldmv*,crates/par2-rs/tests/fixtures/rar5_lz_plain/**
-  RARPAR_LFS_SMOKE_FIXTURES: crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
@@ -39,20 +37,6 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Hydrate CLI test fixtures
-        run: |
-          set -euo pipefail
-          git lfs install --local
-          git lfs pull --include="$RARPAR_LFS_TEST_FIXTURES" --exclude=""
-          git lfs fsck --pointers
-          git lfs ls-files --name-only --include="$RARPAR_LFS_TEST_FIXTURES" > .ci-lfs-hydrated.txt
-          test -s .ci-lfs-hydrated.txt
-          while IFS= read -r path; do
-            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
-              echo "::error::LFS file was not hydrated: $path"
-              exit 1
-            fi
-          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
@@ -167,6 +151,8 @@ jobs:
               )
               sys.exit(1)
           PY
+      - name: Hydrate the test corpus (release-tests)
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile release-tests
       - name: Run release preflight checks
         run: |
           cargo fmt --check --all
@@ -240,21 +226,6 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Hydrate smoke fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
-          git lfs install --local
-          git lfs pull --include="$RARPAR_LFS_SMOKE_FIXTURES" --exclude=""
-          git lfs fsck --pointers
-          git lfs ls-files --name-only --include="$RARPAR_LFS_SMOKE_FIXTURES" > .ci-lfs-hydrated.txt
-          test -s .ci-lfs-hydrated.txt
-          while IFS= read -r path; do
-            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
-              echo "::error::LFS file was not hydrated: $path"
-              exit 1
-            fi
-          done < .ci-lfs-hydrated.txt
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
@@ -443,6 +414,9 @@ jobs:
       - name: Generate manpage and completions
         shell: bash
         run: cargo run --locked -p xtask -- docs --out target/dist/docs
+      - name: Hydrate the test corpus (cli)
+        shell: bash
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile cli
       - name: Smoke test release binary (Unix)
         if: runner.os != 'Windows'
         shell: bash

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,115 @@ func TestVideoRecipesArePinnedAndSingleThreaded(t *testing.T) {
 	}
 	if got := codecParamsFlag("libx264"); got != "-x264-params" {
 		t.Errorf("codecParamsFlag(libx264) = %q", got)
+	}
+}
+
+// The shared `payload video` command and the corpus generator build the same
+// encode: one digest-pinned image, one thread, bitexact on inputs, encoders and
+// muxer, no metadata, and a duration derived from the target size. Asserted on
+// the argument vector so the invariants hold without running Docker.
+func TestVideoEncodeArgsPinEveryDeterminismControl(t *testing.T) {
+	lock, err := LoadToolchains(filepath.Join("..", "..", "config", "toolchains.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range VideoPayloadProfiles() {
+		recipe := videoRecipes[profile]
+		first := videoEncodeArgs(lock.VideoEncoder, recipe, "/work", 8*1024*1024, "clip."+recipe.Extension)
+		second := videoEncodeArgs(lock.VideoEncoder, recipe, "/work", 8*1024*1024, "clip."+recipe.Extension)
+		if strings.Join(first, " ") != strings.Join(second, " ") {
+			t.Fatalf("%s: encode arguments are not a pure function of their inputs", profile)
+		}
+		joined := " " + strings.Join(first, " ") + " "
+		for _, required := range []string{
+			" --platform linux/amd64 ",
+			" " + lock.VideoEncoder.Image + " ",
+			" -nostdin ",
+			" -threads 1 ",
+			" -flags:v +bitexact ",
+			" -flags:a +bitexact ",
+			" -map_metadata -1 ",
+			" " + codecParamsFlag(recipe.VideoCodec) + " " + recipe.CodecParams + " ",
+			" -b:v " + recipe.VideoBitrate + " -minrate " + recipe.VideoBitrate + " -maxrate " + recipe.VideoBitrate + " -bufsize " + recipe.VideoBitrate + " ",
+		} {
+			if !strings.Contains(joined, required) {
+				t.Errorf("%s: encode arguments lack %q: %s", profile, strings.TrimSpace(required), joined)
+			}
+		}
+		// bitexact has to be requested on the input side (before the lavfi
+		// sources) and again on the output side (for the muxer).
+		if strings.Count(joined, " -fflags +bitexact ") != 2 {
+			t.Errorf("%s: -fflags +bitexact must be applied to inputs and muxer: %s", profile, joined)
+		}
+		if !digestPinnedImage(first[10]) {
+			t.Errorf("%s: encoder image is not digest pinned in the argument vector: %q", profile, first[10])
+		}
+		duration := strconv.FormatInt(videoEncodeSeconds(recipe, 8*1024*1024), 10)
+		if strings.Count(joined, " -t "+duration+" -i ") != 2 {
+			t.Errorf("%s: both lavfi inputs must be bounded to %s seconds: %s", profile, duration, joined)
+		}
+		if first[len(first)-1] != "clip."+recipe.Extension {
+			t.Errorf("%s: output name must be the last argument: %v", profile, first)
+		}
+	}
+	// A request smaller than one second of output still encodes one second:
+	// the encoder cannot produce less, and the manifest records what landed.
+	if got := videoEncodeSeconds(videoRecipes[profileFFmpegVideo], 1); got != 1 {
+		t.Fatalf("minimum encode duration = %d, want 1", got)
+	}
+	if got := videoEncodeSeconds(videoRecipes[profileFFmpegVideo], 4*videoRecipes[profileFFmpegVideo].BytesPerSecond); got != 4 {
+		t.Fatalf("encode duration = %d, want 4", got)
+	}
+}
+
+// Everything the command rejects, it rejects before Docker is ever invoked.
+func TestEncodeVideoPayloadRejectsBadRequestsBeforeEncoding(t *testing.T) {
+	lock, err := LoadToolchains(filepath.Join("..", "..", "config", "toolchains.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	out := filepath.Join(t.TempDir(), "clip.mkv")
+	// A Docker executable that cannot exist: any attempt to encode fails loudly
+	// instead of producing a file, so a passing test proves validation ran first.
+	docker := filepath.Join(t.TempDir(), "no-such-docker")
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, profileText, 1024, out); err == nil {
+		t.Fatal("a non-video profile was accepted")
+	}
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, "ffmpeg-video-av1", 1024, out); err == nil {
+		t.Fatal("an unknown video profile was accepted")
+	}
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, profileFFmpegVideo, 0, out); err == nil {
+		t.Fatal("a zero target size was accepted")
+	}
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, profileFFmpegVideo, 1024, ""); err == nil {
+		t.Fatal("an empty output path was accepted")
+	}
+	floating := lock
+	floating.VideoEncoder.Image = "jrottenberg/ffmpeg:7.1-ubuntu2404"
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), floating, profileFFmpegVideo, 1024, out); err == nil {
+		t.Fatal("a floating encoder image was accepted")
+	}
+	if err := os.WriteFile(out, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, profileFFmpegVideo, 1024, out); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("an existing output was not refused: %v", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) != "existing" {
+		t.Fatalf("existing output was disturbed: %q, %v", got, err)
+	}
+	// Once every check passes, the only thing left is Docker itself; with a
+	// missing executable that fails at the encode step, and nothing is written.
+	missing := filepath.Join(t.TempDir(), "fresh.mkv")
+	if _, err := EncodeVideoPayload(ctx, docker, filepath.Join("..", ".."), lock, profileFFmpegVideo, 1024, missing); err == nil || !strings.Contains(err.Error(), "encode ffmpeg-video payload") {
+		t.Fatalf("encode without docker: err = %v", err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("a failed encode left output behind: %v", err)
+	}
+	if profiles := VideoPayloadProfiles(); len(profiles) != 2 || profiles[0] != profileFFmpegVideo || profiles[1] != profileFFmpegVideoHEVC {
+		t.Fatalf("video payload profiles = %v", profiles)
 	}
 }
 

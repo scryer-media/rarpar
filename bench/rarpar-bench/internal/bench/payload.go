@@ -289,16 +289,40 @@ func (assets *PayloadAssets) videoFile(profile string, target int64) (string, er
 		}
 		assets.videoDir = directory
 	}
+	name := fmt.Sprintf("%s-%d.%s", profile, target, recipe.Extension)
+	args := videoEncodeArgs(assets.encoder, recipe, assets.videoDir, target, name)
+	if err := runCommand(assets.ctx, assets.docker, args...); err != nil {
+		return "", fmt.Errorf("encode %s payload: %w", profile, err)
+	}
+	path := filepath.Join(assets.videoDir, name)
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("encoder produced no %s payload: %w", profile, err)
+	}
+	assets.videos[key] = path
+	return path, nil
+}
+
+// videoEncodeSeconds turns a requested payload size into the encode duration
+// the recipe's measured output rate implies, never shorter than one second.
+func videoEncodeSeconds(recipe videoRecipe, target int64) int64 {
 	seconds := target / recipe.BytesPerSecond
 	if seconds < 1 {
 		seconds = 1
 	}
-	name := fmt.Sprintf("%s-%d.%s", profile, target, recipe.Extension)
-	duration := strconv.FormatInt(seconds, 10)
-	args := []string{
-		"run", "--rm", "--platform", assets.encoder.Platform,
-		"-v", assets.videoDir + ":/work", "-w", "/work",
-		"--entrypoint", "ffmpeg", assets.encoder.Image,
+	return seconds
+}
+
+// videoEncodeArgs is the complete `docker run` argument vector for one pinned
+// encode: the digest-pinned encoder image, the recipe's fixed sources and
+// codec knobs, one encoder thread, and bitexact on inputs, encoders and muxer.
+// It is a pure function of its inputs so the invariants that make the encode
+// reproducible can be asserted without running Docker.
+func videoEncodeArgs(encoder VideoEncoder, recipe videoRecipe, workDir string, target int64, name string) []string {
+	duration := strconv.FormatInt(videoEncodeSeconds(recipe, target), 10)
+	return []string{
+		"run", "--rm", "--platform", encoder.Platform,
+		"-v", workDir + ":/work", "-w", "/work",
+		"--entrypoint", "ffmpeg", encoder.Image,
 		"-hide_banner", "-nostdin", "-y", "-loglevel", "error",
 		// On the input side this keeps the lavfi sources off any
 		// wall-clock-seeded behavior.
@@ -322,15 +346,87 @@ func (assets *PayloadAssets) videoFile(profile string, target int64) (string, er
 		"-map_metadata", "-1",
 		name,
 	}
-	if err := runCommand(assets.ctx, assets.docker, args...); err != nil {
-		return "", fmt.Errorf("encode %s payload: %w", profile, err)
+}
+
+// VideoPayloadResult describes one video the shared encoder produced on
+// request: the size it landed at (an encoder is aimed at a size, never handed
+// one) and the digest of the bytes written.
+type VideoPayloadResult struct {
+	Profile     string `json:"profile"`
+	TargetBytes int64  `json:"target_bytes"`
+	Path        string `json:"path"`
+	Bytes       int64  `json:"bytes"`
+	SHA256      string `json:"sha256"`
+	Encoder     string `json:"encoder"`
+}
+
+// VideoPayloadProfiles lists the payload profiles the pinned encoder produces.
+func VideoPayloadProfiles() []string {
+	profiles := make([]string, 0, len(videoProfiles))
+	for profile := range videoProfiles {
+		profiles = append(profiles, profile)
 	}
-	path := filepath.Join(assets.videoDir, name)
-	if _, err := os.Stat(path); err != nil {
-		return "", fmt.Errorf("encoder produced no %s payload: %w", profile, err)
+	sort.Strings(profiles)
+	return profiles
+}
+
+// EncodeVideoPayload writes one real video near targetBytes to out through the
+// benchmark's pinned encoder and recipe. It is the one generator both corpora
+// share: the benchmark's media cases and the test corpus's MKV inputs come out
+// of the same recipe, image digest, and single-threaded bitexact encode, so
+// neither side ever carries its own copy of the ffmpeg command line.
+//
+// out must not already exist; the deterministic timestamp is stamped on the
+// written file the way the corpus generator stamps its payload members.
+func EncodeVideoPayload(ctx context.Context, docker, harnessRoot string, lock ToolchainLock, profile string, targetBytes int64, out string) (VideoPayloadResult, error) {
+	if !videoProfiles[profile] {
+		return VideoPayloadResult{}, fmt.Errorf("payload profile %q is not a video profile (want one of %s)", profile, strings.Join(VideoPayloadProfiles(), ", "))
 	}
-	assets.videos[key] = path
-	return path, nil
+	if targetBytes <= 0 {
+		return VideoPayloadResult{}, fmt.Errorf("target bytes must be positive, got %d", targetBytes)
+	}
+	if out == "" {
+		return VideoPayloadResult{}, fmt.Errorf("output path is required")
+	}
+	if !digestPinnedImage(lock.VideoEncoder.Image) || lock.VideoEncoder.Platform != "linux/amd64" {
+		return VideoPayloadResult{}, fmt.Errorf("video encoder is not digest pinned for linux/amd64 in the toolchain lock")
+	}
+	if _, err := os.Lstat(out); err == nil {
+		return VideoPayloadResult{}, fmt.Errorf("refusing to overwrite existing output %s", out)
+	} else if !os.IsNotExist(err) {
+		return VideoPayloadResult{}, err
+	}
+	assets := newPayloadAssets(ctx, docker, harnessRoot, lock.DockerBase, "", lock.VideoEncoder)
+	defer assets.Close()
+	source, err := assets.videoFile(profile, targetBytes)
+	if err != nil {
+		return VideoPayloadResult{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return VideoPayloadResult{}, err
+	}
+	if err := copyTreeFile(source, out); err != nil {
+		return VideoPayloadResult{}, err
+	}
+	if err := stampDeterministicTime(out); err != nil {
+		return VideoPayloadResult{}, err
+	}
+	digest, err := fileSHA256(out)
+	if err != nil {
+		return VideoPayloadResult{}, err
+	}
+	info, err := os.Stat(out)
+	if err != nil {
+		return VideoPayloadResult{}, err
+	}
+	return VideoPayloadResult{
+		Profile:     profile,
+		TargetBytes: targetBytes,
+		Path:        out,
+		Bytes:       info.Size(),
+		SHA256:      digest,
+		Encoder:     lock.VideoEncoder.ID,
+	}, nil
 }
 
 // collectTarAssets keeps the regular files a predicate accepts, in tar order

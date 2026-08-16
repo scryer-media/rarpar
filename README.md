@@ -335,12 +335,22 @@ the archive set; it waits for each later volume instead.
 
 ## Development
 
-This repository uses Git LFS for binary fixture corpora. After cloning:
+The binary test fixtures are the **test corpus**: a signed, content-addressed
+object set on R2, described by the ledger in `test-corpus/` and hydrated with
+`xtask` (see [docs/test-corpus.md](docs/test-corpus.md)). Until the first
+published corpus is pinned in `test-corpus/lock.json`, Git LFS remains the
+transport. After cloning:
 
 ```bash
 git lfs install
 git lfs pull
 git config core.hooksPath .githooks
+```
+
+Once a corpus is pinned, hydrate what you need instead of `git lfs pull`:
+
+```bash
+cargo run --locked -p xtask -- test-corpus fetch --profile unrar --profile par2
 ```
 
 The versioned pre-commit hook runs `gitleaks` and blocks staged machine-local

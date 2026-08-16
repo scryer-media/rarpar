@@ -13,8 +13,31 @@
 /bench/fleet*.toml
 !/bench/fleet.example.toml
 
+# Test corpus (docs/test-corpus.md). Fixture bytes are hydrated from the
+# published corpus into these paths and must never be committed: a fixture is
+# added by ledgering and publishing it, not by `git add`. Only the generators,
+# READMEs and text originals beside them are tracked. Until the first published
+# manifest is pinned the same paths are Git LFS pointers, which stay tracked
+# (ignore rules never apply to tracked files); the patterns mirror
+# .gitattributes so the switch is a no-op here.
+/crates/unrar-rs/tests/fixtures/**/*.rar
+/crates/unrar-rs/tests/fixtures/**/*.[r-z][0-9][0-9]
+/crates/unrar-rs/tests/fixtures/**/*.rev
+/crates/unrar-rs/tests/fixtures/**/*.exe
+/crates/unrar-rs/tests/fixtures/**/*.bin
+/crates/unrar-rs/tests/fixtures/**/*.mkv
+/crates/unrar-rs/tests/fixtures/**/*.wav
+/crates/par2-rs/tests/fixtures/**/*.rar
+/crates/par2-rs/tests/fixtures/**/*.par2
+/crates/par2-rs/tests/fixtures/par2cmdline-turbo/**/*.tar.gz
+/crates/par2-rs/tests/fixtures/source/*.mkv
+# Hydration scratch: `xtask test-corpus` writes through sibling temp files and
+# renames them into place; a crash can leave one behind.
+/crates/*/tests/fixtures/**/.*.tmp
+
 # Local CI/release artifacts
 /.ci/
+/.ci-*.txt
 /dist/
 /package/
 /logs/

@@ -1,0 +1,248 @@
+name: test-corpus-publish
+
+# Publishes one revision of the signed, content-addressed test corpus to R2
+# and mirrors the toolchain source archives. Manual, main-only, protected:
+# this is the only workflow that holds R2 write credentials, and running it is
+# an operator decision. It never creates a branch, commit or pull request —
+# pinning the published manifest in test-corpus/lock.json is a reviewed PR.
+#
+# See docs/test-corpus.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish" to confirm publishing a corpus revision from main'
+        required: true
+        type: string
+      dry_run:
+        description: 'Reconstruct, verify, build and sign, but upload nothing'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: test-corpus-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GIT_LFS_SKIP_SMUDGE: "1"
+  RUST_TOOLCHAIN: 1.97.1
+  # Pinned: signature bundles are only comparable if every publication used the
+  # same signer. Bump deliberately.
+  COSIGN_VERSION: v3.1.3
+  ALL_FIXTURES: crates/unrar-rs/tests/fixtures/**,crates/par2-rs/tests/fixtures/**
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    # The protected environment holds the R2 secrets and gates the run on its
+    # reviewers; the corpus variables live beside it.
+    environment: test-corpus-publish
+    permissions:
+      contents: read
+      # Keyless cosign: the workflow's OIDC identity is what signs the manifest,
+      # provenance and mirrored tool archives.
+      id-token: write
+    env:
+      # Public-read side (also recorded in test-corpus/lock.json) and the
+      # bucket name: plain variables. The S3 endpoint and the S3 credential
+      # pair for the corpus bucket: secrets, exported straight into the
+      # environment the two publishers read; nothing is derived or echoed.
+      R2_CORPUS_BUCKET: ${{ vars.R2_CORPUS_BUCKET }}
+      R2_CORPUS_PUBLIC_URL: ${{ vars.R2_CORPUS_PUBLIC_URL }}
+      R2_CORPUS_S3_ENDPOINT: ${{ secrets.R2_CORPUS_ENDPOINT }}
+      R2_CORPUS_ACCESS_KEY_ID: ${{ secrets.R2_CORPUS_S3_ACCESS_KEY }}
+      R2_CORPUS_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_S3_SECRET }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - name: Refuse anything but a confirmed run from main
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
+            exit 1
+          fi
+          if [ "$CONFIRM" != "publish" ]; then
+            echo "::error::type \"publish\" in the confirm input to run this workflow"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ]; then
+            for name in R2_CORPUS_BUCKET R2_CORPUS_PUBLIC_URL; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::repository/environment variable $name is not set"
+                exit 1
+              fi
+            done
+            for name in R2_CORPUS_S3_ENDPOINT R2_CORPUS_ACCESS_KEY_ID R2_CORPUS_SECRET_ACCESS_KEY; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::secret for $name (R2_CORPUS_ENDPOINT / R2_CORPUS_S3_ACCESS_KEY / R2_CORPUS_S3_SECRET) is not available to this run"
+                exit 1
+              fi
+            done
+            case "$R2_CORPUS_PUBLIC_URL" in
+              https://*) ;;
+              *) echo "::error::R2_CORPUS_PUBLIC_URL must be an https URL"; exit 1 ;;
+            esac
+            case "$R2_CORPUS_S3_ENDPOINT" in
+              https://*) ;;
+              *) echo "::error::R2_CORPUS_ENDPOINT must be the https S3 endpoint (https://<account>.r2.cloudflarestorage.com)"; exit 1 ;;
+            esac
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Reconstruct the corpus tree from a clean checkout: Git LFS while it is
+      # still the transport, the published corpus once the lock is pinned.
+      - name: Reconstruct the fixture tree
+        run: |
+          set -euo pipefail
+          if git lfs ls-files --name-only 2>/dev/null | grep -q .; then
+            git lfs install --local
+            git lfs pull --include="$ALL_FIXTURES" --exclude=""
+            git lfs fsck --pointers
+            while IFS= read -r path; do
+              if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
+                echo "::error::LFS file was not hydrated: $path"
+                exit 1
+              fi
+            done < <(git lfs ls-files --name-only --include="$ALL_FIXTURES")
+            echo "reconstructed from Git LFS"
+          else
+            echo "no Git LFS fixtures; the pinned corpus is hydrated below"
+          fi
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      - name: Hydrate the pinned corpus when LFS is gone
+        run: |
+          set -euo pipefail
+          if git lfs ls-files --name-only 2>/dev/null | grep -q .; then
+            exit 0
+          fi
+          cargo run --locked -p xtask -- test-corpus fetch --profile all
+
+      # Every path present, no blocked provenance, every public upstream import
+      # re-fetched byte-identical at its pinned commit.
+      - name: Verify the corpus against its ledger and upstreams
+        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
+
+      - name: Validate the shared toolchain lock
+        working-directory: bench/rarpar-bench
+        run: |
+          set -euo pipefail
+          go test ./...
+          go run ./cmd/rarpar-bench toolchains validate
+
+      - name: Build the manifest and provenance
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus build --out target/test-corpus/build
+          cat target/test-corpus/build/manifest.sha256
+
+      # Original RARLAB and par2cmdline-turbo archives: R2-first, official
+      # fallback, reviewed SHA-256 required, signed and conditionally mirrored,
+      # read back before anything continues.
+      - name: Resolve and mirror the toolchain sources
+        working-directory: bench/rarpar-bench
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            go run ./cmd/rarpar-bench toolchains resolve --mirror-base "${R2_CORPUS_PUBLIC_URL:-}"
+          else
+            go run ./cmd/rarpar-bench toolchains resolve \
+              --mirror-base "$R2_CORPUS_PUBLIC_URL" \
+              --publish \
+              --s3-endpoint "$R2_CORPUS_S3_ENDPOINT" \
+              --bucket "$R2_CORPUS_BUCKET"
+          fi
+
+      - name: Sign the manifest and provenance
+        run: cargo run --locked -p xtask -- test-corpus sign --dir target/test-corpus/build
+
+      - name: Publish objects, manifest, provenance and bundles
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus publish \
+            --dir target/test-corpus/build \
+            --base-url "$R2_CORPUS_PUBLIC_URL" \
+            --s3-endpoint "$R2_CORPUS_S3_ENDPOINT" \
+            --bucket "$R2_CORPUS_BUCKET"
+
+      - name: Verify the publication from the public side
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          # A fresh consumer's view: the lock entry the publish step printed,
+          # the manifest it names, its signature, and one profile hydrated
+          # into a scratch tree.
+          cp target/test-corpus/build/lock.json test-corpus/lock.json
+          cargo run --locked -p xtask -- test-corpus verify --require-signature --all-present
+          git checkout -- test-corpus/lock.json
+
+      - name: Record the publication
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### test-corpus publish"
+            echo
+            echo "- ref: \`$GITHUB_REF\` @ \`$GITHUB_SHA\`"
+            echo "- dry run: \`$DRY_RUN\`"
+            if [ -f target/test-corpus/build/manifest.sha256 ]; then
+              echo "- manifest: \`$(cat target/test-corpus/build/manifest.sha256)\`"
+            fi
+            if [ -f target/test-corpus/build/lock.json ]; then
+              echo
+              echo "Pin this in \`test-corpus/lock.json\` through a reviewed PR:"
+              echo
+              echo '```json'
+              cat target/test-corpus/build/lock.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the build directory as a run artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-corpus-build-${{ github.run_id }}
+          path: |
+            target/test-corpus/build/manifest.json
+            target/test-corpus/build/manifest.sha256
+            target/test-corpus/build/manifest.json.sigstore.json
+            target/test-corpus/build/provenance.json
+            target/test-corpus/build/provenance.json.sigstore.json
+            target/test-corpus/build/objects.tsv
+            target/test-corpus/build/lock.json
+          if-no-files-found: warn
+          retention-days: 90

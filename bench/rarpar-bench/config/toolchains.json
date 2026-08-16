@@ -35,6 +35,14 @@
       "binary": "rar"
     },
     {
+      "id": "rarlab-7.20",
+      "image": "rarpar-bench-rarlab:7.20",
+      "platform": "linux/amd64",
+      "url": "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz",
+      "sha256": "d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46",
+      "binary": "rar"
+    },
+    {
       "id": "rarlab-7.23",
       "image": "rarpar-bench-rarlab:7.23",
       "platform": "linux/amd64",

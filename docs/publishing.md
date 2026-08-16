@@ -40,8 +40,10 @@ dependency is visible in the crates.io index.
 ## Fixture Policy
 
 Crates.io packages include tests, examples, benches, and fixture files unless
-the crate manifest excludes them. Git LFS keeps the repository manageable, but
-it does not automatically keep files out of the `.crate` upload.
+the crate manifest excludes them. The fixture corpus lives outside the git
+objects (Git LFS today, the signed R2 corpus described in `test-corpus.md`
+once pinned), but that does not automatically keep hydrated files out of the
+`.crate` upload.
 
 The large local fixture corpora stay in this repository for parity and
 regression testing, but they are excluded from published library packages:

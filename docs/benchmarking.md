@@ -11,6 +11,30 @@ pins each archive writer and the PAR2 generator by URL, SHA-256, Docker image
 identity, and platform. Docker is needed only to build those generators and
 materialize a corpus.
 
+`toolchains build` resolves every original distribution archive before Docker
+starts. Each archive is fetched from the public tool mirror first — the
+content-addressed `tools/<kind>/sha256/<digest>/` objects on R2, whose Sigstore
+bundles must verify under the publish workflow's exact identity and whose
+provenance must agree with the lock — and falls back to RARLAB or GitHub only
+when the mirror does not hold it or cannot be reached; a mirrored object that
+does not verify is an error, never a fallback. Either way the bytes must match
+the SHA-256 in `config/toolchains.json` before anything uses them. The image is
+then built from a temporary context holding only the Dockerfile and that
+verified archive, so the build itself downloads no tool. Set
+`RARPAR_TOOL_MIRROR_BASE` (or `--mirror-base URL`) to the mirror's public read
+base; leave it unset to go straight to the official URLs. `cosign` must be
+installed whenever a mirror base is set, since every mirrored object's signature
+is verified. `toolchains resolve` does the resolving alone, printing kind, name,
+digest and origin per archive without building any image.
+
+The same lock is the generator toolchain of the repository's test corpus
+(`docs/test-corpus.md`): its writer set carries RAR 6.24 and 7.20 for that
+reason alongside the benchmark's own writers, and `bench payload video
+--profile ffmpeg-video --target-bytes BYTES --out PATH` exposes the pinned
+encoder so the fixture generators take their MKV inputs from it instead of
+carrying an ffmpeg command line. The two corpora share nothing else — not a
+manifest, an output, or a regeneration schedule.
+
 Use an empty directory outside source control. `target/bench` is the normal
 local location:
 

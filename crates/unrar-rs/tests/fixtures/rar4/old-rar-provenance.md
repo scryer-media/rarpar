@@ -9,7 +9,14 @@ Fixture provenance:
 - Expected bytes: `src/test/resources/com/github/junrar/audio/BoatModernEnglish.wav`
 
 Upstream repository: https://github.com/junrar/junrar
-Upstream license: Apache-2.0
+Upstream commit: 57091f9ccd43661cf8f12c389917cc24950df707 (v8.1.0)
+Upstream license: the UnRAR license (junrar's `LICENSE` is RARLAB's "UnRAR -
+free portable version" text and its POM declares "UnRar License"; there is no
+SPDX identifier, so `test-corpus/sources.json` records it as `LicenseRef-UnRAR`).
+An earlier revision of this note said Apache-2.0; that was wrong.
+
+These RAR 1.5 / 2.0 archives are immutable imports: they predate every writer
+in the shared toolchain lock and are never assigned a RARLAB writer.
 
 SHA-256:
 

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_url": "",
+  "manifest": {
+    "sha256": "",
+    "url": ""
+  },
+  "signature": {
+    "bundle_url": "",
+    "certificate_identity": "https://github.com/scryer-media/rarpar/.github/workflows/test-corpus-publish.yml@refs/heads/main",
+    "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+  },
+  "provenance": {
+    "sha256": "",
+    "url": ""
+  },
+  "published_from": {
+    "commit": "",
+    "run": ""
+  }
+}

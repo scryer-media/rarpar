@@ -66,8 +66,10 @@ affected Cargo tests.
   output, and enough measurements to support the claim.
 - Prefer small, deterministic synthetic fixtures with documented generation.
   Sourced fixtures require known provenance and redistribution rights.
-- Store binary fixtures through Git LFS and verify they are excluded from
-  crates.io packages.
+- Every binary fixture is an entry in `test-corpus/sources.json` with its
+  digest and provenance (generator and pinned toolchain, or pinned upstream
+  commit and license); see `docs/test-corpus.md`. Verify fixtures are excluded
+  from crates.io packages.
 - Do not commit personal downloads, private data, credentials, ordinary media
   collections, or archives of uncertain origin.
 

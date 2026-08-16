@@ -32,6 +32,8 @@ func run(ctx context.Context, args []string) error {
 		return runToolchains(ctx, args[1:])
 	case "corpus":
 		return runCorpus(ctx, args[1:])
+	case "payload":
+		return runPayload(ctx, args[1:], os.Stdout)
 	case "plan":
 		return runPlan(args[1:])
 	case "preflight":
@@ -54,11 +56,12 @@ func run(ctx context.Context, args []string) error {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `Usage:
-  rarpar-bench toolchains validate|build [--config PATH] [--docker PATH]
+  rarpar-bench toolchains validate|build|resolve [--config PATH] [--docker PATH] [--mirror-base URL] [--publish] [--s3-endpoint URL] [--bucket NAME] [--cache DIR]
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
   rarpar-bench corpus push --root DIR --image REGISTRY/REPO:TAG [--token-file PATH]
   rarpar-bench corpus fetch --image REGISTRY/REPO:TAG --out DIR [--token-file PATH]
+  rarpar-bench payload video --profile ffmpeg-video|ffmpeg-video-hevc --target-bytes BYTES --out PATH [--toolchains PATH] [--docker PATH]
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
@@ -69,18 +72,35 @@ func usage() {
 LANE is cpu, metal, or docker-cpu. PAR2 placement is canonical or smart; canonical
 matches conventional expected-path verification for direct comparisons. Corpus data and run evidence are
 intentionally external to source control; use target/bench by convention.
+
+Toolchain archives resolve from the public tool mirror first (--mirror-base,
+default $RARPAR_TOOL_MIRROR_BASE; empty means official URLs only) and fall back
+to their official URLs only when the mirror does not hold them. Every archive is
+verified against config/toolchains.json before Docker sees it. --publish mirrors
+what the bucket does not hold yet; it needs --s3-endpoint, --bucket and
+R2_CORPUS_ACCESS_KEY_ID/R2_CORPUS_SECRET_ACCESS_KEY, and is for the protected
+publish workflow. resolve does the resolving (and publishing) alone, without
+building any image.
 `)
 }
 
 func runToolchains(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("toolchains requires validate or build")
+		return fmt.Errorf("toolchains requires validate, build, or resolve")
 	}
 	flags := flag.NewFlagSet("toolchains "+args[0], flag.ContinueOnError)
 	config := flags.String("config", defaultPath("config/toolchains.json"), "toolchain lock")
 	docker := flags.String("docker", "docker", "Docker executable")
+	mirrorBase := flags.String("mirror-base", os.Getenv("RARPAR_TOOL_MIRROR_BASE"), "public read base URL of the tool source mirror")
+	publish := flags.Bool("publish", false, "sign and upload archives the mirror does not hold yet (publish workflow only)")
+	endpoint := flags.String("s3-endpoint", "", "S3 endpoint for uploads, e.g. https://<account>.r2.cloudflarestorage.com")
+	bucket := flags.String("bucket", "", "bucket holding the tool mirror")
+	cache := flags.String("cache", "", "directory for resolved archives (default: a rarpar-bench directory under the system temp dir)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	lock, err := bench.LoadToolchains(*config)
 	if err != nil {
@@ -91,10 +111,68 @@ func runToolchains(ctx context.Context, args []string) error {
 		fmt.Println("toolchain lock is valid")
 		return nil
 	case "build":
-		return bench.BuildToolchains(ctx, *docker, harnessRoot(), lock)
+		mirror, err := toolMirror(*mirrorBase, *endpoint, *bucket, *cache, *publish)
+		if err != nil {
+			return err
+		}
+		return bench.BuildToolchains(ctx, *docker, harnessRoot(), lock, mirror)
+	case "resolve":
+		mirror, err := toolMirror(*mirrorBase, *endpoint, *bucket, *cache, *publish)
+		if err != nil {
+			return err
+		}
+		return bench.ResolveToolchainSources(ctx, lock, mirror, os.Stdout)
 	default:
 		return fmt.Errorf("unknown toolchains command %q", args[0])
 	}
+}
+
+// toolMirror builds the source resolver from the command line and the
+// environment. Publishing is fail-closed on configuration: every piece the
+// protected workflow supplies has to be present before anything is signed or
+// uploaded, and the credentials only ever come from the environment.
+func toolMirror(base, endpoint, bucket, cache string, publish bool) (*bench.SourceMirror, error) {
+	mirror := &bench.SourceMirror{BaseURL: strings.TrimSuffix(base, "/"), CacheDir: cache}
+	if !publish {
+		if base == "" {
+			fmt.Fprintln(os.Stderr, "rarpar-bench: no tool mirror configured (--mirror-base/RARPAR_TOOL_MIRROR_BASE); resolving archives from their official URLs")
+		}
+		return mirror, nil
+	}
+	if base == "" {
+		return nil, fmt.Errorf("--publish requires --mirror-base (or RARPAR_TOOL_MIRROR_BASE): the stored copy has to be read back publicly")
+	}
+	if endpoint == "" {
+		return nil, fmt.Errorf("--publish requires --s3-endpoint")
+	}
+	if bucket == "" {
+		return nil, fmt.Errorf("--publish requires --bucket")
+	}
+	accessKeyID := os.Getenv("R2_CORPUS_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("R2_CORPUS_SECRET_ACCESS_KEY")
+	if accessKeyID == "" || secretAccessKey == "" {
+		return nil, fmt.Errorf("--publish requires R2_CORPUS_ACCESS_KEY_ID and R2_CORPUS_SECRET_ACCESS_KEY in the environment")
+	}
+	mirror.Publish = &bench.MirrorPublisher{
+		WriteBase:       strings.TrimSuffix(endpoint, "/") + "/" + bucket,
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		Repository:      os.Getenv("GITHUB_REPOSITORY"),
+		Commit:          os.Getenv("GITHUB_SHA"),
+		WorkflowRef:     os.Getenv("GITHUB_WORKFLOW_REF"),
+		RunURL:          workflowRunURL(),
+	}
+	return mirror, nil
+}
+
+// workflowRunURL is the run that mirrored an archive, when GitHub Actions says
+// so; locally there is no run and the provenance field stays empty.
+func workflowRunURL() string {
+	server, repository, run := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID")
+	if server == "" || repository == "" || run == "" {
+		return ""
+	}
+	return strings.TrimSuffix(server, "/") + "/" + repository + "/actions/runs/" + run
 }
 
 func runCorpus(ctx context.Context, args []string) error {
@@ -136,6 +214,42 @@ func runCorpus(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown corpus command %q", args[0])
 	}
+}
+
+// runPayload exposes the corpus generator's real-content payload encoders on
+// their own, so the test corpus's generator scripts can ask the benchmark's
+// pinned encoder for their video inputs instead of carrying an ffmpeg command
+// line of their own. `payload video` is deliberately narrow: one profile, one
+// target size, one output path; the recipe, image digest and determinism
+// controls stay inside the harness.
+func runPayload(ctx context.Context, args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] != "video" {
+		return fmt.Errorf("payload requires video")
+	}
+	flags := flag.NewFlagSet("payload video", flag.ContinueOnError)
+	profile := flags.String("profile", "", "video payload profile: "+strings.Join(bench.VideoPayloadProfiles(), " or "))
+	targetBytes := flags.Int64("target-bytes", 0, "size to aim the encode at, in bytes")
+	out := flags.String("out", "", "output file (must not exist)")
+	toolchains := flags.String("toolchains", defaultPath("config/toolchains.json"), "toolchain lock")
+	docker := flags.String("docker", "docker", "Docker executable")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("payload video takes no positional arguments")
+	}
+	if *profile == "" || *targetBytes <= 0 || *out == "" {
+		return fmt.Errorf("--profile, a positive --target-bytes, and --out are required")
+	}
+	lock, err := bench.LoadToolchains(*toolchains)
+	if err != nil {
+		return err
+	}
+	result, err := bench.EncodeVideoPayload(ctx, *docker, harnessRoot(), lock, *profile, *targetBytes, workspacePath(*out))
+	if err != nil {
+		return err
+	}
+	return writeJSONTo(stdout, result)
 }
 
 // runCorpusImage moves a corpus through an OCI registry: push publishes a

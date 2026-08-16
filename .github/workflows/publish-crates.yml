@@ -33,7 +33,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GIT_LFS_SKIP_SMUDGE: "1"
-  WEAVER_LFS_ALL_FIXTURES: crates/unrar-rs/tests/fixtures/**,crates/par2-rs/tests/fixtures/**
 
 jobs:
   preflight:
@@ -52,20 +51,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Hydrate test fixtures
-        run: |
-          set -euo pipefail
-          git lfs install --local
-          git lfs pull --include="$WEAVER_LFS_ALL_FIXTURES" --exclude=""
-          git lfs fsck --pointers
-
-          while IFS= read -r path; do
-            [ -f "$path" ] || continue
-            if head -c 43 "$path" | grep -q '^version https://git-lfs.github.com/spec'; then
-              echo "::error file=${path}::fixture is still a Git LFS pointer"
-              exit 1
-            fi
-          done < <(git lfs ls-files --name-only --include="$WEAVER_LFS_ALL_FIXTURES")
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
@@ -90,6 +75,8 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
+      - name: Hydrate the test corpus (all)
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
       - name: Check workspace version
         env:
           EXPECTED_VERSION: ${{ inputs.version }}

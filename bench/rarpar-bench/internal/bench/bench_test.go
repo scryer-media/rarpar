@@ -157,6 +157,128 @@ func TestToolchainLockRequiresPinnedSources(t *testing.T) {
 	}
 }
 
+// The lock is shared by the benchmark and the test corpus, so it has to carry
+// the complete writer set — all six RARLAB releases — and refuse any entry that
+// is missing, duplicated, floating, or wrongly hashed.
+func TestToolchainLockRequiresAllSixRARLABWriters(t *testing.T) {
+	if len(RequiredRARWriters) != 6 {
+		t.Fatalf("required writer set = %v, want six RARLAB releases", RequiredRARWriters)
+	}
+	for _, id := range []string{"rarlab-3.93", "rarlab-4.20", "rarlab-5.00", "rarlab-6.24", "rarlab-7.20", "rarlab-7.23"} {
+		found := false
+		for _, required := range RequiredRARWriters {
+			found = found || required == id
+		}
+		if !found {
+			t.Errorf("required writer set is missing %q", id)
+		}
+	}
+	for _, required := range RequiredRARWriters {
+		t.Run("missing "+required, func(t *testing.T) {
+			lock := validToolchainLock()
+			var kept []RARWriter
+			for _, writer := range lock.RARWriters {
+				if writer.ID != required {
+					kept = append(kept, writer)
+				}
+			}
+			lock.RARWriters = kept
+			if err := lock.Validate(); err == nil || !strings.Contains(err.Error(), required) {
+				t.Fatalf("lock without %s: err = %v", required, err)
+			}
+		})
+	}
+}
+
+func TestToolchainLockRejectsDuplicateFloatingOrMishashedWriters(t *testing.T) {
+	cases := map[string]func(*ToolchainLock){
+		"duplicate id": func(lock *ToolchainLock) {
+			lock.RARWriters = append(lock.RARWriters, lock.RARWriters[0])
+		},
+		"duplicate url under a new id": func(lock *ToolchainLock) {
+			extra := lock.RARWriters[5]
+			extra.ID = "rarlab-7.24"
+			extra.Image = "rar724"
+			extra.SHA256 = strings.Repeat("f", 64)
+			extra.URL = lock.RARWriters[4].URL // rarlab-7.20's tarball
+			lock.RARWriters = append(lock.RARWriters, extra)
+		},
+		"duplicate digest under a new id": func(lock *ToolchainLock) {
+			extra := lock.RARWriters[5]
+			extra.ID = "rarlab-7.24"
+			extra.Image = "rar724"
+			extra.URL = "https://www.rarlab.com/rar/rarlinux-x64-724.tar.gz"
+			extra.SHA256 = lock.RARWriters[4].SHA256
+			lock.RARWriters = append(lock.RARWriters, extra)
+		},
+		"floating unversioned url": func(lock *ToolchainLock) {
+			lock.RARWriters[5].URL = "https://www.rarlab.com/rar/rarlinux-x64.tar.gz"
+		},
+		"url naming another release": func(lock *ToolchainLock) {
+			lock.RARWriters[4].URL = "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz"
+			lock.RARWriters[5].URL = "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz"
+		},
+		"non-rarlab host": func(lock *ToolchainLock) {
+			lock.RARWriters[5].URL = "https://mirror.example.test/rar/rarlinux-x64-723.tar.gz"
+		},
+		"plain http": func(lock *ToolchainLock) {
+			lock.RARWriters[5].URL = "http://www.rarlab.com/rar/rarlinux-x64-723.tar.gz"
+		},
+		"id without release": func(lock *ToolchainLock) {
+			lock.RARWriters[5].ID = "rarlab-latest"
+			lock.RARWriters = append(lock.RARWriters, RARWriter{ID: "rarlab-7.23", Image: "rar723", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz", SHA256: strings.Repeat("e", 64), Binary: "rar"})
+		},
+		"short digest": func(lock *ToolchainLock) {
+			lock.RARWriters[3].SHA256 = strings.Repeat("a", 63)
+		},
+		"uppercase digest": func(lock *ToolchainLock) {
+			lock.RARWriters[3].SHA256 = strings.Repeat("A", 64)
+		},
+		"wrong platform": func(lock *ToolchainLock) {
+			lock.RARWriters[2].Platform = "linux/arm64"
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			lock := validToolchainLock()
+			mutate(&lock)
+			if err := lock.Validate(); err == nil {
+				t.Fatalf("%s was accepted", name)
+			}
+		})
+	}
+}
+
+// The checked-in lock is the one both corpora build from; it must carry the
+// six verified RARLAB packages, each pinned to its published digest.
+func TestCheckedInToolchainLockPinsTheSixRARLABPackages(t *testing.T) {
+	lock, err := LoadToolchains(filepath.Join("..", "..", "config", "toolchains.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]struct{ url, sha256, binary string }{
+		"rarlab-3.93": {"https://www.rarlab.com/rar/rarlinux-3.9.3.tar.gz", "55122286a2a72ccc2b866c5a0e415c05638dfe99cebb5f2ef036784387a8eff8", "rar_static"},
+		"rarlab-4.20": {"https://www.rarlab.com/rar/rarlinux-4.2.0.tar.gz", "6826646bc9620055689f465e61f7d4a86e6ccc66940178d24f48d01734968eb5", "rar_static"},
+		"rarlab-5.00": {"https://www.rarlab.com/rar/rarlinux-5.0.0.tar.gz", "4f942d79bb16dc1981ccb52893e4a24dbee908089d783d766ac45cd4f2c78610", "rar_static"},
+		"rarlab-6.24": {"https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz", "88e22a8e84125c947637bbf28c746e338a0a63279d80f9f9d7373603875db1eb", "rar"},
+		"rarlab-7.20": {"https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", "d3e7fba3272385b1d0255ee332a1e8c1a6779bb5a5ff9d4d8ac2be846e49ca46", "rar"},
+		"rarlab-7.23": {"https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz", "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588", "rar"},
+	}
+	if len(lock.RARWriters) != len(want) {
+		t.Fatalf("lock has %d writers, want %d", len(lock.RARWriters), len(want))
+	}
+	for id, expected := range want {
+		writer, found := lock.Writer(id)
+		if !found {
+			t.Errorf("lock is missing %s", id)
+			continue
+		}
+		if writer.URL != expected.url || writer.SHA256 != expected.sha256 || writer.Binary != expected.binary {
+			t.Errorf("%s = %+v, want %+v", id, writer, expected)
+		}
+	}
+}
+
 func TestCorpusConfigRejectsMutatedCaseWithoutRecovery(t *testing.T) {
 	config := validCorpusConfig()
 	config.Cases[0].Mutation = "damage"
@@ -796,15 +918,19 @@ func TestLegacyRawAndReportJSONRemainPhaseCompatible(t *testing.T) {
 
 func validToolchainLock() ToolchainLock {
 	digest := strings.Repeat("a", 64)
+	// Every writer needs its own digest: the lock rejects two writers that
+	// claim one archive.
+	writerDigest := func(index int) string { return strings.Repeat(string(rune('a'+index)), 64) }
 	return ToolchainLock{
 		SchemaVersion: 1,
 		DockerBase:    "debian@sha256:" + digest,
 		RARWriters: []RARWriter{
-			{ID: "rarlab-3.93", Image: "rar3", Platform: "linux/amd64", URL: "https://example.test/rar3", SHA256: digest, Binary: "rar_static"},
-			{ID: "rarlab-4.20", Image: "rar4", Platform: "linux/amd64", URL: "https://example.test/rar4", SHA256: digest, Binary: "rar_static"},
-			{ID: "rarlab-5.00", Image: "rar5", Platform: "linux/amd64", URL: "https://example.test/rar5", SHA256: digest, Binary: "rar"},
-			{ID: "rarlab-6.24", Image: "rar6", Platform: "linux/amd64", URL: "https://example.test/rar6", SHA256: digest, Binary: "rar"},
-			{ID: "rarlab-7.23", Image: "rar7", Platform: "linux/amd64", URL: "https://example.test/rar7", SHA256: digest, Binary: "rar"},
+			{ID: "rarlab-3.93", Image: "rar3", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-3.9.3.tar.gz", SHA256: writerDigest(0), Binary: "rar_static"},
+			{ID: "rarlab-4.20", Image: "rar4", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-4.2.0.tar.gz", SHA256: writerDigest(1), Binary: "rar_static"},
+			{ID: "rarlab-5.00", Image: "rar5", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-5.0.0.tar.gz", SHA256: writerDigest(2), Binary: "rar"},
+			{ID: "rarlab-6.24", Image: "rar6", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz", SHA256: writerDigest(3), Binary: "rar"},
+			{ID: "rarlab-7.20", Image: "rar720", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz", SHA256: writerDigest(4), Binary: "rar"},
+			{ID: "rarlab-7.23", Image: "rar7", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz", SHA256: writerDigest(5), Binary: "rar"},
 		},
 		PAR2Generator: PAR2Generator{ID: "par2", Image: "par2", Platform: "linux/amd64", URL: "https://example.test/par2", SHA256: digest},
 	}

@@ -1,11 +1,18 @@
 # unrar-rs test fixtures
 
-Binary fixtures live in Git LFS. `.gitattributes` at the repo root routes the
-listed binary extensions, including classic RAR volume names, through the LFS
-filter; anything added here under a different extension needs a new pattern
-before it will be stored correctly.
+Binary fixtures are part of the repository's **test corpus**: every file here
+has an entry in `test-corpus/sources.json` (digest, size, and provenance —
+which generator on which pinned writer, or which pinned upstream commit under
+which license), and the corpus is published as a signed, content-addressed
+object set hydrated by `cargo run -p xtask -- test-corpus fetch --profile …`.
+The UnRAR fixtures are bundled by format era: `rar12` (RAR 1.5 / 2.0),
+`rar34` (RAR 3.x / 4.x — the `rar4/` directory) and `rar57` (RAR 5.x / 7.x —
+the `rar5/` directory), each with `originals/`. See `docs/test-corpus.md`.
+Until the first published corpus is pinned in `test-corpus/lock.json`, Git LFS
+remains the transport (`.gitattributes` routes the listed binary extensions
+through the LFS filter).
 
-Tests soft-skip when a fixture is absent, so a checkout without LFS payloads
+Tests soft-skip when a fixture is absent, so a checkout without the payloads
 still runs the suite. A skip prints `skipping test: <set> fixtures not present`.
 
 `Cargo.toml` sets `exclude = ["tests/fixtures/**"]`, so none of this ships in
@@ -13,17 +20,42 @@ the published crate.
 
 ## Generators
 
-| Script | Produces | Needs |
-| --- | --- | --- |
-| `generate_edge_cases.sh` | most `rar4_*` / `rar5_*` edge-case sets | `rar:latest`, `rar:4` |
-| `generate_generated_matrix.sh` | `generated_matrix_*` multi-volume matrix | `rar:latest`, `rar:4`, ffmpeg |
-| `generate_encrypted.sh` | `*_enc_*` / `*_hp_*` sets | `rar:latest`, `rar:4` |
-| `generate_stored_layout.sh` | the stored-layout sets listed below | `rar:latest` |
-| `generate_ppmd_perf.py` | deterministic RAR4 order-16 PPMd performance and classic-volume corpora | RARLAB rar 6.24 |
+Every generator writes through the shared pinned toolchain in
+`bench/rarpar-bench/config/toolchains.json`; build the images once with
+`cargo run --locked -p xtask -- bench toolchains build`.
 
-The `rar:latest` image is RARLAB rar **7.20**. It dropped `-ma4` and `-vn`, so
-it can no longer write RAR4 archives or old-style (`.r00`, `.r01`) volume
-names; those come from the `rar:4` image (rar 6.24).
+| Script | Produces | Toolchain |
+| --- | --- | --- |
+| `generate_edge_cases.sh` | most `rar4_*` / `rar5_*` edge-case sets and the `originals/` inputs | `rarlab-7.20`, `rarlab-6.24` |
+| `generate_generated_matrix.sh` | `generated_matrix_*` multi-volume matrix | `rarlab-7.20`, `rarlab-6.24`, `ffmpeg-7.1-ubuntu2404` via `xtask bench payload video` |
+| `generate_encrypted.sh` | the four `*_enc_*` sets per format | `rarlab-7.20`, `rarlab-6.24` |
+| `generate_stored_layout.sh` | the stored-layout sets listed below | `rarlab-7.20` |
+| `generate_ppmd_perf.py` | deterministic RAR4 order-16 PPMd performance and classic-volume corpora | `rarlab-6.24` |
+| `generate_rar5_filter_bounds.py` | `rar5/rar5_filter_bounds.rar` (hand-assembled RAR5 filter geometries) | none — pure bit assembly, byte-reproducible |
+| `generate_vm_output_bounds.py` | `rar4/rar4_vm_output_bounds.rar` (hand-assembled RAR 2.9 VM-filter bounds) | none — pure bit assembly, byte-reproducible |
+
+`rarlab-7.20` is RARLAB rar **7.20**. It dropped `-ma4` and `-vn`, so it can no
+longer write RAR4 archives or old-style (`.r00`, `.r01`) volume names; those
+come from `rarlab-6.24` (rar 6.24).
+
+Regeneration is **shape-reproducible, not byte-reproducible** (rar stamps
+times into headers, encryption draws random salts, some inputs were drawn from
+`/dev/urandom`), so re-running a generator is always a corpus revision:
+refresh `test-corpus/sources.json`, publish, and pin. Never use `unrar` — the
+binary or its source — to author, stamp or complete a fixture.
+
+Sets with **no checked-in generator** (`rar4_store`, `rar4_lz`, `rar5_store`,
+`rar5_lz`, `rar4_hp_store`, `rar4_hp_lz`, `rar5_hp_store`, `rar5_hp_lz`,
+`rar5_hp_large`, `rar4_mv_store`, `rar5_mv_store`,
+`rar4_mv_video`, `rar5_mv_video`, `rar4_tiny_volumes`, `rar4_lz_solid_mv`,
+`rar4_ppm_solid_mv`, `rar4_ppm_solid_restart`, `rar3_recovery_volumes`,
+`rar5_recovery_volumes` and `originals/test_clip.mkv`, `originals/binary.bin`)
+were inherited byte-identically from weaver's fixture corpus; their writer and
+recipe were never recorded, so the ledger imports them from the pinned weaver
+commit rather than assigning them a writer. Regenerating any of them on the
+pinned toolchain is a deliberate corpus revision. (`rar4_hp_large`,
+`rar4_solid` and `rar5_solid` have no generator either; they come from the
+Scryer e2e corpus below.)
 
 ## RAR4 PPMd performance corpus
 
@@ -86,9 +118,16 @@ thousandth of the size.
 
 ### Other upstreams
 
-- `rar4/old-rar-provenance.md` — junrar RAR 1.5 / 2.0 oracle archives.
-- `test_read_format_*` — libarchive's RAR test corpus.
-- `ssokolow_*` — ssokolow's RAR sample collection (SFX, locked, AV headers).
+Pinned by commit, path, digest and license in `test-corpus/sources.json`; the
+publish workflow re-fetches every public one and requires byte identity.
+
+- `rar4/old-rar-provenance.md` — junrar RAR 1.5 / 2.0 oracle archives
+  (junrar/junrar, UnRAR license). Immutable imports: no RARLAB writer is, or
+  can be, assigned to them.
+- `test_read_format_*` — libarchive's RAR test corpus (libarchive/libarchive,
+  BSD-2-Clause; stored uuencoded upstream).
+- `ssokolow_*` — ssokolow's RAR sample collection (ssokolow/rar-test-files,
+  CC0-1.0; the SFX stubs inside are freely redistributable RARLAB code).
 
 ## Stored-layout coverage
 

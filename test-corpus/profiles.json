@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "rar12": {
+      "description": "RAR 1.5 / 2.0 era: the junrar oracle archives and their expected output, plus the originals every UnRAR lane compares against.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar4/rar15_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar20_*.rar",
+        "crates/unrar-rs/tests/fixtures/originals/**"
+      ]
+    },
+    "rar34": {
+      "description": "RAR 3.x / 4.x era (RAR 2.9-format archives, SFX modules and RAR3 recovery volumes) plus originals.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar4/**",
+        "crates/unrar-rs/tests/fixtures/originals/**"
+      ],
+      "exclude": [
+        "crates/unrar-rs/tests/fixtures/rar4/rar15_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar20_*.rar"
+      ]
+    },
+    "rar57": {
+      "description": "RAR 5.x / 7.x era (RAR5-format archives, SFX modules and RAR5 recovery volumes) plus originals.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar5/**",
+        "crates/unrar-rs/tests/fixtures/originals/**"
+      ]
+    },
+    "unrar": {
+      "description": "Every unrar-rs fixture: rar12 + rar34 + rar57 (the unrar-slow-tests, fixture-tests and wasm-unrar lanes).",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/**"
+      ]
+    },
+    "par2": {
+      "description": "Every par2-rs fixture (the par2-slow-tests, fixture-tests and wasm-par2 lanes).",
+      "include": [
+        "crates/par2-rs/tests/fixtures/**"
+      ]
+    },
+    "wasm-unrar": {
+      "description": "Exactly the fixture families the wasm UnRAR harness (examples/wasm_extract_check) opens \u2014 ~169 MiB instead of the whole unrar profile. If the harness gains a case, add its family here or the missing file fails the lane loudly.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar4/generated_matrix_rar4_lz_enc.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/generated_matrix_rar4_lz_plain.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_enc_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_enc_mv_store.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_enc_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_lz_solid_mv.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_mv_store.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_mv.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_restart.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_solid.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/generated_matrix_rar5_lz_enc.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/generated_matrix_rar5_lz_plain.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_lz.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_mv_store.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_solid.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar"
+      ]
+    },
+    "unit": {
+      "description": "The two fixtures the no-fixture unit lanes read (unit-tests, platform-tests).",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_hp_large.rar"
+      ]
+    },
+    "cli": {
+      "description": "What the CLI smoke lane and the release smoke read.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar",
+        "crates/par2-rs/tests/fixtures/rar5_lz_plain/**"
+      ]
+    },
+    "release-tests": {
+      "description": "The subset release.yml hydrates for its test job.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_symlink.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_recovery_volumes.part*",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_oldmv*",
+        "crates/par2-rs/tests/fixtures/rar5_lz_plain/**"
+      ]
+    },
+    "ppmd-perf": {
+      "description": "The RAR4 PPMd fixtures ppmd-perf.yml measures.",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_restart.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_solid_mv.rar",
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_order16_32m.rar"
+      ]
+    },
+    "all": {
+      "description": "The whole corpus (publish-crates, and anyone who wants everything).",
+      "include": [
+        "crates/unrar-rs/tests/fixtures/**",
+        "crates/par2-rs/tests/fixtures/**"
+      ]
+    }
+  }
+}
