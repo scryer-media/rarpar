@@ -340,11 +340,10 @@ func extractTarTree(archive, destination string) error {
 		if err != nil {
 			return err
 		}
-		clean := filepath.Clean(header.Name)
-		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
-			return fmt.Errorf("archive %s contains an unsafe path %q", archive, header.Name)
+		target, err := containedPath(destination, header.Name)
+		if err != nil {
+			return fmt.Errorf("archive %s: %w", archive, err)
 		}
-		target := filepath.Join(destination, clean)
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
@@ -359,6 +358,27 @@ func extractTarTree(archive, destination string) error {
 			}
 		}
 	}
+}
+
+// containedPath resolves an archive entry name under destination and refuses
+// anything that would land outside it: absolute names, volume-qualified names,
+// NULs, and any `..` that survives cleaning. The containment check is done on
+// the joined result with filepath.Rel, not by inspecting the name's prefix, so
+// a traversal cannot be smuggled past it by any spelling.
+func containedPath(destination, entryName string) (string, error) {
+	if strings.ContainsRune(entryName, 0) {
+		return "", fmt.Errorf("unsafe path %q: contains NUL", entryName)
+	}
+	clean := filepath.Clean(filepath.FromSlash(entryName))
+	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" {
+		return "", fmt.Errorf("unsafe path %q: absolute", entryName)
+	}
+	target := filepath.Join(destination, clean)
+	relative, err := filepath.Rel(destination, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe path %q: escapes the extraction directory", entryName)
+	}
+	return target, nil
 }
 
 func writeExecutableMode(destination string, source io.Reader, mode os.FileMode) error {
