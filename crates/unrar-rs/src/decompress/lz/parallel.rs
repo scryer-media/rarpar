@@ -3535,6 +3535,13 @@ mod tests {
             .map(|_| Vec::new())
             .collect::<Vec<Vec<DecodedItem>>>();
         let mut scratch = BatchScratch::default();
+        // A uniform span is planned as at most one contiguous run per worker,
+        // so the assignment count follows the pool width, not the block count:
+        // four blocks are four assignments only from four workers up, and two
+        // assignments on a narrower pool. Derive it rather than restate it —
+        // hosts with fewer than four cores are otherwise a false failure.
+        let mut planned = Vec::new();
+        batch_plan::plan_batches_into(0, blocks.len(), worker_count, &mut planned);
         let result = parallel_decode_static(
             &[],
             &blocks,
@@ -3546,7 +3553,9 @@ mod tests {
             &mut scratch,
         );
         let outcome = result.unwrap();
-        assert_eq!(scratch.results.len(), 4);
+        assert_eq!(scratch.results.len(), planned.len());
+        // Whatever the width, the first assignment starts at block 0 and fails
+        // there, so the reduced failure is the same on every pool.
         assert_eq!(outcome.first_failure.unwrap().block_index, 0);
         // Failing at the first block leaves no assignment safe to install.
         assert_eq!(outcome.final_state_index, None);
