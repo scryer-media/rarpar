@@ -169,6 +169,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
 
+      # Resolving a toolchain archive from the mirror verifies its signature
+      # before Docker is allowed near it, so cosign has to be here — not only
+      # in the publish job that creates those signatures. Before the first
+      # publication the mirror answered 404 for every key and the official
+      # fallback hid the gap; the run after it went live failed here with
+      # "cosign: executable file not found". The fallback never skips
+      # verification, it only changes who is asked.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
       # Docker is preinstalled on ubuntu-24.04. Only the images these two units
       # drive are built: the writers `edge_cases` invokes, and nothing else.
       - name: Build the toolchain images these generators need
@@ -301,6 +313,18 @@ jobs:
       # `originals/test_clip.mkv` from the one the corpus ships.
       - name: Restore the shared inputs
         run: tar -xf "$RUNNER_TEMP/inputs/corpus-inputs.tar"
+
+      # Resolving a toolchain archive from the mirror verifies its signature
+      # before Docker is allowed near it, so cosign has to be here — not only
+      # in the publish job that creates those signatures. Before the first
+      # publication the mirror answered 404 for every key and the official
+      # fallback hid the gap; the run after it went live failed here with
+      # "cosign: executable file not found". The fallback never skips
+      # verification, it only changes who is asked.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
       - name: Build the toolchain images this generator needs
         run: |
