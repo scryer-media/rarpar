@@ -111,6 +111,13 @@ pub struct Model {
 
     // State.
     prev_success: u8,
+    /// Symbol of the previous decode's found state (`FoundState->Symbol` at
+    /// the top of the next `DecodeChar`). Kept as a byte instead of
+    /// re-validating `found_state` on every binary/escape decode: rescale and
+    /// update relocate the found state but never change its symbol, so the
+    /// returned symbol of decode N IS `FoundState->Symbol` seen by decode
+    /// N+1. Restart re-seeds it from the restart-installed found state.
+    prev_sym: u8,
     hi_bits_flag: u8,
     init_esc: u8,
     run_length: i32,
@@ -193,6 +200,7 @@ impl Model {
             esc_count: 1,
             num_masked: 0,
             prev_success: 0,
+            prev_sym: 0,
             hi_bits_flag: 0,
             init_esc: 0,
             run_length: 0,
@@ -316,6 +324,7 @@ impl Model {
 
         self.run_length = self.init_rl;
         self.prev_success = 0;
+        self.prev_sym = 0;
         for i in 0..256u32 {
             let off = states_off as usize + i as usize * STATE_SIZE;
             self.alloc.write_byte_at(off + STATE_SYM, i as u8);
@@ -757,6 +766,7 @@ impl Model {
         }
         rc.normalize();
         self.advance_debug_index();
+        self.prev_sym = symbol;
         symbol as i32
     }
 
@@ -790,12 +800,11 @@ impl Model {
         let symbol = (context_head >> 48) as u8;
         let freq = (context_head >> 56) as u8;
 
-        let Some(previous_found_span) = self.validated_state(self.found_state) else {
+        if self.found_state == 0 {
             self.model_fault = true;
             return false;
-        };
-        let previous_symbol = self.span_state_sym(previous_found_span, 0);
-        self.hi_bits_flag = self.hb2_flag[previous_symbol as usize];
+        }
+        self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
         let suffix = context_head as u32;
         if freq == 0 || freq > 128 || suffix == 0 {
             self.model_fault = true;
@@ -983,12 +992,7 @@ impl Model {
             }
             remaining -= 1;
             if remaining == 0 {
-                let Some(previous_found_span) = self.validated_state(self.found_state) else {
-                    self.model_fault = true;
-                    return false;
-                };
-                let previous_symbol = self.span_state_sym(previous_found_span, 0);
-                self.hi_bits_flag = self.hb2_flag[previous_symbol as usize];
+                self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
                 self.num_masked = ns as u32;
                 self.found_state = 0;
                 *found_span = None;

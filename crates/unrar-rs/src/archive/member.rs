@@ -3566,23 +3566,26 @@ impl RarArchive {
         Ok(())
     }
 
-    /// The effective solid flag for one member.
+    /// The effective solid flag for one member — a DISPATCH decision (which
+    /// decoder instance runs), not an inheritance decision.
     ///
-    /// RAR4 headers already carry the **per-file** value: `parse.rs`'s
-    /// `rar4_effective_solid` folds the archive-level flag in only for the
-    /// RAR 1.3-1.5 versions that need it, exactly like extract.cpp:917-922.
-    /// OR-ing the archive flag back in here would make every member of a solid
-    /// RAR4 archive inherit the previous member's window, tables and filters,
-    /// which unrar does only when the member's own header asks for it.
+    /// RAR4 headers carry the **per-file** value, and per-member state
+    /// inheritance is keyed on exactly that flag inside the shared slot:
+    /// `Rar4Decoder::prepare_slot(fh.compression.solid, ..)` gives a
+    /// non-solid member the full `UnpInitData*(false)` reset even
+    /// mid-solid-archive, so routing extra members through the solid path
+    /// cannot make them inherit windows, tables or filters.
     ///
-    /// RAR5 keeps the existing behavior: the first compressed member of a solid
-    /// archive has no per-file SOLID flag but still seeds the following ones.
+    /// The archive-level flag IS folded in here, for the same reason unrar
+    /// needs no equivalent: unrar has a single `Unpack` instance, so the
+    /// (non-solid) first member of a solid archive primes the shared state
+    /// as a side effect. With per-path decoder instances, dispatching that
+    /// first member to the plain path decodes it in a throwaway decoder and
+    /// leaves the solid cursor at 0 — the next member then re-decodes it
+    /// from scratch (measured: exactly one member-equivalent of extra PPMd
+    /// work per solid archive, +33% wall on 3-member fixtures).
     fn member_is_solid(&self, fh: &FileHeader) -> bool {
-        if fh.compression.format.is_rar4_family() {
-            fh.compression.solid
-        } else {
-            self.is_solid || fh.compression.solid
-        }
+        self.is_solid || fh.compression.solid
     }
 
     fn effective_member_dict_size(fh: &FileHeader) -> u64 {
@@ -8205,7 +8208,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_member_solid_dispatch_is_per_file_like_rar_behavior() {
+    fn member_solid_dispatch_folds_the_archive_flag_for_instance_sharing() {
         let mut archive = empty_rar5_archive();
         archive.is_solid = true;
 
@@ -8214,28 +8217,33 @@ mod tests {
         rar4.compression.version = 29;
         rar4.compression.method = CompressionMethod::Normal;
 
-        // extract.cpp:922 dispatches on FileHead.Solid for RAR 2.0+ members, and
-        // parse.rs has already folded the archive flag into that value for the
-        // RAR 1.3-1.5 versions that need it. A non-solid member inside a solid
-        // RAR4 archive therefore decodes non-solid.
+        // `member_is_solid` picks the decoder INSTANCE, not the reset
+        // semantics: `Rar4Decoder::prepare_slot(fh.compression.solid, ..)`
+        // still gives a non-solid member the full `UnpInitData*(false)`
+        // reset inside the shared slot (covered by
+        // `non_solid_reset_keeps_ppmd_allocation_for_the_next_header`).
+        // Folding the archive flag in routes the (non-solid) first member
+        // of a solid archive through the shared slot so it primes the
+        // chain — without it, the next member re-decodes it from scratch
+        // (measured: one member-equivalent of duplicate PPMd work per
+        // solid archive).
         rar4.compression.solid = false;
-        assert!(!archive.member_is_solid(&rar4));
+        assert!(archive.member_is_solid(&rar4));
         rar4.compression.solid = true;
         assert!(archive.member_is_solid(&rar4));
 
-        let mut rar14 = rar4.clone();
-        rar14.compression.format = ArchiveFormat::Rar14;
-        rar14.compression.solid = false;
-        assert!(!archive.member_is_solid(&rar14));
-
-        // RAR5 keeps folding the archive-level flag in: the first compressed
-        // member of a solid archive carries no per-file SOLID flag.
+        // RAR5: the first compressed member of a solid archive carries no
+        // per-file SOLID flag but still seeds the following ones.
         let rar5 = test_rar5_service("m", 0, 0).file_header;
         assert!(!rar5.compression.solid);
         assert!(archive.member_is_solid(&rar5));
 
+        // Non-solid archives keep dispatching on the per-file flag alone.
         archive.is_solid = false;
         assert!(!archive.member_is_solid(&rar5));
+        let mut rar4_plain = rar4.clone();
+        rar4_plain.compression.solid = false;
+        assert!(!archive.member_is_solid(&rar4_plain));
     }
 
     #[test]
