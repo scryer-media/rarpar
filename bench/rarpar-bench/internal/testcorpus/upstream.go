@@ -78,30 +78,101 @@ func fetchUpstreams(ctx context.Context, e *env, jobs int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	type job struct {
-		entry    LedgerFileEntry
-		upstream LedgerUpstream
+	pending, err := upstreamJobs(ledger, nil)
+	if err != nil {
+		return 0, err
 	}
-	var pending []job
+	if err := runUpstreamJobs(ctx, e, pending, jobs); err != nil {
+		return 0, err
+	}
+	return len(pending), nil
+}
+
+// fetchUnitUpstreams places the upstream imports the selected recipes read,
+// and only those.
+//
+// A recipe that reads an `upstream` fixture reads a *source*, not whatever the
+// checkout left behind: on a CI runner with GIT_LFS_SKIP_SMUDGE set that path
+// holds a Git LFS pointer, and par2_captures failed on exactly that ("gzip:
+// invalid header") because the whole-corpus fetch runs after the stages and
+// never runs at all under --only. Fetching a unit's declared inputs before it
+// runs makes `--only par2_captures` and a full run behave the same way.
+func fetchUnitUpstreams(ctx context.Context, e *env, selected []Unit, jobs int) (int, error) {
+	wanted := map[string]bool{}
+	for _, unit := range selected {
+		for _, path := range unit.Upstreams {
+			wanted[path] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return 0, nil
+	}
+	ledger, err := LoadLedger(filepath.Join(e.repoRoot, filepath.FromSlash(LedgerFile)))
+	if err != nil {
+		return 0, err
+	}
+	pending, err := upstreamJobs(ledger, wanted)
+	if err != nil {
+		return 0, err
+	}
+	if len(pending) != len(wanted) {
+		found := map[string]bool{}
+		for _, item := range pending {
+			found[item.entry.Path] = true
+		}
+		var absent []string
+		for path := range wanted {
+			if !found[path] {
+				absent = append(absent, path)
+			}
+		}
+		sort.Strings(absent)
+		return 0, fmt.Errorf(
+			"recipe input(s) %s are not `upstream` entries in %s; a declared upstream input has to be one the ledger pins",
+			strings.Join(absent, ", "), LedgerFile)
+	}
+	if err := runUpstreamJobs(ctx, e, pending, jobs); err != nil {
+		return 0, err
+	}
+	return len(pending), nil
+}
+
+// upstreamJob is one import to place: the ledger entry and the upstream it
+// comes from.
+type upstreamJob struct {
+	entry    LedgerFileEntry
+	upstream LedgerUpstream
+}
+
+// upstreamJobs selects the ledger's upstream entries — all of them, or just
+// the paths `only` names.
+func upstreamJobs(ledger Ledger, only map[string]bool) ([]upstreamJob, error) {
+	var pending []upstreamJob
 	for _, entry := range ledger.Files {
 		if entry.Source.Kind != "upstream" {
 			continue
 		}
+		if only != nil && !only[entry.Path] {
+			continue
+		}
 		upstream, declared := ledger.Upstreams[entry.Source.Upstream]
 		if !declared {
-			return 0, fmt.Errorf("%s: upstream %q is not declared", entry.Path, entry.Source.Upstream)
+			return nil, fmt.Errorf("%s: upstream %q is not declared", entry.Path, entry.Source.Upstream)
 		}
 		if upstream.Private {
-			return 0, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%s: upstream %q is private, so the corpus cannot be generated from it; give the fixture a recipe or make the upstream public",
 				entry.Path, entry.Source.Upstream)
 		}
-		pending = append(pending, job{entry: entry, upstream: upstream})
+		pending = append(pending, upstreamJob{entry: entry, upstream: upstream})
 	}
-	if len(pending) == 0 {
-		return 0, nil
-	}
+	return pending, nil
+}
 
+func runUpstreamJobs(ctx context.Context, e *env, pending []upstreamJob, jobs int) error {
+	if len(pending) == 0 {
+		return nil
+	}
 	client := &http.Client{Timeout: 2 * time.Minute}
 	if jobs < 1 {
 		jobs = 1
@@ -109,7 +180,7 @@ func fetchUpstreams(ctx context.Context, e *env, jobs int) (int, error) {
 	if jobs > 8 {
 		jobs = 8
 	}
-	queue := make(chan job)
+	queue := make(chan upstreamJob)
 	problems := make(chan string, len(pending))
 	var workers sync.WaitGroup
 	for range jobs {
@@ -135,10 +206,10 @@ func fetchUpstreams(ctx context.Context, e *env, jobs int) (int, error) {
 	}
 	if len(collected) > 0 {
 		sort.Strings(collected)
-		return 0, fmt.Errorf("%d upstream import(s) could not be fetched\n  %s",
+		return fmt.Errorf("%d upstream import(s) could not be fetched\n  %s",
 			len(collected), strings.Join(collected, "\n  "))
 	}
-	return len(pending), nil
+	return nil
 }
 
 func fetchOne(ctx context.Context, client *http.Client, e *env, entry LedgerFileEntry, upstream LedgerUpstream) error {

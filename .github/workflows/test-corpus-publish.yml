@@ -12,6 +12,20 @@ name: test-corpus-publish
 # suites are run against the tree that was just produced before any of it is
 # published.
 #
+# Generation fans out. One runner per generator produces that generator's
+# fixtures and hands them on as an artifact; `assemble` gathers the artifacts,
+# holds the result to the ledger's exact path set and refreshes its digests; the
+# three suites then run as three parallel lanes against that one tree. The job
+# graph is:
+#
+#   guard ─► plan ─┬─► generate (inputs) ──┬───────────────────────────────┐
+#                  │                       └─► generate (one job per unit) ─┤
+#                  └─► generate (imports) ──────────────────────────────────┴─► assemble ─► validate (×3) ─► publish
+#
+# The matrix is not written down here: `plan` asks the orchestrator for it with
+# `rarpar-bench testcorpus list --json`, so a recipe added to the Go table gets
+# a runner without anyone editing this file.
+#
 # See docs/test-corpus.md.
 
 on:
@@ -38,20 +52,514 @@ env:
   CARGO_TERM_COLOR: always
   # Every fixture byte in this run is produced by a recipe or fetched from a
   # pinned upstream, so the checkout never needs the LFS payloads: the pointers
-  # it leaves behind are overwritten before anything reads them.
+  # it leaves behind are removed before each generator runs, and a pointer that
+  # survives anywhere downstream is an error rather than content.
   GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
+  SCCACHE_CACHE_VERSION: v1
   # Pinned: signature bundles are only comparable if every publication used the
   # same signer. Bump deliberately.
   COSIGN_VERSION: v3.1.3
 
 jobs:
+  # A bad dispatch fails in seconds, before any runner starts an image build.
+  # This job deliberately does not join the protected environment: an
+  # environment with required reviewers would make it wait for an approval
+  # instead of failing, which is the opposite of what it is for. The
+  # configuration checks that need the environment's secrets are the publish
+  # job's first step.
+  guard:
+    name: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse anything but a confirmed run from main
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
+            exit 1
+          fi
+          if [ "$CONFIRM" != "publish" ]; then
+            echo "::error::type \"publish\" in the confirm input to run this workflow"
+            exit 1
+          fi
+
+  # The Go side is what generates the corpus, so it is checked once here rather
+  # than on thirteen runners — and the generation matrix is read out of the same
+  # unit table the recipes run from.
+  plan:
+    name: plan
+    needs: [guard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      generators: ${{ steps.units.outputs.generators }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Validate the shared toolchain lock
+        working-directory: bench/rarpar-bench
+        run: |
+          set -euo pipefail
+          go test ./...
+          go run ./cmd/rarpar-bench toolchains validate
+
+      # One job per stage-1 generator. Stage 0 (the shared inputs under
+      # originals/) and the upstream imports are their own jobs below, because
+      # everything else depends on the first and nothing depends on the second.
+      - id: units
+        name: Derive the generation matrix from the orchestrator
+        working-directory: bench/rarpar-bench
+        run: |
+          set -euo pipefail
+          go run ./cmd/rarpar-bench testcorpus list --json > "$RUNNER_TEMP/units.json"
+          generators="$(jq -c '[.units[] | select(.stage == 1) | .name]' "$RUNNER_TEMP/units.json")"
+          count="$(printf '%s' "$generators" | jq 'length')"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::the orchestrator lists no stage-1 generator; there would be nothing to generate"
+            exit 1
+          fi
+          echo "generators=$generators" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Generation matrix"
+            echo
+            echo "$count generator job(s) plus \`inputs\` and \`imports\`:"
+            echo
+            jq -r '.units[] | "- `\(.name)` (stage \(.stage)) — toolchains: \(.toolchains | join(", "))"' "$RUNNER_TEMP/units.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Stage 0: the shared inputs every other recipe reads. It is one job rather
+  # than a step of each generation job because the encoder is not
+  # byte-reproducible — `originals/test_clip.mkv` differs between two encodes —
+  # and the suites compare extracted members against exactly these bytes. Every
+  # archive of an input has to be an archive of the input that gets published.
+  generate-inputs:
+    name: generate (inputs)
+    needs: [plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Read-only mirror base for the toolchain source archives, when the
+      # variable is visible outside the protected environment. Empty means the
+      # official URLs; either way every archive is checked against the reviewed
+      # BLAKE3 digest before Docker sees it.
+      R2_CORPUS_PUBLIC_URL: ${{ vars.R2_CORPUS_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      # Docker is preinstalled on ubuntu-24.04. Only the images these two units
+      # drive are built: the writers `edge_cases` invokes, and nothing else.
+      - name: Build the toolchain images these generators need
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- bench toolchains build \
+            --mirror-base "${R2_CORPUS_PUBLIC_URL:-}" \
+            --cache "$RUNNER_TEMP/tool-cache" \
+            --only-images-for inputs \
+            --only-images-for edge_cases
+
+      - name: Generate the shared inputs
+        run: |
+          set -euo pipefail
+          # Nothing is carried forward: this group's fixtures are removed before
+          # its recipes run, so what the artifact carries is what this job wrote.
+          cargo run --locked -p xtask -- test-corpus paths \
+            --generator inputs --generator edge_cases --out "$RUNNER_TEMP/group-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/group-paths.txt" | xargs -0 -r rm -f
+          cargo run --locked -p xtask -- test-corpus generate --only inputs --only edge_cases
+
+      - name: Check and pack this group's output
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus paths \
+            --generator inputs --generator edge_cases --verify --out "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-inputs.tar" -T "$RUNNER_TEMP/group-paths.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-group-inputs
+          path: ${{ runner.temp }}/corpus-inputs.tar
+          if-no-files-found: error
+          # Fixture bytes are already compressed; the zip layer would only cost
+          # CPU on both ends.
+          compression-level: 0
+          retention-days: 1
+
+  # The public upstream imports, at their pinned commits. No toolchain image is
+  # involved, so this runs beside the image builds rather than after them.
+  generate-imports:
+    name: generate (imports)
+    needs: [plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      - name: Fetch every upstream import at its pinned commit
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus paths --upstreams --out "$RUNNER_TEMP/group-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/group-paths.txt" | xargs -0 -r rm -f
+          cargo run --locked -p xtask -- test-corpus generate --imports-only
+
+      - name: Check and pack this group's output
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus paths --upstreams --verify --out "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-imports.tar" -T "$RUNNER_TEMP/group-paths.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-group-imports
+          path: ${{ runner.temp }}/corpus-imports.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # One runner per stage-1 generator. Each builds only the images its own recipe
+  # drives — three of the seven, and the par2cmdline-turbo compile only for the
+  # three units that need it — and uploads only the fixtures the ledger says it
+  # owns, so every ledger path is carried by exactly one artifact.
+  generate:
+    name: generate (${{ matrix.group }})
+    needs: [plan, generate-inputs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      # One broken recipe should not hide the state of the other twelve.
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.plan.outputs.generators) }}
+    env:
+      GROUP: ${{ matrix.group }}
+      R2_CORPUS_PUBLIC_URL: ${{ vars.R2_CORPUS_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      - name: Download the shared inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-group-inputs
+          path: ${{ runner.temp }}/inputs
+
+      # The stage-0 bytes this recipe reads, exactly as the run will publish
+      # them. Regenerating them here would give this runner a different
+      # `originals/test_clip.mkv` from the one the corpus ships.
+      - name: Restore the shared inputs
+        run: tar -xf "$RUNNER_TEMP/inputs/corpus-inputs.tar"
+
+      - name: Build the toolchain images this generator needs
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- bench toolchains build \
+            --mirror-base "${R2_CORPUS_PUBLIC_URL:-}" \
+            --cache "$RUNNER_TEMP/tool-cache" \
+            --only-images-for "$GROUP"
+
+      # The recipe, and only the recipe: the upstream *inputs* it reads (the two
+      # par2cmdline-turbo data tarballs, for par2_captures) are fetched from
+      # their pinned commit by the generator itself, so this job never depends
+      # on the imports job's artifact.
+      - name: Generate this group's fixtures
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus paths \
+            --generator "$GROUP" --out "$RUNNER_TEMP/group-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/group-paths.txt" | xargs -0 -r rm -f
+          cargo run --locked -p xtask -- test-corpus generate --only "$GROUP"
+
+      # Every path this group owns, produced, and nothing outside the ledger.
+      # The ledger itself is refreshed once, in `assemble`, never here.
+      - name: Check and pack this group's output
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus paths \
+            --generator "$GROUP" --verify --out "$RUNNER_TEMP/group-paths.txt"
+          tar -cf "$RUNNER_TEMP/corpus-$GROUP.tar" -T "$RUNNER_TEMP/group-paths.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-group-${{ matrix.group }}
+          path: ${{ runner.temp }}/corpus-${{ matrix.group }}.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # Where the shares become a corpus revision: the tree is rebuilt from the
+  # artifacts alone, required to be exactly the ledger's path set, and the
+  # ledger's sizes and digests are refreshed from the bytes that arrived.
+  assemble:
+    name: assemble
+    needs: [generate, generate-inputs, generate-imports]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: bench/rarpar-bench/go.mod
+          cache-dependency-path: bench/rarpar-bench/go.mod
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      - name: Download every generation artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: corpus-group-*
+          path: ${{ runner.temp }}/groups
+
+      - name: Rebuild the fixture tree from the generation artifacts
+        run: |
+          set -euo pipefail
+          # Nothing is carried forward: every ledger path is removed first, so a
+          # fixture no job produced cannot survive as the checkout's Git LFS
+          # pointer, and cannot survive as checked-in bytes either.
+          cargo run --locked -p xtask -- test-corpus paths --all --out "$RUNNER_TEMP/all-paths.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/all-paths.txt" | xargs -0 -r rm -f
+          for archive in "$RUNNER_TEMP"/groups/*/corpus-*.tar; do
+            echo "unpacking $(basename "$archive")"
+            tar -xf "$archive"
+          done
+
+      # No generator runs here. The produced tree has to be exactly the ledger's
+      # path set, and the ledger's sizes and digests are refreshed to match; a
+      # path no artifact carried is simply absent, which fails.
+      - name: Assemble the corpus revision
+        run: cargo run --locked -p xtask -- test-corpus generate --assemble
+
+      # Every path present, no blocked provenance, every public upstream import
+      # re-fetched byte-identical at its pinned commit — independently of what
+      # the imports job wrote.
+      - name: Verify the corpus against its ledger and upstreams
+        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
+
+      - name: Build the manifest and provenance
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus build --out target/test-corpus/build
+          cat target/test-corpus/build/manifest.blake3
+
+      # Six benchmark cases import a fixture set by digest, so a corpus revision
+      # moves those pins. They are SHA-256 — the benchmark corpus's own contract
+      # — while everything else here is BLAKE3. The lock-pin PR commits
+      # sources.json, lock.json and these corpus.json pins together.
+      - name: Recompute the benchmark fixture pins
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus bench-pins \
+            --out target/test-corpus/build/bench-pins.tsv
+
+      - name: Pack the assembled tree
+        run: tar -cf "$RUNNER_TEMP/corpus-tree.tar" -T "$RUNNER_TEMP/all-paths.txt"
+
+      # The one tree everything downstream reads: the suites validate it and the
+      # publish job uploads its bytes. Nothing regenerates it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-tree
+          path: ${{ runner.temp }}/corpus-tree.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      # The manifest, its provenance, the object list, the benchmark pins and
+      # the refreshed ledger. The suites read the ledger too, so they are held
+      # to the same digests that will be published.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-build
+          path: |
+            target/test-corpus/build/manifest.json
+            target/test-corpus/build/manifest.blake3
+            target/test-corpus/build/provenance.json
+            target/test-corpus/build/objects.tsv
+            target/test-corpus/build/bench-pins.tsv
+            test-corpus/sources.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # The corpus exists to be read by the suites, so the suites are what validates
+  # it — against the tree this run produced, not against a remembered one. No
+  # UnRAR oracle is configured: the tests that want one skip without UNRAR_BIN.
+  # Three lanes, split the way ci.yml splits them, so the longest suite decides
+  # the wall time rather than their sum.
+  validate:
+    name: validate (${{ matrix.lane }})
+    needs: [assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [workspace, unrar, par2]
+    env:
+      LANE: ${{ matrix.lane }}
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+
+      # Keyed per lane, with ci.yml's lanes as the fallback: this workflow runs
+      # from main, where those caches were filled by the same compilation.
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-corpus-${{ matrix.lane }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-corpus-${{ matrix.lane }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-${{ matrix.lane }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+
+      - name: Download the assembled corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-tree
+          path: ${{ runner.temp }}/tree
+
+      - name: Download the refreshed ledger
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-build
+          path: ${{ runner.temp }}/build
+
+      # The tree the generation jobs produced, and the ledger that describes it.
+      # No hydration: nothing in this workflow reads the published corpus or LFS.
+      - name: Restore the corpus
+        run: |
+          set -euo pipefail
+          tar -xf "$RUNNER_TEMP/tree/corpus-tree.tar"
+          cp "$RUNNER_TEMP/build/test-corpus/sources.json" test-corpus/sources.json
+
+      - name: Run the suite
+        run: |
+          set -euo pipefail
+          case "$LANE" in
+            workspace)
+              cargo test --locked --workspace --no-fail-fast
+              ;;
+            unrar)
+              cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
+              ;;
+            par2)
+              cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+              ;;
+            *)
+              echo "::error::unknown validation lane $LANE"
+              exit 1
+              ;;
+          esac
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
   publish:
     name: publish
+    needs: [validate]
     runs-on: ubuntu-24.04
-    # Image builds + generation + the three suites (the unrar-rs suite alone is
-    # budgeted 120 minutes in ci.yml) do not fit in the old 180.
-    timeout-minutes: 300
+    timeout-minutes: 60
     # The protected environment holds the R2 secrets and gates the run on its
     # reviewers; the corpus variables live beside it.
     environment: test-corpus-publish
@@ -72,20 +580,12 @@ jobs:
       R2_CORPUS_SECRET_ACCESS_KEY: ${{ secrets.R2_CORPUS_S3_SECRET }}
       DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
     steps:
-      - name: Refuse anything but a confirmed run from main
-        env:
-          CONFIRM: ${{ inputs.confirm }}
-          REF: ${{ github.ref }}
+      # The secrets and variables live in this environment, so this is the
+      # first place they can be checked at all; the ref and confirmation were
+      # settled by `guard` before any of the work started.
+      - name: Refuse an incomplete publishing configuration
         run: |
           set -euo pipefail
-          if [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::the corpus is published from refs/heads/main only (got $REF)"
-            exit 1
-          fi
-          if [ "$CONFIRM" != "publish" ]; then
-            echo "::error::type \"publish\" in the confirm input to run this workflow"
-            exit 1
-          fi
           if [ "$DRY_RUN" != "true" ]; then
             for name in R2_CORPUS_BUCKET R2_CORPUS_PUBLIC_URL; do
               if [ -z "${!name:-}" ]; then
@@ -132,66 +632,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
 
-      - name: Validate the shared toolchain lock
-        working-directory: bench/rarpar-bench
+      - name: Download the assembled corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-tree
+          path: ${{ runner.temp }}/tree
+
+      - name: Download the manifest, provenance and refreshed ledger
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: corpus-build
+          path: ${{ runner.temp }}/build
+
+      # The bytes to publish are the ones the suites just validated: the tree,
+      # the manifest built from it, and the ledger that describes both. Nothing
+      # is rebuilt here, so nothing can differ from what was validated.
+      - name: Restore the validated corpus and its manifest
         run: |
           set -euo pipefail
-          go test ./...
-          go run ./cmd/rarpar-bench toolchains validate
-
-      # The writers, the encoder and the parity tool the recipes run on. The
-      # mirror is read first and falls back to the official URLs when it holds
-      # nothing yet; either way each archive has to match the reviewed BLAKE3
-      # digest before an image is built from it. The runner is amd64, so the
-      # images run natively.
-      - name: Build the pinned toolchain images
-        run: |
-          set -euo pipefail
-          cargo run --locked -p xtask -- bench toolchains build \
-            --mirror-base "${R2_CORPUS_PUBLIC_URL:-}" \
-            --cache "$RUNNER_TEMP/tool-cache"
-
-      # The corpus itself: every recipe run on those images, every upstream
-      # import fetched at its pinned commit, the produced tree required to be
-      # exactly the ledger's path set, and the ledger's sizes and digests
-      # refreshed to match. Nothing is carried forward from Git LFS.
-      #
-      # The recipes are Go (bench/rarpar-bench/internal/testcorpus) and xtask
-      # delegates to them, so this step needs the Go toolchain set up above.
-      - name: Generate the corpus
-        run: cargo run --locked -p xtask -- test-corpus generate --jobs 4
-
-      # Every path present, no blocked provenance, every public upstream import
-      # re-fetched byte-identical at its pinned commit.
-      - name: Verify the corpus against its ledger and upstreams
-        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
-
-      # The corpus exists to be read by the suites, so the suites are what
-      # validates it — against the tree this run produced, not against a
-      # remembered one. No UnRAR oracle is configured: the tests that want one
-      # skip without UNRAR_BIN.
-      - name: Validate the suites against the generated corpus
-        run: |
-          set -euo pipefail
-          cargo test --locked --workspace --no-fail-fast
-          cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
-          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
-
-      - name: Build the manifest and provenance
-        run: |
-          set -euo pipefail
-          cargo run --locked -p xtask -- test-corpus build --out target/test-corpus/build
+          tar -xf "$RUNNER_TEMP/tree/corpus-tree.tar"
+          mkdir -p target/test-corpus/build
+          cp "$RUNNER_TEMP"/build/target/test-corpus/build/* target/test-corpus/build/
+          cp "$RUNNER_TEMP/build/test-corpus/sources.json" test-corpus/sources.json
           cat target/test-corpus/build/manifest.blake3
-
-      # Six benchmark cases import a fixture set by digest, so a corpus revision
-      # moves those pins. They are SHA-256 — the benchmark corpus's own contract
-      # — while everything else here is BLAKE3. The lock-pin PR commits
-      # sources.json, lock.json and these corpus.json pins together.
-      - name: Recompute the benchmark fixture pins
-        run: |
-          set -euo pipefail
-          cargo run --locked -p xtask -- test-corpus bench-pins \
-            --out target/test-corpus/build/bench-pins.tsv
 
       # Original RARLAB and par2cmdline-turbo archives: R2-first, official
       # fallback, reviewed BLAKE3 digest required, signed and conditionally

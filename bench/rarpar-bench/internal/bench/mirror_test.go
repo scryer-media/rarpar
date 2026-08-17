@@ -923,7 +923,7 @@ for argument in "$@"; do context="$argument"; done
 cp -R "$context" "$directory/context"
 `, record, record))
 
-	if err := BuildToolchains(context.Background(), docker, filepath.Join("..", ".."), lock, fixture.mirror); err != nil {
+	if err := BuildToolchains(context.Background(), docker, filepath.Join("..", ".."), lock, fixture.mirror, nil); err != nil {
 		t.Fatal(err)
 	}
 	builds, err := os.ReadDir(record)
@@ -946,6 +946,46 @@ cp -R "$context" "$directory/context"
 	argv := readArgv(t, filepath.Join(par2Directory, "argv"))
 	assertNoUpstreamArguments(t, lock.PAR2Generator.ID, argv)
 	assertStagedContext(t, lock.PAR2Generator.ID, filepath.Join(par2Directory, "context"), "par2.tar.gz", lock.PAR2Generator.BLAKE3)
+}
+
+// One runner per generator builds one generator's images. The subset is the
+// lock ids `toolchains build --only-images-for` resolves to; the video encoder
+// is a legal member that builds nothing, and an id the lock does not declare
+// is an error rather than a build of nothing at all.
+func TestBuildToolchainsBuildsOnlyTheRequestedToolchains(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	lock := mirroredToolchainLock(t, fixture)
+	record := filepath.Join(fixture.root, "subset-builds")
+	if err := os.MkdirAll(record, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	docker := writeStub(t, fixture.root, "docker-subset", fmt.Sprintf(`#!/bin/sh
+set -eu
+count=$(ls %q | wc -l | tr -d ' ')
+directory=%q/build-$count
+mkdir -p "$directory"
+printf '%%s\n' "$@" > "$directory/argv"
+`, record, record))
+
+	writer := lock.RARWriters[len(lock.RARWriters)-1]
+	only := []string{writer.ID, lock.VideoEncoder.ID}
+	if err := BuildToolchains(context.Background(), docker, filepath.Join("..", ".."), lock, fixture.mirror, only); err != nil {
+		t.Fatal(err)
+	}
+	builds, err := os.ReadDir(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(builds) != 1 {
+		t.Fatalf("%d builds recorded, want exactly the one requested writer", len(builds))
+	}
+	argv := readArgv(t, filepath.Join(record, "build-0", "argv"))
+	if !argvHasPair(argv, "--tag", writer.Image) {
+		t.Fatalf("the build is not tagged %s: %v", writer.Image, argv)
+	}
+	if err := BuildToolchains(context.Background(), docker, filepath.Join("..", ".."), lock, fixture.mirror, []string{"rarlab-0.0"}); err == nil {
+		t.Fatal("an id the lock does not declare must be an error")
+	}
 }
 
 func readArgv(t *testing.T, path string) []string {
