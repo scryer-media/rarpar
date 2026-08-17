@@ -50,11 +50,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Every fixture byte in this run is produced by a recipe or fetched from a
-  # pinned upstream, so the checkout never needs the LFS payloads: the pointers
-  # it leaves behind are removed before each generator runs, and a pointer that
-  # survives anywhere downstream is an error rather than content.
-  GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
   SCCACHE_CACHE_VERSION: v1
   # Pinned: signature bundles are only comparable if every publication used the

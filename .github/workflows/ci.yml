@@ -16,7 +16,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
   SCCACHE_CACHE_VERSION: v1
   WASM_CACHE_VERSION: v2
@@ -183,17 +182,27 @@ jobs:
             exit 1
           fi
 
-          git lfs install --local
-          git lfs ls-files --name-only > .ci-lfs-files.txt
-          test -s .ci-lfs-files.txt
-          # Directory paths, not package names. The crates were renamed in their
-          # manifests but their directories were deliberately left in place, and
-          # every other path in this workflow reflects that.
-          if grep -Ev '^crates/(unrar-rs|par2-rs)/tests/fixtures/' .ci-lfs-files.txt; then
-            echo "::error::unexpected Git LFS path outside fixture corpora"
+          # The corpus left Git LFS when its first published revision was
+          # pinned; nothing may quietly bring it back: no attributes file may
+          # declare an lfs filter, and no pointer blob may be committed where
+          # fixture bytes belong. The patterns are assembled at run time so
+          # this file cannot match itself, and the pointer check is scoped to
+          # the fixture trees because xtask's own tests legitimately hold
+          # pointer literals as test data.
+          lfs_filter="filter=""lfs"
+          pointer_spec="https://git-lfs.github.com""/spec"
+          bad="$(git ls-files -z -- '.gitattributes' '*/.gitattributes' | xargs -0 -r grep -l "$lfs_filter" || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::an attributes file reintroduces Git LFS:"
+            printf '%s\n' "$bad"
             exit 1
           fi
-          git lfs fsck --pointers
+          bad="$(git grep -I --cached -l "$pointer_spec" -- 'crates/*/tests/fixtures' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::a Git LFS pointer is committed where fixture bytes belong:"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
 
   fmt:
     name: fmt
