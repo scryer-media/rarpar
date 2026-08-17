@@ -1,7 +1,7 @@
 # The test corpus
 
 The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
-`crates/par2-rs/tests/fixtures/` are the **test corpus**: 369 archives, parity
+`crates/par2-rs/tests/fixtures/` are the **test corpus**: 375 archives, parity
 sets, SFX modules, video inputs and originals that the unit, integration, slow,
 PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
 content-addressed object set on Cloudflare R2 and hydrated by `xtask`; Git LFS
