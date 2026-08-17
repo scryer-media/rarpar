@@ -118,6 +118,59 @@ fn configured_input_grouping() -> usize {
     })
 }
 
+/// Source lanes the `Simd` family block-interleaves into one contiguous
+/// staging stream, so that one kernel pass reads one sequential run instead of
+/// one region per source.
+///
+/// The aarch64 CLMUL pass folds [`gf_simd::INPUT_BATCH_INTERLEAVE_LANES`]
+/// sources into the destination at a shared block offset. Laid out lane-major
+/// that is eight source lines plus a destination line competing for one L1D
+/// set per block, which no stride residue can make fit a 2-way set — Cortex-A72
+/// kept 26 L1D refills per thousand instructions after the lane/row skew that
+/// took Neoverse N1's 4-way L1D from 35 to 3. Interleaved, the same pass reads
+/// one stream: two streams total with the destination, which any associativity
+/// holds. The x86 folded family has always done this (`split_encode_scatter`,
+/// six lanes at 32 B) and never aliased.
+///
+/// `WEAVER_PAR2_CREATE_INTERLEAVE=N` pins the width so the layouts can be A/B'd
+/// without a rebuild (same escape-hatch pattern as
+/// `WEAVER_PAR2_CREATE_GROUPING`); `1` is the lane-major layout this pass
+/// shipped with. Widths below the kernel's own pass width also shorten the
+/// passes, so only `1`, the kernel width and the whole grouping compare
+/// like for like. Off aarch64 an interleaved width selects the portable
+/// reference kernel in `reedsolomon-rs`, which is a correctness path and not a
+/// fast one — the knob is for validating the layout there, not for running it.
+///
+/// Process-stable by construction, like every other layout input: the staging
+/// plan and the batch loop must agree.
+fn configured_interleave_lanes() -> usize {
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("WEAVER_PAR2_CREATE_INTERLEAVE")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&lanes| (1..=MAX_INPUT_GROUPING).contains(&lanes))
+            .unwrap_or(gf_simd::INPUT_BATCH_INTERLEAVE_LANES)
+    })
+}
+
+/// Kernel granularity of the `Simd` family.
+///
+/// The block-interleaved layout is only expressible in whole
+/// [`gf_simd::INPUT_BATCH_BLOCK_BYTES`] blocks, so the stripe and every tile
+/// inside it must be a whole number of them; that is exactly what the family's
+/// stride is for. aarch64 keeps the block stride even when the interleave is
+/// pinned back to 1, so that pin isolates the layout and changes no plan
+/// number. Elsewhere the family stays at the scalar word it has always used
+/// unless the interleave is pinned on.
+fn simd_stride() -> usize {
+    if cfg!(target_arch = "aarch64") || configured_interleave_lanes() > 1 {
+        gf_simd::INPUT_BATCH_BLOCK_BYTES
+    } else {
+        2
+    }
+}
+
 /// Band shape for one encoding pass: `(band_size, band_count)` with
 /// `band_count = ceil(output_count / band_size)` exactly, so chunked splits,
 /// workspace counts, and memory admission all agree. Never zero-sized.
@@ -789,6 +842,96 @@ fn lane_stride(contract: KernelContract, aligned_len: usize) -> usize {
     }
 }
 
+/// Where one input batch's staging bytes live.
+///
+/// Lanes are taken `interleave` at a time and each group's lanes are
+/// **block-interleaved** into one contiguous stream: lane `j` of group `g`
+/// starts its block `b` at
+/// `group_base(g) + (b * width(g) + j) * INPUT_BATCH_BLOCK_BYTES`. A kernel
+/// pass over the group therefore walks that stream front to back once —
+/// **one** source stream plus the destination — where a lane-major layout gives
+/// it `width` sources plus the destination at a shared offset, i.e. `width + 1`
+/// lines wanting one L1D set per block. That is the whole point: contiguity is
+/// associativity-independent, where the [`SKEW_PERIOD_BYTES`] residue rule only
+/// moves the collision around and needs `width + 1` ways to pay off (it did on
+/// the 4-way Neoverse parts and did not on the 2-way Cortex-A72).
+///
+/// `interleave == 1` is the lane-major layout and reproduces the pre-interleave
+/// addresses exactly: `group_base(l) = l * lane_stride`, one lane per group.
+/// Every family except `Simd` uses it.
+///
+/// Never larger than the planned staging area: the interleaved total is
+/// `input_grouping * aligned_len + (groups - 1) * skew`, and the plan reserves
+/// `input_grouping * (aligned_len + skew)`, which is larger for every
+/// `groups <= input_grouping`.
+#[derive(Clone, Copy)]
+struct StagingLayout {
+    /// Lanes per interleaved group; `1` = lane-major.
+    interleave: usize,
+    /// Lanes in the batch (the family's input grouping).
+    lanes: usize,
+    /// Payload bytes per lane in this stripe.
+    aligned_len: usize,
+    /// Distance between consecutive group bases.
+    group_pitch: usize,
+}
+
+impl StagingLayout {
+    fn new(contract: KernelContract, aligned_len: usize, lane_stride: usize) -> Self {
+        let lanes = contract.input_grouping.max(1);
+        let interleave = contract.interleave_lanes.clamp(1, lanes);
+        let group_pitch = if interleave == 1 {
+            lane_stride
+        } else {
+            // One group is `interleave` lanes wide; keep the skew rule between
+            // groups, which are still separate streams even though the lanes
+            // inside one no longer are.
+            interleave * aligned_len + stripe_skew_bytes(aligned_len)
+        };
+        Self {
+            interleave,
+            lanes,
+            aligned_len,
+            group_pitch,
+        }
+    }
+
+    fn group_count(&self) -> usize {
+        self.lanes.div_ceil(self.interleave).max(1)
+    }
+
+    /// Lanes actually in `group` — the last group is short when the grouping is
+    /// not a multiple of the interleave (twelve inputs interleaved eight-wide
+    /// is a group of eight and a group of four), and its stream is narrower to
+    /// match, so the layout never claims bytes the plan did not reserve.
+    fn group_width(&self, group: usize) -> usize {
+        self.lanes
+            .saturating_sub(group * self.interleave)
+            .min(self.interleave)
+    }
+
+    fn group_base(&self, group: usize) -> usize {
+        group * self.group_pitch
+    }
+
+    /// Bytes this layout occupies, or `None` on overflow.
+    fn total_bytes(&self) -> Option<usize> {
+        let last = self.group_count() - 1;
+        last.checked_mul(self.group_pitch)?
+            .checked_add(self.group_width(last).checked_mul(self.aligned_len)?)
+    }
+
+    /// Byte range of `group`'s stream covering the tile at `tile_start`.
+    ///
+    /// The group's stream holds `width` bytes for every logical byte of a lane,
+    /// so a tile of the lanes is the same tile of the stream, scaled.
+    fn group_tile(&self, group: usize, tile_start: usize, tile_len: usize) -> (usize, usize) {
+        let width = self.group_width(group);
+        let start = self.group_base(group) + tile_start * width;
+        (start, start + tile_len * width)
+    }
+}
+
 /// Output rows whose coefficient state is built in one step.
 ///
 /// The tile loop runs *inside* this, which is what keeps a row's coefficients
@@ -821,16 +964,33 @@ struct KernelContract {
     /// Whether staging lanes sit `lane_stride` apart (skewed) rather than
     /// exactly `aligned_len` apart. See [`SKEW_PERIOD_BYTES`].
     skewed_lanes: bool,
+    /// Source lanes block-interleaved into one contiguous staging stream;
+    /// `1` is the lane-major layout. See [`StagingLayout`] and
+    /// [`configured_interleave_lanes`].
+    interleave_lanes: usize,
 }
 
 impl KernelContract {
     fn for_kernel(kernel: ResolvedKernel) -> Self {
         match kernel {
-            ResolvedKernel::Portable | ResolvedKernel::Simd => Self {
+            // The word-wise reference walks one source at a time, so it wants
+            // lanes it can address with a plain stride and a granularity of one
+            // GF word — the layout this family has always had.
+            ResolvedKernel::Portable => Self {
                 stride: 2,
                 input_grouping: configured_input_grouping(),
                 tile_bytes: family_tile_bytes(TABLE_TILE_BYTES, 2),
                 skewed_lanes: true,
+                interleave_lanes: 1,
+            },
+            ResolvedKernel::Simd => Self {
+                stride: simd_stride(),
+                input_grouping: configured_input_grouping(),
+                tile_bytes: family_tile_bytes(TABLE_TILE_BYTES, simd_stride()),
+                // With an interleave the skew separates whole groups rather
+                // than single lanes; one rule, either way.
+                skewed_lanes: true,
+                interleave_lanes: configured_interleave_lanes(),
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::Folded => Self {
@@ -852,6 +1012,10 @@ impl KernelContract {
                 // separates the two group streams; harmless, and it keeps one
                 // layout rule for every slice-per-source family.
                 skewed_lanes: true,
+                // This family does its own six-lane interleave inside
+                // `split_encode_scatter`, which also splits the byte planes;
+                // the generic block interleave is not its layout.
+                interleave_lanes: 1,
             },
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::XorJitAvx2 => Self {
@@ -864,6 +1028,9 @@ impl KernelContract {
                 // The same contract fixes the lane stride at `len`; the skew
                 // for this family needs a `PackedRun` source stride first.
                 skewed_lanes: false,
+                // `PackedRun` addresses region `r` at `src + r * len`, which is
+                // lane-major by contract.
+                interleave_lanes: 1,
             },
         }
     }
@@ -1446,6 +1613,17 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
         ));
     }
     let lane_stride = lane_stride(contract, aligned_len);
+    let layout = StagingLayout::new(contract, aligned_len, lane_stride);
+    // One check for the whole batch instead of a per-lane one: every offset
+    // below is bounded by the layout's last byte.
+    let layout_bytes = layout
+        .total_bytes()
+        .ok_or_else(|| resource_limit("staging lane offset overflow"))?;
+    if staging_bytes.len() < layout_bytes {
+        return Err(resource_limit(
+            "staging buffer is shorter than the batch layout",
+        ));
+    }
 
     for lane in 0..contract.input_grouping {
         transfer_bytes[..aligned_len].fill(0);
@@ -1460,11 +1638,25 @@ fn fill_staging<P: ForwardSourceProvider + ?Sized>(
 
         match kernel {
             ResolvedKernel::Portable | ResolvedKernel::Simd => {
-                let start = lane
-                    .checked_mul(lane_stride)
-                    .ok_or_else(|| resource_limit("staging lane offset overflow"))?;
-                staging_bytes[start..start + aligned_len]
-                    .copy_from_slice(&transfer_bytes[..aligned_len]);
+                if layout.interleave == 1 {
+                    let start = layout.group_base(lane);
+                    staging_bytes[start..start + aligned_len]
+                        .copy_from_slice(&transfer_bytes[..aligned_len]);
+                } else {
+                    // Block-interleaved: this lane takes every `width`-th block
+                    // of its group's stream, so a kernel pass over the group
+                    // reads one sequential run. The family's stride is the
+                    // block, so the stripe is a whole number of them.
+                    const BLOCK: usize = gf_simd::INPUT_BATCH_BLOCK_BYTES;
+                    debug_assert_eq!(aligned_len % BLOCK, 0, "interleaved stripe must be blocked");
+                    let group = lane / layout.interleave;
+                    let step = layout.group_width(group) * BLOCK;
+                    let mut start = layout.group_base(group) + (lane % layout.interleave) * BLOCK;
+                    for block in transfer_bytes[..aligned_len].chunks_exact(BLOCK) {
+                        staging_bytes[start..start + BLOCK].copy_from_slice(block);
+                        start += step;
+                    }
+                }
             }
             #[cfg(target_arch = "x86_64")]
             ResolvedKernel::Folded => {
@@ -1623,6 +1815,7 @@ fn accumulate_band(
         return Ok(());
     }
     let lane_stride = lane_stride(contract, aligned_len);
+    let layout = StagingLayout::new(contract, aligned_len, lane_stride);
     let mut row = [0u16; MAX_INPUT_GROUPING];
     match kernel {
         ResolvedKernel::Portable => {
@@ -1669,25 +1862,51 @@ fn accumulate_band(
                     for offset in 0..chunk.len() {
                         let dst_start = (first_output + offset) * output_stride + tile_start;
                         let row_base = offset * live_inputs;
-                        // Stack-resident: `live_inputs <=
-                        // MAX_INPUT_GROUPING`, so the descriptor list never
-                        // needs the heap. Building it per row used to cost one
-                        // allocate/free pair per (output row, input group) —
-                        // 3.3M of them on the 4096×819 create shape.
-                        let inputs: [PreparedFactorSrc<'_>; MAX_INPUT_GROUPING] =
-                            std::array::from_fn(|lane| {
-                                let clamped = lane.min(live_inputs - 1);
-                                let source_start_bytes = clamped * lane_stride + tile_start;
-                                PreparedFactorSrc {
-                                    prepared: &prepared[row_base + clamped],
-                                    src: &staging_bytes
-                                        [source_start_bytes..source_start_bytes + tile_len],
-                                }
-                            });
-                        gf_simd::mul_acc_input_batch_prepared(
-                            &mut output[dst_start..dst_start + tile_len],
-                            &inputs[..live_inputs],
-                        );
+                        if layout.interleave == 1 {
+                            // Stack-resident: `live_inputs <=
+                            // MAX_INPUT_GROUPING`, so the descriptor list never
+                            // needs the heap. Building it per row used to cost
+                            // one allocate/free pair per (output row, input
+                            // group) — 3.3M of them on the 4096×819 create
+                            // shape.
+                            let inputs: [PreparedFactorSrc<'_>; MAX_INPUT_GROUPING] =
+                                std::array::from_fn(|lane| {
+                                    let clamped = lane.min(live_inputs - 1);
+                                    let source_start_bytes =
+                                        layout.group_base(clamped) + tile_start;
+                                    PreparedFactorSrc {
+                                        prepared: &prepared[row_base + clamped],
+                                        src: &staging_bytes
+                                            [source_start_bytes..source_start_bytes + tile_len],
+                                    }
+                                });
+                            gf_simd::mul_acc_input_batch_prepared(
+                                &mut output[dst_start..dst_start + tile_len],
+                                &inputs[..live_inputs],
+                            );
+                            continue;
+                        }
+                        // One call per interleaved group: each is one kernel
+                        // pass reading one contiguous stream, and no descriptor
+                        // list is built at all because the group's factors are
+                        // already contiguous in `prepared`.
+                        for group in 0..layout.group_count() {
+                            let first_lane = group * layout.interleave;
+                            if first_lane >= live_inputs {
+                                break;
+                            }
+                            let width = layout.group_width(group);
+                            let live_in_group = (live_inputs - first_lane).min(width);
+                            let (stream_start, stream_end) =
+                                layout.group_tile(group, tile_start, tile_len);
+                            gf_simd::mul_acc_input_batch_prepared_interleaved(
+                                &mut output[dst_start..dst_start + tile_len],
+                                &prepared
+                                    [row_base + first_lane..row_base + first_lane + live_in_group],
+                                &staging_bytes[stream_start..stream_end],
+                                width,
+                            );
+                        }
                     }
                 }
             }
@@ -2896,6 +3115,7 @@ mod tests {
                 input_grouping: DEFAULT_INPUT_GROUPING,
                 tile_bytes: TABLE_TILE_BYTES,
                 skewed_lanes: true,
+                interleave_lanes: 1,
             },
             1,
             0,
@@ -2967,6 +3187,7 @@ mod tests {
                 input_grouping: DEFAULT_INPUT_GROUPING,
                 tile_bytes: TABLE_TILE_BYTES,
                 skewed_lanes: true,
+                interleave_lanes: 1,
             },
         )
         .unwrap();
@@ -3064,6 +3285,7 @@ mod tests {
             input_grouping: DEFAULT_INPUT_GROUPING,
             tile_bytes: TABLE_TILE_BYTES,
             skewed_lanes: true,
+            interleave_lanes: 1,
         };
         let plan =
             BufferPlan::new_with_reserved(65_536, 820, contract, usize::MAX, 0, 0, 0).unwrap();
@@ -3172,6 +3394,212 @@ mod tests {
                     &actual[output].data, block,
                     "kernel {kernel:?} output {output} diverged from the definition"
                 );
+            }
+        }
+    }
+
+    /// The interleaved layout must place every lane inside the area the plan
+    /// reserves, and must reduce to the lane-major addresses at width 1 — the
+    /// two properties that let `BufferPlan` stay untouched by the interleave.
+    #[test]
+    fn staging_layout_fits_the_planned_area_at_every_width() {
+        const BLOCK: usize = gf_simd::INPUT_BATCH_BLOCK_BYTES;
+        for aligned_len in [BLOCK, 4096usize, 8192, 65_536] {
+            for grouping in [1usize, 4, 12, 16] {
+                let base = KernelContract {
+                    stride: BLOCK,
+                    input_grouping: grouping,
+                    tile_bytes: TABLE_TILE_BYTES,
+                    skewed_lanes: true,
+                    interleave_lanes: 1,
+                };
+                let stride = lane_stride(base, aligned_len);
+                let planned = grouping * stride;
+                for interleave in [1usize, 2, 4, 8, 16] {
+                    let contract = KernelContract {
+                        interleave_lanes: interleave,
+                        ..base
+                    };
+                    let layout = StagingLayout::new(contract, aligned_len, stride);
+                    let total = layout.total_bytes().expect("layout fits usize");
+                    assert!(
+                        total <= planned,
+                        "layout {interleave}x{grouping} at {aligned_len} wants {total} of {planned}"
+                    );
+                    // Widths sum to the grouping, so no lane is dropped and no
+                    // lane is counted twice.
+                    let widths: usize = (0..layout.group_count())
+                        .map(|group| layout.group_width(group))
+                        .sum();
+                    assert_eq!(widths, grouping, "every lane belongs to exactly one group");
+                    // Every group's last tile stays inside the layout.
+                    for group in 0..layout.group_count() {
+                        let (_, end) = layout.group_tile(group, aligned_len - BLOCK, BLOCK);
+                        assert!(end <= total, "group {group} tile runs past the layout");
+                    }
+                }
+                // Width 1 is the pre-interleave layout, byte for byte.
+                let lane_major = StagingLayout::new(base, aligned_len, stride);
+                for lane in 0..grouping {
+                    assert_eq!(lane_major.group_base(lane), lane * stride);
+                }
+            }
+        }
+    }
+
+    /// A staging area shorter than the batch's layout is refused up front, as a
+    /// resource error, rather than being discovered as a slice panic partway
+    /// through the fill. One check covers every lane of every family.
+    #[test]
+    fn short_staging_is_refused_before_the_fill() {
+        const BLOCK: usize = gf_simd::INPUT_BATCH_BLOCK_BYTES;
+        let source = vec![0xA5u8; 512];
+        let refs = [source.as_slice()];
+        for interleave in [1usize, 8] {
+            let contract = KernelContract {
+                stride: BLOCK,
+                input_grouping: 8,
+                tile_bytes: TABLE_TILE_BYTES,
+                skewed_lanes: true,
+                interleave_lanes: interleave,
+            };
+            let stride = lane_stride(contract, 512);
+            let needed = StagingLayout::new(contract, 512, stride)
+                .total_bytes()
+                .unwrap();
+            let mut provider = InMemorySourceProvider { sources: &refs };
+            let mut staging = AlignedBuffer::new(needed - 1);
+            let mut transfer = AlignedBuffer::new(512);
+            let result = fill_staging(
+                ResolvedKernel::Simd,
+                &mut staging,
+                &mut transfer,
+                &mut provider,
+                0,
+                0,
+                512,
+                512,
+                contract,
+            );
+            assert!(
+                matches!(result, Err(Par2Error::ResourceLimitExceeded { .. })),
+                "interleave {interleave} accepted a short staging area"
+            );
+        }
+    }
+
+    /// The block-interleaved staging layout is a pure relocation of the same
+    /// bytes: for every interleave width, every live-input count and every
+    /// tile, the accumulated recovery bytes must equal the lane-major layout's
+    /// — and must equal the word-wise `Portable` kernel's, so two broken
+    /// layouts cannot agree their way to a pass.
+    ///
+    /// The live counts straddle the interleave boundary on purpose: eleven live
+    /// inputs at width eight is one full group and one partly-live group, and
+    /// three is the width at which dispatch leaves the CLMUL pass for the VTBL
+    /// kernel, which reads the same layout.
+    #[test]
+    fn interleaved_staging_matches_lane_major_and_the_word_wise_kernel() {
+        const BLOCK: usize = gf_simd::INPUT_BATCH_BLOCK_BYTES;
+        // A whole number of blocks, not a whole number of tiles, with sources
+        // shorter than the stripe so the zero padding is live.
+        const SLICE: usize = 8 * 1024 + 96;
+        let sources: Vec<Vec<u8>> = (0..MAX_INPUT_GROUPING)
+            .map(|source| {
+                (0..(SLICE - source * 37))
+                    .map(|index| (index.wrapping_mul(31) ^ (source * 53) ^ (index >> 5)) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let exponents: Vec<RecoveryExponent> = vec![0, 1, 2, 31, 100];
+        let simd = KernelContract::for_kernel(ResolvedKernel::Simd);
+        let aligned_len = round_up(SLICE, BLOCK).unwrap();
+
+        let run = |kernel: ResolvedKernel, contract: KernelContract, live: usize| -> Vec<u8> {
+            let mut provider = InMemorySourceProvider { sources: &refs };
+            let mut staging =
+                AlignedBuffer::new(contract.input_grouping * lane_stride(contract, aligned_len));
+            let mut transfer = AlignedBuffer::new(aligned_len);
+            fill_staging(
+                kernel,
+                &mut staging,
+                &mut transfer,
+                &mut provider,
+                0,
+                0,
+                SLICE,
+                aligned_len,
+                contract,
+            )
+            .unwrap();
+            let factors = FactorSource::new(refs.len());
+            let mut output = AlignedBuffer::new(exponents.len() * aligned_len);
+            #[cfg(target_arch = "x86_64")]
+            let mut jit_workspaces: Vec<
+                reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
+            > = vec![Default::default()];
+            accumulate_batch(
+                kernel,
+                output.as_bytes_mut(),
+                &staging,
+                &factors,
+                &exponents,
+                0,
+                live,
+                aligned_len,
+                aligned_len,
+                contract,
+                exponents.len(),
+                #[cfg(target_arch = "x86_64")]
+                &mut jit_workspaces,
+                #[cfg(target_arch = "x86_64")]
+                usize::MAX,
+            )
+            .unwrap();
+            output.as_bytes().to_vec()
+        };
+
+        // Groupings that are and are not multiples of the interleave: twelve
+        // inputs eight-wide is a group of eight and a group of four, which is
+        // the `WEAVER_PAR2_CREATE_GROUPING=12` pin's shape and the only one
+        // where a group's width differs from the nominal interleave.
+        for grouping in [12usize, 16, MAX_INPUT_GROUPING] {
+            let portable = KernelContract {
+                input_grouping: grouping,
+                ..KernelContract::for_kernel(ResolvedKernel::Portable)
+            };
+            for live in [1usize, 3, 8, 11, grouping] {
+                let live = live.min(grouping).min(refs.len());
+                let definition = run(ResolvedKernel::Portable, portable, live);
+                for tile_bytes in [UNTILED, 8192usize, 2048] {
+                    let mut lane_major: Option<Vec<u8>> = None;
+                    for interleave in [1usize, 2, 4, 8, 16] {
+                        let contract = KernelContract {
+                            stride: BLOCK,
+                            tile_bytes,
+                            input_grouping: grouping,
+                            interleave_lanes: interleave,
+                            ..simd
+                        };
+                        let got = run(ResolvedKernel::Simd, contract, live);
+                        let case = format!(
+                            "grouping={grouping} interleave={interleave} \
+                             tile={tile_bytes} live={live}"
+                        );
+                        assert_eq!(
+                            got, definition,
+                            "simd {case} diverged from the word-wise kernel"
+                        );
+                        match &lane_major {
+                            None => lane_major = Some(got),
+                            Some(expected) => assert_eq!(
+                                &got, expected,
+                                "simd {case} diverged from the lane-major layout"
+                            ),
+                        }
+                    }
+                }
             }
         }
     }

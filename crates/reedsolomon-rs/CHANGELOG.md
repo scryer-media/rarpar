@@ -3,10 +3,37 @@
 ## 0.4.1
 
 This is a patch release from 0.4.0: kernel selection, code-memory accounting,
-and a new kernel, all behind the existing public surface. No public item
-changed shape, so it stays inside the 0.4.x compatibility range.
+new kernels, and one additive entry point for a caller that stages its inputs
+interleaved. No existing public item changed shape or meaning, so it stays
+inside the 0.4.x compatibility range.
+
+### Public API
+
+- `mul_acc_input_batch_prepared_interleaved`: the grouped-input multiply-
+  accumulate over a **block-interleaved** batch — `lanes` source regions sharing
+  one contiguous stream, lane `l`'s block `b` at
+  `(b * lanes + l) * INPUT_BATCH_BLOCK_BYTES` — instead of one slice per source.
+  A pass over such a group reads one sequential stream plus its destination
+  rather than `lanes + 1` regions at a shared offset, so it needs two cache ways
+  rather than `lanes + 1` however the regions are strided. Same arithmetic, same
+  bytes, same dispatch rule (CLMUL above three live sources, VTBL below it);
+  `lanes == 1` is the lane-major layout and behaves exactly like
+  `mul_acc_input_batch_prepared`. Targets without a grouped-input vector kernel
+  get a portable definition of the layout rather than nothing.
+- `INPUT_BATCH_BLOCK_BYTES` and `INPUT_BATCH_INTERLEAVE_LANES`: the layout's
+  block granularity (32 bytes, the `vld2q`/`vst2q` strip the grouped-input
+  kernels step by) and the interleave width a caller should stage for — the
+  aarch64 CLMUL pass's source count, and 1 elsewhere, where the grouped-input
+  kernels walk one source region at a time and lane-major is what they want.
 
 ### Runtime Behavior
+
+- The aarch64 CLMUL and VTBL grouped-input kernels now take a source *block
+  stride*, so they can consume either staging layout. On the lane-major layout
+  the emitted loop is instruction-for-instruction what it was — LLVM folds the
+  second induction variable away against the constant stride — and the
+  interleaved loop pays 8 instructions per 32-byte block at eight sources
+  (one `add`, six `mov`, one `ldr`; the 48 `pmull` are unchanged).
 
 - GF(2¹⁶) kernel selection for the accumulate path now mirrors the reference
   tool's ladder arm for arm: the GFNI affine kernel when GFNI exists, a new
