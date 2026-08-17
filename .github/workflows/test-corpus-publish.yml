@@ -485,23 +485,29 @@ jobs:
     strategy:
       fail-fast: false
       # The unrar suite is the long pole of the whole run, so it validates as
-      # three shards: nextest partitions every binary's test list
-      # deterministically, the union of the shards is exactly the suite, and
-      # the stage's wall time is the slowest third instead of the whole. All
-      # three read the same assembled tree.
+      # three shards, split by *measured* time rather than test count — the
+      # same weights and the same complement-shard rule as `ci.yml`, which
+      # carries the numbers and how to re-derive them. All three read the
+      # same assembled tree.
       matrix:
         include:
           - lane: workspace
           - lane: par2
           - lane: unrar
             shard: 1
+            filter: binary(failure_paths) + binary(api_parity)
           - lane: unrar
             shard: 2
+            filter: binary(integration) + binary(imported_corpus)
           - lane: unrar
             shard: 3
+            filter: >-
+              not (binary(failure_paths) + binary(api_parity)
+              + binary(integration) + binary(imported_corpus))
     env:
       LANE: ${{ matrix.lane }}
       SHARD: ${{ matrix.shard }}
+      SHARD_FILTER: ${{ matrix.filter }}
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
@@ -579,7 +585,7 @@ jobs:
               ;;
             unrar)
               cargo nextest run --locked -p unrar-rs --features slow-tests \
-                --no-fail-fast --partition "count:${SHARD}/3"
+                --no-fail-fast -E "$SHARD_FILTER"
               if [ "$SHARD" = "1" ]; then
                 # nextest does not run doctests; shard 1 keeps them so the
                 # split loses nothing.
