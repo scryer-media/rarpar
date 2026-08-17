@@ -72,6 +72,12 @@ fn create_validates_empty_files_and_writes_critical_set() {
     assert_eq!(plan.sources.len(), 1);
     assert_eq!(plan.sources[0].par2_name, "data.bin");
     assert_eq!(plan.recovery_count, 0);
+    // The exclusion must be NAMED, not silent: the set does not protect this
+    // file, verify/repair will never look for it, and a caller can only warn
+    // about what the plan reports. The reference tool prints this exclusion on
+    // every noise level for the same reason. The path is the caller's own
+    // spelling, because the warning is for the human who typed it.
+    assert_eq!(plan.skipped_empty, vec![empty.clone()]);
 
     let outcome: Par2CreateOutcome = creator.create(&plan).unwrap();
     assert!(!outcome.dry_run);
@@ -147,6 +153,55 @@ fn a_memoized_replan_matches_a_cold_plan() {
     let cold = Par2Creator::new(build()).plan().unwrap();
     assert_eq!(first, second, "memoized replan differs from the first plan");
     assert_eq!(first, cold, "memoized plan differs from a cold plan");
+}
+
+/// Multiple empty inputs are reported in the order the caller listed them —
+/// the list is for a human matching it against what they typed, so it must
+/// not come back resorted by resolution order or file id.
+#[test]
+fn skipped_empty_files_keep_the_caller_input_order() {
+    let directory = tempdir().unwrap();
+    let z_empty = directory.path().join("z-first-empty.bin");
+    let data = directory.path().join("data.bin");
+    let a_empty = directory.path().join("a-second-empty.bin");
+    fs::write(&z_empty, []).unwrap();
+    fs::write(&data, vec![0x5a; 64]).unwrap();
+    fs::write(&a_empty, []).unwrap();
+
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("set"),
+        Some(directory.path().to_path_buf()),
+        vec![z_empty.clone(), data, a_empty.clone()],
+    );
+    options.block_sizing = BlockSizing::Bytes(16);
+    options.recovery_amount = RecoveryAmount::Count(0);
+
+    let plan = Par2Creator::new(options).plan().unwrap();
+    assert_eq!(plan.sources.len(), 1);
+    assert_eq!(plan.skipped_empty, vec![z_empty, a_empty]);
+}
+
+/// Being empty must not soften validation: a zero-length input that fails the
+/// source checks (here: outside the base directory) is an error, not a skip —
+/// otherwise "empty" becomes a hole through which invalid paths pass quietly.
+#[test]
+fn an_empty_file_outside_the_base_path_is_still_rejected() {
+    let base = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let data = base.path().join("data.bin");
+    let stray_empty = outside.path().join("stray-empty.bin");
+    fs::write(&data, vec![0x5a; 64]).unwrap();
+    fs::write(&stray_empty, []).unwrap();
+
+    let options = Par2CreatorOptions::with_output(
+        base.path().join("set"),
+        Some(base.path().to_path_buf()),
+        vec![data, stray_empty],
+    );
+    assert!(matches!(
+        Par2Creator::new(options).plan(),
+        Err(Par2Error::UnsafeCreationSource { .. })
+    ));
 }
 
 #[test]

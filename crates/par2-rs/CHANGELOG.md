@@ -7,6 +7,15 @@ shape or meaning, so it stays inside the 0.4.x compatibility range.
 
 ### Public API
 
+- `Par2CreatePlan::skipped_empty`: the inputs a plan excluded because they are
+  zero-length, in input order, as the caller spelled them. A PAR2 set cannot
+  describe an empty file — the format protects slices and an empty file has
+  none — so such inputs get no packets and are invisible to verify and repair.
+  The exclusion itself is long-standing and matches the reference tool
+  ("Skipping 0 byte file"); what is new is that the plan now names the excluded
+  files instead of dropping them silently, so a caller can no longer read the
+  set as protection it does not provide. Produced sets are byte-identical to
+  before.
 - `SliceEvidence::from_in_stream_crc32`: mint a slice verdict a caller derived
   itself, in stream, from the slice's PAR2 CRC32. This is for a caller that
   already hashes every payload byte for its own reasons and can cut that hash
