@@ -50,20 +50,22 @@ whole budget failing the first check. Every target therefore ships:
 | Workflow | Trigger | Budget | Sanitizer |
 | --- | --- | --- | --- |
 | `cflite-pr.yml` | pull requests touching either crate or the fuzz config | 600 s, `code-change` | address |
-| `cflite-batch.yml` → `batch (address)` / `batch (undefined)` | nightly 02:41 UTC, or dispatch | 7200 s each, `batch` | address, undefined |
+| `cflite-batch.yml` → `batch (address)` | nightly 02:41 UTC, or dispatch | 7200 s, `batch` | address |
 | `cflite-batch.yml` → `coverage` | after the batch jobs | 600 s | coverage |
 | `cflite-batch.yml` → `prune` | after coverage | 600 s | — |
 
 The pull-request lane is a regression check on the change itself. The deep
 search is the nightly job.
 
-**Why two sanitizers.** They answer different questions: ASan finds the memory
-error, UBSan finds the arithmetic that would have caused one on a different
-target — an overflowing length computation, a bad shift, an unaligned
-reference. Rust catches many of these in debug builds, but these crates ship
-release with overflow checks off, which is exactly the gap UBSan covers. A
-finding from one does not make the other redundant, so the matrix does not
-`fail-fast`.
+**Why one sanitizer.** Both fuzzed crates are pure Rust — no `build.rs`, no C,
+no assembly — and Rust has no `-Zsanitizer=undefined`, so a UBSan lane would
+instrument nothing in this link while looking like coverage; its first run
+proved the point mechanically (cargo-fuzz builds ASan regardless, and the
+bad-build check rejected every target). The arithmetic class UBSan covers in
+C is caught the Rust way instead: the fuzzers build with **debug assertions
+and overflow checks enabled in the optimized build** (`cargo fuzz build -O
+-a`), so an overflowing index or length computation panics under the fuzzer
+rather than wrapping silently.
 
 **Why coverage and prune.** Without a coverage report the budget is spent on
 faith: a target whose coverage has been flat for a month is either finished or

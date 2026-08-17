@@ -27,7 +27,11 @@ build_target() {
   local crate="$1" target="$2" dictionary="$3"
 
   cd "$SRC/rarpar/crates/$crate"
-  cargo fuzz build -O "$target"
+  # -O for the optimizer the fuzzer needs, -a to keep debug assertions and
+  # overflow checks in that optimized build. These crates are pure Rust, so
+  # this is where the arithmetic bugs surface: an index or length computation
+  # that overflows panics here instead of wrapping silently.
+  cargo fuzz build -O -a "$target"
   cp "fuzz/target/x86_64-unknown-linux-gnu/release/$target" "$OUT/"
 
   if [ -d "fuzz/corpus/$target" ]; then
