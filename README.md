@@ -367,6 +367,8 @@ cargo test --locked --workspace --no-fail-fast
 Release and crates.io publishing automation lives under `.github/workflows/`.
 Publishing notes are in `docs/publishing.md`.
 Linux packaging layout notes are in `docs/packaging.md`.
+Continuous fuzzing — targets, seed corpora and the nightly schedule — is in
+[docs/fuzzing.md](docs/fuzzing.md).
 Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License

@@ -9,11 +9,26 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tempfile = "3"
 unrar-rs = { path = "..", default-features = false, features = ["crypto-rust"] }
 
 [[bin]]
 name = "rar_headers"
 path = "fuzz_targets/rar_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_extract"
+path = "fuzz_targets/rar_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_recovery_restore"
+path = "fuzz_targets/rar_recovery_restore.rs"
 test = false
 doc = false
 bench = false
