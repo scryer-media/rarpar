@@ -377,6 +377,40 @@ func (m *SourceMirror) readURL(key string) string {
 	return strings.TrimSuffix(m.BaseURL, "/") + "/" + key
 }
 
+// How a read treats an intermediate cache. Reading a *published* object is a
+// plain read: the key is a digest, so a hit is the object by construction.
+// Reading back an object this process just wrote is not, and cachedRead would
+// answer it wrong.
+const (
+	cachedRead = false
+	freshRead  = true
+)
+
+// freshURL is readURL with a token no cache has seen.
+//
+// A publication reads its own writes, and the same URL was fetched moments
+// earlier to decide whether to publish at all — when the answer was "absent",
+// which is a response a CDN may cache like any other. The read-back would then
+// be served that stale miss and conclude the upload never landed. (It is what
+// broke the first publication: the object was in the bucket and public, and
+// the read-back still saw 404.)
+//
+// A cache key includes the query string, so a token that has never been
+// requested cannot have a stored answer, and object storage ignores a query it
+// was not asked about. Nothing else changes: the bytes are still held to the
+// reviewed digest, and consumers still read the clean URL.
+func (m *SourceMirror) freshURL(key string) string {
+	return fmt.Sprintf("%s?rarpar-read-back=%d", m.readURL(key), time.Now().UnixNano())
+}
+
+// url picks between the two for one read.
+func (m *SourceMirror) url(key string, fresh bool) string {
+	if fresh {
+		return m.freshURL(key)
+	}
+	return m.readURL(key)
+}
+
 func (m *SourceMirror) writeURL(key string) string {
 	return strings.TrimSuffix(m.Publish.WriteBase, "/") + "/" + key
 }
@@ -414,7 +448,7 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 	defer os.RemoveAll(work)
 
 	if m.BaseURL != "" {
-		data, err := m.fetchVerified(ctx, source, filepath.Join(work, "mirror"))
+		data, err := m.fetchVerified(ctx, source, filepath.Join(work, "mirror"), cachedRead)
 		switch {
 		case err == nil:
 			stored, err := writeVerifiedArchive(cacheDir, source.Name, data)
@@ -460,9 +494,9 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 // pinned identity and issuer, and the provenance describes this very archive.
 // It returns errMirrorAbsent only when the archive key itself is a 404; once the
 // archive exists, every companion is mandatory.
-func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, work string) ([]byte, error) {
+func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, work string, fresh bool) ([]byte, error) {
 	keys := source.keys()
-	target := m.readURL(keys.archive)
+	target := m.url(keys.archive, fresh)
 	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, err
@@ -487,15 +521,15 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 	if digest := bytesBLAKE3(data); digest != source.BLAKE3 {
 		return nil, fmt.Errorf("the mirror holds a different object under this digest key %s: blake3 %s", keys.archive, digest)
 	}
-	archiveBundle, err := m.companion(ctx, keys.archiveBundle)
+	archiveBundle, err := m.companion(ctx, keys.archiveBundle, fresh)
 	if err != nil {
 		return nil, err
 	}
-	provenanceData, err := m.companion(ctx, keys.provenance)
+	provenanceData, err := m.companion(ctx, keys.provenance, fresh)
 	if err != nil {
 		return nil, err
 	}
-	provenanceBundle, err := m.companion(ctx, keys.provenanceBundle)
+	provenanceBundle, err := m.companion(ctx, keys.provenanceBundle, fresh)
 	if err != nil {
 		return nil, err
 	}
@@ -539,8 +573,8 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 // within the retry budget is the same retry-exhausted unavailability the
 // archive key itself gets, and it wraps errSourceUnavailable so Resolve may
 // fall back to the official URL — which is still digest-checked.
-func (m *SourceMirror) companion(ctx context.Context, key string) ([]byte, error) {
-	target := m.readURL(key)
+func (m *SourceMirror) companion(ctx context.Context, key string, fresh bool) ([]byte, error) {
+	target := m.url(key, fresh)
 	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("mirror GET %s: %w", key, err)
@@ -630,7 +664,7 @@ func (m *SourceMirror) publish(ctx context.Context, source ArchiveSource, data [
 			return err
 		}
 	}
-	stored, err := m.fetchVerified(ctx, source, filepath.Join(work, "readback"))
+	stored, err := m.fetchVerified(ctx, source, filepath.Join(work, "readback"), freshRead)
 	if err != nil {
 		return fmt.Errorf("read back %s: stored copy is not what was published: %w", keys.archive, err)
 	}

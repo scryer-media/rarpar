@@ -45,6 +45,7 @@ type mirrorFixture struct {
 	officialStatus   []int
 	officialRequests int
 	lastUserAgent    string
+	negativeCache    map[string]bool
 
 	root      string
 	cacheDir  string
@@ -111,6 +112,15 @@ func (f *mirrorFixture) serveRead(writer http.ResponseWriter, request *http.Requ
 	f.mu.Lock()
 	f.reads[key]++
 	f.lastUserAgent = request.Header.Get("User-Agent")
+	// A CDN in front of the bucket, keyed by the whole URL: once a key has
+	// been answered "absent", that answer is replayed for the bare URL until
+	// it expires. A request carrying an unseen query string is a different
+	// cache key, so it reaches the bucket.
+	if f.negativeCache != nil && request.URL.RawQuery == "" && f.negativeCache[key] {
+		f.mu.Unlock()
+		http.NotFound(writer, request)
+		return
+	}
 	if queue := f.readStatus[key]; len(queue) > 0 {
 		status := queue[0]
 		f.readStatus[key] = queue[1:]
@@ -455,6 +465,33 @@ func TestResolveFallsBackToTheOfficialURLWhenTheMirrorIsAbsent(t *testing.T) {
 
 // With a publisher configured the fallback is mirrored: signed, given
 // provenance, conditionally uploaded in order, and read back before use.
+// Publishing reads its own write, and it has just asked for the same URL to
+// decide whether to publish at all — an "absent" a CDN is free to cache. The
+// read-back must not be served that stale miss and conclude the upload never
+// landed: it is what the first publication actually failed on, with the object
+// sitting in the bucket, public and correct.
+func TestPublishReadsBackPastACachedAbsence(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	fixture.mirror.Publish = fixture.publisher()
+	keys := fixture.source.keys()
+	// Every key answers "absent" on its bare URL for the whole run, exactly as
+	// an edge that cached the pre-publication miss would.
+	fixture.negativeCache = map[string]bool{
+		keys.archive:          true,
+		keys.archiveBundle:    true,
+		keys.provenance:       true,
+		keys.provenanceBundle: true,
+	}
+
+	resolved, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir)
+	if err != nil {
+		t.Fatalf("a cached absence must not fail a publication that stored the object: %v", err)
+	}
+	if resolved.Origin != OriginMirrored {
+		t.Fatalf("origin = %q, want %q", resolved.Origin, OriginMirrored)
+	}
+}
+
 func TestResolvePublishesTheOfficialDownload(t *testing.T) {
 	fixture := newMirrorFixture(t)
 	fixture.mirror.Publish = fixture.publisher()

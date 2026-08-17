@@ -975,9 +975,35 @@ struct Publisher {
     credentials: S3Credentials,
 }
 
+/// A counter that makes every read-back URL in this process distinct, so two
+/// objects (or a retry of one) can never share a cache key.
+fn read_back_sequence() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Publisher {
     fn public_url(&self, key: &str) -> String {
         format!("{}/{key}", self.base_url)
+    }
+
+    /// The public URL with a token no cache has answered before.
+    ///
+    /// A read-back reads this process's own write, through whatever sits in
+    /// front of the bucket. If that URL was requested while the object was
+    /// still absent — a probe, an earlier attempt, a consumer that was too
+    /// early — the "absent" can itself be cached, and the read-back would be
+    /// served it and conclude the upload never landed. A cache key covers the
+    /// query string, so an unseen token cannot have a stored answer, while
+    /// object storage ignores a query it was not asked about.
+    fn fresh_public_url(&self, key: &str) -> String {
+        format!(
+            "{}?rarpar-read-back={}-{}",
+            self.public_url(key),
+            std::process::id(),
+            read_back_sequence()
+        )
     }
 
     fn write_url(&self, key: &str) -> String {
@@ -1012,7 +1038,7 @@ impl Publisher {
             "rarpar-corpus-readback-{}-{blake3}",
             std::process::id()
         ));
-        curl::get_to_file(&self.public_url(key), &temp)?;
+        curl::get_to_file(&self.fresh_public_url(key), &temp)?;
         let digest = digest_file(&temp);
         let _ = fs::remove_file(&temp);
         let digest = digest?;

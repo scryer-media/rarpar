@@ -435,7 +435,15 @@ pub(crate) mod tests {
                     }
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or("").to_owned();
-                    let path = parts.next().unwrap_or("").to_owned();
+                    // The query string is not part of the object's identity —
+                    // a real bucket routes on the path and ignores the rest.
+                    // Read-backs carry a cache-busting query, so a server that
+                    // matched the whole target would miss its own objects.
+                    let target = parts.next().unwrap_or("");
+                    let path = target
+                        .split_once('?')
+                        .map_or(target, |(path, _)| path)
+                        .to_owned();
                     seen.lock()
                         .unwrap()
                         .push((method.clone(), path.clone(), headers));
