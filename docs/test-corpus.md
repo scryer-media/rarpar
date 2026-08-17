@@ -349,8 +349,9 @@ that holds R2 write credentials.
 **Generation fans out**: one runner per generator, then one assembly. A
 generator is an independent recipe writing an independent set of paths, so
 there is no reason for thirteen of them to queue behind each other on one
-runner — and the two long ones (`large_sets` writes 787 MB, `heavy_damage`
-110 MB) decided the old wall time on their own.
+runner: each runs, fails and is retried on its own, builds only the images its
+recipe drives, and the three suites — the long part of the run — validate the
+assembled tree in parallel rather than in sequence.
 
 ```
 guard ─► plan ─┬─► generate (inputs) ──┬───────────────────────────────┐
