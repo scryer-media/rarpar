@@ -1,12 +1,18 @@
 package testcorpus
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 )
+
+// The shared toolchain lock, relative to the repository root.
+const toolchainLockFile = "bench/rarpar-bench/config/toolchains.json"
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -125,6 +131,187 @@ func TestStageZeroWritesTheSharedInputs(t *testing.T) {
 	want := []string{"inputs", "edge_cases"}
 	if !slices.Equal(stageZero, want) {
 		t.Fatalf("stage 0 is %v, expected %v", stageZero, want)
+	}
+}
+
+// The unit table's tools and the ledger's generator toolchains are two
+// statements of the same fact: what a recipe drives. The publish workflow
+// builds one job's images from the first, and the manifest records the second,
+// so a disagreement is either an image that is never built or provenance that
+// names a tool the recipe never ran.
+func TestUnitToolsResolveToTheLedgersToolchains(t *testing.T) {
+	root := repoRoot(t)
+	ledger, err := LoadLedger(filepath.Join(root, filepath.FromSlash(LedgerFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := bench.LoadToolchains(filepath.Join(root, filepath.FromSlash(toolchainLockFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range Units() {
+		resolved, err := ToolchainIDs(lock, unit.Tools)
+		if err != nil {
+			t.Fatalf("%s: %v", unit.Name, err)
+		}
+		declared := append([]string(nil), ledger.Generators[unit.Name].Toolchains...)
+		slices.Sort(declared)
+		if !slices.Equal(resolved, declared) {
+			t.Errorf("%s: tools %v resolve to %v, the ledger declares %v", unit.Name, unit.Tools, resolved, declared)
+		}
+	}
+}
+
+// The images a unit needs built are its writers and, where it drives one, the
+// par2 generator. The encoder is never in the list: it is pulled by digest.
+func TestImagesForLeavesTheEncoderToBePulled(t *testing.T) {
+	lock, err := bench.LoadToolchains(filepath.Join(repoRoot(t), filepath.FromSlash(toolchainLockFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := ImagesFor(lock, []string{ToolVideo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 0 {
+		t.Fatalf("the encoder needs no image built, got %v", images)
+	}
+	images, err = ImagesFor(lock, []string{ToolPAR2, ToolRAR5, ToolRAR5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rar5, _ := lock.Writer(rar5WriterID)
+	want := []string{lock.PAR2Generator.Image, rar5.Image}
+	slices.Sort(want)
+	if !slices.Equal(images, want) {
+		t.Fatalf("images %v, want %v", images, want)
+	}
+	if _, err := ImagesFor(lock, []string{"typo"}); err == nil {
+		t.Fatal("an unknown tool must be an error")
+	}
+	if _, err := ToolchainIDsForUnits(lock, []string{"nope"}); err == nil {
+		t.Fatal("an unknown unit must be an error")
+	}
+	ids, err := ToolchainIDsForUnits(lock, []string{"par2_captures"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ids, []string{lock.PAR2Generator.ID}) {
+		t.Fatalf("par2_captures resolves to %v", ids)
+	}
+}
+
+// `list --json` is where the publish workflow's per-generator job matrix comes
+// from, so it has to describe every unit, resolved against the lock.
+func TestDescribeCoversEveryUnitAgainstTheLock(t *testing.T) {
+	lock, err := bench.LoadToolchains(filepath.Join(repoRoot(t), filepath.FromSlash(toolchainLockFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listing, err := Describe(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Units) != len(Units()) {
+		t.Fatalf("described %d units, the table holds %d", len(listing.Units), len(Units()))
+	}
+	encoded, err := json.Marshal(listing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "null") {
+		t.Fatalf("the listing must encode empty lists as [], not null: %s", encoded)
+	}
+	stageOne := 0
+	byName := map[string]UnitDescription{}
+	for _, unit := range listing.Units {
+		byName[unit.Name] = unit
+		if unit.Stage == 1 {
+			stageOne++
+		}
+		if unit.Source == "" {
+			t.Errorf("%s: no source recorded", unit.Name)
+		}
+	}
+	if stageOne != len(Units())-2 {
+		t.Fatalf("%d stage-1 units described, expected every unit but the two stage-0 ones", stageOne)
+	}
+	captures := byName["par2_captures"]
+	if !slices.Equal(captures.Images, []string{lock.PAR2Generator.Image}) {
+		t.Fatalf("par2_captures images %v", captures.Images)
+	}
+	if len(captures.Upstreams) != 2 {
+		t.Fatalf("par2_captures upstream inputs %v", captures.Upstreams)
+	}
+}
+
+// par2_captures replays the upstream par2cmdline-turbo scripts against the two
+// upstream data tarballs, so those tarballs are its *input*. They have to be
+// fetched from the pinned commit before it runs: in a CI checkout with
+// GIT_LFS_SKIP_SMUDGE set, what sits at those paths is a pointer file, and the
+// recipe failed on exactly that with "gzip: invalid header". Every declared
+// input is therefore held to being an `upstream` ledger entry.
+func TestUnitUpstreamInputsAreUpstreamLedgerEntries(t *testing.T) {
+	ledger, err := LoadLedger(filepath.Join(repoRoot(t), filepath.FromSlash(LedgerFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]string{}
+	for _, entry := range ledger.Files {
+		kinds[entry.Path] = entry.Source.Kind
+	}
+	declared := 0
+	for _, unit := range Units() {
+		for _, path := range unit.Upstreams {
+			declared++
+			if kinds[path] != "upstream" {
+				t.Errorf("%s declares input %s, which the ledger records as %q, not an upstream import",
+					unit.Name, path, kinds[path])
+			}
+		}
+	}
+	if declared == 0 {
+		t.Fatal("no unit declares an upstream input; the check is vacuous")
+	}
+
+	var captures Unit
+	for _, unit := range Units() {
+		if unit.Name == "par2_captures" {
+			captures = unit
+		}
+	}
+	want := []string{
+		"crates/par2-rs/tests/fixtures/par2cmdline-turbo/bug190.tar.gz",
+		"crates/par2-rs/tests/fixtures/par2cmdline-turbo/flatdata.tar.gz",
+	}
+	got := append([]string(nil), captures.Upstreams...)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("par2_captures declares %v, want the two tarballs it extracts: %v", got, want)
+	}
+}
+
+// The union of what the selected units read, and nothing else: a job that
+// generates one unit fetches that unit's inputs.
+func TestUpstreamJobsSelectTheDeclaredPathsOnly(t *testing.T) {
+	ledger, err := LoadLedger(filepath.Join(repoRoot(t), filepath.FromSlash(LedgerFile)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := upstreamJobs(ledger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("the ledger declares %d upstream imports", len(all))
+	}
+	wanted := map[string]bool{"crates/par2-rs/tests/fixtures/par2cmdline-turbo/flatdata.tar.gz": true}
+	some, err := upstreamJobs(ledger, wanted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(some) != 1 || !wanted[some[0].entry.Path] {
+		t.Fatalf("selected %d job(s) for one path", len(some))
 	}
 }
 

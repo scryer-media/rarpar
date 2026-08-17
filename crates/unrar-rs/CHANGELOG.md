@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.3
+
+Stability patch from 0.5.2. No public item changed shape.
+
+### Fixed
+
+- **RAR3 recovery-volume restore no longer overflows a rayon worker's stack
+  under fat LTO.** `restore_volumes_from_paths` reconstructed each byte
+  column inside a `par_iter().map(..)` closure that built a fresh
+  `Rar3RsCoder` (~22 KiB of GF tables) and ran a decode with ~12 KiB of scratch
+  polynomials. With `lto = "fat"` / `codegen-units = 1` the optimizer inlines
+  that closure into rayon's recursive splitting helper, so every recursion
+  level carried a ~35 KiB frame and a default 2 MiB worker overflowed on a set
+  of four 22 MiB volumes — an abort, not an error, so an embedder cannot
+  contain it. A plain release build did not reproduce it, which is why it
+  survived the crate's own tests. The per-column decode is now a
+  `#[inline(never)]` leaf, and one boxed coder per rayon split is reused across
+  its columns (the erasure pattern is identical for every column, which is the
+  case the coder's cached locator polynomial exists for). Also markedly
+  faster: the GF tables are built once per split rather than once per byte
+  position.
+
+### Added
+
+- The `rar3_recovery_volumes_large` corpus set (four 1 MiB RAR 2.9-format
+  volumes plus two `.rev`, `rar a -ma4 -m0 -v1m -rv2`) and a test that
+  restores two missing volumes from it and checks them byte for byte against
+  RARLAB's originals. The existing 1 KiB set decodes 1024 columns and cannot
+  reach the recursion the fix above is about; this one decodes a million.
+
 ## 0.5.2
 
 Security patch from 0.5.1. No public item changed shape.

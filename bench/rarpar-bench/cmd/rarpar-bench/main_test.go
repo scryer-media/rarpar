@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,105 @@ func TestUsageAdvertisesPayloadVideo(t *testing.T) {
 	if !strings.Contains(string(source), "rarpar-bench toolchains validate|build|resolve [--config PATH] [--docker PATH] [--mirror-base URL] [--publish] [--s3-endpoint URL] [--bucket NAME] [--cache DIR]") {
 		t.Fatal("usage does not advertise the toolchain mirror contract")
 	}
+}
+
+// The publish workflow fans generation out one job per generator and derives
+// that job matrix from `testcorpus list --json`, so the flag has to emit the
+// whole unit table — resolved against the toolchain lock — as JSON.
+func TestTestCorpusListEmitsTheUnitTableAsJSON(t *testing.T) {
+	ctx := context.Background()
+	config := filepath.Join("..", "..", "config", "toolchains.json")
+	stdout := captureStdout(t, func() {
+		if err := runTestCorpus(ctx, []string{"list", "--json", "--toolchains", config}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var listing struct {
+		Units []struct {
+			Name       string   `json:"name"`
+			Stage      int      `json:"stage"`
+			Source     string   `json:"source"`
+			Toolchains []string `json:"toolchains"`
+			Images     []string `json:"images"`
+			Upstreams  []string `json:"upstreams"`
+		} `json:"units"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &listing); err != nil {
+		t.Fatalf("decode %q: %v", stdout, err)
+	}
+	if len(listing.Units) < 12 {
+		t.Fatalf("%d units listed", len(listing.Units))
+	}
+	stageOne := 0
+	for _, unit := range listing.Units {
+		if unit.Name == "" || unit.Source == "" {
+			t.Fatalf("incomplete unit %+v", unit)
+		}
+		if unit.Stage == 1 {
+			stageOne++
+		}
+	}
+	if stageOne == 0 {
+		t.Fatal("no stage-1 unit listed; the workflow matrix would be empty")
+	}
+
+	// The plain listing stays the tab-separated one the shell reads.
+	plain := captureStdout(t, func() {
+		if err := runTestCorpus(ctx, []string{"list", "--toolchains", config}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(plain, "\tpar2_captures\t") && !strings.Contains(plain, "par2_captures\t1\t") {
+		t.Fatalf("plain listing does not name par2_captures: %q", plain)
+	}
+
+	if err := runTestCorpus(ctx, []string{"list", "--json", "--toolchains", "does/not/exist.json"}); err == nil {
+		t.Fatal("a missing toolchain lock must be an error")
+	}
+}
+
+// `--imports-only` fetches the upstream imports and runs no recipe, so pairing
+// it with `--only` is a contradiction the command refuses rather than resolves.
+func TestTestCorpusImportsOnlyRefusesAnOnlySelection(t *testing.T) {
+	err := runTestCorpus(context.Background(), []string{
+		"generate", "--imports-only", "--only", "core_sets",
+		"--toolchains", filepath.Join("..", "..", "config", "toolchains.json"),
+	})
+	if err == nil {
+		t.Fatal("--imports-only with --only was accepted")
+	}
+	if !strings.Contains(err.Error(), "--imports-only") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// captureStdout runs `body` with os.Stdout redirected and returns what it
+// wrote. The listing goes to the descriptor the workflow reads, so the test
+// reads the same place rather than a convenience writer.
+func captureStdout(t *testing.T, body func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = writer
+	done := make(chan string, 1)
+	go func() {
+		var buffer bytes.Buffer
+		_, _ = buffer.ReadFrom(reader)
+		done <- buffer.String()
+	}()
+	body()
+	os.Stdout = saved
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output := <-done
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output
 }
 
 // Publishing is what the protected workflow does; every piece of its

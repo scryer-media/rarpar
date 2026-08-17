@@ -24,6 +24,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<()> {
     match command.as_deref() {
         Some("build") => build(&root, args.collect()),
         Some("generate") => super::generate::run(&root, args.collect()),
+        Some("paths") => super::generate::paths(&root, args.collect()),
         Some("bench-pins") => super::bench_pins::run(&root, args.collect()),
         Some("verify") => verify(&root, args.collect()),
         Some("fetch") => fetch(&root, args.collect()),
@@ -42,13 +43,22 @@ pub(crate) fn print_usage() {
     eprintln!(
         "\
 Usage:
-  cargo run -p xtask -- test-corpus generate [--jobs N] [--only GENERATOR]...
+  cargo run -p xtask -- test-corpus generate [--jobs N] [--only GENERATOR]... [--imports-only] [--assemble]
       Produce the whole corpus from its recipes: run every generator on the
       pinned toolchain images, fetch every upstream import at its pinned commit,
       require the produced tree to be exactly the ledger's path set, and refresh
       the ledger's sizes and digests. REWRITES the fixture tree and
       test-corpus/sources.json. --only runs named generators and skips the
-      upstreams, the path-set check and the ledger refresh.
+      upstreams, the path-set check and the ledger refresh; --imports-only
+      fetches the upstream imports and runs no recipe. --assemble runs no
+      generator at all: it holds a tree the per-generator jobs produced to the
+      ledger's exact path set and refreshes the sizes and digests.
+  cargo run -p xtask -- test-corpus paths [--generator NAME]... [--upstreams] [--all] [--verify] [--out FILE]
+      The ledger's repository-relative paths for one part of the corpus: what a
+      generation job removes before its recipe runs and hands on afterwards.
+      --verify additionally requires every selected path to be present as
+      produced bytes (never a Git LFS pointer) and nothing outside the ledger to
+      have been produced.
   cargo run -p xtask -- test-corpus bench-pins [--out FILE]
       Recompute the benchmark corpus's fixture_sha256 pins the way the Go
       harness does — SHA-256, because that is what the benchmark corpus's own

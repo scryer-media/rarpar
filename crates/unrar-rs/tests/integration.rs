@@ -6025,6 +6025,85 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     );
 }
 
+/// The same restore at a size that matters: 1 MiB volumes, two of them missing,
+/// so one reconstruction pass decodes about a million byte columns through
+/// rayon's split recursion with the coder reused across each split's columns.
+/// This is the shape whose restore aborted an embedder with a stack overflow
+/// under fat LTO before 0.5.3 — the 1 KiB set above decodes 1024 columns and
+/// never gets there — and the run that proves the reused coder decodes every
+/// column of a real set correctly, byte for byte against RARLAB's originals.
+#[test]
+fn test_rar3_recovery_volumes_large_restore_two_missing_parts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar3_recovery_volumes_large.part1.rar",
+        "rar3_recovery_volumes_large.part4.rar",
+        "rar3_recovery_volumes_large.part1.rev",
+        "rar3_recovery_volumes_large.part2.rev",
+    ];
+    let mut paths = Vec::new();
+    for name in present {
+        let dst = temp_dir.path().join(name);
+        std::fs::copy(fixture("rar4", name), &dst).unwrap();
+        paths.push(dst);
+    }
+
+    let options = unrar_rs::RecoveryOptions {
+        output_dir: Some(temp_dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+    assert_eq!(report.format, unrar_rs::ArchiveFormat::Rar4);
+    assert_eq!(report.missing_volume_numbers, vec![1, 2]);
+    assert_eq!(report.used_recovery_paths.len(), 2);
+    assert_eq!(
+        report.restored_paths,
+        vec![
+            temp_dir
+                .path()
+                .join("rar3_recovery_volumes_large.part2.rar"),
+            temp_dir
+                .path()
+                .join("rar3_recovery_volumes_large.part3.rar"),
+        ]
+    );
+    for volume in [2, 3] {
+        let name = format!("rar3_recovery_volumes_large.part{volume}.rar");
+        let restored = std::fs::read(temp_dir.path().join(&name)).unwrap();
+        let expected = std::fs::read(fixture("rar4", &name)).unwrap();
+        assert_eq!(restored.len(), expected.len(), "{name}: length");
+        assert!(
+            restored == expected,
+            "{name}: bytes differ from RARLAB's original"
+        );
+    }
+
+    // 3.5 MiB of (i * 29 + 7) mod 256, exactly what the recipe stored.
+    let restored_paths: Vec<_> = (1..=4)
+        .map(|volume| {
+            temp_dir
+                .path()
+                .join(format!("rar3_recovery_volumes_large.part{volume}.rar"))
+        })
+        .collect();
+    let mut restored_archive = open_multi_paths(&restored_paths);
+    assert_eq!(restored_archive.member_names(), vec!["payload.bin"]);
+    let payload = restored_archive
+        .extract_member(0, &unrar_rs::ExtractOptions::default(), None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_eq!(payload.len(), 7 * 512 * 1024);
+    assert!(
+        payload
+            .iter()
+            .enumerate()
+            .all(|(index, &byte)| byte == (index as u8).wrapping_mul(29).wrapping_add(7)),
+        "restored payload is not the recipe's ramp"
+    );
+}
+
 #[test]
 fn test_recovery_restore_is_idempotent_for_complete_sets() {
     let rar5_names = (1..=10)

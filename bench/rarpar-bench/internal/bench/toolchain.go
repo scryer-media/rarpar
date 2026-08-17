@@ -154,12 +154,24 @@ func (lock ToolchainLock) Writer(id string) (RARWriter, bool) {
 // the fallback — and checked against the reviewed digest before Docker is
 // started, and the build context holds nothing but the checked-in Dockerfile
 // and that archive, so no image build ever reaches upstream for its tool.
-func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLock, mirror *SourceMirror) error {
+//
+// `only`, when non-empty, restricts the build to those toolchain lock ids: one
+// runner per generator has no use for the six writers and the par2 compile
+// when its recipe drives one of them. An id the lock does not declare is an
+// error, so a typo cannot quietly build nothing.
+func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLock, mirror *SourceMirror, only []string) error {
 	if err := verifyDockerfiles(root, lock.DockerBase); err != nil {
+		return err
+	}
+	wanted, err := selectedToolchains(lock, only)
+	if err != nil {
 		return err
 	}
 	cacheDir := mirror.cacheDir()
 	for _, writer := range lock.RARWriters {
+		if wanted != nil && !wanted[writer.ID] {
+			continue
+		}
 		source, err := WriterArchiveSource(writer)
 		if err != nil {
 			return err
@@ -175,6 +187,9 @@ func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLoc
 		}
 	}
 	par2 := lock.PAR2Generator
+	if wanted != nil && !wanted[par2.ID] {
+		return nil
+	}
 	source, err := PAR2ArchiveSource(par2)
 	if err != nil {
 		return err
@@ -188,6 +203,30 @@ func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLoc
 		return fmt.Errorf("build %s: %w", par2.ID, err)
 	}
 	return nil
+}
+
+// selectedToolchains turns the requested lock ids into a membership set, or
+// nil for "everything". The video encoder is a legal request and simply builds
+// nothing: it is pulled by digest rather than built from a source archive.
+func selectedToolchains(lock ToolchainLock, only []string) (map[string]bool, error) {
+	if len(only) == 0 {
+		return nil, nil
+	}
+	known := map[string]bool{lock.PAR2Generator.ID: true}
+	if lock.VideoEncoder.ID != "" {
+		known[lock.VideoEncoder.ID] = true
+	}
+	for _, writer := range lock.RARWriters {
+		known[writer.ID] = true
+	}
+	wanted := map[string]bool{}
+	for _, id := range only {
+		if !known[id] {
+			return nil, fmt.Errorf("toolchain %q is not in the lock", id)
+		}
+		wanted[id] = true
+	}
+	return wanted, nil
 }
 
 // buildFromArchive stages a throwaway build context — the checked-in Dockerfile

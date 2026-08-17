@@ -1,7 +1,7 @@
 # The test corpus
 
 The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
-`crates/par2-rs/tests/fixtures/` are the **test corpus**: 369 archives, parity
+`crates/par2-rs/tests/fixtures/` are the **test corpus**: 375 archives, parity
 sets, SFX modules, video inputs and originals that the unit, integration, slow,
 PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
 content-addressed object set on Cloudflare R2 and hydrated by `xtask`; Git LFS
@@ -275,8 +275,23 @@ git commit ──► test-corpus/lock.json ──► manifest.blake3 ──► m
 # Needs the images: `cargo run --locked -p xtask -- bench toolchains build`.
 cargo run --locked -p xtask -- test-corpus generate [--jobs N]
 # One recipe at a time while iterating on it (no upstreams, no path-set check,
-# no ledger refresh — a full run is what makes a revision):
+# no ledger refresh — a full run is what makes a revision). The upstream
+# imports the recipe *reads* are still fetched from their pinned commit first:
+# a recipe never reads whatever the checkout left in the tree.
 cargo run --locked -p xtask -- test-corpus generate --only core_sets
+# The upstream imports alone, and no recipe:
+cargo run --locked -p xtask -- test-corpus generate --imports-only
+# What the publish workflow's `assemble` job runs: no recipe, the gathered tree
+# held to the ledger's exact path set, and the sizes and digests refreshed.
+cargo run --locked -p xtask -- test-corpus generate --assemble
+
+# Which fixture paths belong to one part of the corpus — what a generation job
+# removes before its recipe runs and hands on afterwards. --verify additionally
+# requires every selected path to have been produced (never a Git LFS pointer)
+# and nothing outside the ledger to have been.
+cargo run --locked -p xtask -- test-corpus paths --generator core_sets [--verify] [--out FILE]
+cargo run --locked -p xtask -- test-corpus paths --upstreams
+cargo run --locked -p xtask -- test-corpus paths --all
 
 # The benchmark corpus imports six fixture sets by digest, so a revision moves
 # those pins. Print old -> new for bench/rarpar-bench/config/corpus.json. Those
@@ -329,30 +344,78 @@ OIDC); no crypto is implemented in this repository for the corpus.
 
 `test-corpus-publish.yml` is `workflow_dispatch` only, refuses any ref other
 than `refs/heads/main`, runs in a protected environment, and is the only place
-that holds R2 write credentials. Its steps:
+that holds R2 write credentials.
 
-1. Check out `main` (no Git LFS payloads — nothing in this workflow reads
-   them), validate the toolchain lock, and build the pinned toolchain images
-   from mirrored, digest-verified sources.
-2. `test-corpus generate`: run every checked-in recipe on those images, fetch
-   every upstream import at its pinned commit, require the produced tree to be
-   exactly the ledger's path set, and refresh the ledger's sizes and digests.
-3. `test-corpus verify --all-present --upstreams`: the ledger against the tree,
-   no `blocked` entries, and every public upstream re-fetched byte-identical at
-   its pinned commit — independently of what step 2 just wrote.
-4. Run the suites against the corpus that was just generated:
+**Generation fans out**: one runner per generator, then one assembly. A
+generator is an independent recipe writing an independent set of paths, so
+there is no reason for thirteen of them to queue behind each other on one
+runner: each runs, fails and is retried on its own, builds only the images its
+recipe drives, and the three suites — the long part of the run — validate the
+assembled tree in parallel rather than in sequence.
+
+```
+guard ─► plan ─┬─► generate (inputs) ──┬───────────────────────────────┐
+               │                       └─► generate (one job per unit) ─┤
+               └─► generate (imports) ──────────────────────────────────┴─► assemble ─► validate (×3) ─► publish
+```
+
+1. **`guard`** refuses anything but a confirmed dispatch from `refs/heads/main`,
+   in seconds, before a runner starts an image build. It deliberately does not
+   join the protected environment: an environment with required reviewers would
+   make it *wait* rather than fail. The checks that need the environment's
+   secrets are the publish job's first step.
+2. **`plan`** validates the toolchain lock and the Go side (`go test ./...`),
+   then reads the job matrix out of the orchestrator itself with
+   `rarpar-bench testcorpus list --json`. A recipe added to the Go unit table
+   gets a runner without anyone editing the workflow.
+3. **`generate (inputs)`** runs the two stage-0 units — the shared inputs under
+   `originals/` that every other recipe reads. It is one job rather than a step
+   of each generation job because the encoder is *not* byte-reproducible: two
+   encodes of `originals/test_clip.mkv` differ, and the suites compare extracted
+   members against exactly the bytes that get published. Every archive of an
+   input has to be an archive of *the* input.
+4. **`generate (imports)`** fetches every upstream import at its pinned commit
+   (`test-corpus generate --imports-only`) and needs no toolchain image at all.
+5. **`generate (<unit>)`**, one job per stage-1 generator, each of which:
+   restores the stage-0 artifact; builds only the images its own recipe drives
+   (`bench toolchains build --only-images-for <unit>` — three of the seven, and
+   the par2cmdline-turbo *compile* only for the three units that need it);
+   removes the fixtures it owns so nothing is carried forward from the checkout;
+   runs `test-corpus generate --only <unit>`; and uploads exactly the ledger
+   paths whose `generator` is that unit. Every ledger path is carried by exactly
+   one artifact. A recipe that *reads* an upstream import (`par2_captures`
+   replays the upstream par2cmdline-turbo scripts against their data tarballs)
+   fetches those inputs itself, from the pinned commit, so it does not wait on
+   the imports job.
+6. **`assemble`** removes every ledger path from its checkout, unpacks the
+   artifacts over the result, and runs `test-corpus generate --assemble`: no
+   recipe runs, the tree has to be exactly the ledger's path set, and the
+   ledger's sizes and digests are refreshed from the bytes that arrived. A path
+   no job produced is simply absent, which fails — it cannot survive as a Git
+   LFS pointer or as checked-in bytes. Then
+   `test-corpus verify --all-present --upstreams` (the ledger against the tree,
+   no `blocked` entries, every public upstream re-fetched byte-identical,
+   independently of what the imports job wrote), `test-corpus build` → manifest
+   and provenance, `test-corpus bench-pins` → the benchmark `fixture_sha256`
+   values. It publishes two artifacts: the whole assembled tree, and the
+   manifest plus the refreshed `sources.json`.
+7. **`validate`**, three parallel lanes over that one tree —
    `cargo test --workspace`, then the `slow-tests` lanes of `unrar-rs` and
-   `par2-rs`. No UnRAR oracle is configured; the tests that want one skip.
-5. Mirror the toolchain sources: resolve each RARLAB and par2cmdline-turbo
-   archive R2-first, fall back to the official URL, verify the reviewed
-   BLAKE3 digest, sign and conditionally upload the unmodified tarball and its
-   provenance, read back.
-6. `test-corpus build` → manifest; `test-corpus bench-pins` → the benchmark
-   `fixture_sha256` values; `cosign sign-blob` → bundles for manifest and
-   provenance; `test-corpus publish` → objects, manifest, provenance, bundles.
-7. Print the lock entry to paste into `test-corpus/lock.json`, and attach the
-   refreshed `test-corpus/sources.json` and the benchmark pin report to the run.
-   **The workflow never creates a branch, commit, or PR**; pinning the new
+   `par2-rs`, split the way `ci.yml` splits them, each with its own sccache key.
+   No UnRAR oracle is configured; the tests that want one skip. Each lane
+   restores the refreshed `sources.json` too, so the suites read the ledger that
+   is about to be published.
+8. **`publish`** restores the validated tree and its manifest — nothing is
+   regenerated, so nothing can differ from what was validated — mirrors the
+   toolchain sources (resolve each RARLAB and par2cmdline-turbo archive
+   R2-first, fall back to the official URL, verify the reviewed BLAKE3 digest,
+   sign and conditionally upload the unmodified tarball and its provenance, read
+   back), signs manifest and provenance with `cosign sign-blob`, uploads
+   objects, manifest, provenance and bundles, and verifies the publication from
+   the public side.
+9. It prints the lock entry to paste into `test-corpus/lock.json`, and attaches
+   the refreshed `test-corpus/sources.json` and the benchmark pin report to the
+   run. **The workflow never creates a branch, commit, or PR**; pinning the new
    manifest is a reviewed PR — the one that also commits the refreshed
    `sources.json` and the moved `corpus.json` pins — and it must pass CI from a
    clean checkout.
@@ -396,6 +459,14 @@ Regeneration is a corpus revision, and it is one command:
 ```sh
 cargo run --locked -p xtask -- bench toolchains build   # once, and after a lock change
 cargo run --locked -p xtask -- test-corpus generate --jobs 4
+```
+
+While iterating on one recipe, build only the images that recipe drives — the
+par2cmdline-turbo image is a compile, and only three units need it:
+
+```sh
+cargo run --locked -p xtask -- bench toolchains build --only-images-for stored_layout
+cargo run --locked -p xtask -- test-corpus generate --only stored_layout
 ```
 
 `generate` runs every recipe on the pinned images (`rarpar-bench-rarlab:6.24`

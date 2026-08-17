@@ -59,14 +59,14 @@ func run(ctx context.Context, args []string) error {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `Usage:
-  rarpar-bench toolchains validate|build|resolve [--config PATH] [--docker PATH] [--mirror-base URL] [--publish] [--s3-endpoint URL] [--bucket NAME] [--cache DIR]
+  rarpar-bench toolchains validate|build|resolve [--config PATH] [--docker PATH] [--mirror-base URL] [--publish] [--s3-endpoint URL] [--bucket NAME] [--cache DIR] [--only-images-for UNIT]...
   rarpar-bench corpus generate --out DIR [--config PATH] [--toolchains PATH] [--docker PATH]
   rarpar-bench corpus verify --root DIR
   rarpar-bench corpus push --root DIR --image REGISTRY/REPO:TAG [--token-file PATH]
   rarpar-bench corpus fetch --image REGISTRY/REPO:TAG --out DIR [--token-file PATH]
   rarpar-bench payload video --profile ffmpeg-video|ffmpeg-video-hevc --target-bytes BYTES --out PATH [--toolchains PATH] [--docker PATH]
-  rarpar-bench testcorpus generate [--only NAME]... [--jobs N] [--toolchains PATH] [--docker PATH]
-  rarpar-bench testcorpus list
+  rarpar-bench testcorpus generate [--only NAME]... [--imports-only] [--jobs N] [--toolchains PATH] [--docker PATH]
+  rarpar-bench testcorpus list [--json]
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
@@ -102,11 +102,16 @@ func runToolchains(ctx context.Context, args []string) error {
 	endpoint := flags.String("s3-endpoint", "", "S3 endpoint for uploads, e.g. https://<account>.r2.cloudflarestorage.com")
 	bucket := flags.String("bucket", "", "bucket holding the tool mirror")
 	cache := flags.String("cache", "", "directory for resolved archives (default: a rarpar-bench directory under the system temp dir)")
+	var onlyImagesFor stringList
+	flags.Var(&onlyImagesFor, "only-images-for", "build: build only the images the named testcorpus generator needs (repeatable)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if len(onlyImagesFor) > 0 && args[0] != "build" {
+		return fmt.Errorf("--only-images-for applies to toolchains build, not %s", args[0])
 	}
 	lock, err := bench.LoadToolchains(*config)
 	if err != nil {
@@ -117,11 +122,21 @@ func runToolchains(ctx context.Context, args []string) error {
 		fmt.Println("toolchain lock is valid")
 		return nil
 	case "build":
+		// One image build per generator that needs it: a runner producing a
+		// single unit has no use for the writers its recipe never invokes, and
+		// the par2cmdline-turbo image is a compile.
+		var onlyIDs []string
+		if len(onlyImagesFor) > 0 {
+			onlyIDs, err = testcorpus.ToolchainIDsForUnits(lock, onlyImagesFor)
+			if err != nil {
+				return err
+			}
+		}
 		mirror, err := toolMirror(*mirrorBase, *endpoint, *bucket, *cache, *publish)
 		if err != nil {
 			return err
 		}
-		return bench.BuildToolchains(ctx, *docker, harnessRoot(), lock, mirror)
+		return bench.BuildToolchains(ctx, *docker, harnessRoot(), lock, mirror, onlyIDs)
 	case "resolve":
 		mirror, err := toolMirror(*mirrorBase, *endpoint, *bucket, *cache, *publish)
 		if err != nil {
@@ -471,6 +486,8 @@ func runTestCorpus(ctx context.Context, args []string) error {
 	toolchains := flags.String("toolchains", defaultPath("config/toolchains.json"), "toolchain lock")
 	docker := flags.String("docker", "docker", "Docker executable")
 	jobs := flags.Int("jobs", 1, "recipes to run at once within a stage")
+	importsOnly := flags.Bool("imports-only", false, "fetch the upstream imports and run no recipe")
+	asJSON := flags.Bool("json", false, "list: emit the unit table as JSON")
 	var only stringList
 	flags.Var(&only, "only", "run only this recipe (repeatable); skips the upstream imports")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -481,7 +498,18 @@ func runTestCorpus(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "list":
-		for _, unit := range testcorpus.Units() {
+		lock, err := bench.LoadToolchains(*toolchains)
+		if err != nil {
+			return err
+		}
+		listing, err := testcorpus.Describe(lock)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return writeJSONTo(os.Stdout, listing)
+		}
+		for _, unit := range listing.Units {
 			fmt.Printf("%s\t%d\t%s\n", unit.Name, unit.Stage, unit.Source)
 		}
 		return nil
@@ -496,12 +524,13 @@ func runTestCorpus(ctx context.Context, args []string) error {
 			root = absolute
 		}
 		return testcorpus.Generate(ctx, testcorpus.Options{
-			RepoRoot:   root,
-			Toolchains: *toolchains,
-			Docker:     *docker,
-			Only:       only,
-			Jobs:       *jobs,
-			Log:        os.Stdout,
+			RepoRoot:    root,
+			Toolchains:  *toolchains,
+			Docker:      *docker,
+			Only:        only,
+			ImportsOnly: *importsOnly,
+			Jobs:        *jobs,
+			Log:         os.Stdout,
 		})
 	default:
 		return fmt.Errorf("unknown testcorpus command %q", args[0])
