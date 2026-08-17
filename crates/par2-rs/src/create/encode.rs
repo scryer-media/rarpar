@@ -476,11 +476,12 @@ impl ForwardEncoder {
         let mut staging: Vec<std::sync::Arc<AlignedBuffer>> = (0..staging_areas)
             .map(|_| std::sync::Arc::new(AlignedBuffer::new(buffers.staging_bytes)))
             .collect();
-        // One raw batch per ring slot: the hasher consumes them behind the
-        // bands, so a buffer must stay live until it has been both staged and
-        // hashed.
-        let mut transfers: Vec<AlignedBuffer> = (0..staging_areas)
-            .map(|_| AlignedBuffer::new(buffers.transfer_bytes))
+        // One raw batch per ring slot, reclaimed by the same `Arc::get_mut`
+        // proof the staged areas use: a slot must stay live until its batch
+        // has been both accumulated and hashed, which is exactly when every
+        // band has dropped that batch's ticket.
+        let mut transfers: Vec<std::sync::Arc<TransferSlot>> = (0..staging_areas)
+            .map(|_| std::sync::Arc::new(TransferSlot::new(buffers.transfer_bytes)))
             .collect();
         let mut output = AlignedBuffer::new(buffers.output_bytes);
 
@@ -557,11 +558,13 @@ impl ForwardEncoder {
                 let mut slice_lens = [0usize; MAX_INPUT_GROUPING];
                 let source_count = provider.source_count();
                 if let Some(&first_start) = batch_starts.first() {
+                    let slot = std::sync::Arc::get_mut(&mut transfers[0])
+                        .ok_or_else(|| resource_limit("transfer slot is still in use"))?;
                     fill_staging(
                         kernel,
                         std::sync::Arc::get_mut(&mut staging[0])
                             .ok_or_else(|| resource_limit("staging area is still in use"))?,
-                        &mut transfers[0],
+                        &mut slot.buffer,
                         provider,
                         first_start,
                         stripe_offset,
@@ -573,7 +576,7 @@ impl ForwardEncoder {
                     if let Some(observer) = observer.as_mut() {
                         observe_batch(
                             &mut **observer,
-                            transfers[0].as_bytes(),
+                            transfers[0].buffer.as_bytes(),
                             first_start,
                             live_batch_inputs(source_count, first_start, contract),
                             transfer_slot_stride(aligned_len)?,
@@ -605,11 +608,13 @@ impl ForwardEncoder {
                         jit_code_budget,
                     )?;
                     if let Some(next_start) = next_start {
+                        let slot = std::sync::Arc::get_mut(&mut transfers[next_area])
+                            .ok_or_else(|| resource_limit("transfer slot is still in use"))?;
                         fill_staging(
                             kernel,
                             std::sync::Arc::get_mut(&mut staging[next_area])
                                 .ok_or_else(|| resource_limit("staging area is still in use"))?,
-                            &mut transfers[next_area],
+                            &mut slot.buffer,
                             provider,
                             next_start,
                             stripe_offset,
@@ -621,7 +626,7 @@ impl ForwardEncoder {
                         if let Some(observer) = observer.as_mut() {
                             observe_batch(
                                 &mut **observer,
-                                transfers[next_area].as_bytes(),
+                                transfers[next_area].buffer.as_bytes(),
                                 next_start,
                                 live_batch_inputs(source_count, next_start, contract),
                                 transfer_slot_stride(aligned_len)?,
@@ -686,15 +691,41 @@ struct StripeGeometry {
     output_stride: usize,
 }
 
+/// One input batch's raw source bytes, one 64-byte-aligned slot per source,
+/// with everything the source hasher needs to read them back.
+///
+/// Held in the same ring the staged areas are, and handed to the bands on the
+/// same [`BatchTicket`], so the batch a band accumulates and the batch it may
+/// hash are one object with one lifetime.
+struct TransferSlot {
+    buffer: AlignedBuffer,
+    /// Distance between consecutive raw source slots in `buffer`.
+    slot_stride: usize,
+    /// Unpadded length of each source's slice in this stripe.
+    slice_lens: [usize; MAX_INPUT_GROUPING],
+}
+
+impl TransferSlot {
+    fn new(bytes: usize) -> Self {
+        Self {
+            buffer: AlignedBuffer::new(bytes),
+            slot_stride: 0,
+            slice_lens: [0; MAX_INPUT_GROUPING],
+        }
+    }
+}
+
 /// One filled staging area handed from the producer to the band workers.
 ///
 /// The `Arc` is the hand-off: the producer cannot refill an area until every
 /// band has dropped its clone, which is exactly the condition
 /// [`StripeFeed`] tracks, and `Arc::get_mut` then proves it rather than
-/// trusting it.
+/// trusting it. The raw transfer slot rides the same ticket, so the same
+/// proof covers the bytes the source hasher still has to read.
 #[derive(Clone)]
 struct BatchTicket {
     staging: std::sync::Arc<AlignedBuffer>,
+    transfer: std::sync::Arc<TransferSlot>,
     source_start: usize,
     live_inputs: usize,
 }
@@ -712,6 +743,11 @@ struct FeedState {
     /// the slowest: reaching batch `b + 2` needs `published > b + 2`, which
     /// needs `completed > b`, which needs every band to have finished `b`.
     done: Vec<usize>,
+    /// The next batch whose source bytes may be hashed. The whole-file MD5 is
+    /// one serial message per file, so the observer must see the batches in
+    /// index order however they are shared out (see
+    /// [`accumulate_band_stream`]).
+    hash_turn: usize,
     /// Set by whichever side failed first (producer error, cancellation, or a
     /// band's error) so the other side stops waiting instead of deadlocking.
     failed: bool,
@@ -723,6 +759,7 @@ struct StripeFeed {
     state: std::sync::Mutex<FeedState>,
     ready: std::sync::Condvar,
     free: std::sync::Condvar,
+    hashed: std::sync::Condvar,
     band_count: usize,
 }
 
@@ -735,10 +772,12 @@ impl StripeFeed {
                 published: 0,
                 completed: 0,
                 done: vec![0; areas],
+                hash_turn: 0,
                 failed: false,
             }),
             ready: std::sync::Condvar::new(),
             free: std::sync::Condvar::new(),
+            hashed: std::sync::Condvar::new(),
             band_count,
         }
     }
@@ -806,7 +845,29 @@ impl StripeFeed {
         }
     }
 
-    /// Stop both sides. Idempotent, and safe to call from either side.
+    /// Band: block until this band's turn to hash batch `batch_index` comes
+    /// round. `false` means the pass failed elsewhere and this band must stop.
+    fn wait_for_hash_turn(&self, batch_index: usize) -> bool {
+        let mut state = self.lock();
+        while !state.failed && state.hash_turn < batch_index {
+            state = self
+                .hashed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        !state.failed
+    }
+
+    /// Band: hand the hashing turn to the band that owns the next batch. Must
+    /// be called only after this band's own `observe` call has returned.
+    fn finish_hash_turn(&self, batch_index: usize) {
+        let mut state = self.lock();
+        state.hash_turn = batch_index + 1;
+        drop(state);
+        self.hashed.notify_all();
+    }
+
+    /// Stop every side. Idempotent, and safe to call from any of them.
     fn fail(&self) {
         let mut state = self.lock();
         state.failed = true;
@@ -815,6 +876,7 @@ impl StripeFeed {
         drop(state);
         self.ready.notify_all();
         self.free.notify_all();
+        self.hashed.notify_all();
     }
 }
 
@@ -837,7 +899,7 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
     factors: &FactorSource,
     exponents: &[RecoveryExponent],
     staging: &mut [std::sync::Arc<AlignedBuffer>],
-    transfers: &mut Vec<AlignedBuffer>,
+    transfers: &mut [std::sync::Arc<TransferSlot>],
     output: &mut [u8],
     batch_starts: &[usize],
     geometry: StripeGeometry,
@@ -861,23 +923,29 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
     let feed = &feed;
     let source_count = provider.source_count();
 
-    // The source hasher gets its own thread and its own queue of raw batches.
-    // It could run on the producer instead — it is the thread that just read
-    // the bytes — but then the bands could not start a batch until it had been
-    // hashed as well as staged, which puts a per-batch deadline on a digest
-    // that only has to keep up ON AVERAGE. Measured on an 18-thread host,
-    // 256 MiB over 4096 sources: hashing on the producer cost 0.32 s of wall
-    // where the same hashing on the same host cost 0.02-0.07 s once the bands
-    // were slow enough (six of them) to hide it. Decoupled, the bands wait
-    // only for the read and the layout conversion, and the hasher may lag by
-    // as many batches as the transfer pool is deep.
-    let mut hasher_result: Option<Result<()>> = None;
+    // The source hashing rides the band workers rather than a thread of its
+    // own. It could have a dedicated thread — the queue and the transfer pool
+    // are already the right shape for one — but then the pass runs
+    // `bands + producer + hasher` busy threads on a host that admits `bands`,
+    // and on a 4-core part that is a 50% oversubscription: every time either
+    // feed thread is descheduled the ring drains inside its slack and ALL the
+    // bands stop. Measured on 4 pinned cores, eight 32 MiB sources: the
+    // stripe-major feed alone is 1.07x over the per-batch shape and a
+    // dedicated hasher thread gave 4.3% of that straight back, at identical
+    // CPU time. Sharing the digest out over the bands instead adds
+    // `hash_cost / band_count` to each band, spawns nothing, and leaves the
+    // arithmetic width alone (which is what a narrow host cannot spare).
+    //
+    // The turn is what keeps it correct: a whole-file MD5 is one serial
+    // message per file, so batch `b` must be observed after batch `b - 1`
+    // however the work is shared out. Band `b % band_count` owns batch `b`,
+    // takes the turn once it has accumulated that batch, and passes the turn
+    // on before it releases the area — so a released area is also a hashed
+    // one, and the producer's existing `Arc::get_mut` reclaim proof covers
+    // the raw bytes too.
+    let observer = observer.map(std::sync::Mutex::new);
+    let observer = observer.as_ref();
     let mut band_results: Vec<Result<()>> = Vec::with_capacity(band_count);
-    let (free_sender, free_receiver) = std::sync::mpsc::channel::<AlignedBuffer>();
-    let (job_sender, job_receiver) = std::sync::mpsc::channel::<HashJob>();
-    for buffer in transfers.drain(..) {
-        let _ = free_sender.send(buffer);
-    }
 
     let produced = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(band_count);
@@ -886,7 +954,7 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
             .zip(exponents.chunks(band_size));
         #[cfg(target_arch = "x86_64")]
         let bands = bands.zip(jit_workspaces.iter_mut());
-        for band in bands {
+        for (band_index, band) in bands.enumerate() {
             #[cfg(target_arch = "x86_64")]
             let ((band_output, band_exponents), jit_workspace) = band;
             #[cfg(not(target_arch = "x86_64"))]
@@ -905,16 +973,14 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
                     jit_workspace,
                     #[cfg(target_arch = "x86_64")]
                     jit_code_budget,
+                    BandHashDuty {
+                        band_index,
+                        band_count,
+                        observer,
+                    },
                 )
             }));
         }
-        let hasher = observer.map(|observer| {
-            let free_sender = free_sender.clone();
-            scope.spawn(move || run_source_hasher(observer, job_receiver, free_sender))
-        });
-        // With no hasher on this pass nothing would ever drain the queue, so
-        // the producer recycles its own buffers instead of posting jobs.
-        let hash_jobs = hasher.is_some().then_some(&job_sender);
 
         let produced = produce_stripe(
             kernel,
@@ -922,9 +988,7 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
             options,
             contract,
             staging,
-            &free_receiver,
-            &free_sender,
-            hash_jobs,
+            transfers,
             batch_starts,
             geometry,
             source_count,
@@ -932,15 +996,6 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
         );
         if produced.is_err() {
             feed.fail();
-        }
-        // Closing the queue is what tells the hasher the stripe is over.
-        drop(job_sender);
-        if let Some(hasher) = hasher {
-            hasher_result = Some(
-                hasher
-                    .join()
-                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
-            );
         }
         band_results.extend(handles.into_iter().map(|handle| {
             handle
@@ -950,47 +1005,25 @@ fn encode_stripe_banded<P: ForwardSourceProvider + ?Sized>(
         produced
     });
 
-    // A hasher error is the specific one; the producer's is a bare "the queue
-    // closed", so report the hasher's first.
-    if let Some(result) = hasher_result {
-        result?;
-    }
     produced?;
     for result in band_results {
         result?;
     }
-    // Reclaim the pool for the next stripe. Both the hasher and the producer
-    // have finished, so every buffer is back on the free channel.
-    transfers.extend(free_receiver.try_iter());
     Ok(())
 }
 
-/// The source hasher half of [`encode_stripe_banded`]: hash each staged batch
-/// and return its buffer to the producer's pool.
-fn run_source_hasher(
-    observer: &mut dyn ForwardSourceObserver,
-    jobs: std::sync::mpsc::Receiver<HashJob>,
-    free: std::sync::mpsc::Sender<AlignedBuffer>,
-) -> Result<()> {
-    while let Ok(job) = jobs.recv() {
-        observe_batch(
-            observer,
-            job.buffer.as_bytes(),
-            job.first_source_index,
-            job.live_inputs,
-            job.slot_stride,
-            &job.slice_lens,
-        )?;
-        // A closed free channel means the producer is already gone; the stripe
-        // is ending either way, so the buffer simply drops.
-        let _ = free.send(job.buffer);
-    }
-    Ok(())
+/// A band worker's share of the fused source hashing: the batches whose index
+/// is congruent to `band_index` modulo `band_count`.
+#[derive(Clone, Copy)]
+struct BandHashDuty<'turn, 'observer> {
+    band_index: usize,
+    band_count: usize,
+    observer: Option<&'turn std::sync::Mutex<&'observer mut dyn ForwardSourceObserver>>,
 }
 
-/// The producer half of [`encode_stripe_banded`]: fill one staging area per
-/// input batch, in increasing source order, hand it to the bands, and queue
-/// its raw bytes for the source hasher.
+/// The producer half of [`encode_stripe_banded`]: fill one staging area and
+/// its raw transfer slot per input batch, in increasing source order, and hand
+/// both to the bands.
 #[allow(clippy::too_many_arguments)]
 fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
     kernel: ResolvedKernel,
@@ -998,9 +1031,7 @@ fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
     options: &ForwardEncoderOptions,
     contract: KernelContract,
     staging: &mut [std::sync::Arc<AlignedBuffer>],
-    free: &std::sync::mpsc::Receiver<AlignedBuffer>,
-    recycle: &std::sync::mpsc::Sender<AlignedBuffer>,
-    jobs: Option<&std::sync::mpsc::Sender<HashJob>>,
+    transfers: &mut [std::sync::Arc<TransferSlot>],
     batch_starts: &[usize],
     geometry: StripeGeometry,
     source_count: usize,
@@ -1013,60 +1044,40 @@ fn produce_stripe<P: ForwardSourceProvider + ?Sized>(
             // A band already failed; its error is the one that surfaces.
             return Ok(());
         }
-        let mut buffer = free
-            .recv()
-            .map_err(|_| resource_limit("source hashing stopped before the stripe finished"))?;
-        let mut slice_lens = [0usize; MAX_INPUT_GROUPING];
         let area = batch_index % feed.areas;
         let staged = std::sync::Arc::get_mut(&mut staging[area])
             .ok_or_else(|| resource_limit("staging area is still in use"))?;
+        let slot = std::sync::Arc::get_mut(&mut transfers[area])
+            .ok_or_else(|| resource_limit("transfer slot is still in use"))?;
+        slot.slot_stride = slot_stride;
         fill_staging(
             kernel,
             staged,
-            &mut buffer,
+            &mut slot.buffer,
             provider,
             source_start,
             geometry.stripe_offset,
             geometry.actual_len,
             geometry.aligned_len,
             contract,
-            &mut slice_lens,
+            &mut slot.slice_lens,
         )?;
-        let live_inputs = live_batch_inputs(source_count, source_start, contract);
         feed.publish(
             batch_index,
             BatchTicket {
                 staging: std::sync::Arc::clone(&staging[area]),
+                transfer: std::sync::Arc::clone(&transfers[area]),
                 source_start,
-                live_inputs,
+                live_inputs: live_batch_inputs(source_count, source_start, contract),
             },
         );
-        match jobs {
-            Some(jobs) => {
-                if jobs
-                    .send(HashJob {
-                        buffer,
-                        first_source_index: source_start,
-                        live_inputs,
-                        slot_stride,
-                        slice_lens,
-                    })
-                    .is_err()
-                {
-                    // The hasher stopped; its error is the one that surfaces.
-                    return Ok(());
-                }
-            }
-            None => {
-                let _ = recycle.send(buffer);
-            }
-        }
     }
     Ok(())
 }
 
 /// One band worker: zero its own output rows, accumulate every input batch of
-/// the stripe from the feed, then finish its rows.
+/// the stripe from the feed, hash the batches this band owns, then finish its
+/// rows.
 #[allow(clippy::too_many_arguments)]
 fn accumulate_band_stream(
     feed: &StripeFeed,
@@ -1080,6 +1091,7 @@ fn accumulate_band_stream(
     #[cfg(target_arch = "x86_64")]
     jit_workspace: &mut reedsolomon_rs::xor_jit::packed::PackedJitWorkspace,
     #[cfg(target_arch = "x86_64")] jit_code_budget: usize,
+    hash_duty: BandHashDuty<'_, '_>,
 ) -> Result<()> {
     // Each band zeroes exactly its own rows, and the bands partition the
     // output buffer, so the union is the whole-buffer clear the per-batch
@@ -1105,13 +1117,25 @@ fn accumulate_band_stream(
             #[cfg(target_arch = "x86_64")]
             jit_code_budget,
         );
-        // Released before the completion is recorded: the producer treats the
-        // recorded completion as proof that no band still holds the area.
-        drop(ticket);
         if let Err(error) = accumulated {
+            drop(ticket);
             feed.fail();
             return Err(error);
         }
+        if let Some(hashed) = hash_batch_if_owned(feed, &ticket, batch_index, hash_duty) {
+            if let Err(error) = hashed {
+                drop(ticket);
+                feed.fail();
+                return Err(error);
+            }
+            // Only now may the turn move on: the observer is a single serial
+            // stream and the next batch's owner is already waiting for it.
+            feed.finish_hash_turn(batch_index);
+        }
+        // Released before the completion is recorded: the producer treats the
+        // recorded completion as proof that no band still holds the area — of
+        // the staged bytes and of the raw ones the hashing above just read.
+        drop(ticket);
         feed.release(batch_index);
     }
     finish_band_rows(
@@ -1122,6 +1146,43 @@ fn accumulate_band_stream(
         band_exponents.len(),
     )
     .inspect_err(|_| feed.fail())
+}
+
+/// Hash one batch's raw source bytes if this band owns that batch, blocking
+/// until the turn reaches it.
+///
+/// `None` means this band owes nothing for this batch (there is no observer,
+/// or the batch belongs to another band, or the pass has already failed
+/// elsewhere). `Some` is this band's own result, and the caller must pass the
+/// turn on before releasing the area.
+fn hash_batch_if_owned(
+    feed: &StripeFeed,
+    ticket: &BatchTicket,
+    batch_index: usize,
+    duty: BandHashDuty<'_, '_>,
+) -> Option<Result<()>> {
+    let observer = duty.observer?;
+    if batch_index % duty.band_count != duty.band_index {
+        return None;
+    }
+    if !feed.wait_for_hash_turn(batch_index) {
+        // Some other band or the producer already failed; that error is the
+        // one that surfaces, and this band stops without taking the turn.
+        return None;
+    }
+    // The turn is the exclusion; the lock only expresses it to the compiler,
+    // so it is never contended by a second hasher.
+    let mut observer = observer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(observe_batch(
+        &mut **observer,
+        ticket.transfer.buffer.as_bytes(),
+        ticket.source_start,
+        ticket.live_inputs,
+        ticket.transfer.slot_stride,
+        &ticket.transfer.slice_lens,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2111,15 +2172,6 @@ fn transfer_slot_stride(aligned_len: usize) -> Result<usize> {
     round_up(aligned_len, 64)
 }
 
-/// One staged batch's raw bytes, on their way to the source hasher.
-struct HashJob {
-    buffer: AlignedBuffer,
-    first_source_index: usize,
-    live_inputs: usize,
-    slot_stride: usize,
-    slice_lens: [usize; MAX_INPUT_GROUPING],
-}
-
 /// Hand one staged batch's raw slices to the observer, in runs the
 /// multi-buffer digest kernel can lane.
 fn observe_batch(
@@ -2838,17 +2890,51 @@ mod tests {
             let mut areas: Vec<std::sync::Arc<AlignedBuffer>> = (0..depth)
                 .map(|_| std::sync::Arc::new(AlignedBuffer::new(64)))
                 .collect();
+            let mut slots: Vec<std::sync::Arc<TransferSlot>> = (0..depth)
+                .map(|_| std::sync::Arc::new(TransferSlot::new(64)))
+                .collect();
+            // Every batch's hashing turn, in the order the observer would have
+            // been called: the bands push to this under the turn alone.
+            let hashed = std::sync::Mutex::new(Vec::<usize>::with_capacity(BATCHES));
+            let hashed = &hashed;
+            // Bands record what they saw instead of asserting on their own
+            // thread: a band that unwound mid-stripe would never release its
+            // area and the producer would then block on a ring that can never
+            // drain, so a known-bad injection has to FAIL this test rather
+            // than hang it.
+            let faults = std::sync::Mutex::new(Vec::<String>::new());
+            let faults = &faults;
             std::thread::scope(|scope| {
-                for _ in 0..band_count {
+                for band_index in 0..band_count {
                     scope.spawn(move || {
+                        let note = |fault: String| faults.lock().expect("uncontended").push(fault);
                         for batch in 0..BATCHES {
-                            let ticket = feed.acquire(batch).expect("no failure is injected");
-                            assert_eq!(ticket.source_start, batch * 7, "batch order");
-                            assert_eq!(
-                                ticket.staging.as_bytes()[0],
-                                (batch % 251) as u8,
-                                "area was refilled while a band still held it"
-                            );
+                            let Some(ticket) = feed.acquire(batch) else {
+                                note(format!("batch {batch}: no failure is injected"));
+                                return;
+                            };
+                            let stamp = (batch % 251) as u8;
+                            if ticket.source_start != batch * 7 {
+                                note(format!("batch {batch}: batch order"));
+                            }
+                            if ticket.staging.as_bytes()[0] != stamp {
+                                note(format!(
+                                    "batch {batch}: area was refilled while a band still held it"
+                                ));
+                            }
+                            if batch % band_count == band_index {
+                                if !feed.wait_for_hash_turn(batch) {
+                                    note(format!("batch {batch}: the hashing turn never came"));
+                                    return;
+                                }
+                                if ticket.transfer.buffer.as_bytes()[0] != stamp {
+                                    note(format!(
+                                        "batch {batch}: transfer slot was refilled while a band still held it"
+                                    ));
+                                }
+                                hashed.lock().expect("uncontended").push(batch);
+                                feed.finish_hash_turn(batch);
+                            }
                             drop(ticket);
                             feed.release(batch);
                         }
@@ -2860,27 +2946,46 @@ mod tests {
                     let buffer = std::sync::Arc::get_mut(&mut areas[area])
                         .expect("every band released the area before it was reclaimed");
                     buffer.as_bytes_mut()[0] = (batch % 251) as u8;
+                    let slot = std::sync::Arc::get_mut(&mut slots[area])
+                        .expect("every band released the transfer slot before it was reclaimed");
+                    slot.buffer.as_bytes_mut()[0] = (batch % 251) as u8;
                     feed.publish(
                         batch,
                         BatchTicket {
                             staging: std::sync::Arc::clone(&areas[area]),
+                            transfer: std::sync::Arc::clone(&slots[area]),
                             source_start: batch * 7,
                             live_inputs: 1,
                         },
                     );
                 }
             });
+            assert!(
+                faults.lock().expect("no band panicked").is_empty(),
+                "{:?}",
+                faults.lock().expect("no band panicked")
+            );
+            assert_eq!(
+                hashed.lock().expect("no band panicked").as_slice(),
+                (0..BATCHES).collect::<Vec<_>>(),
+                "the hashing turn must reach the observer once per batch, in index order"
+            );
         }
     }
 
-    /// A failed pass must release both sides of the hand-off. Without the
-    /// flag, `acquire` waits for a publish that will never come and
-    /// `wait_for_area` waits for a completion that will never come.
+    /// A failed pass must release every side of the hand-off. Without the
+    /// flag, `acquire` waits for a publish that will never come,
+    /// `wait_for_area` waits for a completion that will never come, and
+    /// `wait_for_hash_turn` waits for a turn whose owner has already stopped.
     #[test]
     fn a_failed_pass_releases_both_sides_of_the_feed() {
         let feed = StripeFeed::new(2, configured_staging_areas());
         feed.fail();
         assert!(feed.acquire(0).is_none(), "a band must stop on failure");
+        assert!(
+            !feed.wait_for_hash_turn(7),
+            "a band owing a hashing turn must stop on failure"
+        );
         assert!(
             !feed.wait_for_area(configured_staging_areas()),
             "the producer must stop on failure"
