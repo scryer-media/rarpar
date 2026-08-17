@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -572,10 +573,18 @@ func TestResolveFallsBackWhenTheMirrorRefusesTheClient(t *testing.T) {
 			keys := fixture.source.keys()
 			fixture.mirrorObjects(fixture.source, fixture.archive, nil)
 			fixture.queueReadStatus(keys.archive, status)
+			var log bytes.Buffer
+			fixture.mirror.Log = &log
 
 			resolved, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir)
 			if err != nil {
 				t.Fatal(err)
+			}
+			// The notice has to name the URL that was refused, not just the
+			// key: a key alone does not say which host answered, which is
+			// exactly what a bare "HTTP 403" left unanswerable in the field.
+			if noticed := log.String(); !strings.Contains(noticed, fixture.mirror.readURL(keys.archive)) {
+				t.Fatalf("notice %q does not name the refused URL", noticed)
 			}
 			if resolved.Origin != OriginOfficial {
 				t.Fatalf("origin = %q, want %q", resolved.Origin, OriginOfficial)
@@ -589,6 +598,48 @@ func TestResolveFallsBackWhenTheMirrorRefusesTheClient(t *testing.T) {
 				t.Fatalf("mirror was read %d times, want exactly one", got)
 			}
 		})
+	}
+}
+
+// The whole point of the refusal diagnostic: the message has to be enough to
+// tell an edge network's block page from object storage's own error, and to
+// find the request again in whichever log the responder keeps.
+func TestDescribeResponseIdentifiesWhoRefused(t *testing.T) {
+	const target = "https://corpus.example.net/tools/rarlab/blake3/abc/rarlinux.tar.gz"
+
+	edge := describeResponse(target, http.StatusForbidden, http.Header{
+		"Server": []string{"cloudflare"},
+		"Cf-Ray": []string{"a2c599ba7f38e677-DEN"},
+	}, []byte("<!doctype html><html><head><title>Blocked</title></head>"+
+		"<body><h1>Sorry, you have been blocked</h1></body></html>"))
+	for _, want := range []string{target, "HTTP 403", "server=cloudflare", "cf-ray=a2c599ba7f38e677-DEN", "you have been blocked"} {
+		if !strings.Contains(edge, want) {
+			t.Fatalf("description %q is missing %q", edge, want)
+		}
+	}
+	if strings.Contains(edge, "<") || strings.Contains(edge, "\n") {
+		t.Fatalf("description %q is not a flattened one-liner", edge)
+	}
+
+	// Storage answering for itself looks nothing like the above, which is the
+	// distinction the field could not make from "HTTP 403" alone.
+	storage := describeResponse(target, http.StatusForbidden, http.Header{
+		"X-Amz-Request-Id": []string{"1234567890"},
+	}, []byte("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"))
+	for _, want := range []string{"x-amz-request-id=1234567890", "AccessDenied"} {
+		if !strings.Contains(storage, want) {
+			t.Fatalf("description %q is missing %q", storage, want)
+		}
+	}
+
+	// A body that would bury the log is cut, and a silent response still says
+	// who answered.
+	long := describeResponse(target, http.StatusForbidden, http.Header{}, bytes.Repeat([]byte("x"), 4096))
+	if len(long) > 400 {
+		t.Fatalf("description is %d bytes; a body excerpt must be truncated", len(long))
+	}
+	if bare := describeResponse(target, http.StatusForbidden, http.Header{}, nil); !strings.Contains(bare, "HTTP 403") {
+		t.Fatalf("description %q lost the status", bare)
 	}
 }
 

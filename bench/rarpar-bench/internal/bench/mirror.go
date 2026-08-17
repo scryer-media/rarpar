@@ -440,7 +440,8 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 // archive exists, every companion is mandatory.
 func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, work string) ([]byte, error) {
 	keys := source.keys()
-	status, data, err := m.get(ctx, m.readURL(keys.archive))
+	target := m.readURL(keys.archive)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, err
 	}
@@ -455,11 +456,11 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 		// held to the same reviewed digest — the fallback cannot lower the bar.
 		// Failing hard here would instead make the *first* publication
 		// impossible, when by definition nothing is mirrored yet.
-		return nil, fmt.Errorf("%w: mirror GET %s: HTTP %d", errSourceUnavailable, keys.archive, status)
+		return nil, fmt.Errorf("%w: mirror %s", errSourceUnavailable, describeResponse(target, status, header, data))
 	case status != http.StatusOK:
 		// Neither absence nor unavailability: something answered for this key
 		// that is not the object, so nothing may be assumed about it.
-		return nil, fmt.Errorf("mirror GET %s: HTTP %d", keys.archive, status)
+		return nil, fmt.Errorf("mirror %s", describeResponse(target, status, header, data))
 	}
 	if digest := bytesBLAKE3(data); digest != source.BLAKE3 {
 		return nil, fmt.Errorf("the mirror holds a different object under this digest key %s: blake3 %s", keys.archive, digest)
@@ -517,12 +518,14 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 // archive key itself gets, and it wraps errSourceUnavailable so Resolve may
 // fall back to the official URL — which is still digest-checked.
 func (m *SourceMirror) companion(ctx context.Context, key string) ([]byte, error) {
-	status, data, err := m.get(ctx, m.readURL(key))
+	target := m.readURL(key)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("mirror GET %s: %w", key, err)
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("mirror is missing companion object %s: HTTP %d", key, status)
+		return nil, fmt.Errorf("mirror is missing companion object %s: %s",
+			key, describeResponse(target, status, header, data))
 	}
 	return data, nil
 }
@@ -691,12 +694,12 @@ func quoteCurlConfigValue(value string) string {
 
 // download fetches an object that must be there: the official upstream.
 func (m *SourceMirror) download(ctx context.Context, target string) ([]byte, error) {
-	status, data, err := m.get(ctx, target)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", status)
+		return nil, fmt.Errorf("%s", describeResponse(target, status, header, data))
 	}
 	return data, nil
 }
@@ -705,17 +708,17 @@ func (m *SourceMirror) download(ctx context.Context, target string) ([]byte, err
 // a 429 — a bounded number of times. A non-transient response is returned with
 // its status so the caller can act on 404; an exhausted budget is reported as
 // errSourceUnavailable.
-func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, error) {
+func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, http.Header, error) {
 	var last error
 	for attempt := 1; attempt <= mirrorAttempts; attempt++ {
 		if attempt > 1 {
 			if err := m.backoff(ctx, attempt); err != nil {
-				return 0, nil, err
+				return 0, nil, nil, err
 			}
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		response, err := m.client().Do(request)
 		if err != nil {
@@ -736,9 +739,65 @@ func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, err
 			last = fmt.Errorf("HTTP %d", response.StatusCode)
 			continue
 		}
-		return response.StatusCode, data, nil
+		return response.StatusCode, data, response.Header, nil
 	}
-	return 0, nil, fmt.Errorf("%w: %s: %v", errSourceUnavailable, target, last)
+	return 0, nil, nil, fmt.Errorf("%w: %s: %v", errSourceUnavailable, target, last)
+}
+
+// describeResponse says who answered and what they said, for a response that
+// carried no object.
+//
+// A bare "HTTP 403" cannot be diagnosed: the mirror key alone does not even
+// name the host it was requested from, and an intermediary that refuses the
+// request looks exactly like a bucket that refuses it. The identifying detail
+// is all in the response — an edge network names itself in `server` and stamps
+// a request id that its own event log can be searched by, while object storage
+// answers with its own error document. Everything here is a public response to
+// a public URL: no credential is ever sent to a read base, so nothing that
+// could be echoed back is sensitive.
+func describeResponse(target string, status int, header http.Header, body []byte) string {
+	description := fmt.Sprintf("GET %s: HTTP %d", target, status)
+	var marks []string
+	for _, name := range []string{"Server", "Cf-Ray", "Cf-Mitigated", "X-Amz-Request-Id"} {
+		if value := header.Get(name); value != "" {
+			marks = append(marks, fmt.Sprintf("%s=%s", strings.ToLower(name), value))
+		}
+	}
+	if len(marks) > 0 {
+		description += " [" + strings.Join(marks, ", ") + "]"
+	}
+	if excerpt := bodyExcerpt(body); excerpt != "" {
+		description += ": " + excerpt
+	}
+	return description
+}
+
+// bodyExcerpt flattens an error document to one short line: tags dropped,
+// runs of whitespace collapsed, truncated. Enough to tell a CDN block page
+// from a storage error, and not enough to bury the log in HTML.
+func bodyExcerpt(body []byte) string {
+	const limit = 200
+	var text strings.Builder
+	inTag := false
+	for _, r := range string(body) {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+			text.WriteRune(' ')
+		case !inTag:
+			text.WriteRune(r)
+		}
+	}
+	flattened := strings.Join(strings.Fields(text.String()), " ")
+	if flattened == "" {
+		return ""
+	}
+	if len(flattened) > limit {
+		flattened = flattened[:limit] + "…"
+	}
+	return strconv.Quote(flattened)
 }
 
 func transientStatus(status int) bool {
