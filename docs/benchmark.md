@@ -52,7 +52,7 @@ hardware, so the Linux rows are, if anything, conservative.
   `macos-arm64` `par2cmdline-turbo` binary — the same reference role as every
   other row, taken from the project's own release. That binary is markedly
   slower on macOS than the Linux and Windows builds of the same version, which
-  lifts every macOS PAR2 ratio here, including the 7.2× heavy-repair figure.
+  lifts every macOS PAR2 ratio here, including the 7.8× heavy-repair figure.
   It is an honest comparison against what a macOS user would actually install;
   it is not a claim that the PAR2 engine is five times faster on Apple Silicon
   than on x86-64.
@@ -63,15 +63,15 @@ hardware, so the Linux rows are, if anything, conservative.
 - *Windows CPU time.* The Windows machine's CPU-time counter is quantized to
   roughly 15.6 ms, so short cases report zero CPU seconds there. Every figure
   on this page is wall-clock and is unaffected.
-- *Shapes that lose.* RAR4 PPMd still trails the reference decoder on the
-  x86-64 machines — 0.80×–0.90× as a class on the re-measured ones, 0.72× on
-  the carried Denverton row — and is counted in the compressed-extraction class
-  anyway; on the Arm cores it has now edged past parity (1.02×–1.08×). PAR2
-  generation still trails `par2cmdline-turbo` on the Intel x86-64 machines and
-  on Zen 2, because `rarpar` flushes and re-validates every written recovery
-  volume before commit; it is ahead on Zen 4 (1.14×), Haswell (1.04×) and all
-  three Arm cores (1.06×–1.14×). It is charted per machine but is not part of
-  the heavy-repair class.
+- *Shapes that lose.* RAR4 PPMd still trails the reference decoder on every
+  x86-64 machine (0.75×–0.90× as a class) and is counted in the
+  compressed-extraction class anyway; on all four Arm cores it has now edged
+  past parity (1.02×–1.08×). PAR2 generation still trails `par2cmdline-turbo`
+  on the Intel x86-64 machines, on Zen 2 and on Denverton, because `rarpar`
+  flushes and re-validates every written recovery volume before commit; it is
+  ahead on Zen 4 (1.14×), Haswell (1.04×), all three Arm cores (1.06×–1.14×)
+  and Apple silicon. It is charted per machine but is not part of the
+  heavy-repair class.
 
 ### Workload classes
 
@@ -83,8 +83,8 @@ hardware, so the Linux rows are, if anything, conservative.
 
 `unrar (text)` **includes PPMd.** PPMd is an archaic RAR4 mode that is
 deliberately left unoptimized, and it drags the compressed-extraction geomean
-down on every x86-64 machine (it now sits just above parity on the Arm cores);
-it is counted regardless.
+down on every x86-64 machine (it now sits just above parity on all four Arm
+cores); it is counted regardless.
 
 Six of the 43 cases sit outside these three classes. They are charted but not
 aggregated: `rar5-v5-recovery-volume` and `rar5-v7-recovery-volume` (recovery
@@ -109,25 +109,27 @@ refresh.
 | Corpus | `rarpar-bench`, 43 cases, digest `59f46fa58f65…` |
 | RAR plan / PAR2 plan | `plan-e4222071b3f06c00` / `plan-900b3c52bca9463e` (Metal lane `plan-e9c4aa7366c941c8`) |
 
-**Which rows this refresh re-measured.** Nine of the eleven machines were
-re-measured on `0ac98f7` with the corpus, plans, protocol and reference
-binaries above: the seven cloud machines (Zen 4, Sapphire Rapids, Skylake-SP,
-Haswell, Cortex-A72, Neoverse N1, Neoverse V2), Alder Lake, and Zen 2. **Two
-rows carry forward from the previous publication on commit `64f5957`** — the
-Intel Atom C3538 (Denverton) row and all three Apple M5 Max slots, including
-the Metal lane and its CPU-versus-Metal timings below. They were measured with
-the same corpus, plans and references, so they remain directly comparable, but
-they are one candidate behind and do not include this candidate's PPMd or PAR2
-generation work. Their charts are unchanged from the previous refresh.
+**Every row on this page was re-measured on `0ac98f7`** with the corpus,
+plans, protocol and reference binaries above — all eleven machines: the seven
+cloud machines (Zen 4, Sapphire Rapids, Skylake-SP, Haswell, Cortex-A72,
+Neoverse N1, Neoverse V2), Alder Lake, Zen 2, Denverton, and both Apple M5 Max
+lanes. No row carries forward, and every chart is regenerated from this run.
 
-The Windows PAR2 row comes from a settled-state pass. On that machine the
+The Apple rows were measured under ordinary desktop load rather than on an idle
+machine; their per-sample spread is correspondingly wider than the other rows'.
+Medians over seven repeats, with the candidate and the reference alternating
+inside the same window, are what absorb that.
+
+The Windows and Apple PAR2 rows come from settled-state passes. On that machine the
 write-heavy generation case is sensitive to on-write filesystem scanning: its
 first pass showed a heavy upper tail (candidate median 4735 ms against a floor
 of 1894 ms) that decayed over repeated passes to a tighter distribution than
 the previous publication ever recorded (1866 ms median, 41 ms spread). The
 published figures are that settled pass. The choice moves the heavy-repair
 geomean by 0.7% and does not change the one-decimal figure; the other five PAR2
-cases reproduce within 1.5% across every pass.
+cases reproduce within 1.5% across every pass. The two Apple PAR2 lanes were
+re-passed the same way and for the same reason, and the settled pass is what is
+published for both; it raises the CPU heavy figure and lowers the Metal one.
 
 Reference tools, with the binary identity recorded by each run:
 
@@ -152,9 +154,6 @@ documented in [benchmarking.md](benchmarking.md).
 
 Geometric mean per class, one decimal. Per-class breakouts follow each machine.
 
-Rows marked † carry forward from the previous publication on commit `64f5957`;
-every other row is from the current run.
-
 | CPU | Arch | Dispatch tier | unrar (binary) | unrar (text) | par2 (heavy) |
 |---|---|---|---:|---:|---:|
 | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.7× | 1.7× | 2.3× |
@@ -163,8 +162,8 @@ every other row is from the current run.
 | Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.5× | 1.2× | 1.7× |
 | AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
 | Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.5× | 1.2× | 1.9× |
-| Intel Atom C3538 (Denverton) † | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
-| Apple M5 Max † | arm64 | NEON | 1.3× | 1.4× | 7.2× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
+| Apple M5 Max | arm64 | NEON | 1.3× | 1.5× | 7.8× |
 | Arm Cortex-A72 | arm64 | NEON | 2.4× | 1.6× | 1.2× |
 | Arm Neoverse N1 | arm64 | NEON | 3.1× | 1.7× | 1.5× |
 | Arm Neoverse V2 | arm64 | NEON | 3.8× | 1.8× | 1.6× |
@@ -302,24 +301,23 @@ decoder at 1.02×.
 
 ## SSSE3 (no AVX)
 
-### Intel Atom C3538 (Denverton) †
+### Intel Atom C3538 (Denverton)
 
-4 cores · Linux 4.4 · dispatch tier SSSE3 · candidate `rarpar 0.3.1`,
-static-musl x86-64 build `f796ac3b…` · references `UnRAR 7.23` (`926d3a00…`)
+4 cores · Linux 4.4 · dispatch tier SSSE3 · candidate `rarpar 0.3.2`,
+static-musl x86-64 build `947787d4…` · references `UnRAR 7.23` (`926d3a00…`)
 and `par2cmdline-turbo 1.4.0` (`2c3ba0c5…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 0.98× | 2.03× | 1.01× | 2.80× | 0.72× | 1.44× |
+| 0.98× | 2.02× | 1.03× | 2.81× | 0.75× | 1.40× |
 
-† **Carried forward, measured on commit `64f5957`.** This row and its two charts
-were not re-measured for this refresh, so they do not include this candidate's
-PPMd or PAR2 generation work; every other x86-64 row on this page moved on both.
-The corpus, plans and reference binaries are the same ones used above, so the
-comparison itself is still like-for-like.
+This is the slowest machine in the set and the only one with no AVX at all. It
+moved least: PPMd +5.1% and PAR2 generation +5.4% (0.71× → 0.74×, still the
+lowest generation figure on the board), everything else inside 2%.
 
-Plain store-mode and plain compressed extraction sit at parity on this tier —
-the one rung where `rarpar`'s wider kernels have nothing to work with. The
+Plain store-mode sits just under parity on this tier and plain compressed
+extraction just over it — the one rung where `rarpar`'s wider kernels have
+nothing to work with. The
 encrypted classes still win by a wide margin, because AES runs through AWS-LC
 against the reference's own AES path.
 
@@ -336,23 +334,20 @@ AArch64 builds use the NEON kernel family; the PMULL carry-less multiply path
 and the EOR3 three-way XOR are picked up at runtime where the CPU exposes them.
 There is no separate SVE tier.
 
-## Apple M5 Max (macOS) †
+## Apple M5 Max (macOS)
 
-18 cores · macOS, Darwin 25.5 · dispatch tier NEON · candidates `rarpar 0.3.1`,
-native arm64 builds `ee8723cb…` (CPU lane) and `ea802b2c…` (Metal lane) ·
+18 cores · macOS, Darwin 25.5 · dispatch tier NEON · candidates `rarpar 0.3.2`,
+native arm64 builds `c61753a1…` (CPU lane) and `7b9f6d68…` (Metal lane) ·
 references `UnRAR 7.23` (`99720d63…`) and `par2cmdline-turbo 1.4.0`
 (`32ab46c2…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy (CPU) | PAR2 heavy (Metal) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1.07× | 2.63× | 1.21× | 2.41× | 0.98× | 7.20× | 5.76× |
+| 1.07× | 2.51× | 1.21× | 2.38× | 1.07× | 7.78× | 5.58× |
 
-† **Carried forward, measured on commit `64f5957`.** Neither lane was
-re-measured for this refresh, so these figures — and the Metal-versus-CPU
-timings below — predate this candidate's PPMd and PAR2 generation work. The
-three Apple-silicon charts are unchanged from the previous refresh. On the
-machines that were re-measured, PPMd rose 3–8% as a class and Arm PAR2
-generation crossed parity, so this row is likely to be conservative on both.
+PPMd crossed parity here, 0.98× → 1.07× — the largest PPMd gain of any machine
+in the set. PAR2 generation went 13.6× → 23.9×, against the slow macOS
+reference binary the caveat above describes.
 
 [![RAR workloads on Apple M5 Max, NEON](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-macos-arm64.svg)
 
@@ -371,12 +366,15 @@ this lane too.
 
 [![PAR2 Metal-lane workloads on Apple M5 Max](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)](../crates/par2-rs/docs/rarpar-par2-benchmark-macos-arm64-metal.svg)
 
-On this corpus Metal was slightly *slower* in wall time than the NEON path
-(`par2-heavy-damage-250`: 305 ms on Metal against 250 ms on CPU) while using
-about a third of the CPU time. The GPU lane's value here is freed CPU, not
-lower latency; these repairs are small enough that the NEON kernels already
-saturate the useful parallelism. These timings carry forward with the rest of
-the Apple-silicon row and were last measured on `64f5957`.
+On this corpus Metal is still slightly *slower* in wall time than the NEON path
+(`par2-heavy-damage-250`: 370 ms on Metal against 281 ms on CPU). The GPU
+lane's value here is freed CPU, not lower latency; these repairs are small
+enough that the NEON kernels already saturate the useful parallelism. Read the
+two millisecond figures against each other rather than against the previous
+publication's: these were measured under ordinary desktop load, which lifts
+both. The Metal lane in particular shared the GPU with other work, and unlike
+the CPU lanes that penalty falls on `rarpar` alone — the reference tool is
+CPU-only — so the Metal figure here is a floor rather than a best estimate.
 
 ## Arm Cortex-A72
 
