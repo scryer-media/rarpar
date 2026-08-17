@@ -377,6 +377,76 @@ fn overwrite_replaces_outputs_only_after_a_valid_staged_set() {
     }));
 }
 
+/// The source hashes the encoder's feed produces must be the hashes a separate
+/// read of the same files produces.
+///
+/// The two paths are selected by the memory budget, not by a flag: a budget
+/// that admits one stripe lets the encode feed the digests, and a budget that
+/// forces several does not (the feed is stripe-major then, so a whole-file MD5
+/// cannot come from it) and the sources are read instead. The PAR2 set the two
+/// write is not allowed to differ by a byte, so this compares them directly.
+///
+/// The sources deliberately include a file with a short trailing slice and one
+/// shorter than the 16 KiB identity read, where `hash_16k` and `hash_full` are
+/// digests of the same bytes.
+#[test]
+fn fused_and_separately_read_source_hashes_write_the_same_set() {
+    let directory = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, length) in [("a.bin", 70_000usize), ("b.bin", 40_003), ("c.bin", 900)] {
+        let path = directory.path().join(name);
+        let bytes = (0..length)
+            .map(|index| (index.wrapping_mul(37) ^ (index >> 5)) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        inputs.push(path);
+    }
+
+    let build = |stem: &str, memory_limit: Option<usize>| -> (Vec<Vec<u8>>, usize, usize) {
+        let mut options = Par2CreatorOptions::with_output(
+            directory.path().join(stem),
+            Some(directory.path().to_path_buf()),
+            inputs.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(4096);
+        options.recovery_amount = RecoveryAmount::Count(5);
+        options.memory_limit = memory_limit;
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        let limit = plan.memory.processing_buffer_limit_bytes;
+        let stripe_bytes = plan.memory.stripe_buffer_bytes;
+        let outcome = creator.create(&plan).unwrap();
+        let bodies = outcome
+            .output_paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        (bodies, limit, stripe_bytes)
+    };
+
+    let (fused, fused_limit, _) = build("fused-set", None);
+    let (separate, _, separate_stripe_bytes) = build("separate-set", Some(16 * 1024));
+    // A single-stripe pass holds every recovery row for a whole 4096-byte
+    // block at once, so its stripe buffers alone cannot be smaller than
+    // `recovery_count * block_size`. The second build's are, so it is
+    // necessarily multi-stripe and its hashes cannot have come from the feed.
+    assert!(
+        separate_stripe_bytes < 5 * 4096,
+        "the small budget must force more than one stripe"
+    );
+    // The default budget floor is hundreds of megabytes against a working set
+    // of a few, so the first build is necessarily single-stripe.
+    assert!(
+        fused_limit >= 16 * 1024 * 1024,
+        "the default budget must admit one stripe"
+    );
+    assert_eq!(fused.len(), separate.len());
+    assert_eq!(
+        fused, separate,
+        "fused and separately read hashes must agree"
+    );
+}
+
 #[test]
 fn creation_uses_bounded_disk_backed_stripes_for_large_sources() {
     let directory = tempdir().unwrap();

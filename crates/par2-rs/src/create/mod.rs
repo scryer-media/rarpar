@@ -116,6 +116,6 @@ impl Par2Creator {
             });
         }
 
-        write_outputs(plan, &canonical.sources, &self.options, selected)
+        write_outputs(plan, canonical.sources, &self.options, selected)
     }
 }

@@ -526,9 +526,27 @@ struct RecoveryLocation {
     slot_index: usize,
 }
 
+/// Where one copy of one critical packet was staged.
+///
+/// Critical packets are laid out before the recovery data is encoded, but
+/// their bodies carry the source content hashes, which the encoder's own feed
+/// produces (see `CreationSource`). The layout does not depend on the hash
+/// VALUES — a planned source already carries a correctly sized placeholder for
+/// every one of them — so the packets are staged at their final size and
+/// rewritten in place once the encode has produced the real bytes.
+#[derive(Clone, Copy)]
+struct CriticalLocation {
+    volume_index: usize,
+    offset: u64,
+    critical_index: usize,
+    len: usize,
+}
+
 struct StagedOutputs {
     volumes: Vec<VolumeState>,
     locations: Vec<RecoveryLocation>,
+    /// Every staged copy of every critical packet, in write order.
+    critical_offsets: Vec<CriticalLocation>,
     planned_targets: Vec<TargetSnapshot>,
     /// One pin per planned target that already existed when the transaction
     /// started, `None` where the path was absent.
@@ -1059,14 +1077,15 @@ impl StagedOutputs {
         let mut staged = Self {
             volumes,
             locations: Vec::with_capacity(plan.recovery_count as usize),
+            critical_offsets: Vec::new(),
             planned_targets: plan.target_snapshots.clone(),
             planned_pins: planned_pins?,
             committed: false,
         };
 
-        for (expected, packet) in critical {
+        for critical_index in 0..critical.len() {
             check_cancel(cancellation)?;
-            append_packet(&mut staged.volumes[0], expected.clone(), packet)?;
+            append_critical_packet(&mut staged, 0, critical_index, critical)?;
         }
         check_cancel(cancellation)?;
         append_packet(&mut staged.volumes[0], ExpectedPacket::Creator, creator)?;
@@ -1075,9 +1094,9 @@ impl StagedOutputs {
             check_cancel(cancellation)?;
             let volume_index = volume_offset + 1;
             if volume_plan.recovery_count == 0 {
-                for (expected, packet) in critical {
+                for critical_index in 0..critical.len() {
                     check_cancel(cancellation)?;
-                    append_packet(&mut staged.volumes[volume_index], expected.clone(), packet)?;
+                    append_critical_packet(&mut staged, volume_index, critical_index, critical)?;
                 }
             } else {
                 let copies = bit_length(volume_plan.recovery_count) as u64;
@@ -1107,8 +1126,7 @@ impl StagedOutputs {
                         })?;
                     while packet_count >= volume_plan.recovery_count as u64 {
                         check_cancel(cancellation)?;
-                        let (expected, packet) = &critical[next_critical];
-                        append_packet(&mut staged.volumes[volume_index], expected.clone(), packet)?;
+                        append_critical_packet(&mut staged, volume_index, next_critical, critical)?;
                         next_critical = (next_critical + 1) % critical.len();
                         packet_count -= volume_plan.recovery_count as u64;
                     }
@@ -1122,6 +1140,49 @@ impl StagedOutputs {
             )?;
         }
         Ok(staged)
+    }
+
+    /// Replace every staged critical packet with the one built from the
+    /// hydrated sources.
+    ///
+    /// Same packets, same order, same offsets: only the bodies' hash bytes and
+    /// the headers' packet MD5s were unknown when the layout was written. The
+    /// length equality is checked rather than assumed, because a length change
+    /// would mean the layout itself was built from something other than the
+    /// sources being written, and that must be an error, not a silent overlap.
+    fn rewrite_critical_packets(
+        &mut self,
+        critical: &[(ExpectedPacket, Vec<u8>)],
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        for location in &self.critical_offsets {
+            check_cancel(cancellation)?;
+            let (_, packet) = critical.get(location.critical_index).ok_or_else(|| {
+                Par2Error::CreationValidation {
+                    path: self.volumes[location.volume_index]
+                        .stage_path
+                        .display()
+                        .to_string(),
+                    reason: "critical packet set changed after staging".to_string(),
+                }
+            })?;
+            let volume = &mut self.volumes[location.volume_index];
+            if packet.len() != location.len {
+                return Err(Par2Error::CreationValidation {
+                    path: volume.stage_path.display().to_string(),
+                    reason: "critical packet length changed after staging".to_string(),
+                });
+            }
+            volume
+                .file
+                .seek(SeekFrom::Start(location.offset))
+                .map_err(Par2Error::Io)?;
+            volume.file.write_all(packet).map_err(Par2Error::Io)?;
+        }
+        for volume in &mut self.volumes {
+            volume.file.flush().map_err(Par2Error::Io)?;
+        }
+        Ok(())
     }
 
     fn finish_recovery_headers(
@@ -1570,14 +1631,34 @@ fn cleanup_stage_files(volumes: Vec<VolumeState>) {
 
 pub(crate) fn write_outputs(
     plan: &Par2CreatePlan,
-    sources: &[CreationSource],
+    mut sources: Vec<CreationSource>,
     options: &Par2CreatorOptions,
     mut backend: SelectedBackend,
 ) -> Result<Par2CreateOutcome> {
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
     }
-    let critical = build_critical_packets(plan, sources)?;
+    // The plan's sources carry their identity but not their content hashes
+    // (see `CreationSource`). The encoder's own feed can produce those for
+    // free — it is about to read exactly these bytes — but only when it is the
+    // CPU encoder, only when there are recovery blocks for it to compute, and
+    // only when the pass is single-stripe, because a stripe-major feed does
+    // not deliver a file's bytes in file order. Anything else reads them here.
+    let fuse_source_hashing = plan.recovery_count > 0
+        && matches!(backend, SelectedBackend::Cpu)
+        && super::encode::forward_stripe_count(
+            plan.slice_size,
+            plan.source_slice_count as usize,
+            plan.recovery_count as usize,
+            options
+                .memory_limit
+                .unwrap_or_else(super::plan::default_memory_limit),
+            options.forward_kernel,
+        )? == 1;
+    if !fuse_source_hashing {
+        super::source::hydrate_source_hashes(&mut sources, plan.slice_size, &options.cancellation)?;
+    }
+    let critical = build_critical_packets(plan, &sources)?;
     let creator = encode_creator_packet(plan.recovery_set_id)?;
     let mut staged = StagedOutputs::create(plan, &critical, &creator, &options.cancellation)?;
 
@@ -1586,8 +1667,8 @@ pub(crate) fn write_outputs(
             usize::try_from(plan.slice_size).map_err(|_| Par2Error::ResourceLimitExceeded {
                 reason: "slice size exceeds addressable memory".to_string(),
             })?;
-        let mut provider = DiskSourceProvider::open(sources, slice_size, &options.cancellation)?;
-        {
+        let mut provider = DiskSourceProvider::open(&sources, slice_size, &options.cancellation)?;
+        let fused = {
             let mut sink = RecoveryWriter {
                 outputs: &mut staged,
                 cancellation: &options.cancellation,
@@ -1596,33 +1677,53 @@ pub(crate) fn write_outputs(
             match &mut backend {
                 SelectedBackend::Cpu => {
                     let encoder = ForwardEncoder::new(slice_size, plan.recovery_exponents.clone())?;
-                    encoder.encode_to(
-                        &mut provider,
-                        &ForwardEncoderOptions {
-                            memory_limit: options.memory_limit,
-                            cancel: Some(options.cancellation.clone()),
-                            progress: options.progress.clone(),
-                            kernel: options.forward_kernel,
-                        },
-                        &mut sink,
-                    )?;
+                    let encoder_options = ForwardEncoderOptions {
+                        memory_limit: options.memory_limit,
+                        cancel: Some(options.cancellation.clone()),
+                        progress: options.progress.clone(),
+                        kernel: options.forward_kernel,
+                    };
+                    if fuse_source_hashing {
+                        let mut hasher =
+                            super::source::FusedSourceHasher::new(&sources, plan.slice_size)?;
+                        encoder.encode_to_observed(
+                            &mut provider,
+                            &encoder_options,
+                            &mut sink,
+                            Some(&mut hasher),
+                        )?;
+                        Some(hasher.finish()?)
+                    } else {
+                        encoder.encode_to(&mut provider, &encoder_options, &mut sink)?;
+                        None
+                    }
                 }
                 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-                SelectedBackend::Metal(state) => state.encode(
-                    &mut provider,
-                    &plan.recovery_exponents,
-                    slice_size,
-                    &options.cancellation,
-                    options.progress.clone(),
-                    &mut sink,
-                )?,
+                SelectedBackend::Metal(state) => {
+                    state.encode(
+                        &mut provider,
+                        &plan.recovery_exponents,
+                        slice_size,
+                        &options.cancellation,
+                        options.progress.clone(),
+                        &mut sink,
+                    )?;
+                    None
+                }
             }
-        }
+        };
         provider.verify_unchanged()?;
+        if let Some(fused) = fused {
+            fused.apply(&mut sources)?;
+            // Same packets at the same offsets, now with the hashes the encode
+            // produced; the staged layout never depended on their values.
+            let critical = build_critical_packets(plan, &sources)?;
+            staged.rewrite_critical_packets(&critical, &options.cancellation)?;
+        }
         staged.finish_recovery_headers(slice_size, plan.recovery_set_id, &options.cancellation)?;
     }
 
-    staged.validate(plan, sources, &options.cancellation)?;
+    staged.validate(plan, &sources, &options.cancellation)?;
     let bytes_written = staged.bytes_written()?;
     staged.commit(options.overwrite, &options.cancellation)?;
     Ok(Par2CreateOutcome {
@@ -1699,6 +1800,33 @@ fn encode_creator_packet(set_id: RecoverySetId) -> Result<Vec<u8>> {
     let mut body = CREATOR_ID.to_vec();
     pad_body(&mut body)?;
     encode_packet(TYPE_CREATOR, set_id, &body)
+}
+
+/// Stage one copy of one critical packet and remember where it landed.
+fn append_critical_packet(
+    staged: &mut StagedOutputs,
+    volume_index: usize,
+    critical_index: usize,
+    critical: &[(ExpectedPacket, Vec<u8>)],
+) -> Result<()> {
+    let (expected, packet) = &critical[critical_index];
+    let volume =
+        staged
+            .volumes
+            .get_mut(volume_index)
+            .ok_or_else(|| Par2Error::CreationValidation {
+                path: "critical packet output".to_string(),
+                reason: "critical packet volume index is out of range".to_string(),
+            })?;
+    let offset = volume.file.stream_position().map_err(Par2Error::Io)?;
+    append_packet(volume, expected.clone(), packet)?;
+    staged.critical_offsets.push(CriticalLocation {
+        volume_index,
+        offset,
+        critical_index,
+        len: packet.len(),
+    });
+    Ok(())
 }
 
 fn append_packet(volume: &mut VolumeState, expected: ExpectedPacket, packet: &[u8]) -> Result<()> {
@@ -2975,6 +3103,7 @@ mod tests {
             })
             .collect();
         StagedOutputs {
+            critical_offsets: Vec::new(),
             volumes,
             locations: Vec::new(),
             planned_targets,
