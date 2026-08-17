@@ -44,6 +44,7 @@ type mirrorFixture struct {
 	official         map[string][]byte
 	officialStatus   []int
 	officialRequests int
+	lastUserAgent    string
 
 	root      string
 	cacheDir  string
@@ -109,6 +110,7 @@ func (f *mirrorFixture) serveRead(writer http.ResponseWriter, request *http.Requ
 	key := strings.TrimPrefix(request.URL.Path, "/")
 	f.mu.Lock()
 	f.reads[key]++
+	f.lastUserAgent = request.Header.Get("User-Agent")
 	if queue := f.readStatus[key]; len(queue) > 0 {
 		status := queue[0]
 		f.readStatus[key] = queue[1:]
@@ -192,6 +194,12 @@ func (f *mirrorFixture) queueReadStatus(key string, statuses ...int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readStatus[key] = append(f.readStatus[key], statuses...)
+}
+
+func (f *mirrorFixture) userAgentSeen() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastUserAgent
 }
 
 func (f *mirrorFixture) officialHits() int {
@@ -598,6 +606,36 @@ func TestResolveFallsBackWhenTheMirrorRefusesTheClient(t *testing.T) {
 				t.Fatalf("mirror was read %d times, want exactly one", got)
 			}
 		})
+	}
+}
+
+// The corpus domain's bot defence refuses Go's default user agent, and a
+// refusal reads exactly like an absent object — so the mirror would quietly
+// stop being usable. Reads present a browser user agent, overridable without a
+// release.
+func TestMirrorReadsSendABrowserUserAgent(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	fixture.mirrorObjects(fixture.source, fixture.archive, nil)
+
+	if _, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	sent := fixture.userAgentSeen()
+	if !strings.HasPrefix(sent, "Mozilla/5.0 ") || !strings.Contains(sent, "Chrome/") {
+		t.Fatalf("user agent %q is not the browser default", sent)
+	}
+	if strings.Contains(sent, "Go-http-client") {
+		t.Fatalf("user agent %q still announces the Go client", sent)
+	}
+
+	t.Setenv(userAgentEnv, "corpus-reader/9")
+	override := newMirrorFixture(t)
+	override.mirrorObjects(override.source, override.archive, nil)
+	if _, err := override.mirror.Resolve(context.Background(), override.source, override.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if sent := override.userAgentSeen(); sent != "corpus-reader/9" {
+		t.Fatalf("user agent = %q, want the override", sent)
 	}
 }
 

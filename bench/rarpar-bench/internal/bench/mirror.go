@@ -61,7 +61,29 @@ const (
 	mirrorHTTPTimeout = 10 * time.Minute
 	archiveMediaType  = "application/gzip"
 	jsonMediaType     = "application/json"
+	// defaultUserAgent is what mirror reads present.
+	//
+	// The mirror is served from a domain behind this project's own bot
+	// defence, which refuses Go's default `Go-http-client/…` — and a refusal
+	// is indistinguishable from the object being absent, so the mirror silently
+	// stops being usable. A browser user agent is what that defence admits.
+	//
+	// RARPAR_CORPUS_USER_AGENT overrides it, so the value can follow whatever
+	// the far end accepts without waiting for a release. `xtask test-corpus`
+	// reads the same variable for the curl transport that hydrates the corpus.
+	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+	userAgentEnv = "RARPAR_CORPUS_USER_AGENT"
 )
+
+// userAgent is the override when it is set and not empty, the browser default
+// otherwise.
+func userAgent() string {
+	if value := strings.TrimSpace(os.Getenv(userAgentEnv)); value != "" {
+		return value
+	}
+	return defaultUserAgent
+}
 
 var (
 	// errMirrorAbsent is the one condition that may fall back to the official
@@ -720,6 +742,7 @@ func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, htt
 		if err != nil {
 			return 0, nil, nil, err
 		}
+		request.Header.Set("User-Agent", userAgent())
 		response, err := m.client().Do(request)
 		if err != nil {
 			last = err

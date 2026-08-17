@@ -46,6 +46,8 @@ fn common_args() -> Vec<String> {
         "--proto".into(),
         allowed_protocols(),
         "--tlsv1.2".into(),
+        "--user-agent".into(),
+        user_agent(),
         "--retry".into(),
         "3".into(),
         "--retry-delay".into(),
@@ -53,6 +55,28 @@ fn common_args() -> Vec<String> {
         "--connect-timeout".into(),
         "20".into(),
     ]
+}
+
+/// The user agent every transfer presents.
+///
+/// The corpus domain sits behind this project's own bot defence, which refuses
+/// the default `curl/8.x` — and a refusal is indistinguishable from the object
+/// being absent, so hydration fails for every CI lane and every contributor. A
+/// browser user agent is what that defence admits, so it is what the busiest
+/// reader of the corpus sends.
+///
+/// `RARPAR_CORPUS_USER_AGENT` overrides it, so the value can follow whatever
+/// the far end accepts without waiting for a release.
+pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+/// The user agent for this transfer: the override when it is set and not
+/// empty, the browser default otherwise.
+pub(crate) fn user_agent() -> String {
+    match std::env::var("RARPAR_CORPUS_USER_AGENT") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => DEFAULT_USER_AGENT.to_owned(),
+    }
 }
 
 /// The status of one HTTP transfer as curl saw it.
@@ -494,6 +518,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// Hydration is the busiest reader of the published corpus, and the domain
+    /// serving it refuses curl's default user agent — a refusal that reads as a
+    /// failed download in every CI lane. Every transfer presents a browser user
+    /// agent, and the environment can change it without a release.
+    #[test]
+    fn transfers_present_a_browser_user_agent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("RARPAR_CORPUS_USER_AGENT") };
+        let args = common_args().join(" ");
+        assert!(args.contains("--user-agent Mozilla/5.0 "), "{args}");
+        assert!(args.contains("Chrome/"), "{args}");
+        assert!(!args.contains("curl/"), "{args}");
+
+        unsafe { std::env::set_var("RARPAR_CORPUS_USER_AGENT", "corpus-reader/9") };
+        assert!(
+            common_args()
+                .join(" ")
+                .contains("--user-agent corpus-reader/9")
+        );
+        // An empty override is not an override: a blank value would otherwise
+        // send no user agent at all, which is what the default exists to avoid.
+        unsafe { std::env::set_var("RARPAR_CORPUS_USER_AGENT", "   ") };
+        assert_eq!(user_agent(), DEFAULT_USER_AGENT);
+        unsafe { std::env::remove_var("RARPAR_CORPUS_USER_AGENT") };
+    }
+
     #[test]
     fn put_arguments_are_conditional_sigv4_and_carry_no_secret() {
         // put_args reads the protocol override; hold the env lock so a
@@ -511,8 +561,13 @@ pub(crate) mod tests {
         assert!(joined.contains("--config -"), "credentials come from stdin");
         assert!(joined.contains("--proto =https"));
         assert!(!joined.contains("--fail"), "412 must be observable");
+        // Matched per argument, not as a substring of the whole line: the
+        // credential flag is `--user`, and `--user-agent` is a different flag
+        // that happens to start with it.
         assert!(
-            !joined.contains("--user"),
+            !args
+                .iter()
+                .any(|arg| arg == "--user" || arg.starts_with("--user=")),
             "no credential on the command line"
         );
         assert!(joined.ends_with("-- https://acct.r2.cloudflarestorage.com/bucket/key"));
