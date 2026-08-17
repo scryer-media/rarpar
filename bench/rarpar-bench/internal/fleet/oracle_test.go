@@ -48,12 +48,21 @@ func TestExtractTarTreeRefusesEscapingEntries(t *testing.T) {
 			t.Fatalf("%q escaped the destination", evil)
 		}
 	}
-	// A benign tarball still extracts, and containment is judged on the
-	// resolved path rather than a name prefix.
-	if _, err := containedPath(root, "..hidden/file"); err != nil {
-		t.Fatalf("a name that merely starts with dots was refused: %v", err)
+	// Any `..` in the raw name is refused before resolution — even spellings
+	// that would resolve harmlessly. The pinned toolchain tarballs this
+	// extracts never carry dotdot in a well-formed name, so the blunt refusal
+	// costs nothing real and is checkable at a glance; the trade is deliberate
+	// (an in-tree `a/b/../c.txt` is refused too, not resolved).
+	for _, name := range []string{"..hidden/file", "a/b/../c.txt", "a/..", ".."} {
+		if _, err := containedPath(root, name); err == nil {
+			t.Fatalf("%q was accepted despite containing dotdot", name)
+		}
 	}
-	if got, err := containedPath(root, "a/b/../c.txt"); err != nil || got != filepath.Join(root, "a", "c.txt") {
-		t.Fatalf("clean in-tree traversal: %q, %v", got, err)
+	// Ordinary nested names still resolve where they should.
+	if got, err := containedPath(root, "a/b/c.txt"); err != nil || got != filepath.Join(root, "a", "b", "c.txt") {
+		t.Fatalf("plain nested name: %q, %v", got, err)
+	}
+	if got, err := containedPath(root, "./a/.hidden"); err != nil || got != filepath.Join(root, "a", ".hidden") {
+		t.Fatalf("dot-prefixed segments that are not dotdot: %q, %v", got, err)
 	}
 }

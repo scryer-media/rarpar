@@ -4,9 +4,10 @@ The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
 `crates/par2-rs/tests/fixtures/` are the **test corpus**: 375 archives, parity
 sets, SFX modules, video inputs and originals that the unit, integration, slow,
 PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
-content-addressed object set on Cloudflare R2 and hydrated by `xtask`; Git LFS
-is the legacy transport and is removed once a published corpus is pinned (see
-[Migration](#migration)).
+content-addressed object set on Cloudflare R2 and hydrated by `xtask`. The
+repository carries no fixture bytes: the published, signed revision the lock
+pins is the only source, and Git LFS — the bridge transport while nothing had
+been published — is gone (see [Migration](#migration) for the record).
 
 The corpus is **generated, never carried forward**. Every fixture is either
 written by a checked-in recipe running on the shared pinned toolchain, or
@@ -211,8 +212,10 @@ per file, overlapping profiles cost nothing extra to store or publish.
 }
 ```
 
-An empty `manifest.blake3` means no corpus has been published yet; `fetch`
-refuses to run and CI keeps hydrating from LFS until the lock is populated.
+An empty `manifest.blake3` means no corpus revision is pinned; `fetch` and
+`hydrate` refuse to run — there is deliberately no other source of fixture
+bytes. (Produce a tree locally with `test-corpus generate` if you are working
+on the recipes themselves.)
 
 ## The published objects
 
@@ -303,9 +306,8 @@ cargo run --locked -p xtask -- test-corpus paths --all
 # evidence is recorded against — and are the one digest here that is not BLAKE3:
 cargo run --locked -p xtask -- test-corpus bench-pins [--out FILE]
 
-# What CI and developers run before Cargo: fetch from the pinned corpus, or —
-# while the lock pins nothing — a verified `git lfs pull` of the same profiles.
-# Fails when anything is missing, still a pointer, or has the wrong digest.
+# What CI and developers run before Cargo: fetch from the pinned, signed
+# corpus. Fails when anything is missing or has the wrong digest.
 cargo run --locked -p xtask -- test-corpus hydrate --profile rar34 --profile rar57
 cargo run --locked -p xtask -- test-corpus hydrate --profile unit
 
@@ -469,23 +471,26 @@ generates, verifies, validates, builds and signs without uploading.
 
 ## Migration
 
-1. Land the tooling with an empty lock. Every CI lane already hydrates through
-   `test-corpus hydrate --profile …`, which — with nothing pinned — pulls the
-   same profiles through Git LFS and verifies them against the ledger.
-2. An operator dispatches the publish workflow from `main`. It **generates** the
-   first corpus revision from the recipes and the pinned upstreams, validates it
-   with the suites, publishes it, and prints the lock entry alongside the
-   refreshed ledger and the moved benchmark pins.
-3. A reviewed PR pins that manifest in `lock.json` **and** commits the
-   `test-corpus/sources.json` and `bench/rarpar-bench/config/corpus.json`
-   `fixture_sha256` values from that run — the three move together, because the
-   published bytes are the ones the ledger and the benchmark pins describe. From
-   that commit on, `hydrate` fetches from R2 instead of LFS, in every lane, with
-   no other CI change; the PR must pass from a clean checkout **without Git
-   LFS**.
-4. Only after that PR is merged are the LFS pointers, `.gitattributes` rules
-   and LFS hooks removed, in a follow-up that also proves a fresh clone without
-   `git-lfs` can hydrate and validate every profile.
+Complete, in the order the plan required. The record, because the constraints
+only make sense against it:
+
+1. The tooling landed with an empty lock; every CI lane hydrated through
+   `test-corpus hydrate --profile …`, which pulled the same profiles through
+   Git LFS — the bridge transport — and verified them against the ledger.
+2. An operator dispatched the publish workflow from `main`
+   ([run 32049608340](https://github.com/scryer-media/rarpar/actions/runs/32049608340)):
+   it generated the first corpus revision from the recipes and the pinned
+   upstreams, validated it with the suites, and published manifest
+   `26eb35b9…` — 375 objects, signed on `refs/heads/main`.
+3. A reviewed PR pinned that manifest in `lock.json` and committed the
+   refreshed `sources.json` and the moved benchmark `fixture_sha256` values
+   together, after the whole chain — hydration, recomputed manifest,
+   signature — was verified from a cold client. From that commit `hydrate`
+   fetched from R2 in every lane.
+4. The LFS pointers, the `.gitattributes` rules and the LFS fallback in
+   `hydrate` were then removed. The repository carries no fixture bytes; the
+   hygiene lane refuses any attributes file that reintroduces an `lfs`
+   filter and any pointer blob committed where fixture bytes belong.
 
 ## Regenerating fixtures
 

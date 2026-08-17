@@ -369,12 +369,31 @@ func containedPath(destination, entryName string) (string, error) {
 	if strings.ContainsRune(entryName, 0) {
 		return "", fmt.Errorf("unsafe path %q: contains NUL", entryName)
 	}
+	// `..` anywhere in the raw name is refused outright, before any
+	// resolution. The archives this extracts are the pinned toolchain
+	// tarballs, whose well-formed entry names never contain dotdot in any
+	// segment — so a name that does is a corrupt or hostile archive, not a
+	// naming style to accommodate, and a refusal the reader can verify at a
+	// glance beats a containment proof they have to trace. The resolved-path
+	// checks below stay as the second and third proofs.
+	if strings.Contains(entryName, "..") {
+		return "", fmt.Errorf("unsafe path %q: contains '..'", entryName)
+	}
 	clean := filepath.Clean(filepath.FromSlash(entryName))
 	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" {
 		return "", fmt.Errorf("unsafe path %q: absolute", entryName)
 	}
-	target := filepath.Join(destination, clean)
-	relative, err := filepath.Rel(destination, target)
+	root := filepath.Clean(destination)
+	target := filepath.Join(root, clean)
+	// Containment is checked on the resolved path itself: after Clean and
+	// Join it must be the extraction directory or sit strictly under it.
+	// The Rel check below proves the same thing a second way; two proofs of
+	// containment cost nothing, and this one is the shape a reader (or a
+	// static analyser) can confirm without modelling filepath.Rel.
+	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe path %q: escapes the extraction directory", entryName)
+	}
+	relative, err := filepath.Rel(root, target)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("unsafe path %q: escapes the extraction directory", entryName)
 	}

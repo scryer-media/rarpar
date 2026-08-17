@@ -10,12 +10,16 @@ name: ClusterFuzzLite batch fuzzing
 # breakage sat undetected for six days at a time, which is how the last one was
 # found.
 #
-# Two sanitizers, because they answer different questions: ASan finds the
-# memory error, UBSan finds the arithmetic that would have caused one on a
-# different target — integer overflow in a length computation, a bad shift, an
-# unaligned reference. Rust catches many of these in debug, but these crates
-# run release with overflow checks off, which is exactly where UBSan earns its
-# place.
+# One sanitizer, deliberately. Both fuzzed crates are pure Rust — no build.rs,
+# no C, no assembly, RustCrypto and blake2s_simd all the way down — and Rust
+# has no -Zsanitizer=undefined, so a UBSan lane would instrument nothing while
+# looking like coverage (its first run proved it: cargo-fuzz builds ASan
+# regardless of the job's sanitizer, and the bad-build check rejected every
+# target as "compiled with ASan"). The arithmetic class UBSan would have
+# covered is caught the Rust way instead: the fuzzers build with debug
+# assertions and overflow checks enabled in the optimized build
+# (`cargo fuzz build -O -a`), so an overflowing length computation panics
+# rather than wrapping.
 
 on:
   schedule:
@@ -25,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       fuzz-seconds:
-        description: 'Total fuzzing budget per sanitizer, in seconds'
+        description: 'Total fuzzing budget, in seconds'
         required: false
         default: '7200'
         type: string
@@ -35,19 +39,12 @@ permissions:
 
 jobs:
   batch-fuzzing:
-    name: batch (${{ matrix.sanitizer }})
+    name: batch (address)
     runs-on: ubuntu-24.04
     # The two-hour budget is fuzzing time only: the sanitizer build of five
     # targets comes first, and a job killed at its timeout discards the corpus
     # it just grew. An hour of headroom is cheap insurance for that.
     timeout-minutes: 180
-    strategy:
-      # One sanitizer finding must not cancel the other's run: they cover
-      # different faults and a UBSan report is not made redundant by an ASan
-      # crash.
-      fail-fast: false
-      matrix:
-        sanitizer: [address, undefined]
     permissions:
       contents: read
       # `output-sarif` publishes findings to the Security tab rather than
@@ -56,7 +53,7 @@ jobs:
       # manual dispatch), so the write is never handed to a fork's token.
       security-events: write
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.sanitizer }}
+      group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - name: Checkout code
@@ -69,7 +66,6 @@ jobs:
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           language: rust
-          sanitizer: ${{ matrix.sanitizer }}
 
       - name: Run fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -77,7 +73,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: ${{ inputs.fuzz-seconds || 7200 }}
           mode: batch
-          sanitizer: ${{ matrix.sanitizer }}
+          sanitizer: address
           output-sarif: true
 
   # What the corpus is actually reaching. Without this the fuzzing budget is

@@ -78,9 +78,9 @@ Usage:
       Hydrate the named profiles from the locked manifest into the tree,
       verifying every object digest. Fails before Cargo when anything is missing.
   cargo run -p xtask -- test-corpus hydrate --profile NAME [--profile NAME]... [--parallel N]
-      What CI runs before Cargo: `fetch` when test-corpus/lock.json pins a
-      published manifest, otherwise a verified `git lfs pull` of the same
-      profiles. Either way every fixture is digest-checked and a shortfall fails.
+      What CI runs before Cargo: `fetch` of the named profiles from the
+      published manifest test-corpus/lock.json pins. Every fixture is
+      digest-checked and a shortfall fails before any test.
   cargo run -p xtask -- test-corpus sign --dir DIR
       Sign DIR/manifest.json and DIR/provenance.json keyless with cosign under
       the ambient OIDC identity (publish workflow only).
@@ -121,110 +121,25 @@ fn hydrate(root: &Path, args: Vec<OsString>) -> Result<()> {
         return fail("hydrate requires at least one --profile");
     }
     let lock = Lock::load(&repo_path(root, LOCK_FILE))?;
-    if !lock.is_unpublished() {
-        let mut forwarded: Vec<OsString> = Vec::new();
-        for profile in &profiles {
-            forwarded.push("--profile".into());
-            forwarded.push(profile.into());
-        }
-        forwarded.push("--parallel".into());
-        forwarded.push(parallel.to_string().into());
-        return fetch(root, forwarded);
-    }
-
-    // Legacy transport: Git LFS, with the profile globs as the include set (the
-    // profile vocabulary is the `git lfs pull --include` vocabulary).
-    let inputs = load_inputs(root)?;
-    let pulls = lfs_pull_plan(&inputs.profiles, &profiles)?;
-    let resolved = inputs.profiles.resolve(&inputs.ledger.paths())?;
-    let mut wanted: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
-    for name in &profiles {
-        wanted.extend(&resolved[name]);
-    }
-    println!(
-        "test-corpus hydrate: no published manifest pinned; pulling profiles [{}] ({} files) through Git LFS",
-        profiles.join(", "),
-        wanted.len()
-    );
-    let git = |args: &[&str]| -> Result<()> {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .map_err(|source| super::error(format!("run git {}: {source}", args.join(" "))))?;
-        if !status.success() {
-            return fail(format!("git {} failed ({status})", args.join(" ")));
-        }
-        Ok(())
-    };
-    git(&["lfs", "install", "--local"])?;
-    for (include_arg, exclude_arg) in &pulls {
-        git(&["lfs", "pull", include_arg, exclude_arg])?;
-    }
-
-    // Verify against the ledger, not against a pointer prefix: every wanted
-    // file present, real bytes, right digest.
-    let wanted_count = wanted.len();
-    let mut failures = Vec::new();
-    for path in wanted {
-        let Some(entry) = inputs.ledger.files.iter().find(|entry| &entry.path == path) else {
-            failures.push(format!(
-                "{path}: resolved by a profile but has no ledger entry"
-            ));
-            continue;
-        };
-        let file = repo_path(root, path);
-        match digest_file(&file) {
-            Err(err) => failures.push(format!("{path}: {err}")),
-            Ok(digest) if digest.lfs_pointer => {
-                failures.push(format!("{path}: still a Git LFS pointer after pull"))
-            }
-            Ok(digest) if digest.blake3 != entry.blake3 || digest.size != entry.size => failures
-                .push(format!(
-                    "{path}: hydrated bytes hash to {} ({} bytes), ledger says {} ({} bytes)",
-                    digest.blake3, digest.size, entry.blake3, entry.size
-                )),
-            Ok(_) => {}
-        }
-    }
-    if !failures.is_empty() {
-        failures.sort();
-        return fail(format!(
-            "test-corpus hydrate: {} fixture(s) not hydrated\n  {}",
-            failures.len(),
-            failures.join("\n  ")
-        ));
-    }
-    println!(
-        "test-corpus hydrate: {wanted_count} fixture(s) present and verified against the ledger"
-    );
-    Ok(())
-}
-
-/// The `git lfs pull` argument pairs the named profiles need: one
-/// `(--include, --exclude)` pull per profile, never one pull over merged
-/// patterns. An exclude belongs to the profile that declares it, so merging
-/// would let `rar34`'s exclusions cancel `rar12`'s includes whenever both are
-/// asked for on one command line — and the ledger check afterwards would then
-/// fail on files the caller legitimately asked for.
-fn lfs_pull_plan(profiles: &ProfilesFile, names: &[String]) -> Result<Vec<(String, String)>> {
-    let mut pulls: Vec<(String, String)> = Vec::new();
-    for name in names {
-        let profile = profiles.profiles.get(name).ok_or_else(|| {
-            super::error(format!(
-                "profile {name:?} is not defined in {PROFILES_FILE}"
-            ))
-        })?;
-        let pull = (
-            format!("--include={}", profile.include.join(",")),
-            format!("--exclude={}", profile.exclude.join(",")),
+    if lock.is_unpublished() {
+        // There is deliberately no fallback here. Git LFS was the bridge
+        // transport while no corpus had been published; it is gone, and the
+        // corpus hydrates only from a published, signed revision the lock
+        // pins. An empty lock is a broken repository state, not a mode.
+        return fail(
+            "test-corpus/lock.json pins no published manifest, so there is nothing to hydrate \
+             from: the corpus exists only as its published, signed revisions. Pin one through \
+             a reviewed PR, or produce a tree locally with `test-corpus generate`.",
         );
-        if !pulls.contains(&pull) {
-            pulls.push(pull);
-        }
     }
-    Ok(pulls)
+    let mut forwarded: Vec<OsString> = Vec::new();
+    for profile in &profiles {
+        forwarded.push("--profile".into());
+        forwarded.push(profile.into());
+    }
+    forwarded.push("--parallel".into());
+    forwarded.push(parallel.to_string().into());
+    fetch(root, forwarded)
 }
 
 // ----------------------------------------------------------------- sign ----
@@ -1208,44 +1123,6 @@ mod tests {
     /// The LFS fallback pulls each profile on its own terms. Merging the
     /// patterns would drop `rar12`'s archives whenever `rar34` — which excludes
     /// exactly those paths from the shared `rar4/` directory — is asked for in
-    /// the same command.
-    #[test]
-    fn the_lfs_pull_plan_keeps_each_profiles_excludes_to_itself() {
-        let profiles: ProfilesFile = serde_json::from_str(
-            r#"{"schema_version":1,"profiles":{
-                "rar12":{"include":["f/rar4/rar15_lz.rar","f/originals/**"]},
-                "rar34":{"include":["f/rar4/**","f/originals/**"],"exclude":["f/rar4/rar15_lz.rar"]},
-                "rar57":{"include":["f/rar5/**"]}
-            }}"#,
-        )
-        .unwrap();
-        let plan = lfs_pull_plan(
-            &profiles,
-            &["rar12".to_owned(), "rar34".to_owned(), "rar12".to_owned()],
-        )
-        .unwrap();
-        assert_eq!(
-            plan,
-            vec![
-                (
-                    "--include=f/rar4/rar15_lz.rar,f/originals/**".to_owned(),
-                    "--exclude=".to_owned()
-                ),
-                (
-                    "--include=f/rar4/**,f/originals/**".to_owned(),
-                    "--exclude=f/rar4/rar15_lz.rar".to_owned()
-                ),
-            ],
-            "one pull per distinct profile, excludes never merged"
-        );
-        let plan = lfs_pull_plan(&profiles, &["rar57".to_owned()]).unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(
-            plan[0].1, "--exclude=",
-            "an empty exclude is a no-op filter"
-        );
-        assert!(lfs_pull_plan(&profiles, &["nope".to_owned()]).is_err());
-    }
 
     #[test]
     fn fetch_hydrates_verifies_dedupes_and_fails_closed() {

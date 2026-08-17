@@ -1,21 +1,21 @@
 {
   "schema_version": 1,
-  "base_url": "",
+  "base_url": "https://rarpar.cdn.scryer-media.dev",
   "manifest": {
-    "blake3": "",
-    "url": ""
+    "blake3": "26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89",
+    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.json"
   },
   "signature": {
-    "bundle_url": "",
+    "bundle_url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.json.sigstore.json",
     "certificate_identity": "https://github.com/scryer-media/rarpar/.github/workflows/test-corpus-publish.yml@refs/heads/main",
     "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
   },
   "provenance": {
-    "blake3": "",
-    "url": ""
+    "blake3": "edbd18c0a7e48ad2d893ed0e90b5e33fe4b81decb5143eecc0f79903d5f7d60c",
+    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.provenance.json"
   },
   "published_from": {
-    "commit": "",
-    "run": ""
+    "commit": "6b66f3cb016e68bc028c58534d7a3425f94a72be",
+    "run": "https://github.com/scryer-media/rarpar/actions/runs/32049608340"
   }
 }
