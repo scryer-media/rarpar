@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 )
 
-// generateRecoveryVolumes writes the two standalone `.rev` recovery-volume sets
-// driven by tests/integration.rs, src/recovery.rs and the CLI's repair lane.
+// generateRecoveryVolumes writes the three standalone `.rev` recovery-volume
+// sets driven by tests/integration.rs, src/recovery.rs and the CLI's repair lane.
 //
-// Both are `rar a … -rv2`, which writes the data volumes and two recovery
+// All are `rar a … -rv2`, which writes the data volumes and two recovery
 // volumes in one pass — RARLAB's writer produces the `.rev` files, exactly as it
 // produces the `.rar` ones. The `.rev` format follows the *archive* format,
 // which is what makes the RAR4 set the interesting one:
@@ -23,14 +23,26 @@ import (
 //     volume names carry no _<data>_<rec>_<pos> suffix. 6.24 rather than the
 //     3.93/4.20 images because it writes the same format and is the RAR4 writer
 //     the rest of the corpus already uses.
+//
 //   - rar5_recovery_volumes comes from rarlab-7.20, so the .rev files carry the
 //     RAR5 `Rar!\x1aRev` signature and a proper header.
+//
+//   - rar3_recovery_volumes_large is the same RAR4-format shape at a size that
+//     matters: 1 MiB volumes, so one reconstruction pass decodes about a
+//     million byte columns and the RS decode runs at real depth through
+//     rayon's split recursion, with the coder reused across a split's columns.
+//     The 1 KiB set cannot reach that path; it decodes 1024 columns and is
+//     done. This is the shape whose restore aborted an embedder with a stack
+//     overflow under fat LTO before unrar-rs 0.5.3, and the size at which the
+//     0.5.1 build still reproduces it — 512 KiB volumes do too, so 1 MiB is
+//     comfortably past the threshold rather than on it.
 //
 // rar names recovery volumes from the first archive name onwards, so two of them
 // are .part1.rev and .part2.rev (.part01/.part02 for the ten-volume RAR5 set).
 //
-// The payloads are the exact arithmetic ramps the sets they replace hold,
-// verified byte for byte against them.
+// The small payloads are the exact arithmetic ramps the sets they replace hold,
+// verified byte for byte against them; the large one is another ramp with its
+// own step and offset so no two sets share bytes.
 func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	work, cleanup, err := workDir("rev")
 	if err != nil {
@@ -38,8 +50,9 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	}
 	defer cleanup()
 	rar4Work := filepath.Join(work, "rar4")
+	rar4LargeWork := filepath.Join(work, "rar4-large")
 	rar5Work := filepath.Join(work, "rar5")
-	for _, dir := range []string{rar4Work, rar5Work} {
+	for _, dir := range []string{rar4Work, rar4LargeWork, rar5Work} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -59,8 +72,18 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		return err
 	}
 
+	// RAR4 large set: 3.5 MiB of (i * 29 + 7) mod 256, in 1 MiB volumes — four
+	// data volumes (the last one half full) and two recovery volumes.
+	if err := writeFile(filepath.Join(rar4LargeWork, "payload.bin"), ramp(7*512*1024, 29, 7)); err != nil {
+		return err
+	}
+
 	if err := e.rar(e.rar4.Image, work, "rar4").add(ctx,
 		"-ma4", "-m0", "-v1k", "-rv2", "rar3_recovery_volumes.rar", "payload.bin"); err != nil {
+		return err
+	}
+	if err := e.rar(e.rar4.Image, work, "rar4-large").add(ctx,
+		"-ma4", "-m0", "-v1m", "-rv2", "rar3_recovery_volumes_large.rar", "payload.bin"); err != nil {
 		return err
 	}
 	if err := e.rar(e.rar5.Image, work, "rar5").add(ctx,
@@ -74,6 +97,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	}{
 		{rar4Work, "rar3_recovery_volumes.part", ".rar", 5},
 		{rar4Work, "rar3_recovery_volumes.part", ".rev", 2},
+		{rar4LargeWork, "rar3_recovery_volumes_large.part", ".rar", 4},
+		{rar4LargeWork, "rar3_recovery_volumes_large.part", ".rev", 2},
 		{rar5Work, "rar5_recovery_volumes.part", ".rar", 10},
 		{rar5Work, "rar5_recovery_volumes.part", ".rev", 2},
 	} {
@@ -90,12 +115,17 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	if err := removeGlob(
 		filepath.Join(rar4Dir, "rar3_recovery_volumes.part*.rar"),
 		filepath.Join(rar4Dir, "rar3_recovery_volumes.part*.rev"),
+		filepath.Join(rar4Dir, "rar3_recovery_volumes_large.part*.rar"),
+		filepath.Join(rar4Dir, "rar3_recovery_volumes_large.part*.rev"),
 		filepath.Join(rar5Dir, "rar5_recovery_volumes.part*.rar"),
 		filepath.Join(rar5Dir, "rar5_recovery_volumes.part*.rev"),
 	); err != nil {
 		return err
 	}
 	if _, err := collect(rar4Work, rar4Dir, "rar3_recovery_volumes."); err != nil {
+		return err
+	}
+	if _, err := collect(rar4LargeWork, rar4Dir, "rar3_recovery_volumes_large."); err != nil {
 		return err
 	}
 	_, err = collect(rar5Work, rar5Dir, "rar5_recovery_volumes.")

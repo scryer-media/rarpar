@@ -1007,26 +1007,24 @@ fn reconstruct_rar3(
             break;
         }
 
+        // One coder per rayon split, boxed and reused across that split's
+        // columns: the erasure pattern is the same for every column, which is
+        // exactly the case the coder's cached locator polynomial exists for,
+        // and building the GF tables once per split instead of once per byte
+        // position is most of the work here.
         let restored_columns = (0..max_read)
             .into_par_iter()
-            .map(|pos| {
-                let mut column = (0..total_count)
-                    .map(|idx| buffers[idx][pos])
-                    .collect::<Vec<_>>();
-                let mut coder =
-                    Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR3 recovery set has invalid recovery count".into(),
-                    })?;
-                if !coder.decode(&mut column, &erasures) {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR3 recovery decoder failed".into(),
-                    });
-                }
-                Ok(missing_volume_numbers
-                    .iter()
-                    .map(|&idx| column[idx])
-                    .collect::<Vec<_>>())
-            })
+            .map_init(
+                || Rar3RsCoder::new(rec_count).map(Box::new),
+                |coder, pos| {
+                    let coder = coder
+                        .as_deref_mut()
+                        .ok_or_else(|| RarError::CorruptArchive {
+                            detail: "RAR3 recovery set has invalid recovery count".into(),
+                        })?;
+                    decode_rar3_column(coder, &buffers, pos, &erasures, missing_volume_numbers)
+                },
+            )
             .collect::<RarResult<Vec<_>>>()?;
 
         for (pos, recovered) in restored_columns.iter().enumerate() {
@@ -1047,6 +1045,35 @@ fn reconstruct_rar3(
         finalize_rar3_restored_output(output, new_style, is_last_data_volume)?;
     }
     Ok(())
+}
+
+/// Reconstruct the missing bytes at one column position across the set.
+///
+/// Deliberately a function of its own and never inlined. Rayon's
+/// `bridge_producer_consumer::helper` recurses once per split and inlines the
+/// consumer's map closure into every level; under fat LTO that placed the
+/// coder's GF tables and the decoder's scratch polynomials — some 35 KiB —
+/// in each recursive frame, and a 2 MiB worker overflowed on a set of four
+/// 22 MiB volumes. Keeping the decode in a leaf frame bounds what the
+/// recursion carries to a few pointers, whatever the optimizer decides.
+#[inline(never)]
+fn decode_rar3_column(
+    coder: &mut Rar3RsCoder,
+    buffers: &[Vec<u8>],
+    pos: usize,
+    erasures: &[usize],
+    missing_volume_numbers: &[usize],
+) -> RarResult<Vec<u8>> {
+    let mut column = buffers.iter().map(|buffer| buffer[pos]).collect::<Vec<_>>();
+    if !coder.decode(&mut column, erasures) {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR3 recovery decoder failed".into(),
+        });
+    }
+    Ok(missing_volume_numbers
+        .iter()
+        .map(|&idx| column[idx])
+        .collect::<Vec<_>>())
 }
 
 fn finalize_rar3_restored_output(
