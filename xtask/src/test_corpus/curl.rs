@@ -355,8 +355,21 @@ pub(crate) mod tests {
     pub(crate) struct FakeServer {
         pub(crate) base_url: String,
         pub(crate) requests: Arc<Mutex<Vec<SeenRequest>>>,
+        /// When set, every GET on a *bare* URL is answered "absent", whatever
+        /// the store holds — a CDN that cached the miss before the object
+        /// existed, which is what a publication reading its own writes has to
+        /// survive. A request carrying a query string still reaches the store.
+        absent_on_bare_url: Arc<Mutex<bool>>,
         handle: Option<std::thread::JoinHandle<()>>,
         stop: Arc<Mutex<bool>>,
+    }
+
+    impl FakeServer {
+        /// Simulate an edge that already answered "absent" for every key,
+        /// before this run stored anything.
+        pub(crate) fn cache_every_absence(&self) {
+            *self.absent_on_bare_url.lock().unwrap() = true;
+        }
     }
 
     impl FakeServer {
@@ -376,6 +389,9 @@ pub(crate) mod tests {
         fn start_with_store(routes: Vec<Route>, write_prefix: Option<String>) -> FakeServer {
             let store: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>> =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
+            // See FakeServer::cache_every_absence.
+            let absent_on_bare_url = Arc::new(Mutex::new(false));
+            let absent_flag = absent_on_bare_url.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -440,6 +456,7 @@ pub(crate) mod tests {
                     // Read-backs carry a cache-busting query, so a server that
                     // matched the whole target would miss its own objects.
                     let target = parts.next().unwrap_or("");
+                    let had_query = target.contains('?');
                     let path = target
                         .split_once('?')
                         .map_or(target, |(path, _)| path)
@@ -463,9 +480,20 @@ pub(crate) mod tests {
                             (status, reply)
                         }
                         (Some(_), None) if method == "GET" => {
-                            match store.lock().unwrap().get(&path) {
-                                Some(stored) => (200, stored.clone()),
-                                None => (404, b"not found".to_vec()),
+                            // A CDN in front of the bucket: a path that has
+                            // once been answered "absent" keeps being answered
+                            // that way on its bare URL, however long ago the
+                            // object was actually stored. A request carrying a
+                            // query string is a different cache key and
+                            // reaches the bucket. This is what a publication
+                            // reading its own writes has to survive.
+                            if !had_query && *absent_flag.lock().unwrap() {
+                                (404, b"not found (cached absence)".to_vec())
+                            } else {
+                                match store.lock().unwrap().get(&path) {
+                                    Some(stored) => (200, stored.clone()),
+                                    None => (404, b"not found".to_vec()),
+                                }
                             }
                         }
                         (_, Some(found)) => found,
@@ -491,6 +519,7 @@ pub(crate) mod tests {
             FakeServer {
                 base_url: format!("http://127.0.0.1:{port}"),
                 requests,
+                absent_on_bare_url,
                 handle: Some(handle),
                 stop,
             }

@@ -895,7 +895,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     let provenance_key = format!("{MANIFESTS_PREFIX}{manifest_blake3}.provenance.json");
     let lock = match publisher.already_published(&manifest_key, &manifest_bytes)? {
         Some(()) => {
-            let existing = curl::get_to_vec(&publisher.public_url(&provenance_key))?;
+            let existing = curl::get_to_vec(&publisher.fresh_public_url(&provenance_key))?;
             let existing_provenance: Provenance =
                 serde_json::from_slice(&existing).map_err(|err| {
                     super::error(format!("published provenance is unreadable: {err}"))
@@ -910,7 +910,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 format!("{manifest_key}.sigstore.json"),
                 format!("{provenance_key}.sigstore.json"),
             ] {
-                curl::get_to_vec(&publisher.public_url(&bundle)).map_err(|err| {
+                curl::get_to_vec(&publisher.fresh_public_url(&bundle)).map_err(|err| {
                     super::error(format!("published bundle {bundle} is missing: {err}"))
                 })?;
             }
@@ -1060,7 +1060,7 @@ impl Publisher {
             std::process::id(),
             blake3_bytes(key.as_bytes())
         ));
-        match curl::get_to_file(&self.public_url(key), &temp) {
+        match curl::get_to_file(&self.fresh_public_url(key), &temp) {
             Err(_) => Ok(None),
             Ok(()) => {
                 let existing = fs::read(&temp)?;
@@ -1096,7 +1096,7 @@ impl Publisher {
             412 => {}
             status => return fail(format!("PUT {key}: HTTP {status}")),
         }
-        let stored = curl::get_to_vec(&self.public_url(key))?;
+        let stored = curl::get_to_vec(&self.fresh_public_url(key))?;
         if stored != bytes {
             return fail(format!(
                 "read-back of {key} differs from the bytes being published; failing closed"
@@ -1497,6 +1497,13 @@ mod tests {
             ),
         ];
         let server = FakeServer::start_stateful(routes, "/bucket");
+        // The edge already answered "absent" for every key before this run
+        // stored anything — a probe, an earlier attempt, a consumer that was
+        // too early. A publication reads its own writes, so every read it
+        // makes has to reach the bucket rather than that cached miss. This is
+        // the failure a real publish hit: the object was stored, and the bare
+        // URL kept serving 404 (`cf-cache-status: HIT`) for hours.
+        server.cache_every_absence();
         unsafe {
             std::env::set_var(CURL_PROTO_ENV, "=http,https");
             std::env::set_var("R2_CORPUS_ACCESS_KEY_ID", "AKIDTEST");
