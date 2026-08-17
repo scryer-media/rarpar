@@ -233,6 +233,66 @@ fn effective_member_dict_size(file_header: &FileHeader) -> u64 {
     }
 }
 
+/// A write ceiling for payloads whose size is bounded by something other than
+/// the archive's own limits — today, RAR3 Unix link targets.
+///
+/// Every RAR3 decode route stops at the member's declared unpacked size except
+/// one: a VM-filtered block is handed to the writer in full, deliberately, so
+/// that this crate matches the oracle's `UnpWrite` of `FilteredDataSize`
+/// (unpack30.cpp:597-599) even when that carries the member past its declared
+/// size. For an ordinary member that overshoot is bounded by the archive's
+/// limits and is the behaviour callers want. For a link target — capped at
+/// MAXPATHSIZE, three orders of magnitude below those limits — it is a way to
+/// spend memory and time on a payload that was never admissible, so the link
+/// path caps the writer and fails the moment the cap is passed.
+///
+/// This wrapper exists so the cap costs nothing anywhere else: ordinary
+/// extraction hands the decoder the same writer it always did, and no
+/// per-write branch is added to `ExtractedMemberSink`. Only the link path pays
+/// one comparison per write call, and its writes are chunk-sized.
+pub(crate) struct BoundedWriter<'a, W: Write> {
+    inner: &'a mut W,
+    written: u64,
+    ceiling: u64,
+    member: &'a str,
+}
+
+impl<'a, W: Write> BoundedWriter<'a, W> {
+    pub(crate) fn new(inner: &'a mut W, ceiling: u64, member: &'a str) -> Self {
+        Self {
+            inner,
+            written: 0,
+            ceiling,
+            member,
+        }
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Refused whole, not truncated: a short write would let the decoder
+        // continue against a silently clipped stream. The error names the
+        // member and the ceiling, never any payload byte.
+        let projected = self.written.saturating_add(buf.len() as u64);
+        if projected > self.ceiling {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "member {} produced more than {} bytes of link target payload",
+                    self.member, self.ceiling
+                ),
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub enum ExtractedMember {
     InMemory(Vec<u8>),
     TempFile { file: NamedTempFile, len: usize },
@@ -767,6 +827,42 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
 mod tests {
     use super::*;
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
+
+    /// The link-only ceiling stops a stream that runs past its bound, and
+    /// stops it *at* the bound: the overflowing write is refused whole rather
+    /// than truncated, so a decoder cannot carry on against a silently
+    /// clipped stream. Writes up to the ceiling reach the inner writer
+    /// untouched.
+    #[test]
+    fn bounded_writer_stops_a_stream_that_exceeds_its_ceiling() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut bounded = BoundedWriter::new(&mut sink, 8, "link");
+
+        assert_eq!(bounded.write(b"12345").unwrap(), 5);
+        assert_eq!(bounded.write(b"678").unwrap(), 3);
+        let err = bounded.write(b"9").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(
+            message.contains("link") && message.contains('8'),
+            "the error names the member and the ceiling: {message}"
+        );
+        // Nothing past the ceiling reached the inner writer, and nothing
+        // before it was lost or clipped.
+        assert_eq!(sink, b"12345678");
+    }
+
+    /// A single write larger than the whole ceiling is refused outright, with
+    /// nothing partially emitted.
+    #[test]
+    fn bounded_writer_refuses_an_oversized_first_write_whole() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut bounded = BoundedWriter::new(&mut sink, 4, "link");
+
+        assert!(bounded.write(b"12345").is_err());
+        assert!(sink.is_empty(), "a refused write must emit nothing");
+    }
 
     #[test]
     fn verify_blake2_uses_blake2sp_reference_vector() {

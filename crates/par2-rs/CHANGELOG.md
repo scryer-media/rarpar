@@ -21,6 +21,21 @@ stays inside the 0.4.x compatibility range.
 
 ### Runtime Behavior
 
+- Packet-inventory loading is bounded: [`PacketScanBudget`]/`PacketScanLimits`
+  meter packets examined, packets retained, and retained metadata bytes across
+  every input file of one load, with checked arithmetic and cancellation polled
+  on every charge. Nothing in the container format bounds the physical packet
+  stream, so a small input could previously inflate into tens of megabytes of
+  retained parse metadata. Exceeding a limit is `ResourceLimitExceeded`, never
+  a truncated set. Bounded entry points (`scan_packets_bounded` and friends)
+  are additive; the existing entry points keep their signatures on default
+  limits.
+- The ordered canonical repair scanner admits its working set against the
+  configured memory limit before allocating: worker count, Phase-A staging
+  windows, and per-worker match scratch are derived from the remaining budget,
+  and slice sizes whose ordered working set cannot fit route to the generic
+  mmap scanner instead of allocating past the limit.
+
 - Creation now encodes stripe-major behind a producer-fed ring: bands of
   recovery rows run as scoped OS threads dispatched once per stripe, and every
   input batch is staged once and streamed to all bands, instead of a fresh

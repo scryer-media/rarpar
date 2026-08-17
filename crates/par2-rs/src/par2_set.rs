@@ -5,8 +5,12 @@ use tracing::{debug, warn};
 
 use crate::checksum;
 use crate::error::{Par2Error, Result};
-use crate::packet::{Packet, RecoverySliceData, scan_packets, scan_packets_from_path};
-use crate::types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum};
+use crate::packet::budget::packet_retained_bytes;
+use crate::packet::{
+    MAX_RECOVERY_EXPONENT, Packet, PacketScanBudget, PacketScanLimits, PacketSink,
+    RecoverySliceData, scan_packets_bounded, scan_packets_from_path_bounded,
+};
+use crate::types::{FileId, MAX_FILES_PER_SET, RecoveryExponent, RecoverySetId, SliceChecksum};
 
 /// Description of a single file in the PAR2 set.
 #[derive(Debug, Clone)]
@@ -53,65 +57,91 @@ pub struct Par2FileSet {
 impl Par2FileSet {
     /// Create a new Par2FileSet by parsing packets from one or more .par2 file contents.
     ///
-    /// Each element of `par2_files` is the raw bytes of a .par2 file.
+    /// Each element of `par2_files` is the raw bytes of a .par2 file. Packets
+    /// stream straight into the builder, which deduplicates as it goes, so the
+    /// peak is the deduplicated inventory rather than the packet stream. One
+    /// [`PacketScanBudget`] spans every input, under the default limits.
     pub fn from_files(par2_files: &[&[u8]]) -> Result<Self> {
-        let mut builder = Par2FileSetBuilder::new();
+        Self::from_files_with_limits(par2_files, PacketScanLimits::default())
+    }
+
+    /// [`Self::from_files`] under caller-chosen limits.
+    pub fn from_files_with_limits(par2_files: &[&[u8]], limits: PacketScanLimits) -> Result<Self> {
+        let budget = PacketScanBudget::new(limits);
+        let mut sink = BuilderSink::new(&budget);
 
         for (i, data) in par2_files.iter().enumerate() {
             debug!("scanning par2 file {} ({} bytes)", i, data.len());
-            let packets = scan_packets(data, 0);
-            for (packet, offset) in packets {
-                builder.add_packet(packet, offset)?;
-            }
+            scan_packets_bounded(data, 0, &budget, &mut sink)?;
         }
 
-        builder.build()
+        sink.into_builder().build()
     }
 
     /// Create a new Par2FileSet by parsing packets directly from one or more
     /// on-disk .par2 files. Recovery slice payloads are kept file-backed.
     pub fn from_paths<P: AsRef<Path>>(par2_files: &[P]) -> Result<Self> {
-        let mut builder = Par2FileSetBuilder::new();
+        Self::from_paths_with_limits(par2_files, PacketScanLimits::default())
+    }
+
+    /// [`Self::from_paths`] under caller-chosen limits.
+    pub fn from_paths_with_limits<P: AsRef<Path>>(
+        par2_files: &[P],
+        limits: PacketScanLimits,
+    ) -> Result<Self> {
+        let budget = PacketScanBudget::new(limits);
+        let mut sink = BuilderSink::new(&budget);
 
         for (i, path) in par2_files.iter().enumerate() {
             debug!("scanning par2 file {} ({})", i, path.as_ref().display());
-            let packets = scan_packets_from_path(path.as_ref())?;
-            for (packet, offset) in packets {
-                builder.add_packet(packet, offset)?;
-            }
+            scan_packets_from_path_bounded(path.as_ref(), &budget, &mut sink)?;
         }
 
-        builder.build()
+        sink.into_builder().build()
     }
 
     /// Create a Par2FileSet with diagnostic information about parse errors.
     ///
     /// Unlike [`Self::from_files`], this does not fail on individual file parse errors.
     /// Instead, errors are collected into [`Par2Diagnostic`]. Returns an error
-    /// only if no valid main packet was found across all files.
+    /// only if no valid main packet was found across all files — or if the
+    /// shared budget is exhausted, which is never downgraded to a diagnostic
+    /// because a partial inventory is indistinguishable from a small one.
     pub fn from_files_with_diagnostics(par2_files: &[&[u8]]) -> Result<Par2ParseResult> {
+        let budget = PacketScanBudget::new(PacketScanLimits::default());
         let mut builder = Par2FileSetBuilder::new();
         let mut diagnostic = Par2Diagnostic::default();
 
         for (i, data) in par2_files.iter().enumerate() {
             debug!("scanning par2 file {} ({} bytes)", i, data.len());
-            let packets = scan_packets(data, 0);
+            let mut accepted = 0usize;
+            let mut sink = |packet: Packet, offset: u64, _set_id: RecoverySetId| -> Result<()> {
+                accepted += 1;
+                match builder.add_packet_budgeted(packet, offset, &budget) {
+                    Ok(_) => {}
+                    // A budget refusal is the caller's problem, not a per-file
+                    // diagnostic: it means the inventory would be incomplete.
+                    Err(
+                        error @ (Par2Error::ResourceLimitExceeded { .. } | Par2Error::Cancelled),
+                    ) => {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        diagnostic
+                            .damaged_files
+                            .push((i, format!("packet error at offset {offset}: {error}")));
+                        diagnostic.skipped_packets += 1;
+                    }
+                }
+                Ok(())
+            };
+            scan_packets_bounded(data, 0, &budget, &mut sink)?;
 
-            if packets.is_empty() && !data.is_empty() {
+            if accepted == 0 && !data.is_empty() {
                 diagnostic
                     .damaged_files
                     .push((i, "no valid packets found".to_string()));
                 diagnostic.skipped_packets += 1;
-                continue;
-            }
-
-            for (packet, offset) in packets {
-                if let Err(e) = builder.add_packet(packet, offset) {
-                    diagnostic
-                        .damaged_files
-                        .push((i, format!("packet error at offset {offset}: {e}")));
-                    diagnostic.skipped_packets += 1;
-                }
             }
         }
 
@@ -123,10 +153,14 @@ impl Par2FileSet {
     }
 
     /// Create from an already-parsed list of packets.
+    ///
+    /// The caller already holds the packets, so this charges only the builder's
+    /// own retention against a default budget.
     pub fn from_packets(packets: Vec<Packet>) -> Result<Self> {
+        let budget = PacketScanBudget::new(PacketScanLimits::default());
         let mut builder = Par2FileSetBuilder::new();
         for packet in packets {
-            builder.add_packet(packet, 0)?;
+            builder.add_packet_budgeted(packet, 0, &budget)?;
         }
         builder.build()
     }
@@ -335,8 +369,65 @@ pub struct Par2ParseResult {
     pub diagnostic: Par2Diagnostic,
 }
 
+/// Sink that feeds a [`Par2FileSetBuilder`] directly from a scan.
+///
+/// This is the streaming replacement for scan-into-`Vec` then drain-into-
+/// builder: a duplicate or rejected packet is dropped where it is parsed, and
+/// its budget charge is handed straight back, so redundant critical packets
+/// spread across many volumes never accumulate.
+struct BuilderSink<'a> {
+    budget: &'a PacketScanBudget,
+    builder: Par2FileSetBuilder,
+}
+
+impl<'a> BuilderSink<'a> {
+    fn new(budget: &'a PacketScanBudget) -> Self {
+        Self {
+            budget,
+            builder: Par2FileSetBuilder::new(),
+        }
+    }
+
+    fn into_builder(self) -> Par2FileSetBuilder {
+        self.builder
+    }
+}
+
+impl PacketSink for BuilderSink<'_> {
+    fn accept(
+        &mut self,
+        packet: Packet,
+        offset: u64,
+        _recovery_set_id: RecoverySetId,
+    ) -> Result<()> {
+        self.builder
+            .add_packet_budgeted(packet, offset, self.budget)?;
+        Ok(())
+    }
+}
+
+/// What [`Par2FileSetBuilder::add_packet`] did with a packet.
+///
+/// The caller needs this to keep its budget honest — a duplicate holds nothing,
+/// so its charge must be released — and to count diagnostics without keeping a
+/// second set of dedup maps beside the builder's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketAdmission {
+    /// The packet's contents are now held by the builder.
+    Retained,
+    /// A packet of this kind and key was already held; nothing was kept.
+    Duplicate,
+    /// The packet cannot contribute to a repair and nothing was kept: an
+    /// unknown packet type, a recovery exponent outside the usable GF domain,
+    /// or a packet that would push a logical bound past its limit.
+    Rejected,
+}
+
 /// Builder that aggregates packets into a Par2FileSet.
-struct Par2FileSetBuilder {
+///
+/// Packets arrive one at a time and are deduplicated on arrival, so the builder
+/// holds the logical inventory and never a copy of the packet stream.
+pub(crate) struct Par2FileSetBuilder {
     main_packet: Option<crate::packet::MainPacket>,
     files: HashMap<FileId, FileDescription>,
     slice_checksums: HashMap<FileId, Vec<SliceChecksum>>,
@@ -345,7 +436,7 @@ struct Par2FileSetBuilder {
 }
 
 impl Par2FileSetBuilder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             main_packet: None,
             files: HashMap::new(),
@@ -355,8 +446,75 @@ impl Par2FileSetBuilder {
         }
     }
 
-    fn add_packet(&mut self, packet: Packet, _offset: u64) -> Result<()> {
+    /// Whether a packet with this key is already held.
+    ///
+    /// Lets a caller that must defer a packet decide, before retaining it, that
+    /// it is bound to be a duplicate: the builder's keys only ever accumulate.
+    pub(crate) fn would_duplicate(&self, packet: &Packet) -> bool {
         match packet {
+            Packet::Main(_) => self.main_packet.is_some(),
+            Packet::FileDescription(desc) => self.files.contains_key(&desc.file_id),
+            Packet::InputFileSliceChecksum(ifsc) => {
+                self.slice_checksums.contains_key(&ifsc.file_id)
+            }
+            Packet::RecoverySlice(slice) => self.recovery_slices.contains_key(&slice.exponent),
+            Packet::Creator(_) => self.creator.is_some(),
+            Packet::Unknown { .. } => false,
+        }
+    }
+
+    /// Whether [`Self::add_packet`] would keep this packet's contents.
+    ///
+    /// Mirrors `add_packet`'s decision exactly so a caller can charge its budget
+    /// *before* handing the packet over. Charging first and refunding on a
+    /// duplicate would make a duplicate briefly occupy a retained slot, and an
+    /// inventory sitting exactly on its limit would then be refused by its own
+    /// redundancy.
+    pub(crate) fn would_retain(&self, packet: &Packet) -> bool {
+        match packet {
+            Packet::Main(_) => self.main_packet.is_none(),
+            Packet::FileDescription(desc) => {
+                !self.files.contains_key(&desc.file_id) && self.files.len() < MAX_FILES_PER_SET
+            }
+            Packet::InputFileSliceChecksum(ifsc) => {
+                !self.slice_checksums.contains_key(&ifsc.file_id)
+                    && self.slice_checksums.len() < MAX_FILES_PER_SET
+            }
+            Packet::RecoverySlice(slice) => {
+                slice.exponent <= MAX_RECOVERY_EXPONENT
+                    && !self.recovery_slices.contains_key(&slice.exponent)
+            }
+            Packet::Creator(_) => self.creator.is_none(),
+            Packet::Unknown { .. } => false,
+        }
+    }
+
+    /// [`Self::add_packet`], charging `budget` for exactly what is kept.
+    ///
+    /// A duplicate, an unknown packet, or a packet past a logical bound costs
+    /// the budget nothing: it is never charged in the first place.
+    pub(crate) fn add_packet_budgeted(
+        &mut self,
+        packet: Packet,
+        offset: u64,
+        budget: &PacketScanBudget,
+    ) -> Result<PacketAdmission> {
+        if !self.would_retain(&packet) {
+            // Still goes through `add_packet`, which is where a Main packet from
+            // a foreign recovery set is detected.
+            return self.add_packet(packet, offset);
+        }
+        let bytes = packet_retained_bytes(&packet);
+        budget.charge_retained(bytes)?;
+        let admission = self.add_packet(packet, offset)?;
+        if admission != PacketAdmission::Retained {
+            budget.release_retained(bytes);
+        }
+        Ok(admission)
+    }
+
+    pub(crate) fn add_packet(&mut self, packet: Packet, _offset: u64) -> Result<PacketAdmission> {
+        Ok(match packet {
             Packet::Main(main) => {
                 if let Some(existing) = &self.main_packet {
                     if existing.recovery_set_id != main.recovery_set_id {
@@ -364,50 +522,92 @@ impl Par2FileSetBuilder {
                     }
                     // Duplicate main packet with same RSID: ignore
                     debug!("duplicate main packet (same recovery set ID), ignoring");
+                    PacketAdmission::Duplicate
                 } else {
                     self.main_packet = Some(main);
+                    PacketAdmission::Retained
                 }
             }
             Packet::FileDescription(fd) => {
                 let file_id = fd.file_id;
-                self.files
-                    .entry(file_id)
-                    .or_insert_with(|| FileDescription {
-                        file_id: fd.file_id,
-                        hash_full: fd.hash_full,
-                        hash_16k: fd.hash_16k,
-                        length: fd.file_length,
-                        par2_name: fd.par2_name,
-                        filename: fd.filename,
-                    });
+                if self.files.contains_key(&file_id) {
+                    PacketAdmission::Duplicate
+                } else if self.files.len() >= MAX_FILES_PER_SET {
+                    // Bound the map before it grows: a Main packet cannot name
+                    // more than MAX_FILES_PER_SET files, so descriptions past
+                    // that describe files no repair can address.
+                    warn!(
+                        "discarding file description beyond the {MAX_FILES_PER_SET}-file set limit"
+                    );
+                    PacketAdmission::Rejected
+                } else {
+                    self.files.insert(
+                        file_id,
+                        FileDescription {
+                            file_id: fd.file_id,
+                            hash_full: fd.hash_full,
+                            hash_16k: fd.hash_16k,
+                            length: fd.file_length,
+                            par2_name: fd.par2_name,
+                            filename: fd.filename,
+                        },
+                    );
+                    PacketAdmission::Retained
+                }
             }
             Packet::InputFileSliceChecksum(ifsc) => {
                 // Use the first IFSC packet for each file ID
-                self.slice_checksums
-                    .entry(ifsc.file_id)
-                    .or_insert(ifsc.checksums);
+                if self.slice_checksums.contains_key(&ifsc.file_id) {
+                    PacketAdmission::Duplicate
+                } else if self.slice_checksums.len() >= MAX_FILES_PER_SET {
+                    warn!("discarding IFSC packet beyond the {MAX_FILES_PER_SET}-file set limit");
+                    PacketAdmission::Rejected
+                } else {
+                    self.slice_checksums.insert(ifsc.file_id, ifsc.checksums);
+                    PacketAdmission::Retained
+                }
             }
             Packet::RecoverySlice(rs) => {
-                self.recovery_slices
-                    .entry(rs.exponent)
-                    .or_insert_with(|| RecoverySlice {
-                        exponent: rs.exponent,
-                        data: rs.data,
-                    });
+                if rs.exponent > MAX_RECOVERY_EXPONENT {
+                    // Outside the usable GF exponent domain, so this block can
+                    // never take part in a solve. Refuse it before it claims a
+                    // map slot.
+                    warn!(
+                        exponent = rs.exponent,
+                        "discarding recovery block outside the usable exponent domain"
+                    );
+                    PacketAdmission::Rejected
+                } else {
+                    match self.recovery_slices.entry(rs.exponent) {
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            PacketAdmission::Duplicate
+                        }
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(RecoverySlice {
+                                exponent: rs.exponent,
+                                data: rs.data,
+                            });
+                            PacketAdmission::Retained
+                        }
+                    }
+                }
             }
             Packet::Creator(c) => {
                 if self.creator.is_none() {
                     self.creator = Some(c.creator_id);
+                    PacketAdmission::Retained
+                } else {
+                    PacketAdmission::Duplicate
                 }
             }
             Packet::Unknown { packet_type, .. } => {
                 warn!("ignoring unknown packet type: {packet_type:02x?}");
+                PacketAdmission::Rejected
             }
-        }
-        Ok(())
+        })
     }
 
-    fn build(self) -> Result<Par2FileSet> {
+    pub(crate) fn build(self) -> Result<Par2FileSet> {
         let main = self.main_packet.ok_or(Par2Error::NoMainPacket)?;
 
         // Validate recovery block data lengths against slice_size.
@@ -853,6 +1053,7 @@ mod tests {
         ));
 
         let packets: Vec<_> = crate::packet::scan_packets(&file2, 0)
+            .unwrap()
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -886,6 +1087,7 @@ mod tests {
         ));
 
         let packets: Vec<_> = crate::packet::scan_packets(&other_stream, 0)
+            .unwrap()
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -918,6 +1120,7 @@ mod tests {
 
         // Merge the same recovery block again
         let packets: Vec<_> = crate::packet::scan_packets(&stream, 0)
+            .unwrap()
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -940,5 +1143,178 @@ mod tests {
         // Should succeed (duplicate with same RSID is ok)
         let set = Par2FileSet::from_files(&[&stream]).unwrap();
         assert_eq!(set.slice_size, 4096);
+    }
+
+    fn make_recovery_body(exponent: u32, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&exponent.to_le_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    /// Exponents outside the usable GF domain describe no recoverable block, so
+    /// they must be refused before they claim a slot in the recovery map.
+    #[test]
+    fn recovery_exponents_outside_the_usable_domain_are_discarded() {
+        let main_body = make_main_body(4, &[]);
+        let rsid = compute_rsid(&main_body);
+
+        let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        for exponent in [
+            0u32,
+            MAX_RECOVERY_EXPONENT,
+            MAX_RECOVERY_EXPONENT + 1,
+            u32::MAX,
+        ] {
+            stream.extend_from_slice(&make_full_packet(
+                header::TYPE_RECOVERY,
+                &make_recovery_body(exponent, &[0xAB; 4]),
+                rsid,
+            ));
+        }
+
+        let set = Par2FileSet::from_files(&[&stream]).unwrap();
+        assert_eq!(set.recovery_block_count(), 2);
+        assert!(set.recovery_slices.contains_key(&0));
+        assert!(set.recovery_slices.contains_key(&MAX_RECOVERY_EXPONENT));
+        assert!(
+            !set.recovery_slices
+                .contains_key(&(MAX_RECOVERY_EXPONENT + 1))
+        );
+    }
+
+    /// Redundant critical packets are what a real multi-volume set is mostly
+    /// made of. They have to cost work but not retention, or the retained
+    /// budget would be spent on copies of the same few packets.
+    #[test]
+    fn duplicate_packets_do_not_consume_the_retained_packet_budget() {
+        let file_id = [0x31; 16];
+        let main_body = make_main_body(4, &[file_id]);
+        let rsid = compute_rsid(&main_body);
+        let fd = make_full_packet(
+            header::TYPE_FILE_DESC,
+            &make_file_desc_body(file_id, [0xAA; 16], [0xAA; 16], 4, "dup.bin"),
+            rsid,
+        );
+        let ifsc = make_full_packet(
+            header::TYPE_IFSC,
+            &make_ifsc_body(file_id, &[(0x1234, [0xCC; 16])]),
+            rsid,
+        );
+
+        let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        for _ in 0..2_000 {
+            stream.extend_from_slice(&fd);
+            stream.extend_from_slice(&ifsc);
+        }
+
+        // Exactly the logical inventory: Main + one File Description + one IFSC.
+        let limits = PacketScanLimits::default().with_max_retained_packets(3);
+        let set = Par2FileSet::from_files_with_limits(&[&stream], limits).unwrap();
+        assert_eq!(set.files.len(), 1);
+        assert_eq!(set.slice_checksums.len(), 1);
+    }
+
+    /// One budget spans every input, so redundancy spread across volumes is
+    /// counted once for the load rather than once per file.
+    #[test]
+    fn the_retained_budget_is_shared_across_every_input_file() {
+        let main_body = make_main_body(4, &[]);
+        let rsid = compute_rsid(&main_body);
+
+        let build = |exponents: std::ops::Range<u32>| {
+            let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+            for exponent in exponents {
+                stream.extend_from_slice(&make_full_packet(
+                    header::TYPE_RECOVERY,
+                    &make_recovery_body(exponent, &[0xAB; 4]),
+                    rsid,
+                ));
+            }
+            stream
+        };
+        let first = build(0..5);
+        let second = build(5..10);
+
+        // Main plus five recovery blocks fits either file on its own.
+        let limits = PacketScanLimits::default().with_max_retained_packets(6);
+        assert_eq!(
+            Par2FileSet::from_files_with_limits(&[&first], limits)
+                .unwrap()
+                .recovery_block_count(),
+            5
+        );
+        assert_eq!(
+            Par2FileSet::from_files_with_limits(&[&second], limits)
+                .unwrap()
+                .recovery_block_count(),
+            5
+        );
+
+        // Together they need eleven, and the shared budget refuses them.
+        let error = Par2FileSet::from_files_with_limits(&[&first, &second], limits).unwrap_err();
+        assert!(matches!(error, Par2Error::ResourceLimitExceeded { .. }));
+
+        let limits = limits.with_max_retained_packets(11);
+        assert_eq!(
+            Par2FileSet::from_files_with_limits(&[&first, &second], limits)
+                .unwrap()
+                .recovery_block_count(),
+            10
+        );
+    }
+
+    /// A set right up against the documented ceilings still loads.
+    #[test]
+    fn an_inventory_near_the_documented_recovery_ceiling_still_loads() {
+        let main_body = make_main_body(4, &[]);
+        let rsid = compute_rsid(&main_body);
+        let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        // A slice of the domain rather than all 65,536: the full-scale run lives
+        // in the repairer's reproduction test, which owns the slow path.
+        for exponent in (MAX_RECOVERY_EXPONENT - 999)..=MAX_RECOVERY_EXPONENT {
+            stream.extend_from_slice(&make_full_packet(
+                header::TYPE_RECOVERY,
+                &make_recovery_body(exponent, &[0xAB; 4]),
+                rsid,
+            ));
+        }
+
+        let set = Par2FileSet::from_files(&[&stream]).unwrap();
+        assert_eq!(set.recovery_block_count(), 1_000);
+        assert!(set.recovery_slices.contains_key(&MAX_RECOVERY_EXPONENT));
+    }
+
+    /// A refused load yields an error and nothing else. There is no partially
+    /// built set to observe, by construction: the builder is consumed to
+    /// produce a `Par2FileSet` and the error path never reaches that point.
+    #[test]
+    fn a_refused_load_produces_no_file_set_at_all() {
+        let main_body = make_main_body(4, &[]);
+        let rsid = compute_rsid(&main_body);
+        let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        for exponent in 0..32u32 {
+            stream.extend_from_slice(&make_full_packet(
+                header::TYPE_RECOVERY,
+                &make_recovery_body(exponent, &[0xAB; 4]),
+                rsid,
+            ));
+        }
+
+        let limits = PacketScanLimits::default().with_max_retained_packets(4);
+        let outcome = Par2FileSet::from_files_with_limits(&[&stream], limits);
+        assert!(matches!(
+            outcome,
+            Err(Par2Error::ResourceLimitExceeded { .. })
+        ));
+        assert!(outcome.is_err(), "no Par2FileSet is reachable from Err");
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("refused.par2");
+        std::fs::write(&path, &stream).unwrap();
+        assert!(matches!(
+            Par2FileSet::from_paths_with_limits(&[path], limits),
+            Err(Par2Error::ResourceLimitExceeded { .. })
+        ));
     }
 }

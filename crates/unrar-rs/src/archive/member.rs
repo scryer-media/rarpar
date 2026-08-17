@@ -1087,6 +1087,15 @@ impl RarArchive {
         options: &ExtractOptions,
         fh: &FileHeader,
     ) -> RarResult<Rar3UnixLinkTarget> {
+        // Admission is decided from the header alone, before a byte of the
+        // member is read or decoded. Both sizes matter and they bound
+        // different things: `data_size` is what the archive stores, and
+        // `unpacked_size` is what decoding it would produce. A link whose
+        // packed payload is small but whose declared expanded size is large
+        // passes the first check and fails the second — without it, such a
+        // member would decode under the *general* member ceiling
+        // (`limits.max_unpacked_size`, megabytes) and only meet MAXPATHSIZE
+        // once it was already materialized.
         if fh.data_size > MAX_LINK_TARGET_BYTES as u64 {
             return Err(RarError::ResourceLimit {
                 detail: format!(
@@ -1096,26 +1105,76 @@ impl RarArchive {
             });
         }
 
+        // A link payload with no declared expanded size fails closed. Every
+        // RAR3 decode route stops at the target size this crate derives from
+        // the header, and `target_unpacked_size` falls back to the general
+        // member ceiling when the header declares nothing — which is exactly
+        // the bound a link must not be given. Ordinary members keep that
+        // fallback; a symlink target that does not say how long it is has no
+        // legitimate shape.
+        let Some(declared_unpacked_size) = fh.unpacked_size else {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR3 Unix symlink target for {} declares no expanded size; \
+                     refusing to extract an unbounded link payload",
+                    fh.name
+                ),
+            });
+        };
+        if declared_unpacked_size > MAX_LINK_TARGET_BYTES as u64 {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "RAR3 Unix symlink target for {} declares an expanded size of {} bytes, \
+                     exceeding MAXPATHSIZE {}",
+                    fh.name, declared_unpacked_size, MAX_LINK_TARGET_BYTES
+                ),
+            });
+        }
+
         let link_options = ExtractOptions {
             verify: false,
             password: options.password.clone(),
             restore_owners: false,
         };
-        let payload = self
-            .extract_member_with_link_policy(index, &link_options, None, true)?
-            .into_bytes()?;
-        if payload.len() > MAX_LINK_TARGET_BYTES {
+        let extracted = self.extract_member_with_link_policy(
+            index,
+            &link_options,
+            None,
+            true,
+            Some(MAX_LINK_TARGET_BYTES as u64),
+        )?;
+        // Length before materialization: `ExtractedMember::len()` answers for
+        // both variants without touching the payload, so a result that
+        // overran its declared size is rejected while a tempfile-backed one is
+        // still on disk, rather than after `into_bytes()` has read and
+        // allocated it. Defence in depth — the decode routes are bounded by
+        // the declared size admitted above — but the cheap check is the one
+        // that runs before the expensive read.
+        Self::ensure_link_payload_within_limit(fh, extracted.len())?;
+        let payload = extracted.into_bytes()?;
+        Self::ensure_link_payload_within_limit(fh, payload.len())?;
+
+        Self::decode_rar3_unix_link_target_payload(fh, &payload, options.verify)
+    }
+
+    /// The length gate applied to a link payload, before and after
+    /// materialization.
+    ///
+    /// `ExtractedMember::len()` answers for an in-memory and a tempfile-backed
+    /// result alike without touching either, so calling this first is what
+    /// keeps an oversized tempfile from being read and allocated by
+    /// `into_bytes()`. Calling it again on the materialized bytes is defence
+    /// in depth against a future variant whose `len()` and contents disagree.
+    fn ensure_link_payload_within_limit(fh: &FileHeader, len: usize) -> RarResult<()> {
+        if len > MAX_LINK_TARGET_BYTES {
             return Err(RarError::ResourceLimit {
                 detail: format!(
                     "RAR3 Unix symlink target for {} is {} bytes, exceeding MAXPATHSIZE {}",
-                    fh.name,
-                    payload.len(),
-                    MAX_LINK_TARGET_BYTES
+                    fh.name, len, MAX_LINK_TARGET_BYTES
                 ),
             });
         }
-
-        Self::decode_rar3_unix_link_target_payload(fh, &payload, options.verify)
+        Ok(())
     }
 
     fn decode_rar3_unix_link_target_payload(
@@ -3988,15 +4047,20 @@ impl RarArchive {
         options: &ExtractOptions,
         progress: Option<&dyn ProgressHandler>,
     ) -> RarResult<crate::extract::ExtractedMember> {
-        self.extract_member_with_link_policy(index, options, progress, false)
+        self.extract_member_with_link_policy(index, options, progress, false, None)
     }
 
+    /// `link_output_ceiling` caps what the decoder may write, for callers whose
+    /// payload is bounded by something smaller than the archive's limits. Only
+    /// the RAR3 link path passes one; `None` is ordinary extraction and takes
+    /// exactly the code it always took.
     fn extract_member_with_link_policy(
         &mut self,
         index: usize,
         options: &ExtractOptions,
         progress: Option<&dyn ProgressHandler>,
         allow_link_payload: bool,
+        link_output_ceiling: Option<u64>,
     ) -> RarResult<crate::extract::ExtractedMember> {
         let entry = self
             .members
@@ -4297,36 +4361,76 @@ impl RarArchive {
                     inner: &mut output,
                     hash: Some(stream_hash.clone()),
                 };
-                if let Some(ref pwd) = member_password {
-                    let reader = Self::wrap_rar4_encrypted_reader(
-                        &self.kdf_cache,
-                        base_reader,
-                        &fh,
-                        pwd,
-                        rar4_salt,
-                    )?;
-                    let written = Self::solid_decode_reader_to_writer(
-                        &mut self.solid_decoder_rar4,
-                        &mut self.solid_decoder,
-                        self.limits.max_dict_size,
-                        reader,
-                        unpacked_size,
-                        &fh,
-                        &mut hash_writer,
-                    )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                } else {
-                    let written = Self::solid_decode_reader_to_writer(
-                        &mut self.solid_decoder_rar4,
-                        &mut self.solid_decoder,
-                        self.limits.max_dict_size,
-                        base_reader,
-                        unpacked_size,
-                        &fh,
-                        &mut hash_writer,
-                    )?;
-                    self.enforce_unknown_lz_output_limit(&fh, written)?;
-                }
+                // The ceiling wraps the writer only for a link payload. A
+                // VM-filtered block is emitted past the declared size by
+                // design (see BoundedWriter), which an ordinary member may do
+                // and a link target may not; ordinary extraction takes the
+                // `None` arm and hands the decoder the same writer as before.
+                let written = match link_output_ceiling {
+                    Some(ceiling) => {
+                        let mut bounded =
+                            crate::extract::BoundedWriter::new(&mut hash_writer, ceiling, &fh.name);
+                        if let Some(ref pwd) = member_password {
+                            let reader = Self::wrap_rar4_encrypted_reader(
+                                &self.kdf_cache,
+                                base_reader,
+                                &fh,
+                                pwd,
+                                rar4_salt,
+                            )?;
+                            Self::solid_decode_reader_to_writer(
+                                &mut self.solid_decoder_rar4,
+                                &mut self.solid_decoder,
+                                self.limits.max_dict_size,
+                                reader,
+                                unpacked_size,
+                                &fh,
+                                &mut bounded,
+                            )?
+                        } else {
+                            Self::solid_decode_reader_to_writer(
+                                &mut self.solid_decoder_rar4,
+                                &mut self.solid_decoder,
+                                self.limits.max_dict_size,
+                                base_reader,
+                                unpacked_size,
+                                &fh,
+                                &mut bounded,
+                            )?
+                        }
+                    }
+                    None => {
+                        if let Some(ref pwd) = member_password {
+                            let reader = Self::wrap_rar4_encrypted_reader(
+                                &self.kdf_cache,
+                                base_reader,
+                                &fh,
+                                pwd,
+                                rar4_salt,
+                            )?;
+                            Self::solid_decode_reader_to_writer(
+                                &mut self.solid_decoder_rar4,
+                                &mut self.solid_decoder,
+                                self.limits.max_dict_size,
+                                reader,
+                                unpacked_size,
+                                &fh,
+                                &mut hash_writer,
+                            )?
+                        } else {
+                            Self::solid_decode_reader_to_writer(
+                                &mut self.solid_decoder_rar4,
+                                &mut self.solid_decoder,
+                                self.limits.max_dict_size,
+                                base_reader,
+                                unpacked_size,
+                                &fh,
+                                &mut hash_writer,
+                            )?
+                        }
+                    }
+                };
+                self.enforce_unknown_lz_output_limit(&fh, written)?;
                 hash_writer.flush().map_err(RarError::Io)?;
                 let outputs = stream_hash.finalize().map_err(RarError::Io)?;
                 (
@@ -8568,6 +8672,135 @@ mod tests {
             matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
             "expected ResourceLimit, got {err}"
         );
+    }
+
+    /// A packed size small enough to pass the first gate, with a declared
+    /// expanded size that is not. Without the expanded-size gate this member
+    /// would decode under the *general* member ceiling — megabytes — and only
+    /// meet MAXPATHSIZE once it had been materialized.
+    ///
+    /// The archive deliberately holds no members: reaching extraction at all
+    /// would fail with "member index 0 out of range", so a ResourceLimit here
+    /// is proof the header alone decided it, before any data was read.
+    #[test]
+    fn rar3_symlink_target_rejects_oversized_declared_expanded_size_before_decoding() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.data_size = 64;
+        fh.unpacked_size = Some(MAX_LINK_TARGET_BYTES as u64 + 1);
+
+        let err = archive
+            .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RarError::ResourceLimit { ref detail }
+                    if detail.contains("declares an expanded size")
+                        && detail.contains("MAXPATHSIZE")
+            ),
+            "expected an expanded-size ResourceLimit, got {err}"
+        );
+    }
+
+    /// A header that declares no expanded size fails closed: the decode routes
+    /// would otherwise be bounded by the general member ceiling, which is the
+    /// one bound a link target must never be given. Same empty-archive proof
+    /// that nothing was read.
+    #[test]
+    fn rar3_symlink_target_rejects_missing_expanded_size_before_extraction() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.data_size = 64;
+        fh.unpacked_size = None;
+
+        let err = archive
+            .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RarError::CorruptArchive { ref detail }
+                    if detail.contains("declares no expanded size")
+            ),
+            "expected a missing-expanded-size CorruptArchive, got {err}"
+        );
+    }
+
+    /// The boundary itself is admissible. Exactly MAXPATHSIZE passes the
+    /// header gates and the call proceeds to extraction — which this archive
+    /// cannot satisfy, so the "out of range" error *is* the assertion: the
+    /// size checks let it through.
+    #[test]
+    fn rar3_symlink_target_admits_exactly_maxpathsize_declared_expanded_size() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.data_size = 64;
+        fh.unpacked_size = Some(MAX_LINK_TARGET_BYTES as u64);
+
+        let err = archive
+            .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RarError::CorruptArchive { ref detail } if detail.contains("out of range")
+            ),
+            "exactly MAXPATHSIZE must pass admission and reach extraction, got {err}"
+        );
+    }
+
+    /// An in-memory result over the cap is refused by the length gate.
+    #[test]
+    fn rar3_symlink_target_rejects_oversized_in_memory_extracted_member() {
+        let fh = test_rar3_symlink_header(None);
+        let extracted =
+            crate::extract::ExtractedMember::InMemory(vec![b'a'; MAX_LINK_TARGET_BYTES + 1]);
+
+        let err = RarArchive::ensure_link_payload_within_limit(&fh, extracted.len()).unwrap_err();
+
+        assert!(
+            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            "expected ResourceLimit, got {err}"
+        );
+        assert!(
+            RarArchive::ensure_link_payload_within_limit(&fh, MAX_LINK_TARGET_BYTES).is_ok(),
+            "exactly MAXPATHSIZE bytes must pass the length gate"
+        );
+    }
+
+    /// The same gate, for a tempfile-backed result — and this is the case the
+    /// ordering exists for. `len()` answers from the header of the spooled
+    /// result, so the refusal happens while the payload is still on disk,
+    /// never having been read into memory by `into_bytes()`.
+    #[test]
+    fn rar3_symlink_target_rejects_oversized_tempfile_extracted_member_before_materializing() {
+        use std::io::Write as _;
+
+        let fh = test_rar3_symlink_header(None);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let oversized = MAX_LINK_TARGET_BYTES + 1;
+        file.write_all(&vec![b'a'; oversized]).unwrap();
+        file.flush().unwrap();
+        let extracted = crate::extract::ExtractedMember::TempFile {
+            file,
+            len: oversized,
+        };
+
+        let err = RarArchive::ensure_link_payload_within_limit(&fh, extracted.len()).unwrap_err();
+
+        assert!(
+            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            "expected ResourceLimit, got {err}"
+        );
+        // Still on disk and never materialized: the guard ran on `len()` alone.
+        assert_eq!(extracted.len(), oversized);
     }
 
     #[test]

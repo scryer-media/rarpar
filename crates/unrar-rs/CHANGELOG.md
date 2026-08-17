@@ -7,6 +7,12 @@ This is a patch release from 0.5.3, internal only: no public item changed.
 
 ### Runtime Behavior
 
+- RAR3 symbolic-link targets are bounded before decoding: a declared expanded
+  size past the maximum path size is rejected up front, a missing expanded
+  size is rejected before extraction, and oversized in-memory or
+  tempfile-extracted link members are refused before materializing. Exactly
+  `MAXPATHSIZE` is still admitted.
+
 - Solid RAR4 archives no longer decode their first member twice. Solid
   dispatch is a decision about which decoder instance runs, not about state
   inheritance — inheritance is keyed on the member's own header flag inside

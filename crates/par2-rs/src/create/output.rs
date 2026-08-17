@@ -1917,17 +1917,27 @@ fn validate_staged_volume(
     let file_length = fs::metadata(&volume.stage_path)
         .map_err(Par2Error::Io)?
         .len();
-    let scanned =
-        match scan_packets_from_path_with_set_ids_cancellable(&volume.stage_path, cancellation) {
-            Ok(scanned) => scanned,
-            Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
-            Err(error) => {
-                return Err(Par2Error::CreationValidation {
-                    path: volume.stage_path.display().to_string(),
-                    reason: error.to_string(),
-                });
-            }
-        };
+    // We wrote this volume, so we know exactly how many packets it should hold.
+    // Admit one extra so a volume with a stray packet fails with the packet
+    // count mismatch below rather than a generic resource-limit message.
+    let scan_ceiling = volume.expected.len().saturating_add(1);
+    let scan_limits = crate::packet::PacketScanLimits::default()
+        .with_max_retained_packets(scan_ceiling)
+        .with_max_examined_packets(scan_ceiling as u64);
+    let scanned = match scan_packets_from_path_with_set_ids_cancellable(
+        &volume.stage_path,
+        scan_limits,
+        cancellation,
+    ) {
+        Ok(scanned) => scanned,
+        Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
+        Err(error) => {
+            return Err(Par2Error::CreationValidation {
+                path: volume.stage_path.display().to_string(),
+                reason: error.to_string(),
+            });
+        }
+    };
     validation_checkpoint(cancellation);
     check_cancel(cancellation)?;
     if scanned.len() != volume.expected.len() {

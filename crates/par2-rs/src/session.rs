@@ -1507,6 +1507,7 @@ mod tests {
 
     fn parse_packets(data: &[u8]) -> Vec<Packet> {
         crate::packet::scan_packets(data, 0)
+            .unwrap()
             .into_iter()
             .map(|(p, _)| p)
             .collect()

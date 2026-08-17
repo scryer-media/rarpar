@@ -170,9 +170,13 @@ pub use gf::{add as gf_add, input_slice_constants, inv as gf_inv, mul as gf_mul,
 pub use gf_simd::{FactorDst, mul_acc_multi_region, mul_acc_region};
 pub use matrix::{Matrix, build_decode_matrix};
 pub use packet::{
-    CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, Packet, PacketHeader, PacketType,
-    RecoverySliceData, RecoverySlicePacket, ScannedPacket, parse_packet, scan_packets,
-    scan_packets_from_path, scan_packets_from_path_with_set_ids,
+    CreatorPacket, DEFAULT_MAX_EXAMINED_PACKETS, DEFAULT_MAX_RETAINED_METADATA_BYTES,
+    DEFAULT_MAX_RETAINED_PACKETS, FileDescriptionPacket, IfscPacket, MAX_RECOVERY_EXPONENT,
+    MainPacket, Packet, PacketHeader, PacketScanBudget, PacketScanLimits, PacketSink, PacketType,
+    RECOVERY_EXPONENT_DOMAIN, RecoverySliceData, RecoverySlicePacket, ScannedPacket, parse_packet,
+    scan_packets, scan_packets_bounded, scan_packets_from_path, scan_packets_from_path_bounded,
+    scan_packets_from_path_with_set_ids, scan_packets_from_path_with_set_ids_limited,
+    scan_packets_with_limits,
 };
 pub use par2_set::{
     FileDescription, MergeResult, Par2Diagnostic, Par2FileSet, Par2ParseResult, RecoverySlice,
