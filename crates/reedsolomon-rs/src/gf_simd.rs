@@ -4293,9 +4293,32 @@ unsafe fn mul_acc_multi_region_clmul_sha3(factors_and_dsts: &mut [FactorDst<'_>]
 #[cfg(target_arch = "aarch64")]
 const CLMUL_APPLE_FUSION: bool = cfg!(target_vendor = "apple");
 
-/// Sources processed per CLMUL pass on aarch64.
+/// Sources processed per narrow CLMUL pass on aarch64 — the reference
+/// encoder's `CLMUL_NUM_REGIONS`, and still the shape every partial group runs.
 #[cfg(target_arch = "aarch64")]
 const CLMUL_SRC_GROUP: usize = 8;
+
+/// Sources processed per *wide* CLMUL pass on aarch64.
+///
+/// A pass costs a fixed amount of work per 32-byte block regardless of how many
+/// sources it carries: the destination's `LD2`/`ST2` read-modify-write, the
+/// packed Barrett reduction, and the fold into the destination. On a core whose
+/// vector pipes are the binding resource — Neoverse V2 runs this loop with all
+/// four V pipes at ~98% occupancy and the load pipes at half — that fixed cost
+/// is what to attack, because it is charged once per pass and divided by the
+/// number of sources the pass carries.
+///
+/// Per 32-byte block at eight sources the fixed part is ~32 of the ~138 vector
+/// issue slots (destination `LD2` 2 + `ST2` 4 + reduction 24 + fold 2) and each
+/// source adds ~12 (`LD2` 2, the Karatsuba middle `EOR` 1, six `PMULL` 6, its
+/// share of the `EOR3` merge tree 3). Sixteen sources in one pass spend
+/// (32 + 16×12)/16 = 14.0 slots per source where eight spend 138/8 = 17.25.
+/// The extra live coefficients spill, but a spill reload is a load-pipe uop and
+/// costs no vector slot at all, so the trade pays in the resource that is not
+/// binding. Partial groups keep using [`CLMUL_SRC_GROUP`], so the widths this
+/// kernel already generated are untouched.
+#[cfg(target_arch = "aarch64")]
+const CLMUL_SRC_GROUP_WIDE: usize = 16;
 
 /// Whether the input-batch dispatch may pick the CLMUL kernels. Setting
 /// `WEAVER_GF16_CLMUL_BATCH=0` pins the VTBL shuffle path so the two can be
@@ -4311,6 +4334,24 @@ fn clmul_batch_enabled() -> bool {
 #[inline]
 fn clmul_sha3_available() -> bool {
     std::arch::is_aarch64_feature_detected!("sha3")
+}
+
+/// Whether the Apple PMULL+EOR fusion flavor may be used.
+///
+/// `WEAVER_GF16_CLMUL_APPLE_FUSION=0` selects the non-Apple EOR3-merge flavor
+/// instead — the one a Neoverse part runs — so that flavor can be disassembled
+/// and A/B'd on Apple silicon, which also has FEAT_SHA3. Same escape-hatch
+/// pattern as `WEAVER_GF16_CLMUL_BATCH`. Off Apple there is only one SHA3
+/// flavor: the constant is already `false`, the check folds away, and the
+/// environment is never read.
+#[cfg(target_arch = "aarch64")]
+fn clmul_apple_fusion_enabled() -> bool {
+    if !CLMUL_APPLE_FUSION {
+        return false;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("WEAVER_GF16_CLMUL_APPLE_FUSION").is_none_or(|v| v != "0"))
 }
 
 /// Per-source broadcast coefficients: factor split into lo/hi bytes plus the
@@ -4711,12 +4752,12 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
     // registers stay loop-invariant instead of being re-walked out of a
     // wide `Option<(u16, ClmulBatchCoeff, &[u8])>` array each block.
     while let Some((first_factor, first_src)) = it.next() {
-        let mut factors = [first_factor; CLMUL_SRC_GROUP];
-        let mut slices = [first_src; CLMUL_SRC_GROUP];
-        let mut srcs = [first_src.as_ptr(); CLMUL_SRC_GROUP];
-        let mut coeffs = [unsafe { clmul_batch_coeff(first_factor) }; CLMUL_SRC_GROUP];
+        let mut factors = [first_factor; CLMUL_SRC_GROUP_WIDE];
+        let mut slices = [first_src; CLMUL_SRC_GROUP_WIDE];
+        let mut srcs = [first_src.as_ptr(); CLMUL_SRC_GROUP_WIDE];
+        let mut coeffs = [unsafe { clmul_batch_coeff(first_factor) }; CLMUL_SRC_GROUP_WIDE];
         let mut n = 1usize;
-        for slot in 1..CLMUL_SRC_GROUP {
+        for slot in 1..CLMUL_SRC_GROUP_WIDE {
             let Some((factor, src)) = it.next() else {
                 break;
             };
@@ -4732,17 +4773,27 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
         // gf16_clmul_neon_base.h:54`, CLMUL_NUM_REGIONS 8): the source count is
         // a constant inside the loop, so the whole region sequence unrolls to a
         // single backedge.
+        //
+        // A full sixteen goes through one wide pass; anything short of that
+        // splits into an eight-source pass plus a pass for the remainder, which
+        // is exactly the sequence of passes this kernel made before the wide
+        // body existed (grouping was by eights, so a twelve-source batch ran an
+        // eight then a four). Same passes, same order, same arithmetic.
         unsafe {
             let dst_ptr = dst.as_mut_ptr();
-            match n {
-                1 => clmul_pass::<SHA3, FUSED, 1>(dst_ptr, &srcs, &coeffs, vec_len),
-                2 => clmul_pass::<SHA3, FUSED, 2>(dst_ptr, &srcs, &coeffs, vec_len),
-                3 => clmul_pass::<SHA3, FUSED, 3>(dst_ptr, &srcs, &coeffs, vec_len),
-                4 => clmul_pass::<SHA3, FUSED, 4>(dst_ptr, &srcs, &coeffs, vec_len),
-                5 => clmul_pass::<SHA3, FUSED, 5>(dst_ptr, &srcs, &coeffs, vec_len),
-                6 => clmul_pass::<SHA3, FUSED, 6>(dst_ptr, &srcs, &coeffs, vec_len),
-                7 => clmul_pass::<SHA3, FUSED, 7>(dst_ptr, &srcs, &coeffs, vec_len),
-                _ => clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst_ptr, &srcs, &coeffs, vec_len),
+            if n == CLMUL_SRC_GROUP_WIDE {
+                clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP_WIDE>(dst_ptr, &srcs, &coeffs, vec_len);
+            } else if n > CLMUL_SRC_GROUP {
+                clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst_ptr, &srcs, &coeffs, vec_len);
+                clmul_pass_narrow::<SHA3, FUSED>(
+                    dst_ptr,
+                    &srcs[CLMUL_SRC_GROUP..],
+                    &coeffs[CLMUL_SRC_GROUP..],
+                    n - CLMUL_SRC_GROUP,
+                    vec_len,
+                );
+            } else {
+                clmul_pass_narrow::<SHA3, FUSED>(dst_ptr, &srcs, &coeffs, n, vec_len);
             }
         }
 
@@ -4764,18 +4815,33 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
 /// the iterator-driven shape ran, in the identical order.
 ///
 /// # Safety
-/// `dst` and every `srcs[i]` for `i < N` must be valid for `vec_len` bytes,
-/// `vec_len` must be a multiple of 32, and `dst` must not alias any source.
+/// `srcs` and `coeffs` must each hold at least `N` entries, `dst` and every
+/// `srcs[i]` for `i < N` must be valid for `vec_len` bytes, `vec_len` must be a
+/// multiple of 32, and `dst` must not alias any source.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
     dst: *mut u8,
-    srcs: &[*const u8; CLMUL_SRC_GROUP],
-    coeffs: &[ClmulBatchCoeff; CLMUL_SRC_GROUP],
+    srcs: &[*const u8],
+    coeffs: &[ClmulBatchCoeff],
     vec_len: usize,
 ) {
     use std::arch::aarch64::*;
+    debug_assert!(srcs.len() >= N && coeffs.len() >= N);
     unsafe {
+        // Slices rather than fixed-size arrays only so the wide pass and the
+        // narrow tail pass can share one body; every index below is a compile-
+        // time constant less than `N`, and the caller guarantees the lengths.
+        macro_rules! src {
+            ($idx:expr) => {
+                *srcs.get_unchecked($idx)
+            };
+        }
+        macro_rules! coeff {
+            ($idx:expr) => {
+                coeffs.get_unchecked($idx)
+            };
+        }
         // A shared byte offset, not a walking cursor per source: `LD2` has no
         // register-offset addressing mode either way, so both shapes pay one
         // address `add` per source per block, but eight loop-carried cursors
@@ -4789,7 +4855,7 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
             macro_rules! prefetch_lane {
                 ($idx:expr) => {
                     if N > $idx {
-                        prefetch_src_l1(srcs[$idx].wrapping_add(offset + 64));
+                        prefetch_src_l1(src!($idx).wrapping_add(offset + 64));
                     }
                 };
             }
@@ -4802,21 +4868,31 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 prefetch_lane!(5);
                 prefetch_lane!(6);
                 prefetch_lane!(7);
+                prefetch_lane!(8);
+                prefetch_lane!(9);
+                prefetch_lane!(10);
+                prefetch_lane!(11);
+                prefetch_lane!(12);
+                prefetch_lane!(13);
+                prefetch_lane!(14);
+                prefetch_lane!(15);
             }
 
-            let mut acc = clmul_round1(srcs[0].add(offset), &coeffs[0]);
+            let mut acc = clmul_round1(src!(0).add(offset), coeff!(0));
             if SHA3 && !FUSED {
                 // Merge pairs through EOR3, with the odd final product taking
                 // the single-product path — the same pairing the runtime loop
-                // produced, unrolled.
+                // produced, unrolled. `merge_pair!(a, b)` covers the width that
+                // ends on `a` too, so an even `N` folds its last source through
+                // `merge_pair!(N-1, N)` with no special case.
                 macro_rules! merge_pair {
                     ($a:expr, $b:expr) => {
                         if N > $b {
-                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
-                            let pc = clmul_round1(srcs[$b].add(offset), &coeffs[$b]);
+                            let pb = clmul_round1(src!($a).add(offset), coeff!($a));
+                            let pc = clmul_round1(src!($b).add(offset), coeff!($b));
                             clmul_merge2::<SHA3>(&mut acc, pb, pc);
                         } else if N == $a + 1 {
-                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
+                            let pb = clmul_round1(src!($a).add(offset), coeff!($a));
                             clmul_merge1(&mut acc, pb);
                         }
                     };
@@ -4824,10 +4900,11 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 merge_pair!(1, 2);
                 merge_pair!(3, 4);
                 merge_pair!(5, 6);
-                if N == 8 {
-                    let pb = clmul_round1(srcs[7].add(offset), &coeffs[7]);
-                    clmul_merge1(&mut acc, pb);
-                }
+                merge_pair!(7, 8);
+                merge_pair!(9, 10);
+                merge_pair!(11, 12);
+                merge_pair!(13, 14);
+                merge_pair!(15, 16);
             } else {
                 macro_rules! accumulate_lane {
                     ($idx:expr) => {
@@ -4835,11 +4912,11 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                             if FUSED {
                                 clmul_round_acc_fused(
                                     &mut acc,
-                                    srcs[$idx].add(offset),
-                                    &coeffs[$idx],
+                                    src!($idx).add(offset),
+                                    coeff!($idx),
                                 );
                             } else {
-                                clmul_round_acc(&mut acc, srcs[$idx].add(offset), &coeffs[$idx]);
+                                clmul_round_acc(&mut acc, src!($idx).add(offset), coeff!($idx));
                             }
                         }
                     };
@@ -4851,6 +4928,14 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 accumulate_lane!(5);
                 accumulate_lane!(6);
                 accumulate_lane!(7);
+                accumulate_lane!(8);
+                accumulate_lane!(9);
+                accumulate_lane!(10);
+                accumulate_lane!(11);
+                accumulate_lane!(12);
+                accumulate_lane!(13);
+                accumulate_lane!(14);
+                accumulate_lane!(15);
             }
 
             let r = clmul_barrett_reduce::<SHA3>(acc);
@@ -4866,6 +4951,39 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
             vst2q_u8(block, vb);
 
             offset += 32;
+        }
+    }
+}
+
+/// One CLMUL pass for a live width of `1..=CLMUL_SRC_GROUP`, picked at runtime.
+///
+/// The straight-line bodies these arms instantiate are exactly the ones the
+/// kernel generated before the wide pass existed; the wide pass adds one more
+/// width rather than replacing them, so a partial group still runs the
+/// reference encoder's eight-region shape.
+///
+/// # Safety
+/// As [`clmul_pass`], with `n` in `1..=CLMUL_SRC_GROUP` and `srcs`/`coeffs`
+/// holding at least `n` entries.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_pass_narrow<const SHA3: bool, const FUSED: bool>(
+    dst: *mut u8,
+    srcs: &[*const u8],
+    coeffs: &[ClmulBatchCoeff],
+    n: usize,
+    vec_len: usize,
+) {
+    unsafe {
+        match n {
+            1 => clmul_pass::<SHA3, FUSED, 1>(dst, srcs, coeffs, vec_len),
+            2 => clmul_pass::<SHA3, FUSED, 2>(dst, srcs, coeffs, vec_len),
+            3 => clmul_pass::<SHA3, FUSED, 3>(dst, srcs, coeffs, vec_len),
+            4 => clmul_pass::<SHA3, FUSED, 4>(dst, srcs, coeffs, vec_len),
+            5 => clmul_pass::<SHA3, FUSED, 5>(dst, srcs, coeffs, vec_len),
+            6 => clmul_pass::<SHA3, FUSED, 6>(dst, srcs, coeffs, vec_len),
+            7 => clmul_pass::<SHA3, FUSED, 7>(dst, srcs, coeffs, vec_len),
+            _ => clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst, srcs, coeffs, vec_len),
         }
     }
 }
@@ -4887,10 +5005,17 @@ unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSr
 #[target_feature(enable = "sha3")]
 unsafe fn mul_acc_input_batch_clmul_sha3(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
     unsafe {
-        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
-            dst,
-            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
-        )
+        if CLMUL_APPLE_FUSION && !clmul_apple_fusion_enabled() {
+            mul_acc_input_batch_clmul_body::<true, false>(
+                dst,
+                factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+            )
+        } else {
+            mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+                dst,
+                factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+            )
+        }
     }
 }
 
@@ -4919,12 +5044,21 @@ unsafe fn mul_acc_input_batch_clmul_sha3_prepared(
     factors_and_srcs: &[PreparedFactorSrc<'_>],
 ) {
     unsafe {
-        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
-            dst,
-            factors_and_srcs
-                .iter()
-                .map(|fs| (fs.prepared.factor, fs.src)),
-        )
+        if CLMUL_APPLE_FUSION && !clmul_apple_fusion_enabled() {
+            mul_acc_input_batch_clmul_body::<true, false>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, fs.src)),
+            )
+        } else {
+            mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, fs.src)),
+            )
+        }
     }
 }
 
@@ -5890,8 +6024,14 @@ mod tests {
         // Every live width 1..=CLMUL_SRC_GROUP reaches its own straight-line
         // `clmul_pass` instantiation, and the counts past 8 exercise the
         // multi-pass group split. Two of the first four factors are 0/1, so a
-        // `count` of k lands on a live width of about k-2.
-        for &count in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17] {
+        // `count` of k lands on a live width of about k-2 — so the counts below
+        // walk live widths 1..=18 one at a time plus 22, 24 and 32, which is
+        // every narrow width, the wide `CLMUL_SRC_GROUP_WIDE` pass (live 16),
+        // each wide+narrow split (live 9..=15 and 17..=24), and a second full
+        // wide group (live 32).
+        for &count in &[
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 26, 34,
+        ] {
             for &len in &[2usize, 30, 32, 34, 64, 96, 4094, 4096] {
                 let factors: Vec<u16> = (0..count)
                     .map(|i| match i {
