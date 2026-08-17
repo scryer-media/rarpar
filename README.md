@@ -1,5 +1,8 @@
 # rarpar
 
+[![License](https://img.shields.io/github/license/scryer-media/rarpar)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/scryer-media/rarpar/badge)](https://scorecard.dev/viewer/?uri=github.com/scryer-media/rarpar)
+
 `rarpar` is a smart RAR/PAR2 command-line tool written in Rust. Point it at an
 archive, a PAR2 file, or a messy download directory and it will discover what is
 there, repair what can be repaired, restore recovery volumes when possible, and
