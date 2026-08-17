@@ -1,7 +1,7 @@
 # The test corpus
 
 The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
-`crates/par2-rs/tests/fixtures/` are the **test corpus**: 375 archives, parity
+`crates/par2-rs/tests/fixtures/` are the **test corpus**: 376 archives, parity
 sets, SFX modules, video inputs and originals that the unit, integration, slow,
 PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
 content-addressed object set on Cloudflare R2 and hydrated by `xtask`. The
@@ -491,6 +491,36 @@ only make sense against it:
    `hydrate` were then removed. The repository carries no fixture bytes; the
    hygiene lane refuses any attributes file that reintroduces an `lfs`
    filter and any pointer blob committed where fixture bytes belong.
+
+## Adding a fixture
+
+A fixture is added by ledgering it and publishing it, in that order, and the
+window between the two is a first-class state rather than a broken one:
+
+1. One PR adds the recipe (or upstream entry) **and** its `sources.json`
+   entry. For a generated fixture the entry's size and digest are
+   placeholders — regeneration is not byte-reproducible, so no value written
+   by hand could be authoritative — and the entry's `notes` say so. A ledger
+   path the pinned manifest does not carry is **pending first publication**:
+   `verify` exempts it from presence and digest checks (it can be hydrated
+   from nowhere), excludes it from the manifest recomputed for the lock
+   comparison, and prints it by name. Everything already published is still
+   held to the pinned manifest, so the PR's CI stays green and still proves
+   what it could always prove. Tests that read the new fixture must skip when
+   it is absent — the same skip they need on any not-yet-hydrated checkout.
+2. An operator dispatches the publish workflow. Generation produces the new
+   fixture, `assemble` refreshes its ledger entry from the produced bytes, and
+   the new revision's manifest carries it.
+3. The lock-pin PR lands the refreshed `sources.json`, the new `lock.json`
+   and the moved benchmark pins together, exactly as for any revision. Nothing
+   is pending anymore.
+
+The publish workflow's own `assemble` job validates the *candidate* revision
+with `verify --candidate`: the tree must be exactly the ledger — no pending
+grace there — and the lock, which pins the previous revision, is deliberately
+not compared against, because a regeneration always moves digests. The publish
+job verifies the new manifest against the new lock from the public side after
+uploading, so the comparison is reordered, never lost.
 
 ## Regenerating fixtures
 

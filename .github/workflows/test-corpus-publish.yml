@@ -418,8 +418,14 @@ jobs:
       # Every path present, no blocked provenance, every public upstream import
       # re-fetched byte-identical at its pinned commit — independently of what
       # the imports job wrote.
-      - name: Verify the corpus against its ledger and upstreams
-        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
+      # --candidate: this tree is the next revision, so the lock — which pins
+      # the previous one — is deliberately not compared against; a
+      # regeneration always moves digests, and holding a candidate to the old
+      # lock would refuse every publish after the first. The publish job
+      # verifies the new manifest against the new lock from the public side
+      # after uploading.
+      - name: Verify the candidate revision against its ledger and upstreams
+        run: cargo run --locked -p xtask -- test-corpus verify --candidate --all-present --upstreams
 
       - name: Build the manifest and provenance
         run: |
