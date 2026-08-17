@@ -162,7 +162,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xtask-corpus-cosign-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let _guard = crate::test_corpus::curl::tests::ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_corpus::http::tests::ENV_LOCK.lock().unwrap();
 
         let ok = stub_cosign(&dir, 0);
         unsafe { std::env::set_var(COSIGN_ENV, &ok) };

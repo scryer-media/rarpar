@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::ledger::{Ledger, Source, Upstream};
-use super::{Result, blake3_bytes, curl, fail};
+use super::{Result, blake3_bytes, fail, http};
 
 /// The raw-content URL for a file at a pinned commit of a GitHub repository.
 pub(crate) fn raw_url(upstream: &Upstream, path: &str) -> Result<String> {
@@ -109,7 +109,7 @@ pub(crate) fn verify_public_upstreams(ledger: &Ledger) -> Vec<UpstreamCheck> {
         }
         let outcome = (|| -> Result<()> {
             let url = raw_url(declared, path)?;
-            let fetched = curl::get_to_vec(&url)?;
+            let fetched = http::get_to_vec(&url)?;
             let bytes = match declared.encoding.as_str() {
                 "raw" => fetched,
                 "uuencode" => uudecode(&fetched)?,

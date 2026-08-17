@@ -9,10 +9,20 @@ blake3 = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
 clap_mangen = "0.3"
+# The corpus transport signs its writes with AWS SigV4, which specifies
+# HMAC-SHA256. That signature is the only cryptography xtask performs;
+# signatures over the corpus itself still come from `cosign`.
+hmac = { workspace = true }
 rarpar = { path = "../tools/rarpar", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# SHA-256 is still needed for exactly one thing: `test-corpus bench-pins`
-# reproduces the benchmark harness's `fixture_sha256` contract, which is
-# SHA-256 by specification of that corpus. Everything else digests with blake3.
+# SHA-256 is needed for exactly two things, each because something else
+# specifies it: `test-corpus bench-pins` reproduces the benchmark harness's
+# `fixture_sha256` contract, and SigV4 hashes the canonical request and its
+# payload with SHA-256. Everything else digests with blake3.
 sha2 = { workspace = true }
+# The corpus HTTP client: blocking, no async runtime, rustls (so CI needs no
+# system TLS library and no openssl) with the bundled Mozilla roots. `gzip` is
+# off deliberately — every corpus read is content-addressed bytes, so transfers
+# stay identity-coded and a proxy cannot re-encode them out from under a digest.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }

@@ -6,20 +6,24 @@
 //! the profile table (`test-corpus/profiles.json`) and the shared toolchain lock.
 //! `test-corpus/lock.json` pins the one manifest a checkout hydrates from.
 //!
-//! See `docs/test-corpus.md` for the contract. Nothing here implements crypto:
-//! digests come from `blake3`, transport from `curl`, signatures from `cosign`.
+//! See `docs/test-corpus.md` for the contract. Digests come from `blake3`,
+//! transport from an in-process HTTP client over `rustls`, signatures from
+//! `cosign`; the only cryptography written here is the AWS SigV4 request
+//! signature the S3 endpoint specifies (`sigv4`), which authenticates a write
+//! and verifies nothing.
 
 mod bench_pins;
 mod checked_in;
 mod commands;
-mod curl;
 mod generate;
 mod glob;
+mod http;
 mod ledger;
 mod lock;
 mod manifest;
 mod profiles;
 mod sigstore;
+mod sigv4;
 mod upstream;
 
 use std::ffi::OsString;
@@ -204,13 +208,17 @@ pub(crate) fn rename_into_place(temp: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// UTC timestamp in RFC 3339 form without pulling in a calendar crate; used
-/// only for human-facing provenance fields, never for anything hashed.
-pub(crate) fn utc_now_rfc3339() -> String {
-    let seconds = std::time::SystemTime::now()
+/// Seconds since the Unix epoch, or 0 if the clock is before it.
+pub(crate) fn utc_now_seconds() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// UTC calendar parts — (year, month, day, hour, minute, second) — for a Unix
+/// timestamp, without pulling in a calendar crate.
+pub(crate) fn utc_parts(seconds: u64) -> (i64, i64, i64, u64, u64, u64) {
     let days = seconds / 86_400;
     let remainder = seconds % 86_400;
     // Civil-from-days (Howard Hinnant's algorithm), proleptic Gregorian.
@@ -224,12 +232,21 @@ pub(crate) fn utc_now_rfc3339() -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+    (
+        year,
+        month,
+        day,
         remainder / 3600,
         (remainder % 3600) / 60,
-        remainder % 60
+        remainder % 60,
     )
+}
+
+/// UTC timestamp in RFC 3339 form; used only for human-facing provenance
+/// fields, never for anything hashed.
+pub(crate) fn utc_now_rfc3339() -> String {
+    let (year, month, day, hour, minute, second) = utc_parts(utc_now_seconds());
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 #[cfg(test)]
@@ -295,6 +312,11 @@ mod tests {
 
     #[test]
     fn utc_timestamp_has_rfc3339_shape() {
+        // A pinned instant first: the calendar conversion is shared with the
+        // `x-amz-date` a SigV4 signature covers, where a wrong day is a
+        // signature the far end rejects for no visible reason.
+        assert_eq!(utc_parts(1_440_938_160), (2015, 8, 30, 12, 36, 0));
+        assert_eq!(utc_parts(0), (1970, 1, 1, 0, 0, 0));
         let stamp = utc_now_rfc3339();
         assert_eq!(stamp.len(), 20, "{stamp}");
         assert!(stamp.ends_with('Z'));

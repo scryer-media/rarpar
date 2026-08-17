@@ -5,12 +5,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::curl::{self, Download, S3Credentials};
+use super::http::{self, Download};
 use super::ledger::{Finding, Ledger};
 use super::lock::Lock;
 use super::manifest::{Manifest, Provenance, ToolchainLock};
 use super::profiles::ProfilesFile;
 use super::sigstore;
+use super::sigv4::S3Credentials;
 use super::{
     LEDGER_FILE, LOCK_FILE, MANIFESTS_PREFIX, OBJECTS_PREFIX, PROFILES_FILE, Result,
     TOOLCHAINS_FILE, blake3_bytes, digest_file, fail, next_path, next_string, repo_path,
@@ -462,7 +463,7 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
             ));
         }
         if !offline {
-            match curl::get_to_vec(&lock.manifest.url) {
+            match http::get_to_vec(&lock.manifest.url) {
                 Err(err) => problems.push(format!("published manifest unavailable: {err}")),
                 Ok(published) => {
                     let published_digest = blake3_bytes(&published);
@@ -517,7 +518,7 @@ fn verify_signature(lock: &Lock, manifest_bytes: &[u8]) -> Result<()> {
     if !sigstore::cosign_available() {
         return fail("cosign is not installed (install cosign, or set RARPAR_COSIGN)");
     }
-    let bundle = curl::get_to_vec(&lock.signature.bundle_url)?;
+    let bundle = http::get_to_vec(&lock.signature.bundle_url)?;
     let dir = std::env::temp_dir().join(format!("rarpar-corpus-verify-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let manifest_path = dir.join("manifest.json");
@@ -621,7 +622,7 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let transfers = curl::get_many(&downloads, parallel)?;
+    let transfers = http::get_many(&downloads, parallel)?;
     // Verify every downloaded object once, by digest.
     let mut verified: BTreeMap<&String, std::result::Result<(), String>> = BTreeMap::new();
     for (blake3, temp) in &by_digest {
@@ -733,7 +734,7 @@ fn locked_manifest(root: &Path, lock: &Lock) -> Result<Manifest> {
         }
         let _ = fs::remove_file(&cache);
     }
-    let bytes = curl::get_to_vec(&lock.manifest.url)?;
+    let bytes = http::get_to_vec(&lock.manifest.url)?;
     let digest = blake3_bytes(&bytes);
     if digest != lock.manifest.blake3 {
         return fail(format!(
@@ -895,7 +896,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     let provenance_key = format!("{MANIFESTS_PREFIX}{manifest_blake3}.provenance.json");
     let lock = match publisher.already_published(&manifest_key, &manifest_bytes)? {
         Some(()) => {
-            let existing = curl::get_to_vec(&publisher.public_url(&provenance_key))?;
+            let existing = http::get_to_vec(&publisher.fresh_public_url(&provenance_key))?;
             let existing_provenance: Provenance =
                 serde_json::from_slice(&existing).map_err(|err| {
                     super::error(format!("published provenance is unreadable: {err}"))
@@ -910,7 +911,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 format!("{manifest_key}.sigstore.json"),
                 format!("{provenance_key}.sigstore.json"),
             ] {
-                curl::get_to_vec(&publisher.public_url(&bundle)).map_err(|err| {
+                http::get_to_vec(&publisher.fresh_public_url(&bundle)).map_err(|err| {
                     super::error(format!("published bundle {bundle} is missing: {err}"))
                 })?;
             }
@@ -975,9 +976,35 @@ struct Publisher {
     credentials: S3Credentials,
 }
 
+/// A counter that makes every read-back URL in this process distinct, so two
+/// objects (or a retry of one) can never share a cache key.
+fn read_back_sequence() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Publisher {
     fn public_url(&self, key: &str) -> String {
         format!("{}/{key}", self.base_url)
+    }
+
+    /// The public URL with a token no cache has answered before.
+    ///
+    /// A read-back reads this process's own write, through whatever sits in
+    /// front of the bucket. If that URL was requested while the object was
+    /// still absent — a probe, an earlier attempt, a consumer that was too
+    /// early — the "absent" can itself be cached, and the read-back would be
+    /// served it and conclude the upload never landed. A cache key covers the
+    /// query string, so an unseen token cannot have a stored answer, while
+    /// object storage ignores a query it was not asked about.
+    fn fresh_public_url(&self, key: &str) -> String {
+        format!(
+            "{}?rarpar-read-back={}-{}",
+            self.public_url(key),
+            std::process::id(),
+            read_back_sequence()
+        )
     }
 
     fn write_url(&self, key: &str) -> String {
@@ -989,7 +1016,7 @@ impl Publisher {
     /// replacement.
     fn put_object(&self, blake3: &str, path: &Path, size: u64) -> Result<PutOutcome> {
         let key = format!("{OBJECTS_PREFIX}{blake3}");
-        match curl::put_conditional(
+        match http::put_conditional(
             path,
             &self.write_url(&key),
             "application/octet-stream",
@@ -1012,7 +1039,7 @@ impl Publisher {
             "rarpar-corpus-readback-{}-{blake3}",
             std::process::id()
         ));
-        curl::get_to_file(&self.public_url(key), &temp)?;
+        http::get_to_file(&self.fresh_public_url(key), &temp)?;
         let digest = digest_file(&temp);
         let _ = fs::remove_file(&temp);
         let digest = digest?;
@@ -1034,7 +1061,7 @@ impl Publisher {
             std::process::id(),
             blake3_bytes(key.as_bytes())
         ));
-        match curl::get_to_file(&self.public_url(key), &temp) {
+        match http::get_to_file(&self.fresh_public_url(key), &temp) {
             Err(_) => Ok(None),
             Ok(()) => {
                 let existing = fs::read(&temp)?;
@@ -1065,12 +1092,12 @@ impl Publisher {
         {
             return fail(format!("{} does not hash to {expected}", path.display()));
         }
-        match curl::put_conditional(path, &self.write_url(key), content_type, &self.credentials)? {
+        match http::put_conditional(path, &self.write_url(key), content_type, &self.credentials)? {
             status if (200..300).contains(&status) => {}
             412 => {}
             status => return fail(format!("PUT {key}: HTTP {status}")),
         }
-        let stored = curl::get_to_vec(&self.public_url(key))?;
+        let stored = http::get_to_vec(&self.fresh_public_url(key))?;
         if stored != bytes {
             return fail(format!(
                 "read-back of {key} differs from the bytes being published; failing closed"
@@ -1126,8 +1153,8 @@ impl Publisher {
 mod tests {
     use super::*;
     use crate::test_corpus::blake3_bytes;
-    use crate::test_corpus::curl::CURL_PROTO_ENV;
-    use crate::test_corpus::curl::tests::{ENV_LOCK, FakeServer};
+    use crate::test_corpus::http::ALLOW_PLAIN_HTTP_ENV;
+    use crate::test_corpus::http::tests::{ENV_LOCK, FakeServer};
 
     /// A miniature repository: a ledger with three fixtures (two of them
     /// byte-identical), the checked-in toolchain lock, one profile per file
@@ -1231,7 +1258,7 @@ mod tests {
         let alpha_key = format!("/{OBJECTS_PREFIX}{alpha}");
         let beta_key = format!("/{OBJECTS_PREFIX}{beta}");
         // beta is served corrupted: the fetch must refuse it and still place alpha.
-        let routes: Vec<crate::test_corpus::curl::tests::Route> = vec![
+        let routes: Vec<crate::test_corpus::http::tests::Route> = vec![
             (
                 ("GET", Box::leak(manifest_key.into_boxed_str())),
                 (200, manifest_bytes.clone()),
@@ -1246,7 +1273,7 @@ mod tests {
             ),
         ];
         let server = FakeServer::start(routes);
-        unsafe { std::env::set_var(CURL_PROTO_ENV, "=http,https") };
+        unsafe { std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1") };
         let lock = Lock::published(
             &server.base_url,
             &manifest_blake3,
@@ -1320,7 +1347,7 @@ mod tests {
                 .join("crates/unrar-rs/tests/fixtures/rar5/a.rar")
                 .exists()
         );
-        unsafe { std::env::remove_var(CURL_PROTO_ENV) };
+        unsafe { std::env::remove_var(ALLOW_PLAIN_HTTP_ENV) };
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1460,7 +1487,7 @@ mod tests {
         // alpha already exists on the bucket (412) and reads back identical;
         // beta and every document are new: their PUTs land in the store and the
         // read-backs are answered from it.
-        let routes: Vec<crate::test_corpus::curl::tests::Route> = vec![
+        let routes: Vec<crate::test_corpus::http::tests::Route> = vec![
             (
                 ("PUT", leak(format!("/bucket/{OBJECTS_PREFIX}{alpha}"))),
                 (412, Vec::new()),
@@ -1471,8 +1498,15 @@ mod tests {
             ),
         ];
         let server = FakeServer::start_stateful(routes, "/bucket");
+        // The edge already answered "absent" for every key before this run
+        // stored anything — a probe, an earlier attempt, a consumer that was
+        // too early. A publication reads its own writes, so every read it
+        // makes has to reach the bucket rather than that cached miss. This is
+        // the failure a real publish hit: the object was stored, and the bare
+        // URL kept serving 404 (`cf-cache-status: HIT`) for hours.
+        server.cache_every_absence();
         unsafe {
-            std::env::set_var(CURL_PROTO_ENV, "=http,https");
+            std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1");
             std::env::set_var("R2_CORPUS_ACCESS_KEY_ID", "AKIDTEST");
             std::env::set_var("R2_CORPUS_SECRET_ACCESS_KEY", "verysecret");
         }
@@ -1548,7 +1582,7 @@ mod tests {
 
         // Read-back disagreement: the bucket answers 412 (someone else's object
         // under this key) and the public copy is not our bytes.
-        let mut routes: Vec<crate::test_corpus::curl::tests::Route> = Vec::new();
+        let mut routes: Vec<crate::test_corpus::http::tests::Route> = Vec::new();
         routes.push((
             ("PUT", leak(format!("/bucket/{OBJECTS_PREFIX}{alpha}"))),
             (412, Vec::new()),
@@ -1579,7 +1613,7 @@ mod tests {
         );
         drop(requests);
         unsafe {
-            std::env::remove_var(CURL_PROTO_ENV);
+            std::env::remove_var(ALLOW_PLAIN_HTTP_ENV);
             std::env::remove_var("R2_CORPUS_ACCESS_KEY_ID");
             std::env::remove_var("R2_CORPUS_SECRET_ACCESS_KEY");
             for name in [
