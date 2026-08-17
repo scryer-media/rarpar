@@ -1987,13 +1987,20 @@ pub const INPUT_BATCH_BLOCK_BYTES: usize = 32;
 /// Source lanes a caller should block-interleave into one contiguous stream for
 /// [`mul_acc_input_batch_prepared_interleaved`].
 ///
-/// On aarch64 this is [`CLMUL_SRC_GROUP`] — the sources one kernel pass folds
-/// into the destination — so a pass reads exactly one sequential stream plus
-/// its destination: two streams, which even a 2-way L1D holds. Everywhere else
-/// the grouped-input kernels walk one source region at a time and a lane-major
-/// layout is what they want, so the advertised width is 1 (no interleave).
+/// On aarch64 this is [`CLMUL_SRC_GROUP_WIDE`] — the sources the wide kernel
+/// pass folds into the destination — so a full group runs one pass that reads
+/// exactly one sequential stream plus its destination: two streams, which even
+/// a 2-way L1D holds, with the pass's fixed per-block cost divided by sixteen.
+/// The two levers were measured composing on an M5 (single band thread,
+/// eight-volume corpus, medians of five): width 16 beats width 8 by 3.9% on
+/// the fused flavour and 11.8% on the EOR3-merge flavour — width 16 lost to 8
+/// before the wide pass existed, because an eight-source pass over a
+/// sixteen-wide stream reads every other block and skips the rest. Everywhere
+/// else the grouped-input kernels walk one source region at a time and a
+/// lane-major layout is what they want, so the advertised width is 1 (no
+/// interleave).
 #[cfg(target_arch = "aarch64")]
-pub const INPUT_BATCH_INTERLEAVE_LANES: usize = CLMUL_SRC_GROUP;
+pub const INPUT_BATCH_INTERLEAVE_LANES: usize = CLMUL_SRC_GROUP_WIDE;
 #[cfg(not(target_arch = "aarch64"))]
 pub const INPUT_BATCH_INTERLEAVE_LANES: usize = 1;
 
