@@ -193,6 +193,23 @@ impl SourceFingerprint {
     }
 }
 
+/// Sources that will be protected, and the inputs that will not be.
+///
+/// A PAR2 set cannot describe a zero-length file: the format protects slices,
+/// an empty file has none, and its FileDescription packet would claim a slice
+/// range no recovery packet covers. The reference encoder resolves this by
+/// dropping such inputs from the set (`commandline.cpp`, "Ignore all 0 byte
+/// files") and telling the operator it did, on every noise level. Dropping them
+/// silently is the one part of that this crate used to leave out, which meant a
+/// set could protect fewer files than the caller listed with nothing to say so.
+pub(crate) struct CollectedSources {
+    pub(crate) sources: Vec<CreationSource>,
+    /// Inputs excluded because they are zero-length, in the order given, spelled
+    /// the way the caller spelled them rather than canonicalized — this is
+    /// destined for a human who is looking for the name they typed.
+    pub(crate) skipped_empty: Vec<PathBuf>,
+}
+
 /// Resolve and validate explicit source files in input order, reading each
 /// file's identity (length, 16 KiB digest, [`FileId`], slice count).
 ///
@@ -207,7 +224,7 @@ pub(crate) fn collect_sources(
     progress: Option<&ProgressCallback>,
     total_bytes: u64,
     cache: Option<&SourceScanCache>,
-) -> Result<Vec<CreationSource>> {
+) -> Result<CollectedSources> {
     if inputs.is_empty() {
         return Err(Par2Error::InvalidCreationOptions {
             reason: "at least one source file is required".to_string(),
@@ -223,6 +240,7 @@ pub(crate) fn collect_sources(
     }
 
     let mut active_inputs = Vec::with_capacity(inputs.len());
+    let mut skipped_empty = Vec::new();
     for input in inputs {
         if cancellation.is_cancelled() {
             return Err(Par2Error::Cancelled);
@@ -250,6 +268,11 @@ pub(crate) fn collect_sources(
         }
         if metadata.len() > 0 {
             active_inputs.push(input);
+        } else {
+            // Validated exactly like a protected input above — a zero-length
+            // file that is outside the base path or is not a regular file is
+            // still an error, not a skip — and only then set aside.
+            skipped_empty.push(input.clone());
         }
     }
     if active_inputs.is_empty() {
@@ -349,7 +372,10 @@ pub(crate) fn collect_sources(
             });
         }
     }
-    Ok(sources)
+    Ok(CollectedSources {
+        sources,
+        skipped_empty,
+    })
 }
 
 /// Resolve explicit inputs and collect their lengths before selecting a slice size.

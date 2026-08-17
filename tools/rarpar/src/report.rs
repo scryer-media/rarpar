@@ -37,6 +37,10 @@ struct ParCreatePlanReport {
     backend_selected: &'static str,
     memory: ParCreateMemoryReport,
     dry_run: bool,
+    /// Inputs excluded from the set because they are zero-length. A PAR2 set
+    /// cannot describe an empty file, so these get no packets and are invisible
+    /// to verify/repair — consumers must not read the set as covering them.
+    skipped_empty_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +152,7 @@ impl ParCreatePlanReport {
                 controller_overhead_blocks: plan.memory.controller_overhead_blocks,
             },
             dry_run: plan.dry_run,
+            skipped_empty_files: display_paths(&plan.skipped_empty),
         }
     }
 }
@@ -220,6 +225,18 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
 }
 
 pub fn emit_par_create_plan(cli: &Cli, plan: &Par2CreatePlan) -> Result<(), RarparError> {
+    // Not gated on --quiet: an input the set will NOT protect is a warning,
+    // not progress chrome, and the reference tool prints it on every noise
+    // level for the same reason. JSON mode instead carries the list in the
+    // report's `skipped_empty_files`, where a machine consumer will look.
+    if !cli.json {
+        for path in &plan.skipped_empty {
+            eprintln!(
+                "rarpar: skipping empty file (a PAR2 set cannot protect it): {}",
+                path.display()
+            );
+        }
+    }
     if !cli.json && !cli.quiet {
         print_plan_summary(plan);
     }
