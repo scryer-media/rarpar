@@ -1,11 +1,12 @@
 # Changelog
 
-## 0.4.1
 
-This is a patch release from 0.4.0: kernel selection, code-memory accounting,
-new kernels, and one additive entry point for a caller that stages its inputs
-interleaved. No existing public item changed shape or meaning, so it stays
-inside the 0.4.x compatibility range.
+## 0.4.2
+
+This is a patch release from 0.4.1: wider aarch64 CLMUL passes, a
+block-interleaved input-batch layout with one additive entry point, and
+instruction diets on existing kernels. No existing public item changed shape
+or meaning, so it stays inside the 0.4.x compatibility range.
 
 ### Public API
 
@@ -23,29 +24,41 @@ inside the 0.4.x compatibility range.
 - `INPUT_BATCH_BLOCK_BYTES` and `INPUT_BATCH_INTERLEAVE_LANES`: the layout's
   block granularity (32 bytes, the `vld2q`/`vst2q` strip the grouped-input
   kernels step by) and the interleave width a caller should stage for — the
-  aarch64 CLMUL pass's source count, and 1 elsewhere, where the grouped-input
-  kernels walk one source region at a time and lane-major is what they want.
+  sixteen sources the wide aarch64 CLMUL pass folds, and 1 elsewhere, where
+  the grouped-input kernels walk one source region at a time and lane-major
+  is what they want. Sixteen was measured against eight on the interleaved
+  layout once the wide pass existed: +3.9% on the Apple fused flavour and
+  +11.8% on the EOR3-merge flavour, because an eight-source pass over a
+  sixteen-wide stream reads every other block where the wide pass reads the
+  stream densely.
 
 ### Runtime Behavior
 
+- The aarch64 CLMUL input-batch kernels fold sixteen sources into one pass
+  over the destination where they folded eight. The pass's fixed per-block
+  work — the destination `LD2`/`ST2` read-modify-write, the packed Barrett
+  reduction, and the fold — is charged once however many sources it carries,
+  and sixteen divides it twice as far: (32 + 16×12)/16 ≈ 14.0 vector issue
+  slots per source against 138/8 ≈ 17.25. The extra live coefficients spill,
+  and a spill reload is a load-pipe uop on a kernel whose vector pipes are the
+  binding resource (~98% occupancy on a Neoverse V2 model, load pipes half
+  idle). Partial groups keep the eight-source shape, so every width the kernel
+  generated before is emitted unchanged.
 - The aarch64 CLMUL and VTBL grouped-input kernels now take a source *block
   stride*, so they can consume either staging layout. On the lane-major layout
   the emitted loop is instruction-for-instruction what it was — LLVM folds the
   second induction variable away against the constant stride — and the
   interleaved loop pays 8 instructions per 32-byte block at eight sources
   (one `add`, six `mov`, one `ldr`; the 48 `pmull` are unchanged).
-
-- GF(2¹⁶) kernel selection for the accumulate path now mirrors the reference
-  tool's ladder arm for arm: the GFNI affine kernel when GFNI exists, a new
-  512-bit shuffle2x kernel on AVX512BW/VL-without-GFNI silicon (honoring the
-  existing `WEAVER_GF16_SHUFFLE2X_AVX512` pin), the AVX2 XOR-JIT behind the
-  fast-JIT CPU gate, and the 256-bit shuffle kernel as the remaining AVX2
-  fallback. The previous ladder admitted XOR-JIT above the AVX2 line, which
-  measured badly on AVX-512-without-GFNI hosts.
-- The new 512-bit shuffle2x kernel is the split-layout shuffle widened to
-  zmm: two destination blocks per iteration with all 24 table registers
-  resident and a pairwise lane-swap fold. It remains the arm for an odd
-  trailing group.
+- The aarch64 CLMUL kernels emit `PMULL`/`PMULL2` directly through
+  single-instruction inline asm for their high-half products. The intrinsic
+  spelling let LLVM see that each broadcast coefficient's high half equals its
+  low half and rewrite the multiply as `ext` plus a low `pMULL` — two
+  instructions in place of one on three of the six products of every source.
+  Instructions per 256 bytes of source at eight live sources: 191 → 166 on the
+  plain-NEON flavour, 170 → 153 on the EOR3-merge flavour, 157 → 147 on the
+  Apple fused flavour, with every `ext` gone. The reference encoder blocks the
+  same rewrite the same way.
 - Adjacent groups now fuse into a single twelve-source destination pass on
   AVX512BW/VL-without-GFNI silicon, mirroring the reference's multi-region
   shape (`idealInputMultiple` 3 for `SHUFFLE_AVX512`, 6 for
@@ -59,6 +72,32 @@ inside the 0.4.x compatibility range.
   once per twelve sources instead of once per six. Same arithmetic, same
   bytes; `WEAVER_GF16_SHUFFLE2X_PAIR=0` pins the previous single-group loop
   shape for A/B.
+- `WEAVER_GF16_CLMUL_APPLE_FUSION=0` selects the non-Apple EOR3-merge SHA3
+  flavour on Apple silicon, which also has FEAT_SHA3, so the flavour a
+  Neoverse part runs can be disassembled and A/B'd there. Off Apple there is
+  only one SHA3 flavour and the check folds away; the environment is never
+  read.
+
+## 0.4.1
+
+This is a patch release from 0.4.0: kernel selection, code-memory accounting,
+and a new kernel, all behind the existing public surface. No public item
+changed shape, so it stays inside the 0.4.x compatibility range.
+
+### Runtime Behavior
+
+- GF(2¹⁶) kernel selection for the accumulate path now mirrors the reference
+  tool's ladder arm for arm: the GFNI affine kernel when GFNI exists, a new
+  512-bit shuffle2x kernel on AVX512BW/VL-without-GFNI silicon (honoring the
+  existing `WEAVER_GF16_SHUFFLE2X_AVX512` pin), the AVX2 XOR-JIT behind the
+  fast-JIT CPU gate, and the 256-bit shuffle kernel as the remaining AVX2
+  fallback. The previous ladder admitted XOR-JIT above the AVX2 line, which
+  measured badly on AVX-512-without-GFNI hosts.
+- The new 512-bit shuffle2x kernel is the split-layout shuffle widened to
+  zmm: two destination blocks per iteration with all 24 table registers
+  resident and a pairwise lane-swap fold, single-group by register math (the
+  shuffle needs 4 table registers per source where affine needs 2, so the
+  GFNI pair shape cannot fit).
 - The AVX2 XOR-JIT builds ONE sealed multi-row batch per input batch and
   recycles it across stripes — never a build per output row. The coefficient
   rows depend only on the input batch and the recovery exponents, never the

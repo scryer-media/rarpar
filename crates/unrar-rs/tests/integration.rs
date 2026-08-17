@@ -6704,9 +6704,11 @@ fn rar4_grouped_solid_members_extract_exactly_through_the_shared_decoder() {
     // Out-of-order single-member extraction across the reset boundary:
     // member 2 is a reset point; member 3 depends on it. Fresh archive per
     // probe so each starts with a cold solid cursor.
-    for (index, (name, expected_sha)) in
-        [(2usize, EXPECTED[2]), (3usize, EXPECTED[3]), (1usize, EXPECTED[1])]
-    {
+    for (index, (name, expected_sha)) in [
+        (2usize, EXPECTED[2]),
+        (3usize, EXPECTED[3]),
+        (1usize, EXPECTED[1]),
+    ] {
         let file = std::fs::File::open(&fixture).unwrap();
         let mut archive = unrar_rs::RarArchive::open(file).unwrap();
         let data = archive

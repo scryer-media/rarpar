@@ -3,6 +3,40 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.3.2
+
+### CLI Changes
+
+- `par create` now warns on stderr for every zero-length input it excludes
+  from the set (`skipping empty file (a PAR2 set cannot protect it): …`), on
+  every noise level including `--quiet` — the same unconditional report
+  `par2cmdline` gives, because an input the set will not protect is a warning,
+  not progress chrome. `--json` reports the same list as the plan's
+  `skipped_empty_files`. The exclusion itself is unchanged and matches the
+  reference tool; details in the `par2-rs` changelog.
+
+### Performance
+
+- PAR2 creation now beats `par2cmdline-turbo` on every ARM class in the bench
+  fleet: 1.22× on Cortex-A72 (was 0.54×), 1.10× on Neoverse V2 (was 0.77×),
+  1.01× on Neoverse N1 (was 0.74×), and extends Zen 4 to 1.16× (>1 =
+  `rarpar` faster), byte-identical sets throughout. The levers are a
+  de-aliased, block-interleaved staging layout feeding sixteen-source CLMUL
+  passes, a stripe-major banded pipeline with source hashing fused onto the
+  encode bands, and a create-side kernel ladder correction on Zen 2; details
+  in the `par2-rs` and `reedsolomon-rs` changelogs.
+- Solid RAR4 archives no longer decode their first member twice (up to −33%
+  wall on small solid PPMd archives); details in the `unrar-rs` changelog.
+
+### Libraries
+
+- `reedsolomon-rs` moves to 0.4.2. See
+  [its changelog](crates/reedsolomon-rs/CHANGELOG.md).
+- `unrar-rs` moves to 0.5.4. See
+  [its changelog](crates/unrar-rs/CHANGELOG.md).
+- `par2-rs` moves to 0.4.2. See
+  [its changelog](crates/par2-rs/CHANGELOG.md).
+
 ## rarpar 0.3.1
 
 ### CLI Changes
