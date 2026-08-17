@@ -55,7 +55,7 @@ and manifest keys, lock pins, the toolchain lock's archive pins and the tool
 mirror's keys — is a 32-byte BLAKE3 digest in lowercase hex. SHA-256 survives
 only where something else specifies it: the `oid sha256:` line of a Git LFS
 pointer, the `@sha256:` digest of an OCI image reference, the SigV4 signature
-curl computes for an S3 PUT, whatever Sigstore and cosign do internally, and
+an S3 PUT carries, whatever Sigstore and cosign do internally, and
 the benchmark corpus's own `fixture_sha256` contract, which existing fleet
 evidence is recorded against. Each of those sites says so in a comment where it
 appears.
@@ -333,16 +333,47 @@ cargo run --locked -p xtask -- bench payload video --profile ffmpeg-video --targ
 cargo run --locked -p xtask -- bench toolchains resolve --mirror-base https://<public R2 domain>
 ```
 
-`fetch` and `publish` speak HTTP through `curl` (already required by the
-harness's Docker builds and present on every CI runner). `publish` uses curl's
-native SigV4 (`--aws-sigv4 aws:amz:auto:s3`) against the R2 S3 endpoint with
+`fetch` and `publish` speak HTTP natively, through a blocking rustls client in
+`xtask/src/test_corpus/http.rs` — no subprocess, and no system TLS library for
+CI to provide. The transport policy is stated and tested in that module rather
+than inherited from a command line: https only (plain http is refused unless
+the escape hatch is set *and* the far end is a loopback address, which is how
+the tests reach their local server), no redirects followed, bounded retries on
+transient failures, a connect timeout, and per-URL statuses from a batch
+download so one missing object cannot abort the other 374.
+
+`publish` signs its writes with AWS Signature Version 4
+(`xtask/src/test_corpus/sigv4.rs`) against the R2 S3 endpoint with
 `If-None-Match: *`, so a key is created at most once; a `412 Precondition
 Failed` is followed by a public read-back that must match the digest, and any
-mismatch aborts the publication. Publishing a manifest that is already published is an
-idempotent re-verification: its objects are read back, the first publication's
-provenance and signatures are kept, and the printed lock entry names that first
-publication. Signatures come from `cosign` (keyless, GitHub
-OIDC); no crypto is implemented in this repository for the corpus.
+mismatch aborts the publication. The secret is an HMAC key inside the process
+and nothing else — never an argument, a header value, an error message, or
+`Debug` output — and the signing is held to the published AWS test vector.
+Publishing a manifest that is already published is an idempotent
+re-verification: its objects are read back, the first publication's provenance
+and signatures are kept, and the printed lock entry names that first
+publication.
+
+**Every read a publication makes of its own writes carries a cache-busting
+token** (`?rarpar-read-back=…`). A publication asks whether a key exists before
+writing it; on a first publication that answers "absent", and an edge is free
+to cache that answer — so a read-back of the bare URL is served the stale miss
+and concludes the upload never landed. Measured on the live endpoint, hours
+after a successful upload: the bare URL returned `404` with
+`cf-cache-status: HIT`, the same URL with a token returned `200` and the object.
+A cache key covers the query string, so an unseen token has no stored answer,
+while object storage ignores a query it was not asked about. Consumers are
+deliberately *not* given tokens: their keys are digests, so a cache hit is the
+object by construction.
+
+**Signatures remain `cosign` subprocesses** (keyless, GitHub OIDC), and that is
+a deliberate choice rather than an unfinished migration. The bundle format is
+the interop contract this corpus promises — anyone can verify a manifest with
+`cosign verify-blob` under the pinned identity — the workflow pins the binary
+version so signatures stay comparable across publications, and a
+reimplementation could only lose on both counts. SigV4 above is the one piece
+of cryptography this repository performs for the corpus, and only because an
+S3 PUT cannot be made without it.
 
 ## The publish workflow
 
