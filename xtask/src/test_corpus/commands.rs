@@ -5,12 +5,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::curl::{self, Download, S3Credentials};
+use super::http::{self, Download};
 use super::ledger::{Finding, Ledger};
 use super::lock::Lock;
 use super::manifest::{Manifest, Provenance, ToolchainLock};
 use super::profiles::ProfilesFile;
 use super::sigstore;
+use super::sigv4::S3Credentials;
 use super::{
     LEDGER_FILE, LOCK_FILE, MANIFESTS_PREFIX, OBJECTS_PREFIX, PROFILES_FILE, Result,
     TOOLCHAINS_FILE, blake3_bytes, digest_file, fail, next_path, next_string, repo_path,
@@ -77,9 +78,9 @@ Usage:
       Hydrate the named profiles from the locked manifest into the tree,
       verifying every object digest. Fails before Cargo when anything is missing.
   cargo run -p xtask -- test-corpus hydrate --profile NAME [--profile NAME]... [--parallel N]
-      What CI runs before Cargo: `fetch` when test-corpus/lock.json pins a
-      published manifest, otherwise a verified `git lfs pull` of the same
-      profiles. Either way every fixture is digest-checked and a shortfall fails.
+      What CI runs before Cargo: `fetch` of the named profiles from the
+      published manifest test-corpus/lock.json pins. Every fixture is
+      digest-checked and a shortfall fails before any test.
   cargo run -p xtask -- test-corpus sign --dir DIR
       Sign DIR/manifest.json and DIR/provenance.json keyless with cosign under
       the ambient OIDC identity (publish workflow only).
@@ -120,110 +121,25 @@ fn hydrate(root: &Path, args: Vec<OsString>) -> Result<()> {
         return fail("hydrate requires at least one --profile");
     }
     let lock = Lock::load(&repo_path(root, LOCK_FILE))?;
-    if !lock.is_unpublished() {
-        let mut forwarded: Vec<OsString> = Vec::new();
-        for profile in &profiles {
-            forwarded.push("--profile".into());
-            forwarded.push(profile.into());
-        }
-        forwarded.push("--parallel".into());
-        forwarded.push(parallel.to_string().into());
-        return fetch(root, forwarded);
-    }
-
-    // Legacy transport: Git LFS, with the profile globs as the include set (the
-    // profile vocabulary is the `git lfs pull --include` vocabulary).
-    let inputs = load_inputs(root)?;
-    let pulls = lfs_pull_plan(&inputs.profiles, &profiles)?;
-    let resolved = inputs.profiles.resolve(&inputs.ledger.paths())?;
-    let mut wanted: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
-    for name in &profiles {
-        wanted.extend(&resolved[name]);
-    }
-    println!(
-        "test-corpus hydrate: no published manifest pinned; pulling profiles [{}] ({} files) through Git LFS",
-        profiles.join(", "),
-        wanted.len()
-    );
-    let git = |args: &[&str]| -> Result<()> {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .map_err(|source| super::error(format!("run git {}: {source}", args.join(" "))))?;
-        if !status.success() {
-            return fail(format!("git {} failed ({status})", args.join(" ")));
-        }
-        Ok(())
-    };
-    git(&["lfs", "install", "--local"])?;
-    for (include_arg, exclude_arg) in &pulls {
-        git(&["lfs", "pull", include_arg, exclude_arg])?;
-    }
-
-    // Verify against the ledger, not against a pointer prefix: every wanted
-    // file present, real bytes, right digest.
-    let wanted_count = wanted.len();
-    let mut failures = Vec::new();
-    for path in wanted {
-        let Some(entry) = inputs.ledger.files.iter().find(|entry| &entry.path == path) else {
-            failures.push(format!(
-                "{path}: resolved by a profile but has no ledger entry"
-            ));
-            continue;
-        };
-        let file = repo_path(root, path);
-        match digest_file(&file) {
-            Err(err) => failures.push(format!("{path}: {err}")),
-            Ok(digest) if digest.lfs_pointer => {
-                failures.push(format!("{path}: still a Git LFS pointer after pull"))
-            }
-            Ok(digest) if digest.blake3 != entry.blake3 || digest.size != entry.size => failures
-                .push(format!(
-                    "{path}: hydrated bytes hash to {} ({} bytes), ledger says {} ({} bytes)",
-                    digest.blake3, digest.size, entry.blake3, entry.size
-                )),
-            Ok(_) => {}
-        }
-    }
-    if !failures.is_empty() {
-        failures.sort();
-        return fail(format!(
-            "test-corpus hydrate: {} fixture(s) not hydrated\n  {}",
-            failures.len(),
-            failures.join("\n  ")
-        ));
-    }
-    println!(
-        "test-corpus hydrate: {wanted_count} fixture(s) present and verified against the ledger"
-    );
-    Ok(())
-}
-
-/// The `git lfs pull` argument pairs the named profiles need: one
-/// `(--include, --exclude)` pull per profile, never one pull over merged
-/// patterns. An exclude belongs to the profile that declares it, so merging
-/// would let `rar34`'s exclusions cancel `rar12`'s includes whenever both are
-/// asked for on one command line — and the ledger check afterwards would then
-/// fail on files the caller legitimately asked for.
-fn lfs_pull_plan(profiles: &ProfilesFile, names: &[String]) -> Result<Vec<(String, String)>> {
-    let mut pulls: Vec<(String, String)> = Vec::new();
-    for name in names {
-        let profile = profiles.profiles.get(name).ok_or_else(|| {
-            super::error(format!(
-                "profile {name:?} is not defined in {PROFILES_FILE}"
-            ))
-        })?;
-        let pull = (
-            format!("--include={}", profile.include.join(",")),
-            format!("--exclude={}", profile.exclude.join(",")),
+    if lock.is_unpublished() {
+        // There is deliberately no fallback here. Git LFS was the bridge
+        // transport while no corpus had been published; it is gone, and the
+        // corpus hydrates only from a published, signed revision the lock
+        // pins. An empty lock is a broken repository state, not a mode.
+        return fail(
+            "test-corpus/lock.json pins no published manifest, so there is nothing to hydrate \
+             from: the corpus exists only as its published, signed revisions. Pin one through \
+             a reviewed PR, or produce a tree locally with `test-corpus generate`.",
         );
-        if !pulls.contains(&pull) {
-            pulls.push(pull);
-        }
     }
-    Ok(pulls)
+    let mut forwarded: Vec<OsString> = Vec::new();
+    for profile in &profiles {
+        forwarded.push("--profile".into());
+        forwarded.push(profile.into());
+    }
+    forwarded.push("--parallel".into());
+    forwarded.push(parallel.to_string().into());
+    fetch(root, forwarded)
 }
 
 // ----------------------------------------------------------------- sign ----
@@ -462,7 +378,7 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
             ));
         }
         if !offline {
-            match curl::get_to_vec(&lock.manifest.url) {
+            match http::get_to_vec(&lock.manifest.url) {
                 Err(err) => problems.push(format!("published manifest unavailable: {err}")),
                 Ok(published) => {
                     let published_digest = blake3_bytes(&published);
@@ -517,7 +433,7 @@ fn verify_signature(lock: &Lock, manifest_bytes: &[u8]) -> Result<()> {
     if !sigstore::cosign_available() {
         return fail("cosign is not installed (install cosign, or set RARPAR_COSIGN)");
     }
-    let bundle = curl::get_to_vec(&lock.signature.bundle_url)?;
+    let bundle = http::get_to_vec(&lock.signature.bundle_url)?;
     let dir = std::env::temp_dir().join(format!("rarpar-corpus-verify-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let manifest_path = dir.join("manifest.json");
@@ -621,7 +537,7 @@ fn fetch(root: &Path, args: Vec<OsString>) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let transfers = curl::get_many(&downloads, parallel)?;
+    let transfers = http::get_many(&downloads, parallel)?;
     // Verify every downloaded object once, by digest.
     let mut verified: BTreeMap<&String, std::result::Result<(), String>> = BTreeMap::new();
     for (blake3, temp) in &by_digest {
@@ -733,7 +649,7 @@ fn locked_manifest(root: &Path, lock: &Lock) -> Result<Manifest> {
         }
         let _ = fs::remove_file(&cache);
     }
-    let bytes = curl::get_to_vec(&lock.manifest.url)?;
+    let bytes = http::get_to_vec(&lock.manifest.url)?;
     let digest = blake3_bytes(&bytes);
     if digest != lock.manifest.blake3 {
         return fail(format!(
@@ -895,7 +811,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
     let provenance_key = format!("{MANIFESTS_PREFIX}{manifest_blake3}.provenance.json");
     let lock = match publisher.already_published(&manifest_key, &manifest_bytes)? {
         Some(()) => {
-            let existing = curl::get_to_vec(&publisher.public_url(&provenance_key))?;
+            let existing = http::get_to_vec(&publisher.fresh_public_url(&provenance_key))?;
             let existing_provenance: Provenance =
                 serde_json::from_slice(&existing).map_err(|err| {
                     super::error(format!("published provenance is unreadable: {err}"))
@@ -910,7 +826,7 @@ fn publish(root: &Path, args: Vec<OsString>) -> Result<()> {
                 format!("{manifest_key}.sigstore.json"),
                 format!("{provenance_key}.sigstore.json"),
             ] {
-                curl::get_to_vec(&publisher.public_url(&bundle)).map_err(|err| {
+                http::get_to_vec(&publisher.fresh_public_url(&bundle)).map_err(|err| {
                     super::error(format!("published bundle {bundle} is missing: {err}"))
                 })?;
             }
@@ -975,9 +891,35 @@ struct Publisher {
     credentials: S3Credentials,
 }
 
+/// A counter that makes every read-back URL in this process distinct, so two
+/// objects (or a retry of one) can never share a cache key.
+fn read_back_sequence() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Publisher {
     fn public_url(&self, key: &str) -> String {
         format!("{}/{key}", self.base_url)
+    }
+
+    /// The public URL with a token no cache has answered before.
+    ///
+    /// A read-back reads this process's own write, through whatever sits in
+    /// front of the bucket. If that URL was requested while the object was
+    /// still absent — a probe, an earlier attempt, a consumer that was too
+    /// early — the "absent" can itself be cached, and the read-back would be
+    /// served it and conclude the upload never landed. A cache key covers the
+    /// query string, so an unseen token cannot have a stored answer, while
+    /// object storage ignores a query it was not asked about.
+    fn fresh_public_url(&self, key: &str) -> String {
+        format!(
+            "{}?rarpar-read-back={}-{}",
+            self.public_url(key),
+            std::process::id(),
+            read_back_sequence()
+        )
     }
 
     fn write_url(&self, key: &str) -> String {
@@ -989,7 +931,7 @@ impl Publisher {
     /// replacement.
     fn put_object(&self, blake3: &str, path: &Path, size: u64) -> Result<PutOutcome> {
         let key = format!("{OBJECTS_PREFIX}{blake3}");
-        match curl::put_conditional(
+        match http::put_conditional(
             path,
             &self.write_url(&key),
             "application/octet-stream",
@@ -1012,7 +954,7 @@ impl Publisher {
             "rarpar-corpus-readback-{}-{blake3}",
             std::process::id()
         ));
-        curl::get_to_file(&self.public_url(key), &temp)?;
+        http::get_to_file(&self.fresh_public_url(key), &temp)?;
         let digest = digest_file(&temp);
         let _ = fs::remove_file(&temp);
         let digest = digest?;
@@ -1034,7 +976,7 @@ impl Publisher {
             std::process::id(),
             blake3_bytes(key.as_bytes())
         ));
-        match curl::get_to_file(&self.public_url(key), &temp) {
+        match http::get_to_file(&self.fresh_public_url(key), &temp) {
             Err(_) => Ok(None),
             Ok(()) => {
                 let existing = fs::read(&temp)?;
@@ -1065,12 +1007,12 @@ impl Publisher {
         {
             return fail(format!("{} does not hash to {expected}", path.display()));
         }
-        match curl::put_conditional(path, &self.write_url(key), content_type, &self.credentials)? {
+        match http::put_conditional(path, &self.write_url(key), content_type, &self.credentials)? {
             status if (200..300).contains(&status) => {}
             412 => {}
             status => return fail(format!("PUT {key}: HTTP {status}")),
         }
-        let stored = curl::get_to_vec(&self.public_url(key))?;
+        let stored = http::get_to_vec(&self.fresh_public_url(key))?;
         if stored != bytes {
             return fail(format!(
                 "read-back of {key} differs from the bytes being published; failing closed"
@@ -1126,8 +1068,8 @@ impl Publisher {
 mod tests {
     use super::*;
     use crate::test_corpus::blake3_bytes;
-    use crate::test_corpus::curl::CURL_PROTO_ENV;
-    use crate::test_corpus::curl::tests::{ENV_LOCK, FakeServer};
+    use crate::test_corpus::http::ALLOW_PLAIN_HTTP_ENV;
+    use crate::test_corpus::http::tests::{ENV_LOCK, FakeServer};
 
     /// A miniature repository: a ledger with three fixtures (two of them
     /// byte-identical), the checked-in toolchain lock, one profile per file
@@ -1181,44 +1123,6 @@ mod tests {
     /// The LFS fallback pulls each profile on its own terms. Merging the
     /// patterns would drop `rar12`'s archives whenever `rar34` — which excludes
     /// exactly those paths from the shared `rar4/` directory — is asked for in
-    /// the same command.
-    #[test]
-    fn the_lfs_pull_plan_keeps_each_profiles_excludes_to_itself() {
-        let profiles: ProfilesFile = serde_json::from_str(
-            r#"{"schema_version":1,"profiles":{
-                "rar12":{"include":["f/rar4/rar15_lz.rar","f/originals/**"]},
-                "rar34":{"include":["f/rar4/**","f/originals/**"],"exclude":["f/rar4/rar15_lz.rar"]},
-                "rar57":{"include":["f/rar5/**"]}
-            }}"#,
-        )
-        .unwrap();
-        let plan = lfs_pull_plan(
-            &profiles,
-            &["rar12".to_owned(), "rar34".to_owned(), "rar12".to_owned()],
-        )
-        .unwrap();
-        assert_eq!(
-            plan,
-            vec![
-                (
-                    "--include=f/rar4/rar15_lz.rar,f/originals/**".to_owned(),
-                    "--exclude=".to_owned()
-                ),
-                (
-                    "--include=f/rar4/**,f/originals/**".to_owned(),
-                    "--exclude=f/rar4/rar15_lz.rar".to_owned()
-                ),
-            ],
-            "one pull per distinct profile, excludes never merged"
-        );
-        let plan = lfs_pull_plan(&profiles, &["rar57".to_owned()]).unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(
-            plan[0].1, "--exclude=",
-            "an empty exclude is a no-op filter"
-        );
-        assert!(lfs_pull_plan(&profiles, &["nope".to_owned()]).is_err());
-    }
 
     #[test]
     fn fetch_hydrates_verifies_dedupes_and_fails_closed() {
@@ -1231,7 +1135,7 @@ mod tests {
         let alpha_key = format!("/{OBJECTS_PREFIX}{alpha}");
         let beta_key = format!("/{OBJECTS_PREFIX}{beta}");
         // beta is served corrupted: the fetch must refuse it and still place alpha.
-        let routes: Vec<crate::test_corpus::curl::tests::Route> = vec![
+        let routes: Vec<crate::test_corpus::http::tests::Route> = vec![
             (
                 ("GET", Box::leak(manifest_key.into_boxed_str())),
                 (200, manifest_bytes.clone()),
@@ -1246,7 +1150,7 @@ mod tests {
             ),
         ];
         let server = FakeServer::start(routes);
-        unsafe { std::env::set_var(CURL_PROTO_ENV, "=http,https") };
+        unsafe { std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1") };
         let lock = Lock::published(
             &server.base_url,
             &manifest_blake3,
@@ -1320,7 +1224,7 @@ mod tests {
                 .join("crates/unrar-rs/tests/fixtures/rar5/a.rar")
                 .exists()
         );
-        unsafe { std::env::remove_var(CURL_PROTO_ENV) };
+        unsafe { std::env::remove_var(ALLOW_PLAIN_HTTP_ENV) };
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1460,7 +1364,7 @@ mod tests {
         // alpha already exists on the bucket (412) and reads back identical;
         // beta and every document are new: their PUTs land in the store and the
         // read-backs are answered from it.
-        let routes: Vec<crate::test_corpus::curl::tests::Route> = vec![
+        let routes: Vec<crate::test_corpus::http::tests::Route> = vec![
             (
                 ("PUT", leak(format!("/bucket/{OBJECTS_PREFIX}{alpha}"))),
                 (412, Vec::new()),
@@ -1471,8 +1375,15 @@ mod tests {
             ),
         ];
         let server = FakeServer::start_stateful(routes, "/bucket");
+        // The edge already answered "absent" for every key before this run
+        // stored anything — a probe, an earlier attempt, a consumer that was
+        // too early. A publication reads its own writes, so every read it
+        // makes has to reach the bucket rather than that cached miss. This is
+        // the failure a real publish hit: the object was stored, and the bare
+        // URL kept serving 404 (`cf-cache-status: HIT`) for hours.
+        server.cache_every_absence();
         unsafe {
-            std::env::set_var(CURL_PROTO_ENV, "=http,https");
+            std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1");
             std::env::set_var("R2_CORPUS_ACCESS_KEY_ID", "AKIDTEST");
             std::env::set_var("R2_CORPUS_SECRET_ACCESS_KEY", "verysecret");
         }
@@ -1548,7 +1459,7 @@ mod tests {
 
         // Read-back disagreement: the bucket answers 412 (someone else's object
         // under this key) and the public copy is not our bytes.
-        let mut routes: Vec<crate::test_corpus::curl::tests::Route> = Vec::new();
+        let mut routes: Vec<crate::test_corpus::http::tests::Route> = Vec::new();
         routes.push((
             ("PUT", leak(format!("/bucket/{OBJECTS_PREFIX}{alpha}"))),
             (412, Vec::new()),
@@ -1579,7 +1490,7 @@ mod tests {
         );
         drop(requests);
         unsafe {
-            std::env::remove_var(CURL_PROTO_ENV);
+            std::env::remove_var(ALLOW_PLAIN_HTTP_ENV);
             std::env::remove_var("R2_CORPUS_ACCESS_KEY_ID");
             std::env::remove_var("R2_CORPUS_SECRET_ACCESS_KEY");
             for name in [

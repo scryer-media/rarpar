@@ -1,12 +1,13 @@
 # The test corpus
 
 The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
-`crates/par2-rs/tests/fixtures/` are the **test corpus**: 369 archives, parity
+`crates/par2-rs/tests/fixtures/` are the **test corpus**: 375 archives, parity
 sets, SFX modules, video inputs and originals that the unit, integration, slow,
 PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
-content-addressed object set on Cloudflare R2 and hydrated by `xtask`; Git LFS
-is the legacy transport and is removed once a published corpus is pinned (see
-[Migration](#migration)).
+content-addressed object set on Cloudflare R2 and hydrated by `xtask`. The
+repository carries no fixture bytes: the published, signed revision the lock
+pins is the only source, and Git LFS — the bridge transport while nothing had
+been published — is gone (see [Migration](#migration) for the record).
 
 The corpus is **generated, never carried forward**. Every fixture is either
 written by a checked-in recipe running on the shared pinned toolchain, or
@@ -55,7 +56,7 @@ and manifest keys, lock pins, the toolchain lock's archive pins and the tool
 mirror's keys — is a 32-byte BLAKE3 digest in lowercase hex. SHA-256 survives
 only where something else specifies it: the `oid sha256:` line of a Git LFS
 pointer, the `@sha256:` digest of an OCI image reference, the SigV4 signature
-curl computes for an S3 PUT, whatever Sigstore and cosign do internally, and
+an S3 PUT carries, whatever Sigstore and cosign do internally, and
 the benchmark corpus's own `fixture_sha256` contract, which existing fleet
 evidence is recorded against. Each of those sites says so in a comment where it
 appears.
@@ -211,8 +212,10 @@ per file, overlapping profiles cost nothing extra to store or publish.
 }
 ```
 
-An empty `manifest.blake3` means no corpus has been published yet; `fetch`
-refuses to run and CI keeps hydrating from LFS until the lock is populated.
+An empty `manifest.blake3` means no corpus revision is pinned; `fetch` and
+`hydrate` refuse to run — there is deliberately no other source of fixture
+bytes. (Produce a tree locally with `test-corpus generate` if you are working
+on the recipes themselves.)
 
 ## The published objects
 
@@ -261,9 +264,13 @@ git commit ──► test-corpus/lock.json ──► manifest.blake3 ──► m
 - The tool-source mirror in the benchmark harness fails closed: an object that
   is present on R2 but has a wrong digest, an invalid signature, a signer other
   than the publish workflow, or provenance that disagrees with the lock is an
-  error. It is neither replaced nor silently bypassed; only *absence* (HTTP
-  404) or retry-exhausted unavailability falls back to the official RARLAB URL,
-  and that download must still match the reviewed BLAKE3 digest before it is used.
+  error. It is neither replaced nor silently bypassed. Three conditions fall
+  back to the official RARLAB URL: *absence* (HTTP 404), *refusal* (401, 403,
+  410 — a bucket that is not public yet, or an edge rule that will not answer
+  this client; the first publication depends on this, since nothing is mirrored
+  when it starts), and retry-exhausted unavailability. None of them yields
+  bytes, and the download that replaces them must still match the reviewed
+  BLAKE3 digest before it is used.
 
 ## Commands
 
@@ -299,9 +306,8 @@ cargo run --locked -p xtask -- test-corpus paths --all
 # evidence is recorded against — and are the one digest here that is not BLAKE3:
 cargo run --locked -p xtask -- test-corpus bench-pins [--out FILE]
 
-# What CI and developers run before Cargo: fetch from the pinned corpus, or —
-# while the lock pins nothing — a verified `git lfs pull` of the same profiles.
-# Fails when anything is missing, still a pointer, or has the wrong digest.
+# What CI and developers run before Cargo: fetch from the pinned, signed
+# corpus. Fails when anything is missing or has the wrong digest.
 cargo run --locked -p xtask -- test-corpus hydrate --profile rar34 --profile rar57
 cargo run --locked -p xtask -- test-corpus hydrate --profile unit
 
@@ -329,16 +335,47 @@ cargo run --locked -p xtask -- bench payload video --profile ffmpeg-video --targ
 cargo run --locked -p xtask -- bench toolchains resolve --mirror-base https://<public R2 domain>
 ```
 
-`fetch` and `publish` speak HTTP through `curl` (already required by the
-harness's Docker builds and present on every CI runner). `publish` uses curl's
-native SigV4 (`--aws-sigv4 aws:amz:auto:s3`) against the R2 S3 endpoint with
+`fetch` and `publish` speak HTTP natively, through a blocking rustls client in
+`xtask/src/test_corpus/http.rs` — no subprocess, and no system TLS library for
+CI to provide. The transport policy is stated and tested in that module rather
+than inherited from a command line: https only (plain http is refused unless
+the escape hatch is set *and* the far end is a loopback address, which is how
+the tests reach their local server), no redirects followed, bounded retries on
+transient failures, a connect timeout, and per-URL statuses from a batch
+download so one missing object cannot abort the other 374.
+
+`publish` signs its writes with AWS Signature Version 4
+(`xtask/src/test_corpus/sigv4.rs`) against the R2 S3 endpoint with
 `If-None-Match: *`, so a key is created at most once; a `412 Precondition
 Failed` is followed by a public read-back that must match the digest, and any
-mismatch aborts the publication. Publishing a manifest that is already published is an
-idempotent re-verification: its objects are read back, the first publication's
-provenance and signatures are kept, and the printed lock entry names that first
-publication. Signatures come from `cosign` (keyless, GitHub
-OIDC); no crypto is implemented in this repository for the corpus.
+mismatch aborts the publication. The secret is an HMAC key inside the process
+and nothing else — never an argument, a header value, an error message, or
+`Debug` output — and the signing is held to the published AWS test vector.
+Publishing a manifest that is already published is an idempotent
+re-verification: its objects are read back, the first publication's provenance
+and signatures are kept, and the printed lock entry names that first
+publication.
+
+**Every read a publication makes of its own writes carries a cache-busting
+token** (`?rarpar-read-back=…`). A publication asks whether a key exists before
+writing it; on a first publication that answers "absent", and an edge is free
+to cache that answer — so a read-back of the bare URL is served the stale miss
+and concludes the upload never landed. Measured on the live endpoint, hours
+after a successful upload: the bare URL returned `404` with
+`cf-cache-status: HIT`, the same URL with a token returned `200` and the object.
+A cache key covers the query string, so an unseen token has no stored answer,
+while object storage ignores a query it was not asked about. Consumers are
+deliberately *not* given tokens: their keys are digests, so a cache hit is the
+object by construction.
+
+**Signatures remain `cosign` subprocesses** (keyless, GitHub OIDC), and that is
+a deliberate choice rather than an unfinished migration. The bundle format is
+the interop contract this corpus promises — anyone can verify a manifest with
+`cosign verify-blob` under the pinned identity — the workflow pins the binary
+version so signatures stay comparable across publications, and a
+reimplementation could only lose on both counts. SigV4 above is the one piece
+of cryptography this repository performs for the corpus, and only because an
+S3 PUT cannot be made without it.
 
 ## The publish workflow
 
@@ -434,23 +471,26 @@ generates, verifies, validates, builds and signs without uploading.
 
 ## Migration
 
-1. Land the tooling with an empty lock. Every CI lane already hydrates through
-   `test-corpus hydrate --profile …`, which — with nothing pinned — pulls the
-   same profiles through Git LFS and verifies them against the ledger.
-2. An operator dispatches the publish workflow from `main`. It **generates** the
-   first corpus revision from the recipes and the pinned upstreams, validates it
-   with the suites, publishes it, and prints the lock entry alongside the
-   refreshed ledger and the moved benchmark pins.
-3. A reviewed PR pins that manifest in `lock.json` **and** commits the
-   `test-corpus/sources.json` and `bench/rarpar-bench/config/corpus.json`
-   `fixture_sha256` values from that run — the three move together, because the
-   published bytes are the ones the ledger and the benchmark pins describe. From
-   that commit on, `hydrate` fetches from R2 instead of LFS, in every lane, with
-   no other CI change; the PR must pass from a clean checkout **without Git
-   LFS**.
-4. Only after that PR is merged are the LFS pointers, `.gitattributes` rules
-   and LFS hooks removed, in a follow-up that also proves a fresh clone without
-   `git-lfs` can hydrate and validate every profile.
+Complete, in the order the plan required. The record, because the constraints
+only make sense against it:
+
+1. The tooling landed with an empty lock; every CI lane hydrated through
+   `test-corpus hydrate --profile …`, which pulled the same profiles through
+   Git LFS — the bridge transport — and verified them against the ledger.
+2. An operator dispatched the publish workflow from `main`
+   ([run 32049608340](https://github.com/scryer-media/rarpar/actions/runs/32049608340)):
+   it generated the first corpus revision from the recipes and the pinned
+   upstreams, validated it with the suites, and published manifest
+   `26eb35b9…` — 375 objects, signed on `refs/heads/main`.
+3. A reviewed PR pinned that manifest in `lock.json` and committed the
+   refreshed `sources.json` and the moved benchmark `fixture_sha256` values
+   together, after the whole chain — hydration, recomputed manifest,
+   signature — was verified from a cold client. From that commit `hydrate`
+   fetched from R2 in every lane.
+4. The LFS pointers, the `.gitattributes` rules and the LFS fallback in
+   `hydrate` were then removed. The repository carries no fixture bytes; the
+   hygiene lane refuses any attributes file that reintroduces an `lfs`
+   filter and any pointer blob committed where fixture bytes belong.
 
 ## Regenerating fixtures
 

@@ -19,5 +19,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "par2_verify_repair"
+path = "fuzz_targets/par2_verify_repair.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = []

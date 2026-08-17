@@ -1,0 +1,32 @@
+# libFuzzer dictionary for the PAR2 targets.
+#
+# The PAR2 specification is public and the format is almost entirely
+# fixed-width tokens: an 8-byte packet magic followed by a 16-byte type. A
+# mutator that has to find those by chance never gets past the first packet;
+# with them it can start rearranging real packet streams, which is where the
+# interesting arithmetic lives.
+
+# Packet framing
+packet_magic="PAR2\x00PKT"
+version="PAR 2.0\x00"
+
+# Packet types (16 bytes each, space padded, as the spec writes them)
+type_main="PAR 2.0\x00Main\x00\x00\x00\x00"
+type_file_desc="PAR 2.0\x00FileDesc"
+type_ifsc="PAR 2.0\x00IFSC\x00\x00\x00\x00"
+type_recovery="PAR 2.0\x00RecvSlic"
+type_creator="PAR 2.0\x00Creator\x00"
+type_unicode_name="PAR 2.0\x00UniFileN"
+type_ascii_name="PAR 2.0\x00FileName"
+type_packed_main="PAR 2.0\x00PkdMain\x00"
+type_packed_recovery="PAR 2.0\x00PkdRecvS"
+
+# Field-sized values that make counts and offsets plausible
+zero_u32="\x00\x00\x00\x00"
+zero_u64="\x00\x00\x00\x00\x00\x00\x00\x00"
+one_u32="\x01\x00\x00\x00"
+one_u64="\x01\x00\x00\x00\x00\x00\x00\x00"
+slice_4k="\x00\x10\x00\x00\x00\x00\x00\x00"
+slice_64k="\x00\x00\x01\x00\x00\x00\x00\x00"
+max_u32="\xff\xff\xff\xff"
+max_u16="\xff\xff"

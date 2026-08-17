@@ -65,20 +65,22 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
 }
 
 #[test]
-fn every_fixture_path_in_the_tree_is_in_the_ledger_and_nothing_else_is() {
+fn every_fixture_file_in_the_tree_is_in_the_ledger() {
     let (ledger, _, _, _) = load();
     let on_disk = corpus_paths_on_disk(&root()).unwrap();
     let listed = ledger.paths();
     let missing: Vec<&String> = on_disk.difference(&listed).collect();
-    let extra: Vec<&String> = listed.difference(&on_disk).collect();
     assert!(
         missing.is_empty(),
         "fixture files without a ledger entry:\n{missing:#?}"
     );
-    assert!(
-        extra.is_empty(),
-        "ledger entries with no file in the tree:\n{extra:#?}"
-    );
+    // The converse — every ledger path present on disk — is deliberately NOT
+    // asserted here. Since the corpus left Git LFS the repository carries no
+    // fixture bytes, so an unhydrated checkout (this test's normal habitat:
+    // the no-fixture unit-tests lane, a fresh clone) legitimately has none of
+    // them. Presence is hydration's contract, enforced where hydration
+    // happens: `hydrate` fails on any shortfall, and the corpus lanes run
+    // `verify --all-present` after it.
     // Nothing outside the two fixture roots is corpus content: no benchmark
     // output, no source, no scratch.
     for path in &listed {

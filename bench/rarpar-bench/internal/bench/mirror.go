@@ -61,7 +61,29 @@ const (
 	mirrorHTTPTimeout = 10 * time.Minute
 	archiveMediaType  = "application/gzip"
 	jsonMediaType     = "application/json"
+	// defaultUserAgent is what mirror reads present.
+	//
+	// The mirror is served from a domain behind this project's own bot
+	// defence, which refuses Go's default `Go-http-client/…` — and a refusal
+	// is indistinguishable from the object being absent, so the mirror silently
+	// stops being usable. A browser user agent is what that defence admits.
+	//
+	// RARPAR_CORPUS_USER_AGENT overrides it, so the value can follow whatever
+	// the far end accepts without waiting for a release. `xtask test-corpus`
+	// reads the same variable for the curl transport that hydrates the corpus.
+	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+	userAgentEnv = "RARPAR_CORPUS_USER_AGENT"
 )
+
+// userAgent is the override when it is set and not empty, the browser default
+// otherwise.
+func userAgent() string {
+	if value := strings.TrimSpace(os.Getenv(userAgentEnv)); value != "" {
+		return value
+	}
+	return defaultUserAgent
+}
 
 var (
 	// errMirrorAbsent is the one condition that may fall back to the official
@@ -355,6 +377,40 @@ func (m *SourceMirror) readURL(key string) string {
 	return strings.TrimSuffix(m.BaseURL, "/") + "/" + key
 }
 
+// How a read treats an intermediate cache. Reading a *published* object is a
+// plain read: the key is a digest, so a hit is the object by construction.
+// Reading back an object this process just wrote is not, and cachedRead would
+// answer it wrong.
+const (
+	cachedRead = false
+	freshRead  = true
+)
+
+// freshURL is readURL with a token no cache has seen.
+//
+// A publication reads its own writes, and the same URL was fetched moments
+// earlier to decide whether to publish at all — when the answer was "absent",
+// which is a response a CDN may cache like any other. The read-back would then
+// be served that stale miss and conclude the upload never landed. (It is what
+// broke the first publication: the object was in the bucket and public, and
+// the read-back still saw 404.)
+//
+// A cache key includes the query string, so a token that has never been
+// requested cannot have a stored answer, and object storage ignores a query it
+// was not asked about. Nothing else changes: the bytes are still held to the
+// reviewed digest, and consumers still read the clean URL.
+func (m *SourceMirror) freshURL(key string) string {
+	return fmt.Sprintf("%s?rarpar-read-back=%d", m.readURL(key), time.Now().UnixNano())
+}
+
+// url picks between the two for one read.
+func (m *SourceMirror) url(key string, fresh bool) string {
+	if fresh {
+		return m.freshURL(key)
+	}
+	return m.readURL(key)
+}
+
 func (m *SourceMirror) writeURL(key string) string {
 	return strings.TrimSuffix(m.Publish.WriteBase, "/") + "/" + key
 }
@@ -392,7 +448,7 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 	defer os.RemoveAll(work)
 
 	if m.BaseURL != "" {
-		data, err := m.fetchVerified(ctx, source, filepath.Join(work, "mirror"))
+		data, err := m.fetchVerified(ctx, source, filepath.Join(work, "mirror"), cachedRead)
 		switch {
 		case err == nil:
 			stored, err := writeVerifiedArchive(cacheDir, source.Name, data)
@@ -438,32 +494,42 @@ func (m *SourceMirror) Resolve(ctx context.Context, source ArchiveSource, cacheD
 // pinned identity and issuer, and the provenance describes this very archive.
 // It returns errMirrorAbsent only when the archive key itself is a 404; once the
 // archive exists, every companion is mandatory.
-func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, work string) ([]byte, error) {
+func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, work string, fresh bool) ([]byte, error) {
 	keys := source.keys()
-	status, data, err := m.get(ctx, m.readURL(keys.archive))
+	target := m.url(keys.archive, fresh)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, err
 	}
 	switch {
 	case status == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: %s", errMirrorAbsent, keys.archive)
+	case refusedStatus(status):
+		// The mirror refused to serve rather than serving something wrong: an
+		// unauthenticated read of a private bucket, or an edge rule that will
+		// not answer this client. No bytes came back, so there is nothing to
+		// mistake for the object, and the official archive that replaces it is
+		// held to the same reviewed digest — the fallback cannot lower the bar.
+		// Failing hard here would instead make the *first* publication
+		// impossible, when by definition nothing is mirrored yet.
+		return nil, fmt.Errorf("%w: mirror %s", errSourceUnavailable, describeResponse(target, status, header, data))
 	case status != http.StatusOK:
 		// Neither absence nor unavailability: something answered for this key
 		// that is not the object, so nothing may be assumed about it.
-		return nil, fmt.Errorf("mirror GET %s: HTTP %d", keys.archive, status)
+		return nil, fmt.Errorf("mirror %s", describeResponse(target, status, header, data))
 	}
 	if digest := bytesBLAKE3(data); digest != source.BLAKE3 {
 		return nil, fmt.Errorf("the mirror holds a different object under this digest key %s: blake3 %s", keys.archive, digest)
 	}
-	archiveBundle, err := m.companion(ctx, keys.archiveBundle)
+	archiveBundle, err := m.companion(ctx, keys.archiveBundle, fresh)
 	if err != nil {
 		return nil, err
 	}
-	provenanceData, err := m.companion(ctx, keys.provenance)
+	provenanceData, err := m.companion(ctx, keys.provenance, fresh)
 	if err != nil {
 		return nil, err
 	}
-	provenanceBundle, err := m.companion(ctx, keys.provenanceBundle)
+	provenanceBundle, err := m.companion(ctx, keys.provenanceBundle, fresh)
 	if err != nil {
 		return nil, err
 	}
@@ -507,13 +573,15 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 // within the retry budget is the same retry-exhausted unavailability the
 // archive key itself gets, and it wraps errSourceUnavailable so Resolve may
 // fall back to the official URL — which is still digest-checked.
-func (m *SourceMirror) companion(ctx context.Context, key string) ([]byte, error) {
-	status, data, err := m.get(ctx, m.readURL(key))
+func (m *SourceMirror) companion(ctx context.Context, key string, fresh bool) ([]byte, error) {
+	target := m.url(key, fresh)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("mirror GET %s: %w", key, err)
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("mirror is missing companion object %s: HTTP %d", key, status)
+		return nil, fmt.Errorf("mirror is missing companion object %s: %s",
+			key, describeResponse(target, status, header, data))
 	}
 	return data, nil
 }
@@ -596,7 +664,7 @@ func (m *SourceMirror) publish(ctx context.Context, source ArchiveSource, data [
 			return err
 		}
 	}
-	stored, err := m.fetchVerified(ctx, source, filepath.Join(work, "readback"))
+	stored, err := m.fetchVerified(ctx, source, filepath.Join(work, "readback"), freshRead)
 	if err != nil {
 		return fmt.Errorf("read back %s: stored copy is not what was published: %w", keys.archive, err)
 	}
@@ -682,12 +750,12 @@ func quoteCurlConfigValue(value string) string {
 
 // download fetches an object that must be there: the official upstream.
 func (m *SourceMirror) download(ctx context.Context, target string) ([]byte, error) {
-	status, data, err := m.get(ctx, target)
+	status, data, header, err := m.get(ctx, target)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", status)
+		return nil, fmt.Errorf("%s", describeResponse(target, status, header, data))
 	}
 	return data, nil
 }
@@ -696,18 +764,19 @@ func (m *SourceMirror) download(ctx context.Context, target string) ([]byte, err
 // a 429 — a bounded number of times. A non-transient response is returned with
 // its status so the caller can act on 404; an exhausted budget is reported as
 // errSourceUnavailable.
-func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, error) {
+func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, http.Header, error) {
 	var last error
 	for attempt := 1; attempt <= mirrorAttempts; attempt++ {
 		if attempt > 1 {
 			if err := m.backoff(ctx, attempt); err != nil {
-				return 0, nil, err
+				return 0, nil, nil, err
 			}
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
+		request.Header.Set("User-Agent", userAgent())
 		response, err := m.client().Do(request)
 		if err != nil {
 			last = err
@@ -727,13 +796,82 @@ func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, err
 			last = fmt.Errorf("HTTP %d", response.StatusCode)
 			continue
 		}
-		return response.StatusCode, data, nil
+		return response.StatusCode, data, response.Header, nil
 	}
-	return 0, nil, fmt.Errorf("%w: %s: %v", errSourceUnavailable, target, last)
+	return 0, nil, nil, fmt.Errorf("%w: %s: %v", errSourceUnavailable, target, last)
+}
+
+// describeResponse says who answered and what they said, for a response that
+// carried no object.
+//
+// A bare "HTTP 403" cannot be diagnosed: the mirror key alone does not even
+// name the host it was requested from, and an intermediary that refuses the
+// request looks exactly like a bucket that refuses it. The identifying detail
+// is all in the response — an edge network names itself in `server` and stamps
+// a request id that its own event log can be searched by, while object storage
+// answers with its own error document. Everything here is a public response to
+// a public URL: no credential is ever sent to a read base, so nothing that
+// could be echoed back is sensitive.
+func describeResponse(target string, status int, header http.Header, body []byte) string {
+	description := fmt.Sprintf("GET %s: HTTP %d", target, status)
+	var marks []string
+	for _, name := range []string{"Server", "Cf-Ray", "Cf-Mitigated", "X-Amz-Request-Id"} {
+		if value := header.Get(name); value != "" {
+			marks = append(marks, fmt.Sprintf("%s=%s", strings.ToLower(name), value))
+		}
+	}
+	if len(marks) > 0 {
+		description += " [" + strings.Join(marks, ", ") + "]"
+	}
+	if excerpt := bodyExcerpt(body); excerpt != "" {
+		description += ": " + excerpt
+	}
+	return description
+}
+
+// bodyExcerpt flattens an error document to one short line: tags dropped,
+// runs of whitespace collapsed, truncated. Enough to tell a CDN block page
+// from a storage error, and not enough to bury the log in HTML.
+func bodyExcerpt(body []byte) string {
+	const limit = 200
+	var text strings.Builder
+	inTag := false
+	for _, r := range string(body) {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+			text.WriteRune(' ')
+		case !inTag:
+			text.WriteRune(r)
+		}
+	}
+	flattened := strings.Join(strings.Fields(text.String()), " ")
+	if flattened == "" {
+		return ""
+	}
+	if len(flattened) > limit {
+		flattened = flattened[:limit] + "…"
+	}
+	return strconv.Quote(flattened)
 }
 
 func transientStatus(status int) bool {
 	return status >= 500 || status == http.StatusTooManyRequests
+}
+
+// refusedStatus is the mirror declining to serve this client at all, as
+// opposed to answering for the key. A bucket that is not public yet answers
+// 401/403 for every key including ones it holds; a CDN rule that blocks the
+// runner's network answers 403 before the bucket is consulted; 410 is a key
+// deliberately retired. None of them hand back an object, so each is treated
+// as the mirror being unavailable for this archive rather than as a mirror
+// that lies about it.
+func refusedStatus(status int) bool {
+	return status == http.StatusUnauthorized ||
+		status == http.StatusForbidden ||
+		status == http.StatusGone
 }
 
 func (m *SourceMirror) backoff(ctx context.Context, attempt int) error {

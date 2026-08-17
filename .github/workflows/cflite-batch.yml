@@ -1,16 +1,57 @@
 name: ClusterFuzzLite batch fuzzing
 
+# Deep fuzzing: the long-running counterpart to the five-minute code-change lane
+# on pull requests.
+#
+# Nightly rather than weekly. These are container formats whose interesting
+# states are several correct headers deep, so a run's value is superlinear in
+# its budget for a long time before it plateaus — and a corpus that grows every
+# night makes every later run start further in. Weekly also meant a build
+# breakage sat undetected for six days at a time, which is how the last one was
+# found.
+#
+# One sanitizer, deliberately. Both fuzzed crates are pure Rust — no build.rs,
+# no C, no assembly, RustCrypto and blake2s_simd all the way down — and Rust
+# has no -Zsanitizer=undefined, so a UBSan lane would instrument nothing while
+# looking like coverage (its first run proved it: cargo-fuzz builds ASan
+# regardless of the job's sanitizer, and the bad-build check rejected every
+# target as "compiled with ASan"). The arithmetic class UBSan would have
+# covered is caught the Rust way instead: the fuzzers build with debug
+# assertions and overflow checks enabled in the optimized build
+# (`cargo fuzz build -O -a`), so an overflowing length computation panics
+# rather than wrapping.
+
 on:
   schedule:
-    - cron: '41 2 * * 0'
+    # 02:41 every day. Offset from the hour: the runner pool is measurably
+    # busier on the hour, and nothing here needs a round number.
+    - cron: '41 2 * * *'
   workflow_dispatch:
+    inputs:
+      fuzz-seconds:
+        description: 'Total fuzzing budget, in seconds'
+        required: false
+        default: '7200'
+        type: string
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   batch-fuzzing:
+    name: batch (address)
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    # The two-hour budget is fuzzing time only: the sanitizer build of five
+    # targets comes first, and a job killed at its timeout discards the corpus
+    # it just grew. An hour of headroom is cheap insurance for that.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      # `output-sarif` publishes findings to the Security tab rather than
+      # leaving them in a run log nobody reads. Only this job produces them,
+      # and this workflow only ever runs on this repository (schedule and
+      # manual dispatch), so the write is never handed to a fork's token.
+      security-events: write
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: false
@@ -30,6 +71,66 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 3600
+          fuzz-seconds: ${{ inputs.fuzz-seconds || 7200 }}
           mode: batch
           sanitizer: address
+          output-sarif: true
+
+  # What the corpus is actually reaching. Without this the fuzzing budget is
+  # spent on faith: a target whose coverage has been flat for a month is either
+  # done or stuck behind a check it cannot satisfy, and those need opposite
+  # responses.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Reads the corpus the batch jobs just extended, so it runs after them.
+    needs: [batch-fuzzing]
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: coverage
+
+      - name: Report coverage
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: coverage
+          sanitizer: coverage
+
+  # A corpus grows monotonically otherwise, and most of what it accumulates is
+  # inputs that reach nothing the corpus did not already reach. Pruning keeps
+  # the set minimal, which is what makes tomorrow's run spend its budget on new
+  # ground instead of re-executing thousands of redundant inputs.
+  prune:
+    name: prune corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [coverage]
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+
+      - name: Prune
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune

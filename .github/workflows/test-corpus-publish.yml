@@ -50,11 +50,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Every fixture byte in this run is produced by a recipe or fetched from a
-  # pinned upstream, so the checkout never needs the LFS payloads: the pointers
-  # it leaves behind are removed before each generator runs, and a pointer that
-  # survives anywhere downstream is an error rather than content.
-  GIT_LFS_SKIP_SMUDGE: "1"
   RUST_TOOLCHAIN: 1.97.1
   SCCACHE_CACHE_VERSION: v1
   # Pinned: signature bundles are only comparable if every publication used the
@@ -453,16 +448,30 @@ jobs:
   # Three lanes, split the way ci.yml splits them, so the longest suite decides
   # the wall time rather than their sum.
   validate:
-    name: validate (${{ matrix.lane }})
+    name: validate (${{ matrix.lane }}${{ matrix.shard && format(' {0}/3', matrix.shard) || '' }})
     needs: [assemble]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      # The unrar suite is the long pole of the whole run, so it validates as
+      # three shards: nextest partitions every binary's test list
+      # deterministically, the union of the shards is exactly the suite, and
+      # the stage's wall time is the slowest third instead of the whole. All
+      # three read the same assembled tree.
       matrix:
-        lane: [workspace, unrar, par2]
+        include:
+          - lane: workspace
+          - lane: par2
+          - lane: unrar
+            shard: 1
+          - lane: unrar
+            shard: 2
+          - lane: unrar
+            shard: 3
     env:
       LANE: ${{ matrix.lane }}
+      SHARD: ${{ matrix.shard }}
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
@@ -525,6 +534,12 @@ jobs:
           tar -xf "$RUNNER_TEMP/tree/corpus-tree.tar"
           cp "$RUNNER_TEMP/build/test-corpus/sources.json" test-corpus/sources.json
 
+      - name: Install cargo-nextest
+        if: ${{ matrix.lane == 'unrar' }}
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Run the suite
         run: |
           set -euo pipefail
@@ -533,7 +548,13 @@ jobs:
               cargo test --locked --workspace --no-fail-fast
               ;;
             unrar)
-              cargo test --locked -p unrar-rs --features slow-tests --no-fail-fast
+              cargo nextest run --locked -p unrar-rs --features slow-tests \
+                --no-fail-fast --partition "count:${SHARD}/3"
+              if [ "$SHARD" = "1" ]; then
+                # nextest does not run doctests; shard 1 keeps them so the
+                # split loses nothing.
+                cargo test --locked -p unrar-rs --features slow-tests --doc
+              fi
               ;;
             par2)
               cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
@@ -549,7 +570,7 @@ jobs:
         run: sccache --show-stats || true
 
       - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' }}
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (matrix.lane != 'unrar' || matrix.shard == 1) }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}/.sccache

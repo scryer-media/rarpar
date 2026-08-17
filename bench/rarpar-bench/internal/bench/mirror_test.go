@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,8 @@ type mirrorFixture struct {
 	official         map[string][]byte
 	officialStatus   []int
 	officialRequests int
+	lastUserAgent    string
+	negativeCache    map[string]bool
 
 	root      string
 	cacheDir  string
@@ -108,6 +111,16 @@ func (f *mirrorFixture) serveRead(writer http.ResponseWriter, request *http.Requ
 	key := strings.TrimPrefix(request.URL.Path, "/")
 	f.mu.Lock()
 	f.reads[key]++
+	f.lastUserAgent = request.Header.Get("User-Agent")
+	// A CDN in front of the bucket, keyed by the whole URL: once a key has
+	// been answered "absent", that answer is replayed for the bare URL until
+	// it expires. A request carrying an unseen query string is a different
+	// cache key, so it reaches the bucket.
+	if f.negativeCache != nil && request.URL.RawQuery == "" && f.negativeCache[key] {
+		f.mu.Unlock()
+		http.NotFound(writer, request)
+		return
+	}
 	if queue := f.readStatus[key]; len(queue) > 0 {
 		status := queue[0]
 		f.readStatus[key] = queue[1:]
@@ -191,6 +204,12 @@ func (f *mirrorFixture) queueReadStatus(key string, statuses ...int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readStatus[key] = append(f.readStatus[key], statuses...)
+}
+
+func (f *mirrorFixture) userAgentSeen() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastUserAgent
 }
 
 func (f *mirrorFixture) officialHits() int {
@@ -446,6 +465,33 @@ func TestResolveFallsBackToTheOfficialURLWhenTheMirrorIsAbsent(t *testing.T) {
 
 // With a publisher configured the fallback is mirrored: signed, given
 // provenance, conditionally uploaded in order, and read back before use.
+// Publishing reads its own write, and it has just asked for the same URL to
+// decide whether to publish at all — an "absent" a CDN is free to cache. The
+// read-back must not be served that stale miss and conclude the upload never
+// landed: it is what the first publication actually failed on, with the object
+// sitting in the bucket, public and correct.
+func TestPublishReadsBackPastACachedAbsence(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	fixture.mirror.Publish = fixture.publisher()
+	keys := fixture.source.keys()
+	// Every key answers "absent" on its bare URL for the whole run, exactly as
+	// an edge that cached the pre-publication miss would.
+	fixture.negativeCache = map[string]bool{
+		keys.archive:          true,
+		keys.archiveBundle:    true,
+		keys.provenance:       true,
+		keys.provenanceBundle: true,
+	}
+
+	resolved, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir)
+	if err != nil {
+		t.Fatalf("a cached absence must not fail a publication that stored the object: %v", err)
+	}
+	if resolved.Origin != OriginMirrored {
+		t.Fatalf("origin = %q, want %q", resolved.Origin, OriginMirrored)
+	}
+}
+
 func TestResolvePublishesTheOfficialDownload(t *testing.T) {
 	fixture := newMirrorFixture(t)
 	fixture.mirror.Publish = fixture.publisher()
@@ -552,6 +598,123 @@ func TestResolveFallsBackWhenTheMirrorIsUnavailable(t *testing.T) {
 	// The whole retry budget is spent before the mirror is called unavailable.
 	if got := fixture.readHits(keys.archive); got != mirrorAttempts {
 		t.Fatalf("mirror was read %d times, want the full budget of %d", got, mirrorAttempts)
+	}
+}
+
+// A mirror that refuses the client outright — a bucket that is not public yet,
+// or a CDN rule that will not answer this network — is unavailable too. It
+// serves no bytes, so there is nothing to mistake for the archive, and the
+// official download that replaces it is held to the same reviewed digest.
+// Publishing the first revision depends on this: nothing is mirrored yet, so a
+// refusal on every key must not be the end of the road.
+func TestResolveFallsBackWhenTheMirrorRefusesTheClient(t *testing.T) {
+	for _, status := range []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusGone,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixture := newMirrorFixture(t)
+			keys := fixture.source.keys()
+			fixture.mirrorObjects(fixture.source, fixture.archive, nil)
+			fixture.queueReadStatus(keys.archive, status)
+			var log bytes.Buffer
+			fixture.mirror.Log = &log
+
+			resolved, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The notice has to name the URL that was refused, not just the
+			// key: a key alone does not say which host answered, which is
+			// exactly what a bare "HTTP 403" left unanswerable in the field.
+			if noticed := log.String(); !strings.Contains(noticed, fixture.mirror.readURL(keys.archive)) {
+				t.Fatalf("notice %q does not name the refused URL", noticed)
+			}
+			if resolved.Origin != OriginOfficial {
+				t.Fatalf("origin = %q, want %q", resolved.Origin, OriginOfficial)
+			}
+			if got := fixture.officialHits(); got != 1 {
+				t.Fatalf("official requests = %d, want exactly one", got)
+			}
+			// A refusal is answered once and believed: retrying it would only
+			// spend the budget on a client the mirror will not serve.
+			if got := fixture.readHits(keys.archive); got != 1 {
+				t.Fatalf("mirror was read %d times, want exactly one", got)
+			}
+		})
+	}
+}
+
+// The corpus domain's bot defence refuses Go's default user agent, and a
+// refusal reads exactly like an absent object — so the mirror would quietly
+// stop being usable. Reads present a browser user agent, overridable without a
+// release.
+func TestMirrorReadsSendABrowserUserAgent(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	fixture.mirrorObjects(fixture.source, fixture.archive, nil)
+
+	if _, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	sent := fixture.userAgentSeen()
+	if !strings.HasPrefix(sent, "Mozilla/5.0 ") || !strings.Contains(sent, "Chrome/") {
+		t.Fatalf("user agent %q is not the browser default", sent)
+	}
+	if strings.Contains(sent, "Go-http-client") {
+		t.Fatalf("user agent %q still announces the Go client", sent)
+	}
+
+	t.Setenv(userAgentEnv, "corpus-reader/9")
+	override := newMirrorFixture(t)
+	override.mirrorObjects(override.source, override.archive, nil)
+	if _, err := override.mirror.Resolve(context.Background(), override.source, override.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if sent := override.userAgentSeen(); sent != "corpus-reader/9" {
+		t.Fatalf("user agent = %q, want the override", sent)
+	}
+}
+
+// The whole point of the refusal diagnostic: the message has to be enough to
+// tell an edge network's block page from object storage's own error, and to
+// find the request again in whichever log the responder keeps.
+func TestDescribeResponseIdentifiesWhoRefused(t *testing.T) {
+	const target = "https://corpus.example.net/tools/rarlab/blake3/abc/rarlinux.tar.gz"
+
+	edge := describeResponse(target, http.StatusForbidden, http.Header{
+		"Server": []string{"cloudflare"},
+		"Cf-Ray": []string{"a2c599ba7f38e677-DEN"},
+	}, []byte("<!doctype html><html><head><title>Blocked</title></head>"+
+		"<body><h1>Sorry, you have been blocked</h1></body></html>"))
+	for _, want := range []string{target, "HTTP 403", "server=cloudflare", "cf-ray=a2c599ba7f38e677-DEN", "you have been blocked"} {
+		if !strings.Contains(edge, want) {
+			t.Fatalf("description %q is missing %q", edge, want)
+		}
+	}
+	if strings.Contains(edge, "<") || strings.Contains(edge, "\n") {
+		t.Fatalf("description %q is not a flattened one-liner", edge)
+	}
+
+	// Storage answering for itself looks nothing like the above, which is the
+	// distinction the field could not make from "HTTP 403" alone.
+	storage := describeResponse(target, http.StatusForbidden, http.Header{
+		"X-Amz-Request-Id": []string{"1234567890"},
+	}, []byte("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"))
+	for _, want := range []string{"x-amz-request-id=1234567890", "AccessDenied"} {
+		if !strings.Contains(storage, want) {
+			t.Fatalf("description %q is missing %q", storage, want)
+		}
+	}
+
+	// A body that would bury the log is cut, and a silent response still says
+	// who answered.
+	long := describeResponse(target, http.StatusForbidden, http.Header{}, bytes.Repeat([]byte("x"), 4096))
+	if len(long) > 400 {
+		t.Fatalf("description is %d bytes; a body excerpt must be truncated", len(long))
+	}
+	if bare := describeResponse(target, http.StatusForbidden, http.Header{}, nil); !strings.Contains(bare, "HTTP 403") {
+		t.Fatalf("description %q lost the status", bare)
 	}
 }
 

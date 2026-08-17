@@ -7,13 +7,15 @@ on:
       - 'crates/par2-rs/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
+      - '.github/workflows/cflite-batch.yml'
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   pr-fuzzing:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
@@ -34,6 +36,9 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 300
+          # Five targets share this budget, and a pull request lane is a
+          # smoke test for regressions the change itself introduced — the deep
+          # search is the nightly batch job's work.
+          fuzz-seconds: 600
           mode: code-change
           sanitizer: address

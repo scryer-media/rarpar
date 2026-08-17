@@ -32,7 +32,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  GIT_LFS_SKIP_SMUDGE: "1"
 
 jobs:
   preflight:

@@ -1,0 +1,65 @@
+# libFuzzer dictionary for the RAR targets.
+#
+# Tokens, not archives: signatures, header types and flag words the format
+# spends most of its bytes on. A mutator that has to discover "Rar!\x1a\x07\x01"
+# a byte at a time spends the whole run in the first eight bytes; given the
+# token it starts where the format actually branches.
+#
+# Nothing here is a fixture, and nothing here was learned by disassembling
+# unrar — these are the constants the published format documentation states.
+
+# Signatures
+rar4_signature="Rar!\x1a\x07\x00"
+rar5_signature="Rar!\x1a\x07\x01\x00"
+rar5_rev_signature="Rar!\x1aRev"
+sfx_mz="MZ"
+
+# RAR4 header types (HEAD_TYPE)
+rar4_marker="\x72\x21"
+rar4_archive="\x73"
+rar4_file="\x74"
+rar4_comment="\x75"
+rar4_av="\x76"
+rar4_sub="\x77"
+rar4_protect="\x78"
+rar4_sign="\x79"
+rar4_newsub="\x7a"
+rar4_endarc="\x7b"
+
+# RAR4 file flags that change how the body is read
+rar4_flag_split_before="\x01\x00"
+rar4_flag_split_after="\x02\x00"
+rar4_flag_password="\x04\x00"
+rar4_flag_solid="\x10\x00"
+rar4_flag_large="\x00\x01"
+rar4_flag_unicode="\x00\x02"
+rar4_flag_salt="\x00\x04"
+
+# RAR4 compression methods (0x30..0x35 = store..best)
+rar4_method_store="\x30"
+rar4_method_fastest="\x31"
+rar4_method_normal="\x33"
+rar4_method_best="\x35"
+
+# RAR5 header types
+rar5_main="\x01"
+rar5_file="\x02"
+rar5_service="\x03"
+rar5_encryption="\x04"
+rar5_endarc="\x05"
+
+# RAR5 service record names
+rar5_service_crypt="CRYPT"
+rar5_service_htime="STM"
+rar5_service_qopen="QO"
+rar5_service_acl="ACL"
+rar5_service_stream="STM"
+rar5_service_rr="RR"
+
+# Filter names the VM dispatches on
+filter_delta="Delta"
+filter_e8="E8"
+filter_e8e9="E8E9"
+filter_itanium="ITANIUM"
+filter_rgb="RGB"
+filter_audio="AUDIO"
