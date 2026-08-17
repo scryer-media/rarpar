@@ -27,7 +27,7 @@ on:
       fuzz-seconds:
         description: 'Total fuzzing budget per sanitizer, in seconds'
         required: false
-        default: '3600'
+        default: '7200'
         type: string
 
 permissions:
@@ -37,7 +37,10 @@ jobs:
   batch-fuzzing:
     name: batch (${{ matrix.sanitizer }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # The two-hour budget is fuzzing time only: the sanitizer build of five
+    # targets comes first, and a job killed at its timeout discards the corpus
+    # it just grew. An hour of headroom is cheap insurance for that.
+    timeout-minutes: 180
     strategy:
       # One sanitizer finding must not cancel the other's run: they cover
       # different faults and a UBSan report is not made redundant by an ASan
@@ -72,7 +75,7 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: ${{ inputs.fuzz-seconds || 3600 }}
+          fuzz-seconds: ${{ inputs.fuzz-seconds || 7200 }}
           mode: batch
           sanitizer: ${{ matrix.sanitizer }}
           output-sarif: true

@@ -50,7 +50,7 @@ whole budget failing the first check. Every target therefore ships:
 | Workflow | Trigger | Budget | Sanitizer |
 | --- | --- | --- | --- |
 | `cflite-pr.yml` | pull requests touching either crate or the fuzz config | 600 s, `code-change` | address |
-| `cflite-batch.yml` → `batch (address)` / `batch (undefined)` | nightly 02:41 UTC, or dispatch | 3600 s each, `batch` | address, undefined |
+| `cflite-batch.yml` → `batch (address)` / `batch (undefined)` | nightly 02:41 UTC, or dispatch | 7200 s each, `batch` | address, undefined |
 | `cflite-batch.yml` → `coverage` | after the batch jobs | 600 s | coverage |
 | `cflite-batch.yml` → `prune` | after coverage | 600 s | — |
 
