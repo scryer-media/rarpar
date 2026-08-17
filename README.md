@@ -336,21 +336,20 @@ the archive set; it waits for each later volume instead.
 ## Development
 
 The binary test fixtures are the **test corpus**: a signed, content-addressed
-object set on R2, described by the ledger in `test-corpus/` and hydrated with
-`xtask` (see [docs/test-corpus.md](docs/test-corpus.md)). Until the first
-published corpus is pinned in `test-corpus/lock.json`, Git LFS remains the
-transport. After cloning:
+object set on R2, described by the ledger in `test-corpus/` and pinned by
+`test-corpus/lock.json` (see [docs/test-corpus.md](docs/test-corpus.md)). The
+repository carries no fixture bytes at all — a clone needs no Git LFS. After
+cloning:
 
 ```bash
-git lfs install
-git lfs pull
 git config core.hooksPath .githooks
 ```
 
-Once a corpus is pinned, hydrate what you need instead of `git lfs pull`:
+Then hydrate the profiles you need; every object is digest-checked against the
+pinned, signed manifest:
 
 ```bash
-cargo run --locked -p xtask -- test-corpus fetch --profile unrar --profile par2
+cargo run --locked -p xtask -- test-corpus hydrate --profile unrar --profile par2
 ```
 
 The versioned pre-commit hook runs `gitleaks` and blocks staged machine-local

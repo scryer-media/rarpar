@@ -14,12 +14,9 @@
 !/bench/fleet.example.toml
 
 # Test corpus (docs/test-corpus.md). Fixture bytes are hydrated from the
-# published corpus into these paths and must never be committed: a fixture is
-# added by ledgering and publishing it, not by `git add`. Only the generators,
-# READMEs and text originals beside them are tracked. Until the first published
-# manifest is pinned the same paths are Git LFS pointers, which stay tracked
-# (ignore rules never apply to tracked files); the patterns mirror
-# .gitattributes so the switch is a no-op here.
+# published, signed corpus into these paths and must never be committed: a
+# fixture is added by ledgering and publishing it, not by `git add`. Only the
+# generators, READMEs and text originals beside them are tracked.
 /crates/unrar-rs/tests/fixtures/**/*.rar
 /crates/unrar-rs/tests/fixtures/**/*.[r-z][0-9][0-9]
 /crates/unrar-rs/tests/fixtures/**/*.rev
