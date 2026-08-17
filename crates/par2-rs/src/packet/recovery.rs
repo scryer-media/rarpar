@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -12,7 +13,11 @@ use crate::types::{CancellationToken, RecoveryExponent};
 pub enum RecoverySliceData {
     InMemory(Bytes),
     FileBacked {
-        path: PathBuf,
+        /// Shared rather than owned: one PAR2 volume can hold tens of thousands
+        /// of recovery packets, and every one of them names the same file. An
+        /// `Arc<Path>` lets the scanner intern the path once per volume instead
+        /// of allocating a `PathBuf` per packet.
+        path: Arc<Path>,
         offset: u64,
         len: usize,
         /// Packet MD5 from the header, kept so lazily-loaded payloads can be
@@ -28,12 +33,7 @@ impl RecoverySliceData {
     }
 
     pub fn file_backed(path: PathBuf, offset: u64, len: usize) -> Self {
-        Self::FileBacked {
-            path,
-            offset,
-            len,
-            packet_hash: None,
-        }
+        Self::file_backed_shared(Arc::from(path), offset, len, None)
     }
 
     pub fn file_backed_with_hash(
@@ -42,11 +42,21 @@ impl RecoverySliceData {
         len: usize,
         packet_hash: [u8; 16],
     ) -> Self {
+        Self::file_backed_shared(Arc::from(path), offset, len, Some(packet_hash))
+    }
+
+    /// Build a file-backed slice over an already-interned path.
+    pub fn file_backed_shared(
+        path: Arc<Path>,
+        offset: u64,
+        len: usize,
+        packet_hash: Option<[u8; 16]>,
+    ) -> Self {
         Self::FileBacked {
             path,
             offset,
             len,
-            packet_hash: Some(packet_hash),
+            packet_hash,
         }
     }
 
@@ -120,7 +130,13 @@ impl RecoverySliceData {
             .metadata()
             .ok()
             .map_or(*offset + *len as u64, |metadata| metadata.len());
-        crate::file_cache::drop_touched_file_cache(&file, path, file_len, *offset, *len as u64);
+        crate::file_cache::drop_touched_file_cache(
+            &file,
+            path.as_ref(),
+            file_len,
+            *offset,
+            *len as u64,
+        );
         Ok(hasher.finalize() == *expected)
     }
 
@@ -147,7 +163,7 @@ impl RecoverySliceData {
             Self::InMemory(_) => None,
             Self::FileBacked {
                 path, offset, len, ..
-            } => Some((path.as_path(), *offset, *len)),
+            } => Some((path.as_ref(), *offset, *len)),
         }
     }
 
@@ -186,7 +202,7 @@ impl RecoverySliceData {
                     .map_or(*len as u64, |metadata| metadata.len());
                 crate::file_cache::drop_touched_file_cache(
                     &file,
-                    path,
+                    path.as_ref(),
                     file_len,
                     offset + start as u64,
                     read_len as u64,

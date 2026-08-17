@@ -6628,3 +6628,96 @@ fn test_rar4_ppmd_solid_multi_member_boundaries() {
         assert_eq!(&bytes[..prefix.len()], *prefix, "member {index} prefix");
     }
 }
+
+/// The `-s2` grouped-solid RAR4 PPMd fixture: members 0 and 2 are group
+/// leaders (per-file SOLID clear, a mid-archive reset at member 2) while the
+/// archive-level solid flag is set. Guards two properties of
+/// `member_is_solid` folding the archive flag (the duplicate-member-decode
+/// fix): group leaders route through the SHARED solid decoder and prime
+/// their group (full-archive extraction is exact and single-pass), and the
+/// reset at member 2 still happens inside the shared slot (its output is
+/// exact even though it dispatched down the solid path).
+#[test]
+fn rar4_grouped_solid_members_extract_exactly_through_the_shared_decoder() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rar4/rar4_ppm_s2groups.rar");
+    if !fixture.exists() {
+        eprintln!("skipping test: rar34 fixtures not present");
+        return;
+    }
+
+    // Pinned payload SHA-256 (generate_ppmd_perf.py build_s2_group_set —
+    // deterministic streams, printed at generation time).
+    const EXPECTED: [(&str, &str); 4] = [
+        (
+            "ppmd-s2grp0.txt",
+            "862433261f04205c032eac969055955b12dbe9db1987870c3345ba455b343db8",
+        ),
+        (
+            "ppmd-s2grp1.txt",
+            "ca815c6f4d26919ea26eb966a80591b8843ac5b56d3c791ac66f69877fff90e1",
+        ),
+        (
+            "ppmd-s2grp2.txt",
+            "9f84eda71518a055e4248c5f856e16169e79a85757285607f609eedaf6f88bae",
+        ),
+        (
+            "ppmd-s2grp3.txt",
+            "e45ff436b99abe7e3565831542a96bac8b343724e88aa49f673ac88112867feb",
+        ),
+    ];
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    // Sequential whole-archive extraction: one shared decoder, no duplicate
+    // member decode (the perf property is asserted by construction — the
+    // extraction is exact, and the solid cursor moves strictly forward).
+    let file = std::fs::File::open(&fixture).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(file).unwrap();
+    let names: Vec<String> = archive
+        .member_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert_eq!(names.len(), 4);
+    for (index, (name, expected_sha)) in EXPECTED.iter().enumerate() {
+        assert_eq!(names[index], *name);
+        let data = archive
+            .extract_member(index, &unrar_rs::ExtractOptions::default(), None)
+            .unwrap();
+        assert_eq!(
+            sha256_hex(&data.to_bytes().unwrap()),
+            *expected_sha,
+            "member {index} ({name}) diverged"
+        );
+    }
+
+    // Out-of-order single-member extraction across the reset boundary:
+    // member 2 is a reset point; member 3 depends on it. Fresh archive per
+    // probe so each starts with a cold solid cursor.
+    for (index, (name, expected_sha)) in [
+        (2usize, EXPECTED[2]),
+        (3usize, EXPECTED[3]),
+        (1usize, EXPECTED[1]),
+    ] {
+        let file = std::fs::File::open(&fixture).unwrap();
+        let mut archive = unrar_rs::RarArchive::open(file).unwrap();
+        let data = archive
+            .extract_member(index, &unrar_rs::ExtractOptions::default(), None)
+            .unwrap();
+        assert_eq!(
+            sha256_hex(&data.to_bytes().unwrap()),
+            expected_sha,
+            "cold-cursor member {index} ({name}) diverged"
+        );
+    }
+}

@@ -173,6 +173,17 @@ pub struct Par2CreatePlan {
     pub memory: Par2MemoryPlan,
     /// Whether the caller requested a write-free operation.
     pub dry_run: bool,
+    /// Inputs excluded from the set because they are zero-length, in input
+    /// order, as the caller spelled them.
+    ///
+    /// A PAR2 set cannot describe an empty file (the format protects slices
+    /// and an empty file has none), so these inputs are not in `sources`, get
+    /// no packets, and are invisible to verify and repair. The reference
+    /// encoder makes the same exclusion and reports it unconditionally
+    /// ("Skipping 0 byte file"); callers that surface plans to a human should
+    /// do the same with this list, because a set that silently protects fewer
+    /// files than were listed reads as protection it does not provide.
+    pub skipped_empty: Vec<PathBuf>,
 }
 
 impl Par2CreatePlan {
@@ -613,7 +624,7 @@ pub(crate) fn build_plan_with_cache(
             })
     })?;
     let block_size = choose_block_size(&input_lengths, options.block_sizing)?;
-    let mut sources = collect_sources(
+    let collected = collect_sources(
         &base_path,
         &options.inputs,
         block_size,
@@ -622,6 +633,8 @@ pub(crate) fn build_plan_with_cache(
         total_bytes,
         cache,
     )?;
+    let skipped_empty = collected.skipped_empty;
+    let mut sources = collected.sources;
     sources.sort_by_key(|source| source.file_id);
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
@@ -732,6 +745,7 @@ pub(crate) fn build_plan_with_cache(
         backend: options.backend,
         memory,
         dry_run: options.dry_run,
+        skipped_empty,
     })
 }
 

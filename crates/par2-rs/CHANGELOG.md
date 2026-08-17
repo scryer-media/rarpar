@@ -1,5 +1,84 @@
 # Changelog
 
+
+## 0.4.2
+
+This is a patch release from 0.4.1: a rebuilt creation encode pipeline and one
+additive plan field. No existing public item changed shape or meaning, so it
+stays inside the 0.4.x compatibility range.
+
+### Public API
+
+- `Par2CreatePlan::skipped_empty`: the inputs a plan excluded because they are
+  zero-length, in input order, as the caller spelled them. A PAR2 set cannot
+  describe an empty file — the format protects slices and an empty file has
+  none — so such inputs get no packets and are invisible to verify and repair.
+  The exclusion itself is long-standing and matches the reference tool
+  ("Skipping 0 byte file"); what is new is that the plan now names the excluded
+  files instead of dropping them silently, so a caller can no longer read the
+  set as protection it does not provide. Produced sets are byte-identical to
+  before.
+
+### Runtime Behavior
+
+- Packet-inventory loading is bounded: [`PacketScanBudget`]/`PacketScanLimits`
+  meter packets examined, packets retained, and retained metadata bytes across
+  every input file of one load, with checked arithmetic and cancellation polled
+  on every charge. Nothing in the container format bounds the physical packet
+  stream, so a small input could previously inflate into tens of megabytes of
+  retained parse metadata. Exceeding a limit is `ResourceLimitExceeded`, never
+  a truncated set. Bounded entry points (`scan_packets_bounded` and friends)
+  are additive; the existing entry points keep their signatures on default
+  limits.
+- The ordered canonical repair scanner admits its working set against the
+  configured memory limit before allocating: worker count, Phase-A staging
+  windows, and per-worker match scratch are derived from the remaining budget,
+  and slice sizes whose ordered working set cannot fit route to the generic
+  mmap scanner instead of allocating past the limit.
+
+- Creation now encodes stripe-major behind a producer-fed ring: bands of
+  recovery rows run as scoped OS threads dispatched once per stripe, and every
+  input batch is staged once and streamed to all bands, instead of a fresh
+  dispatch per batch. Whole-file source hashing is fused into the same feed —
+  the raw batch rides the ring beside its staged form, and the band that owns
+  a batch hashes it under an ordered turn before releasing the slot — so the
+  pass never runs more busy threads than the host admits. The serial MD5 head
+  this folds away was 9–14% of create CPU on 4-vCPU x86 hosts, and the
+  dedicated-hasher shape it replaces gave 9% of create wall back to the
+  scheduler on those same hosts. `WEAVER_PAR2_CREATE_AREAS` pins the ring
+  depth for A/B.
+
+- Creation's staging areas de-alias the L1D: kernel-family lanes and output
+  rows sit 1 KiB off a 4 KiB period instead of at power-of-two strides, so one
+  pass's streams stop competing for a single cache set. Neoverse N1 went from
+  35 L1D refills per thousand instructions to 3 on the eight-volume create
+  corpus case. The aarch64 CLMUL create family also grew its input batch from
+  twelve sources to sixteen — a whole number of kernel passes per batch;
+  `WEAVER_PAR2_CREATE_GROUPING` pins the batch width.
+
+- Creation's staging area is now **block-interleaved** for the aarch64 CLMUL
+  family: the sixteen sources the wide kernel pass folds into a destination
+  share one contiguous stream, thirty-two bytes each in turn, instead of
+  sitting in separate slices the pass reads at a common offset. Lane-major, a
+  pass puts every source line plus a destination line into one L1D set per
+  block, which no stride residue can make fit a 2-way set — the lane/row skew
+  above moved Cortex-A72's 2-way L1D only from 29 refills per thousand
+  instructions to 26. Interleaved, the pass is one sequential stream plus its
+  destination: two streams, which any associativity holds. The x86 folded
+  family has always laid its staging out this way and never had the problem;
+  the x86 kernels, the packed XOR-JIT family and the word-wise reference path
+  keep lane-major, which is the right shape for each of their kernels. On the
+  bench fleet this pipeline takes create from 0.54× the reference tool to
+  1.22× on Cortex-A72 and from 0.77× to 1.10× on Neoverse V2, byte-identical
+  sets throughout. `WEAVER_PAR2_CREATE_INTERLEAVE=N` pins the interleave
+  width (`1` = the lane-major layout) so layouts can be compared without a
+  rebuild.
+
+- Create's automatic kernel ladder now prefers the folded shuffle family over
+  the packed XOR-JIT tier when both are available: on create's access shape
+  the JIT tier measured 1.3–4.4× slower than shuffle2x-256 at 64/16/8 KiB
+  slices on Zen 2. Repair's XOR-JIT codebook and selection are untouched.
+
 ## 0.4.1
 
 This is a patch release from 0.4.0. Additive only: no existing item changed

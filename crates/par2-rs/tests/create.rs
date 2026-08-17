@@ -72,6 +72,12 @@ fn create_validates_empty_files_and_writes_critical_set() {
     assert_eq!(plan.sources.len(), 1);
     assert_eq!(plan.sources[0].par2_name, "data.bin");
     assert_eq!(plan.recovery_count, 0);
+    // The exclusion must be NAMED, not silent: the set does not protect this
+    // file, verify/repair will never look for it, and a caller can only warn
+    // about what the plan reports. The reference tool prints this exclusion on
+    // every noise level for the same reason. The path is the caller's own
+    // spelling, because the warning is for the human who typed it.
+    assert_eq!(plan.skipped_empty, vec![empty.clone()]);
 
     let outcome: Par2CreateOutcome = creator.create(&plan).unwrap();
     assert!(!outcome.dry_run);
@@ -147,6 +153,55 @@ fn a_memoized_replan_matches_a_cold_plan() {
     let cold = Par2Creator::new(build()).plan().unwrap();
     assert_eq!(first, second, "memoized replan differs from the first plan");
     assert_eq!(first, cold, "memoized plan differs from a cold plan");
+}
+
+/// Multiple empty inputs are reported in the order the caller listed them —
+/// the list is for a human matching it against what they typed, so it must
+/// not come back resorted by resolution order or file id.
+#[test]
+fn skipped_empty_files_keep_the_caller_input_order() {
+    let directory = tempdir().unwrap();
+    let z_empty = directory.path().join("z-first-empty.bin");
+    let data = directory.path().join("data.bin");
+    let a_empty = directory.path().join("a-second-empty.bin");
+    fs::write(&z_empty, []).unwrap();
+    fs::write(&data, vec![0x5a; 64]).unwrap();
+    fs::write(&a_empty, []).unwrap();
+
+    let mut options = Par2CreatorOptions::with_output(
+        directory.path().join("set"),
+        Some(directory.path().to_path_buf()),
+        vec![z_empty.clone(), data, a_empty.clone()],
+    );
+    options.block_sizing = BlockSizing::Bytes(16);
+    options.recovery_amount = RecoveryAmount::Count(0);
+
+    let plan = Par2Creator::new(options).plan().unwrap();
+    assert_eq!(plan.sources.len(), 1);
+    assert_eq!(plan.skipped_empty, vec![z_empty, a_empty]);
+}
+
+/// Being empty must not soften validation: a zero-length input that fails the
+/// source checks (here: outside the base directory) is an error, not a skip —
+/// otherwise "empty" becomes a hole through which invalid paths pass quietly.
+#[test]
+fn an_empty_file_outside_the_base_path_is_still_rejected() {
+    let base = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let data = base.path().join("data.bin");
+    let stray_empty = outside.path().join("stray-empty.bin");
+    fs::write(&data, vec![0x5a; 64]).unwrap();
+    fs::write(&stray_empty, []).unwrap();
+
+    let options = Par2CreatorOptions::with_output(
+        base.path().join("set"),
+        Some(base.path().to_path_buf()),
+        vec![data, stray_empty],
+    );
+    assert!(matches!(
+        Par2Creator::new(options).plan(),
+        Err(Par2Error::UnsafeCreationSource { .. })
+    ));
 }
 
 #[test]
@@ -375,6 +430,76 @@ fn overwrite_replaces_outputs_only_after_a_valid_staged_set() {
             .to_string_lossy()
             .starts_with(".par2-create-")
     }));
+}
+
+/// The source hashes the encoder's feed produces must be the hashes a separate
+/// read of the same files produces.
+///
+/// The two paths are selected by the memory budget, not by a flag: a budget
+/// that admits one stripe lets the encode feed the digests, and a budget that
+/// forces several does not (the feed is stripe-major then, so a whole-file MD5
+/// cannot come from it) and the sources are read instead. The PAR2 set the two
+/// write is not allowed to differ by a byte, so this compares them directly.
+///
+/// The sources deliberately include a file with a short trailing slice and one
+/// shorter than the 16 KiB identity read, where `hash_16k` and `hash_full` are
+/// digests of the same bytes.
+#[test]
+fn fused_and_separately_read_source_hashes_write_the_same_set() {
+    let directory = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, length) in [("a.bin", 70_000usize), ("b.bin", 40_003), ("c.bin", 900)] {
+        let path = directory.path().join(name);
+        let bytes = (0..length)
+            .map(|index| (index.wrapping_mul(37) ^ (index >> 5)) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        inputs.push(path);
+    }
+
+    let build = |stem: &str, memory_limit: Option<usize>| -> (Vec<Vec<u8>>, usize, usize) {
+        let mut options = Par2CreatorOptions::with_output(
+            directory.path().join(stem),
+            Some(directory.path().to_path_buf()),
+            inputs.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(4096);
+        options.recovery_amount = RecoveryAmount::Count(5);
+        options.memory_limit = memory_limit;
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        let limit = plan.memory.processing_buffer_limit_bytes;
+        let stripe_bytes = plan.memory.stripe_buffer_bytes;
+        let outcome = creator.create(&plan).unwrap();
+        let bodies = outcome
+            .output_paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        (bodies, limit, stripe_bytes)
+    };
+
+    let (fused, fused_limit, _) = build("fused-set", None);
+    let (separate, _, separate_stripe_bytes) = build("separate-set", Some(16 * 1024));
+    // A single-stripe pass holds every recovery row for a whole 4096-byte
+    // block at once, so its stripe buffers alone cannot be smaller than
+    // `recovery_count * block_size`. The second build's are, so it is
+    // necessarily multi-stripe and its hashes cannot have come from the feed.
+    assert!(
+        separate_stripe_bytes < 5 * 4096,
+        "the small budget must force more than one stripe"
+    );
+    // The default budget floor is hundreds of megabytes against a working set
+    // of a few, so the first build is necessarily single-stripe.
+    assert!(
+        fused_limit >= 16 * 1024 * 1024,
+        "the default budget must admit one stripe"
+    );
+    assert_eq!(fused.len(), separate.len());
+    assert_eq!(
+        fused, separate,
+        "fused and separately read hashes must agree"
+    );
 }
 
 #[test]

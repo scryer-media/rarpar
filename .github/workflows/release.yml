@@ -23,6 +23,48 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Nothing builds from a tag this job has not proven was signed by the
+  # trusted release identity and cut from the release branch lineage. Same
+  # policy and allowed-signers mechanism as the sibling repositories.
+  release-trust:
+    name: verify-release-tag-trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout signed release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Verify trusted SSH tag signature and release branch ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            rarpar-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected release tag: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          release_branch="release-${RELEASE_TAG#rarpar-v}"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signing/allowed_signers"
+          git verify-tag "$RELEASE_TAG"
+          git fetch origin \
+            "refs/heads/main:refs/remotes/origin/main" \
+            "refs/heads/$release_branch:refs/remotes/origin/$release_branch"
+          tag_target="$(git rev-list -n 1 "$RELEASE_TAG^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_target" "origin/$release_branch"; then
+            echo "$RELEASE_TAG is not reachable from origin/$release_branch" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor origin/main "$tag_target"; then
+            echo "$release_branch must be created from the current origin/main before release" >&2
+            exit 1
+          fi
+
   preflight:
     name: preflight
     runs-on: ubuntu-24.04
@@ -115,8 +157,8 @@ jobs:
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           expected_requirements = {
-              "par2-rs": "^0.4.1",
-              "unrar-rs": "^0.5.2",
+              "par2-rs": "^0.4.2",
+              "unrar-rs": "^0.5.4",
           }
           for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)
@@ -142,7 +184,7 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in expected_requirements
           }
-          expected_versions = {"par2-rs": "0.4.1", "unrar-rs": "0.5.1"}
+          expected_versions = {"par2-rs": "0.4.2", "unrar-rs": "0.5.4"}
           if resolved != expected_versions:
               print(
                   f"packaged rarpar resolved {resolved}, expected {expected_versions}",
@@ -163,7 +205,7 @@ jobs:
 
   build:
     name: build-${{ matrix.platform }}
-    needs: [preflight]
+    needs: [release-trust, preflight]
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 45
     env:
@@ -517,6 +559,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -571,12 +614,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Build and push CPU-only image
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: container-context
           file: .github/docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: mode=max,version=v1
+          sbom: true
           tags: ${{ steps.image.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -600,14 +646,138 @@ jobs:
           docker buildx imagetools inspect "$image" | tee ghcr-manifest.txt
           grep -Fq "linux/amd64" ghcr-manifest.txt
           grep -Fq "linux/arm64" ghcr-manifest.txt
+      - name: Install Cosign
+        if: ${{ github.event_name == 'push' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Keylessly sign immutable OCI index
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+      - name: Verify keyless OCI signature
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.push.outputs.digest }}
+
+  # SLSA Build L3 provenance for the container image, attested by the
+  # slsa-github-generator's own trusted builder identity and pushed to the
+  # registry alongside the image. Tag pushes only: a workflow_dispatch redeploy
+  # runs from a branch ref, and provenance minted under a branch identity would
+  # be unverifiable against the release policy.
+  container-provenance:
+    name: container-slsa-provenance
+    needs: [container]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rarpar-v') }}
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    with:
+      image: ${{ needs.container.outputs.image }}
+      digest: ${{ needs.container.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # Independent re-verification of everything the two jobs above claim to have
+  # produced, straight against the registry: a signing step that only trusts
+  # its own output is a vacuous check.
+  oci-verify:
+    name: verify-oci-release-trust
+    needs: [container, container-provenance]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rarpar-v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Install SLSA verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@v2.7.1
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Verify OCI signature, provenance, and SBOM
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.container.outputs.image }}
+          DIGEST: ${{ needs.container.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          immutable_image="${IMAGE}@${DIGEST}"
+          cosign verify \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$immutable_image"
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.1.0" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$immutable_image"
+          slsa-verifier verify-image "$immutable_image" \
+            --source-uri "github.com/${REPOSITORY}" \
+            --source-tag "${REF_NAME}"
+          index="$(docker buildx imagetools inspect --raw "$immutable_image")"
+          for platform in linux/amd64 linux/arm64; do
+            os="${platform%/*}"
+            architecture="${platform#*/}"
+            subject_digest="$(jq -r \
+              --arg os "$os" \
+              --arg architecture "$architecture" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $architecture) | .digest' \
+              <<< "$index")"
+            test -n "$subject_digest" && test "$subject_digest" != null
+            attestation_digest="$(jq -r \
+              --arg subject "$subject_digest" \
+              '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest" and .annotations["vnd.docker.reference.digest"] == $subject) | .digest' \
+              <<< "$index")"
+            test -n "$attestation_digest" && test "$attestation_digest" != null
+            docker buildx imagetools inspect --raw "${IMAGE}@${attestation_digest}" |
+              jq -e 'any(.layers[]; .mediaType == "application/vnd.in-toto+json" and .annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")' > /dev/null
+          done
 
   deploy:
     name: deploy-github-release
-    needs: [build, container]
+    # oci-verify is skipped on workflow_dispatch redeploys (no tag identity to
+    # verify against); on tag pushes it must have passed. Every other need must
+    # have succeeded outright.
+    needs: [build, container, oci-verify]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.container.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.oci-verify.result) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+    outputs:
+      base64_subjects: ${{ steps.subjects.outputs.base64_subjects }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -643,12 +813,42 @@ jobs:
             | sort -z \
             | xargs -0 sha256sum > "$checksum_file"
           mv "$checksum_file" SHA256SUMS
+      - name: Export SLSA subjects
+        id: subjects
+        run: |
+          set -euo pipefail
+          echo "base64_subjects=$(base64 < release-assets/SHA256SUMS | tr -d '\n')" >> "$GITHUB_OUTPUT"
+      - name: Install Cosign
+        if: ${{ github.event_name == 'push' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Keylessly sign and verify the checksum manifest
+        if: ${{ github.event_name == 'push' }}
+        working-directory: release-assets
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle SHA256SUMS.sigstore.json \
+            SHA256SUMS
+          cosign verify-blob \
+            --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           release_files=(release-assets/rarpar-*.tar.gz release-assets/rarpar-*.zip release-assets/SHA256SUMS)
+          if [ -f release-assets/SHA256SUMS.sigstore.json ]; then
+            release_files+=(release-assets/SHA256SUMS.sigstore.json)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
           else
@@ -794,3 +994,23 @@ jobs:
             git commit -m "rarpar ${VERSION}"
             git push origin HEAD:main
           fi
+
+  # SLSA Build L3 provenance for the eight release archives, subjects taken
+  # from the same SHA256SUMS the release ships, attested by the generator's
+  # trusted builder identity and uploaded to the release as
+  # rarpar-provenance.intoto.jsonl. Runs after deploy so the release it
+  # uploads to exists; tag pushes only, same reasoning as the container
+  # provenance.
+  archive-provenance:
+    name: archive-slsa-provenance
+    needs: [deploy]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rarpar-v') }}
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    with:
+      base64-subjects: ${{ needs.deploy.outputs.base64_subjects }}
+      provenance-name: rarpar-provenance.intoto.jsonl
+      upload-assets: true

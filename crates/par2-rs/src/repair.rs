@@ -6963,6 +6963,11 @@ mod tests {
             finished_rx,
             transfer_buffers: std::array::from_fn(|_| None),
             transfer_buffer_len: 8,
+            // Present only on wasm (see the field's doc); `None` is the
+            // can-spawn shape, and this test exercises the transfer-buffer
+            // protocol alone, which needs no inline workers.
+            #[cfg(target_family = "wasm")]
+            inline: None,
         };
 
         complete_tx

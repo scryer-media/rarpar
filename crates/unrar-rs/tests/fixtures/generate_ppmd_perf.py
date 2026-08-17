@@ -44,6 +44,16 @@ OLDMV_PAYLOAD_SIZE = 262_144
 OLDMV_PAYLOAD_NAME = "ppmd-oldmv.txt"
 OLDMV_VOLUME_SIZE = "64k"
 
+# The grouped-solid set: four deterministic members under `-s2`, so member 2
+# is a MID-ARCHIVE RESET POINT (per-file solid flag clear while the archive
+# flag is set). This is the shape that distinguishes "solid dispatch picks
+# the decoder instance" from "solid drives the reset": the reset must key on
+# the per-file flag inside the shared slot, and the group leaders must still
+# prime the chain for their group (see member_is_solid in archive/member.rs).
+S2_GROUP_MEMBERS = 4
+S2_GROUP_MEMBER_SIZE = 524_288
+S2_GROUP_PAYLOAD_STEM = "ppmd-s2grp"
+
 
 def write_payload(path: Path, payload_size: int = PAYLOAD_SIZE) -> str:
     # SHA-256 twice over, and deliberately: the payload stream is base64 over a
@@ -132,6 +142,53 @@ def build_set(
     return payload_sha256, written
 
 
+def build_s2_group_set(
+    run_rar,
+    work_dir: Path,
+    destination: Path,
+) -> tuple[list[str], list[Path]]:
+    """Write the 4-member `-s2` grouped-solid archive at `destination`."""
+    payload_names = []
+    payload_hashes = []
+    for index in range(S2_GROUP_MEMBERS):
+        name = f"{S2_GROUP_PAYLOAD_STEM}{index}.txt"
+        # Distinct per-member streams: extend the seed with the member index
+        # (write_payload hashes SEED || counter; vary the counter start).
+        payload = work_dir / name
+        digest = hashlib.sha256()
+        written = 0
+        counter = index * 1_000_000
+        with payload.open("wb") as output:
+            while written < S2_GROUP_MEMBER_SIZE:
+                block = hashlib.sha256(SEED + counter.to_bytes(8, "little")).digest()
+                encoded = base64.b64encode(block) + b"\n"
+                encoded = encoded[: S2_GROUP_MEMBER_SIZE - written]
+                output.write(encoded)
+                digest.update(encoded)
+                written += len(encoded)
+                counter += 1
+        os.utime(payload, (FIXED_MTIME, FIXED_MTIME))
+        payload_names.append(name)
+        payload_hashes.append(digest.hexdigest())
+
+    command = ["a", "-idq", "-ma4", "-m5", "-s2", "-mc16:16t+", "-md4m", "-ep", "-o+"]
+    command.append(destination.name)
+    command.extend(payload_names)
+    run_rar(work_dir, command)
+    for name in payload_names:
+        (work_dir / name).unlink()
+
+    produced = work_dir / destination.name
+    if not produced.is_file():
+        raise SystemExit(f"rar produced no output for {destination.name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+    shutil.copyfile(produced, destination)
+    produced.unlink()
+    return payload_hashes, [destination]
+
+
 def local_runner(rar_bin: Path):
     def run(work_dir: Path, command: list[str]) -> None:
         subprocess.run([str(rar_bin), *command], cwd=work_dir, check=True)
@@ -206,6 +263,14 @@ def main() -> None:
         run_rar = docker_runner(args.docker, args.image)
 
     if args.all:
+        with tempfile.TemporaryDirectory() as tmp:
+            hashes, written = build_s2_group_set(
+                run_rar, Path(tmp), FIXTURE_DIR / "rar4" / "rar4_ppm_s2groups.rar"
+            )
+        for index, digest in enumerate(hashes):
+            print(f"rar4_ppm_s2groups member {index} payload sha256: {digest}")
+        for path in written:
+            print(f"wrote {path}")
         sets = [
             (
                 "rar4_ppm_order16_32m.rar",

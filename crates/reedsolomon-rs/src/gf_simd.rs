@@ -739,6 +739,18 @@ fn shuffle2x_avx512_enabled() -> bool {
     })
 }
 
+/// Whether the 512-bit shuffle2x path pairs adjacent groups into a single
+/// twelve-source destination pass ([`mul_acc_shuffle2x_pair_avx512`]) rather
+/// than one pass per six-source group. Setting `WEAVER_GF16_SHUFFLE2X_PAIR=0`
+/// pins the single-group loop shape so hardware that runs this tier can A/B
+/// the two shapes — same width, same arithmetic — without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn shuffle2x_pair_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("WEAVER_GF16_SHUFFLE2X_PAIR").is_some_and(|v| v == "0"))
+}
+
 /// Bytes per split-layout block: one 256-bit register holding 16 GF(2^16)
 /// words as [16 low bytes | 16 high bytes].
 pub const SPLIT_BLOCK_BYTES: usize = 32;
@@ -1135,7 +1147,28 @@ pub fn mul_acc_shuffle2x_batch(
         debug_assert!(altmap_supported());
         if altmap_uses_avx2() {
             if shuffle2x_avx512_enabled() {
-                for (staging, group_tables) in stagings.iter().zip(tables.iter()) {
+                // Adjacent groups run fused twelve sources at a time: lane
+                // pairing frees enough table registers to hold both groups, so
+                // each destination block is read and written once per twelve
+                // sources instead of once per six. An odd trailing group falls
+                // back to the single-group kernel.
+                let mut group = 0usize;
+                if shuffle2x_pair_enabled() {
+                    while group + 1 < stagings.len() {
+                        unsafe {
+                            mul_acc_shuffle2x_pair_avx512(
+                                dst,
+                                stagings[group],
+                                stagings[group + 1],
+                                &tables[group],
+                                &tables[group + 1],
+                            )
+                        };
+                        group += 2;
+                    }
+                }
+                for (staging, group_tables) in stagings[group..].iter().zip(tables[group..].iter())
+                {
                     unsafe { mul_acc_shuffle2x_group_avx512(dst, staging, group_tables) };
                 }
             } else {
@@ -1447,6 +1480,168 @@ unsafe fn mul_acc_shuffle2x_group_avx512(
         }
         if offset < len {
             mul_acc_shuffle2x_group_avx2(&mut dst[offset..], &staging[src..], tables);
+        }
+    }
+}
+
+/// Multiply two interleaved six-source groups into a split-layout destination
+/// with one pass over `dst` — twelve sources per destination load/store.
+///
+/// **Oracle alignment.** ParPar's multi-region controller applies several
+/// source regions per destination pass (`gf16_muladd_multi.h`), sized by each
+/// method's `idealInputMultiple`: 3 for `SHUFFLE_AVX512`, 6 for
+/// `SHUFFLE2X_AVX512`. This is that shape for rarpar's split layout, at twelve
+/// regions — the whole `DEFAULT_INPUT_GROUPING` row lands in a single
+/// destination read-modify-write instead of one per six-source group.
+///
+/// **Lane pairing is what pays for it.** `vpshufb` looks up inside each
+/// 128-bit lane independently, so a zmm table register does not have to hold
+/// one source's table twice (what [`mul_acc_shuffle2x_group_avx512`] does with
+/// its `widen`): it can hold *two* sources' tables, `[x's 32 bytes | y's 32
+/// bytes]`. The staging interleave already places lane `l`'s block at
+/// `(block * FOLDED_GROUP + l) * 32`, so a single 64-byte load at an even lane
+/// is exactly `[lane 2i's block | lane 2i+1's block]` of the same destination
+/// block, in the lane order those joined tables expect. Two consequences, both
+/// of them the point of this kernel:
+///
+/// - four table registers now cover a source *pair*, so twelve sources fit in
+///   the same 24 zmm the single-group kernel spends on six, and one
+///   destination read-modify-write serves twelve sources instead of six;
+/// - the per-source `vinserti64x4` that kernel needs to build a zmm from two
+///   32-byte blocks disappears. On Skylake-SP that insert issues on port 5,
+///   the same port every `vpshufb` needs, and it was 19% of the single-group
+///   loop's port-5 traffic.
+///
+/// Measured on the emitted assembly, per twelve source-block-into-destination-
+/// block operations — the same unit of work for both kernels, and neither
+/// spills: 62 vector ALU ops of which 31 are port-5-only for the single-group
+/// kernel, 58 of which 26 for this one. The XOR reduction is *not* where the
+/// difference comes from: LLVM already contracts the single-group kernel's XOR
+/// chains into `vpternlog`, so both loops issue eleven of them. Writing the
+/// ternary logic explicitly here only makes the reference's reduction
+/// (`gf16_shuffle2x_avx512_round`, imm 0x96) legible in the source.
+///
+/// The reduction mirrors [`mul_acc_folded_pair_gfni_avx512`]: `vpermq 0x4e`
+/// swaps the two 128-bit halves inside each 256-bit lane (the ymm kernel's
+/// `permute2x128<0x01>` plane swap applied to both sources at once), then the
+/// two halves — which accumulate into the *same* 32-byte destination block —
+/// fold together with the prior destination bytes in one ternary-logic op.
+/// Every XOR term per output byte is unchanged; only their association order
+/// differs, so the bytes are identical to the 256-bit kernel's.
+///
+/// `dst.len()` must be a multiple of [`SPLIT_BLOCK_BYTES`] and each staging
+/// must span `dst.len() * FOLDED_GROUP` bytes; both hold for every caller
+/// through [`mul_acc_shuffle2x_batch`]. There is no tail: the kernel steps one
+/// 32-byte destination block per iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]
+unsafe fn mul_acc_shuffle2x_pair_avx512(
+    dst: &mut [u8],
+    staging_a: &[u8],
+    staging_b: &[u8],
+    tables_a: &[&Shuffle2xTables; FOLDED_GROUP],
+    tables_b: &[&Shuffle2xTables; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!(dst.len().is_multiple_of(SPLIT_BLOCK_BYTES));
+    debug_assert!(staging_a.len() >= dst.len() * FOLDED_GROUP);
+    debug_assert!(staging_b.len() >= dst.len() * FOLDED_GROUP);
+
+    unsafe {
+        // Join two sources' 32-byte `[low-plane | high-plane]` tables into one
+        // zmm: lanes 0-1 serve source `x`, lanes 2-3 source `y`.
+        let join = |x: &[u8; 32], y: &[u8; 32]| {
+            _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_loadu_si256(x.as_ptr() as *const __m256i)),
+                _mm256_loadu_si256(y.as_ptr() as *const __m256i),
+            )
+        };
+        // Six source pairs: three from each group, in the order the loads walk
+        // them. 6 x 4 = 24 table registers, the whole twelve-source row.
+        const PAIRS: usize = FOLDED_GROUP / 2;
+        let mut table_regs = [[_mm512_setzero_si512(); 4]; 2 * PAIRS];
+        for (pair, regs) in table_regs.iter_mut().enumerate() {
+            let tables = if pair < PAIRS { tables_a } else { tables_b };
+            let lane = (pair % PAIRS) * 2;
+            let (x, y) = (tables[lane], tables[lane + 1]);
+            *regs = [
+                join(&x.norm_lo, &y.norm_lo),
+                join(&x.swap_lo, &y.swap_lo),
+                join(&x.norm_hi, &y.norm_hi),
+                join(&x.swap_hi, &y.swap_hi),
+            ];
+        }
+
+        let mask = _mm512_set1_epi8(0x0f);
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
+
+            // One 64-byte load covers source pair `$pair` of `$staging` for
+            // this destination block; the two nibble indices feed all four of
+            // that pair's tables.
+            macro_rules! nibbles {
+                ($staging:expr, $pair:literal) => {{
+                    let data = _mm512_loadu_si512(
+                        $staging.as_ptr().add(src + $pair * 2 * SPLIT_BLOCK_BYTES)
+                            as *const __m512i,
+                    );
+                    (
+                        _mm512_and_si512(data, mask),
+                        _mm512_and_si512(_mm512_srli_epi16::<4>(data), mask),
+                    )
+                }};
+            }
+
+            // First pair seeds both accumulators, so neither needs a zeroing
+            // XOR nor a dependency on the previous iteration.
+            let (lo, hi) = nibbles!(staging_a, 0);
+            let [nl, sl, nh, sh] = table_regs[0];
+            let mut result =
+                _mm512_xor_si512(_mm512_shuffle_epi8(nl, lo), _mm512_shuffle_epi8(nh, hi));
+            let mut swapped =
+                _mm512_xor_si512(_mm512_shuffle_epi8(sl, lo), _mm512_shuffle_epi8(sh, hi));
+
+            // `acc = acc ^ p ^ q` in one ternary-logic op per nibble pair —
+            // the reference's `_mm512_ternarylogic_epi32(..., 0x96)` reduction.
+            macro_rules! pair {
+                ($staging:expr, $pair:literal, $regs:literal) => {
+                    let (lo, hi) = nibbles!($staging, $pair);
+                    let [nl, sl, nh, sh] = table_regs[$regs];
+                    result = _mm512_ternarylogic_epi64::<0x96>(
+                        result,
+                        _mm512_shuffle_epi8(nl, lo),
+                        _mm512_shuffle_epi8(nh, hi),
+                    );
+                    swapped = _mm512_ternarylogic_epi64::<0x96>(
+                        swapped,
+                        _mm512_shuffle_epi8(sl, lo),
+                        _mm512_shuffle_epi8(sh, hi),
+                    );
+                };
+            }
+            pair!(staging_a, 1, 1);
+            pair!(staging_a, 2, 2);
+            pair!(staging_b, 0, 3);
+            pair!(staging_b, 1, 4);
+            pair!(staging_b, 2, 5);
+
+            let crossed = _mm512_permutex_epi64::<0x4e>(swapped);
+            result = _mm512_xor_si512(result, crossed);
+            let prior = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let mixed = _mm256_ternarylogic_epi64::<0x96>(
+                prior,
+                _mm512_castsi512_si256(result),
+                _mm512_extracti64x4_epi64::<1>(result),
+            );
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, mixed);
+
+            offset += SPLIT_BLOCK_BYTES;
+            src += stride;
         }
     }
 }
@@ -1784,6 +1979,31 @@ unsafe fn mul_acc_folded_pair_gfni_avx512(
     }
 }
 
+/// Block granularity of the grouped-input source layout: the 32-byte block the
+/// aarch64 CLMUL and VTBL input-batch kernels consume per step (`vld2q`/`vst2q`
+/// of one 16-word strip).
+pub const INPUT_BATCH_BLOCK_BYTES: usize = 32;
+
+/// Source lanes a caller should block-interleave into one contiguous stream for
+/// [`mul_acc_input_batch_prepared_interleaved`].
+///
+/// On aarch64 this is [`CLMUL_SRC_GROUP_WIDE`] — the sources the wide kernel
+/// pass folds into the destination — so a full group runs one pass that reads
+/// exactly one sequential stream plus its destination: two streams, which even
+/// a 2-way L1D holds, with the pass's fixed per-block cost divided by sixteen.
+/// The two levers were measured composing on an M5 (single band thread,
+/// eight-volume corpus, medians of five): width 16 beats width 8 by 3.9% on
+/// the fused flavour and 11.8% on the EOR3-merge flavour — width 16 lost to 8
+/// before the wide pass existed, because an eight-source pass over a
+/// sixteen-wide stream reads every other block and skips the rest. Everywhere
+/// else the grouped-input kernels walk one source region at a time and a
+/// lane-major layout is what they want, so the advertised width is 1 (no
+/// interleave).
+#[cfg(target_arch = "aarch64")]
+pub const INPUT_BATCH_INTERLEAVE_LANES: usize = CLMUL_SRC_GROUP_WIDE;
+#[cfg(not(target_arch = "aarch64"))]
+pub const INPUT_BATCH_INTERLEAVE_LANES: usize = 1;
+
 /// Multiply multiple input regions by prepared factors and XOR-accumulate the
 /// results into a single destination buffer.
 pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[PreparedFactorSrc<'_>]) {
@@ -1850,6 +2070,91 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
             })
             .collect();
         mul_acc_input_batch(dst, &fallback_inputs);
+    }
+}
+
+/// Multiply a **block-interleaved** group of source lanes by their prepared
+/// factors and XOR-accumulate all of them into one destination.
+///
+/// `stream` carries `lanes` source regions interleaved at
+/// [`INPUT_BATCH_BLOCK_BYTES`]: lane `l`'s block `b` starts at
+/// `(b * lanes + l) * INPUT_BATCH_BLOCK_BYTES`. One pass over the group
+/// therefore walks `stream` from front to back exactly once instead of walking
+/// `lanes` separate regions in lockstep — the same number of bytes, one memory
+/// stream instead of `lanes` of them, which is what makes the pass fit an L1D
+/// of any associativity rather than needing `lanes + 1` ways.
+///
+/// `factors[i]` belongs to lane `i`. `factors.len()` may be smaller than
+/// `lanes` when a batch is only partly live; the layout stride still follows
+/// `lanes`, because that is how the bytes were written. `lanes == 1` is the
+/// lane-major layout and `stream` is then simply lane 0's region.
+///
+/// Panics unless `stream.len() == lanes * dst.len()`, `factors.len() <= lanes`,
+/// `lanes >= 1`, and — for `lanes > 1` — `dst.len()` is a whole number of
+/// blocks. The interleave is only expressible per whole block.
+pub fn mul_acc_input_batch_prepared_interleaved(
+    dst: &mut [u8],
+    factors: &[PreparedInputFactor],
+    stream: &[u8],
+    lanes: usize,
+) {
+    let len = dst.len();
+    assert!(lanes >= 1, "an interleaved group needs at least one lane");
+    assert!(
+        factors.len() <= lanes,
+        "an interleaved group cannot carry more factors than lanes"
+    );
+    assert!(len.is_multiple_of(2), "region length must be even");
+    assert!(
+        lanes == 1 || len.is_multiple_of(INPUT_BATCH_BLOCK_BYTES),
+        "an interleaved region must be a whole number of blocks"
+    );
+    assert_eq!(
+        stream.len(),
+        lanes * len,
+        "interleaved stream must hold every lane of the region"
+    );
+
+    if len == 0 || factors.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Same dispatch rule as `mul_acc_input_batch_prepared`: CLMUL above
+        // three live sources, VTBL below it.
+        if factors.len() > 3 && clmul_batch_enabled() {
+            if clmul_sha3_available() {
+                unsafe { mul_acc_input_batch_clmul_sha3_interleaved(dst, factors, stream, lanes) };
+            } else {
+                unsafe { mul_acc_input_batch_clmul_interleaved(dst, factors, stream, lanes) };
+            }
+            return;
+        }
+        unsafe { mul_acc_input_batch_neon_prepared_interleaved(dst, factors, stream, lanes) };
+        return;
+    }
+
+    #[allow(unreachable_code)]
+    {
+        // Portable definition of the layout. Only the aarch64 create family
+        // stages its inputs this way, so on every other target this is a
+        // correctness path rather than a hot one: it is what the differential
+        // tests measure the vector kernels against, and what a future target
+        // adopting the layout would fall back to. GF(2^16) addition is XOR, so
+        // folding lane by lane inside a block gives the identical bytes to any
+        // other order.
+        for (block, dst_block) in dst.chunks_mut(INPUT_BATCH_BLOCK_BYTES).enumerate() {
+            let block_base = block * lanes * INPUT_BATCH_BLOCK_BYTES;
+            for (lane, prepared) in factors.iter().enumerate() {
+                let start = block_base + lane * INPUT_BATCH_BLOCK_BYTES;
+                mul_acc_region_scalar(
+                    prepared.factor,
+                    &stream[start..start + dst_block.len()],
+                    dst_block,
+                );
+            }
+        }
     }
 }
 
@@ -4098,9 +4403,32 @@ unsafe fn mul_acc_multi_region_clmul_sha3(factors_and_dsts: &mut [FactorDst<'_>]
 #[cfg(target_arch = "aarch64")]
 const CLMUL_APPLE_FUSION: bool = cfg!(target_vendor = "apple");
 
-/// Sources processed per CLMUL pass on aarch64.
+/// Sources processed per narrow CLMUL pass on aarch64 — the reference
+/// encoder's `CLMUL_NUM_REGIONS`, and still the shape every partial group runs.
 #[cfg(target_arch = "aarch64")]
 const CLMUL_SRC_GROUP: usize = 8;
+
+/// Sources processed per *wide* CLMUL pass on aarch64.
+///
+/// A pass costs a fixed amount of work per 32-byte block regardless of how many
+/// sources it carries: the destination's `LD2`/`ST2` read-modify-write, the
+/// packed Barrett reduction, and the fold into the destination. On a core whose
+/// vector pipes are the binding resource — Neoverse V2 runs this loop with all
+/// four V pipes at ~98% occupancy and the load pipes at half — that fixed cost
+/// is what to attack, because it is charged once per pass and divided by the
+/// number of sources the pass carries.
+///
+/// Per 32-byte block at eight sources the fixed part is ~32 of the ~138 vector
+/// issue slots (destination `LD2` 2 + `ST2` 4 + reduction 24 + fold 2) and each
+/// source adds ~12 (`LD2` 2, the Karatsuba middle `EOR` 1, six `PMULL` 6, its
+/// share of the `EOR3` merge tree 3). Sixteen sources in one pass spend
+/// (32 + 16×12)/16 = 14.0 slots per source where eight spend 138/8 = 17.25.
+/// The extra live coefficients spill, but a spill reload is a load-pipe uop and
+/// costs no vector slot at all, so the trade pays in the resource that is not
+/// binding. Partial groups keep using [`CLMUL_SRC_GROUP`], so the widths this
+/// kernel already generated are untouched.
+#[cfg(target_arch = "aarch64")]
+const CLMUL_SRC_GROUP_WIDE: usize = 16;
 
 /// Whether the input-batch dispatch may pick the CLMUL kernels. Setting
 /// `WEAVER_GF16_CLMUL_BATCH=0` pins the VTBL shuffle path so the two can be
@@ -4116,6 +4444,24 @@ fn clmul_batch_enabled() -> bool {
 #[inline]
 fn clmul_sha3_available() -> bool {
     std::arch::is_aarch64_feature_detected!("sha3")
+}
+
+/// Whether the Apple PMULL+EOR fusion flavor may be used.
+///
+/// `WEAVER_GF16_CLMUL_APPLE_FUSION=0` selects the non-Apple EOR3-merge flavor
+/// instead — the one a Neoverse part runs — so that flavor can be disassembled
+/// and A/B'd on Apple silicon, which also has FEAT_SHA3. Same escape-hatch
+/// pattern as `WEAVER_GF16_CLMUL_BATCH`. Off Apple there is only one SHA3
+/// flavor: the constant is already `false`, the check folds away, and the
+/// environment is never read.
+#[cfg(target_arch = "aarch64")]
+fn clmul_apple_fusion_enabled() -> bool {
+    if !CLMUL_APPLE_FUSION {
+        return false;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("WEAVER_GF16_CLMUL_APPLE_FUSION").is_none_or(|v| v != "0"))
 }
 
 /// Per-source broadcast coefficients: factor split into lo/hi bytes plus the
@@ -4214,19 +4560,74 @@ unsafe fn clmul_load_planes(src: *const u8) -> ClmulSrcPlanes {
     }
 }
 
+/// `PMULL` on the low halves, as one asm instruction.
+///
+/// Paired with [`pmull_high`] below; see that function for why the intrinsics
+/// are not used here.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_low(
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull {r:v}.8h, {a:v}.8b, {b:v}.8b",
+            r = lateout(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
+/// `PMULL2` on the high halves, as one asm instruction.
+///
+/// `vmull_high_p8(x, c)` looks like the obvious spelling, but every `c` here is
+/// a `vdupq_n_p8` broadcast, so LLVM sees that the coefficient's high half
+/// equals its low half and rewrites the multiply as `ext c,c,#8` + `pmull` —
+/// two instructions where one would do, on every high product of every source
+/// of every block. That is 24 extra instructions per 32-byte block on an
+/// eight-source pass (measured: 191 vs the reference's 159 for the plain NEON
+/// flavor). Emitting the instruction directly is how the reference kernel
+/// (`parpar/gf16/gf16_clmul_neon.h`, `pmull_low`/`pmull_high`) avoids the same
+/// rewrite. `lateout` lets the result share a register with an input: the
+/// operands are read before the destination is written.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_high(
+    a: std::arch::aarch64::poly8x16_t,
+    b: std::arch::aarch64::poly8x16_t,
+) -> std::arch::aarch64::poly16x8_t {
+    use std::arch::aarch64::*;
+    let result: uint16x8_t;
+    unsafe {
+        std::arch::asm!(
+            "pmull2 {r:v}.8h, {a:v}.16b, {b:v}.16b",
+            r = lateout(vreg) result,
+            a = in(vreg) vreinterpretq_u8_p8(a),
+            b = in(vreg) vreinterpretq_u8_p8(b),
+            options(pure, nomem, nostack),
+        );
+        vreinterpretq_p16_u16(result)
+    }
+}
+
 /// The six Karatsuba products of loaded planes and broadcast coefficients.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_partials(d: ClmulSrcPlanes, c: &ClmulBatchCoeff) -> ClmulPartials {
-    use std::arch::aarch64::*;
     unsafe {
         ClmulPartials {
-            low1: vmull_p8(vget_low_p8(d.lo), vget_low_p8(c.lo)),
-            low2: vmull_high_p8(d.lo, c.lo),
-            mid1: vmull_p8(vget_low_p8(d.mid), vget_low_p8(c.mid)),
-            mid2: vmull_high_p8(d.mid, c.mid),
-            high1: vmull_p8(vget_low_p8(d.hi), vget_low_p8(c.hi)),
-            high2: vmull_high_p8(d.hi, c.hi),
+            low1: pmull_low(d.lo, c.lo),
+            low2: pmull_high(d.lo, c.lo),
+            mid1: pmull_low(d.mid, c.mid),
+            mid2: pmull_high(d.mid, c.mid),
+            high1: pmull_low(d.hi, c.hi),
+            high2: pmull_high(d.hi, c.hi),
         }
     }
 }
@@ -4430,24 +4831,42 @@ pub(crate) unsafe fn clmul_barrett_reduce<const SHA3: bool>(
 /// prepared dispatch paths run allocation-free: sources are consumed in
 /// fixed groups of [`CLMUL_SRC_GROUP`] through a stack buffer, one full pass
 /// over `dst` per group.
+///
+/// `src_block_stride` is the distance between consecutive
+/// [`INPUT_BATCH_BLOCK_BYTES`] blocks *of one source*: exactly
+/// [`INPUT_BATCH_BLOCK_BYTES`] for the lane-major layout, where every source
+/// is its own contiguous region, and `lanes * INPUT_BATCH_BLOCK_BYTES` for the
+/// block-interleaved layout, where a whole group of sources shares one
+/// contiguous stream so the pass reads *one* stream instead of `N` of them.
+/// The loop pays one extra address increment per block for the general form
+/// and nothing else; the arithmetic and its order are untouched.
+///
+/// # Safety
+/// Every yielded pointer must be readable at `block * src_block_stride + k`
+/// for every `block` in `0..len.div_ceil(INPUT_BATCH_BLOCK_BYTES)` and every
+/// `k` in `0..min(INPUT_BATCH_BLOCK_BYTES, len - block * INPUT_BATCH_BLOCK_BYTES)`,
+/// `src_block_stride` must be at least [`INPUT_BATCH_BLOCK_BYTES`], and no
+/// source may alias `dst`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool>(
+unsafe fn mul_acc_input_batch_clmul_body<const SHA3: bool, const FUSED: bool>(
     dst: &mut [u8],
-    inputs: impl Iterator<Item = (u16, &'a [u8])> + Clone,
+    inputs: impl Iterator<Item = (u16, *const u8)> + Clone,
+    src_block_stride: usize,
 ) {
     let len = dst.len();
     // The public dispatchers assert this; guard direct (test/future) callers
     // too — a short src would send vld2q/tail slicing out of bounds.
     debug_assert!(len.is_multiple_of(2), "region length must be even");
+    debug_assert!(
+        src_block_stride >= INPUT_BATCH_BLOCK_BYTES,
+        "source block stride must cover a whole block"
+    );
 
     // factor==1 is a plain XOR; fold those up front like the other kernels.
     for (factor, src) in inputs.clone() {
-        debug_assert_eq!(src.len(), len, "src length must match dst");
         if factor == 1 {
-            for (d, s) in dst.iter_mut().zip(src.iter()) {
-                *d ^= *s;
-            }
+            unsafe { xor_acc_blocked(dst, src, src_block_stride) };
         }
     }
 
@@ -4461,18 +4880,16 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
     // registers stay loop-invariant instead of being re-walked out of a
     // wide `Option<(u16, ClmulBatchCoeff, &[u8])>` array each block.
     while let Some((first_factor, first_src)) = it.next() {
-        let mut factors = [first_factor; CLMUL_SRC_GROUP];
-        let mut slices = [first_src; CLMUL_SRC_GROUP];
-        let mut srcs = [first_src.as_ptr(); CLMUL_SRC_GROUP];
-        let mut coeffs = [unsafe { clmul_batch_coeff(first_factor) }; CLMUL_SRC_GROUP];
+        let mut factors = [first_factor; CLMUL_SRC_GROUP_WIDE];
+        let mut srcs = [first_src; CLMUL_SRC_GROUP_WIDE];
+        let mut coeffs = [unsafe { clmul_batch_coeff(first_factor) }; CLMUL_SRC_GROUP_WIDE];
         let mut n = 1usize;
-        for slot in 1..CLMUL_SRC_GROUP {
+        for slot in 1..CLMUL_SRC_GROUP_WIDE {
             let Some((factor, src)) = it.next() else {
                 break;
             };
             factors[slot] = factor;
-            slices[slot] = src;
-            srcs[slot] = src.as_ptr();
+            srcs[slot] = src;
             coeffs[slot] = unsafe { clmul_batch_coeff(factor) };
             n += 1;
         }
@@ -4482,26 +4899,80 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
         // gf16_clmul_neon_base.h:54`, CLMUL_NUM_REGIONS 8): the source count is
         // a constant inside the loop, so the whole region sequence unrolls to a
         // single backedge.
+        //
+        // A full sixteen goes through one wide pass; anything short of that
+        // splits into an eight-source pass plus a pass for the remainder, which
+        // is exactly the sequence of passes this kernel made before the wide
+        // body existed (grouping was by eights, so a twelve-source batch ran an
+        // eight then a four). Same passes, same order, same arithmetic.
         unsafe {
             let dst_ptr = dst.as_mut_ptr();
-            match n {
-                1 => clmul_pass::<SHA3, FUSED, 1>(dst_ptr, &srcs, &coeffs, vec_len),
-                2 => clmul_pass::<SHA3, FUSED, 2>(dst_ptr, &srcs, &coeffs, vec_len),
-                3 => clmul_pass::<SHA3, FUSED, 3>(dst_ptr, &srcs, &coeffs, vec_len),
-                4 => clmul_pass::<SHA3, FUSED, 4>(dst_ptr, &srcs, &coeffs, vec_len),
-                5 => clmul_pass::<SHA3, FUSED, 5>(dst_ptr, &srcs, &coeffs, vec_len),
-                6 => clmul_pass::<SHA3, FUSED, 6>(dst_ptr, &srcs, &coeffs, vec_len),
-                7 => clmul_pass::<SHA3, FUSED, 7>(dst_ptr, &srcs, &coeffs, vec_len),
-                _ => clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst_ptr, &srcs, &coeffs, vec_len),
+            let stride = src_block_stride;
+            if n == CLMUL_SRC_GROUP_WIDE {
+                clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP_WIDE>(
+                    dst_ptr, &srcs, &coeffs, vec_len, stride,
+                );
+            } else if n > CLMUL_SRC_GROUP {
+                clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(
+                    dst_ptr, &srcs, &coeffs, vec_len, stride,
+                );
+                clmul_pass_narrow::<SHA3, FUSED>(
+                    dst_ptr,
+                    &srcs[CLMUL_SRC_GROUP..],
+                    &coeffs[CLMUL_SRC_GROUP..],
+                    n - CLMUL_SRC_GROUP,
+                    vec_len,
+                    stride,
+                );
+            } else {
+                clmul_pass_narrow::<SHA3, FUSED>(dst_ptr, &srcs, &coeffs, n, vec_len, stride);
             }
         }
 
-        // Scalar tail (< one 32-byte block) for this group's sources.
+        // Scalar tail (< one 32-byte block) for this group's sources. The tail
+        // lies inside the last, partial block, which is contiguous in both
+        // layouts — `vec_len / BLOCK` whole blocks in, at this source's stride.
         if vec_len < len {
+            let tail_len = len - vec_len;
+            let tail_offset = (vec_len / INPUT_BATCH_BLOCK_BYTES) * src_block_stride;
             for lane in 0..n {
-                mul_acc_region_scalar(factors[lane], &slices[lane][vec_len..], &mut dst[vec_len..]);
+                let src =
+                    unsafe { std::slice::from_raw_parts(srcs[lane].add(tail_offset), tail_len) };
+                mul_acc_region_scalar(factors[lane], src, &mut dst[vec_len..]);
             }
         }
+    }
+}
+
+/// XOR one source region into `dst` when the source's blocks sit
+/// `src_block_stride` apart. The factor-1 fold of the input-batch kernels.
+///
+/// # Safety
+/// Same source-readability contract as [`mul_acc_input_batch_clmul_body`].
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn xor_acc_blocked(dst: &mut [u8], src: *const u8, src_block_stride: usize) {
+    let len = dst.len();
+    if src_block_stride == INPUT_BATCH_BLOCK_BYTES {
+        // Lane-major: one contiguous run, which is the shape the loop
+        // vectorizer handles best. Kept literally as it was before the
+        // interleaved layout existed.
+        let src = unsafe { std::slice::from_raw_parts(src, len) };
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d ^= *s;
+        }
+        return;
+    }
+    let mut offset = 0usize;
+    let mut src_offset = 0usize;
+    while offset < len {
+        let take = INPUT_BATCH_BLOCK_BYTES.min(len - offset);
+        let block = unsafe { std::slice::from_raw_parts(src.add(src_offset), take) };
+        for (d, s) in dst[offset..offset + take].iter_mut().zip(block.iter()) {
+            *d ^= *s;
+        }
+        offset += take;
+        src_offset += src_block_stride;
     }
 }
 
@@ -4513,52 +4984,106 @@ unsafe fn mul_acc_input_batch_clmul_body<'a, const SHA3: bool, const FUSED: bool
 /// is the structural half of the kernel — the arithmetic is identical to what
 /// the iterator-driven shape ran, in the identical order.
 ///
+/// `src_block_stride` advances a source by one 32-byte block: 32 for the
+/// lane-major layout, `lanes * 32` for the block-interleaved one, where the
+/// `N` sources of this pass are one contiguous stream.
+///
 /// # Safety
-/// `dst` and every `srcs[i]` for `i < N` must be valid for `vec_len` bytes,
-/// `vec_len` must be a multiple of 32, and `dst` must not alias any source.
+/// `srcs` and `coeffs` must each hold at least `N` entries, `dst` must be valid
+/// for `vec_len` bytes, every `srcs[i]` for `i < N` must be valid for reading
+/// 32 bytes at `block * src_block_stride` for every `block < vec_len / 32`,
+/// `vec_len` must be a multiple of 32, `src_block_stride` must be at least 32,
+/// and `dst` must not alias any source.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
     dst: *mut u8,
-    srcs: &[*const u8; CLMUL_SRC_GROUP],
-    coeffs: &[ClmulBatchCoeff; CLMUL_SRC_GROUP],
+    srcs: &[*const u8],
+    coeffs: &[ClmulBatchCoeff],
     vec_len: usize,
+    src_block_stride: usize,
 ) {
     use std::arch::aarch64::*;
+    debug_assert!(srcs.len() >= N && coeffs.len() >= N);
     unsafe {
+        // Slices rather than fixed-size arrays only so the wide pass and the
+        // narrow tail pass can share one body; every index below is a compile-
+        // time constant less than `N`, and the caller guarantees the lengths.
+        macro_rules! src {
+            ($idx:expr) => {
+                *srcs.get_unchecked($idx)
+            };
+        }
+        macro_rules! coeff {
+            ($idx:expr) => {
+                coeffs.get_unchecked($idx)
+            };
+        }
+        // A shared byte offset, not a walking cursor per source: `LD2` has no
+        // register-offset addressing mode either way, so both shapes pay one
+        // address `add` per source per block, but eight loop-carried cursors
+        // cost twelve `mov`s per block in register-copy traffic on the fused
+        // flavor (measured 147 -> 160 instructions per block at eight
+        // sources). LLVM will not fold the increments into `ld2 {..}, [x], #32`
+        // from either spelling, and inline asm cannot express the consecutive
+        // register pair `LD2` needs.
+        //
+        // Two offsets rather than one because the destination advances a block
+        // at a time while the sources advance by their layout's block stride;
+        // they coincide on the lane-major layout, and the second increment is
+        // the whole cost of supporting both.
         let mut offset = 0usize;
+        let mut src_offset = 0usize;
         while offset < vec_len {
             macro_rules! prefetch_lane {
                 ($idx:expr) => {
                     if N > $idx {
-                        prefetch_src_l1(srcs[$idx].wrapping_add(offset + 64));
+                        prefetch_src_l1(src!($idx).wrapping_add(src_offset + 64));
                     }
                 };
             }
             if NEON_SRC_PREFETCH {
-                prefetch_lane!(0);
-                prefetch_lane!(1);
-                prefetch_lane!(2);
-                prefetch_lane!(3);
-                prefetch_lane!(4);
-                prefetch_lane!(5);
-                prefetch_lane!(6);
-                prefetch_lane!(7);
+                if src_block_stride == INPUT_BATCH_BLOCK_BYTES {
+                    prefetch_lane!(0);
+                    prefetch_lane!(1);
+                    prefetch_lane!(2);
+                    prefetch_lane!(3);
+                    prefetch_lane!(4);
+                    prefetch_lane!(5);
+                    prefetch_lane!(6);
+                    prefetch_lane!(7);
+                    prefetch_lane!(8);
+                    prefetch_lane!(9);
+                    prefetch_lane!(10);
+                    prefetch_lane!(11);
+                    prefetch_lane!(12);
+                    prefetch_lane!(13);
+                    prefetch_lane!(14);
+                    prefetch_lane!(15);
+                } else {
+                    // Interleaved: the `N` sources are one sequential stream,
+                    // so the next block group is one hint, not `N` of them —
+                    // and a sequential stream is what the hardware prefetcher
+                    // is for in the first place.
+                    prefetch_src_l1(src!(0).wrapping_add(src_offset + src_block_stride));
+                }
             }
 
-            let mut acc = clmul_round1(srcs[0].add(offset), &coeffs[0]);
+            let mut acc = clmul_round1(src!(0).add(src_offset), coeff!(0));
             if SHA3 && !FUSED {
                 // Merge pairs through EOR3, with the odd final product taking
                 // the single-product path — the same pairing the runtime loop
-                // produced, unrolled.
+                // produced, unrolled. `merge_pair!(a, b)` covers the width that
+                // ends on `a` too, so an even `N` folds its last source through
+                // `merge_pair!(N-1, N)` with no special case.
                 macro_rules! merge_pair {
                     ($a:expr, $b:expr) => {
                         if N > $b {
-                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
-                            let pc = clmul_round1(srcs[$b].add(offset), &coeffs[$b]);
+                            let pb = clmul_round1(src!($a).add(src_offset), coeff!($a));
+                            let pc = clmul_round1(src!($b).add(src_offset), coeff!($b));
                             clmul_merge2::<SHA3>(&mut acc, pb, pc);
                         } else if N == $a + 1 {
-                            let pb = clmul_round1(srcs[$a].add(offset), &coeffs[$a]);
+                            let pb = clmul_round1(src!($a).add(src_offset), coeff!($a));
                             clmul_merge1(&mut acc, pb);
                         }
                     };
@@ -4566,10 +5091,11 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 merge_pair!(1, 2);
                 merge_pair!(3, 4);
                 merge_pair!(5, 6);
-                if N == 8 {
-                    let pb = clmul_round1(srcs[7].add(offset), &coeffs[7]);
-                    clmul_merge1(&mut acc, pb);
-                }
+                merge_pair!(7, 8);
+                merge_pair!(9, 10);
+                merge_pair!(11, 12);
+                merge_pair!(13, 14);
+                merge_pair!(15, 16);
             } else {
                 macro_rules! accumulate_lane {
                     ($idx:expr) => {
@@ -4577,11 +5103,11 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                             if FUSED {
                                 clmul_round_acc_fused(
                                     &mut acc,
-                                    srcs[$idx].add(offset),
-                                    &coeffs[$idx],
+                                    src!($idx).add(src_offset),
+                                    coeff!($idx),
                                 );
                             } else {
-                                clmul_round_acc(&mut acc, srcs[$idx].add(offset), &coeffs[$idx]);
+                                clmul_round_acc(&mut acc, src!($idx).add(src_offset), coeff!($idx));
                             }
                         }
                     };
@@ -4593,6 +5119,14 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
                 accumulate_lane!(5);
                 accumulate_lane!(6);
                 accumulate_lane!(7);
+                accumulate_lane!(8);
+                accumulate_lane!(9);
+                accumulate_lane!(10);
+                accumulate_lane!(11);
+                accumulate_lane!(12);
+                accumulate_lane!(13);
+                accumulate_lane!(14);
+                accumulate_lane!(15);
             }
 
             let r = clmul_barrett_reduce::<SHA3>(acc);
@@ -4608,6 +5142,42 @@ unsafe fn clmul_pass<const SHA3: bool, const FUSED: bool, const N: usize>(
             vst2q_u8(block, vb);
 
             offset += 32;
+            src_offset += src_block_stride;
+        }
+    }
+}
+
+/// One CLMUL pass for a live width of `1..=CLMUL_SRC_GROUP`, picked at runtime.
+///
+/// The straight-line bodies these arms instantiate are exactly the ones the
+/// kernel generated before the wide pass existed; the wide pass adds one more
+/// width rather than replacing them, so a partial group still runs the
+/// reference encoder's eight-region shape.
+///
+/// # Safety
+/// As [`clmul_pass`], with `n` in `1..=CLMUL_SRC_GROUP` and `srcs`/`coeffs`
+/// holding at least `n` entries.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_pass_narrow<const SHA3: bool, const FUSED: bool>(
+    dst: *mut u8,
+    srcs: &[*const u8],
+    coeffs: &[ClmulBatchCoeff],
+    n: usize,
+    vec_len: usize,
+    src_block_stride: usize,
+) {
+    let s = src_block_stride;
+    unsafe {
+        match n {
+            1 => clmul_pass::<SHA3, FUSED, 1>(dst, srcs, coeffs, vec_len, s),
+            2 => clmul_pass::<SHA3, FUSED, 2>(dst, srcs, coeffs, vec_len, s),
+            3 => clmul_pass::<SHA3, FUSED, 3>(dst, srcs, coeffs, vec_len, s),
+            4 => clmul_pass::<SHA3, FUSED, 4>(dst, srcs, coeffs, vec_len, s),
+            5 => clmul_pass::<SHA3, FUSED, 5>(dst, srcs, coeffs, vec_len, s),
+            6 => clmul_pass::<SHA3, FUSED, 6>(dst, srcs, coeffs, vec_len, s),
+            7 => clmul_pass::<SHA3, FUSED, 7>(dst, srcs, coeffs, vec_len, s),
+            _ => clmul_pass::<SHA3, FUSED, CLMUL_SRC_GROUP>(dst, srcs, coeffs, vec_len, s),
         }
     }
 }
@@ -4618,7 +5188,10 @@ unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSr
     unsafe {
         mul_acc_input_batch_clmul_body::<false, false>(
             dst,
-            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+            factors_and_srcs
+                .iter()
+                .map(|fs| (fs.factor, fs.src.as_ptr())),
+            INPUT_BATCH_BLOCK_BYTES,
         )
     }
 }
@@ -4629,10 +5202,23 @@ unsafe fn mul_acc_input_batch_clmul(dst: &mut [u8], factors_and_srcs: &[FactorSr
 #[target_feature(enable = "sha3")]
 unsafe fn mul_acc_input_batch_clmul_sha3(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
     unsafe {
-        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
-            dst,
-            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
-        )
+        if CLMUL_APPLE_FUSION && !clmul_apple_fusion_enabled() {
+            mul_acc_input_batch_clmul_body::<true, false>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.factor, fs.src.as_ptr())),
+                INPUT_BATCH_BLOCK_BYTES,
+            )
+        } else {
+            mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.factor, fs.src.as_ptr())),
+                INPUT_BATCH_BLOCK_BYTES,
+            )
+        }
     }
 }
 
@@ -4649,7 +5235,8 @@ unsafe fn mul_acc_input_batch_clmul_prepared(
             dst,
             factors_and_srcs
                 .iter()
-                .map(|fs| (fs.prepared.factor, fs.src)),
+                .map(|fs| (fs.prepared.factor, fs.src.as_ptr())),
+            INPUT_BATCH_BLOCK_BYTES,
         )
     }
 }
@@ -4661,13 +5248,87 @@ unsafe fn mul_acc_input_batch_clmul_sha3_prepared(
     factors_and_srcs: &[PreparedFactorSrc<'_>],
 ) {
     unsafe {
-        mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+        if CLMUL_APPLE_FUSION && !clmul_apple_fusion_enabled() {
+            mul_acc_input_batch_clmul_body::<true, false>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, fs.src.as_ptr())),
+                INPUT_BATCH_BLOCK_BYTES,
+            )
+        } else {
+            mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, fs.src.as_ptr())),
+                INPUT_BATCH_BLOCK_BYTES,
+            )
+        }
+    }
+}
+
+/// Interleaved-layout entries for the two shipping CLMUL flavors: the sources
+/// of one staging group share `stream`, lane `i` starting one block in from
+/// lane `i - 1`, and every lane advances by `lanes` blocks.
+///
+/// # Safety
+/// `stream` must hold `lanes` interleaved lanes covering `dst.len()` bytes
+/// each, and must not alias `dst`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_input_batch_clmul_interleaved(
+    dst: &mut [u8],
+    factors: &[PreparedInputFactor],
+    stream: &[u8],
+    lanes: usize,
+) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<false, false>(
             dst,
-            factors_and_srcs
-                .iter()
-                .map(|fs| (fs.prepared.factor, fs.src)),
+            interleaved_lane_inputs(factors, stream),
+            lanes * INPUT_BATCH_BLOCK_BYTES,
         )
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_input_batch_clmul_sha3_interleaved(
+    dst: &mut [u8],
+    factors: &[PreparedInputFactor],
+    stream: &[u8],
+    lanes: usize,
+) {
+    unsafe {
+        if CLMUL_APPLE_FUSION && !clmul_apple_fusion_enabled() {
+            mul_acc_input_batch_clmul_body::<true, false>(
+                dst,
+                interleaved_lane_inputs(factors, stream),
+                lanes * INPUT_BATCH_BLOCK_BYTES,
+            )
+        } else {
+            mul_acc_input_batch_clmul_body::<true, CLMUL_APPLE_FUSION>(
+                dst,
+                interleaved_lane_inputs(factors, stream),
+                lanes * INPUT_BATCH_BLOCK_BYTES,
+            )
+        }
+    }
+}
+
+/// `(factor, first-block pointer)` per lane of a block-interleaved group.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn interleaved_lane_inputs<'a>(
+    factors: &'a [PreparedInputFactor],
+    stream: &'a [u8],
+) -> impl Iterator<Item = (u16, *const u8)> + Clone + 'a {
+    let base = stream.as_ptr();
+    factors.iter().enumerate().map(move |(lane, prepared)| {
+        (prepared.factor, unsafe {
+            base.add(lane * INPUT_BATCH_BLOCK_BYTES)
+        })
+    })
 }
 
 /// Test-only instantiation of the non-Apple EOR3 merge flavor so that path can
@@ -4681,7 +5342,33 @@ unsafe fn mul_acc_input_batch_clmul_sha3_unfused(
     unsafe {
         mul_acc_input_batch_clmul_body::<true, false>(
             dst,
-            factors_and_srcs.iter().map(|fs| (fs.factor, fs.src)),
+            factors_and_srcs
+                .iter()
+                .map(|fs| (fs.factor, fs.src.as_ptr())),
+            INPUT_BATCH_BLOCK_BYTES,
+        )
+    }
+}
+
+/// Test-only interleaved entry for the same non-Apple EOR3 merge flavor, so
+/// the layout can be compared across both layouts on that flavor too rather
+/// than only on whichever one the host happens to dispatch to.
+///
+/// # Safety
+/// Same contract as [`mul_acc_input_batch_clmul_interleaved`].
+#[cfg(all(target_arch = "aarch64", test))]
+#[target_feature(enable = "sha3")]
+unsafe fn mul_acc_input_batch_clmul_sha3_unfused_interleaved(
+    dst: &mut [u8],
+    factors: &[PreparedInputFactor],
+    stream: &[u8],
+    lanes: usize,
+) {
+    unsafe {
+        mul_acc_input_batch_clmul_body::<true, false>(
+            dst,
+            interleaved_lane_inputs(factors, stream),
+            lanes * INPUT_BATCH_BLOCK_BYTES,
         )
     }
 }
@@ -4922,45 +5609,96 @@ unsafe fn mul_acc_input_batch_neon_prepared(
     dst: &mut [u8],
     factors_and_srcs: &[PreparedFactorSrc<'_>],
 ) {
+    unsafe {
+        mul_acc_input_batch_neon_prepared_blocked(
+            dst,
+            factors_and_srcs
+                .iter()
+                .map(|fs| (fs.prepared, fs.src.as_ptr())),
+            INPUT_BATCH_BLOCK_BYTES,
+        )
+    }
+}
+
+/// Interleaved-layout entry for the VTBL grouped-input kernel: what the
+/// `WEAVER_GF16_CLMUL_BATCH=0` pin and batches of three or fewer live sources
+/// run. Its access pattern is the CLMUL one — every source plus the
+/// destination at the same block offset — so it wants the same single stream.
+///
+/// # Safety
+/// `stream` must hold `lanes` interleaved lanes covering `dst.len()` bytes
+/// each, and must not alias `dst`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_input_batch_neon_prepared_interleaved(
+    dst: &mut [u8],
+    factors: &[PreparedInputFactor],
+    stream: &[u8],
+    lanes: usize,
+) {
+    let base = stream.as_ptr();
+    unsafe {
+        mul_acc_input_batch_neon_prepared_blocked(
+            dst,
+            factors
+                .iter()
+                .enumerate()
+                .map(|(lane, prepared)| (prepared, base.add(lane * INPUT_BATCH_BLOCK_BYTES))),
+            lanes * INPUT_BATCH_BLOCK_BYTES,
+        )
+    }
+}
+
+/// Shared body of the VTBL grouped-input kernel over either staging layout.
+///
+/// # Safety
+/// Same source-readability contract as [`mul_acc_input_batch_clmul_body`].
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_input_batch_neon_prepared_blocked<'a>(
+    dst: &mut [u8],
+    inputs: impl Iterator<Item = (&'a PreparedInputFactor, *const u8)>,
+    src_block_stride: usize,
+) {
     use std::arch::aarch64::*;
 
     let len = dst.len();
+    debug_assert!(
+        src_block_stride >= INPUT_BATCH_BLOCK_BYTES,
+        "source block stride must cover a whole block"
+    );
 
-    let xor_inputs: Vec<&[u8]> = factors_and_srcs
-        .iter()
-        .filter(|fs| fs.prepared.factor == 1)
-        .map(|fs| fs.src)
-        .collect();
-
-    struct NeonInputTableSet<'a> {
+    struct NeonInputTableSet {
         t: [uint8x16_t; 8],
         factor: u16,
-        src: &'a [u8],
+        src: *const u8,
     }
 
-    let table_sets: Vec<NeonInputTableSet<'_>> = unsafe {
-        factors_and_srcs
-            .iter()
-            .filter(|fs| fs.prepared.factor != 0 && fs.prepared.factor != 1)
-            .map(|fs| {
-                let tables = fs.prepared.arm_tables();
-                NeonInputTableSet {
-                    t: [
-                        vld1q_u8(tables.tables[0].as_ptr()),
-                        vld1q_u8(tables.tables[1].as_ptr()),
-                        vld1q_u8(tables.tables[2].as_ptr()),
-                        vld1q_u8(tables.tables[3].as_ptr()),
-                        vld1q_u8(tables.tables[4].as_ptr()),
-                        vld1q_u8(tables.tables[5].as_ptr()),
-                        vld1q_u8(tables.tables[6].as_ptr()),
-                        vld1q_u8(tables.tables[7].as_ptr()),
-                    ],
-                    factor: fs.prepared.factor,
-                    src: fs.src,
-                }
-            })
-            .collect()
-    };
+    let mut xor_inputs: Vec<*const u8> = Vec::new();
+    let mut table_sets: Vec<NeonInputTableSet> = Vec::new();
+    for (prepared, src) in inputs {
+        match prepared.factor {
+            0 => {}
+            1 => xor_inputs.push(src),
+            factor => {
+                let tables = prepared.arm_tables();
+                table_sets.push(NeonInputTableSet {
+                    t: unsafe {
+                        [
+                            vld1q_u8(tables.tables[0].as_ptr()),
+                            vld1q_u8(tables.tables[1].as_ptr()),
+                            vld1q_u8(tables.tables[2].as_ptr()),
+                            vld1q_u8(tables.tables[3].as_ptr()),
+                            vld1q_u8(tables.tables[4].as_ptr()),
+                            vld1q_u8(tables.tables[5].as_ptr()),
+                            vld1q_u8(tables.tables[6].as_ptr()),
+                            vld1q_u8(tables.tables[7].as_ptr()),
+                        ]
+                    },
+                    factor,
+                    src,
+                });
+            }
+        }
+    }
 
     if xor_inputs.is_empty() && table_sets.is_empty() {
         return;
@@ -4969,6 +5707,7 @@ unsafe fn mul_acc_input_batch_neon_prepared(
     unsafe {
         let mask_0f = vdupq_n_u8(0x0F);
         let mut offset = 0usize;
+        let mut src_offset = 0usize;
 
         // Full-width strips (see `mul_acc_region_neon`): `vld2q_u8` loads a
         // 32-byte block directly as separated even/odd byte planes, so every
@@ -4978,14 +5717,14 @@ unsafe fn mul_acc_input_batch_neon_prepared(
             let mut d = vld2q_u8(dst.as_ptr().add(offset));
 
             for src in &xor_inputs {
-                let s = vld2q_u8(src.as_ptr().add(offset));
+                let s = vld2q_u8(src.add(src_offset));
                 d.0 = veorq_u8(d.0, s.0);
                 d.1 = veorq_u8(d.1, s.1);
             }
 
             for ts in &table_sets {
                 // Deinterleaving load: .0 = lo bytes of 16 words, .1 = hi.
-                let s = vld2q_u8(ts.src.as_ptr().add(offset));
+                let s = vld2q_u8(ts.src.add(src_offset));
                 let lo_n0 = vandq_u8(s.0, mask_0f);
                 let lo_n1 = vandq_u8(vshrq_n_u8(s.0, 4), mask_0f);
                 let hi_n0 = vandq_u8(s.1, mask_0f);
@@ -5008,16 +5747,22 @@ unsafe fn mul_acc_input_batch_neon_prepared(
 
             vst2q_u8(dst.as_mut_ptr().add(offset), d);
             offset += 32;
+            src_offset += src_block_stride;
         }
 
         if offset < len {
+            // The tail is inside one block, so it is contiguous in either
+            // layout; `src_offset` already names that block.
+            let tail_len = len - offset;
             for src in &xor_inputs {
-                for (d, s) in dst[offset..].iter_mut().zip(src[offset..].iter()) {
+                let s = std::slice::from_raw_parts(src.add(src_offset), tail_len);
+                for (d, s) in dst[offset..].iter_mut().zip(s.iter()) {
                     *d ^= *s;
                 }
             }
             for ts in &table_sets {
-                mul_acc_region_scalar(ts.factor, &ts.src[offset..], &mut dst[offset..]);
+                let s = std::slice::from_raw_parts(ts.src.add(src_offset), tail_len);
+                mul_acc_region_scalar(ts.factor, s, &mut dst[offset..]);
             }
         }
     }
@@ -5632,8 +6377,14 @@ mod tests {
         // Every live width 1..=CLMUL_SRC_GROUP reaches its own straight-line
         // `clmul_pass` instantiation, and the counts past 8 exercise the
         // multi-pass group split. Two of the first four factors are 0/1, so a
-        // `count` of k lands on a live width of about k-2.
-        for &count in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17] {
+        // `count` of k lands on a live width of about k-2 — so the counts below
+        // walk live widths 1..=18 one at a time plus 22, 24 and 32, which is
+        // every narrow width, the wide `CLMUL_SRC_GROUP_WIDE` pass (live 16),
+        // each wide+narrow split (live 9..=15 and 17..=24), and a second full
+        // wide group (live 32).
+        for &count in &[
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 26, 34,
+        ] {
             for &len in &[2usize, 30, 32, 34, 64, 96, 4094, 4096] {
                 let factors: Vec<u16> = (0..count)
                     .map(|i| match i {
@@ -5702,6 +6453,224 @@ mod tests {
                     assert_eq!(
                         prepared_sha3, reference,
                         "prepared sha3 clmul count={count} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Lay `lanes` equal-length regions out block-interleaved, the layout
+    /// [`mul_acc_input_batch_prepared_interleaved`] reads: lane `l`'s block `b`
+    /// at `(b * lanes + l) * INPUT_BATCH_BLOCK_BYTES`. Lanes past `inputs.len()`
+    /// are the zero padding a partly-live batch leaves behind, so the tests see
+    /// the same bytes the encoder would stage.
+    fn interleave_lanes(inputs: &[Vec<u8>], lanes: usize, len: usize) -> Vec<u8> {
+        let mut stream = vec![0u8; lanes * len];
+        for (lane, input) in inputs.iter().enumerate() {
+            assert_eq!(input.len(), len);
+            for (block, chunk) in input.chunks(INPUT_BATCH_BLOCK_BYTES).enumerate() {
+                let start = (block * lanes + lane) * INPUT_BATCH_BLOCK_BYTES;
+                stream[start..start + chunk.len()].copy_from_slice(chunk);
+            }
+        }
+        stream
+    }
+
+    /// The block-interleaved layout is a pure relocation of the same bytes: for
+    /// every kernel flavor, every live width and both layouts, the accumulated
+    /// destination must be identical — and identical to the scalar field
+    /// definition, so the test cannot pass by two layouts being wrong together.
+    ///
+    /// This is the guard on the layout the aarch64 create family stages with.
+    /// The three CLMUL flavors are driven directly rather than through the
+    /// dispatcher, because a host only ever reaches one of them: Apple cores
+    /// run the fused SHA3 flavor, so the plain and the EOR3-merge flavors that
+    /// ship on other aarch64 parts would otherwise never be compared across the
+    /// two layouts at all.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn interleaved_input_batch_matches_lane_major_in_every_flavor() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // `lanes` is the layout width; `count` the live sources in it. Widths
+        // 8 and 16 are the shipping ones (a full CLMUL pass group and a whole
+        // 16-input batch); 5 is a short trailing group. `count < lanes` is the
+        // last batch of a job, whose dead lanes still occupy their blocks.
+        for &lanes in &[1usize, 2, 4, 5, 8, 16] {
+            for &count in &[1usize, 2, 3, 4, 8, 11, 16] {
+                if count > lanes {
+                    continue;
+                }
+                // Interleaving is only expressible per whole block; the encoder
+                // guarantees it through the family's stride.
+                for &len in &[32usize, 64, 96, 2048] {
+                    let factors: Vec<u16> = (0..count)
+                        .map(|i| match i {
+                            0 => 1,
+                            1 => 0,
+                            2 => 0x8000,
+                            3 => 0xFFFF,
+                            _ => (next() >> 16) as u16,
+                        })
+                        .collect();
+                    let inputs: Vec<Vec<u8>> = (0..count)
+                        .map(|_| (0..len).map(|_| next() as u8).collect())
+                        .collect();
+                    let prepared: Vec<PreparedInputFactor> =
+                        factors.iter().map(|&f| prepare_input_factor(f)).collect();
+                    let lane_major: Vec<PreparedFactorSrc<'_>> = prepared
+                        .iter()
+                        .zip(inputs.iter())
+                        .map(|(prepared, input)| PreparedFactorSrc {
+                            prepared,
+                            src: input,
+                        })
+                        .collect();
+                    let stream = interleave_lanes(&inputs, lanes, len);
+                    let case = format!("lanes={lanes} count={count} len={len}");
+
+                    let mut reference = vec![0x3Du8; len];
+                    for (&factor, input) in factors.iter().zip(inputs.iter()) {
+                        mul_acc_region_scalar(factor, input, &mut reference);
+                    }
+
+                    // Plain NEON flavor.
+                    let mut lane_out = vec![0x3Du8; len];
+                    let mut interleaved_out = vec![0x3Du8; len];
+                    unsafe {
+                        mul_acc_input_batch_clmul_prepared(&mut lane_out, &lane_major);
+                        mul_acc_input_batch_clmul_interleaved(
+                            &mut interleaved_out,
+                            &prepared,
+                            &stream,
+                            lanes,
+                        );
+                    }
+                    assert_eq!(lane_out, reference, "plain clmul lane-major {case}");
+                    assert_eq!(interleaved_out, reference, "plain clmul interleaved {case}");
+
+                    if clmul_sha3_available() {
+                        // Shipping SHA3 flavor for this build (fused on Apple).
+                        let mut lane_out = vec![0x3Du8; len];
+                        let mut interleaved_out = vec![0x3Du8; len];
+                        unsafe {
+                            mul_acc_input_batch_clmul_sha3_prepared(&mut lane_out, &lane_major);
+                            mul_acc_input_batch_clmul_sha3_interleaved(
+                                &mut interleaved_out,
+                                &prepared,
+                                &stream,
+                                lanes,
+                            );
+                        }
+                        assert_eq!(lane_out, reference, "sha3 clmul lane-major {case}");
+                        assert_eq!(interleaved_out, reference, "sha3 clmul interleaved {case}");
+
+                        // EOR3-merge flavor: what non-Apple aarch64 ships.
+                        let raw: Vec<FactorSrc<'_>> = factors
+                            .iter()
+                            .zip(inputs.iter())
+                            .map(|(&factor, input)| FactorSrc { factor, src: input })
+                            .collect();
+                        let mut lane_out = vec![0x3Du8; len];
+                        let mut interleaved_out = vec![0x3Du8; len];
+                        unsafe {
+                            mul_acc_input_batch_clmul_sha3_unfused(&mut lane_out, &raw);
+                            mul_acc_input_batch_clmul_sha3_unfused_interleaved(
+                                &mut interleaved_out,
+                                &prepared,
+                                &stream,
+                                lanes,
+                            );
+                        }
+                        assert_eq!(lane_out, reference, "unfused sha3 lane-major {case}");
+                        assert_eq!(
+                            interleaved_out, reference,
+                            "unfused sha3 interleaved {case}"
+                        );
+                    }
+
+                    // VTBL: the `WEAVER_GF16_CLMUL_BATCH=0` pin and every batch
+                    // of three or fewer live sources.
+                    let mut lane_out = vec![0x3Du8; len];
+                    let mut interleaved_out = vec![0x3Du8; len];
+                    unsafe {
+                        mul_acc_input_batch_neon_prepared(&mut lane_out, &lane_major);
+                        mul_acc_input_batch_neon_prepared_interleaved(
+                            &mut interleaved_out,
+                            &prepared,
+                            &stream,
+                            lanes,
+                        );
+                    }
+                    assert_eq!(lane_out, reference, "vtbl lane-major {case}");
+                    assert_eq!(interleaved_out, reference, "vtbl interleaved {case}");
+
+                    // And the public dispatcher, which is what the encoder
+                    // calls and which picks a flavor per host.
+                    let mut dispatched = vec![0x3Du8; len];
+                    mul_acc_input_batch_prepared_interleaved(
+                        &mut dispatched,
+                        &prepared,
+                        &stream,
+                        lanes,
+                    );
+                    assert_eq!(dispatched, reference, "dispatched interleaved {case}");
+                }
+            }
+        }
+    }
+
+    /// The same layout guard on every other target, where
+    /// [`mul_acc_input_batch_prepared_interleaved`] runs the portable
+    /// definition. Keeps the interleaved contract non-vacuous on x86 CI, which
+    /// otherwise never executes a line of it.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn interleaved_input_batch_matches_the_definition() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &lanes in &[1usize, 2, 4, 5, 8, 16] {
+            for &count in &[1usize, 3, 8, 16] {
+                if count > lanes {
+                    continue;
+                }
+                for &len in &[32usize, 64, 96, 2048] {
+                    let factors: Vec<u16> = (0..count)
+                        .map(|i| match i {
+                            0 => 1,
+                            1 => 0,
+                            2 => 0x8000,
+                            _ => (next() >> 16) as u16,
+                        })
+                        .collect();
+                    let inputs: Vec<Vec<u8>> = (0..count)
+                        .map(|_| (0..len).map(|_| next() as u8).collect())
+                        .collect();
+                    let prepared: Vec<PreparedInputFactor> =
+                        factors.iter().map(|&f| prepare_input_factor(f)).collect();
+                    let stream = interleave_lanes(&inputs, lanes, len);
+
+                    let mut reference = vec![0x3Du8; len];
+                    for (&factor, input) in factors.iter().zip(inputs.iter()) {
+                        mul_acc_region_scalar(factor, input, &mut reference);
+                    }
+                    let mut got = vec![0x3Du8; len];
+                    mul_acc_input_batch_prepared_interleaved(&mut got, &prepared, &stream, lanes);
+                    assert_eq!(
+                        got, reference,
+                        "interleaved lanes={lanes} count={count} len={len}"
                     );
                 }
             }
@@ -6182,8 +7151,9 @@ mod tests {
             return;
         }
         // Odd and even group counts, and factors mixing zero (padding lanes),
-        // one (XOR passthrough), and arbitrary values.
-        for groups in [1usize, 2, 3, 5] {
+        // one (XOR passthrough), and arbitrary values. Even counts exercise the
+        // 512-bit paired arm end to end, odd counts its single-group remainder.
+        for groups in [1usize, 2, 3, 4, 5] {
             for len in [32usize, 4096, 21824] {
                 let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
                     .map(|g| {
@@ -6308,6 +7278,137 @@ mod tests {
             unsafe { mul_acc_shuffle2x_group_avx2(&mut narrow, &staging, &tables) };
             unsafe { mul_acc_shuffle2x_group_avx512(&mut wide, &staging, &tables) };
             assert_eq!(narrow, wide, "shuffle2x width mismatch len={len}");
+        }
+    }
+
+    /// The layout invariant [`mul_acc_shuffle2x_pair_avx512`] rests on: inside
+    /// the interleaved staging stream, lane `2i` and lane `2i+1` of the same
+    /// destination block are *adjacent* 32-byte blocks in that order, so the
+    /// pair kernel's single 64-byte load is exactly the two blocks the
+    /// single-group kernels load separately. Runs on any x86 host — no AVX-512
+    /// needed — so a future change to the interleave granularity or lane order
+    /// fails here rather than silently corrupting the twelve-source arm on
+    /// hardware nobody in the loop owns.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn split_staging_pairs_adjacent_lanes() {
+        if !altmap_supported() {
+            return;
+        }
+        for len in [32usize, 64, 4096] {
+            let inputs: Vec<Vec<u8>> = (0..FOLDED_GROUP)
+                .map(|l| (0..len).map(|i| ((i * (l + 5) + 11) % 256) as u8).collect())
+                .collect();
+            let mut staging = vec![0u8; len * FOLDED_GROUP];
+            for (lane, input) in inputs.iter().enumerate() {
+                split_encode_scatter(input, &mut staging, lane);
+            }
+            // Independent expectation: each lane's own split-layout bytes.
+            let encoded: Vec<Vec<u8>> = inputs
+                .iter()
+                .map(|input| {
+                    let mut buf = input.clone();
+                    altmap_encode(&mut buf);
+                    buf
+                })
+                .collect();
+
+            for block in 0..len / SPLIT_BLOCK_BYTES {
+                for pair in 0..FOLDED_GROUP / 2 {
+                    let lane = pair * 2;
+                    let wide = (block * FOLDED_GROUP + lane) * SPLIT_BLOCK_BYTES;
+                    let block_bytes = block * SPLIT_BLOCK_BYTES..(block + 1) * SPLIT_BLOCK_BYTES;
+                    assert_eq!(
+                        &staging[wide..wide + SPLIT_BLOCK_BYTES],
+                        &encoded[lane][block_bytes.clone()],
+                        "low half of the pair load is not lane {lane} \
+                         (len={len} block={block})"
+                    );
+                    assert_eq!(
+                        &staging[wide + SPLIT_BLOCK_BYTES..wide + 2 * SPLIT_BLOCK_BYTES],
+                        &encoded[lane + 1][block_bytes],
+                        "high half of the pair load is not lane {} (len={len} block={block})",
+                        lane + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Differential for the twelve-source paired kernel: two groups fused into
+    /// one destination pass must be byte-identical both to the 256-bit kernel
+    /// run twice (the arithmetic reference) and to the shipped single-group
+    /// 512-bit kernel run twice (the tier this replaces). NOTE-skips on
+    /// hardware without AVX-512; the c5-class leg executes it for real.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn shuffle2x_pair_avx512_matches_group() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP shuffle2x_pair_avx512_matches_group: host lacks avx2");
+            return;
+        }
+        if !(is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl"))
+        {
+            eprintln!(
+                "NOTE shuffle2x_pair_avx512_matches_group: host lacks \
+                 avx512f+avx512bw+avx512vl, paired 512-bit arm skipped"
+            );
+            return;
+        }
+        // Zero (padding lanes), one (XOR passthrough) and arbitrary factors,
+        // placed so both groups and both halves of a pair see each kind.
+        let factors: [u16; 2 * FOLDED_GROUP] = [
+            0x0000, 0x0001, 0x2F1D, 0xABCD, 0x0101, 0xFFFF, 0x0001, 0x0000, 0x8000, 0x1234, 0x9E37,
+            0x0002,
+        ];
+        let owned: Vec<Shuffle2xTables> = factors
+            .iter()
+            .map(|&f| precompute_shuffle2x_tables(f))
+            .collect();
+        let tables_a: [&Shuffle2xTables; FOLDED_GROUP] = std::array::from_fn(|l| &owned[l]);
+        let tables_b: [&Shuffle2xTables; FOLDED_GROUP] =
+            std::array::from_fn(|l| &owned[FOLDED_GROUP + l]);
+
+        // Even and odd block counts, a single-block region, and sizes past the
+        // 8 KiB create tile.
+        for len in [32usize, 64, 96, 4096, 4128, 21824] {
+            let stagings: Vec<Vec<u8>> = (0..2)
+                .map(|g| {
+                    let mut staging = vec![0u8; len * FOLDED_GROUP];
+                    for lane in 0..FOLDED_GROUP {
+                        let input: Vec<u8> = (0..len)
+                            .map(|i| ((i * (g * 6 + lane + 3) + 41) % 256) as u8)
+                            .collect();
+                        split_encode_scatter(&input, &mut staging, lane);
+                    }
+                    staging
+                })
+                .collect();
+
+            let mut narrow = vec![0x5Au8; len];
+            altmap_encode(&mut narrow);
+            let mut wide = narrow.clone();
+            let mut grouped = narrow.clone();
+            unsafe {
+                mul_acc_shuffle2x_group_avx2(&mut narrow, &stagings[0], &tables_a);
+                mul_acc_shuffle2x_group_avx2(&mut narrow, &stagings[1], &tables_b);
+                mul_acc_shuffle2x_group_avx512(&mut grouped, &stagings[0], &tables_a);
+                mul_acc_shuffle2x_group_avx512(&mut grouped, &stagings[1], &tables_b);
+                mul_acc_shuffle2x_pair_avx512(
+                    &mut wide,
+                    &stagings[0],
+                    &stagings[1],
+                    &tables_a,
+                    &tables_b,
+                );
+            }
+            assert_eq!(narrow, wide, "pair kernel differs from 256-bit len={len}");
+            assert_eq!(
+                grouped, wide,
+                "pair kernel differs from single-group 512 len={len}"
+            );
         }
     }
 

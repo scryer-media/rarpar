@@ -1,7 +1,7 @@
 [package]
 name = "rarpar"
 description = "Intelligent RAR/PAR2 repair and extraction CLI"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -38,8 +38,8 @@ metal = ["runtime", "par2-rs/metal"]
 musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
-par2-rs = { path = "../../crates/par2-rs", version = "0.4.1", default-features = false, optional = true }
-unrar-rs = { path = "../../crates/unrar-rs", version = "0.5.3", default-features = false, optional = true }
+par2-rs = { path = "../../crates/par2-rs", version = "0.4.2", default-features = false, optional = true }
+unrar-rs = { path = "../../crates/unrar-rs", version = "0.5.4", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

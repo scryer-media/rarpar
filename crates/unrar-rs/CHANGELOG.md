@@ -1,5 +1,35 @@
 # Changelog
 
+
+## 0.5.4
+
+This is a patch release from 0.5.3, internal only: no public item changed.
+
+### Runtime Behavior
+
+- RAR3 symbolic-link targets are bounded before decoding: a declared expanded
+  size past the maximum path size is rejected up front, a missing expanded
+  size is rejected before extraction, and oversized in-memory or
+  tempfile-extracted link members are refused before materializing. Exactly
+  `MAXPATHSIZE` is still admitted.
+
+- Solid RAR4 archives no longer decode their first member twice. Solid
+  dispatch is a decision about which decoder instance runs, not about state
+  inheritance — inheritance is keyed on the member's own header flag inside
+  the shared slot, where a non-solid member still gets a full reset
+  mid-archive. Routing the (non-solid) first member of a solid archive to the
+  plain path decoded it in a throwaway decoder and left the solid cursor at
+  zero, so the next member re-decoded it from scratch: exactly one
+  member-equivalent of redundant work per solid archive, measured at +33%
+  wall on three-member PPMd fixtures. The archive-level flag is now folded
+  into dispatch, which is the arrangement unrar gets for free from its single
+  `Unpack` instance.
+- The PPMd model keeps the previous decode's found-state symbol as a byte
+  instead of re-validating the found state on every binary and escape decode:
+  rescale and update relocate the found state but never change its symbol, so
+  the symbol returned by decode N is exactly what decode N+1 needs. Restart
+  re-seeds it from the restart-installed state. Decoded output is unchanged.
+
 ## 0.5.3
 
 Stability patch from 0.5.2. No public item changed shape.

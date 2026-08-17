@@ -13,7 +13,7 @@ use std::os::unix::fs::FileExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,15 +22,18 @@ use crate::DiskFileAccess;
 use crate::checksum::{self, Crc32Hasher, Md5State};
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
-use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
-use crate::par2_set::{FileDescription, Par2FileSet};
+use crate::packet::budget::packet_retained_bytes;
+use crate::packet::{
+    Packet, PacketScanBudget, PacketScanLimits, PacketSink, scan_packets_from_path_bounded,
+};
+use crate::par2_set::{FileDescription, PacketAdmission, Par2FileSet, Par2FileSetBuilder};
 use crate::path::is_generated_par2_artifact_name;
 use crate::repair::{
     DEFAULT_REPAIR_MEMORY_LIMIT, RepairOptions, execute_repair_with_options,
     plan_repair_with_memory_limit, repair_matrix_resource_limit_reason,
 };
 use crate::types::{
-    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
+    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, RecoverySetId, SliceChecksum,
 };
 use crate::verify::{
     self, FileAccess, FileStatus, FileVerification, Repairability, VerificationResult,
@@ -363,6 +366,10 @@ pub struct Par2RepairerOptions {
     /// scans fall back to the bounded serial scanner when their fixed
     /// bookkeeping cannot fit; `None` uses the crate default.
     pub memory_limit: Option<usize>,
+    /// Resource bounds for the packet-inventory load, shared across every
+    /// `.par2` input of the pass. The defaults come from what the PAR2 format
+    /// can describe; see [`PacketScanLimits`].
+    pub packet_scan_limits: PacketScanLimits,
     pub rename_only: bool,
     pub purge: bool,
     pub scan_skip_data: bool,
@@ -389,6 +396,7 @@ impl Par2RepairerOptions {
             extra_paths: Vec::new(),
             repair: true,
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
+            packet_scan_limits: PacketScanLimits::default(),
             rename_only: false,
             purge: false,
             scan_skip_data: false,
@@ -1012,104 +1020,252 @@ impl Par2Repairer {
             }
         }
 
-        let mut diagnostics = PacketDiagnostics::default();
-        let mut recovery_set_id = None;
-        let mut scanned_files = Vec::new();
+        let budget = PacketScanBudget::with_cancellation(
+            self.options.packet_scan_limits,
+            self.options.cancel.clone(),
+        );
+        let mut loader = InventoryLoader::new(&budget);
 
         for input in paths {
-            let path = input.path;
-            let packet_list = match scan_packets_from_path_with_set_ids(&path) {
-                Ok(packet_list) => packet_list,
-                Err(_) if input.optional => {
-                    if input.purgeable {
-                        scanned_files.push((path, input.purgeable, Vec::new()));
-                    }
-                    continue;
+            budget.check_cancelled()?;
+            loader.begin_file(input.path.clone(), input.purgeable);
+            match scan_packets_from_path_bounded(&input.path, &budget, &mut loader) {
+                Ok(()) => {}
+                // A budget refusal or a cancellation is never softened into
+                // "this optional input contributed nothing": that would hand
+                // back a silently short inventory.
+                Err(error @ (Par2Error::ResourceLimitExceeded { .. } | Par2Error::Cancelled)) => {
+                    return Err(error);
                 }
+                Err(_) if input.optional => {}
                 Err(error) => return Err(error),
-            };
-            if packet_list.is_empty() {
-                if !input.optional {
-                    diagnostics.corrupt_packets += 1;
-                }
-                if input.purgeable {
-                    scanned_files.push((path, input.purgeable, packet_list));
-                }
-                continue;
             }
+            loader.end_file(input.optional);
+        }
 
-            if let Some(file_set_id) = packet_list.iter().find_map(|packet| match &packet.packet {
-                Packet::Main(main) => Some(main.recovery_set_id),
-                _ => None,
-            }) {
-                if let Some(existing) = recovery_set_id {
-                    if existing != file_set_id {
-                        diagnostics.conflicting_packets += packet_list.len() as u32;
-                        if input.purgeable {
-                            scanned_files.push((path, input.purgeable, Vec::new()));
-                        }
+        loader.finish()
+    }
+}
+
+/// Streams scanned packets into one deduplicated inventory.
+///
+/// Replaces the scan-into-`Vec` / retain-per-file / move-into-`Vec<Packet>` /
+/// build chain that used to hold the same packets in three places at once. A
+/// packet is now filtered, deduplicated, and either absorbed or dropped at the
+/// point it is parsed.
+///
+/// # Choosing the active recovery set
+///
+/// The active recovery-set ID is the one carried by the first Main packet seen
+/// across the inputs, in input order — the same packet the previous two-pass
+/// loader picked. Every later packet is filtered against it and a foreign
+/// packet is discarded before its contents are retained.
+///
+/// Packets seen *before* that first Main cannot be filtered yet, so they are
+/// staged, and the stage is flushed the moment the ID is known. Staging is
+/// charged to the same budget as everything else, so a file that never yields a
+/// Main cannot use the stage to escape the bound. Real volumes put their Main
+/// packet within the first handful of packets, so the stage is normally short
+/// lived and only ever holds part of the first input.
+///
+/// # Deliberate difference from the previous loader
+///
+/// The old loader dropped a whole file when the file's own first Main packet
+/// disagreed with the active set. For a file whose packets all belong to that
+/// foreign set — the case that actually occurs — the per-packet filter drops
+/// exactly the same packets and reports exactly the same count. The two differ
+/// only for a file that mixes packets from two recovery sets, where the
+/// per-packet filter now keeps the packets that do belong to the active set
+/// instead of discarding the file wholesale.
+struct InventoryLoader<'a> {
+    budget: &'a PacketScanBudget,
+    builder: Par2FileSetBuilder,
+    diagnostics: PacketDiagnostics,
+    active_set_id: Option<RecoverySetId>,
+    staged: Vec<StagedPacket>,
+    files: Vec<InventoryFile>,
+}
+
+/// A packet held until the active recovery-set ID is known.
+enum StagedPacket {
+    /// Contents kept, charged to the budget's retained meters.
+    Held {
+        packet: Packet,
+        set_id: RecoverySetId,
+        bytes: usize,
+        file: usize,
+    },
+    /// Contents dropped on arrival because the builder already holds this key.
+    /// Only the record survives, so the packet can still be counted as work
+    /// once the set filter has been applied.
+    KnownDuplicate { set_id: RecoverySetId, file: usize },
+}
+
+struct InventoryFile {
+    path: PathBuf,
+    purgeable: bool,
+    /// At least one packet from this file survived the recovery-set filter.
+    contributed: bool,
+    /// Packets this file yielded, whatever became of them.
+    scanned: u32,
+}
+
+impl<'a> InventoryLoader<'a> {
+    fn new(budget: &'a PacketScanBudget) -> Self {
+        Self {
+            budget,
+            builder: Par2FileSetBuilder::new(),
+            diagnostics: PacketDiagnostics::default(),
+            active_set_id: None,
+            staged: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn begin_file(&mut self, path: PathBuf, purgeable: bool) {
+        self.files.push(InventoryFile {
+            path,
+            purgeable,
+            contributed: false,
+            scanned: 0,
+        });
+    }
+
+    fn end_file(&mut self, optional: bool) {
+        let file = self.files.last().expect("begin_file precedes end_file");
+        if file.scanned == 0 && !optional {
+            self.diagnostics.corrupt_packets += 1;
+        }
+    }
+
+    /// Absorb a packet whose recovery set has already been checked.
+    ///
+    /// The budget is charged inside the builder, and only for what the builder
+    /// actually keeps.
+    fn commit(&mut self, packet: Packet, file: usize) -> Result<()> {
+        self.diagnostics.packets_loaded += 1;
+        self.files[file].contributed = true;
+        if self.builder.add_packet_budgeted(packet, 0, self.budget)? == PacketAdmission::Duplicate {
+            self.diagnostics.duplicate_packets += 1;
+        }
+        Ok(())
+    }
+
+    /// Move everything staged into the builder now that the active set is known.
+    fn flush_staged(&mut self) -> Result<()> {
+        for staged in std::mem::take(&mut self.staged) {
+            self.budget.release_bytes(size_of::<StagedPacket>());
+            match staged {
+                StagedPacket::Held {
+                    packet,
+                    set_id,
+                    bytes,
+                    file,
+                } => {
+                    // Hand back the staging charge; `commit` re-charges for
+                    // whatever the builder ends up keeping.
+                    self.budget.release_retained(bytes);
+                    if self.active_set_id.is_some_and(|active| active != set_id) {
+                        self.diagnostics.conflicting_packets += 1;
                         continue;
                     }
-                } else {
-                    recovery_set_id = Some(file_set_id);
+                    self.commit(packet, file)?;
                 }
-            }
-
-            scanned_files.push((path, input.purgeable, packet_list));
-        }
-
-        let mut packets = Vec::new();
-        let mut purge_paths = Vec::new();
-        let mut main_seen = false;
-        let mut creator_seen = false;
-        let mut file_desc_ids = HashSet::<FileId>::new();
-        let mut ifsc_ids = HashSet::<FileId>::new();
-        let mut recovery_exponents = HashSet::<u32>::new();
-        for (path, purgeable, packet_list) in scanned_files {
-            let mut file_contributed = false;
-            for scanned in packet_list {
-                if let Some(active_set_id) = recovery_set_id
-                    && scanned.recovery_set_id != active_set_id
-                {
-                    diagnostics.conflicting_packets += 1;
-                    continue;
+                StagedPacket::KnownDuplicate { set_id, file } => {
+                    if self.active_set_id.is_some_and(|active| active != set_id) {
+                        self.diagnostics.conflicting_packets += 1;
+                        continue;
+                    }
+                    self.diagnostics.packets_loaded += 1;
+                    self.diagnostics.duplicate_packets += 1;
+                    self.files[file].contributed = true;
                 }
-                match &scanned.packet {
-                    Packet::Main(_) if main_seen => diagnostics.duplicate_packets += 1,
-                    Packet::Main(_) => main_seen = true,
-                    Packet::FileDescription(packet) if !file_desc_ids.insert(packet.file_id) => {
-                        diagnostics.duplicate_packets += 1;
-                    }
-                    Packet::InputFileSliceChecksum(packet) if !ifsc_ids.insert(packet.file_id) => {
-                        diagnostics.duplicate_packets += 1;
-                    }
-                    Packet::RecoverySlice(packet)
-                        if !recovery_exponents.insert(packet.exponent) =>
-                    {
-                        diagnostics.duplicate_packets += 1;
-                    }
-                    Packet::Creator(_) if creator_seen => diagnostics.duplicate_packets += 1,
-                    Packet::Creator(_) => creator_seen = true,
-                    Packet::Unknown { .. }
-                    | Packet::FileDescription(_)
-                    | Packet::InputFileSliceChecksum(_)
-                    | Packet::RecoverySlice(_) => {}
-                }
-                diagnostics.packets_loaded += 1;
-                packets.push(scanned.packet);
-                file_contributed = true;
-            }
-            if purgeable && (file_contributed || !path.exists() || is_par2_path(&path)) {
-                purge_paths.push(path);
             }
         }
+        Ok(())
+    }
 
-        let set = Par2FileSet::from_packets(packets)?;
+    fn finish(mut self) -> Result<PacketInventory> {
+        // No Main packet anywhere leaves the stage unfiltered; flush it so the
+        // builder can report the real reason rather than an empty set.
+        self.flush_staged()?;
+        self.budget.check_cancelled()?;
+
+        let purge_paths = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.purgeable
+                    && (file.contributed || !file.path.exists() || is_par2_path(&file.path))
+            })
+            .map(|file| file.path.clone())
+            .collect();
+
+        self.budget.check_cancelled()?;
+        let set = self.builder.build()?;
         Ok(PacketInventory {
             set,
-            diagnostics,
+            diagnostics: self.diagnostics,
             purge_paths,
         })
+    }
+}
+
+impl PacketSink for InventoryLoader<'_> {
+    fn accept(
+        &mut self,
+        packet: Packet,
+        _offset: u64,
+        recovery_set_id: RecoverySetId,
+    ) -> Result<()> {
+        let file = self.files.len() - 1;
+        self.files[file].scanned += 1;
+
+        let newly_active = match (&packet, self.active_set_id) {
+            (Packet::Main(main), None) => {
+                self.active_set_id = Some(main.recovery_set_id);
+                true
+            }
+            _ => false,
+        };
+
+        if let Some(active) = self.active_set_id
+            && recovery_set_id != active
+        {
+            self.diagnostics.conflicting_packets += 1;
+            return Ok(());
+        }
+
+        if newly_active {
+            // Everything staged behind this Main can now be filtered.
+            self.flush_staged()?;
+        }
+
+        if self.active_set_id.is_some() {
+            return self.commit(packet, file);
+        }
+
+        // Still waiting on the first Main packet. Stage the packet, unless the
+        // builder already holds its key, in which case only the fact of it
+        // needs to survive.
+        self.budget.charge_bytes(size_of::<StagedPacket>())?;
+        crate::packet::budget::reserve_fallible(&mut self.staged, 1)?;
+        if self.builder.would_duplicate(&packet) {
+            self.staged.push(StagedPacket::KnownDuplicate {
+                set_id: recovery_set_id,
+                file,
+            });
+            return Ok(());
+        }
+        let bytes = packet_retained_bytes(&packet);
+        self.budget.charge_retained(bytes)?;
+        self.staged.push(StagedPacket::Held {
+            packet,
+            set_id: recovery_set_id,
+            bytes,
+            file,
+        });
+        Ok(())
     }
 }
 
@@ -3534,6 +3690,10 @@ struct VerificationHashTable {
     by_crc: HashMap<u32, Vec<usize>>,
     short_blocks: Vec<usize>,
     slice_size: u64,
+    /// Longest `by_crc` bucket: the most CRC candidates a single window can
+    /// ever produce, and so the ceiling on the parallel scanner's per-worker
+    /// candidate scratch.
+    max_crc_bucket: usize,
 }
 
 impl VerificationHashTable {
@@ -3549,10 +3709,12 @@ impl VerificationHashTable {
                 short_blocks.push(block.global_index);
             }
         }
+        let max_crc_bucket = by_crc.values().map(Vec::len).max().unwrap_or(0);
         Self {
             by_crc,
             short_blocks,
             slice_size,
+            max_crc_bucket,
         }
     }
 
@@ -3696,6 +3858,111 @@ struct AlignedWindowFacts {
 
 fn ordered_scan_facts_allocation_bytes(window_count: usize) -> Option<usize> {
     window_count.checked_mul(std::mem::size_of::<AlignedWindowFacts>())
+}
+
+/// Byte budget for the match entries Phase A retains. Only the `u32` payload
+/// behind `AlignedWindowFacts::matches` is charged here — the fixed headers,
+/// the per-worker read buffers, and the per-worker candidate scratch are all
+/// charged up front by [`ordered_scan_admission`]. Shared across Phase A
+/// workers, so charges are atomic; a charge that cannot fit aborts the whole
+/// phase and the file goes to the serial scanner.
+struct OrderedScanMatchBudget {
+    remaining: AtomicUsize,
+}
+
+impl OrderedScanMatchBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(bytes),
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> bool {
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .is_ok()
+    }
+}
+
+/// How much of `memory_limit` a parallel ordered scan may spend on match
+/// entries, and how many windows each worker may hold in its read buffer.
+struct OrderedScanAdmission {
+    read_windows: usize,
+    match_budget: usize,
+}
+
+/// Smallest match budget the read buffers must leave behind. A scan whose
+/// buffers would swallow the whole limit is useless: every window that matches
+/// anything would blow the budget and send the file straight back to the
+/// serial scanner.
+const ORDERED_SCAN_MATCH_RESERVE_BYTES: usize = 1024 * 1024;
+
+/// Count of Phase A read buffers and scratch vectors that can be live at once.
+/// `try_for_each_init` builds one pair per running task, and no more tasks run
+/// concurrently than there are pool threads or segments.
+fn ordered_scan_workers(window_count: usize, segment_windows: usize) -> usize {
+    window_count
+        .div_ceil(segment_windows.max(1))
+        .min(rayon::current_num_threads())
+        .max(1)
+}
+
+/// Admission accounting for one parallel ordered scan, in bytes of heap held
+/// at once: the fixed `AlignedWindowFacts` headers, one read buffer plus one
+/// CRC-candidate scratch per concurrent worker, and the data-dependent match
+/// entries Phase A retains. Read buffers shrink to fit rather than refusing
+/// the scan, but never below one window per worker and never past the match
+/// reserve; whatever the fixed part leaves becomes the match budget. `None`
+/// means the fixed part alone does not fit, so the serial scanner takes the
+/// file.
+fn ordered_scan_admission(
+    window_count: usize,
+    segment_windows: usize,
+    slice_size: usize,
+    max_crc_bucket: usize,
+    workers: usize,
+    memory_limit: usize,
+) -> Option<OrderedScanAdmission> {
+    if slice_size == 0 || workers == 0 || window_count == 0 {
+        return None;
+    }
+    let facts_bytes = ordered_scan_facts_allocation_bytes(window_count)?;
+    let scratch_bytes = max_crc_bucket
+        .checked_mul(std::mem::size_of::<u32>())?
+        .checked_mul(workers)?;
+    let fixed_bytes = facts_bytes.checked_add(scratch_bytes)?;
+    let spendable = memory_limit.checked_sub(fixed_bytes)?;
+
+    let wanted_windows = (SCANNER_IO_TARGET_BYTES / slice_size)
+        .max(1)
+        .min(segment_windows.max(1))
+        .min(window_count);
+    let affordable_windows =
+        spendable.saturating_sub(ORDERED_SCAN_MATCH_RESERVE_BYTES) / workers / slice_size;
+    let read_windows = wanted_windows.min(affordable_windows).max(1);
+    let read_bytes = read_windows.checked_mul(slice_size)?.checked_mul(workers)?;
+
+    Some(OrderedScanAdmission {
+        read_windows,
+        match_budget: spendable.checked_sub(read_bytes)?,
+    })
+}
+
+/// Phase A failure modes. `Refused` means the phase could not stay inside its
+/// admitted memory (budget exhausted or an allocation the allocator declined);
+/// the caller drops the partial facts and re-runs the file through the serial
+/// scanner, which produces the same result either way.
+enum WindowFactsError {
+    Refused,
+    Scan(Par2Error),
+}
+
+impl From<io::Error> for WindowFactsError {
+    fn from(error: io::Error) -> Self {
+        Self::Scan(Par2Error::Io(error))
+    }
 }
 
 /// How a gap resync hands control back to the aligned merge loop.
@@ -4225,8 +4492,23 @@ impl<'a> RollingBlockScanner<'a> {
         crc: u32,
     ) -> Vec<u32> {
         let mut matches = Vec::new();
+        self.collect_ordered_window_md5_matches(blocks, data, crc, &mut matches);
+        matches
+    }
+
+    /// [`Self::ordered_window_md5_matches`] into a caller-owned buffer, which
+    /// it clears first. Phase A reuses one buffer per worker so it can size
+    /// each retained match vector exactly, which is what its budget charges.
+    fn collect_ordered_window_md5_matches(
+        &self,
+        blocks: &[SourceBlock],
+        data: &[u8],
+        crc: u32,
+        matches: &mut Vec<u32>,
+    ) {
+        matches.clear();
         let Some(candidates) = self.table.by_crc.get(&crc) else {
-            return matches;
+            return;
         };
         let mut md5 = None;
         for block_index in candidates {
@@ -4239,7 +4521,6 @@ impl<'a> RollingBlockScanner<'a> {
                 matches.push(*block_index as u32);
             }
         }
-        matches
     }
 
     /// Selection half of the ordered window check: applies the expected-block
@@ -4308,8 +4589,11 @@ impl<'a> RollingBlockScanner<'a> {
     /// serial cursor state machine over those facts, and Phase C byte-steps
     /// through gaps, splicing back into Phase B when a match realigns. All
     /// reads go through bounded buffers (positional reads in Phase A, the
-    /// serial cursor in Phase C). The fixed facts table is admitted under the
-    /// configured working-memory budget; larger scans use the serial scanner.
+    /// serial cursor in Phase C). Everything the scan holds at once — facts
+    /// headers, per-worker read buffers and scratch, and the match entries
+    /// Phase A retains — is admitted under the configured working-memory
+    /// budget; scans that do not fit, or that outgrow the match budget
+    /// mid-flight, go to the serial scanner instead.
     #[allow(clippy::too_many_arguments)]
     fn scan_file_ordered_canonical_parallel(
         &self,
@@ -4344,10 +4628,20 @@ impl<'a> RollingBlockScanner<'a> {
         }
         let last_full_offset = len - slice_size;
         let window_count = last_full_offset / slice_size + 1;
+        let segment_windows = segment_windows.max(1);
         let mut facts: Vec<AlignedWindowFacts> = Vec::new();
-        let facts_fit = ordered_scan_facts_allocation_bytes(window_count)
-            .is_some_and(|allocation_bytes| allocation_bytes <= memory_limit);
-        if !facts_fit || facts.try_reserve_exact(window_count).is_err() {
+        // The header reservation runs only once the accounting admits the
+        // scan, and is itself fallible; either refusal takes the serial path.
+        let admission = ordered_scan_admission(
+            window_count,
+            segment_windows,
+            slice_size,
+            self.table.max_crc_bucket,
+            ordered_scan_workers(window_count, segment_windows),
+            memory_limit,
+        )
+        .filter(|_| facts.try_reserve_exact(window_count).is_ok());
+        let Some(admission) = admission else {
             #[allow(clippy::drop_non_drop)]
             drop(file);
             return self.scan_file_ordered_canonical_serial(
@@ -4358,27 +4652,59 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 scan_options,
             );
-        }
+        };
 
         crate::file_cache::advise_sequential(&file, path, len as u64);
         let mut stats = FileScanStats::new(FileScanMode::OrderedCanonicalParallel, len as u64);
-        let segment_windows = segment_windows.max(1);
         facts.resize_with(window_count, AlignedWindowFacts::default);
         let baseline = blocks.baseline();
         let shared_file = &file;
-        facts
+        let match_budget = OrderedScanMatchBudget::new(admission.match_budget);
+        let phase_a = facts
             .par_chunks_mut(segment_windows)
             .enumerate()
-            .try_for_each_init(Vec::new, |read_buffer, (segment_index, segment)| {
-                self.compute_aligned_window_facts(
-                    shared_file,
-                    baseline,
-                    segment,
-                    segment_index * segment_windows,
-                    read_buffer,
-                    cancel,
-                )
-            })?;
+            .try_for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(read_buffer, candidates), (segment_index, segment)| {
+                    self.compute_aligned_window_facts(
+                        shared_file,
+                        baseline,
+                        segment,
+                        segment_index * segment_windows,
+                        admission.read_windows,
+                        read_buffer,
+                        candidates,
+                        &match_budget,
+                        cancel,
+                    )
+                },
+            );
+        match phase_a {
+            Ok(()) => {}
+            // Cancellation and I/O keep the pre-existing story: the caller
+            // decides whether to propagate or re-run the file serially.
+            Err(WindowFactsError::Scan(error)) => {
+                #[allow(clippy::drop_non_drop)]
+                drop(file);
+                return Err(error);
+            }
+            // A refusal is not a failure — the partial facts go away and the
+            // file is rescanned serially from a clean slate. Phase A only
+            // reads `blocks`, so no partial selection has to be unwound.
+            Err(WindowFactsError::Refused) => {
+                drop(facts);
+                #[allow(clippy::drop_non_drop)]
+                drop(file);
+                return self.scan_file_ordered_canonical_serial(
+                    path,
+                    kind,
+                    lookup,
+                    target_file,
+                    blocks,
+                    scan_options,
+                );
+            }
+        }
 
         let ordered_full_blocks: Vec<usize> = (0..target_file.block_count)
             .map(|local| target_file.first_block + local)
@@ -4472,40 +4798,70 @@ impl<'a> RollingBlockScanner<'a> {
 
     /// Phase A worker: fills one segment's facts. Reads only the hash table
     /// and the immutable baseline blocks, so segments run lock-free. Windows
-    /// arrive through `read_buffer` in whole-window chunks of roughly
-    /// `SCANNER_IO_TARGET_BYTES`, positionally read from the shared handle.
-    /// Hashing is the serial scanner's single-shot CRC-gated MD5: multi-lane
-    /// MD5 batching lost here because every lane required a padded copy of
-    /// its window (it may return per-arch if measurement justifies it).
+    /// arrive through `read_buffer` in whole-window chunks of `read_windows`,
+    /// positionally read from the shared handle. Hashing is the serial
+    /// scanner's single-shot CRC-gated MD5: multi-lane MD5 batching lost here
+    /// because every lane required a padded copy of its window (it may return
+    /// per-arch if measurement justifies it).
+    ///
+    /// `read_buffer` and `candidates` are the worker-owned buffers the
+    /// admission already paid for; every retained match vector is charged
+    /// against `match_budget` at its exact size, so a duplicate-heavy file
+    /// refuses rather than growing past the working-memory limit.
+    #[allow(clippy::too_many_arguments)]
     fn compute_aligned_window_facts(
         &self,
         file: &File,
         blocks: &[SourceBlock],
         facts: &mut [AlignedWindowFacts],
         first_window: usize,
+        read_windows: usize,
         read_buffer: &mut Vec<u8>,
+        candidates: &mut Vec<u32>,
+        match_budget: &OrderedScanMatchBudget,
         cancel: Option<&CancellationToken>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), WindowFactsError> {
         if let Some(cancel) = cancel
             && cancel.is_cancelled()
         {
-            return Err(Par2Error::Cancelled);
+            return Err(WindowFactsError::Scan(Par2Error::Cancelled));
         }
 
         let slice_size = self.table.slice_size as usize;
-        let read_windows = (SCANNER_IO_TARGET_BYTES / slice_size).max(1);
+        let read_windows = read_windows.max(1);
         let mut slot = 0usize;
         while slot < facts.len() {
             let read_count = read_windows.min(facts.len() - slot);
-            let read_len = read_count * slice_size;
+            let read_len = read_count
+                .checked_mul(slice_size)
+                .ok_or(WindowFactsError::Refused)?;
             if read_buffer.len() < read_len {
+                read_buffer
+                    .try_reserve(read_len - read_buffer.len())
+                    .map_err(|_| WindowFactsError::Refused)?;
                 read_buffer.resize(read_len, 0);
             }
             let read_offset = ((first_window + slot) * slice_size) as u64;
             read_exact_file_at(file, &mut read_buffer[..read_len], read_offset)?;
             for (index, window) in read_buffer[..read_len].chunks_exact(slice_size).enumerate() {
                 let crc = checksum::crc32(window);
-                facts[slot + index].matches = self.ordered_window_md5_matches(blocks, window, crc);
+                self.collect_ordered_window_md5_matches(blocks, window, crc, candidates);
+                if candidates.is_empty() {
+                    continue;
+                }
+                let charge = candidates
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(WindowFactsError::Refused)?;
+                if !match_budget.charge(charge) {
+                    return Err(WindowFactsError::Refused);
+                }
+                let mut retained = Vec::new();
+                retained
+                    .try_reserve_exact(candidates.len())
+                    .map_err(|_| WindowFactsError::Refused)?;
+                retained.extend_from_slice(candidates);
+                facts[slot + index].matches = retained;
             }
             slot += read_count;
         }
@@ -8300,6 +8656,35 @@ mod tests {
         assert_eq!(ordered_scan_facts_allocation_bytes(usize::MAX), None);
     }
 
+    /// Smallest working-memory limit whose admission still leaves room for
+    /// `match_bytes` of retained match entries. Searched rather than derived:
+    /// the read buffers shrink as the limit does, so the match budget is not
+    /// monotone in the limit and has no closed form. `match_bytes` is a sound
+    /// floor for the search — the budget can never exceed the whole limit.
+    fn smallest_limit_admitting_matches(
+        window_count: usize,
+        segment_windows: usize,
+        slice_size: usize,
+        max_crc_bucket: usize,
+        match_bytes: usize,
+        search_span: usize,
+    ) -> usize {
+        let workers = ordered_scan_workers(window_count, segment_windows);
+        (match_bytes..=match_bytes + search_span)
+            .find(|limit| {
+                ordered_scan_admission(
+                    window_count,
+                    segment_windows,
+                    slice_size,
+                    max_crc_bucket,
+                    workers,
+                    *limit,
+                )
+                .is_some_and(|admission| admission.match_budget >= match_bytes)
+            })
+            .expect("no limit inside the search span admits the scan")
+    }
+
     #[test]
     fn ordered_parallel_scan_falls_back_when_facts_exceed_memory_limit() {
         let dir = tempdir().unwrap();
@@ -8312,15 +8697,131 @@ mod tests {
         fs::write(&candidate, oversized).unwrap();
         let state = RepairState::from_set(dir.path(), set).unwrap();
         let facts_bytes = ordered_scan_facts_allocation_bytes(9).unwrap();
+        // Only the first window matches the set's single block.
+        let retained_bytes = std::mem::size_of::<u32>();
+        let admitting_limit = smallest_limit_admitting_matches(
+            9,
+            2,
+            slice_size,
+            state.hash_table.max_crc_bucket,
+            retained_bytes,
+            64 * 1024,
+        );
+        assert!(facts_bytes < admitting_limit);
 
         let (parallel_locations, parallel_stats) =
-            scan_ordered_parallel_direct_with_memory_limit(&state, &candidate, 2, facts_bytes);
+            scan_ordered_parallel_direct_with_memory_limit(&state, &candidate, 2, admitting_limit);
         assert_eq!(parallel_stats.mode, FileScanMode::OrderedCanonicalParallel);
 
-        let (fallback_locations, fallback_stats) =
-            scan_ordered_parallel_direct_with_memory_limit(&state, &candidate, 2, facts_bytes - 1);
-        assert_eq!(fallback_stats.mode, FileScanMode::OrderedCanonical);
-        assert_eq!(fallback_locations, parallel_locations);
+        for starved_limit in [admitting_limit - 1, facts_bytes - 1] {
+            let (fallback_locations, fallback_stats) =
+                scan_ordered_parallel_direct_with_memory_limit(
+                    &state,
+                    &candidate,
+                    2,
+                    starved_limit,
+                );
+            assert_eq!(fallback_stats.mode, FileScanMode::OrderedCanonical);
+            assert_eq!(fallback_locations, parallel_locations);
+        }
+    }
+
+    /// The admission gap the fixed-header budget missed: Phase A retains one
+    /// `Vec<u32>` of matching slice indices per aligned window, so a recovery
+    /// set with many byte-identical slices multiplies retained bytes far past
+    /// the header cost the old accounting checked. 256 duplicate slices over
+    /// 2,048 aligned windows is 48 KiB of headers against 2 MiB of retained
+    /// entries.
+    #[test]
+    fn ordered_parallel_scan_refuses_duplicate_slice_match_blowup() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let duplicate_count = 256usize;
+        let window_count = 2048usize;
+        let segment_windows = 128usize;
+
+        let duplicate = seeded_block(211, slice_size);
+        let dupes: Vec<u8> = std::iter::repeat_n(duplicate.as_slice(), duplicate_count)
+            .flatten()
+            .copied()
+            .collect();
+        // Every slice of the recorded target is unique, so the candidate's
+        // windows can only match the duplicate pool.
+        let mut target = Vec::with_capacity(window_count * slice_size);
+        for index in 0..window_count {
+            target.extend_from_slice(&(index as u32).to_le_bytes());
+            target.resize((index + 1) * slice_size, 0x5A);
+        }
+        let set = synthetic_set(
+            &[("dupes.bin", &dupes), ("target.bin", &target)],
+            slice_size as u64,
+        );
+        let candidate = dir.path().join("target.bin");
+        let damaged: Vec<u8> = std::iter::repeat_n(duplicate.as_slice(), window_count)
+            .flatten()
+            .copied()
+            .collect();
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        assert_eq!(state.hash_table.max_crc_bucket, duplicate_count);
+
+        let retained_bytes = window_count * duplicate_count * std::mem::size_of::<u32>();
+        let facts_bytes = ordered_scan_facts_allocation_bytes(window_count).unwrap();
+        assert!(facts_bytes * 16 < retained_bytes);
+
+        let admitting_limit = smallest_limit_admitting_matches(
+            window_count,
+            segment_windows,
+            slice_size,
+            duplicate_count,
+            retained_bytes,
+            8 * 1024 * 1024,
+        );
+        // One byte short of the retained demand, yet far past what the old
+        // header-only accounting checked: this is the shape that used to stay
+        // in the parallel scanner while holding 2 MiB it never budgeted. The
+        // one-byte gap pins the admission budget to the true retained size
+        // rather than merely somewhere near it.
+        let starved_limit = admitting_limit - 1;
+        assert!(facts_bytes < starved_limit);
+        let starved = ordered_scan_admission(
+            window_count,
+            segment_windows,
+            slice_size,
+            duplicate_count,
+            ordered_scan_workers(window_count, segment_windows),
+            starved_limit,
+        )
+        .unwrap();
+        assert_eq!(starved.match_budget, retained_bytes - 1);
+
+        let (serial_locations, serial_stats) = scan_ordered_serial_direct(&state, &candidate);
+
+        let (parallel_locations, parallel_stats) = scan_ordered_parallel_direct_with_memory_limit(
+            &state,
+            &candidate,
+            segment_windows,
+            admitting_limit,
+        );
+        assert_eq!(parallel_stats.mode, FileScanMode::OrderedCanonicalParallel);
+        assert_eq!(parallel_locations, serial_locations);
+        assert_eq!(
+            scan_stat_counters(parallel_stats),
+            scan_stat_counters(serial_stats)
+        );
+
+        let (refused_locations, refused_stats) = scan_ordered_parallel_direct_with_memory_limit(
+            &state,
+            &candidate,
+            segment_windows,
+            starved_limit,
+        );
+        assert_eq!(refused_stats.mode, FileScanMode::OrderedCanonical);
+        assert_eq!(refused_locations, serial_locations);
+        assert_eq!(
+            scan_stat_counters(refused_stats),
+            scan_stat_counters(serial_stats)
+        );
     }
 
     #[test]
@@ -9477,6 +9978,320 @@ mod tests {
         assert_eq!(inventory.diagnostics.packets_loaded, 2);
         assert_eq!(inventory.diagnostics.duplicate_packets, 1);
         assert_eq!(inventory.set.recovery_file_ids.len(), 0);
+    }
+
+    /// One Main packet with `slice_size`, no files.
+    fn empty_main_packet(slice_size: u64) -> (Vec<u8>, [u8; 16]) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&slice_size.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let rsid = checksum::md5(&body);
+        (
+            make_full_packet(crate::packet::header::TYPE_MAIN, &body, rsid),
+            rsid,
+        )
+    }
+
+    fn recovery_packet(exponent: u32, payload: &[u8], rsid: [u8; 16]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&exponent.to_le_bytes());
+        body.extend_from_slice(payload);
+        make_full_packet(crate::packet::header::TYPE_RECOVERY, &body, rsid)
+    }
+
+    /// A `.par2` file holding one Main packet followed by `count` minimal
+    /// recovery packets with consecutive exponents.
+    fn write_recovery_run(path: &Path, exponents: std::ops::Range<u32>) -> [u8; 16] {
+        let (main, rsid) = empty_main_packet(4);
+        let mut stream = main;
+        stream.reserve(exponents.len() * 72);
+        for exponent in exponents {
+            stream.extend_from_slice(&recovery_packet(exponent, &[0xAB; 4], rsid));
+        }
+        fs::write(path, &stream).unwrap();
+        rsid
+    }
+
+    fn repairer_for(dir: &Path, par2: Vec<PathBuf>) -> Par2RepairerOptions {
+        Par2RepairerOptions::new(dir.to_path_buf(), par2)
+    }
+
+    /// The reported amplification: a ~4.5 MiB file of 65,537 minimal recovery
+    /// packets. It must load under the default budget, keep exactly the usable
+    /// exponents, and refuse the one packet whose exponent is outside the GF
+    /// domain — without ever materialising the packet stream.
+    #[test]
+    fn inventory_loads_a_sixty_five_thousand_packet_recovery_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("amplify.par2");
+        // 0..=65_535 are usable; 65_536 is one past the domain, which is what
+        // makes this 65,537 packets rather than 65,536.
+        write_recovery_run(&path, 0..65_537);
+        assert!(fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+
+        let inventory = Par2Repairer::new(repairer_for(dir.path(), vec![path]))
+            .load_inventory()
+            .unwrap();
+
+        assert_eq!(
+            inventory.set.recovery_block_count(),
+            crate::packet::RECOVERY_EXPONENT_DOMAIN as u32
+        );
+        assert!(
+            inventory
+                .set
+                .recovery_slices
+                .contains_key(&crate::packet::MAX_RECOVERY_EXPONENT)
+        );
+        assert!(
+            !inventory
+                .set
+                .recovery_slices
+                .contains_key(&(crate::packet::MAX_RECOVERY_EXPONENT + 1))
+        );
+        // Main plus every packet the file held, out-of-domain one included.
+        assert_eq!(inventory.diagnostics.packets_loaded, 65_538);
+        assert_eq!(inventory.diagnostics.duplicate_packets, 0);
+        assert_eq!(inventory.diagnostics.conflicting_packets, 0);
+    }
+
+    /// The same file, one packet over a configured retained-packet limit.
+    #[test]
+    fn inventory_refuses_one_packet_past_the_configured_retained_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.par2");
+        write_recovery_run(&path, 0..64);
+
+        // Main plus 64 recovery blocks is 65 retained packets.
+        let mut options = repairer_for(dir.path(), vec![path.clone()]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(65);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+        assert_eq!(inventory.set.recovery_block_count(), 64);
+
+        let mut options = repairer_for(dir.path(), vec![path]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(64);
+        let error = Par2Repairer::new(options).load_inventory().unwrap_err();
+        assert!(matches!(error, Par2Error::ResourceLimitExceeded { .. }));
+    }
+
+    /// Two `.par2` inputs that each fit on their own but do not fit together.
+    /// One budget spans the load, so the second file is what trips it.
+    #[test]
+    fn inventory_budget_is_shared_across_every_par2_input() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.par2");
+        let second = dir.path().join("second.par2");
+        write_recovery_run(&first, 0..32);
+        write_recovery_run(&second, 32..64);
+
+        let limits = PacketScanLimits::default().with_max_retained_packets(40);
+        let mut options = repairer_for(dir.path(), vec![first.clone()]);
+        options.packet_scan_limits = limits;
+        assert_eq!(
+            Par2Repairer::new(options)
+                .load_inventory()
+                .unwrap()
+                .set
+                .recovery_block_count(),
+            32
+        );
+
+        let mut options = repairer_for(dir.path(), vec![first.clone(), second.clone()]);
+        options.packet_scan_limits = limits;
+        let error = Par2Repairer::new(options).load_inventory().unwrap_err();
+        assert!(matches!(error, Par2Error::ResourceLimitExceeded { .. }));
+
+        // No partial inventory is reachable: the load either returns a complete
+        // Par2FileSet or it returns an error carrying none.
+        let mut options = repairer_for(dir.path(), vec![first, second]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(65);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+        assert_eq!(inventory.set.recovery_block_count(), 64);
+    }
+
+    /// Duplicates are scan work, not retention: a set replicated many times
+    /// over must still fit a budget sized for its logical inventory.
+    #[test]
+    fn inventory_duplicates_spend_work_budget_but_not_retention_budget() {
+        let dir = tempdir().unwrap();
+        let (main, rsid) = empty_main_packet(4);
+        let recovery = recovery_packet(0, &[0xAB; 4], rsid);
+        let mut stream = main.clone();
+        for _ in 0..500 {
+            stream.extend_from_slice(&main);
+            stream.extend_from_slice(&recovery);
+        }
+        let path = dir.path().join("redundant.par2");
+        fs::write(&path, &stream).unwrap();
+
+        let mut options = repairer_for(dir.path(), vec![path]);
+        // Exactly the logical inventory: one Main and one recovery block.
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(2);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        assert_eq!(inventory.set.recovery_block_count(), 1);
+        assert_eq!(inventory.diagnostics.packets_loaded, 1_001);
+        assert_eq!(inventory.diagnostics.duplicate_packets, 999);
+    }
+
+    /// The examined meter counts packets the inventory never keeps, so a stream
+    /// that is nothing but redundancy still has a ceiling.
+    #[test]
+    fn inventory_examined_meter_bounds_pure_redundancy() {
+        let dir = tempdir().unwrap();
+        let (main, rsid) = empty_main_packet(4);
+        let recovery = recovery_packet(0, &[0xAB; 4], rsid);
+        let mut stream = main;
+        for _ in 0..64 {
+            stream.extend_from_slice(&recovery);
+        }
+        let path = dir.path().join("redundant.par2");
+        fs::write(&path, &stream).unwrap();
+
+        let mut options = repairer_for(dir.path(), vec![path]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_examined_packets(16);
+        let error = Par2Repairer::new(options).load_inventory().unwrap_err();
+        assert!(matches!(error, Par2Error::ResourceLimitExceeded { .. }));
+    }
+
+    /// An input with no Main packet anywhere leaves every packet staged. The
+    /// stage still has to be flushed so the load reports the real reason.
+    #[test]
+    fn inventory_without_a_main_packet_reports_the_missing_main() {
+        let dir = tempdir().unwrap();
+        let mut stream = Vec::new();
+        for exponent in 0..8u32 {
+            stream.extend_from_slice(&recovery_packet(exponent, &[0xAB; 4], [0x5C; 16]));
+        }
+        let path = dir.path().join("mainless.par2");
+        fs::write(&path, &stream).unwrap();
+
+        let error = Par2Repairer::new(repairer_for(dir.path(), vec![path]))
+            .load_inventory()
+            .unwrap_err();
+        assert!(matches!(error, Par2Error::NoMainPacket));
+    }
+
+    /// Packets that precede the first Main packet cannot be filtered yet, so
+    /// they are staged. Staging is budgeted like anything else.
+    #[test]
+    fn packets_staged_before_the_first_main_are_charged_to_the_budget() {
+        let dir = tempdir().unwrap();
+        let (main, rsid) = empty_main_packet(4);
+        // Recovery packets first, then the Main packet: the layout par2cmdline
+        // actually writes for a volume file.
+        let mut stream = Vec::new();
+        for exponent in 0..32u32 {
+            stream.extend_from_slice(&recovery_packet(exponent, &[0xAB; 4], rsid));
+        }
+        stream.extend_from_slice(&main);
+        let path = dir.path().join("recovery-first.par2");
+        fs::write(&path, &stream).unwrap();
+
+        let mut options = repairer_for(dir.path(), vec![path.clone()]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(33);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+        assert_eq!(inventory.set.recovery_block_count(), 32);
+        assert_eq!(inventory.diagnostics.packets_loaded, 33);
+
+        let mut options = repairer_for(dir.path(), vec![path]);
+        options.packet_scan_limits = PacketScanLimits::default().with_max_retained_packets(16);
+        let error = Par2Repairer::new(options).load_inventory().unwrap_err();
+        assert!(matches!(error, Par2Error::ResourceLimitExceeded { .. }));
+    }
+
+    /// Every packet of a conflicting volume is counted and discarded, and the
+    /// volume contributes nothing, so it is not offered for purge.
+    #[test]
+    fn inventory_discards_a_whole_conflicting_volume_and_leaves_it_unpurged() {
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("active.par2");
+        write_recovery_run(&active, 0..4);
+
+        let mut foreign_body = Vec::new();
+        foreign_body.extend_from_slice(&8u64.to_le_bytes());
+        foreign_body.extend_from_slice(&0u32.to_le_bytes());
+        let foreign_rsid = checksum::md5(&foreign_body);
+        let mut foreign = make_full_packet(
+            crate::packet::header::TYPE_MAIN,
+            &foreign_body,
+            foreign_rsid,
+        );
+        for exponent in 0..4u32 {
+            foreign.extend_from_slice(&recovery_packet(exponent, &[0xCD; 8], foreign_rsid));
+        }
+        let foreign_path = dir.path().join("foreign.par2");
+        fs::write(&foreign_path, &foreign).unwrap();
+
+        let mut options = repairer_for(dir.path(), vec![active.clone()]);
+        options.recovery_paths.push(foreign_path.clone());
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        assert_eq!(inventory.set.recovery_block_count(), 4);
+        assert_eq!(inventory.diagnostics.conflicting_packets, 5);
+        assert_eq!(inventory.diagnostics.packets_loaded, 5);
+        // The conflicting volume is a `.par2` path, so it stays purgeable by
+        // name exactly as before, while contributing nothing.
+        assert_eq!(inventory.purge_paths, vec![active, foreign_path]);
+    }
+
+    #[test]
+    fn inventory_scanning_stops_when_cancelled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.par2");
+        write_recovery_run(&path, 0..256);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut options = repairer_for(dir.path(), vec![path]);
+        options.cancel = Some(cancel);
+        let error = Par2Repairer::new(options).load_inventory().unwrap_err();
+        assert!(matches!(error, Par2Error::Cancelled));
+    }
+
+    /// Cancellation asserted after the last packet is read still has to be
+    /// observed, before the set is assembled and handed back.
+    #[test]
+    fn inventory_construction_observes_cancellation_after_the_last_packet() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.par2");
+        write_recovery_run(&path, 0..8);
+
+        let cancel = CancellationToken::new();
+        let budget =
+            PacketScanBudget::with_cancellation(PacketScanLimits::default(), Some(cancel.clone()));
+        let mut loader = InventoryLoader::new(&budget);
+        loader.begin_file(path.clone(), true);
+        scan_packets_from_path_bounded(&path, &budget, &mut loader).unwrap();
+        loader.end_file(false);
+
+        cancel.cancel();
+        assert!(matches!(loader.finish(), Err(Par2Error::Cancelled)));
+    }
+
+    /// The inventory keeps recovery payloads file-backed, and the deferred
+    /// packet-hash check still works against the interned volume path.
+    #[test]
+    fn inventory_recovery_payloads_stay_file_backed_and_still_validate() {
+        let dir = tempdir().unwrap();
+        let (main, rsid) = empty_main_packet(8);
+        let mut stream = main;
+        for exponent in 0..4u32 {
+            stream.extend_from_slice(&recovery_packet(exponent, &[0xC3; 8], rsid));
+        }
+        let path = dir.path().join("volume.par2");
+        fs::write(&path, &stream).unwrap();
+
+        let inventory = Par2Repairer::new(repairer_for(dir.path(), vec![path]))
+            .load_inventory()
+            .unwrap();
+
+        assert_eq!(inventory.set.recovery_block_count(), 4);
+        for (exponent, slice) in &inventory.set.recovery_slices {
+            assert!(slice.data.as_bytes().is_none(), "payload stays on disk");
+            assert_eq!(slice.data.to_vec().unwrap(), vec![0xC3; 8]);
+            assert!(slice.data.validate_packet_hash(&rsid, *exponent).unwrap());
+        }
     }
 
     #[cfg(feature = "slow-tests")]

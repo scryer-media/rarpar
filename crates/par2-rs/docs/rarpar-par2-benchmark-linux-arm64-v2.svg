@@ -11,7 +11,7 @@
     .cpu { fill: #2563eb; } .gpu { fill: #7c3aed; } .slower { fill: #d97706; }
     @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .column, .timing, .tick { fill: #9ca7b5; } .grid { stroke: #30363d; } .parity { stroke: #e6edf3; } .rule { stroke: #21262d; } .cpu { fill: #58a6ff; } .gpu { fill: #bc8cff; } .slower { fill: #f2a65a; } }
   </style>
-  <metadata>schema=1; report_sha256=8cd60a3fe3c72d6cf7685d082d48f95bbedbd5922f9df331fb1c01d5620a339c; corpus_digest=59f46fa58f651958ad8fc035d98a0cf0ce69345b740a1e9cc5fc52ab58929ada; plan_id=plan-900b3c52bca9463e; candidate_sha256=53622ea3f930386411011537836123f8772f2e1a392c207a10513bb58352854c; reference_sha256=df2884ca3cadca5b1d26a80272cfbda757522f188eda2cd948c5e68f085c9afc; lane=cpu; collector=wall-clock; par2_placement=canonical</metadata>
+  <metadata>schema=1; report_sha256=67f1345d4bf2f26717989760a6c0aecd07b8ae47cb4af748277e27b0dbf74b72; corpus_digest=59f46fa58f651958ad8fc035d98a0cf0ce69345b740a1e9cc5fc52ab58929ada; plan_id=plan-900b3c52bca9463e; candidate_sha256=2db548cfa02988aaa42546a46d4246a520339309af9274f440e101a33ac3b26e; reference_sha256=df2884ca3cadca5b1d26a80272cfbda757522f188eda2cd948c5e68f085c9afc; lane=cpu; collector=wall-clock; par2_placement=canonical</metadata>
   <rect class="bg" width="1200" height="522"/>
   <text class="title" x="48" y="48">rarpar PAR2 relative speed benchmark</text>
   <text class="subtitle" x="48" y="75">Lower elapsed time is better. Bars show the faster side's multiplier on a symmetric log scale.</text>
@@ -32,34 +32,34 @@
   <g aria-label="PAR2 benchmarks">
     <text class="machine" x="48" y="140">linux-arm64-v2 / arm64 / cpu / canonical placement</text>
     <text class="workload" x="48" y="168">PAR2 verification</text>
-    <text class="timing" x="48" y="184">13.4 ms -> 6.2 ms</text>
-    <rect class="cpu" x="885.0" y="160" width="98.6" height="14" rx="2"/>
-    <text class="ratio" x="991.6" y="172">2.2x</text>
+    <text class="timing" x="48" y="184">13.1 ms -> 5.9 ms</text>
+    <rect class="cpu" x="885.0" y="160" width="101.5" height="14" rx="2"/>
+    <text class="ratio" x="994.5" y="172">2.2x</text>
     <line class="rule" x1="48" y1="194" x2="1150" y2="194"/>
     <text class="workload" x="48" y="222">PAR2 byte-damage repair</text>
-    <text class="timing" x="48" y="238">21.7 ms -> 11.6 ms</text>
-    <rect class="cpu" x="885.0" y="214" width="79.6" height="14" rx="2"/>
-    <text class="ratio" x="972.6" y="226">1.9x</text>
+    <text class="timing" x="48" y="238">21.0 ms -> 10.9 ms</text>
+    <rect class="cpu" x="885.0" y="214" width="83.4" height="14" rx="2"/>
+    <text class="ratio" x="976.4" y="226">1.9x</text>
     <line class="rule" x1="48" y1="248" x2="1150" y2="248"/>
     <text class="workload" x="48" y="276">PAR2 heavy repair with 28 damaged slices</text>
-    <text class="timing" x="48" y="292">562.2 ms -> 344.1 ms</text>
-    <rect class="cpu" x="885.0" y="268" width="62.6" height="14" rx="2"/>
-    <text class="ratio" x="955.6" y="280">1.6x</text>
+    <text class="timing" x="48" y="292">558.4 ms -> 339.4 ms</text>
+    <rect class="cpu" x="885.0" y="268" width="63.4" height="14" rx="2"/>
+    <text class="ratio" x="956.4" y="280">1.6x</text>
     <line class="rule" x1="48" y1="302" x2="1150" y2="302"/>
-    <text class="workload" x="48" y="330">PAR2 missing-volume repair</text>
-    <text class="timing" x="48" y="346">22.5 ms -> 15.9 ms</text>
-    <rect class="cpu" x="885.0" y="322" width="44.4" height="14" rx="2"/>
-    <text class="ratio" x="937.4" y="334">1.4x</text>
+    <text class="workload" x="48" y="330">PAR2 heavy repair with 250 damaged slices</text>
+    <text class="timing" x="48" y="346">1.09 s -> 735.9 ms</text>
+    <rect class="cpu" x="885.0" y="322" width="50.2" height="14" rx="2"/>
+    <text class="ratio" x="943.2" y="334">1.5x</text>
     <line class="rule" x1="48" y1="356" x2="1150" y2="356"/>
-    <text class="workload" x="48" y="384">PAR2 heavy repair with 250 damaged slices</text>
-    <text class="timing" x="48" y="400">1.10 s -> 784.5 ms</text>
-    <rect class="cpu" x="885.0" y="376" width="43.5" height="14" rx="2"/>
-    <text class="ratio" x="936.5" y="388">1.4x</text>
+    <text class="workload" x="48" y="384">PAR2 missing-volume repair</text>
+    <text class="timing" x="48" y="400">21.8 ms -> 15.2 ms</text>
+    <rect class="cpu" x="885.0" y="376" width="45.7" height="14" rx="2"/>
+    <text class="ratio" x="938.7" y="388">1.4x</text>
     <line class="rule" x1="48" y1="410" x2="1150" y2="410"/>
     <text class="workload" x="48" y="438">PAR2 generation from 256 MiB RAR5 multi-volume input</text>
-    <text class="timing" x="48" y="454">4.28 s -> 5.58 s</text>
-    <rect class="slower" x="851.2" y="430" width="33.8" height="14" rx="2"/>
-    <text class="ratio" x="843.2" y="442" text-anchor="end">1.3x</text>
+    <text class="timing" x="48" y="454">4.23 s -> 3.99 s</text>
+    <rect class="cpu" x="885.0" y="430" width="7.5" height="14" rx="2"/>
+    <text class="ratio" x="900.5" y="442">1.1x</text>
     <line class="rule" x1="48" y1="464" x2="1150" y2="464"/>
   </g>
 </svg>
