@@ -81,6 +81,23 @@ shape or meaning, so it stays inside the 0.4.x compatibility range.
 
 ### Performance
 
+- Creation's staging area is now **block-interleaved** for the aarch64 CLMUL
+  family: the eight sources one kernel pass folds into a destination share one
+  contiguous stream, thirty-two bytes each in turn, instead of sitting in eight
+  separate slices the pass reads at a common offset. Lane-major, a pass puts
+  eight source lines plus a destination line into one L1D set per block, which
+  no stride residue can make fit a 2-way set — the lane/row skew that took
+  Neoverse N1's 4-way L1D from 35 L1D refills per thousand instructions to 3
+  moved Cortex-A72's 2-way L1D only from 29 to 26. Interleaved, the pass is one
+  sequential stream plus its destination: two streams, which any associativity
+  holds, and each 64-byte line now serves two lanes of the same block rather
+  than two block-steps of one lane that a 2-way set cannot keep apart. The x86
+  folded family has always laid its staging out this way and never had the
+  problem; the x86 kernels, the packed XOR-JIT family and the word-wise
+  reference path keep the lane-major layout, which is the right shape for each
+  of their kernels. Recovery bytes are unchanged.
+  `WEAVER_PAR2_CREATE_INTERLEAVE=N` pins the interleave width (`1` = the
+  lane-major layout) so the two can be compared without a rebuild.
 - Multi-buffer MD5 now backs slice hashing on **both** the creation and the
   verify/repair sides. One MD5 stream is a serial dependency chain that no SIMD
   can widen, so the kernel instead holds one independent message per 32-bit

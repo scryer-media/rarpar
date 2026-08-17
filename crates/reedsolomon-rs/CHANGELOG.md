@@ -3,10 +3,37 @@
 ## 0.4.1
 
 This is a patch release from 0.4.0: kernel selection, code-memory accounting,
-and a new kernel, all behind the existing public surface. No public item
-changed shape, so it stays inside the 0.4.x compatibility range.
+new kernels, and one additive entry point for a caller that stages its inputs
+interleaved. No existing public item changed shape or meaning, so it stays
+inside the 0.4.x compatibility range.
+
+### Public API
+
+- `mul_acc_input_batch_prepared_interleaved`: the grouped-input multiply-
+  accumulate over a **block-interleaved** batch — `lanes` source regions sharing
+  one contiguous stream, lane `l`'s block `b` at
+  `(b * lanes + l) * INPUT_BATCH_BLOCK_BYTES` — instead of one slice per source.
+  A pass over such a group reads one sequential stream plus its destination
+  rather than `lanes + 1` regions at a shared offset, so it needs two cache ways
+  rather than `lanes + 1` however the regions are strided. Same arithmetic, same
+  bytes, same dispatch rule (CLMUL above three live sources, VTBL below it);
+  `lanes == 1` is the lane-major layout and behaves exactly like
+  `mul_acc_input_batch_prepared`. Targets without a grouped-input vector kernel
+  get a portable definition of the layout rather than nothing.
+- `INPUT_BATCH_BLOCK_BYTES` and `INPUT_BATCH_INTERLEAVE_LANES`: the layout's
+  block granularity (32 bytes, the `vld2q`/`vst2q` strip the grouped-input
+  kernels step by) and the interleave width a caller should stage for — the
+  aarch64 CLMUL pass's source count, and 1 elsewhere, where the grouped-input
+  kernels walk one source region at a time and lane-major is what they want.
 
 ### Runtime Behavior
+
+- The aarch64 CLMUL and VTBL grouped-input kernels now take a source *block
+  stride*, so they can consume either staging layout. On the lane-major layout
+  the emitted loop is instruction-for-instruction what it was — LLVM folds the
+  second induction variable away against the constant stride — and the
+  interleaved loop pays 8 instructions per 32-byte block at eight sources
+  (one `add`, six `mov`, one `ldr`; the 48 `pmull` are unchanged).
 
 - GF(2¹⁶) kernel selection for the accumulate path now mirrors the reference
   tool's ladder arm for arm: the GFNI affine kernel when GFNI exists, a new
@@ -17,9 +44,21 @@ changed shape, so it stays inside the 0.4.x compatibility range.
   measured badly on AVX-512-without-GFNI hosts.
 - The new 512-bit shuffle2x kernel is the split-layout shuffle widened to
   zmm: two destination blocks per iteration with all 24 table registers
-  resident and a pairwise lane-swap fold, single-group by register math (the
-  shuffle needs 4 table registers per source where affine needs 2, so the
-  GFNI pair shape cannot fit).
+  resident and a pairwise lane-swap fold. It remains the arm for an odd
+  trailing group.
+- Adjacent groups now fuse into a single twelve-source destination pass on
+  AVX512BW/VL-without-GFNI silicon, mirroring the reference's multi-region
+  shape (`idealInputMultiple` 3 for `SHUFFLE_AVX512`, 6 for
+  `SHUFFLE2X_AVX512`) at twelve regions. `vpshufb` looks up per 128-bit lane,
+  so one table register can serve *two* sources rather than holding one
+  source's table twice — four registers per source pair, twelve sources in
+  the same 24 zmm the single-group kernel spends on six. The per-source
+  `vinserti64x4` that built a zmm from two 32-byte staging blocks is gone
+  with it: 62 vector ALU ops (31 port-5-only) per twelve source-block
+  operations become 58 (26), and each destination block is read and written
+  once per twelve sources instead of once per six. Same arithmetic, same
+  bytes; `WEAVER_GF16_SHUFFLE2X_PAIR=0` pins the previous single-group loop
+  shape for A/B.
 - The AVX2 XOR-JIT builds ONE sealed multi-row batch per input batch and
   recycles it across stripes — never a build per output row. The coefficient
   rows depend only on the input batch and the recovery exponents, never the
