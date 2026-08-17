@@ -654,18 +654,26 @@ jobs:
       - name: Keylessly sign immutable OCI index
         if: ${{ github.event_name == 'push' }}
         shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign sign --yes "${{ steps.image.outputs.name }}@${{ steps.push.outputs.digest }}"
+          cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
       - name: Verify keyless OCI signature
         if: ${{ github.event_name == 'push' }}
         shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cosign verify \
-            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${{ steps.image.outputs.name }}@${{ steps.push.outputs.digest }}"
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
     outputs:
       image: ${{ steps.image.outputs.name }}
       digest: ${{ steps.push.outputs.digest }}
@@ -683,7 +691,7 @@ jobs:
       actions: read
       id-token: write
       packages: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       image: ${{ needs.container.outputs.image }}
       digest: ${{ needs.container.outputs.digest }}
@@ -720,11 +728,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.container.outputs.image }}
           DIGEST: ${{ needs.container.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           immutable_image="${IMAGE}@${DIGEST}"
           cosign verify \
-            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$immutable_image"
           cosign verify-attestation \
@@ -733,8 +743,8 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$immutable_image"
           slsa-verifier verify-image "$immutable_image" \
-            --source-uri "github.com/${{ github.repository }}" \
-            --source-tag "${{ github.ref_name }}"
+            --source-uri "github.com/${REPOSITORY}" \
+            --source-tag "${REF_NAME}"
           index="$(docker buildx imagetools inspect --raw "$immutable_image")"
           for platform in linux/amd64 linux/arm64; do
             os="${platform%/*}"
@@ -817,6 +827,9 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         working-directory: release-assets
         shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cosign sign-blob --yes \
@@ -824,7 +837,7 @@ jobs:
             SHA256SUMS
           cosign verify-blob \
             --bundle SHA256SUMS.sigstore.json \
-            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             SHA256SUMS
       - name: Create or update GitHub release
@@ -996,7 +1009,7 @@ jobs:
       actions: read
       contents: write
       id-token: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects: ${{ needs.deploy.outputs.base64_subjects }}
       provenance-name: rarpar-provenance.intoto.jsonl
