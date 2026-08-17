@@ -555,6 +555,43 @@ func TestResolveFallsBackWhenTheMirrorIsUnavailable(t *testing.T) {
 	}
 }
 
+// A mirror that refuses the client outright — a bucket that is not public yet,
+// or a CDN rule that will not answer this network — is unavailable too. It
+// serves no bytes, so there is nothing to mistake for the archive, and the
+// official download that replaces it is held to the same reviewed digest.
+// Publishing the first revision depends on this: nothing is mirrored yet, so a
+// refusal on every key must not be the end of the road.
+func TestResolveFallsBackWhenTheMirrorRefusesTheClient(t *testing.T) {
+	for _, status := range []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusGone,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixture := newMirrorFixture(t)
+			keys := fixture.source.keys()
+			fixture.mirrorObjects(fixture.source, fixture.archive, nil)
+			fixture.queueReadStatus(keys.archive, status)
+
+			resolved, err := fixture.mirror.Resolve(context.Background(), fixture.source, fixture.cacheDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.Origin != OriginOfficial {
+				t.Fatalf("origin = %q, want %q", resolved.Origin, OriginOfficial)
+			}
+			if got := fixture.officialHits(); got != 1 {
+				t.Fatalf("official requests = %d, want exactly one", got)
+			}
+			// A refusal is answered once and believed: retrying it would only
+			// spend the budget on a client the mirror will not serve.
+			if got := fixture.readHits(keys.archive); got != 1 {
+				t.Fatalf("mirror was read %d times, want exactly one", got)
+			}
+		})
+	}
+}
+
 // A transient failure inside the budget is retried, and the mirror still wins.
 func TestResolveRetriesATransientMirrorFailure(t *testing.T) {
 	fixture := newMirrorFixture(t)

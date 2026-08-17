@@ -261,9 +261,13 @@ git commit ──► test-corpus/lock.json ──► manifest.blake3 ──► m
 - The tool-source mirror in the benchmark harness fails closed: an object that
   is present on R2 but has a wrong digest, an invalid signature, a signer other
   than the publish workflow, or provenance that disagrees with the lock is an
-  error. It is neither replaced nor silently bypassed; only *absence* (HTTP
-  404) or retry-exhausted unavailability falls back to the official RARLAB URL,
-  and that download must still match the reviewed BLAKE3 digest before it is used.
+  error. It is neither replaced nor silently bypassed. Three conditions fall
+  back to the official RARLAB URL: *absence* (HTTP 404), *refusal* (401, 403,
+  410 — a bucket that is not public yet, or an edge rule that will not answer
+  this client; the first publication depends on this, since nothing is mirrored
+  when it starts), and retry-exhausted unavailability. None of them yields
+  bytes, and the download that replaces them must still match the reviewed
+  BLAKE3 digest before it is used.
 
 ## Commands
 

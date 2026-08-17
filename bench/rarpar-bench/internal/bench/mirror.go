@@ -447,6 +447,15 @@ func (m *SourceMirror) fetchVerified(ctx context.Context, source ArchiveSource, 
 	switch {
 	case status == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: %s", errMirrorAbsent, keys.archive)
+	case refusedStatus(status):
+		// The mirror refused to serve rather than serving something wrong: an
+		// unauthenticated read of a private bucket, or an edge rule that will
+		// not answer this client. No bytes came back, so there is nothing to
+		// mistake for the object, and the official archive that replaces it is
+		// held to the same reviewed digest — the fallback cannot lower the bar.
+		// Failing hard here would instead make the *first* publication
+		// impossible, when by definition nothing is mirrored yet.
+		return nil, fmt.Errorf("%w: mirror GET %s: HTTP %d", errSourceUnavailable, keys.archive, status)
 	case status != http.StatusOK:
 		// Neither absence nor unavailability: something answered for this key
 		// that is not the object, so nothing may be assumed about it.
@@ -734,6 +743,19 @@ func (m *SourceMirror) get(ctx context.Context, target string) (int, []byte, err
 
 func transientStatus(status int) bool {
 	return status >= 500 || status == http.StatusTooManyRequests
+}
+
+// refusedStatus is the mirror declining to serve this client at all, as
+// opposed to answering for the key. A bucket that is not public yet answers
+// 401/403 for every key including ones it holds; a CDN rule that blocks the
+// runner's network answers 403 before the bucket is consulted; 410 is a key
+// deliberately retired. None of them hand back an object, so each is treated
+// as the mirror being unavailable for this archive rather than as a mirror
+// that lies about it.
+func refusedStatus(status int) bool {
+	return status == http.StatusUnauthorized ||
+		status == http.StatusForbidden ||
+		status == http.StatusGone
 }
 
 func (m *SourceMirror) backoff(ctx context.Context, attempt int) error {
