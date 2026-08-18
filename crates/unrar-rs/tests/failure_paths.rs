@@ -45,74 +45,101 @@ fn extract_all_clean(bytes: Vec<u8>, password: Option<&str>) {
     }
 }
 
-/// Fast default set: one representative per format/mode family.
-#[cfg(not(feature = "slow-tests"))]
-const DAMAGE_TARGETS: &[(&str, &str, Option<&str>)] = &[
-    ("rar4", "rar4_lz.rar", None),
-    ("rar4", "rar4_solid.rar", None),
-    ("rar4", "rar4_enc_lz.rar", Some(PASSWORD)),
-    ("rar4", "rar4_hp_lz.rar", Some(HP_PASSWORD)),
-    ("rar5", "rar5_lz.rar", None),
-    ("rar5", "rar5_solid.rar", None),
-    ("rar5", "rar5_enc_lz.rar", Some(PASSWORD)),
-    ("rar5", "rar5_hp_lz.rar", Some(HP_PASSWORD)),
-];
+/// Where the corruption sweep puts its bit flips: the signature and header
+/// region, then spread across the data area.
+fn damage_positions(len: usize) -> [usize; 6] {
+    [16, 40, len / 4, len / 2, len * 3 / 4, len - 8]
+}
 
-/// Full matrix, including the slow PPMd and multi-member solid fixtures.
-#[cfg(feature = "slow-tests")]
-const DAMAGE_TARGETS: &[(&str, &str, Option<&str>)] = &[
-    ("rar4", "rar4_lz.rar", None),
-    ("rar4", "rar4_store.rar", None),
-    ("rar4", "rar4_solid.rar", None),
-    ("rar4", "rar4_lz_solid_mv.rar", None),
-    ("rar4", "rar4_ppm_solid_restart.rar", None),
-    ("rar4", "rar4_ppm_solid_mv.rar", None),
-    ("rar4", "rar4_enc_lz.rar", Some(PASSWORD)),
-    ("rar4", "rar4_hp_lz.rar", Some(HP_PASSWORD)),
-    ("rar5", "rar5_lz.rar", None),
-    ("rar5", "rar5_store.rar", None),
-    ("rar5", "rar5_solid.rar", None),
-    ("rar5", "rar5_multifile_lz.rar", None),
-    ("rar5", "rar5_enc_lz.rar", Some(PASSWORD)),
-    ("rar5", "rar5_hp_lz.rar", Some(HP_PASSWORD)),
-    ("rar5", "rar5_solid_encrypted.rar", Some(E2E_PASSWORD)),
-];
-
-#[test]
-fn truncated_archives_fail_cleanly() {
-    for (dir, name, password) in DAMAGE_TARGETS {
-        let full = fixture_bytes(dir, name);
-        let len = full.len();
-
-        let mut cuts = vec![len / 4, len / 2, len - 1];
-        // Header-region cuts: signature and first block boundaries.
-        cuts.extend((0..24).step_by(4));
-        for cut in cuts {
-            extract_all_clean(full[..cut.min(len)].to_vec(), *password);
+/// Half of one target's corruption sweep. The split is by position, not by
+/// fixture: on a solid or PPMd archive a flip early in the data area costs
+/// far more to re-extract than one near the end, so halving the *positions*
+/// splits the cost roughly evenly, where halving the fixture list would not.
+fn corrupted_target_half_fails_cleanly(dir: &str, name: &str, password: Option<&str>, half: usize) {
+    let full = fixture_bytes(dir, name);
+    let len = full.len();
+    let positions = damage_positions(len);
+    for &pos in positions.iter().skip(half).step_by(2) {
+        let pos = pos.min(len - 1);
+        for flip in [0xFFu8, 0x01] {
+            let mut damaged = full.clone();
+            damaged[pos] ^= flip;
+            extract_all_clean(damaged, password);
         }
     }
 }
 
-#[test]
-fn corrupted_archives_fail_cleanly() {
-    for (dir, name, password) in DAMAGE_TARGETS {
-        let full = fixture_bytes(dir, name);
-        let len = full.len();
-
-        // Header region and spread through the data area.
-        #[cfg(not(feature = "slow-tests"))]
-        let positions = [40, len / 2];
-        #[cfg(feature = "slow-tests")]
-        let positions = [16, 40, len / 4, len / 2, len * 3 / 4, len - 8];
-        for &pos in &positions {
-            let pos = pos.min(len - 1);
-            for flip in [0xFFu8, 0x01] {
-                let mut damaged = full.clone();
-                damaged[pos] ^= flip;
-                extract_all_clean(damaged, *password);
-            }
-        }
+/// The truncation sweep for one target: the signature and first block
+/// boundaries, then quarter, half and one byte short.
+fn truncated_target_fails_cleanly(dir: &str, name: &str, password: Option<&str>) {
+    let full = fixture_bytes(dir, name);
+    let len = full.len();
+    let mut cuts = vec![len / 4, len / 2, len - 1];
+    cuts.extend((0..24).step_by(4));
+    for cut in cuts {
+        extract_all_clean(full[..cut.min(len)].to_vec(), password);
     }
+}
+
+/// One test per damage target, rather than one test that walks them all.
+///
+/// These sweeps are the slowest thing the crate runs — fifteen targets, each
+/// re-extracted twelve times for corruption and twelve more for truncation —
+/// and as two `#[test]` functions they were also strictly *serial*. nextest
+/// schedules tests, not loop iterations, so a whole CI shard's wall time was
+/// one of these functions running alone (590 s of a 720 s shard, measured)
+/// while its sibling shards sat idle. Splitting the loop is what lets the work
+/// spread across a runner's cores, and it gives the shard partitioner
+/// something to balance: forty-five medium tests instead of two enormous
+/// ones. The corruption sweep splits again by position half, because on the
+/// solid and PPMd fixtures one target alone still ran 93 s.
+///
+/// Coverage is unchanged — same targets, same positions, same flips, same
+/// cuts. Only the scheduling boundary moved.
+macro_rules! damage_target_tests {
+    ($($name:ident => ($dir:expr, $file:expr, $password:expr)),* $(,)?) => {
+        $(
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn corrupted_bit_flips_fail_cleanly_a() {
+                    corrupted_target_half_fails_cleanly($dir, $file, $password, 0);
+                }
+
+                #[test]
+                fn corrupted_bit_flips_fail_cleanly_b() {
+                    corrupted_target_half_fails_cleanly($dir, $file, $password, 1);
+                }
+
+                #[test]
+                fn truncations_fail_cleanly() {
+                    truncated_target_fails_cleanly($dir, $file, $password);
+                }
+            }
+        )*
+    };
+}
+
+// The full matrix, including the slow PPMd and multi-member solid fixtures.
+// This file is `slow-tests`-only in its entirety (see the inner attribute at
+// the top), so there is no reduced set to select between.
+damage_target_tests! {
+    rar4_lz => ("rar4", "rar4_lz.rar", None),
+    rar4_store => ("rar4", "rar4_store.rar", None),
+    rar4_solid => ("rar4", "rar4_solid.rar", None),
+    rar4_lz_solid_mv => ("rar4", "rar4_lz_solid_mv.rar", None),
+    rar4_ppm_solid_restart => ("rar4", "rar4_ppm_solid_restart.rar", None),
+    rar4_ppm_solid_mv => ("rar4", "rar4_ppm_solid_mv.rar", None),
+    rar4_enc_lz => ("rar4", "rar4_enc_lz.rar", Some(PASSWORD)),
+    rar4_hp_lz => ("rar4", "rar4_hp_lz.rar", Some(HP_PASSWORD)),
+    rar5_lz => ("rar5", "rar5_lz.rar", None),
+    rar5_store => ("rar5", "rar5_store.rar", None),
+    rar5_solid => ("rar5", "rar5_solid.rar", None),
+    rar5_multifile_lz => ("rar5", "rar5_multifile_lz.rar", None),
+    rar5_enc_lz => ("rar5", "rar5_enc_lz.rar", Some(PASSWORD)),
+    rar5_hp_lz => ("rar5", "rar5_hp_lz.rar", Some(HP_PASSWORD)),
+    rar5_solid_encrypted => ("rar5", "rar5_solid_encrypted.rar", Some(E2E_PASSWORD)),
 }
 
 #[test]
