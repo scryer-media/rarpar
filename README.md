@@ -1,6 +1,6 @@
 # rarpar
 
-[![License](https://img.shields.io/github/license/scryer-media/rarpar)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later%20AND%20UnRAR--restriction-blue)](#license)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/scryer-media/rarpar/badge)](https://scorecard.dev/viewer/?uri=github.com/scryer-media/rarpar)
 
 `rarpar` is a smart RAR/PAR2 command-line tool written in Rust. Point it at an
@@ -334,9 +334,9 @@ the archive set; it waits for each later volume instead.
 - `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
-- `tools/rarpar`: the standalone CLI. Source is GPL-3.0-or-later. Normal
-  binary builds link `unrar-rs`, so binary distribution also carries the
-  additional UnRAR source-code restriction.
+- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with the
+  additional UnRAR source-code restriction — `unrar-rs` is a default
+  dependency, so an ordinary build carries it.
 
 ## Development
 
@@ -380,14 +380,23 @@ Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
 `unrar-rs` is used:
 
-- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
-  GPL-3.0-or-later.
+- `reedsolomon-rs` and `par2-rs` are GPL-3.0-or-later. Neither depends on
+  `unrar-rs`, so neither carries the restriction.
 - `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
   restriction documented in `crates/unrar-rs/LICENSE`.
-- `rarpar` binary releases link `unrar-rs` and therefore carry that
-  additional restriction too. Release archives include `LICENSE`,
-  `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
+- `rarpar` is GPL-3.0-or-later with that same additional restriction.
+  `unrar-rs` is a default dependency — `default` enables `runtime`, which
+  enables `dep:unrar-rs` — so an ordinary `cargo build`, `cargo install` or
+  release archive contains UnRAR-derived code. Release archives include
+  `LICENSE`, `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
 
 The additional restriction applies to the RAR extraction and recovery code in
-`unrar-rs` and to `rarpar` binaries that include it. It does not apply to
-the PAR2 or Reed-Solomon crates.
+`unrar-rs`, and to `rarpar`, which includes it by default. It does not apply
+to the PAR2 or Reed-Solomon crates, which is why those two are published to
+crates.io under a plain `GPL-3.0-or-later` SPDX identifier while `unrar-rs`
+and `rarpar` use `license-file` instead — the combination is not expressible
+as an SPDX identifier.
+
+Building `rarpar` with `--no-default-features` and without `runtime` links no
+`unrar-rs` and is GPL-3.0-or-later alone, but no distributed rarpar is built
+that way.
