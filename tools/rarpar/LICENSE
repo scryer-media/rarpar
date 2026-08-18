@@ -1,10 +1,19 @@
 # rarpar License
 
-rarpar source code is licensed under GPL-3.0-or-later.
+rarpar is licensed under GPL-3.0-or-later with the additional UnRAR
+source-code restriction reproduced at the end of this file.
 
-Normal rarpar binary distributions include and link `unrar-rs`. Those
-binary distributions therefore carry the additional UnRAR source-code
-restriction for the RAR extraction and recovery code.
+The restriction is not a property of only the binaries. `unrar-rs` is a
+default dependency of this crate: it is pulled in by the `runtime` feature,
+and `default = ["runtime", "musl-allocator"]`. An ordinary `cargo build`,
+`cargo install` or release archive therefore contains UnRAR-derived RAR
+extraction and recovery code and carries the restriction with it.
+
+Only a deliberate `--no-default-features` build that also omits `runtime`
+links no `unrar-rs`. That configuration is GPL-3.0-or-later alone, and it is
+not what any distributed rarpar is — so rarpar is described as
+GPL-3.0-or-later AND the UnRAR restriction, rather than as GPL-3.0-or-later
+with a caveat about binaries.
 
 Binary release archives include:
 
