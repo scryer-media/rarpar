@@ -75,6 +75,36 @@ jobs:
           mode: batch
           sanitizer: address
           output-sarif: true
+        # Timeouts are findings here, and without this they are discarded.
+        #
+        # The 2026-08-17 run watched rar_extract spend 34 s on a single unit
+        # against a 25 s limit, logged "Detected bug", and then two seconds
+        # later logged "finished running without reportable crashes" and went
+        # green. Nothing was uploaded, the SARIF came out empty, and the
+        # reproducer — written to a container /tmp, not to out/artifacts — was
+        # destroyed with the container. The corpus could not answer the
+        # question afterwards: replaying all 3873 retained inputs takes 223 ms
+        # total, slowest unit 19 ms, because libFuzzer only promotes an input
+        # that adds coverage and a unit that merely runs long adds none.
+        #
+        # The cause is a classifier in CIFuzz that keys off the artifact's
+        # filename: a testcase named `timeout-*` is reportable only if
+        # REPORT_TIMEOUTS says so, and it defaults to False
+        # (infra/cifuzz/config_utils.py: `environment.get_bool('REPORT_TIMEOUTS',
+        # False)`). It short-circuits there, which is why the log shows no
+        # reproducibility check at all. There is no action input for it, so it
+        # goes through the environment; `get_bool` accepts only 'true'/'false',
+        # and anything else raises rather than silently reading as false.
+        #
+        # REPORT_OOMS already defaults to True, so out-of-memory findings were
+        # never subject to this and need no flag.
+        #
+        # Deliberately not set on the pull request lane: until a timeout is
+        # captured we cannot tell a pathological input from a stalled shared
+        # runner, and that ambiguity belongs in a nightly report rather than in
+        # a gate that blocks someone's merge.
+        env:
+          REPORT_TIMEOUTS: 'true'
 
   # What the corpus is actually reaching. Without this the fuzzing budget is
   # spent on faith: a target whose coverage has been flat for a month is either
@@ -107,6 +137,16 @@ jobs:
           mode: coverage
           sanitizer: coverage
 
+  # Measured on the 2026-08-17 run, since "the corpus is being reused" is the
+  # kind of claim that is easy to assume and easy to get wrong: every target
+  # downloads its corpus before fuzzing and uploads it after, and libFuzzer
+  # reads all of it — rar_extract logged `1550 files found`, `seed corpus:
+  # files: 1550`, then `INITED ... corp: 1503`, the 47 dropped being inputs
+  # that contribute no feature the rest already cover. (`Loaded 1024/1566` in
+  # the same log is a progress line printed every 1024 files, not a cap.)
+  # Across the run the corpus went 6.5 MB out of batch to 3.8 MB out of prune,
+  # which is this job doing its job.
+  #
   # A corpus grows monotonically otherwise, and most of what it accumulates is
   # inputs that reach nothing the corpus did not already reach. Pruning keeps
   # the set minimal, which is what makes tomorrow's run spend its budget on new
