@@ -173,6 +173,42 @@ jobs:
       - name: Run publish preflight checks
         run: |
           cargo fmt --check --all
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-semver-checks@0.50.0
+      # A version number is a compatibility promise, and until this step nothing
+      # in the workflow checked that the promise held. `Check workspace version`
+      # proves the manifests agree with each other and with the input; it cannot
+      # see that the code underneath them stopped being compatible. Under
+      # Cargo's pre-1.0 rules `0.4.1 -> 0.4.2` is a *compatible* bump, so a
+      # break reaches everyone requiring "0.4" on their next `cargo update`,
+      # with no version signal that anything moved — and registry versions are
+      # immutable, so the only remedy after the fact is a yank plus the bump
+      # that should have happened. This compares each crate against its own
+      # published baseline and exits 100 when the version bump is too small for
+      # the change it carries.
+      #
+      # A floor, not a proof. On the par2-rs 0.4.2 that prompted this gate it
+      # caught the added `Par2RepairerOptions` field but missed `scan_packets`
+      # changing its return type: 195 pass, 1 fail, one real break unreported.
+      # Read a green result as "no known lint fired", and still diff the public
+      # surface by hand for a release that touches library API.
+      - name: Check semver against the published baselines
+        env:
+          PUBLISH_PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH_PACKAGE" = "all" ]; then
+            packages="reedsolomon-rs unrar-rs par2-rs"
+          else
+            packages="$PUBLISH_PACKAGE"
+          fi
+          for package in $packages; do
+            echo "::group::cargo-semver-checks ${package}"
+            cargo semver-checks --package "$package"
+            echo "::endgroup::"
+          done
       - name: Verify package contents
         env:
           PUBLISH_PACKAGE: ${{ inputs.package }}
