@@ -80,12 +80,14 @@
       ]
     },
     "release-tests": {
-      "description": "The subset release.yml hydrates for its test job.",
+      "description": "Exactly the fixtures `cargo test -p rarpar` opens, which is what release.yml's test job runs. Every path tools/rarpar/tests/cli.rs reaches must be listed here or the release fails at preflight, after the tag is already public — CI does not catch it, because fixture-tests hydrates the whole unrar profile and never exercises this subset.",
       "include": [
         "crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_store.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_symlink.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_dirs.rar",
+        "crates/unrar-rs/tests/fixtures/rar5/rar5_multifile_store.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_recovery_volumes.part*",
         "crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar",
