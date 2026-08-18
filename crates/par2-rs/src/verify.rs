@@ -350,51 +350,151 @@ pub fn verify_full_hash(
     verify_full_hash_streaming(desc.hash_full, actual_len, file_id, access)
 }
 
-fn verify_quick_and_full_hash(
+/// What the strict single-file streaming pass established.
+enum StrictStreamOutcome {
+    /// A slice's CRC32 disagreed with its IFSC entry, so the file's bytes
+    /// provably differ from the protected content. The stream stopped there:
+    /// the whole-file hashes were never finished, and could not have changed
+    /// the verdict (see [`verify_selected_file_ids_resolved`]).
+    SliceCrcMismatch,
+    /// The whole file streamed to the end. Verdicts for the 16 KiB prefix and
+    /// the whole-file MD5, exactly as the unfused pass reported them.
+    Hashes { quick_ok: bool, full_ok: bool },
+}
+
+/// Slice-aligned chunk size for the fused strict stream: the largest whole
+/// number of slices that fits in [`VERIFY_FULL_HASH_CHUNK_BYTES`], so every
+/// chunk ends on a slice boundary and the per-slice CRC32 needs no carry
+/// state between chunks. `None` when a single slice does not fit, in which
+/// case the stream runs unfused at the original chunk size. The buffer is
+/// therefore never larger than the unfused pass's, so the resident-memory
+/// accounting of a verify is unchanged.
+fn fused_chunk_bytes(slice_size: u64) -> Option<usize> {
+    let slice = usize::try_from(slice_size).ok()?;
+    if slice == 0 || slice > VERIFY_FULL_HASH_CHUNK_BYTES {
+        return None;
+    }
+    Some((VERIFY_FULL_HASH_CHUNK_BYTES / slice) * slice)
+}
+
+/// One streaming pass over a file that feeds the 16 KiB and whole-file MD5
+/// chains and, when `slice_checksums` is supplied, CRC32s each slice out of the
+/// same buffer.
+///
+/// The CRC32 rides along on bytes already in cache for the MD5 chain, so it
+/// costs no extra read, no extra buffer, and no extra thread — a clean file
+/// pays only the CRC32 arithmetic. Its value is the early exit: the first slice
+/// whose CRC32 disagrees with its IFSC entry proves the file's content differs
+/// from the protected content, and from there the serial MD5 chain can only
+/// confirm what is already known, so the pass abandons it.
+///
+/// `slice_checksums` must be `Some` only when the entry count matches the
+/// file's slice count and the on-disk length matches the description — the
+/// same preconditions under which [`verify_slices`] indexes those entries.
+fn stream_strict_hashes(
     par2: &Par2FileSet,
     file_id: &FileId,
     access: &dyn FileAccess,
-) -> Option<(bool, bool)> {
+    slice_checksums: Option<&[SliceChecksum]>,
+) -> Option<StrictStreamOutcome> {
     let desc = par2.file_description(file_id)?;
     let actual_len = access.file_length(file_id)?;
+    let slice_size = par2.slice_size;
+    // `fused_chunk_bytes` is `None` for a zero or oversized slice size, so a
+    // fused pass always has a positive, slice-aligned chunk.
+    let fused = slice_checksums.zip(fused_chunk_bytes(slice_size));
+    let chunk_bytes = fused.map_or(VERIFY_FULL_HASH_CHUNK_BYTES, |(_, chunk)| chunk);
+
     let mut quick_state = checksum::FileHashState::new();
     let mut full_state = None;
-    let mut buf = vec![0u8; VERIFY_FULL_HASH_CHUNK_BYTES];
+    let mut buf = vec![0u8; chunk_bytes];
     let mut total_read = 0u64;
+    let mut reader = access.open_sequential_reader(file_id).ok()?;
 
-    if let Some(mut reader) = access.open_sequential_reader(file_id).ok()? {
-        loop {
-            let read_len = reader.read(&mut buf).ok()?;
-            if read_len == 0 {
-                break;
+    while total_read < actual_len {
+        let want = ((actual_len - total_read) as usize).min(chunk_bytes);
+        let read_len = match reader.as_mut() {
+            // Chunks are filled exactly, not by a single `read`, so the chunk
+            // boundary stays slice-aligned for the CRC32 ride-along.
+            Some(reader) => {
+                read_from_sequential_reader(&mut **reader, &mut buf[..want], want).ok()?
             }
-            update_quick_and_full_hash_states(&mut quick_state, &mut full_state, &buf[..read_len]);
-            total_read += read_len as u64;
+            None => access
+                .read_file_range_into(file_id, total_read, &mut buf[..want])
+                .ok()?,
+        };
+        if read_len == 0 {
+            break;
         }
-    } else {
-        while total_read < actual_len {
-            let chunk_len = ((actual_len - total_read) as usize).min(buf.len());
-            let read_len = access
-                .read_file_range_into(file_id, total_read, &mut buf[..chunk_len])
-                .ok()?;
-            if read_len == 0 {
-                return Some((false, false));
-            }
-            update_quick_and_full_hash_states(&mut quick_state, &mut full_state, &buf[..read_len]);
-            total_read += read_len as u64;
+        let data = &buf[..read_len];
+        update_quick_and_full_hash_states(&mut quick_state, &mut full_state, data);
+        if let Some((checksums, _)) = fused
+            && chunk_proves_slice_damage(data, total_read, slice_size, actual_len, checksums)
+        {
+            return Some(StrictStreamOutcome::SliceCrcMismatch);
+        }
+        total_read += read_len as u64;
+        if read_len < want {
+            break;
         }
     }
 
-    if total_read != actual_len {
-        return Some((false, false));
+    // A file that grew past its reported length is not the described file. The
+    // unfused pass caught that by reading to EOF; the fused pass stops at
+    // `actual_len`, so it probes for a trailing byte instead.
+    let grew = match reader.as_mut() {
+        Some(reader) => {
+            let mut probe = [0u8; 1];
+            read_from_sequential_reader(&mut **reader, &mut probe, 1).ok()? != 0
+        }
+        None => false,
+    };
+    if total_read != actual_len || grew {
+        return Some(StrictStreamOutcome::Hashes {
+            quick_ok: false,
+            full_ok: false,
+        });
     }
 
     let quick_hash = quick_state.finalize();
     let full_hash = full_state.map_or(quick_hash, checksum::FileHashState::finalize);
-    Some((
-        quick_hash == desc.hash_16k,
-        actual_len == desc.length && full_hash == desc.hash_full,
-    ))
+    Some(StrictStreamOutcome::Hashes {
+        quick_ok: quick_hash == desc.hash_16k,
+        full_ok: actual_len == desc.length && full_hash == desc.hash_full,
+    })
+}
+
+/// True when some slice wholly contained in this slice-aligned chunk has a
+/// CRC32 that disagrees with its IFSC entry.
+///
+/// Only a window that is either a full slice or the file's final (zero-padded)
+/// slice is judged; a short window anywhere else is the product of a short
+/// read, and padding it would manufacture a mismatch. Padding matches
+/// [`check_slice_span`] and [`verify_slices`] exactly, so a slice this rejects
+/// is one they reject too.
+fn chunk_proves_slice_damage(
+    data: &[u8],
+    chunk_offset: u64,
+    slice_size: u64,
+    file_len: u64,
+    checksums: &[SliceChecksum],
+) -> bool {
+    debug_assert!(chunk_offset.is_multiple_of(slice_size));
+    let slice = slice_size as usize;
+    let first_slice = (chunk_offset / slice_size) as usize;
+    for (index, window) in data.chunks(slice).enumerate() {
+        let Some(expected) = checksums.get(first_slice + index) else {
+            return false;
+        };
+        let window_end = chunk_offset + (index as u64) * slice_size + window.len() as u64;
+        if window.len() != slice && window_end != file_len {
+            return false;
+        }
+        if checksum::crc32_padded(window, slice_size) != expected.crc32 {
+            return true;
+        }
+    }
+    false
 }
 
 fn verify_full_hash_streaming(
@@ -848,7 +948,20 @@ pub fn verify_selected_file_ids_parallel_with_options(
             {
                 return single_file_result(par2, file);
             }
-            verify_selected_file_ids(par2, access, std::slice::from_ref(file_id))
+            // A lone file has no other rayon axis in flight, so the strict
+            // pipeline's damaged branch may fan out across this file's spans.
+            // Otherwise identical to the `verify_selected_file_ids` call this
+            // replaced, `fast_verify` included — an eligible file was already
+            // handled above, and an ineligible one reaches the same branch
+            // either way.
+            verify_selected_file_ids_resolved(
+                par2,
+                access,
+                span_parallel.then_some(access),
+                std::slice::from_ref(file_id),
+                &VerifyOptions::default(),
+                fast_verify,
+            )
         })
         .collect();
     combine_partial_results(par2, partials)
@@ -1029,6 +1142,30 @@ fn finish_sliced_verification(
         valid_slices,
         missing_slice_count: damaged,
     }
+}
+
+/// Per-slice validity for the strict pipeline's damaged branch.
+///
+/// Uses the span-parallel scanner when the caller established there is no
+/// other rayon axis in flight and the file is eligible for it, else the serial
+/// [`verify_slices`]. Both compare the same per-slice CRC32 and zero-padded
+/// MD5 against the same IFSC entries, so the vectors agree; only the span
+/// iteration differs. An ineligible file (missing or short IFSC, length
+/// mismatch) falls back, which is also where a length mismatch lands.
+fn strict_slice_validity(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    span_access: Option<&(dyn FileAccess + Sync)>,
+    file_id: &FileId,
+    slice_count: usize,
+) -> Vec<bool> {
+    if let Some(span_access) = span_access
+        && let Some(file) = verify_file_sliced(par2, span_access, file_id, true)
+        && file.valid_slices.len() == slice_count
+    {
+        return file.valid_slices;
+    }
+    verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count])
 }
 
 /// Wrap a single [`FileVerification`] into a set-level [`VerificationResult`],
@@ -1250,7 +1387,7 @@ pub fn verify_selected_file_ids_with_options(
 ) -> VerificationResult {
     // Resolved once per call: env override wins, otherwise the option flag.
     let fast_verify = fast_verify_enabled(options.fast_verify);
-    verify_selected_file_ids_resolved(par2, access, file_ids, options, fast_verify)
+    verify_selected_file_ids_resolved(par2, access, None, file_ids, options, fast_verify)
 }
 
 /// [`verify_selected_file_ids_with_options`] with `fast_verify` already
@@ -1258,9 +1395,15 @@ pub fn verify_selected_file_ids_with_options(
 /// a specific pipeline's I/O discipline can pin the mode instead of
 /// inheriting an ambient `WEAVER_PAR2_FAST_VERIFY` from the test
 /// environment.
+///
+/// `span_access` is the same object as `access`, supplied only by a caller
+/// that has established there is no other rayon axis in flight (a lone file).
+/// It lets the damaged branch's slice scan fan out across spans instead of
+/// walking them serially; the per-slice results are identical either way.
 fn verify_selected_file_ids_resolved(
     par2: &Par2FileSet,
     access: &dyn FileAccess,
+    span_access: Option<&(dyn FileAccess + Sync)>,
     file_ids: &[FileId],
     options: &VerifyOptions,
     fast_verify: bool,
@@ -1389,8 +1532,7 @@ fn verify_selected_file_ids_resolved(
         }
 
         if actual_len != desc.length {
-            let valid =
-                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
+            let valid = strict_slice_validity(par2, access, span_access, file_id, slice_count);
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
             total_missing_blocks = total_missing_blocks.saturating_add(damaged);
             files.push(FileVerification {
@@ -1432,32 +1574,37 @@ fn verify_selected_file_ids_resolved(
             continue;
         }
 
-        let (quick_ok, full_ok) =
-            verify_quick_and_full_hash(par2, file_id, access).unwrap_or((false, false));
-        if !quick_ok {
-            // 16k hash failed; do slice-level check to find which slices are bad
-            let valid =
-                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
-            let damaged = valid.iter().filter(|&&v| !v).count() as u32;
-            total_missing_blocks = total_missing_blocks.saturating_add(damaged);
-            let status = if damaged == 0 {
-                // Slice checks can identify usable blocks, but only a full
-                // length+MD5 match is allowed to mark a file complete.
-                FileStatus::Damaged(0)
-            } else {
-                FileStatus::Damaged(damaged)
-            };
-            files.push(FileVerification {
-                file_id: *file_id,
-                filename: desc.filename.clone(),
-                status,
-                valid_slices: valid.clone(),
-                missing_slice_count: damaged,
-            });
-            continue;
-        }
+        // One streaming pass computes the 16 KiB and whole-file MD5 chains and
+        // CRC32s each slice out of the same buffer. Passing the IFSC entries is
+        // gated on the count matching this file's slice count, which is the
+        // precondition under which `verify_slices` indexes them; `actual_len ==
+        // desc.length` is already established above.
+        let checksums = par2
+            .file_checksums(file_id)
+            .filter(|checksums| checksums.len() == slice_count);
+        let outcome = stream_strict_hashes(par2, file_id, access, checksums).unwrap_or(
+            StrictStreamOutcome::Hashes {
+                quick_ok: false,
+                full_ok: false,
+            },
+        );
 
-        if full_ok {
+        // Only an intact 16 KiB prefix *and* an intact whole-file MD5 mark a
+        // file complete; every other outcome is the damaged branch, which
+        // reports the per-slice validity vector. That collapse is why the
+        // stream may abandon the MD5 chain once a slice CRC32 has proven the
+        // content differs: the abandoned chain's only reachable verdict was
+        // `full_ok == false`, which lands in this same branch. Believing
+        // otherwise would require an MD5 second-preimage — the assumption the
+        // `full_ok == true` arm already rests on.
+        let complete = matches!(
+            outcome,
+            StrictStreamOutcome::Hashes {
+                quick_ok: true,
+                full_ok: true
+            }
+        );
+        if complete {
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
@@ -1466,11 +1613,12 @@ fn verify_selected_file_ids_resolved(
                 missing_slice_count: 0,
             });
         } else {
-            // Full hash failed but 16k passed; check slice by slice
-            let valid =
-                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
+            let valid = strict_slice_validity(par2, access, span_access, file_id, slice_count);
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
             total_missing_blocks = total_missing_blocks.saturating_add(damaged);
+            // Slice checks can identify usable blocks, but only a full
+            // length+MD5 match is allowed to mark a file complete, so a
+            // zero-damage slice scan still reports `Damaged(0)` here.
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
@@ -1549,8 +1697,21 @@ mod tests {
         file_data: &[u8],
         slice_size: u64,
     ) -> (Par2FileSet, MemoryFileAccess, FileId) {
+        setup_test_set_with_full_hash(file_data, slice_size, None)
+    }
+
+    /// [`setup_test_set`], optionally describing a different whole-file MD5
+    /// than the data actually has. That combination cannot arise from real
+    /// damage (it would need an MD5 collision), but it is the only way to
+    /// exercise the strict pipeline's "whole-file hash disagrees while every
+    /// slice checks out" verdict.
+    fn setup_test_set_with_full_hash(
+        file_data: &[u8],
+        slice_size: u64,
+        full_hash_override: Option<[u8; 16]>,
+    ) -> (Par2FileSet, MemoryFileAccess, FileId) {
         let file_length = file_data.len() as u64;
-        let hash_full = checksum::md5(file_data);
+        let hash_full = full_hash_override.unwrap_or_else(|| checksum::md5(file_data));
         let hash_16k_data = &file_data[..file_data.len().min(16384)];
         let hash_16k = checksum::md5(hash_16k_data);
 
@@ -2139,6 +2300,7 @@ mod tests {
         let verification = verify_selected_file_ids_resolved(
             &set,
             &access,
+            None,
             &[file_id],
             &VerifyOptions::default(),
             false,
@@ -2198,6 +2360,7 @@ mod tests {
         let verification = verify_selected_file_ids_resolved(
             &set,
             &access,
+            None,
             &file_ids,
             &VerifyOptions::default(),
             false,
@@ -2494,6 +2657,7 @@ mod tests {
         let result = verify_selected_file_ids_resolved(
             &set,
             &access,
+            None,
             &[file_id],
             &VerifyOptions::default(),
             true,
@@ -2684,5 +2848,195 @@ mod tests {
                 blocks_available: 40
             }
         ));
+    }
+
+    fn deterministic_file(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The strict pipeline's damaged verdict must be exactly the per-slice
+    /// vector `verify_slices` computes, wherever the damage sits — including
+    /// the zero-padded tail slice, and including a slice size too large for
+    /// the fused stream's slice-aligned chunk (which disables the CRC32
+    /// ride-along and runs the whole-file hash to completion).
+    #[test]
+    fn strict_verify_reports_verify_slices_vector_for_every_damage_position() {
+        for slice_size in [1024u64, (VERIFY_FULL_HASH_CHUNK_BYTES as u64) + 512] {
+            let len = (slice_size as usize) * 5 + 300;
+            let pristine = deterministic_file(len);
+            let slice_count = (len as u64).div_ceil(slice_size) as usize;
+            for damaged_slice in 0..slice_count {
+                let mut data = pristine.clone();
+                let at = (damaged_slice as u64 * slice_size) as usize + 7;
+                data[at] ^= 0xff;
+                let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+                let mut access = MemoryFileAccess::new();
+                access.add_file(file_id, data);
+
+                let expected = verify_slices(&set, &file_id, &access).expect("slice vector");
+                assert!(!expected[damaged_slice], "slice {damaged_slice} must fail");
+                let expected_damaged = expected.iter().filter(|valid| !**valid).count() as u32;
+
+                for span_access in [None, Some(&access as &(dyn FileAccess + Sync))] {
+                    let result = verify_selected_file_ids_resolved(
+                        &set,
+                        &access,
+                        span_access,
+                        &[file_id],
+                        &VerifyOptions::default(),
+                        false,
+                    );
+                    let file = &result.files[0];
+                    assert!(
+                        matches!(file.status, FileStatus::Damaged(count) if count == expected_damaged),
+                        "slice_size {slice_size} damaged slice {damaged_slice}: {:?}",
+                        file.status
+                    );
+                    assert_eq!(file.valid_slices, expected);
+                    assert_eq!(file.missing_slice_count, expected_damaged);
+                    assert_eq!(result.total_missing_blocks, expected_damaged);
+                }
+            }
+        }
+    }
+
+    /// An intact file still needs the whole-file MD5 to be called complete,
+    /// and the fused stream must run it to the end to say so.
+    #[test]
+    fn strict_verify_still_requires_the_whole_file_hash_to_report_complete() {
+        let slice_size = 1024u64;
+        let data = deterministic_file((slice_size as usize) * 4 + 11);
+        let (set, access, file_id) = setup_test_set(&data, slice_size);
+
+        for span_access in [None, Some(&access as &(dyn FileAccess + Sync))] {
+            let result = verify_selected_file_ids_resolved(
+                &set,
+                &access,
+                span_access,
+                &[file_id],
+                &VerifyOptions::default(),
+                false,
+            );
+            assert!(matches!(result.files[0].status, FileStatus::Complete));
+            assert_eq!(result.files[0].valid_slices, vec![true; 5]);
+            assert_eq!(result.total_missing_blocks, 0);
+        }
+    }
+
+    /// Every slice checks out but the described whole-file MD5 does not: the
+    /// strict rule is that only a full length+MD5 match may mark a file
+    /// complete, so this reports `Damaged(0)` with an all-valid slice vector.
+    /// The fused stream must not short-circuit its way past that.
+    #[test]
+    fn strict_verify_reports_damaged_zero_when_only_the_whole_file_hash_disagrees() {
+        // Over 16 KiB: below that the format requires hash_16k == hash_full,
+        // so the two hashes cannot be made to disagree.
+        let slice_size = 4096u64;
+        let data = deterministic_file((slice_size as usize) * 6);
+        let (set, access, file_id) =
+            setup_test_set_with_full_hash(&data, slice_size, Some([0x5a; 16]));
+
+        for span_access in [None, Some(&access as &(dyn FileAccess + Sync))] {
+            let result = verify_selected_file_ids_resolved(
+                &set,
+                &access,
+                span_access,
+                &[file_id],
+                &VerifyOptions::default(),
+                false,
+            );
+            assert!(matches!(result.files[0].status, FileStatus::Damaged(0)));
+            assert_eq!(result.files[0].valid_slices, vec![true; 6]);
+            assert_eq!(result.total_missing_blocks, 0);
+        }
+    }
+
+    /// `strict_slice_validity` may pick either scanner, so the span-parallel
+    /// scanner and `verify_slices` must agree slice for slice.
+    #[test]
+    fn span_parallel_slice_scan_matches_verify_slices() {
+        let slice_size = 1024u64;
+        let pristine = deterministic_file((slice_size as usize) * 9 + 617);
+        let mut data = pristine.clone();
+        for damaged_slice in [0usize, 3, 9] {
+            let at = (damaged_slice as u64 * slice_size) as usize + 1;
+            data[at] ^= 0xff;
+        }
+        let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, data);
+
+        let serial = verify_slices(&set, &file_id, &access).expect("slice vector");
+        let spanned = verify_file_sliced(&set, &access, &file_id, true).expect("span scan");
+        assert_eq!(spanned.valid_slices, serial);
+        assert_eq!(
+            strict_slice_validity(&set, &access, Some(&access), &file_id, serial.len()),
+            serial
+        );
+    }
+
+    /// Measures what the CRC32 ride-along costs an intact file — the one case
+    /// where its work buys nothing (every slice matches, so the early exit
+    /// never fires). In-memory access, so the arithmetic has no I/O to hide
+    /// behind: this is the overhead's worst case. Run by hand:
+    ///
+    /// ```sh
+    /// cargo test --release -p par2-rs --lib -- --ignored perf_intact_ride_along
+    /// ```
+    #[test]
+    #[ignore = "perf measurement, run by hand in release mode"]
+    fn perf_intact_ride_along_overhead() {
+        let slice_size = 512 * 1024u64;
+        let len = 512 * 1024 * 1024usize;
+        let data = deterministic_file(len);
+        let (set, access, file_id) = setup_test_set_with_full_hash(&data, slice_size, None);
+        let checksums = set.file_checksums(&file_id).expect("checksums");
+
+        let mut timings: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        // Alternate arms so thermal drift hits both equally.
+        for _round in 0..5 {
+            for (arm, slice_checksums) in [(0usize, None), (1usize, Some(checksums))] {
+                let started = std::time::Instant::now();
+                let outcome = stream_strict_hashes(&set, &file_id, &access, slice_checksums)
+                    .expect("stream outcome");
+                let elapsed = started.elapsed().as_secs_f64();
+                assert!(matches!(
+                    outcome,
+                    StrictStreamOutcome::Hashes {
+                        quick_ok: true,
+                        full_ok: true
+                    }
+                ));
+                timings[arm].push(elapsed);
+            }
+        }
+        let best = |samples: &[f64]| samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let plain = best(&timings[0]);
+        let fused = best(&timings[1]);
+        let mb = len as f64 / (1024.0 * 1024.0);
+        println!(
+            "intact strict stream, {len} bytes, slice {slice_size}: \
+             plain {:.0} MB/s, ride-along {:.0} MB/s, overhead {:+.2}%",
+            mb / plain,
+            mb / fused,
+            (fused / plain - 1.0) * 100.0
+        );
+    }
+
+    /// The fused stream must not read past the described length, and must
+    /// still notice a file that grew behind the length it was told.
+    #[test]
+    fn fused_chunk_size_is_slice_aligned_and_bounded() {
+        assert_eq!(fused_chunk_bytes(0), None);
+        assert_eq!(
+            fused_chunk_bytes((VERIFY_FULL_HASH_CHUNK_BYTES as u64) + 1),
+            None
+        );
+        for slice_size in [2u64, 1024, 65536, VERIFY_FULL_HASH_CHUNK_BYTES as u64] {
+            let chunk = fused_chunk_bytes(slice_size).expect("chunk");
+            assert!(chunk > 0);
+            assert!(chunk <= VERIFY_FULL_HASH_CHUNK_BYTES);
+            assert_eq!(chunk as u64 % slice_size, 0);
+        }
     }
 }

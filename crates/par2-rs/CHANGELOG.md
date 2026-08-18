@@ -3,9 +3,30 @@
 
 ## 0.4.2
 
-This is a patch release from 0.4.1: a rebuilt creation encode pipeline and one
-additive plan field. No existing public item changed shape or meaning, so it
-stays inside the 0.4.x compatibility range.
+This is a patch release from 0.4.1: a rebuilt creation encode pipeline, one
+additive plan field, and a faster strict-verify path for damaged files. No
+existing public item changed shape or meaning, so it stays inside the 0.4.x
+compatibility range.
+
+### Performance
+
+- The strict verify pipeline no longer streams a damaged file's whole-file MD5
+  to completion before finding out it was doomed. One pass reads slice-aligned
+  chunks, feeds the 16 KiB and whole-file MD5 chains, and CRC32s each slice out
+  of the same buffer; the first slice CRC32 that disagrees with its IFSC entry
+  ends the pass, because a file whose content provably differs has no reachable
+  verdict other than the damaged branch — believing otherwise would require an
+  MD5 second-preimage, the same assumption a passing full hash already rests
+  on. The per-slice validity vector then comes from the slice scanner, which
+  may take the span-parallel path. Verdicts are bit-identical in every case:
+  `Complete` still requires the full length and whole-file MD5, and a clean
+  slice scan under a failed full hash still reports `Damaged(0)`.
+- An intact file pays only the CRC32 arithmetic, which rides on bytes already
+  in cache for the MD5 chain and goes through the folded SIMD CRC tier:
+  measured at +0.49% on an in-memory stream (941 → 937 MB/s), the worst case,
+  since real verification has I/O for it to hide behind. The measurement is a
+  permanent `--ignored` test (`perf_intact_ride_along_overhead`), so the claim
+  can be re-checked on any host.
 
 ### Public API
 
