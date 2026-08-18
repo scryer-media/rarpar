@@ -237,6 +237,74 @@ fn bench_verify_slices_batched_io(c: &mut Criterion) {
     group.finish();
 }
 
+/// The shape a *selective* verification pass presents: one intact file, read
+/// back on its own.
+///
+/// Per-file rayon has no second file to spread across here, so whatever this
+/// costs is what one core does. The three arms decompose it:
+///
+/// - `strict_full_md5` — the default `verify_selected_file_ids` pipeline, whose
+///   whole-file MD5 is one message and therefore one inherently serial chain
+///   that never reaches the multi-buffer engine in `md5_simd`;
+/// - `slice_proof_multi_buffer` — the same read proved from per-slice IFSC
+///   checksums, which is multiple independent MD5 messages and does ride that
+///   engine;
+/// - `read_only_floor` — the same bytes off disk and nothing else, so the gap
+///   between the two above can be read against what I/O alone costs.
+fn bench_single_file_verify_shape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("single_file_verify_shape");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    let slice_size = 1024 * 1024u64;
+    let data = (0..(128 * 1024 * 1024))
+        .map(|index| (index as u8).wrapping_mul(19).wrapping_add(5))
+        .collect::<Vec<_>>();
+    let filename = "single-file-verify.bin".to_string();
+    let (set, file_id) = synthetic_par2_file(&filename, &data, slice_size);
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join(&filename);
+    fs::write(&path, &data).expect("write benchmark data");
+    let access = DiskFileAccess::new(dir.path().to_path_buf(), &set);
+    let ids = [file_id];
+
+    group.bench_function("strict_full_md5", |b| {
+        b.iter(|| {
+            let result = par2_rs::verify_selected_file_ids(
+                black_box(&set),
+                black_box(&access),
+                black_box(&ids),
+            );
+            black_box(result);
+        });
+    });
+
+    let fast = par2_rs::VerifyOptions {
+        fast_verify: true,
+        ..Default::default()
+    };
+    group.bench_function("slice_proof_multi_buffer", |b| {
+        b.iter(|| {
+            let result = par2_rs::verify::verify_selected_file_ids_parallel_with_options(
+                black_box(&set),
+                black_box(&access),
+                black_box(&ids),
+                black_box(&fast),
+            );
+            black_box(result);
+        });
+    });
+
+    group.bench_function("read_only_floor", |b| {
+        b.iter(|| {
+            let bytes = fs::read(black_box(&path)).expect("read benchmark data");
+            black_box(bytes.len());
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_gf_kernel(c: &mut Criterion) {
     let mut group = c.benchmark_group("gf_kernel");
     group.sample_size(20);
@@ -391,6 +459,7 @@ criterion_group!(
     bench_verify_plan,
     bench_repair_workflow,
     bench_verify_slices_batched_io,
+    bench_single_file_verify_shape,
     bench_gf_kernel,
     bench_md5_hotloop,
     bench_matrix_solve
