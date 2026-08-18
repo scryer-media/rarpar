@@ -691,7 +691,16 @@ jobs:
       actions: read
       id-token: write
       packages: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    # Tag, not digest, and not by oversight: this builder resolves its own ref
+    # to fetch and verify the matching prebuilt binary, and rejects anything
+    # that is not a version tag — "Invalid ref: <sha>. Expected ref of the form
+    # refs/tags/vX.Y.Z". A digest pin does not fail loudly either; the inner
+    # step's failure is swallowed and surfaces only as `final` exiting 27,
+    # which is how rarpar-v0.3.3 shipped with no attestations. The tag is not
+    # the whole of the trust here: `oci-verify` below independently checks the
+    # provenance against this generator's own certificate identity at
+    # refs/tags/v2.1.0.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0 # zizmor: ignore[unpinned-uses]
     with:
       image: ${{ needs.container.outputs.image }}
       digest: ${{ needs.container.outputs.digest }}
@@ -1009,7 +1018,9 @@ jobs:
       actions: read
       contents: write
       id-token: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    # Same constraint as the container generator above: this builder requires
+    # its own ref to be refs/tags/vX.Y.Z and refuses a digest.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0 # zizmor: ignore[unpinned-uses]
     with:
       base64-subjects: ${{ needs.deploy.outputs.base64_subjects }}
       provenance-name: rarpar-provenance.intoto.jsonl
