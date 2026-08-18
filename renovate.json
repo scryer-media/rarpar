@@ -24,6 +24,12 @@
       "separateMajorMinor": true
     },
     {
+      "description": "slsa-github-generator must stay on a version tag, never a digest. Its builder resolves its own ref to download and verify the matching prebuilt binary, and rejects anything that is not refs/tags/vX.Y.Z: 'Invalid ref: <sha>. Expected ref of the form refs/tags/vX.Y.Z'. A digest pin therefore fails the provenance jobs, which is how rarpar-v0.3.3 shipped without attestations. This turns off digest pinning for these two reusable workflows only; every other action stays SHA-pinned, and the release job independently verifies the generator's own certificate identity against refs/tags/v2.1.0, so the tag is not the only thing being trusted.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["slsa-framework/slsa-github-generator"],
+      "pinDigests": false
+    },
+    {
       "description": "The generator toolchain is frozen: the RARLAB writers, the FFmpeg encoder image and the par2cmdline-turbo generator in config/toolchains.json, and the Docker bases the toolchain images build from, are pinned deliberately. Changing any of them is an intentional corpus revision (docs/test-corpus.md), never a dependency update.",
       "matchFileNames": [
         "bench/rarpar-bench/config/toolchains.json",
