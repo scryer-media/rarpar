@@ -34,8 +34,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   [its changelog](crates/reedsolomon-rs/CHANGELOG.md).
 - `unrar-rs` moves to 0.5.4. See
   [its changelog](crates/unrar-rs/CHANGELOG.md).
-- `par2-rs` moves to 0.4.2. See
-  [its changelog](crates/par2-rs/CHANGELOG.md).
+- `par2-rs` moves to 0.5.0 — a compatibility break, because bounding the
+  packet inventory changed `scan_packets`'s return type and added a field to
+  `Par2RepairerOptions`. See [its changelog](crates/par2-rs/CHANGELOG.md).
 
 ## rarpar 0.3.1
 
