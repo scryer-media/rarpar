@@ -169,6 +169,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
 
+      # Resolving a toolchain archive from the mirror verifies its signature
+      # before Docker is allowed near it, so cosign has to be here — not only
+      # in the publish job that creates those signatures. Before the first
+      # publication the mirror answered 404 for every key and the official
+      # fallback hid the gap; the run after it went live failed here with
+      # "cosign: executable file not found". The fallback never skips
+      # verification, it only changes who is asked.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
       # Docker is preinstalled on ubuntu-24.04. Only the images these two units
       # drive are built: the writers `edge_cases` invokes, and nothing else.
       - name: Build the toolchain images these generators need
@@ -302,6 +314,18 @@ jobs:
       - name: Restore the shared inputs
         run: tar -xf "$RUNNER_TEMP/inputs/corpus-inputs.tar"
 
+      # Resolving a toolchain archive from the mirror verifies its signature
+      # before Docker is allowed near it, so cosign has to be here — not only
+      # in the publish job that creates those signatures. Before the first
+      # publication the mirror answered 404 for every key and the official
+      # fallback hid the gap; the run after it went live failed here with
+      # "cosign: executable file not found". The fallback never skips
+      # verification, it only changes who is asked.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
       - name: Build the toolchain images this generator needs
         run: |
           set -euo pipefail
@@ -394,8 +418,14 @@ jobs:
       # Every path present, no blocked provenance, every public upstream import
       # re-fetched byte-identical at its pinned commit — independently of what
       # the imports job wrote.
-      - name: Verify the corpus against its ledger and upstreams
-        run: cargo run --locked -p xtask -- test-corpus verify --all-present --upstreams
+      # --candidate: this tree is the next revision, so the lock — which pins
+      # the previous one — is deliberately not compared against; a
+      # regeneration always moves digests, and holding a candidate to the old
+      # lock would refuse every publish after the first. The publish job
+      # verifies the new manifest against the new lock from the public side
+      # after uploading.
+      - name: Verify the candidate revision against its ledger and upstreams
+        run: cargo run --locked -p xtask -- test-corpus verify --candidate --all-present --upstreams
 
       - name: Build the manifest and provenance
         run: |
@@ -455,23 +485,29 @@ jobs:
     strategy:
       fail-fast: false
       # The unrar suite is the long pole of the whole run, so it validates as
-      # three shards: nextest partitions every binary's test list
-      # deterministically, the union of the shards is exactly the suite, and
-      # the stage's wall time is the slowest third instead of the whole. All
-      # three read the same assembled tree.
+      # three shards, split by *measured* time rather than test count — the
+      # same weights and the same complement-shard rule as `ci.yml`, which
+      # carries the numbers and how to re-derive them. All three read the
+      # same assembled tree.
       matrix:
         include:
           - lane: workspace
           - lane: par2
           - lane: unrar
             shard: 1
+            filter: binary(failure_paths) + binary(api_parity)
           - lane: unrar
             shard: 2
+            filter: binary(integration) + binary(imported_corpus)
           - lane: unrar
             shard: 3
+            filter: >-
+              not (binary(failure_paths) + binary(api_parity)
+              + binary(integration) + binary(imported_corpus))
     env:
       LANE: ${{ matrix.lane }}
       SHARD: ${{ matrix.shard }}
+      SHARD_FILTER: ${{ matrix.filter }}
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
@@ -549,7 +585,7 @@ jobs:
               ;;
             unrar)
               cargo nextest run --locked -p unrar-rs --features slow-tests \
-                --no-fail-fast --partition "count:${SHARD}/3"
+                --no-fail-fast -E "$SHARD_FILTER"
               if [ "$SHARD" = "1" ]; then
                 # nextest does not run doctests; shard 1 keeps them so the
                 # split loses nothing.

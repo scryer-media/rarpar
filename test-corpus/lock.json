@@ -2,20 +2,20 @@
   "schema_version": 1,
   "base_url": "https://rarpar.cdn.scryer-media.dev",
   "manifest": {
-    "blake3": "26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89",
-    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.json"
+    "blake3": "37c9d311db93e371ebf20a76fd67a1fa5f38b02a457e074fd15cfd2a21848294",
+    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/37c9d311db93e371ebf20a76fd67a1fa5f38b02a457e074fd15cfd2a21848294.json"
   },
   "signature": {
-    "bundle_url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.json.sigstore.json",
+    "bundle_url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/37c9d311db93e371ebf20a76fd67a1fa5f38b02a457e074fd15cfd2a21848294.json.sigstore.json",
     "certificate_identity": "https://github.com/scryer-media/rarpar/.github/workflows/test-corpus-publish.yml@refs/heads/main",
     "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
   },
   "provenance": {
-    "blake3": "edbd18c0a7e48ad2d893ed0e90b5e33fe4b81decb5143eecc0f79903d5f7d60c",
-    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/26eb35b94172b2fc67627c37695d97c69814f59b05424fe43596a1a358857e89.provenance.json"
+    "blake3": "80eba4e4a76dd3d40f0eecc5c5bd589e337caab5e91418a6e7bcf8f8fa80136a",
+    "url": "https://rarpar.cdn.scryer-media.dev/test-corpus/manifests/blake3/37c9d311db93e371ebf20a76fd67a1fa5f38b02a457e074fd15cfd2a21848294.provenance.json"
   },
   "published_from": {
-    "commit": "6b66f3cb016e68bc028c58534d7a3425f94a72be",
-    "run": "https://github.com/scryer-media/rarpar/actions/runs/32049608340"
+    "commit": "531c9ac7143d61026b38f15806f474f43f22dfc4",
+    "run": "https://github.com/scryer-media/rarpar/actions/runs/32095829404"
   }
 }

@@ -101,8 +101,8 @@ refresh.
 
 | Component | Version |
 |---|---|
-| `rarpar` CLI | 0.3.2, workspace commit `0ac98f7` |
-| `par2-rs` | 0.4.2 |
+| `rarpar` CLI | 0.3.3, workspace commit `0ac98f7` |
+| `par2-rs` | 0.5.0 |
 | `unrar-rs` | 0.5.4 |
 | `reedsolomon-rs` | 0.4.2 |
 | Rust toolchain | 1.97.1 |

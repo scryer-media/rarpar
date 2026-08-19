@@ -548,8 +548,32 @@ jobs:
       # One shard's failure is a third of the suite; the other two thirds are
       # still worth knowing about.
       fail-fast: false
+      # Shards are assigned by *measured* time, not by test count. Counting
+      # tests split this suite 1810 s / 320 s / 330 s of work, because the
+      # cost is nowhere near uniform: from run 32079063363, the whole
+      # 2460 s divides across binaries as
+      #
+      #     failure_paths  690 s   integration  550 s   lib          540 s
+      #     imported_corpus 343 s  api_parity   149 s   wasm_*       150 s
+      #     everything else  38 s
+      #
+      # so the split below is a bin-pack of those weights: ~839 s / ~893 s /
+      # ~729 s. Shard 3 is written as the complement, so a test binary added
+      # later still runs somewhere without anyone remembering this list.
+      #
+      # Re-derive after a large change: take a green run's log and total the
+      # `PASS [ … s]` lines per binary
+      # (`gh run view <id> --log | grep 'unrar-tests'`).
       matrix:
-        shard: [1, 2, 3]
+        include:
+          - shard: 1
+            filter: binary(failure_paths) + binary(api_parity)
+          - shard: 2
+            filter: binary(integration) + binary(imported_corpus)
+          - shard: 3
+            filter: >-
+              not (binary(failure_paths) + binary(api_parity)
+              + binary(integration) + binary(imported_corpus))
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -559,6 +583,7 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
       SHARD: ${{ matrix.shard }}
+      SHARD_FILTER: ${{ matrix.filter }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -645,20 +670,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The whole crate, partitioned: nextest splits every binary's test
-          # list deterministically across the three shards, so the union of
-          # the shards is exactly the suite and each shard carries about a
-          # third of `integration`'s runtime rather than one shard carrying
-          # all of it. This is the only lane that installs RARLAB's unrar, so
-          # the oracle differentials run here with UNRAR_BIN set rather than
-          # skipping themselves as they do everywhere else.
+          # This shard's slice of the crate, selected by test binary (see the
+          # weights on the matrix above). Shard 3 is the complement of the
+          # other two, so the three filters partition the suite exactly: no
+          # test runs twice, and none is dropped when a binary is added.
+          #
+          # This is the only lane that installs RARLAB's unrar, so the oracle
+          # differentials run here with UNRAR_BIN set rather than skipping
+          # themselves as they do everywhere else.
           #
           # `--features slow-tests` brings the gated coverage along in the
           # same build: the five targets that are `#![cfg(feature =
           # "slow-tests")]` in their entirety. A feature name that stops
           # existing is a hard cargo error, not a silent zero.
           cargo nextest run --locked -p unrar-rs --features slow-tests \
-            --no-fail-fast --partition "count:${SHARD}/3"
+            --no-fail-fast -E "$SHARD_FILTER"
       - name: Run the doctests (shard 1 carries them)
         if: ${{ matrix.shard == 1 }}
         run: |

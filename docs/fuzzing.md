@@ -80,6 +80,23 @@ each night's corpus makes the next night start further in. Weekly also meant a
 build breakage could sit undetected for six days — which is how the last one was
 found.
 
+**Why the batch job sets `REPORT_TIMEOUTS`.** A hang is a finding for these
+formats, and CIFuzz drops hangs by default. It classifies by artifact filename:
+a testcase named `timeout-*` is reportable only if `REPORT_TIMEOUTS` says so,
+and it defaults to false. On 2026-08-17 that cost a real observation —
+`rar_extract` spent 34 s on one unit against a 25 s limit, CIFuzz logged
+"Detected bug" and then "finished running without reportable crashes", uploaded
+nothing, emitted an empty SARIF, and the run went green. The reproducer went to
+a container `/tmp` and died with the container.
+
+The corpus cannot recover such a unit after the fact: libFuzzer only promotes an
+input that adds coverage, and running long adds none. Replaying all 3873
+retained `rar_extract` inputs takes 223 ms in total, slowest unit 19 ms — so
+nothing in the corpus resembles the event, and there is no way to tell a
+pathological archive from a stalled shared runner until one is captured. Hence
+the flag on the nightly job. It is deliberately *not* set on the pull request
+lane, where that same ambiguity would block merges on a runner hiccup.
+
 ## Running one locally
 
 ```sh
