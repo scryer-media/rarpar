@@ -49,7 +49,7 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
         "blocked paths would stop publication:\n{}",
         blocked.join("\n")
     );
-    assert_eq!(ledger.files.len(), 375, "the corpus has 375 fixture paths");
+    assert_eq!(ledger.files.len(), 376, "the corpus has 376 fixture paths");
     // The ledger's on-disk layout is the canonical one, so `--update-ledger`
     // never reformats a reviewed file.
     // Compared with line endings normalised: a Windows checkout with

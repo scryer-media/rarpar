@@ -3,7 +3,7 @@
 //! Supports both stored (method 0) and LZ-compressed (methods 1-5) extraction.
 
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use tempfile::NamedTempFile;
 
@@ -338,6 +338,38 @@ impl ExtractedMember {
                 reopened.read_to_end(&mut data).map_err(RarError::Io)?;
                 Ok(data)
             }
+        }
+    }
+
+    /// Read the member's bytes without materializing a tempfile-backed one.
+    ///
+    /// Unlike [`Self::to_bytes`] and [`Self::into_bytes`], this is not subject
+    /// to the memory materialization limit: a spooled member streams from its
+    /// tempfile instead of being pulled into a `Vec` first. Consumers that
+    /// want a `Read` rather than a `Write` sink should prefer this.
+    pub fn into_reader(self) -> RarResult<ExtractedMemberReader> {
+        match self {
+            Self::InMemory(data) => Ok(ExtractedMemberReader::Memory(Cursor::new(data))),
+            Self::TempFile { file, len: _ } => {
+                let mut reopened = file.reopen().map_err(RarError::Io)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                Ok(ExtractedMemberReader::File(reopened))
+            }
+        }
+    }
+}
+
+/// Reader over an [`ExtractedMember`], from memory or its backing tempfile.
+pub enum ExtractedMemberReader {
+    Memory(Cursor<Vec<u8>>),
+    File(std::fs::File),
+}
+
+impl Read for ExtractedMemberReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Memory(cursor) => cursor.read(buf),
+            Self::File(file) => file.read(buf),
         }
     }
 }
@@ -827,6 +859,35 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
 mod tests {
     use super::*;
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
+
+    #[test]
+    fn into_reader_streams_an_in_memory_member() {
+        let member = ExtractedMember::InMemory(b"hello world".to_vec());
+        let mut out = Vec::new();
+        let mut reader = member.into_reader().expect("in-memory reader");
+        std::io::copy(&mut reader, &mut out).expect("copy");
+        assert_eq!(out, b"hello world");
+    }
+
+    /// A spooled member reads from its tempfile rather than being pulled into
+    /// a `Vec` first, so it is not subject to the materialization limit that
+    /// `to_bytes`/`into_bytes` enforce.
+    #[test]
+    fn into_reader_streams_a_tempfile_member_from_the_start() {
+        let payload = vec![0xABu8; 4096];
+        let mut file = NamedTempFile::new().expect("tempfile");
+        file.write_all(&payload).expect("write payload");
+        file.flush().expect("flush");
+
+        let member = ExtractedMember::TempFile {
+            file,
+            len: payload.len(),
+        };
+        let mut out = Vec::new();
+        let mut reader = member.into_reader().expect("tempfile reader");
+        std::io::copy(&mut reader, &mut out).expect("copy");
+        assert_eq!(out, payload);
+    }
 
     /// The link-only ceiling stops a stream that runs past its bound, and
     /// stops it *at* the bound: the overflowing write is refused whole rather

@@ -769,7 +769,7 @@ impl LzDecoder {
             } else if sym == 256 {
                 // Filter marker: queue only — RAR writes at the border, at
                 // filter-queue overflow, and at member end, never on registration.
-                *output_size = self.handle_filter(reader, *output_size, writer)?;
+                self.handle_filter(reader, *output_size, writer)?;
                 // The block just queued may reach past the declared size, and a
                 // block is written whole or not at all, so the bound has to
                 // cover it. Refreshed here rather than per symbol: only this arm
@@ -924,7 +924,7 @@ impl LzDecoder {
         reader: &mut R,
         output_size: u64,
         writer: &mut W,
-    ) -> RarResult<u64> {
+    ) -> RarResult<()> {
         let block_start_delta = Self::read_filter_data(reader)? as u64;
         let block_start = self.current_file_base_total + output_size + block_start_delta;
         let mut block_length = Self::read_filter_data(reader)? as usize;
@@ -956,7 +956,7 @@ impl LzDecoder {
             writer,
         )?;
 
-        Ok(self.current_file_emitted)
+        Ok(())
     }
 
     fn read_filter_data<R: BitRead>(reader: &mut R) -> RarResult<u32> {
@@ -2095,19 +2095,39 @@ mod tests {
 
     #[test]
     fn write_border_reserves_maximum_incremental_match_margin() {
-        let dict_size = 1 << 20;
-        let write_span = 100_000usize;
+        let large_dict = 32 * 1024 * 1024;
+        let initial = LzDecoder::flush_border(0, 0, large_dict, UNPACK_MAX_WRITE);
+        assert_eq!(initial, UNPACK_MAX_WRITE as u64 - MAX_INCREMENTAL_LZ_MATCH);
 
-        // Fully drained window: the border is one write span ahead, minus the
-        // widest single LZ item.
-        let border = LzDecoder::flush_border(4_000, 4_000, dict_size, write_span);
-        assert_eq!(border, 4_000 + write_span as u64 - MAX_INCREMENTAL_LZ_MATCH);
+        let normal = LzDecoder::flush_border(
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+            large_dict,
+            UNPACK_MAX_WRITE,
+        );
+        assert_eq!(normal, 8 * 1024 * 1024 - MAX_INCREMENTAL_LZ_MATCH);
 
-        // A write that could not drain the window (a pending filter still
-        // covers it) pulls the border back to the ring-full point so the retry
-        // still happens before the dictionary overruns.
-        let stalled = LzDecoder::flush_border(1_000_000, 0, dict_size, write_span);
-        assert_eq!(stalled, dict_size as u64 - MAX_INCREMENTAL_LZ_MATCH);
+        let small_dict = 256 * 1024;
+        let full_ring_ahead = LzDecoder::flush_border(0, 0, small_dict, small_dict);
+        assert_eq!(
+            full_ring_ahead,
+            small_dict as u64 - MAX_INCREMENTAL_LZ_MATCH
+        );
+        assert!(
+            0 < full_ring_ahead,
+            "a full-ring-ahead border must remain distinct from the same ring index"
+        );
+
+        let wrap_base = large_dict as u64 * 3 + 1_024;
+        let wrapped = LzDecoder::flush_border(wrap_base, wrap_base, large_dict, UNPACK_MAX_WRITE);
+        assert_eq!(
+            wrapped,
+            wrap_base + UNPACK_MAX_WRITE as u64 - MAX_INCREMENTAL_LZ_MATCH
+        );
+
+        let stalled =
+            LzDecoder::flush_border(large_dict as u64 - 1_024, 0, large_dict, UNPACK_MAX_WRITE);
+        assert_eq!(stalled, large_dict as u64 - MAX_INCREMENTAL_LZ_MATCH);
 
         // Tiny dictionaries clamp to zero instead of wrapping, which makes the
         // gate fire on every item.
@@ -2800,6 +2820,27 @@ mod tests {
         assert!(decoder.pending_filters.is_empty());
     }
 
+    /// `UnpWriteData` adds the whole span it was handed while it is still under
+    /// the declared size, then early-returns on every later span. A 2-byte
+    /// member fed a 4-byte span therefore freezes the counter at 4 — above the
+    /// declared size, not at it (unpack50.cpp:538-548).
+    #[test]
+    fn raw_span_past_member_boundary_freezes_the_counter_above_the_limit() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.begin_file_decode(2);
+        let mut out = Vec::new();
+
+        decoder.window.put_bytes(b"abcd");
+        decoder.flush_stream_output(&mut out).unwrap();
+        decoder.window.put_bytes(b"efgh");
+        decoder.flush_stream_output(&mut out).unwrap();
+
+        assert_eq!(out, b"ab");
+        assert_eq!(decoder.current_file_emitted, 2);
+        assert_eq!(decoder.current_file_written_size, 4);
+        assert_eq!(decoder.window.total_flushed(), 8);
+    }
+
     #[test]
     fn test_flush_filters_keeps_future_filter_when_no_output_is_ready() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
@@ -2875,6 +2916,33 @@ mod tests {
         write_test_bits(&mut bits, u32::from(block_length), 8);
         write_test_bits(&mut bits, u32::from(filter_code), 3);
         pack_test_bits(&bits)
+    }
+
+    #[test]
+    fn filter_registration_keeps_the_decoded_cursor_when_emission_lags() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.current_file_emitted = 4;
+        let mut out = Vec::new();
+
+        let first = rar5_filter_descriptor(3, 5, 1);
+        decoder
+            .handle_filter(&mut BitReader::new(&first), 10, &mut out)
+            .unwrap();
+        let second = rar5_filter_descriptor(0, 5, 1);
+        decoder
+            .handle_filter(&mut BitReader::new(&second), 15, &mut out)
+            .unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(decoder.current_file_emitted, 4);
+        assert_eq!(
+            decoder
+                .pending_filters
+                .iter()
+                .map(|filter| filter.block_start)
+                .collect::<Vec<_>>(),
+            vec![13, 15]
+        );
     }
 
     #[test]

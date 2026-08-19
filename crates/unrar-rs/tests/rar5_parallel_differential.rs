@@ -366,12 +366,212 @@ fn extract_summaries(
     Ok(summaries)
 }
 
+fn summarize_bytes(path: String, bytes: &[u8]) -> MemberSummary {
+    MemberSummary {
+        path,
+        content: MemberContent::File {
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        },
+    }
+}
+
+fn extract_buffered_summaries(
+    relative_paths: &[&str],
+    password: Option<&str>,
+) -> Result<Vec<MemberSummary>, RarError> {
+    let paths: Vec<_> = relative_paths.iter().map(|path| fixture(path)).collect();
+    let mut archive = open_volumes(&paths, password)?;
+    let members: Vec<_> = archive
+        .metadata()
+        .members
+        .iter()
+        .map(|member| (member.name.clone(), member.is_directory))
+        .collect();
+    let opts = options(password);
+    let mut summaries = Vec::with_capacity(members.len());
+
+    for (index, (path, is_directory)) in members.into_iter().enumerate() {
+        if is_directory {
+            summaries.push(MemberSummary {
+                path,
+                content: MemberContent::Directory,
+            });
+            continue;
+        }
+        let bytes = archive.extract_member(index, &opts, None)?.to_bytes()?;
+        summaries.push(summarize_bytes(path, &bytes));
+    }
+    Ok(summaries)
+}
+
+fn extract_solid_to_writer_summaries(
+    relative_paths: &[&str],
+    password: Option<&str>,
+) -> Result<Vec<MemberSummary>, RarError> {
+    let paths: Vec<_> = relative_paths.iter().map(|path| fixture(path)).collect();
+    let mut archive = open_volumes(&paths, password)?;
+    let members: Vec<_> = archive
+        .metadata()
+        .members
+        .iter()
+        .map(|member| (member.name.clone(), member.is_directory))
+        .collect();
+    let opts = options(password);
+    let mut summaries = Vec::with_capacity(members.len());
+
+    for (index, (path, is_directory)) in members.into_iter().enumerate() {
+        if is_directory {
+            summaries.push(MemberSummary {
+                path,
+                content: MemberContent::Directory,
+            });
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let written = archive.extract_member_solid_to_writer(index, &opts, &mut bytes)?;
+        assert_eq!(
+            written,
+            bytes.len() as u64,
+            "member {path}: reported and streamed sizes differ"
+        );
+        summaries.push(summarize_bytes(path, &bytes));
+    }
+    Ok(summaries)
+}
+
 fn assert_success(label: &str, paths: &[&str], password: Option<&str>) {
     let parallel = with_parallel_mode(false, || extract_summaries(paths, password))
         .unwrap_or_else(|error| panic!("{label}: normal extraction failed: {error:?}"));
     let scalar = with_parallel_mode(true, || extract_summaries(paths, password))
         .unwrap_or_else(|error| panic!("{label}: scalar extraction failed: {error:?}"));
     assert_eq!(parallel, scalar, "{label}: member paths or bytes differ");
+}
+
+#[test]
+fn rar5_solid_wrap_match_has_fixed_verified_bytes_in_both_modes() {
+    let paths = ["rar5/rar5_solid_wrap_match.rar"];
+    require_hydrated("solid wrap match", &paths);
+    let expected = vec![
+        MemberSummary {
+            path: "wrap-prefix.bin".into(),
+            content: MemberContent::File {
+                len: 17 * 1024 * 1024,
+                sha256: [
+                    0x08, 0x84, 0x49, 0x9d, 0x4d, 0x62, 0x45, 0xf3, 0x46, 0xcc, 0xf5, 0xc6, 0x73,
+                    0x8c, 0x0e, 0xc3, 0xa3, 0x18, 0xd6, 0x46, 0x04, 0xa1, 0x40, 0x80, 0x47, 0x79,
+                    0x18, 0x91, 0xd9, 0x3d, 0x35, 0xc5,
+                ],
+            },
+        },
+        MemberSummary {
+            path: "wrap-source.dds".into(),
+            content: MemberContent::File {
+                len: 24 * 1024 * 1024 + 128,
+                sha256: [
+                    0xa2, 0x4f, 0x7b, 0x28, 0xf3, 0xbe, 0xaa, 0x8e, 0x5e, 0x68, 0x24, 0x51, 0xe8,
+                    0x7b, 0x80, 0x1c, 0x7f, 0xfc, 0xc7, 0x39, 0x50, 0xc2, 0x98, 0xed, 0xba, 0xa2,
+                    0x81, 0x1b, 0xc7, 0xc2, 0xb8, 0xbc,
+                ],
+            },
+        },
+        MemberSummary {
+            path: "wrap-gap.bin".into(),
+            content: MemberContent::File {
+                len: 1024 * 1024,
+                sha256: [
+                    0xce, 0x57, 0x1c, 0x52, 0xd1, 0xb0, 0x5d, 0x10, 0x2b, 0x87, 0x86, 0x4c, 0x45,
+                    0x2b, 0x18, 0x98, 0x4f, 0xee, 0x93, 0x32, 0x5c, 0x2c, 0x56, 0x0e, 0xf5, 0x71,
+                    0x30, 0x8f, 0xbd, 0xdb, 0xb1, 0xde,
+                ],
+            },
+        },
+        MemberSummary {
+            path: "wrap-duplicate.dds".into(),
+            content: MemberContent::File {
+                len: 24 * 1024 * 1024 + 128,
+                sha256: [
+                    0xa2, 0x4f, 0x7b, 0x28, 0xf3, 0xbe, 0xaa, 0x8e, 0x5e, 0x68, 0x24, 0x51, 0xe8,
+                    0x7b, 0x80, 0x1c, 0x7f, 0xfc, 0xc7, 0x39, 0x50, 0xc2, 0x98, 0xed, 0xba, 0xa2,
+                    0x81, 0x1b, 0xc7, 0xc2, 0xb8, 0xbc,
+                ],
+            },
+        },
+    ];
+
+    let fixture_paths: Vec<_> = paths.iter().map(|path| fixture(path)).collect();
+    let archive = open_volumes(&fixture_paths, None).expect("open solid wrap-match fixture");
+    let metadata = archive.metadata();
+    let declared_sizes: Vec<_> = metadata
+        .members
+        .iter()
+        .map(|member| (member.name.as_str(), member.unpacked_size))
+        .collect();
+    assert_eq!(
+        declared_sizes,
+        vec![
+            ("wrap-prefix.bin", Some(17 * 1024 * 1024)),
+            ("wrap-source.dds", Some(24 * 1024 * 1024 + 128)),
+            ("wrap-gap.bin", Some(1024 * 1024)),
+            ("wrap-duplicate.dds", Some(24 * 1024 * 1024 + 128)),
+        ],
+        "fixture member headers changed"
+    );
+
+    let parallel = with_parallel_mode(false, || extract_summaries(&paths, None))
+        .unwrap_or_else(|error| panic!("solid wrap match normal extraction failed: {error:?}"));
+    assert_eq!(parallel, expected, "normal extraction digest mismatch");
+
+    let scalar = with_parallel_mode(true, || extract_summaries(&paths, None))
+        .unwrap_or_else(|error| panic!("solid wrap match scalar extraction failed: {error:?}"));
+    assert_eq!(scalar, expected, "scalar extraction digest mismatch");
+
+    let buffered = with_parallel_mode(false, || extract_buffered_summaries(&paths, None))
+        .unwrap_or_else(|error| panic!("solid wrap match buffered extraction failed: {error:?}"));
+    assert_eq!(buffered, expected, "buffered extraction digest mismatch");
+
+    let direct_parallel =
+        with_parallel_mode(false, || extract_solid_to_writer_summaries(&paths, None))
+            .unwrap_or_else(|error| {
+                panic!("solid wrap match direct normal extraction failed: {error:?}")
+            });
+    assert_eq!(
+        direct_parallel, expected,
+        "direct normal extraction digest mismatch"
+    );
+
+    let direct_scalar =
+        with_parallel_mode(true, || extract_solid_to_writer_summaries(&paths, None))
+            .unwrap_or_else(|error| {
+                panic!("solid wrap match direct scalar extraction failed: {error:?}")
+            });
+    assert_eq!(
+        direct_scalar, expected,
+        "direct scalar extraction digest mismatch"
+    );
+
+    let (duplicate_len, duplicate_sha256) = match &expected[3].content {
+        MemberContent::File { len, sha256 } => (*len, *sha256),
+        MemberContent::Directory => panic!("duplicate fixture member must be a file"),
+    };
+    with_parallel_mode(false, || -> Result<(), RarError> {
+        let fixture_paths: Vec<_> = paths.iter().map(|path| fixture(path)).collect();
+        let mut archive = open_volumes(&fixture_paths, None)?;
+        let opts = options(None);
+        assert_eq!(archive.skip_member_solid(0, &opts)?, 17 * 1024 * 1024);
+        assert_eq!(archive.skip_member_solid(1, &opts)?, 24 * 1024 * 1024 + 128);
+        assert_eq!(archive.skip_member_solid(2, &opts)?, 1024 * 1024);
+
+        let mut duplicate = Vec::new();
+        let written = archive.extract_member_solid_to_writer(3, &opts, &mut duplicate)?;
+        assert_eq!(written, duplicate_len);
+        let actual_sha256: [u8; 32] = Sha256::digest(&duplicate).into();
+        assert_eq!(actual_sha256, duplicate_sha256);
+        Ok(())
+    })
+    .unwrap_or_else(|error| {
+        panic!("solid wrap match skipped-prerequisite extraction failed: {error:?}")
+    });
 }
 
 fn assert_failure(label: &str, paths: &[&str], password: Option<&str>) {

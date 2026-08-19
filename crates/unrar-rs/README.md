@@ -14,7 +14,10 @@ unrar-rs = "0.5"
 This crate reads existing archives. It exposes no writer, builder, or
 archive-creation API, for the licensing reason given below.
 
-## Usage
+## Listing
+
+Reading headers decompresses nothing, so listing a large set costs only its
+headers.
 
 ```rust
 use unrar_rs::RarArchive;
@@ -25,8 +28,35 @@ for member in &archive.metadata().members {
 }
 ```
 
-Reading headers decompresses nothing, so listing a large set costs only its
-headers. Extraction verifies by default:
+## Extracting
+
+`extract_member` is the entry point. It returns an `ExtractedMember`, and
+`into_reader` turns that into a `Read` — from memory for a small member,
+straight from a temporary file for one too large to hold.
+
+```rust
+use unrar_rs::{ExtractOptions, RarArchive};
+
+let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
+let options = ExtractOptions { verify: true, password: None, restore_owners: false };
+
+let members = archive.metadata().members;
+for (index, info) in members.iter().enumerate() {
+    if info.is_directory {
+        continue;
+    }
+    let member = archive.extract_member(index, &options, None)?;
+    let mut reader = member.into_reader()?;
+    std::io::copy(&mut reader, &mut std::io::sink())?;
+}
+```
+
+With `verify` set, a member whose CRC32 or BLAKE2sp does not match is an error
+rather than a silently wrong result.
+
+To land a member directly on disk, `extract_member_to_file` applies the
+archived metadata as it writes; `extract_by_name` looks a member up by name
+instead of index.
 
 ```rust
 use unrar_rs::{ExtractOptions, RarArchive};
@@ -41,6 +71,18 @@ archive.extract_member_to_file(
 )?;
 ```
 
+### Solid archives
+
+Solid and non-solid archives extract through the same calls. The difference is
+ordering: a solid archive compresses its members against one shared dictionary,
+so extract those in ascending index order and that shared state is carried
+across members for you. Members of a non-solid archive can be extracted in any
+order.
+
+`skip_member_solid` advances past a member you do not want without
+materialising it, and `extract_member_solid_to_writer` streams one into a
+writer you already hold.
+
 ## Capabilities
 
 - RAR5 and RAR4, including legacy RAR 1.5 / 2.0 / 2.9, and SFX archives.
@@ -54,7 +96,7 @@ archive.extract_member_to_file(
 - Path sanitisation against traversal, and header-declared limits that bound
   allocation.
 
-## Extracting from volumes that are not files
+## Volumes that are not files
 
 `extract_member_streaming` reads through a `VolumeProvider` rather than the
 filesystem, so a member can be extracted while its volumes are still arriving,

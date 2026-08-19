@@ -3,7 +3,9 @@
 //! These tests construct RAR5 archives programmatically and verify
 //! that the parser + decompressor produce correct output.
 
-use std::io::Cursor;
+use std::cell::Cell;
+use std::io::{Cursor, Write};
+use std::rc::Rc;
 
 use unrar_rs::test_support::encrypt_aes128_cbc;
 
@@ -1392,6 +1394,103 @@ fn test_solid_archive_stored_files() {
         )
         .unwrap();
     assert_eq!(result2, file2_content);
+}
+
+struct LocalSolidWriter {
+    bytes: Vec<u8>,
+    written: Rc<Cell<u64>>,
+    flushes: Rc<Cell<u64>>,
+}
+
+impl Write for LocalSolidWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        self.written.set(self.written.get() + bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        Ok(())
+    }
+}
+
+fn local_solid_writer(written: Rc<Cell<u64>>, flushes: Rc<Cell<u64>>) -> LocalSolidWriter {
+    LocalSolidWriter {
+        bytes: Vec::new(),
+        written,
+        flushes,
+    }
+}
+
+#[test]
+fn solid_to_writer_accepts_borrowed_local_writer_and_preserves_cursor() {
+    let first = b"First file in solid archive";
+    let second = b"Second file in solid archive";
+    let archive_bytes = build_solid_stored_archive("first.txt", first, "second.txt", second);
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        ..Default::default()
+    };
+
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes.clone())).unwrap();
+    let first_written = Rc::new(Cell::new(0));
+    let first_flushes = Rc::new(Cell::new(0));
+    let mut first_writer = local_solid_writer(first_written.clone(), first_flushes.clone());
+    let written = archive
+        .extract_member_solid_to_writer(0, &options, &mut first_writer)
+        .unwrap();
+    assert_eq!(written, first.len() as u64);
+    assert_eq!(first_writer.bytes, first);
+    assert_eq!(first_written.get(), written);
+    assert_eq!(first_flushes.get(), 1);
+
+    let second_written = Rc::new(Cell::new(0));
+    let second_flushes = Rc::new(Cell::new(0));
+    let mut second_writer = local_solid_writer(second_written.clone(), second_flushes.clone());
+    let written = archive
+        .extract_member_solid_to_writer(1, &options, &mut second_writer)
+        .unwrap();
+    assert_eq!(written, second.len() as u64);
+    assert_eq!(second_writer.bytes, second);
+    assert_eq!(second_written.get(), written);
+    assert_eq!(second_flushes.get(), 1);
+    assert!(matches!(
+        archive.extract_member_solid_to_writer(0, &options, &mut first_writer),
+        Err(unrar_rs::RarError::SolidOrderViolation { .. })
+    ));
+
+    let mut skipped_archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    assert_eq!(
+        skipped_archive.skip_member_solid(0, &options).unwrap(),
+        first.len() as u64
+    );
+    let target_written = Rc::new(Cell::new(0));
+    let target_flushes = Rc::new(Cell::new(0));
+    let mut target_writer = local_solid_writer(target_written.clone(), target_flushes.clone());
+    let written = skipped_archive
+        .extract_member_solid_to_writer(1, &options, &mut target_writer)
+        .unwrap();
+    assert_eq!(written, second.len() as u64);
+    assert_eq!(target_writer.bytes, second);
+    assert_eq!(target_written.get(), written);
+    assert_eq!(target_flushes.get(), 1);
+
+    let mut non_solid = unrar_rs::RarArchive::open(Cursor::new(build_stored_rar5_archive(
+        "plain.txt",
+        b"plain",
+    )))
+    .unwrap();
+    assert!(matches!(
+        non_solid.extract_member_solid_to_writer(0, &options, &mut target_writer),
+        Err(unrar_rs::RarError::CorruptArchive { detail })
+            if detail.contains("is not in a solid archive")
+    ));
+    assert!(matches!(
+        non_solid.skip_member_solid(0, &options),
+        Err(unrar_rs::RarError::CorruptArchive { detail })
+            if detail.contains("is not in a solid archive")
+    ));
 }
 
 #[test]
@@ -4778,6 +4877,33 @@ fn test_rar5_multivolume_solid_pair_second_member_streams_from_its_own_volumes()
 }
 
 #[test]
+fn test_rar5_multivolume_solid_pair_second_member_writes_to_borrowed_writer() {
+    let volume_names = store_pair_volumes("rar5_mv_solid_pair");
+    let volume_refs: Vec<_> = volume_names.iter().map(String::as_str).collect();
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+
+    let mut expected_archive = open_multi("rar5", &volume_refs);
+    let expected = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let mut archive = open_multi("rar5", &volume_refs);
+    let mut actual = Vec::new();
+    let written = archive
+        .extract_member_solid_to_writer(1, &options, &mut actual)
+        .unwrap();
+
+    assert_eq!(written, actual.len() as u64);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn test_rar4_fixture_multivolume_video_batch() {
     let vols: Vec<&str> = (1..=5)
         .map(|i| match i {
@@ -5527,6 +5653,47 @@ fn test_rar5_solid_encrypted_extract_all_members_sequentially() {
 }
 
 #[test]
+fn test_rar5_solid_to_writer_uses_per_call_password() {
+    let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+        restore_owners: false,
+    };
+
+    let mut expected_archive = unrar_rs::RarArchive::open_with_password(
+        std::fs::File::open(&fixture).unwrap(),
+        "e2e-test-password",
+    )
+    .unwrap();
+    let expected_first = expected_archive
+        .extract_member(0, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let expected_second = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut first = Vec::new();
+    let first_written = archive
+        .extract_member_solid_to_writer(0, &options, &mut first)
+        .unwrap();
+    assert_eq!(first_written, first.len() as u64);
+    assert_eq!(first, expected_first);
+
+    let mut second = Vec::new();
+    let second_written = archive
+        .extract_member_solid_to_writer(1, &options, &mut second)
+        .unwrap();
+    assert_eq!(second_written, second.len() as u64);
+    assert_eq!(second, expected_second);
+}
+
+#[test]
 fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
     let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
     let options = unrar_rs::ExtractOptions {
@@ -5676,6 +5843,33 @@ fn test_rar4_solid_reopen_archive_for_later_member() {
         unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
 
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
+fn test_rar4_solid_to_writer_reopens_to_later_member() {
+    let fixture = fixture("rar4", "rar4_solid.rar");
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+
+    let mut expected_archive =
+        unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_second = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let mut archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut actual_second = Vec::new();
+    let written = archive
+        .extract_member_solid_to_writer(1, &options, &mut actual_second)
+        .unwrap();
+
+    assert_eq!(written, actual_second.len() as u64);
     assert_eq!(actual_second, expected_second);
 }
 
