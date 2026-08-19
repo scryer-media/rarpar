@@ -449,6 +449,7 @@ fn assert_success(label: &str, paths: &[&str], password: Option<&str>) {
 }
 
 #[test]
+#[ignore = "fixture ships in the next published corpus revision; run with --ignored"]
 fn rar5_solid_wrap_match_has_fixed_verified_bytes_in_both_modes() {
     let paths = ["rar5/rar5_solid_wrap_match.rar"];
     require_hydrated("solid wrap match", &paths);
