@@ -71,17 +71,44 @@ archive.extract_member_to_file(
 )?;
 ```
 
+### Writing straight into your own sink
+
+`extract_member_streaming` decodes a member directly into a writer you hold, so
+nothing is buffered in memory or spooled to a temporary file on the way. Point
+it at a `VolumeProvider`; `StaticVolumeProvider` wraps a list of paths.
+
+```rust
+use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+
+let path = std::path::PathBuf::from("release.rar");
+let mut archive = RarArchive::open(std::fs::File::open(&path)?)?;
+let provider = StaticVolumeProvider::from_ordered(vec![path]);
+let options = ExtractOptions { verify: true, password: None, restore_owners: false };
+
+let members = archive.metadata().members;
+for (index, info) in members.iter().enumerate() {
+    if info.is_directory {
+        continue;
+    }
+    let mut sink = std::io::sink();
+    archive.extract_member_streaming(index, &options, &provider, &mut sink)?;
+}
+```
+
+The provider is also how a member is extracted while its volumes are still
+arriving, or from volumes that never exist as files at all.
+
 ### Solid archives
 
-Solid and non-solid archives extract through the same calls. The difference is
+Every call above handles solid and non-solid archives alike. The difference is
 ordering: a solid archive compresses its members against one shared dictionary,
 so extract those in ascending index order and that shared state is carried
 across members for you. Members of a non-solid archive can be extracted in any
 order.
 
 `skip_member_solid` advances past a member you do not want without
-materialising it, and `extract_member_solid_to_writer` streams one into a
-writer you already hold.
+materialising it, and `extract_member_solid_to_writer` streams one into a writer
+when every volume is already attached and you have no provider to hand.
 
 ## Capabilities
 
@@ -96,13 +123,11 @@ writer you already hold.
 - Path sanitisation against traversal, and header-declared limits that bound
   allocation.
 
-## Volumes that are not files
+## Volume numbering
 
-`extract_member_streaming` reads through a `VolumeProvider` rather than the
-filesystem, so a member can be extracted while its volumes are still arriving,
-or from volumes that never exist as files. Volumes are addressed in the set's
-own numbering throughout: a member whose first segment is in volume 5 requests
-volume 5.
+Volumes are addressed in the set's own numbering throughout: a member whose
+first segment is in volume 5 requests volume 5. Do not re-key a provider to the
+member's first volume.
 
 ## Verification
 
