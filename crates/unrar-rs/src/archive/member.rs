@@ -4693,7 +4693,7 @@ impl RarArchive {
         Self::preallocate_output_file(&file, self.target_unpacked_size(&fh));
         let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
 
-        if fh.compression.method == CompressionMethod::Store {
+        if fh.compression.method == CompressionMethod::Store && !is_solid {
             let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_data_hash = Self::expected_rar14_hash(&fh, options.verify);
             let expected_blake = if options.verify {
@@ -5001,112 +5001,8 @@ impl RarArchive {
             return Ok(written);
         }
 
-        if is_solid && fh.compression.method != CompressionMethod::Store {
-            let expected_crc = if options.verify { fh.data_crc32 } else { None };
-            let expected_blake = if options.verify {
-                match hash.as_ref() {
-                    Some(FileHash::Blake2sp(expected)) => Some(*expected),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            // BLAKE2sp runs off-thread for large members (see hash_pipeline).
-            // CRC32 stays inline on purpose: hardware CRC keeps up with the
-            // decoder without paying for the channel hop.
-            let blake_stream = expected_blake
-                .is_some()
-                .then(|| SharedHashStream::new(false, false, true, unpacked_size));
-
-            let (written, actual_crc) = {
-                let mut blake_writer = HashTrackingWriter {
-                    inner: &mut writer,
-                    hash: blake_stream.clone(),
-                };
-                let mut hash_writer =
-                    HashingWriter::new(&mut blake_writer, expected_crc.is_some(), false);
-                self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
-                let segments = self.members[index].segments.clone();
-                let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
-                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-                let written = if let Some(ref pwd) = member_password {
-                    if archive_format.is_rar4_family() {
-                        let reader = Self::wrap_rar4_encrypted_reader(
-                            &self.kdf_cache,
-                            base_reader,
-                            &fh,
-                            pwd,
-                            rar4_salt,
-                        )?;
-                        Self::solid_decode_reader_to_writer(
-                            &mut self.solid_decoder_rar4,
-                            &mut self.solid_decoder,
-                            self.limits.max_dict_size,
-                            reader,
-                            unpacked_size,
-                            &fh,
-                            &mut hash_writer,
-                        )?
-                    } else {
-                        let crypto =
-                            rar5_crypto
-                                .as_ref()
-                                .ok_or_else(|| RarError::CorruptArchive {
-                                    detail: format!(
-                                        "member {} is missing RAR5 crypto material",
-                                        fh.name
-                                    ),
-                                })?;
-                        let reader = crate::crypto::DecryptingReader::new_rar5(
-                            base_reader,
-                            &crypto.key,
-                            &crypto.iv,
-                        );
-                        Self::solid_decode_reader_to_writer(
-                            &mut self.solid_decoder_rar4,
-                            &mut self.solid_decoder,
-                            self.limits.max_dict_size,
-                            reader,
-                            unpacked_size,
-                            &fh,
-                            &mut hash_writer,
-                        )?
-                    }
-                } else {
-                    Self::solid_decode_reader_to_writer(
-                        &mut self.solid_decoder_rar4,
-                        &mut self.solid_decoder,
-                        self.limits.max_dict_size,
-                        base_reader,
-                        unpacked_size,
-                        &fh,
-                        &mut hash_writer,
-                    )?
-                };
-                self.enforce_unknown_lz_output_limit(&fh, written)?;
-                hash_writer.flush().map_err(RarError::Io)?;
-                (written, expected_crc.map(|_| hash_writer.finalize_crc()))
-            };
-            let (_, actual_blake) = finalize_shared_hash(blake_stream)?;
-
-            Self::verify_member_crc32(
-                &fh.name,
-                expected_crc,
-                actual_crc,
-                use_hash_mac,
-                rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
-            )?;
-            Self::verify_member_blake2(
-                &fh.name,
-                expected_blake,
-                actual_blake,
-                use_hash_mac,
-                rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
-            )?;
-
-            self.solid_next_index = index + 1;
+        if is_solid {
+            let written = self.extract_member_solid_to_writer_local(index, options, &mut writer)?;
 
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
             self.restore_ntfs_acl_for_member(index, options, out_path)?;
@@ -5124,6 +5020,26 @@ impl RarArchive {
                 fh.name, fh.compression.method,
             ),
         })
+    }
+
+    /// Extract one member from an attached solid archive into a borrowed writer.
+    ///
+    /// Requests follow the archive's forward-only solid cursor. Prerequisite
+    /// members are decoded internally when needed, while `writer` receives
+    /// only the requested member's bytes.
+    pub fn extract_member_solid_to_writer<W: Write + ?Sized>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        self.extract_member_solid_to_writer_local(index, options, writer)
+    }
+
+    /// Advance through a solid member while discarding its produced bytes.
+    pub fn skip_member_solid(&mut self, index: usize, options: &ExtractOptions) -> RarResult<u64> {
+        let mut sink = std::io::sink();
+        self.extract_member_solid_to_writer_local(index, options, &mut sink)
     }
 
     /// Extract a solid member into per-volume chunk writers while preserving
@@ -5412,6 +5328,216 @@ impl RarArchive {
 
         Ok(chunks)
     }
+
+    fn extract_member_solid_to_writer_local<W: Write + ?Sized>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        let entry = self
+            .members
+            .get(index)
+            .cloned()
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: format!("member index {index} out of range"),
+            })?;
+        let fh = entry.file_header.clone();
+        self.reject_link_member_without_file_target(&entry, &fh)?;
+
+        let member_password = if entry.is_encrypted {
+            let password = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: fh.name.clone(),
+                })?;
+            Some(password.to_owned())
+        } else {
+            None
+        };
+        let archive_format = self.format;
+        let hash = entry.hash.clone();
+        let file_encryption = entry.file_encryption.clone();
+        let rar4_salt = entry.rar4_salt;
+
+        if !self.is_solid {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "member {} is not in a solid archive; use non-solid chunked extraction",
+                    fh.name
+                ),
+            });
+        }
+
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
+        let store_limit = self.store_copy_limit(&fh);
+        let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
+            member_password
+                .as_deref()
+                .map(|password| {
+                    self.prepare_rar5_encrypted_member(&fh.name, password, file_encryption.as_ref())
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let use_hash_mac = file_encryption.is_some_and(|encryption| encryption.use_hash_mac);
+
+        self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
+        if fh.is_directory {
+            writer.flush().map_err(RarError::Io)?;
+            self.solid_next_index = index + 1;
+            return Ok(0);
+        }
+
+        let base_reader =
+            ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &entry.segments, &fh.name)
+                .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
+        let reader: Box<dyn std::io::Read + '_> = if let Some(password) = member_password.as_deref()
+        {
+            if archive_format.is_rar4_family() {
+                Box::new(Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    base_reader,
+                    &fh,
+                    password,
+                    rar4_salt,
+                )?)
+            } else {
+                let crypto = rar5_crypto
+                    .as_ref()
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: format!("member {} is missing RAR5 crypto material", fh.name),
+                    })?;
+                Box::new(crate::crypto::DecryptingReader::new_rar5(
+                    base_reader,
+                    &crypto.key,
+                    &crypto.iv,
+                ))
+            }
+        } else {
+            Box::new(base_reader)
+        };
+
+        if fh.compression.method == CompressionMethod::Store {
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
+            let expected_data_hash = Self::expected_rar14_hash(&fh, options.verify);
+            let expected_blake = if options.verify {
+                match hash.as_ref() {
+                    Some(FileHash::Blake2sp(expected)) => Some(*expected),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let tracked_data_hash =
+                expected_data_hash.or(expected_crc.map(crate::types::DataHash::Crc32));
+            let stream_hash = SharedHashStream::new(
+                matches!(tracked_data_hash, Some(crate::types::DataHash::Crc32(_))),
+                matches!(tracked_data_hash, Some(crate::types::DataHash::Rar14(_))),
+                expected_blake.is_some(),
+                unpacked_size,
+            );
+            let (written, actual_crc, actual_data_hash, actual_blake) = {
+                let mut hash_writer = HashTrackingWriter {
+                    inner: writer,
+                    hash: Some(stream_hash.clone()),
+                };
+                let written =
+                    Self::copy_reader_to_writer(reader, &mut hash_writer, store_limit, &fh.name)?;
+                hash_writer.flush().map_err(RarError::Io)?;
+                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                let actual_crc = expected_crc.map(|_| outputs.crc32.unwrap_or(0));
+                let actual_data_hash = expected_data_hash.map(|expected| match expected {
+                    crate::types::DataHash::Crc32(_) => {
+                        crate::types::DataHash::Crc32(outputs.crc32.unwrap_or(0))
+                    }
+                    crate::types::DataHash::Rar14(_) => {
+                        crate::types::DataHash::Rar14(outputs.rar14.unwrap_or(0))
+                    }
+                });
+                let actual_blake = expected_blake.map(|_| outputs.blake2sp.unwrap_or([0; 32]));
+                (written, actual_crc, actual_data_hash, actual_blake)
+            };
+
+            Self::verify_member_crc32(
+                &fh.name,
+                expected_crc,
+                actual_crc,
+                use_hash_mac,
+                rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+            )?;
+            Self::verify_member_data_hash(
+                &fh.name,
+                expected_data_hash,
+                actual_data_hash,
+                use_hash_mac,
+                rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+            )?;
+            Self::verify_member_blake2(
+                &fh.name,
+                expected_blake,
+                actual_blake,
+                use_hash_mac,
+                rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+            )?;
+
+            self.solid_next_index = index + 1;
+            return Ok(written);
+        }
+
+        let expected_crc = if options.verify { fh.data_crc32 } else { None };
+        let expected_blake = if options.verify {
+            match hash.as_ref() {
+                Some(FileHash::Blake2sp(expected)) => Some(*expected),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (written, actual_crc, actual_blake) = {
+            let mut hash_writer =
+                HashingWriter::new(writer, expected_crc.is_some(), expected_blake.is_some());
+            let written = Self::solid_decode_reader_to_writer(
+                &mut self.solid_decoder_rar4,
+                &mut self.solid_decoder,
+                self.limits.max_dict_size,
+                reader,
+                unpacked_size,
+                &fh,
+                &mut hash_writer,
+            )?;
+            self.enforce_unknown_lz_output_limit(&fh, written)?;
+            hash_writer.flush().map_err(RarError::Io)?;
+            (
+                written,
+                expected_crc.map(|_| hash_writer.finalize_crc()),
+                expected_blake.map(|_| hash_writer.finalize_blake2()),
+            )
+        };
+
+        Self::verify_member_crc32(
+            &fh.name,
+            expected_crc,
+            actual_crc,
+            use_hash_mac,
+            rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+        )?;
+        Self::verify_member_blake2(
+            &fh.name,
+            expected_blake,
+            actual_blake,
+            use_hash_mac,
+            rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+        )?;
+
+        self.solid_next_index = index + 1;
+        Ok(written)
+    }
+
     /// Prepare the archive-wide RAR5 decoder for the next **non-solid** member.
     ///
     /// RAR runs one `Unpack` object per command and re-inits it per file, so a

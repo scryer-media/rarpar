@@ -42,6 +42,42 @@ func deterministicBytes(label string, size int) []byte {
 	return out[:size]
 }
 
+const ddsHeaderSize = 128
+
+// ddsTexture creates a deterministic uncompressed BGRA DDS image. Its regular
+// channel stride makes the pinned RARLAB writer emit ordinary RAR5 Delta
+// filters, while the pixel data remains completely reproducible.
+func ddsTexture(width, height int) []byte {
+	const bytesPerPixel = 4
+	pixels := width * height
+	out := make([]byte, ddsHeaderSize+pixels*bytesPerPixel)
+	copy(out, "DDS ")
+	header := out[4:]
+	binary.LittleEndian.PutUint32(header[0:4], 124)
+	binary.LittleEndian.PutUint32(header[4:8], 0x0002100f)
+	binary.LittleEndian.PutUint32(header[8:12], uint32(height))
+	binary.LittleEndian.PutUint32(header[12:16], uint32(width))
+	binary.LittleEndian.PutUint32(header[16:20], uint32(width*bytesPerPixel))
+	binary.LittleEndian.PutUint32(header[72:76], 32)
+	binary.LittleEndian.PutUint32(header[76:80], 0x41)
+	binary.LittleEndian.PutUint32(header[84:88], 32)
+	binary.LittleEndian.PutUint32(header[88:92], 0x00ff0000)
+	binary.LittleEndian.PutUint32(header[92:96], 0x0000ff00)
+	binary.LittleEndian.PutUint32(header[96:100], 0x000000ff)
+	binary.LittleEndian.PutUint32(header[100:104], 0xff000000)
+	binary.LittleEndian.PutUint32(header[104:108], 0x1000)
+	for pixel := 0; pixel < pixels; pixel++ {
+		x := pixel % width
+		y := pixel / width
+		offset := ddsHeaderSize + pixel*bytesPerPixel
+		out[offset] = byte(x*13 + y*7)
+		out[offset+1] = byte(x*3 + y*19)
+		out[offset+2] = byte(x*11 + y*5)
+		out[offset+3] = 0xff
+	}
+	return out
+}
+
 // splitmix64 is the corpus's choice PRNG: a fixed, fully specified algorithm,
 // so "which word comes next" cannot drift with a standard-library change the
 // way `math/rand`'s stream can.
@@ -257,6 +293,25 @@ func (w rarWriter) add(ctx context.Context, args ...string) error {
 	return runDocker(ctx, w.environment, command...)
 }
 
+func (w rarWriter) requireRAR5Solid(ctx context.Context, archive string) error {
+	work := "/work"
+	if w.sub != "" {
+		work = "/work/" + w.sub
+	}
+	command := []string{
+		"run", "--rm", "--platform", "linux/amd64",
+		"-v", w.host + ":/work", "-w", work, w.image, "lt", archive,
+	}
+	listing, err := runDockerOutput(ctx, w.environment, command...)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(listing, "Details: RAR 5, solid") {
+		return fmt.Errorf("RARLAB technical listing for %q is not a solid RAR5 archive", archive)
+	}
+	return nil
+}
+
 // par2 runs the pinned par2cmdline-turbo image, whose ENTRYPOINT is `par2`.
 func (e *env) par2Run(ctx context.Context, host, sub string, args ...string) error {
 	work := "/work"
@@ -280,6 +335,17 @@ func runDocker(ctx context.Context, e *env, args ...string) error {
 		return fmt.Errorf("%s %s: %w: %s", e.docker, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func runDockerOutput(ctx context.Context, e *env, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, e.docker, args...)
+	var stdout, stderr strings.Builder
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return "", fmt.Errorf("%s %s: %w: %s", e.docker, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
 // video encodes one MKV member through the pinned FFmpeg encoder, in process.

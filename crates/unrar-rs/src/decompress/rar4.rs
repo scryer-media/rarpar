@@ -4697,6 +4697,31 @@ mod tests {
         );
     }
 
+    /// Same oracle rule as the RAR5 counterpart: `UnpWriteData` adds the whole
+    /// span while still under the declared size, then early-returns on every
+    /// later span, so a 2-byte member fed a 4-byte span freezes the counter at
+    /// 4 rather than at 2 (unpack50.cpp:538-548, shared by v29).
+    #[test]
+    fn rar4_raw_span_past_member_boundary_freezes_the_counter_above_the_limit() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode(2);
+        let mut out = Vec::new();
+
+        decoder.window.put_bytes(b"abcd");
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+        decoder.window.put_bytes(b"efgh");
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"ab");
+        assert_eq!(decoder.current_file_emitted, 2);
+        assert_eq!(decoder.current_file_written_size, 4);
+        assert_eq!(decoder.window.total_flushed(), 8);
+    }
+
     #[test]
     fn test_filter_flush_respects_hidden_match_tail() {
         let mut decoder = Rar4LzDecoder::new(1024);

@@ -14,6 +14,12 @@ const (
 	// ~85 MB main member and a ~26 MB companion for the solid encrypted set.
 	sampleTargetBytes  = 85 * 1000 * 1000
 	episodeTargetBytes = 26 * 1000 * 1000
+	// The RAR5 solid wrap regression uses a 32 MiB dictionary, a source range
+	// that wraps the dictionary, and a duplicate more than 25 MiB behind it.
+	wrapPrefixBytes   = 17 * 1024 * 1024
+	wrapTextureWidth  = 3072
+	wrapTextureHeight = 2048
+	wrapGapBytes      = 1024 * 1024
 )
 
 // generateLargeSets writes the large single-volume sets: the solid archives, the
@@ -75,7 +81,22 @@ func generateLargeSets(ctx context.Context, e *env) error {
 	if err := copyFile(sample, filepath.Join(src, "映画テスト.mkv")); err != nil {
 		return err
 	}
-
+	wrapPrefix := filepath.Join(src, "wrap-prefix.bin")
+	if err := writeFile(wrapPrefix, deterministicBytes("rar5-solid-wrap/prefix", wrapPrefixBytes)); err != nil {
+		return err
+	}
+	wrapSource := filepath.Join(src, "wrap-source.dds")
+	if err := writeFile(wrapSource, ddsTexture(wrapTextureWidth, wrapTextureHeight)); err != nil {
+		return err
+	}
+	wrapGap := filepath.Join(src, "wrap-gap.bin")
+	if err := writeFile(wrapGap, deterministicBytes("rar5-solid-wrap/gap", wrapGapBytes)); err != nil {
+		return err
+	}
+	wrapDuplicate := filepath.Join(src, "wrap-duplicate.dds")
+	if err := copyFile(wrapSource, wrapDuplicate); err != nil {
+		return err
+	}
 	rar5 := e.rar(e.rar5.Image, work, "src")
 	rar4 := e.rar(e.rar4.Image, work, "src")
 	nested := e.rar(e.rar5.Image, work, "nest")
@@ -90,11 +111,15 @@ func generateLargeSets(ctx context.Context, e *env) error {
 		{rar4, []string{"-ma4", "-m1", "-hp" + e2ePassword, "../out/rar4_hp_large.rar", "sample.mkv"}},
 		{rar5, []string{"-m1", "-s", "-p" + e2ePassword, "../out/rar5_solid_encrypted.rar", "ep1.mkv", "sample.mkv"}},
 		{rar5, []string{"-m1", "../out/rar5_unicode_cjk.rar", "映画テスト.mkv"}},
+		{rar5, []string{"-ma5", "-m5", "-md32m", "-s", "-ds", "-ep1", "-tsm-", "../out/rar5_solid_wrap_match.rar", "wrap-prefix.bin", "wrap-source.dds", "wrap-gap.bin", "wrap-duplicate.dds"}},
 	}
 	for _, set := range sets {
 		if err := set.writer.add(ctx, set.args...); err != nil {
 			return err
 		}
+	}
+	if err := rar5.requireRAR5Solid(ctx, "../out/rar5_solid_wrap_match.rar"); err != nil {
+		return err
 	}
 
 	// The nested chains, built innermost first and pruned as they go so no more
@@ -146,6 +171,7 @@ func generateLargeSets(ctx context.Context, e *env) error {
 		filepath.Join(rar5Dir, "rar5_solid.rar"),
 		filepath.Join(rar5Dir, "rar5_hp_large.rar"),
 		filepath.Join(rar5Dir, "rar5_solid_encrypted.rar"),
+		filepath.Join(rar5Dir, "rar5_solid_wrap_match.rar"),
 		filepath.Join(rar5Dir, "rar5_unicode_cjk.rar"),
 		filepath.Join(rar5Dir, "rar5_nested_2deep.rar"),
 		filepath.Join(rar5Dir, "rar5_nested_3deep.rar"),

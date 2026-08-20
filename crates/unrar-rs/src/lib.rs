@@ -14,10 +14,11 @@
 //! archives only. It intentionally exposes no archive writer, builder, or
 //! creation API — the restriction above is why.
 //!
-//! # Reading an archive
+//! # Listing an archive
 //!
 //! [`RarArchive::open`] takes anything `Read + Seek`, so an archive can come
-//! from a file, a buffer, or your own source.
+//! from a file, a buffer, or your own source. Reading headers decompresses
+//! nothing, so listing a 50 GB set costs only its headers.
 //!
 //! ```no_run
 //! use unrar_rs::RarArchive;
@@ -33,8 +34,40 @@
 //! # }
 //! ```
 //!
-//! Reading headers never decompresses anything, so listing a 50 GB set costs
-//! only its headers. Extraction verifies by default:
+//! # Extracting
+//!
+//! [`extract_member`](RarArchive::extract_member) is the entry point. It hands
+//! back an [`ExtractedMember`], and [`into_reader`](ExtractedMember::into_reader)
+//! turns that into a `Read` — from memory for a small member, straight from a
+//! temporary file for one too large to hold:
+//!
+//! ```no_run
+//! use unrar_rs::{ExtractOptions, RarArchive};
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
+//! let options = ExtractOptions { verify: true, password: None, restore_owners: false };
+//!
+//! let members = archive.metadata().members;
+//! for (index, info) in members.iter().enumerate() {
+//!     if info.is_directory {
+//!         continue;
+//!     }
+//!     let member = archive.extract_member(index, &options, None)?;
+//!     let mut reader = member.into_reader()?;
+//!     std::io::copy(&mut reader, &mut std::io::sink())?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Verification is part of extraction: with [`ExtractOptions::verify`] set, a
+//! member whose CRC32 or BLAKE2sp does not match is an error rather than a
+//! silently wrong result.
+//!
+//! To land a member directly on disk, use
+//! [`extract_member_to_file`](RarArchive::extract_member_to_file), which
+//! applies the archived metadata as it writes:
 //!
 //! ```no_run
 //! use unrar_rs::{ExtractOptions, RarArchive};
@@ -52,17 +85,57 @@
 //! # }
 //! ```
 //!
-//! # Extracting from volumes that are not files
+//! [`extract_by_name`](RarArchive::extract_by_name) looks a member up by name
+//! instead of index.
 //!
-//! [`extract_member_streaming`](RarArchive::extract_member_streaming) reads
-//! through a [`volume::VolumeProvider`] instead of the
-//! filesystem, so a member can be extracted while its volumes are still
-//! arriving — or from volumes that never exist as files at all.
+//! ## Writing straight into your own sink
 //!
-//! Volumes are addressed in the **set's own numbering** throughout, the same
-//! one [`RarVolumeFacts`] reports and `add_volume` accepts: a member whose first
+//! [`extract_member_streaming`](RarArchive::extract_member_streaming) decodes a
+//! member directly into a writer you hold, so nothing is buffered in memory or
+//! spooled to a temporary file on the way. Point it at a
+//! [`volume::VolumeProvider`] — [`StaticVolumeProvider`] wraps a list of paths:
+//!
+//! ```no_run
+//! use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let path = std::path::PathBuf::from("release.rar");
+//! let mut archive = RarArchive::open(std::fs::File::open(&path)?)?;
+//! let provider = StaticVolumeProvider::from_ordered(vec![path]);
+//! let options = ExtractOptions { verify: true, password: None, restore_owners: false };
+//!
+//! let members = archive.metadata().members;
+//! for (index, info) in members.iter().enumerate() {
+//!     if info.is_directory {
+//!         continue;
+//!     }
+//!     let mut sink = std::io::sink();
+//!     archive.extract_member_streaming(index, &options, &provider, &mut sink)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The provider is also how a member is extracted while its volumes are still
+//! arriving, or from volumes that never exist as files at all. Volumes are
+//! addressed in the **set's own numbering** throughout, the same one
+//! [`RarVolumeFacts`] reports and `add_volume` accepts: a member whose first
 //! segment lives in volume 5 asks the provider for volume 5. Do not re-key a
 //! provider to the member's first volume.
+//!
+//! ## Solid archives
+//!
+//! Every call above handles solid and non-solid archives alike. The difference
+//! is ordering: a solid archive compresses its members against one shared
+//! dictionary, so extract those in ascending index order and that shared state
+//! is carried across members for you. Members of a non-solid archive can be
+//! extracted in any order.
+//!
+//! [`skip_member_solid`](RarArchive::skip_member_solid) advances past a member
+//! you do not want without materialising it, and
+//! [`extract_member_solid_to_writer`](RarArchive::extract_member_solid_to_writer)
+//! streams one into a writer when every volume is already attached and you have
+//! no provider to hand.
 //!
 //! # Encrypted archives
 //!
@@ -221,7 +294,7 @@ pub use crypto::{
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
-pub use extract::{ExtractOptions, ExtractedMember};
+pub use extract::{ExtractOptions, ExtractedMember, ExtractedMemberReader};
 pub use limits::Limits;
 pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
