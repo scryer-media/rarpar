@@ -1,6 +1,64 @@
 # Changelog
 
 
+## 0.5.5
+
+A correctness release from 0.5.4, plus a simpler way to extract a solid
+member.
+
+**Upgrade if you read RAR5 solid archives.** Versions 0.5.1 through 0.5.4 can
+decode some of them wrongly. Extraction with `ExtractOptions::verify` set
+reports the damage as a CRC or BLAKE2sp error, but with verification off the
+wrong bytes are returned silently. 0.5.0 and earlier are unaffected.
+
+### Fixed
+
+- RAR5 members carrying filters could decode to the wrong bytes. Registering a
+  filter returned the count of bytes already handed to the writer, and the
+  serial decode loop assigned that back over its position in the member.
+  Emission trails decoding by up to one write window, so every filter marker
+  moved the position backwards — which then misplaced each later filter block
+  and corrupted the output around it. Filter registration no longer returns a
+  position at all, so nothing can overwrite it.
+
+  Delta filters are what RAR emits for regular-stride binary content —
+  uncompressed textures, bitmaps, PCM audio, game assets — so archives of that
+  kind were the ones affected. The block-parallel decode path was never
+  affected, which is why scalar decoding failed on more members than parallel
+  decoding did on the same archive.
+
+### Added
+
+- `RarArchive::extract_member_solid_to_writer` extracts one member of a solid
+  archive into a borrowed writer. It requires no `'static` bound, no `Send` or
+  `Sync`, and no writer factory.
+
+- `RarArchive::skip_member_solid` advances the solid decoder past a member
+  without materialising it.
+
+- `ExtractedMember::into_reader` returns an `ExtractedMemberReader`, reading
+  from memory or streaming from the backing temporary file. A spooled member is
+  no longer pulled into a `Vec` to be read, so it is not subject to the
+  in-memory materialisation limit that `to_bytes` and `into_bytes` enforce.
+
+### Runtime Behavior
+
+- Filtered output is written whole, and the write counter advances, exactly as
+  the reference implementation does. `UnpWriteData` clamps raw spans only, and
+  advances its counter by the full span it was handed while the member is still
+  under its declared size; filtered blocks go straight to the output. That
+  counter supplies the file offset for the E8, E8E9 and ARM filters and the
+  RAR4 virtual machine's `R[6]` register, so it tracks the reference exactly.
+
+### Documentation
+
+- The crate documentation and README lead with `extract_member` and
+  `into_reader`, and cover writing a member straight into a caller's sink with
+  `extract_member_streaming`. Solid and non-solid archives extract through the
+  same calls; solidity determines only that members are read in ascending
+  order.
+
+
 ## 0.5.4
 
 This is a patch release from 0.5.3, internal only: no public item changed.
