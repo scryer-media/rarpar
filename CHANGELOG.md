@@ -3,6 +3,18 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.3.4
+
+### Libraries
+
+- `reedsolomon-rs` moves to 0.4.3, including guarded AVX512BMM capability
+  detection for future SIMD dispatch work. See its
+  [changelog](crates/reedsolomon-rs/CHANGELOG.md).
+- `par2-rs` moves to 0.6.0. Repair scans now merge candidates before relocating
+  unresolved short blocks, avoiding repeated relocation re-reads; its new
+  `ScanDiagnostics` counters make that work observable. See its
+  [changelog](crates/par2-rs/CHANGELOG.md).
+
 ## rarpar 0.3.3
 
 ### CLI Changes
