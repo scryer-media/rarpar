@@ -326,6 +326,14 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        // Top of the ladder once it exists: a native 16x16 GF(2) matrix
+        // multiply is a closer fit for GF(2^16) than GFNI's four 8x8 affine
+        // pieces. The gate is hard-wired off — see `mul_acc_region_avx512bmm`,
+        // which is still a stub.
+        if avx512bmm_enabled() {
+            mul_acc_region_avx512bmm(factor, src, dst);
+            return;
+        }
         if is_x86_feature_detected!("gfni")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
@@ -749,6 +757,111 @@ fn shuffle2x_pair_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
         .get_or_init(|| !std::env::var_os("WEAVER_GF16_SHUFFLE2X_PAIR").is_some_and(|v| v == "0"))
+}
+
+// ---------------------------------------------------------------------------
+// AVX512BMM (AMD bit-matrix multiply) — detection only, no kernel yet.
+// ---------------------------------------------------------------------------
+
+/// CPUID leaf carrying AMD's extended feature identifiers. AVX512BMM is
+/// advertised in this leaf's `EAX`.
+#[cfg(target_arch = "x86_64")]
+const AVX512BMM_CPUID_LEAF: u32 = 0x8000_0021;
+
+/// Bit position within [`AVX512BMM_CPUID_LEAF`]'s `EAX` that reports AVX512BMM.
+#[cfg(target_arch = "x86_64")]
+const AVX512BMM_CPUID_EAX_BIT: u32 = 23;
+
+/// Master switch for the AVX512BMM tier, `false` until a kernel exists (see the
+/// TODO on `mul_acc_region_avx512bmm`). Editing this constant is the *only* way
+/// the tier can ever be selected: there is no environment pin and no build
+/// flag, so no CPU — present or future — can reach the stub by advertising a
+/// feature bit.
+#[cfg(target_arch = "x86_64")]
+const AVX512BMM_TIER_IMPLEMENTED: bool = false;
+
+/// Whether this CPU advertises AVX512BMM: AMD's 16x16 GF(2) bit-matrix multiply
+/// with OR/XOR accumulation (`VBMACOR16x16x16`, `VBMACXOR16x16x16`) plus
+/// `VBITREV`, introduced with Zen 6.
+///
+/// Reported honestly whether or not a kernel exists. [`avx512bmm_enabled`] is
+/// the separate gate deciding whether the tier may actually run, so this
+/// function answering `true` means "hardware present, tier still unavailable".
+///
+/// `is_x86_feature_detected!` has no `avx512bmm` name (absent from `std_detect`,
+/// which does not query this leaf at all), so the leaf is read directly. The
+/// extended-leaf maximum from `0x80000000` is checked first because an
+/// out-of-range CPUID leaf does not reliably return zero.
+///
+/// **The bit is `EAX[23]`, not `EBX[23]`.** The par2cmdline-turbo / ParPar
+/// reference reads `EBX` of this leaf in `gf16mul.cpp`, but `EBX` there carries
+/// microcode-patch and RAP size fields rather than feature bits, so their BMM
+/// tier never engages on real silicon (and could mis-fire if that size field
+/// ever sets bit 23). Do not "align" this with theirs.
+pub fn avx512bmm_detected() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *DETECTED.get_or_init(|| {
+            // `__cpuid` is a safe intrinsic here: CPUID is baseline on x86_64,
+            // so there is no target-feature precondition for a caller to
+            // uphold and no unsafe block to justify.
+            if std::arch::x86_64::__cpuid(0x8000_0000).eax < AVX512BMM_CPUID_LEAF {
+                return false;
+            }
+            std::arch::x86_64::__cpuid(AVX512BMM_CPUID_LEAF).eax & (1u32 << AVX512BMM_CPUID_EAX_BIT)
+                != 0
+        });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether the AVX512BMM tier may be selected by the kernel ladders.
+///
+/// Always `false` today: detection is real, the kernel is not. Kept as its own
+/// predicate — rather than folding the constant into each ladder — so the one
+/// place that decides selection is the one place a future implementer edits.
+pub fn avx512bmm_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return AVX512BMM_TIER_IMPLEMENTED && avx512bmm_detected();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+// TODO: implement the AVX512BMM GF(2^16) multiply-accumulate kernel below.
+//
+// WHAT TO BUILD. Multiplication by a fixed factor in GF(2^16) is linear over
+// GF(2), so it is a 16x16 binary matrix applied to each word — the same fact
+// the GFNI tier exploits, except GFNI must decompose that matrix into four 8x8
+// `gf2p8affineqb` transforms plus the XORs that merge them (see the module
+// header and `precompute_affine_matrices`). `VBMACXOR16x16x16` is a native
+// 16x16 GF(2) matrix multiply with XOR accumulation, so one instruction per
+// tile should replace all four affine transforms *and* fold the
+// XOR-accumulate into the destination. Build the per-factor matrix the way
+// `affine_matrices_from_field` builds its four sub-matrices, undivided.
+//
+// WHY IT IS NOT BUILT. No AVX512BMM hardware is reachable. The extension ships
+// first on Zen 6 (EPYC "Venice", launched 2026-07-23); as of 2026-08 the newest
+// AMD instance family any major cloud rents is 5th-generation EPYC ("Turin",
+// Zen 5), which has no BMM, and no Venice-based instance family has been
+// announced. A kernel that cannot be executed even once would be guesswork.
+//
+// WHEN HARDWARE ARRIVES. (1) Implement the kernel. (2) Prove it bit-exact
+// against `mul_acc_region_scalar` and the existing GFNI/AVX-512 tiers across
+// the length ladder the other kernel tests use, straddling the full-width strip
+// and the tail chain. (3) Benchmark it against the GFNI affine tier. Only then
+// flip `AVX512BMM_TIER_IMPLEMENTED`, and extend the tier arm from
+// `mul_acc_region` to the remaining ladders (`mul_acc_multi_region`,
+// `mul_acc_input_batch`, `mul_acc_input_batch_prepared`, and a
+// `PreparedX86Factor` flavor in `prepare_input_factor`). It should also become
+// an `unsafe fn` carrying `#[target_feature(enable = "avx512bmm")]` like every
+// other kernel here, once `std_detect`/`core_arch` carry that feature name.
+#[cfg(target_arch = "x86_64")]
+fn mul_acc_region_avx512bmm(_factor: u16, _src: &[u8], _dst: &mut [u8]) {
+    unimplemented!("AVX512BMM GF(2^16) kernel is a stub; see avx512bmm_enabled")
 }
 
 /// Bytes per split-layout block: one 256-bit register holding 16 GF(2^16)
@@ -5771,6 +5884,50 @@ unsafe fn mul_acc_input_batch_neon_prepared_blocked<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AVX512BMM tier is detection-only. Its gate must read `false` on
+    /// every machine — including one that advertises the feature — because the
+    /// kernel behind it is `unimplemented!()`, and the region ladder must go on
+    /// producing field-exact results with the arm present.
+    #[test]
+    fn avx512bmm_tier_is_never_selected() {
+        assert!(
+            !avx512bmm_enabled(),
+            "AVX512BMM tier must stay unselectable until its kernel exists"
+        );
+        // Detection is free to answer either way; it must not drag the gate
+        // open. Run the ladder to prove nothing routes into the stub.
+        let src: Vec<u8> = (0..512u32).map(|b| (b % 251) as u8).collect();
+        let mut reference = vec![0x3Cu8; src.len()];
+        let mut got = vec![0x3Cu8; src.len()];
+        mul_acc_region_scalar(0x2F1D, &src, &mut reference);
+        mul_acc_region(0x2F1D, &src, &mut got);
+        assert_eq!(got, reference, "region ladder diverged from the field");
+        assert!(!avx512bmm_enabled(), "gate opened after detection ran");
+    }
+
+    /// Pins the CPUID coordinates AVX512BMM is advertised at: leaf
+    /// `0x80000021`, `EAX` bit 23. The par2cmdline-turbo / ParPar reference
+    /// reads `EBX` of the same leaf, which holds size fields rather than
+    /// feature bits, so this test exists to make an "alignment" edit toward
+    /// their version fail loudly.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512bmm_cpuid_coordinates_are_pinned() {
+        assert_eq!(AVX512BMM_CPUID_LEAF, 0x8000_0021);
+        assert_eq!(AVX512BMM_CPUID_EAX_BIT, 23);
+        assert_eq!(1u32 << AVX512BMM_CPUID_EAX_BIT, 0x0080_0000);
+        // Read through a binding rather than asserting on the constant
+        // directly: on hardware without BMM the gate reads `false` either way,
+        // so only the constant proves the tier is still switched off.
+        let implemented = AVX512BMM_TIER_IMPLEMENTED;
+        assert!(
+            !implemented,
+            "flip AVX512BMM_TIER_IMPLEMENTED only once the kernel exists and is validated"
+        );
+        // Detection is cached and side-effect free.
+        assert_eq!(avx512bmm_detected(), avx512bmm_detected());
+    }
 
     /// The nibble scratch is only sound if every coefficient structure is
     /// XOR-linear in the factor. Prove it exhaustively for all 65536 factors

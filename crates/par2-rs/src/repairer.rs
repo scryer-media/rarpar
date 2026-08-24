@@ -134,6 +134,23 @@ pub struct ScanDiagnostics {
     pub blocks_found: u32,
     pub duplicate_blocks: u32,
     pub files_skipped: u32,
+    /// Candidates the deferred short-block relocation search re-read. Zero is
+    /// the healthy shape: it means the merged scan state already placed every
+    /// short block, so nothing had to be hunted for.
+    pub short_relocation_candidates_scanned: u32,
+    /// Candidates the relocation search declined to re-read because the merged
+    /// scan state already accounts for every byte of them.
+    pub short_relocation_candidates_skipped: u32,
+    /// Rolling windows the relocation search stepped, summed over candidates.
+    /// This is the counter that makes an exhaustive relocation search visible;
+    /// the ordinary per-file scan counters never see its work.
+    pub short_relocation_windows_stepped: u64,
+    /// Bytes the relocation search re-read from candidate files.
+    pub short_relocation_bytes_read: u64,
+    /// Short blocks the relocation search matched and placed. A block whose
+    /// held location the search may not displace is skipped before the match
+    /// check, so a match counted here is never a futile offer.
+    pub short_relocation_blocks_placed: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -226,10 +243,42 @@ impl FileScanStats {
     }
 }
 
+/// Accounting for the exhaustive short-block relocation search.
+///
+/// That search is the one scan phase whose cost is not proportional to the
+/// candidate it was asked about: it re-reads a whole candidate once per
+/// distinct still-open short length. It used to update no counter at all, so
+/// a quadratic blow-up surfaced in the logs as a slow file scan reporting zero
+/// windows stepped. These fields exist so it can never hide again.
+#[derive(Debug, Default, Clone, Copy)]
+struct ShortRelocationStats {
+    windows_stepped: u64,
+    bytes_read: u64,
+    blocks_placed: u64,
+}
+
+impl ShortRelocationStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.windows_stepped = self.windows_stepped.saturating_add(other.windows_stepped);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.blocks_placed = self.blocks_placed.saturating_add(other.blocks_placed);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScanCandidate {
     path: PathBuf,
     kind: BlockLocationKind,
+}
+
+/// One candidate the deferred relocation search may re-read: a candidate that
+/// reached the block-scan phase, so its bytes were never claimed wholesale by
+/// a complete-file match.
+#[derive(Debug, Clone)]
+struct ShortRelocationTarget {
+    path: PathBuf,
+    kind: BlockLocationKind,
+    len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +381,23 @@ impl CandidateScanResult {
             files_skipped: 1,
             ..Self::ignored(path, kind)
         }
+    }
+
+    /// The relocation target this candidate offers, if any.
+    ///
+    /// Only a candidate that actually reached the block-scan phase qualifies.
+    /// [`FileScanMode::Complete`] marks the early exits — a whole-file hash
+    /// match, or a rename-only pass — which never looked at short blocks
+    /// before this change either.
+    fn short_relocation_target(&self) -> Option<ShortRelocationTarget> {
+        let stats = self.stats?;
+        (stats.mode != FileScanMode::Complete && self.bytes_scanned > 0).then(|| {
+            ShortRelocationTarget {
+                path: self.path.clone(),
+                kind: self.kind,
+                len: self.bytes_scanned,
+            }
+        })
     }
 }
 
@@ -2800,11 +2866,193 @@ impl RepairState {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        let mut relocation_targets = Vec::new();
         for result in results {
+            if let Some(target) = result.short_relocation_target() {
+                relocation_targets.push(target);
+            }
             self.apply_scan_result(result, diagnostics);
         }
+        self.relocate_open_short_blocks(options, &relocation_targets, diagnostics)?;
 
         Ok(())
+    }
+
+    /// Exhaustive short-block relocation, run once per candidate batch over the
+    /// merged scan state.
+    ///
+    /// Every candidate above scans a private pre-merge snapshot, so a candidate
+    /// cannot see that another candidate has already placed a short block.
+    /// Searching for relocated short blocks inside that phase therefore made
+    /// every candidate sweep its whole file once per distinct short length in
+    /// the set — quadratic in set size, and reached in both passes, because a
+    /// fully obfuscated download makes every file an extra candidate. Deferring
+    /// the search to the merged state searches only for blocks that are still
+    /// open, and only inside candidates the merged state cannot already account
+    /// for byte-for-byte.
+    ///
+    /// The search itself is unchanged, and so is its reach into candidates
+    /// that still hold unexplained bytes: a short block shifted inside,
+    /// concatenated into, or otherwise relocated within one is still found.
+    /// Only a block duplicated inside a candidate the merged state already
+    /// explains in full goes unsalvaged, and that costs a recovery block, not
+    /// the data.
+    fn relocate_open_short_blocks(
+        &mut self,
+        options: &Par2RepairerOptions,
+        targets: &[ShortRelocationTarget],
+        diagnostics: &mut ScanDiagnostics,
+    ) -> Result<()> {
+        if targets.is_empty() || self.hash_table.short_blocks.is_empty() {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let mut candidates_scanned = 0u32;
+        let mut candidates_skipped = 0u32;
+        let mut totals = ShortRelocationStats::default();
+        let mut open_short_block_count;
+
+        let changed = {
+            let table = &self.hash_table;
+            let slice_size = self.set.slice_size;
+            // Built on demand: the healthy path breaks out below before any
+            // candidate is considered, and never pays for the span map.
+            let mut explained = None;
+            let mut blocks = ScanBlockState::new(&self.blocks);
+            let mut open = open_short_blocks(table, &blocks, slice_size);
+            open_short_block_count = open.iter().filter(|open| **open).count();
+
+            for target in targets {
+                if open_short_block_count == 0 {
+                    break;
+                }
+                check_cancel(options)?;
+                if explained
+                    .get_or_insert_with(|| self.explained_bytes_by_path())
+                    .get_mut(&target.path)
+                    .is_some_and(|spans| merged_span_bytes(spans) >= target.len)
+                {
+                    candidates_skipped = candidates_skipped.saturating_add(1);
+                    continue;
+                }
+
+                candidates_scanned = candidates_scanned.saturating_add(1);
+                let candidate_started = Instant::now();
+                let mut stats = ShortRelocationStats::default();
+                let attempted = {
+                    let mut scan = ShortRelocationScan {
+                        table,
+                        path: &target.path,
+                        kind: target.kind,
+                        open: &open,
+                        blocks: &mut blocks,
+                        stats: &mut stats,
+                    };
+                    scan_shifted_short_blocks_from_file(&mut scan, target.len as usize)
+                };
+                let attempted = match attempted {
+                    Ok(attempted) => attempted,
+                    Err(error) => {
+                        log_short_relocation(
+                            &target.path,
+                            target.kind,
+                            &[],
+                            &stats,
+                            candidate_started.elapsed(),
+                        );
+                        return Err(error);
+                    }
+                };
+                log_short_relocation(
+                    &target.path,
+                    target.kind,
+                    &attempted,
+                    &stats,
+                    candidate_started.elapsed(),
+                );
+                totals.accumulate(&stats);
+                if stats.blocks_placed > 0 {
+                    open = open_short_blocks(table, &blocks, slice_size);
+                    open_short_block_count = open.iter().filter(|open| **open).count();
+                }
+            }
+
+            blocks.changed_locations()
+        };
+
+        let found_before = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        for (block_index, location) in changed {
+            self.record_block_location(block_index, location);
+        }
+        let found_after = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        diagnostics.blocks_found = diagnostics
+            .blocks_found
+            .saturating_add(found_after.saturating_sub(found_before) as u32);
+        diagnostics.short_relocation_candidates_scanned = diagnostics
+            .short_relocation_candidates_scanned
+            .saturating_add(candidates_scanned);
+        diagnostics.short_relocation_candidates_skipped = diagnostics
+            .short_relocation_candidates_skipped
+            .saturating_add(candidates_skipped);
+        diagnostics.short_relocation_windows_stepped = diagnostics
+            .short_relocation_windows_stepped
+            .saturating_add(totals.windows_stepped);
+        diagnostics.short_relocation_bytes_read = diagnostics
+            .short_relocation_bytes_read
+            .saturating_add(totals.bytes_read);
+        diagnostics.short_relocation_blocks_placed = diagnostics
+            .short_relocation_blocks_placed
+            .saturating_add(totals.blocks_placed.min(u64::from(u32::MAX)) as u32);
+
+        log_short_relocation_pass(
+            targets.len(),
+            candidates_scanned,
+            candidates_skipped,
+            open_short_block_count,
+            &totals,
+            started.elapsed(),
+        );
+
+        Ok(())
+    }
+
+    /// Located byte spans of every path the merged state can account for,
+    /// keyed by path. A candidate whose spans already cover its whole length
+    /// holds no byte the merged state cannot already name, so the relocation
+    /// search skips it. What that gives up is narrow and deliberate: a short
+    /// block whose bytes are *duplicated* inside such a candidate is real but
+    /// no longer salvaged from there, costing one recovery block instead of a
+    /// whole-candidate sweep per still-open short length.
+    fn explained_bytes_by_path(&self) -> HashMap<PathBuf, Vec<(u64, u64)>> {
+        let mut spans: HashMap<PathBuf, Vec<(u64, u64)>> = HashMap::new();
+        let mut push = |location: &BlockLocation| {
+            if let Some(path) = location.path() {
+                spans
+                    .entry(path.to_path_buf())
+                    .or_default()
+                    .push((location.offset, location.len));
+            }
+        };
+        for file in &self.files {
+            if let Some(location) = file.complete_location.as_ref() {
+                push(location);
+            }
+        }
+        for block in &self.blocks {
+            if let Some(location) = block.location.as_ref() {
+                push(location);
+            }
+        }
+        spans
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4208,6 +4456,7 @@ impl<'a> RollingBlockScanner<'a> {
             &mut state,
             scan_options,
         )?;
+        self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
@@ -4268,6 +4517,7 @@ impl<'a> RollingBlockScanner<'a> {
             DEFAULT_REPAIR_MEMORY_LIMIT,
             None,
         )?;
+        self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
@@ -4987,6 +5237,7 @@ impl<'a> RollingBlockScanner<'a> {
             read_target,
             scan_options,
         )?;
+        self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
@@ -5113,6 +5364,7 @@ impl<'a> RollingBlockScanner<'a> {
             &mut state,
             scan_options,
         )?;
+        self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
@@ -5279,10 +5531,41 @@ impl<'a> RollingBlockScanner<'a> {
             }
         }
 
-        scan_shifted_short_blocks_from_slice(self.table, path, kind, blocks, &map);
-
         drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
+        Ok(stats)
+    }
+
+    /// Test-only mirror of the production two-phase shape: scan one candidate,
+    /// then run the relocation search over whatever short blocks that scan left
+    /// open. Production defers the same search to
+    /// [`RepairState::relocate_open_short_blocks`], which runs it once over the
+    /// merged state of a whole candidate batch instead of once per candidate.
+    #[cfg(test)]
+    fn relocate_open_short_blocks_in(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        blocks: &mut ScanBlockState<'_>,
+    ) -> Result<ShortRelocationStats> {
+        let mut stats = ShortRelocationStats::default();
+        let Ok(metadata) = fs::metadata(path) else {
+            return Ok(stats);
+        };
+        let len = metadata.len() as usize;
+        if len == 0 {
+            return Ok(stats);
+        }
+        let open = open_short_blocks(self.table, blocks, self.table.slice_size);
+        let mut scan = ShortRelocationScan {
+            table: self.table,
+            path,
+            kind,
+            open: &open,
+            blocks,
+            stats: &mut stats,
+        };
+        scan_shifted_short_blocks_from_file(&mut scan, len)?;
         Ok(stats)
     }
 }
@@ -5410,6 +5693,83 @@ fn log_file_scan(
             blocks_confirmed,
             elapsed_ms = elapsed.as_millis(),
             "slow par2 file scan"
+        );
+    }
+}
+
+/// One candidate's share of the deferred short-block relocation search.
+///
+/// The ordinary file-scan counters never see this work — it happens after the
+/// scan, over a candidate the scan already read — so it gets its own record.
+/// `short_lengths` is what the sweep actually looked for: one full pass over
+/// the candidate per entry.
+fn log_short_relocation(
+    path: &Path,
+    kind: BlockLocationKind,
+    short_lengths: &[usize],
+    stats: &ShortRelocationStats,
+    elapsed: Duration,
+) {
+    debug!(
+        path = %path.display(),
+        ?kind,
+        scan_mode = "short_relocation",
+        short_lengths = ?short_lengths,
+        short_lengths_attempted = short_lengths.len(),
+        windows_stepped = stats.windows_stepped,
+        bytes_reread = stats.bytes_read,
+        blocks_placed = stats.blocks_placed,
+        elapsed_ms = elapsed.as_millis(),
+        "completed par2 short-block relocation scan"
+    );
+
+    if stats.windows_stepped >= SCANNER_SLOW_WARN_STEPS || elapsed >= SCANNER_SLOW_WARN_DURATION {
+        warn!(
+            path = %path.display(),
+            ?kind,
+            scan_mode = "short_relocation",
+            short_lengths = ?short_lengths,
+            short_lengths_attempted = short_lengths.len(),
+            windows_stepped = stats.windows_stepped,
+            bytes_reread = stats.bytes_read,
+            blocks_placed = stats.blocks_placed,
+            elapsed_ms = elapsed.as_millis(),
+            "slow par2 short-block relocation scan"
+        );
+    }
+}
+
+fn log_short_relocation_pass(
+    candidates_considered: usize,
+    candidates_scanned: u32,
+    candidates_skipped: u32,
+    open_short_blocks: usize,
+    stats: &ShortRelocationStats,
+    elapsed: Duration,
+) {
+    debug!(
+        candidates_considered,
+        candidates_scanned,
+        candidates_skipped,
+        open_short_blocks,
+        windows_stepped = stats.windows_stepped,
+        bytes_reread = stats.bytes_read,
+        blocks_placed = stats.blocks_placed,
+        elapsed_ms = elapsed.as_millis(),
+        "completed par2 short-block relocation pass"
+    );
+
+    if stats.windows_stepped >= SCANNER_SLOW_WARN_STEPS || elapsed >= SCANNER_SLOW_WARN_DURATION {
+        warn!(
+            candidates_considered,
+            candidates_scanned,
+            candidates_skipped,
+            open_short_blocks,
+            windows_stepped = stats.windows_stepped,
+            bytes_reread = stats.bytes_read,
+            blocks_placed = stats.blocks_placed,
+            elapsed_ms = elapsed.as_millis(),
+            "slow par2 short-block relocation pass"
         );
     }
 }
@@ -5613,42 +5973,106 @@ fn scan_short_blocks_from_file(
         }
     }
 
-    scan_shifted_short_blocks_from_file(table, path, kind, blocks, len)?;
-
     Ok(())
 }
 
+/// Everything the exhaustive short-block relocation search works on for one
+/// candidate: the table it matches against, the candidate it re-reads, the set
+/// of short blocks whose placement is still open, the shared block state it
+/// records into, and its own accounting.
+struct ShortRelocationScan<'a, 'blocks> {
+    table: &'a VerificationHashTable,
+    path: &'a Path,
+    kind: BlockLocationKind,
+    /// Indexed by block index; `true` for a short block still worth hunting.
+    open: &'a [bool],
+    blocks: &'a mut ScanBlockState<'blocks>,
+    stats: &'a mut ShortRelocationStats,
+}
+
+/// The per-length constants of one relocation sweep, hoisted out of the
+/// window loop.
+struct ShortWindowParams<'a> {
+    short_len: usize,
+    zero_combine: &'a checksum::Crc32CombineOp,
+    zero_crc: u32,
+    window_table: &'a [u32; 256],
+}
+
+/// Sweep one candidate for every still-open short length that fits in it.
+/// Returns the lengths it attempted, for logging.
 fn scan_shifted_short_blocks_from_file(
-    table: &VerificationHashTable,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut ScanBlockState<'_>,
+    scan: &mut ShortRelocationScan<'_, '_>,
     len: usize,
-) -> Result<()> {
-    let lengths = unmatched_short_lengths(table, blocks, len);
-    for short_len in lengths {
-        scan_shifted_short_len_from_file(table, path, kind, blocks, len, short_len)?;
+) -> Result<Vec<usize>> {
+    let lengths = open_short_lengths(scan.table, scan.blocks, scan.open, len);
+    for short_len in &lengths {
+        scan_shifted_short_len_from_file(scan, len, *short_len)?;
     }
 
-    Ok(())
+    Ok(lengths)
 }
 
-fn scan_shifted_short_blocks_from_slice(
-    table: &VerificationHashTable,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut ScanBlockState<'_>,
-    data: &[u8],
-) {
-    let lengths = unmatched_short_lengths(table, blocks, data.len());
-    for short_len in lengths {
-        scan_shifted_short_len_from_slice(table, path, kind, blocks, data, short_len);
-    }
-}
-
-fn unmatched_short_lengths(
+/// Short block placements the relocation search is still allowed to improve.
+///
+/// A short block already sitting at its own slice offset is settled: whichever
+/// container it was found in is a positional copy of its file — the file
+/// itself, or a renamed or obfuscated copy of it — so the block is exactly
+/// where it belongs and the same MD5-verified bytes found elsewhere could only
+/// be an equivalent source. Hunting for it again is pure cost, and it is that
+/// cost, repeated per candidate, that made a healthy multi-file set quadratic.
+///
+/// A placement at any other offset stays open, so a better placement can still
+/// displace it exactly as it could when every candidate searched its own
+/// snapshot and the merge arbitrated between them.
+fn open_short_blocks(
     table: &VerificationHashTable,
     blocks: &ScanBlockState<'_>,
+    slice_size: u64,
+) -> Vec<bool> {
+    let mut open = vec![false; blocks.baseline().len()];
+    for block_index in &table.short_blocks {
+        open[*block_index] = !short_block_is_settled(blocks, *block_index, slice_size);
+    }
+    open
+}
+
+fn short_block_is_settled(
+    blocks: &ScanBlockState<'_>,
+    block_index: usize,
+    slice_size: u64,
+) -> bool {
+    let Some(location) = blocks.location(block_index) else {
+        return false;
+    };
+    let block = blocks.block(block_index);
+    location.offset == u64::from(block.local_index).saturating_mul(slice_size)
+        && location.len == block.expected_len
+}
+
+/// Total bytes the merged spans cover, merging overlaps. Sorts in place.
+fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
+    spans.sort_unstable();
+    let mut covered = 0u64;
+    let mut reach = 0u64;
+    for (offset, len) in spans.iter() {
+        let end = offset.saturating_add(*len);
+        let start = (*offset).max(reach);
+        if end > start {
+            covered = covered.saturating_add(end - start);
+            reach = end;
+        }
+    }
+    covered
+}
+
+/// The distinct short lengths still worth sweeping a `len`-byte candidate for.
+/// Deduping by length is what makes the sweep affordable: one pass over the
+/// candidate answers every open short block of that length at once.
+fn open_short_lengths(
+    table: &VerificationHashTable,
+    blocks: &ScanBlockState<'_>,
+    open: &[bool],
     len: usize,
 ) -> Vec<usize> {
     let mut lengths: Vec<usize> = table
@@ -5657,7 +6081,7 @@ fn unmatched_short_lengths(
         .filter_map(|block_index| {
             let block = blocks.block(*block_index);
             let short_len = block.expected_len as usize;
-            (blocks.location(*block_index).is_none() && short_len > 0 && short_len <= len)
+            (open.get(*block_index).copied().unwrap_or(false) && short_len > 0 && short_len <= len)
                 .then_some(short_len)
         })
         .collect();
@@ -5667,21 +6091,21 @@ fn unmatched_short_lengths(
 }
 
 fn scan_shifted_short_len_from_file(
-    table: &VerificationHashTable,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut ScanBlockState<'_>,
+    scan: &mut ShortRelocationScan<'_, '_>,
     len: usize,
     short_len: usize,
 ) -> Result<()> {
     if short_len == 0 || short_len > len {
         return Ok(());
     }
+    let table = scan.table;
+    let path = scan.path;
 
     if short_len > SCANNER_IO_TARGET_BYTES {
         let file = File::open(path)?;
         let map = MappedFile::map(&file)?;
-        scan_shifted_short_len_from_slice(table, path, kind, blocks, &map, short_len);
+        scan.stats.bytes_read = scan.stats.bytes_read.saturating_add(map.len() as u64);
+        scan_shifted_short_len_from_slice(scan, &map, short_len);
         drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         return Ok(());
@@ -5714,19 +6138,19 @@ fn scan_shifted_short_len_from_file(
         let read_len = file.read(&mut buffer[valid_len..])?;
         total_read += read_len;
         valid_len += read_len;
+        scan.stats.bytes_read = scan.stats.bytes_read.saturating_add(read_len as u64);
 
         scan_shifted_short_windows(
-            table,
+            scan,
+            &ShortWindowParams {
+                short_len,
+                zero_combine: &zero_combine,
+                zero_crc,
+                window_table: &window_table,
+            },
             &buffer[..valid_len],
             base_offset,
             &mut next_unscanned_offset,
-            path,
-            kind,
-            blocks,
-            short_len,
-            &zero_combine,
-            zero_crc,
-            &window_table,
         );
 
         if read_len == 0 {
@@ -5739,10 +6163,7 @@ fn scan_shifted_short_len_from_file(
 }
 
 fn scan_shifted_short_len_from_slice(
-    table: &VerificationHashTable,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut ScanBlockState<'_>,
+    scan: &mut ShortRelocationScan<'_, '_>,
     data: &[u8],
     short_len: usize,
 ) {
@@ -5750,40 +6171,41 @@ fn scan_shifted_short_len_from_slice(
         return;
     }
 
-    let pad_len = table.slice_size.saturating_sub(short_len as u64);
+    let pad_len = scan.table.slice_size.saturating_sub(short_len as u64);
     let zero_crc = crc32_zeros(pad_len);
     let zero_combine = checksum::Crc32CombineOp::new(pad_len);
     let window_table = generate_window_table(short_len as u64);
     let mut next_unscanned_offset = 0usize;
     scan_shifted_short_windows(
-        table,
+        scan,
+        &ShortWindowParams {
+            short_len,
+            zero_combine: &zero_combine,
+            zero_crc,
+            window_table: &window_table,
+        },
         data,
         0,
         &mut next_unscanned_offset,
-        path,
-        kind,
-        blocks,
-        short_len,
-        &zero_combine,
-        zero_crc,
-        &window_table,
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scan_shifted_short_windows(
-    table: &VerificationHashTable,
+    scan: &mut ShortRelocationScan<'_, '_>,
+    params: &ShortWindowParams<'_>,
     buffer: &[u8],
     base_offset: usize,
     next_unscanned_offset: &mut usize,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut ScanBlockState<'_>,
-    short_len: usize,
-    zero_combine: &checksum::Crc32CombineOp,
-    zero_crc: u32,
-    window_table: &[u32; 256],
 ) {
+    let ShortWindowParams {
+        short_len,
+        zero_combine,
+        zero_crc,
+        window_table,
+    } = *params;
+    let table = scan.table;
+    let path = scan.path;
+    let kind = scan.kind;
     if short_len == 0 || buffer.len() < short_len {
         return;
     }
@@ -5795,21 +6217,28 @@ fn scan_shifted_short_windows(
     }
 
     let mut crc = checksum::crc32(&buffer[local_offset..local_offset + short_len]);
+    let mut windows_stepped = 0u64;
     loop {
         let padded_crc = zero_combine.combine(crc, zero_crc);
         if let Some(candidates) = table.by_crc.get(&padded_crc) {
             let data = &buffer[local_offset..local_offset + short_len];
             let absolute_offset = (base_offset + local_offset) as u64;
             for block_index in candidates {
-                let block = blocks.block(*block_index);
-                if blocks.location(*block_index).is_some()
+                let block = scan.blocks.block(*block_index);
+                // Gating on the recording guard, not only on `open`, keeps the
+                // sweep from taking a hold it is not allowed to displace — an
+                // access-backed one above all — and skips the MD5 confirmation
+                // for any block whose placement could not have stood anyway.
+                if !scan.open.get(*block_index).copied().unwrap_or(false)
                     || block.expected_len as usize != short_len
+                    || !can_record_block_location(scan.blocks, *block_index, path, kind)
                 {
                     continue;
                 }
                 if short_block_matches(data, table.slice_size, block) {
+                    scan.stats.blocks_placed = scan.stats.blocks_placed.saturating_add(1);
                     record_block_location(
-                        blocks,
+                        scan.blocks,
                         *block_index,
                         BlockLocation {
                             source: SourceLocation::Path(path.to_path_buf()),
@@ -5833,8 +6262,10 @@ fn scan_shifted_short_windows(
             window_table,
         );
         local_offset += 1;
+        windows_stepped += 1;
     }
 
+    scan.stats.windows_stepped = scan.stats.windows_stepped.saturating_add(windows_stepped);
     *next_unscanned_offset = base_offset + last_local_offset + 1;
 }
 
@@ -9908,6 +10339,432 @@ mod tests {
             Some(dir.path().join("interior.bin").as_path())
         );
         assert_eq!(location.offset, 4);
+    }
+
+    /// Distinct pseudo-random bytes per seed, so no two synthetic files ever
+    /// share block content by accident.
+    fn relocation_filler(seed: u64, len: usize) -> Vec<u8> {
+        let mut value = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                value ^= value << 13;
+                value ^= value >> 7;
+                value ^= value << 17;
+                (value & 0xFF) as u8
+            })
+            .collect()
+    }
+
+    /// A set of `count` files, each `full_slices` whole slices plus a terminal
+    /// short slice of `short_len` bytes, written to disk under their canonical
+    /// names with one whole slice corrupted so no whole-file hash match can
+    /// short-circuit the block scan.
+    fn damaged_canonical_short_block_set(
+        dir: &Path,
+        slice_size: u64,
+        full_slices: usize,
+        tails: &[usize],
+    ) -> Par2FileSet {
+        let sources = tails
+            .iter()
+            .enumerate()
+            .map(|(index, tail)| {
+                (
+                    format!("part{index}.bin"),
+                    relocation_filler(index as u64 + 1, full_slices * slice_size as usize + tail),
+                )
+            })
+            .collect::<Vec<_>>();
+        let described = sources
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect::<Vec<_>>();
+        let set = synthetic_set(&described, slice_size);
+        for (name, data) in &sources {
+            let mut damaged = data.clone();
+            damaged[slice_size as usize..2 * slice_size as usize].fill(0xEE);
+            fs::write(dir.join(name), damaged).unwrap();
+        }
+        set
+    }
+
+    fn short_block_of<'a>(state: &'a RepairState, safe_name: &str) -> &'a SourceBlock {
+        let file = state
+            .files
+            .iter()
+            .find(|file| file.safe_name == safe_name)
+            .expect("described file");
+        &state.blocks[file.first_block + file.block_count - 1]
+    }
+
+    fn distinct_short_lengths(state: &RepairState) -> Vec<u64> {
+        let mut lengths = state
+            .hash_table
+            .short_blocks
+            .iter()
+            .map(|index| state.blocks[*index].expected_len)
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        lengths.dedup();
+        lengths
+    }
+
+    /// The common case, and the shape that used to be quadratic: every file
+    /// carries a terminal short block at its own slice offset, so the targeted
+    /// checks place all of them and the exhaustive relocation search is never
+    /// entered — even though every candidate is damaged elsewhere and so still
+    /// holds unexplained bytes.
+    #[test]
+    fn canonical_terminal_short_blocks_never_enter_the_relocation_search() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let set = damaged_canonical_short_block_set(dir.path(), slice_size, 3, &[21, 21, 21, 21]);
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        assert_eq!(distinct_short_lengths(&state), vec![21]);
+        for index in 0..4 {
+            let block = short_block_of(&state, &format!("part{index}.bin"));
+            let location = block
+                .location
+                .as_ref()
+                .expect("terminal short block placed");
+            assert_eq!(location.offset, 3 * slice_size);
+            assert_eq!(
+                location.path(),
+                Some(dir.path().join(format!("part{index}.bin")).as_path())
+            );
+        }
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 0);
+        assert_eq!(diagnostics.short_relocation_windows_stepped, 0);
+        assert_eq!(diagnostics.short_relocation_bytes_read, 0);
+    }
+
+    /// The measured production shape: many files sharing one short length plus
+    /// a final file with a different one. Two distinct lengths used to mean two
+    /// whole-file sweeps *per candidate*; now they mean none.
+    #[test]
+    fn two_distinct_short_lengths_never_enter_the_relocation_search() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let set = damaged_canonical_short_block_set(dir.path(), slice_size, 3, &[21, 21, 21, 37]);
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        assert_eq!(distinct_short_lengths(&state), vec![21, 37]);
+        for index in 0..4 {
+            let block = short_block_of(&state, &format!("part{index}.bin"));
+            let location = block
+                .location
+                .as_ref()
+                .expect("terminal short block placed");
+            assert_eq!(location.offset, 3 * slice_size);
+        }
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 0);
+        assert_eq!(diagnostics.short_relocation_windows_stepped, 0);
+    }
+
+    /// A fully obfuscated download: no canonical name exists, so every file is
+    /// an extra candidate and every short block is unplaced when the candidate
+    /// scan starts. The tail check still places each one at its own slice
+    /// offset inside its renamed container, so the merged state closes them all
+    /// and no candidate is swept. This is the second-pass blow-up case.
+    #[test]
+    fn an_all_obfuscated_set_never_enters_the_relocation_search() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let sources = (0..4u64)
+            .map(|index| {
+                (
+                    format!("part{index}.bin"),
+                    relocation_filler(index + 1, 3 * slice_size as usize + 21),
+                )
+            })
+            .collect::<Vec<_>>();
+        let described = sources
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect::<Vec<_>>();
+        let set = synthetic_set(&described, slice_size);
+        for (index, (_, data)) in sources.iter().enumerate() {
+            let mut damaged = data.clone();
+            damaged[slice_size as usize..2 * slice_size as usize].fill(0xEE);
+            fs::write(dir.path().join(format!("{index:02}.obfuscated")), damaged).unwrap();
+        }
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        for index in 0..4 {
+            let block = short_block_of(&state, &format!("part{index}.bin"));
+            let location = block
+                .location
+                .as_ref()
+                .expect("terminal short block placed");
+            assert_eq!(location.offset, 3 * slice_size);
+            assert_eq!(
+                location.path(),
+                Some(dir.path().join(format!("{index:02}.obfuscated")).as_path())
+            );
+            assert_eq!(location.kind, BlockLocationKind::Extra);
+        }
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 0);
+        assert_eq!(diagnostics.short_relocation_windows_stepped, 0);
+    }
+
+    /// The structural guard behind every counter assertion above: none of the
+    /// per-candidate scan entry points runs the exhaustive relocation search
+    /// itself. Each one scans a private pre-merge snapshot, so a search there
+    /// cannot see what other candidates already placed — which is exactly how
+    /// it became quadratic. A displaced short block must therefore survive the
+    /// scan phase unplaced, and be found only when the deferred pass asks.
+    #[test]
+    fn the_candidate_scan_phase_defers_the_relocation_search() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEFGH12345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, b"ABCDEFGHxx12345JUNK").unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let lookup = SourceFileScanLookup {
+            files: &state.files,
+            file_index_by_id: &state.file_index_by_id,
+        };
+        let target_file = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == candidate)
+            .expect("described file");
+
+        let mut generic = ScanBlockState::new(&baseline);
+        scanner
+            .scan_file_with_state_options(
+                &candidate,
+                BlockLocationKind::Canonical,
+                &state.files,
+                &state.file_index_by_id,
+                &mut generic,
+                ScanSkipOptions::disabled(),
+            )
+            .unwrap();
+        let mut ordered = ScanBlockState::new(&baseline);
+        scanner
+            .scan_file_ordered_canonical_state(
+                &candidate,
+                BlockLocationKind::Canonical,
+                lookup,
+                target_file,
+                &mut ordered,
+                ScanSkipOptions::disabled(),
+                true,
+                DEFAULT_REPAIR_MEMORY_LIMIT,
+                None,
+            )
+            .unwrap();
+        let mut mapped = ScanBlockState::new(&baseline);
+        scanner
+            .scan_file_mmap_with_state_options(
+                &candidate,
+                BlockLocationKind::Canonical,
+                &state.files,
+                &state.file_index_by_id,
+                &mut mapped,
+                ScanSkipOptions::disabled(),
+            )
+            .unwrap();
+
+        for scanned in [&generic, &ordered, &mapped] {
+            assert!(scanned.location(0).is_some(), "aligned block still placed");
+            assert!(
+                scanned.location(1).is_none(),
+                "scan phase must not relocate short blocks"
+            );
+        }
+
+        let stats = scanner
+            .relocate_open_short_blocks_in(&candidate, BlockLocationKind::Canonical, &mut generic)
+            .unwrap();
+
+        assert_eq!(stats.blocks_placed, 1);
+        assert!(stats.windows_stepped > 0);
+        assert!(stats.bytes_read > 0);
+        assert_eq!(
+            generic.location(1).map(|location| location.offset),
+            Some(10)
+        );
+    }
+
+    /// Scanning only ever produces path locations, so an access-backed hold —
+    /// evidence no scan could have made — must survive a scan match rather
+    /// than lose to one. The relocation sweep is the one recording site that
+    /// could break that: "open" means only that a hold is not at the block's
+    /// own slice offset, and an access-backed hold at any other offset is
+    /// open. The sweep must decline it even with matching bytes in hand.
+    #[test]
+    fn relocation_never_displaces_an_access_backed_incumbent() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEFGH12345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, b"ABCDEFGHxx12345JUNK").unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+
+        let mut baseline = state.blocks.clone();
+        let held = BlockLocation {
+            source: SourceLocation::Access(baseline[1].file_id),
+            offset: 3,
+            len: baseline[1].expected_len,
+            kind: BlockLocationKind::Canonical,
+        };
+        assert_ne!(
+            held.offset,
+            u64::from(baseline[1].local_index) * state.set.slice_size,
+            "the hold must not be at the block's own slice offset"
+        );
+        baseline[1].location = Some(held.clone());
+
+        let mut blocks = ScanBlockState::new(&baseline);
+        assert!(
+            open_short_blocks(&state.hash_table, &blocks, state.set.slice_size)[1],
+            "a hold away from the block's slice offset leaves it open"
+        );
+
+        let stats = scanner
+            .relocate_open_short_blocks_in(&candidate, BlockLocationKind::Canonical, &mut blocks)
+            .unwrap();
+
+        assert!(
+            stats.windows_stepped > 0,
+            "the candidate carrying the matching bytes really was swept"
+        );
+        assert_eq!(stats.blocks_placed, 0);
+        assert_eq!(blocks.location(1), Some(&held));
+    }
+
+    /// The regression a plain "canonical candidates skip the search" gate would
+    /// cause: the short block really is displaced inside its own canonically
+    /// named file, so neither the owner-offset check nor the tail check reaches
+    /// it and only the deferred search can.
+    #[test]
+    fn a_shifted_short_block_inside_a_canonical_file_is_still_found() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEFGH12345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        fs::write(dir.path().join("target.bin"), b"ABCDEFGHxx12345JUNK").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        let location = short_block_of(&state, "target.bin")
+            .location
+            .as_ref()
+            .expect("displaced short block placed");
+        assert_eq!(
+            location.path(),
+            Some(dir.path().join("target.bin").as_path())
+        );
+        assert_eq!(location.offset, 10);
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 1);
+        assert_eq!(diagnostics.short_relocation_blocks_placed, 1);
+        assert!(diagnostics.short_relocation_windows_stepped > 0);
+        assert!(diagnostics.short_relocation_bytes_read > 0);
+    }
+
+    /// The same displacement in an obfuscated extra file: the owning file is
+    /// gone and the copy carries a trailing suffix, so the short block sits at
+    /// neither the owner offset nor the candidate tail.
+    #[test]
+    fn a_shifted_short_block_inside_an_extra_file_is_still_found() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEFGH12345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        fs::write(dir.path().join("obfuscated.dat"), b"xxABCDEFGH12345TRAILER").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        let location = short_block_of(&state, "target.bin")
+            .location
+            .as_ref()
+            .expect("displaced short block placed");
+        assert_eq!(
+            location.path(),
+            Some(dir.path().join("obfuscated.dat").as_path())
+        );
+        assert_eq!(location.offset, 10);
+        assert_eq!(location.kind, BlockLocationKind::Extra);
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 1);
+        assert_eq!(diagnostics.short_relocation_blocks_placed, 1);
+    }
+
+    /// Two equally valid copies: the search runs in candidate order and stops
+    /// as soon as the block is settled, so the first candidate wins and the
+    /// second is never swept.
+    #[test]
+    fn relocation_settles_on_the_first_candidate_that_carries_the_block() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEFGH12345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        fs::write(dir.path().join("aaa.dat"), b"ABCDEFGH12345TRAILER").unwrap();
+        fs::write(dir.path().join("zzz.dat"), b"ABCDEFGH12345TRAILER").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        let location = short_block_of(&state, "target.bin")
+            .location
+            .as_ref()
+            .expect("displaced short block placed");
+        assert_eq!(location.path(), Some(dir.path().join("aaa.dat").as_path()));
+        assert_eq!(location.offset, 8);
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 1);
+    }
+
+    /// A short block whose owner is missing outright stays unplaced, and the
+    /// one candidate the pass could have swept is skipped because the merged
+    /// state already accounts for every byte of it. This is the guard: an
+    /// unresolvable short block must not turn intact candidates into work.
+    #[test]
+    fn an_explained_candidate_is_never_swept_for_a_missing_short_block() {
+        let dir = tempdir().unwrap();
+        // Large enough that the canonical whole-file hash check is skipped, so
+        // the intact file really does reach the block scan and become a
+        // relocation target rather than an early complete-file match.
+        let slice_size = 256 * 1024u64;
+        let present = relocation_filler(1, 4 * slice_size as usize + 1000);
+        let absent = relocation_filler(2, slice_size as usize + 77);
+        let set = synthetic_set(
+            &[("present.bin", &present), ("absent.bin", &absent)],
+            slice_size,
+        );
+        fs::write(dir.path().join("present.bin"), &present).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        assert_eq!(
+            short_block_of(&state, "present.bin")
+                .location
+                .as_ref()
+                .map(|location| location.offset),
+            Some(4 * slice_size)
+        );
+        assert!(short_block_of(&state, "absent.bin").location.is_none());
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 0);
+        assert_eq!(diagnostics.short_relocation_candidates_skipped, 1);
+        assert_eq!(diagnostics.short_relocation_windows_stepped, 0);
     }
 
     #[test]

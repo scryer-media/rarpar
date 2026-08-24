@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.3
+
+### Public API
+
+- `avx512bmm_detected` reports the AMD AVX512BMM CPUID feature, and
+  `avx512bmm_enabled` reports whether its kernel tier may run. The tier remains
+  deliberately disabled until a bit-exact kernel is implemented and validated,
+  so dispatch behavior is unchanged on every current CPU.
+
 
 ## 0.4.2
 
@@ -166,4 +175,3 @@ runner methods.
 - Packed AVX2 generation uses bounded fixed slots and runtime CPU dispatch;
   release binaries are not specialized with `target-cpu`.
 - The declared minimum supported Rust version is 1.97.1.
-
