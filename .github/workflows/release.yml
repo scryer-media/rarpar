@@ -157,8 +157,8 @@ jobs:
           )
           dependencies = {dep["name"]: dep for dep in package["dependencies"]}
           expected_requirements = {
-              "par2-rs": "^0.5.0",
-              "unrar-rs": "^0.5.4",
+              "par2-rs": "^0.6.0",
+              "unrar-rs": "^0.5.5",
           }
           for name, expected_requirement in expected_requirements.items():
               dep = dependencies.get(name)
@@ -184,7 +184,7 @@ jobs:
               for package in metadata["packages"]
               if package["name"] in expected_requirements
           }
-          expected_versions = {"par2-rs": "0.5.0", "unrar-rs": "0.5.4"}
+          expected_versions = {"par2-rs": "0.6.0", "unrar-rs": "0.5.5"}
           if resolved != expected_versions:
               print(
                   f"packaged rarpar resolved {resolved}, expected {expected_versions}",
