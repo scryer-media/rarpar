@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "criterion",
  "memmap2",
@@ -4066,7 +4066,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "blake3",
  "clap",

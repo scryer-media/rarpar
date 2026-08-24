@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0
+
+This release defers short-block relocation until candidate scans have merged,
+so a block already found by another candidate is not searched for repeatedly.
+The result preserves the exhaustive relocation search for candidates with
+unexplained bytes while avoiding quadratic re-reads in obfuscated sets.
+
+### Breaking changes
+
+- `ScanDiagnostics` adds relocation-search counters: candidates scanned and
+  skipped, rolling windows stepped, bytes re-read, and blocks placed. Because
+  the public struct can be constructed exhaustively, callers using struct
+  literals must add these fields or use `..Default::default()`.
+
+### Runtime behavior
+
+- Repair scans now merge candidate results before relocating remaining short
+  blocks. Diagnostics make the deferred search's work visible and cancellation
+  remains checked before each candidate is re-read.
+
 
 ## 0.5.0
 
@@ -349,4 +369,3 @@ well as the migration items below.
   accounting.
 - Repair output is staged until compute and content verification succeed.
 - The declared minimum supported Rust version is 1.97.1.
-
