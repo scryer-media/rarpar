@@ -148,6 +148,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_SHA: ${{ github.sha }}
+          PUBLISH_PACKAGE: ${{ inputs.package }}
         run: |
           set -euo pipefail
           case "$PUBLISH_PACKAGE" in
