@@ -35,13 +35,14 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::error::Par2Error;
-use crate::evidence::CommittedFileEvidence;
+use crate::evidence::{CommittedFileEvidence, FileStatFingerprint};
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
 use crate::par2_set::{MergeResult, Par2FileSet};
 use crate::repair::{DEFAULT_REPAIR_MEMORY_LIMIT, repair_matrix_resource_limit_reason};
 use crate::repairer::{
-    PacketDiagnostics, Par2RepairOutcome, Par2RepairStatus, Par2Repairer, Par2RepairerOptions,
-    RepairInstall, RepairState, RepairVerificationAccess, ScanDiagnostics, SourceLocation,
+    EvidenceScanTrust, PacketDiagnostics, Par2RepairOutcome, Par2RepairStatus, Par2Repairer,
+    Par2RepairerOptions, RepairInstall, RepairState, RepairVerificationAccess, ScanDiagnostics,
+    SourceLocation, stat_fingerprint,
 };
 use crate::session::SliceEvidence;
 use crate::types::{CancellationToken, FileId, ProgressCallback};
@@ -95,6 +96,43 @@ pub struct Par2RepairSessionOptions {
     pub rename_only: bool,
     pub scan_skip_data: bool,
     pub scan_skip_leeway: u64,
+    /// Let the analysis scan seek past byte ranges that seeded slice evidence
+    /// has already located, instead of reading and re-hashing them.
+    ///
+    /// `false` — the default — reads every candidate file in full, exactly as
+    /// every release before this option did. Turning it on is a statement about
+    /// the host's evidence, not about this crate: a damaged file's scan then
+    /// reads only the ranges no verdict accounts for, and the verdicts that
+    /// covered the rest are taken as given.
+    ///
+    /// What still holds when it is on:
+    ///
+    /// - Only evidence admitted by [`SliceEvidence::may_seed_repair_input`] can
+    ///   settle anything, and only where the block it names is already located
+    ///   at that path and offset. A skip can never drop a block.
+    /// - Each verdict carries the stat fingerprint its path had when it was
+    ///   admitted — length, mtime, and on Unix device and inode. The file is
+    ///   re-stat'd immediately before its scan, and any verdict whose
+    ///   fingerprint no longer matches is refused: that file is read in full,
+    ///   with no error and no partial trust.
+    /// - Repair is untouched. This governs analysis reads only; repair inputs
+    ///   still go through their own validated read paths.
+    /// - [`ScanDiagnostics::bytes_skipped_by_evidence`] and
+    ///   [`ScanDiagnostics::slices_settled_by_evidence`] are non-zero whenever
+    ///   an outcome was reached without reading its sources in full.
+    ///
+    /// What does not hold: a verdict that is simply *wrong* about bytes that
+    /// never moved is believed. `stat` cannot see that, and with this on
+    /// nothing re-reads to catch it. That is the trade being made.
+    ///
+    /// Seed verdicts against a settled file. A host that feeds them while the
+    /// file is still being written will find most of them refused at scan time,
+    /// because the fingerprint each was admitted against no longer matches.
+    ///
+    /// [`SliceEvidence::may_seed_repair_input`]: crate::SliceEvidence::may_seed_repair_input
+    /// [`ScanDiagnostics::bytes_skipped_by_evidence`]: crate::ScanDiagnostics::bytes_skipped_by_evidence
+    /// [`ScanDiagnostics::slices_settled_by_evidence`]: crate::ScanDiagnostics::slices_settled_by_evidence
+    pub trust_seeded_evidence_for_scan: bool,
     pub cancel: Option<CancellationToken>,
     pub progress: Option<ProgressCallback>,
     /// Handle serving this set's sources. `None` — the default — reads sources
@@ -197,6 +235,7 @@ impl Default for Par2RepairSessionOptions {
             rename_only: false,
             scan_skip_data: false,
             scan_skip_leeway: 64,
+            trust_seeded_evidence_for_scan: false,
             cancel: None,
             progress: None,
             source_access: None,
@@ -263,6 +302,16 @@ pub enum Par2SessionError {
 struct RetainedSliceEvidence {
     source: SourceLocation,
     valid: bool,
+    /// What `stat` said about the path when this verdict was admitted, or
+    /// `None` when there was nothing to fingerprint: an access-backed source,
+    /// a path that could not be stat'd, or — the ordinary case — a session
+    /// that never asked for the scan-skip policy and so has no use for one.
+    ///
+    /// Nothing reads this unless
+    /// [`Par2RepairSessionOptions::trust_seeded_evidence_for_scan`] is set, and
+    /// nothing captures it otherwise, so a default session pays neither the
+    /// syscall nor a change of behaviour.
+    fingerprint: Option<FileStatFingerprint>,
 }
 
 pub struct Par2RepairSession {
@@ -493,13 +542,31 @@ impl Par2RepairSession {
             });
         }
         let key = (evidence.file_id(), evidence.slice_index());
-        let retained = RetainedSliceEvidence {
-            source,
-            valid: evidence.is_valid(),
-        };
-        if self.slice_evidence.get(&key) == Some(&retained) {
+        let valid = evidence.is_valid();
+        // Dedup on the verdict itself, never on the fingerprint. Re-admitting
+        // an identical verdict has always been a no-op, and it stays one: a
+        // fingerprint in the comparison would turn a repeat call after an
+        // mtime change into a re-seed that invalidates the whole path.
+        if self
+            .slice_evidence
+            .get(&key)
+            .is_some_and(|existing| existing.source == source && existing.valid == valid)
+        {
             return Ok(());
         }
+        // Captured here and only here: the state of the path at the moment
+        // this verdict was admitted, which is the only thing the scan-skip gate
+        // can honestly compare a later stat against.
+        let fingerprint = if self.options.trust_seeded_evidence_for_scan {
+            source.path().and_then(stat_fingerprint)
+        } else {
+            None
+        };
+        let retained = RetainedSliceEvidence {
+            source,
+            valid,
+            fingerprint,
+        };
         let Some(location_budget) = self.state.block_location_budget(
             evidence.file_id(),
             evidence.slice_index(),
@@ -569,9 +636,10 @@ impl Par2RepairSession {
         } else if self.sources_scanned {
             self.diagnostics.scan.clone()
         } else {
+            let trust = self.evidence_scan_trust();
             let scan = self
                 .state
-                .scan_unresolved(&repairer_options(&self.options, false))?;
+                .scan_unresolved(&repairer_options(&self.options, false), &trust)?;
             self.sources_scanned = true;
             self.diagnostics.source_scan_passes =
                 self.diagnostics.source_scan_passes.saturating_add(1);
@@ -589,6 +657,33 @@ impl Par2RepairSession {
         self.assessment = Some(assessment.clone());
         self.refresh_diagnostics();
         Ok(assessment)
+    }
+
+    /// The slice verdicts this session is willing to let the scan take on
+    /// trust, with the fingerprint each was admitted against.
+    ///
+    /// Empty unless
+    /// [`Par2RepairSessionOptions::trust_seeded_evidence_for_scan`] is set — no
+    /// fingerprint is captured without it, so there is nothing to offer. Only
+    /// valid, path-keyed verdicts appear: an invalid verdict locates nothing,
+    /// and an access-keyed one belongs to a session that never scans.
+    fn evidence_scan_trust(&self) -> EvidenceScanTrust {
+        let mut trust = EvidenceScanTrust::default();
+        if !self.options.trust_seeded_evidence_for_scan {
+            return trust;
+        }
+        for (&(file_id, slice_index), evidence) in &self.slice_evidence {
+            if !evidence.valid {
+                continue;
+            }
+            let (Some(path), Some(fingerprint)) =
+                (evidence.source.path(), evidence.fingerprint.as_ref())
+            else {
+                continue;
+            };
+            trust.record(file_id, path, slice_index, fingerprint.clone());
+        }
+        trust
     }
 
     /// Return the cached assessment. Call [`Self::analyze`] first.

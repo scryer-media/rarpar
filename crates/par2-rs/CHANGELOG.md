@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.7.1
+
+A host that has already vouched for most of a damaged file no longer has to
+watch the analysis read it again. The new opt-in
+`Par2RepairSessionOptions::trust_seeded_evidence_for_scan` lets the ordered
+canonical scan seek past the byte ranges of slices seeded evidence has already
+located, so a damaged candidate's scan reads only the ranges no verdict
+accounts for.
+
+**Semver: additive, 0.7.x-minor material.** Every new item lands under an
+existing `#[non_exhaustive]` umbrella — the option on
+`Par2RepairSessionOptions` and the two counters on `ScanDiagnostics`, both of
+which have been `#[non_exhaustive]` since 0.7.0. No public signature changed,
+no variant was added, and `Par2RepairerOptions` — the one options type callers
+can still build exhaustively — is untouched. Nothing here needs a major bump.
+
+### Added
+
+- `Par2RepairSessionOptions::trust_seeded_evidence_for_scan`, default `false`.
+  With it off, behaviour, reads, verdicts and diagnostics are exactly what they
+  were: no fingerprint is captured, no plan is built, and no scan path changes.
+  The `rarpar` CLI does not set it.
+- `ScanDiagnostics::slices_settled_by_evidence` and
+  `ScanDiagnostics::bytes_skipped_by_evidence`. Both stay zero without the
+  opt-in. A non-zero value is the disclosure that an outcome was reached
+  without reading its sources in full; `bytes_scanned` now excludes what was
+  skipped, so the two sum to the candidate's length.
+
+### Runtime behaviour with the option on
+
+- A slice is settled only when seeded evidence named it for exactly the path
+  being scanned, the block is a full slice, and the scan state already holds a
+  location for it at that path and offset. A skip therefore cannot drop a
+  block: the block it declines to look for is already placed.
+- Every path-keyed slice verdict records the stat fingerprint its path carried
+  when it was admitted — length, mtime, and on Unix device and inode. The file
+  is re-stat'd immediately before its scan, and any verdict whose fingerprint
+  no longer matches is refused: that candidate is read in full, with no error
+  and no partial trust.
+- The skip is scoped to the ordered canonical scan, which is the path a damaged
+  source file takes. Extra candidates, the generic rolling scanner and the
+  whole-file hash probe are untouched. A file with honoured skips takes the
+  serial ordered scanner rather than the parallel one, for the same reason
+  skip-data sampling already does: the parallel scan's first phase reads every
+  aligned window up front.
+- Repair is unaffected. This governs analysis reads only; repair inputs still
+  go through their existing validated read paths.
+- What the option buys is what it costs: a verdict that is wrong about bytes
+  that never moved is believed, because nothing re-reads to catch it. Seed
+  verdicts against a settled file — verdicts fed while a file is still being
+  written carry fingerprints that no longer match by scan time, and are
+  refused.
+
 ## 0.7.0
 
 A carried analysis that reaches a repair no longer throws itself away. Before

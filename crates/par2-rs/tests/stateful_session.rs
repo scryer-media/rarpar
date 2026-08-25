@@ -4,9 +4,10 @@ mod benchmark_support;
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use benchmark_support::{crate_bench_scenarios, stage_scenario};
 use par2_rs::checksum::{self, SliceChecksumState};
@@ -659,4 +660,306 @@ fn file_keyed_slice_evidence_requires_an_access_backed_session() {
         session.add_slice_evidence_for_file(evidence),
         Err(Par2SessionError::InvalidState { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in seeded-evidence scan skipping
+// ---------------------------------------------------------------------------
+
+const SKIP_SLICE_SIZE: u64 = 64 * 1024;
+const SKIP_SLICE_COUNT: usize = 20;
+/// The one slice damaged on disk in every fixture below.
+const SKIP_DAMAGED_SLICE: usize = 7;
+
+/// A one-file set whose payload is comfortably past the whole-file-hash probe
+/// threshold, so the ordered canonical block scan is the only thing that reads
+/// the candidate and the byte counters describe it alone.
+fn skip_policy_fixture() -> (VirtualSet, Vec<u8>, PathBuf) {
+    let mut payload = vec![0u8; SKIP_SLICE_COUNT * SKIP_SLICE_SIZE as usize];
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for byte in payload.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    let set = build_virtual_set(&payload, SKIP_SLICE_SIZE, 2);
+    let source_path = set.temp.path().join(&set.filename);
+    (set, payload, source_path)
+}
+
+fn write_damaged_source(source_path: &Path, payload: &[u8], damaged_slices: &[usize]) {
+    let mut damaged = payload.to_vec();
+    for &slice in damaged_slices {
+        let start = slice * SKIP_SLICE_SIZE as usize;
+        damaged[start..start + SKIP_SLICE_SIZE as usize].fill(0x5A);
+    }
+    fs::write(source_path, &damaged).expect("write damaged source");
+}
+
+fn open_skip_session(set: &VirtualSet, trust_seeded_evidence: bool) -> Par2RepairSession {
+    let mut options =
+        Par2RepairSessionOptions::new(set.temp.path().to_path_buf(), vec![set.par2_path.clone()]);
+    options.trust_seeded_evidence_for_scan = trust_seeded_evidence;
+    Par2RepairSession::open(options).expect("open filesystem session")
+}
+
+/// Seed genuine verdicts, taken from the true payload the way a live verifier
+/// would, for every slice in `slices`.
+fn seed_slices(
+    session: &mut Par2RepairSession,
+    set: &VirtualSet,
+    payload: &[u8],
+    source_path: &Path,
+    slices: &[u32],
+) {
+    for evidence in settled_evidence(set, payload, slices) {
+        assert!(evidence.is_valid());
+        session
+            .add_slice_evidence(source_path, evidence)
+            .expect("retain path-keyed slice evidence");
+    }
+}
+
+fn intact_slices() -> Vec<u32> {
+    (0..SKIP_SLICE_COUNT as u32)
+        .filter(|index| *index as usize != SKIP_DAMAGED_SLICE)
+        .collect()
+}
+
+#[test]
+fn the_seeded_evidence_scan_skip_is_off_by_default() {
+    let (set, payload, source) = skip_policy_fixture();
+    write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+
+    let mut session = open_skip_session(&set, false);
+    seed_slices(&mut session, &set, &payload, &source, &intact_slices());
+    let outcome = session.analyze().expect("analyze with the default policy");
+
+    assert_eq!(outcome.status, Par2RepairStatus::RepairPossible);
+    assert_eq!(outcome.missing_blocks, 1);
+    assert_eq!(outcome.scan.files_scanned, 1);
+    assert_eq!(
+        outcome.scan.bytes_scanned,
+        payload.len() as u64,
+        "the default policy reads the candidate in full"
+    );
+    assert_eq!(outcome.scan.slices_settled_by_evidence, 0);
+    assert_eq!(outcome.scan.bytes_skipped_by_evidence, 0);
+}
+
+#[test]
+fn trusted_seeded_evidence_reads_only_the_unclaimed_ranges() {
+    let (set, payload, source) = skip_policy_fixture();
+    write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+
+    // Same directory, same bytes, two sessions: the only difference between
+    // the arms is the policy.
+    let mut baseline = open_skip_session(&set, false);
+    seed_slices(&mut baseline, &set, &payload, &source, &intact_slices());
+    let read_in_full = baseline.analyze().expect("baseline analysis");
+    drop(baseline);
+
+    let mut session = open_skip_session(&set, true);
+    seed_slices(&mut session, &set, &payload, &source, &intact_slices());
+    let with_skips = session.analyze().expect("analysis with trusted evidence");
+
+    assert_eq!(with_skips.status, read_in_full.status);
+    assert_eq!(with_skips.missing_blocks, read_in_full.missing_blocks);
+    assert_eq!(with_skips.available_blocks, read_in_full.available_blocks);
+    assert_eq!(with_skips.files_damaged, read_in_full.files_damaged);
+    assert_eq!(with_skips.files_complete, read_in_full.files_complete);
+    assert_eq!(with_skips.files_missing, read_in_full.files_missing);
+    assert_eq!(with_skips.scan.blocks_found, read_in_full.scan.blocks_found);
+
+    assert_eq!(
+        with_skips.scan.slices_settled_by_evidence,
+        SKIP_SLICE_COUNT as u32 - 1
+    );
+    assert_eq!(
+        with_skips.scan.bytes_scanned + with_skips.scan.bytes_skipped_by_evidence,
+        payload.len() as u64,
+        "every byte of the candidate is either read or accounted for as skipped"
+    );
+    // The damaged slice, plus the window overlap on either side of it, is all
+    // that has to come off the disk.
+    assert!(
+        with_skips.scan.bytes_scanned <= 4 * SKIP_SLICE_SIZE,
+        "expected the read to collapse to the damaged region, got {}",
+        with_skips.scan.bytes_scanned
+    );
+    assert!(with_skips.scan.bytes_scanned < read_in_full.scan.bytes_scanned);
+    eprintln!(
+        "evidence_skip_metrics file_bytes={} read_in_full={} with_skips={} skipped={} slices_settled={}",
+        payload.len(),
+        read_in_full.scan.bytes_scanned,
+        with_skips.scan.bytes_scanned,
+        with_skips.scan.bytes_skipped_by_evidence,
+        with_skips.scan.slices_settled_by_evidence,
+    );
+}
+
+#[test]
+fn the_policy_is_inert_when_no_evidence_was_seeded() {
+    let (set, payload, source) = skip_policy_fixture();
+    write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+
+    let mut baseline = open_skip_session(&set, false);
+    let read_in_full = baseline.analyze().expect("baseline analysis");
+    drop(baseline);
+
+    let mut session = open_skip_session(&set, true);
+    let trusted = session.analyze().expect("trusted-policy analysis");
+
+    assert_eq!(trusted.status, read_in_full.status);
+    assert_eq!(trusted.missing_blocks, read_in_full.missing_blocks);
+    assert_eq!(trusted.available_blocks, read_in_full.available_blocks);
+    assert_eq!(trusted.scan.bytes_scanned, read_in_full.scan.bytes_scanned);
+    assert_eq!(trusted.scan.slices_settled_by_evidence, 0);
+    assert_eq!(trusted.scan.bytes_skipped_by_evidence, 0);
+}
+
+fn bump_modified_time(path: &Path) {
+    let modified = fs::metadata(path).expect("stat").modified().expect("mtime");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for touch");
+    file.set_times(fs::FileTimes::new().set_modified(modified + Duration::from_secs(1)))
+        .expect("set mtime");
+}
+
+/// One way a seeded source can change after its verdicts were admitted, named
+/// for assertion messages.
+type PostSeedingMutation = (&'static str, fn(&Path, &[u8]));
+
+/// Every way of changing a source file after its verdicts were admitted that
+/// the stat gate is required to see.
+fn post_seeding_mutations() -> Vec<PostSeedingMutation> {
+    vec![
+        ("mtime bumped", |path, _| bump_modified_time(path)),
+        ("slice rewritten", |path, payload| {
+            write_damaged_source(path, payload, &[SKIP_DAMAGED_SLICE, 12])
+        }),
+        ("truncated", |path, payload| {
+            let keep = 10 * SKIP_SLICE_SIZE as usize;
+            fs::write(path, &payload[..keep]).expect("truncate source");
+        }),
+    ]
+}
+
+#[test]
+fn a_file_that_changed_after_seeding_loses_every_skip() {
+    for (name, mutate) in post_seeding_mutations() {
+        // The default-policy arm is the reference: a session that changed
+        // under its own evidence reaches some verdict, right or wrong, and the
+        // gate's job is to make the opted-in session reach exactly that one.
+        let (set, payload, source) = skip_policy_fixture();
+        write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+        let mut baseline = open_skip_session(&set, false);
+        seed_slices(&mut baseline, &set, &payload, &source, &intact_slices());
+        mutate(&source, &payload);
+        let read_in_full = baseline.analyze().expect("baseline analysis");
+        drop(baseline);
+
+        let (set, payload, source) = skip_policy_fixture();
+        write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+        let mut session = open_skip_session(&set, true);
+        seed_slices(&mut session, &set, &payload, &source, &intact_slices());
+        mutate(&source, &payload);
+        let outcome = session.analyze().expect("analysis after the file changed");
+
+        assert_eq!(
+            outcome.scan.slices_settled_by_evidence, 0,
+            "{name}: a stale fingerprint must settle nothing"
+        );
+        assert_eq!(
+            outcome.scan.bytes_skipped_by_evidence, 0,
+            "{name}: a stale fingerprint must skip no bytes"
+        );
+        assert_eq!(
+            outcome.scan.bytes_scanned,
+            fs::metadata(&source).expect("stat source").len(),
+            "{name}: the candidate must be read in full"
+        );
+        assert_eq!(
+            outcome.scan.bytes_scanned, read_in_full.scan.bytes_scanned,
+            "{name}: the read must match the default policy"
+        );
+        assert_eq!(
+            outcome.status, read_in_full.status,
+            "{name}: unexpected status"
+        );
+        assert_eq!(
+            outcome.missing_blocks, read_in_full.missing_blocks,
+            "{name}: unexpected verdict"
+        );
+        assert_eq!(
+            outcome.available_blocks, read_in_full.available_blocks,
+            "{name}: unexpected verdict"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_claim_is_trusted_while_the_fingerprint_holds_and_refused_once_it_moves() {
+    // The evidence for the damaged slice is taken from the *true* payload
+    // while the disk holds damage: a verdict that is simply wrong about what
+    // is on disk. Slice 19 is left unnamed so the file stays a scan candidate.
+    let claimed: Vec<u32> = (0..SKIP_SLICE_COUNT as u32 - 1).collect();
+
+    let (set, payload, source) = skip_policy_fixture();
+    write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+    let mut session = open_skip_session(&set, true);
+    seed_slices(&mut session, &set, &payload, &source, &claimed);
+    let trusted = session.analyze().expect("analysis over unchanged bytes");
+
+    // This is what opting in means, stated as an assertion: with the
+    // fingerprint intact the wrong claim is believed and its bytes are never
+    // read. Nothing in this crate re-derives it, which is why the host's
+    // evidence admission bar is where the real check lives.
+    assert!(trusted.scan.slices_settled_by_evidence > 0);
+    assert!(trusted.scan.bytes_skipped_by_evidence > 0);
+
+    // The same wrong claim over a file whose fingerprint moved is refused by
+    // the stat gate: the candidate is read in full instead.
+    let (set, payload, source) = skip_policy_fixture();
+    write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+    let mut session = open_skip_session(&set, true);
+    seed_slices(&mut session, &set, &payload, &source, &claimed);
+    bump_modified_time(&source);
+    let refused = session.analyze().expect("analysis after the file changed");
+
+    assert_eq!(refused.scan.slices_settled_by_evidence, 0);
+    assert_eq!(refused.scan.bytes_skipped_by_evidence, 0);
+    assert_eq!(refused.scan.bytes_scanned, payload.len() as u64);
+}
+
+#[test]
+fn repair_output_is_identical_with_and_without_the_scan_skip_policy() {
+    let mut outputs = Vec::new();
+    for trust_seeded_evidence in [false, true] {
+        let (set, payload, source) = skip_policy_fixture();
+        write_damaged_source(&source, &payload, &[SKIP_DAMAGED_SLICE]);
+
+        let mut session = open_skip_session(&set, trust_seeded_evidence);
+        seed_slices(&mut session, &set, &payload, &source, &intact_slices());
+        let assessment = session.analyze().expect("analyze before repair");
+        assert_eq!(assessment.status, Par2RepairStatus::RepairPossible);
+        assert_eq!(
+            assessment.scan.bytes_skipped_by_evidence > 0,
+            trust_seeded_evidence
+        );
+
+        let outcome = session.repair().expect("repair");
+        assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+        let repaired = fs::read(&source).expect("read repaired file");
+        assert_eq!(repaired, payload, "repair must restore the true bytes");
+        outputs.push(repaired);
+    }
+
+    assert_eq!(
+        outputs[0], outputs[1],
+        "the scan policy must not reach the repaired bytes"
+    );
 }
