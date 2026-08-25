@@ -159,6 +159,16 @@ pub struct ScanDiagnostics {
     /// its own. Every counter above then describes that earlier scan, and this
     /// pass read no source bytes to analyse the set.
     pub carried: bool,
+    /// Source slices this pass declined to read because seeded evidence had
+    /// already located them and the file still matched the stat fingerprint
+    /// that evidence was admitted against. Zero unless the host opted in with
+    /// [`crate::Par2RepairSessionOptions::trust_seeded_evidence_for_scan`].
+    pub slices_settled_by_evidence: u32,
+    /// Source bytes covered by [`Self::slices_settled_by_evidence`], and
+    /// therefore neither read nor hashed. [`Self::bytes_scanned`] excludes
+    /// them, so an outcome reached without reading its sources in full is
+    /// distinguishable from one that was: this counter is non-zero.
+    pub bytes_skipped_by_evidence: u64,
 }
 
 /// How a pass treated the scan state it was handed.
@@ -248,14 +258,176 @@ struct CarriedFileStat {
 /// which is why the repair that consumes a carry re-checks the bytes
 /// themselves against their slice checksums as it reads them.
 fn stat_for_carry(path: &Path) -> CarriedFileStat {
-    let state = fs::symlink_metadata(path)
-        .ok()
-        .filter(|meta| meta.file_type().is_file())
-        .map(|meta| FileStatFingerprint::from_metadata(&meta));
     CarriedFileStat {
         path: path.to_path_buf(),
-        state,
+        state: stat_fingerprint(path),
     }
+}
+
+/// Fingerprint `path` as every stat gate in this crate compares it: symlinks
+/// are not followed and only regular files fingerprint, so a path that became
+/// a directory, a symlink or a device reads as absent rather than unchanged.
+pub(crate) fn stat_fingerprint(path: &Path) -> Option<FileStatFingerprint> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .map(|meta| FileStatFingerprint::from_metadata(&meta))
+}
+
+/// Which seeded slice verdicts an analysis pass is permitted to take on trust
+/// instead of re-reading, and the proof each one must still carry.
+///
+/// This is empty unless the host opted in with
+/// [`crate::Par2RepairSessionOptions::trust_seeded_evidence_for_scan`], and an
+/// empty plan leaves the scan byte-for-byte what it always was. Only path-keyed
+/// evidence can appear here: an access-backed session never scans a directory,
+/// so it has no reads to skip, and committed whole-file evidence removes its
+/// file from the candidate list outright.
+///
+/// The fingerprint is captured per slice verdict rather than per file, because
+/// verdicts admitted at different moments describe different states of the same
+/// path. A host that feeds verdicts while the file is still growing will find
+/// most of them refused at scan time; that is the honest answer, not a defect.
+#[derive(Debug, Default)]
+pub(crate) struct EvidenceScanTrust {
+    files: HashMap<FileId, EvidenceTrustEntry>,
+}
+
+#[derive(Debug)]
+struct EvidenceTrustEntry {
+    /// The path the evidence named. A skip is offered only when the candidate
+    /// being scanned is this exact path.
+    path: PathBuf,
+    /// Set once a second path is named for the same PAR2 file, and never
+    /// cleared. That is not a picture this can reason about, so the whole
+    /// entry stops offering anything — latched rather than recomputed, because
+    /// verdicts arrive in map order and a rule that only cleared what it had
+    /// seen so far would depend on that order.
+    conflicted: bool,
+    /// Local slice index and the fingerprint the path carried when that
+    /// verdict was admitted.
+    slices: Vec<(u32, FileStatFingerprint)>,
+}
+
+impl EvidenceScanTrust {
+    pub(crate) fn record(
+        &mut self,
+        file_id: FileId,
+        path: &Path,
+        slice_index: u32,
+        fingerprint: FileStatFingerprint,
+    ) {
+        let entry = self
+            .files
+            .entry(file_id)
+            .or_insert_with(|| EvidenceTrustEntry {
+                path: path.to_path_buf(),
+                conflicted: false,
+                slices: Vec::new(),
+            });
+        if entry.conflicted {
+            return;
+        }
+        if entry.path != path {
+            entry.conflicted = true;
+            entry.slices.clear();
+            return;
+        }
+        entry.slices.push((slice_index, fingerprint));
+    }
+
+    /// Slice verdicts admitted for `path` under `file_id`, or `None` when this
+    /// plan says nothing about that pair.
+    fn slices_for(&self, file_id: &FileId, path: &Path) -> Option<&[(u32, FileStatFingerprint)]> {
+        let entry = self.files.get(file_id)?;
+        (!entry.conflicted && entry.path == path).then_some(entry.slices.as_slice())
+    }
+}
+
+/// Per-local-slice bitmap of what one candidate's scan may skip.
+///
+/// A local index is set only when *all* of the following hold: seeded evidence
+/// named it for exactly this path, the path still carries the fingerprint that
+/// verdict was admitted against, the block is a full slice, and the scan state
+/// already holds a location for it at this path and this offset. The last
+/// condition is what makes a skip incapable of losing a block — the scan
+/// declines to look for a block that is already placed.
+///
+/// The converse is deliberate and is the whole meaning of opting in: if the
+/// host's verdict was wrong about bytes that never moved, the fingerprint still
+/// matches, the range is still skipped, and the wrong verdict stands. Nothing
+/// here re-derives it. That is why the evidence admission bar
+/// ([`crate::SliceEvidence::may_seed_repair_input`]) exists on the way in.
+fn evidence_settled_slices(
+    trust: &EvidenceScanTrust,
+    target_file: &SourceFileEntry,
+    path: &Path,
+    blocks: &ScanBlockState<'_>,
+    slice_size: u64,
+) -> Vec<bool> {
+    let Some(slices) = trust.slices_for(&target_file.file_id, path) else {
+        return Vec::new();
+    };
+    if slices.is_empty() || slice_size == 0 {
+        return Vec::new();
+    }
+    // The fresh stat happens here, immediately before this candidate is read,
+    // and nowhere earlier: a fingerprint checked at plan-build time would leave
+    // a window in which the file could change before the scan reached it.
+    let Some(current) = stat_fingerprint(path) else {
+        return Vec::new();
+    };
+
+    let mut settled = vec![false; target_file.block_count];
+    for (local_index, fingerprint) in slices {
+        if *fingerprint != current {
+            continue;
+        }
+        let local = *local_index as usize;
+        if local >= target_file.block_count {
+            continue;
+        }
+        let block_index = target_file.first_block + local;
+        let block = blocks.block(block_index);
+        if block.file_id != target_file.file_id || block.expected_len != slice_size {
+            continue;
+        }
+        let offset = local as u64 * slice_size;
+        if blocks.location(block_index).is_some_and(|location| {
+            location.offset == offset
+                && location.len == block.expected_len
+                && location.source.is_path(path)
+        }) {
+            settled[local] = true;
+        }
+    }
+    settled
+}
+
+/// Coalesce settled local slice indices into byte ranges.
+///
+/// Consecutive settled slices become one range, so a file whose damage is a
+/// single burst costs one seek rather than one per intact slice. A slice whose
+/// range would run past the file on disk is dropped: the file is shorter than
+/// the set describes, which is a discrepancy for the scan to find, not one to
+/// seek over.
+fn settled_byte_runs(settled: &[bool], slice_size: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    if slice_size == 0 {
+        return runs;
+    }
+    for (local, _) in settled.iter().enumerate().filter(|(_, set)| **set) {
+        let start = local * slice_size;
+        let end = start + slice_size;
+        if end > len {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
+    runs
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +456,10 @@ struct FileScanStats {
     windows_stepped: u64,
     jumps_taken: u64,
     max_consecutive_steps: u64,
+    /// Bytes this file's scan seeked past instead of reading, because seeded
+    /// evidence already accounted for them. Always zero without the opt-in.
+    bytes_skipped_by_evidence: u64,
+    slices_settled_by_evidence: u32,
 }
 
 impl FileScanStats {
@@ -294,6 +470,8 @@ impl FileScanStats {
             windows_stepped: 0,
             jumps_taken: 0,
             max_consecutive_steps: 0,
+            bytes_skipped_by_evidence: 0,
+            slices_settled_by_evidence: 0,
         }
     }
 }
@@ -409,7 +587,13 @@ struct CandidateScanResult {
     kind: BlockLocationKind,
     files_scanned: u32,
     files_skipped: u32,
+    /// The candidate's length — the bytes this scan was asked to account for.
+    /// What it actually read is this minus [`Self::bytes_skipped_by_evidence`];
+    /// the two are separate because the deferred short-block relocation search
+    /// needs the file length, not the read total.
     bytes_scanned: u64,
+    bytes_skipped_by_evidence: u64,
+    slices_settled_by_evidence: u32,
     stats: Option<FileScanStats>,
     elapsed: Duration,
     complete_files: Vec<CompleteFileMatch>,
@@ -424,6 +608,8 @@ impl CandidateScanResult {
             files_scanned: 0,
             files_skipped: 0,
             bytes_scanned: 0,
+            bytes_skipped_by_evidence: 0,
+            slices_settled_by_evidence: 0,
             stats: None,
             elapsed: Duration::ZERO,
             complete_files: Vec::new(),
@@ -2860,9 +3046,15 @@ impl RepairState {
     /// Scan only files that do not already have committed whole-file or
     /// per-slice evidence. This is deliberately separate from `scan`, which
     /// remains the one-shot scanner and preserves its existing behaviour.
+    ///
+    /// `trust` names the seeded slice verdicts whose byte ranges this pass may
+    /// take on trust rather than re-read. It is empty unless the host opted in,
+    /// and an empty plan makes this function read exactly what it read before
+    /// the policy existed.
     pub(crate) fn scan_unresolved(
         &mut self,
         options: &Par2RepairerOptions,
+        trust: &EvidenceScanTrust,
     ) -> Result<ScanDiagnostics> {
         let mut diagnostics = ScanDiagnostics::default();
         let mut canonical_candidates = self
@@ -2881,7 +3073,7 @@ impl RepairState {
             .collect::<Vec<_>>();
         canonical_candidates.sort_by(|left, right| left.path.cmp(&right.path));
         canonical_candidates.dedup_by(|left, right| left.path == right.path);
-        self.scan_candidates(options, &canonical_candidates, &mut diagnostics)?;
+        self.scan_candidates(options, &canonical_candidates, &mut diagnostics, trust)?;
 
         self.refresh_file_states();
         if self.sources_resolved() {
@@ -2916,7 +3108,15 @@ impl RepairState {
                 })
             })
             .collect::<Vec<_>>();
-        self.scan_candidates(options, &extra_candidates, &mut diagnostics)?;
+        // Extra candidates are, by construction, paths no source file claims,
+        // so no seeded verdict can name one. The empty plan states that rather
+        // than relying on the lookup to miss.
+        self.scan_candidates(
+            options,
+            &extra_candidates,
+            &mut diagnostics,
+            &EvidenceScanTrust::default(),
+        )?;
         self.refresh_file_states();
         Ok(diagnostics)
     }
@@ -2933,7 +3133,14 @@ impl RepairState {
             .collect::<Vec<_>>();
         canonical_candidates.sort_by(|left, right| left.path.cmp(&right.path));
         canonical_candidates.dedup_by(|left, right| left.path == right.path);
-        self.scan_candidates(options, &canonical_candidates, &mut diagnostics)?;
+        // The one-shot repairer holds no seeded evidence: nothing is located
+        // before it starts, so there is nothing for a skip policy to skip.
+        self.scan_candidates(
+            options,
+            &canonical_candidates,
+            &mut diagnostics,
+            &EvidenceScanTrust::default(),
+        )?;
 
         self.refresh_file_states();
         if self.files_are_canonical_complete() {
@@ -2973,7 +3180,12 @@ impl RepairState {
                 })
             })
             .collect::<Vec<_>>();
-        self.scan_candidates(options, &extra_candidates, &mut diagnostics)?;
+        self.scan_candidates(
+            options,
+            &extra_candidates,
+            &mut diagnostics,
+            &EvidenceScanTrust::default(),
+        )?;
 
         self.refresh_file_states();
         Ok(diagnostics)
@@ -2984,6 +3196,7 @@ impl RepairState {
         options: &Par2RepairerOptions,
         candidates: &[ScanCandidate],
         diagnostics: &mut ScanDiagnostics,
+        trust: &EvidenceScanTrust,
     ) -> Result<()> {
         if candidates.is_empty() {
             return Ok(());
@@ -3023,6 +3236,7 @@ impl RepairState {
                         hash_table,
                         slice_size,
                         false,
+                        trust,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3040,6 +3254,7 @@ impl RepairState {
                         hash_table,
                         slice_size,
                         true,
+                        trust,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3245,6 +3460,7 @@ impl RepairState {
         hash_table: &VerificationHashTable,
         slice_size: u64,
         inner_parallel: bool,
+        trust: &EvidenceScanTrust,
     ) -> Result<CandidateScanResult> {
         let path = &candidate.path;
         let kind = candidate.kind;
@@ -3273,6 +3489,8 @@ impl RepairState {
             files_scanned: 1,
             files_skipped: 0,
             bytes_scanned: metadata.len(),
+            bytes_skipped_by_evidence: 0,
+            slices_settled_by_evidence: 0,
             stats: None,
             elapsed: Duration::ZERO,
             complete_files: Vec::new(),
@@ -3318,6 +3536,12 @@ impl RepairState {
         let scanner = RollingBlockScanner::new(hash_table, slice_size);
         let mut scan_blocks = ScanBlockState::new(baseline_blocks);
         let stats = if let Some(target_file) = ordered_target.as_ref() {
+            // Seeded-evidence skipping reaches exactly here: the ordered
+            // canonical scan is the path a damaged source file takes, and the
+            // only one where a seeded verdict names the same path and offsets
+            // the scanner is about to walk.
+            let settled =
+                evidence_settled_slices(trust, target_file, path, &scan_blocks, slice_size);
             scanner.scan_file_ordered_canonical_state(
                 path,
                 kind,
@@ -3334,6 +3558,7 @@ impl RepairState {
                 inner_parallel,
                 options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT),
                 options.cancel.as_ref(),
+                &settled,
             )?
         } else {
             scanner.scan_file_with_state_options(
@@ -3350,6 +3575,8 @@ impl RepairState {
         };
 
         result.block_locations = scan_blocks.changed_locations();
+        result.bytes_skipped_by_evidence = stats.bytes_skipped_by_evidence;
+        result.slices_settled_by_evidence = stats.slices_settled_by_evidence;
         result.stats = Some(stats);
         result.elapsed = started.elapsed();
 
@@ -3450,9 +3677,21 @@ impl RepairState {
         diagnostics.files_skipped = diagnostics
             .files_skipped
             .saturating_add(result.files_skipped);
-        diagnostics.bytes_scanned = diagnostics
-            .bytes_scanned
-            .saturating_add(result.bytes_scanned);
+        // `bytes_scanned` is what this pass read. Ranges a seeded verdict
+        // settled were seeked past, so they are subtracted here and reported
+        // separately: the two counters together say both how big the candidate
+        // was and how much of it the pass actually looked at.
+        diagnostics.bytes_scanned = diagnostics.bytes_scanned.saturating_add(
+            result
+                .bytes_scanned
+                .saturating_sub(result.bytes_skipped_by_evidence),
+        );
+        diagnostics.bytes_skipped_by_evidence = diagnostics
+            .bytes_skipped_by_evidence
+            .saturating_add(result.bytes_skipped_by_evidence);
+        diagnostics.slices_settled_by_evidence = diagnostics
+            .slices_settled_by_evidence
+            .saturating_add(result.slices_settled_by_evidence);
 
         let found_before = self
             .blocks
@@ -4492,14 +4731,14 @@ struct OrderedWindowCursor<'a> {
     in_index: usize,
     tail_index: usize,
     crc: u32,
+    /// Bytes this cursor has actually pulled off the disk, across seeks. A
+    /// walk with no skips reads the file exactly once, so the shortfall
+    /// against the file length is what the skips saved.
+    bytes_read: u64,
     window_table: &'a [u32; 256],
 }
 
 impl<'a> OrderedWindowCursor<'a> {
-    fn new(path: &Path, block_size: usize, window_table: &'a [u32; 256]) -> io::Result<Self> {
-        Self::new_at(path, block_size, window_table, 0)
-    }
-
     /// Cursor whose first window starts at `start` (callers guarantee a full
     /// window fits there). The parallel scan's gap resync uses this to read
     /// only the gap region through the bounded two-window buffer.
@@ -4536,6 +4775,7 @@ impl<'a> OrderedWindowCursor<'a> {
             in_index: block_size,
             tail_index: 0,
             crc: 0,
+            bytes_read: 0,
             window_table,
         };
         cursor.fill(true)?;
@@ -4557,6 +4797,10 @@ impl<'a> OrderedWindowCursor<'a> {
 
     fn crc(&self) -> u32 {
         self.crc
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     fn step(&mut self) -> io::Result<bool> {
@@ -4615,6 +4859,35 @@ impl<'a> OrderedWindowCursor<'a> {
         Ok(true)
     }
 
+    /// Restart the window at `start`, reading nothing in between.
+    ///
+    /// This is the difference between [`Self::jump`] and a real skip: `jump`
+    /// discards buffered bytes but still streams them off the disk, because
+    /// every byte it passes over is a byte the scan was asked to explain. A
+    /// seek is only sound where something else already explains the gap, which
+    /// is the one thing the seeded-evidence policy establishes.
+    ///
+    /// Returns `false` when `start` leaves no room for a full window, which
+    /// ends the aligned walk.
+    fn seek_to(&mut self, start: usize) -> io::Result<bool> {
+        if start > self.last_full_offset() {
+            self.current_offset = self.last_full_offset().saturating_add(1);
+            return Ok(false);
+        }
+        if start == self.current_offset {
+            return Ok(true);
+        }
+        self.file.seek(SeekFrom::Start(start as u64))?;
+        self.read_offset = start;
+        self.current_offset = start;
+        self.out_index = 0;
+        self.in_index = self.block_size;
+        self.tail_index = 0;
+        self.fill(true)?;
+        self.crc = checksum::crc32(&self.buffer[..self.block_size]);
+        Ok(true)
+    }
+
     fn fill(&mut self, long_fill: bool) -> io::Result<()> {
         if self.read_offset >= self.len {
             return Ok(());
@@ -4636,6 +4909,7 @@ impl<'a> OrderedWindowCursor<'a> {
             }
             self.tail_index += read;
             self.read_offset += read;
+            self.bytes_read = self.bytes_read.saturating_add(read as u64);
         }
 
         if self.tail_index < self.buffer.len() {
@@ -4752,6 +5026,29 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut [SourceBlock],
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
+        self.scan_file_ordered_canonical_settled(
+            path,
+            kind,
+            lookup,
+            target_file,
+            blocks,
+            scan_options,
+            &[],
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_file_ordered_canonical_settled(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        target_file: &SourceFileEntry,
+        blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
+        settled: &[bool],
+    ) -> Result<FileScanStats> {
         let baseline = blocks.to_vec();
         let mut state = ScanBlockState::new(&baseline);
         let stats = self.scan_file_ordered_canonical_state(
@@ -4764,6 +5061,7 @@ impl<'a> RollingBlockScanner<'a> {
             true,
             DEFAULT_REPAIR_MEMORY_LIMIT,
             None,
+            settled,
         )?;
         self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
@@ -4782,6 +5080,9 @@ impl<'a> RollingBlockScanner<'a> {
         inner_parallel: bool,
         memory_limit: usize,
         cancel: Option<&CancellationToken>,
+        // Local slice indices this scan may seek past instead of reading. All
+        // false (or empty) is the default and every pre-policy caller.
+        settled: &[bool],
     ) -> Result<FileScanStats> {
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
         // the serial scanner; single-thread pools do too. `inner_parallel`
@@ -4796,8 +5097,17 @@ impl<'a> RollingBlockScanner<'a> {
         // short-circuits before `rayon::current_num_threads`, so the parallel
         // segment scanner (and its worker pool) is never reached; on
         // `wasm32-wasip1-threads` the ordinary parallel gating below applies.
+        //
+        // A file with honoured seeded-evidence skips joins skip-data on the
+        // serial scanner for the same reason: the parallel scan's Phase A
+        // computes facts for every aligned window up front, which is precisely
+        // the reading the skip exists to avoid. Taking the serial path costs
+        // this file its per-file fan-out and saves it most of its I/O; only a
+        // file with at least one honoured skip pays that trade.
+        let has_settled_skips = settled.contains(&true);
         if !reedsolomon_rs::threading::parallel_enabled()
             || scan_options.skip_data
+            || has_settled_skips
             || ordered_scan_force_serial()
             || !ordered_scan_parallel_enabled()
             || !inner_parallel
@@ -4810,6 +5120,7 @@ impl<'a> RollingBlockScanner<'a> {
                 target_file,
                 blocks,
                 scan_options,
+                settled,
             );
         }
         let segment_windows = ordered_scan_segment_windows(self.table.slice_size as usize);
@@ -4835,10 +5146,12 @@ impl<'a> RollingBlockScanner<'a> {
                 target_file,
                 blocks,
                 scan_options,
+                settled,
             ),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_file_ordered_canonical_serial(
         &self,
         path: &Path,
@@ -4847,6 +5160,7 @@ impl<'a> RollingBlockScanner<'a> {
         target_file: &SourceFileEntry,
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
+        settled: &[bool],
     ) -> Result<FileScanStats> {
         let len = fs::metadata(path)?.len() as usize;
         let mut stats = FileScanStats::new(FileScanMode::OrderedCanonical, len as u64);
@@ -4870,8 +5184,43 @@ impl<'a> RollingBlockScanner<'a> {
             .map(|local| target_file.first_block + local)
             .filter(|block_index| blocks.block(*block_index).expected_len == self.table.slice_size)
             .collect();
-        let mut cursor = OrderedWindowCursor::new(path, slice_size, &self.window_table)?;
-        let mut preferred_next = (!ordered_full_blocks.is_empty()).then_some(0usize);
+        let settled_runs = settled_byte_runs(settled, slice_size, len);
+        let mut next_run = 0usize;
+        let mut settled_slices = 0u32;
+        // Enter the file at its first unsettled byte rather than at zero. The
+        // cursor fills its buffer as it is constructed, so opening at zero only
+        // to seek away would read exactly the bytes this policy exists to
+        // avoid.
+        let mut entry_offset = 0usize;
+        if let Some(&(start, end)) = settled_runs.first()
+            && start == 0
+        {
+            entry_offset = end;
+            next_run = 1;
+            settled_slices += ((end - start) / slice_size) as u32;
+        }
+        if entry_offset > len - slice_size {
+            // Every aligned window in the file belongs to a settled slice.
+            // There is no walk left to run, only the short tail.
+            stats.slices_settled_by_evidence = settled_slices;
+            stats.bytes_skipped_by_evidence = entry_offset.min(len) as u64;
+            scan_short_blocks_from_file(
+                self.table,
+                path,
+                kind,
+                lookup.files,
+                lookup.file_index_by_id,
+                blocks,
+                len,
+            )?;
+            return Ok(stats);
+        }
+        let mut cursor =
+            OrderedWindowCursor::new_at(path, slice_size, &self.window_table, entry_offset)?;
+        let entry_local = entry_offset / slice_size;
+        let mut preferred_next = ordered_full_blocks
+            .iter()
+            .position(|block_index| *block_index >= target_file.first_block + entry_local);
         let mut current_step_run = 0u64;
         let scan_distance = scan_options.scan_distance(slice_size);
         let scan_skip = if scan_distance > 0 {
@@ -4882,6 +5231,37 @@ impl<'a> RollingBlockScanner<'a> {
         let mut scan_offset = scan_distance / 2;
 
         while cursor.offset() <= cursor.last_full_offset() {
+            // Retire runs the cursor has already passed. A block match or a
+            // skip-data jump can land past or inside a run; either way the run
+            // is simply not taken, and the bytes are read as they always were.
+            while settled_runs
+                .get(next_run)
+                .is_some_and(|(_, end)| *end <= cursor.offset())
+            {
+                next_run += 1;
+            }
+            if let Some(&(start, end)) = settled_runs.get(next_run)
+                && cursor.offset() == start
+            {
+                settled_slices = settled_slices.saturating_add(((end - start) / slice_size) as u32);
+                stats.jumps_taken += 1;
+                stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
+                current_step_run = 0;
+                scan_offset = scan_distance / 2;
+                next_run += 1;
+                // Resume the ordered expectation at the first full block that
+                // starts at or after the run, exactly as a match-driven jump
+                // would have left it.
+                let next_local = end / slice_size;
+                preferred_next = ordered_full_blocks
+                    .iter()
+                    .position(|block_index| *block_index >= target_file.first_block + next_local);
+                if !cursor.seek_to(end)? {
+                    break;
+                }
+                continue;
+            }
+
             let expected_block = preferred_next
                 .and_then(|position| ordered_full_blocks.get(position))
                 .copied();
@@ -4945,6 +5325,16 @@ impl<'a> RollingBlockScanner<'a> {
         }
 
         stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
+        stats.slices_settled_by_evidence = settled_slices;
+        if settled_slices > 0 {
+            // Measured, not assumed: without a skip this walk streams the whole
+            // file, so whatever it did not read is what the skips saved. That
+            // is narrower than the settled ranges themselves — a window
+            // byte-stepping out of a damaged region still reads into the
+            // settled slice that follows it — and this counter reports the
+            // narrower, true number.
+            stats.bytes_skipped_by_evidence = (len as u64).saturating_sub(cursor.bytes_read());
+        }
 
         scan_short_blocks_from_file(
             self.table,
@@ -5115,6 +5505,8 @@ impl<'a> RollingBlockScanner<'a> {
             // a descriptor whose `Drop` does the close this relies on.
             #[allow(clippy::drop_non_drop)]
             drop(file);
+            // No settled slices: a file with any is routed to the serial
+            // scanner before this function is reached.
             return self.scan_file_ordered_canonical_serial(
                 path,
                 kind,
@@ -5122,6 +5514,7 @@ impl<'a> RollingBlockScanner<'a> {
                 target_file,
                 blocks,
                 scan_options,
+                &[],
             );
         }
         let last_full_offset = len - slice_size;
@@ -5149,6 +5542,7 @@ impl<'a> RollingBlockScanner<'a> {
                 target_file,
                 blocks,
                 scan_options,
+                &[],
             );
         };
 
@@ -5200,6 +5594,7 @@ impl<'a> RollingBlockScanner<'a> {
                     target_file,
                     blocks,
                     scan_options,
+                    &[],
                 );
             }
         }
@@ -8582,6 +8977,202 @@ mod tests {
         (block_location_summary(&blocks), stats)
     }
 
+    /// Pre-locate `settled_locals` from "evidence", then run the ordered
+    /// canonical scan with the skip policy either honouring them (`honour`) or
+    /// ignoring them. Both arms start from the same located state, so the only
+    /// difference between them is the policy.
+    fn scan_with_settled_evidence(
+        state: &RepairState,
+        path: &Path,
+        settled_locals: &[usize],
+        honour: bool,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let mut blocks = state.blocks.clone();
+        let target = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == path)
+            .unwrap()
+            .clone();
+        let mut settled = vec![false; target.block_count];
+        for &local in settled_locals {
+            let block_index = target.first_block + local;
+            blocks[block_index].location = Some(BlockLocation {
+                source: SourceLocation::Path(path.to_path_buf()),
+                offset: local as u64 * state.set.slice_size,
+                len: blocks[block_index].expected_len,
+                kind: BlockLocationKind::Canonical,
+            });
+            settled[local] = true;
+        }
+        if !honour {
+            settled = vec![false; target.block_count];
+        }
+        let stats = scanner
+            .scan_file_ordered_canonical_settled(
+                path,
+                BlockLocationKind::Canonical,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
+                &target,
+                &mut blocks,
+                ScanSkipOptions::disabled(),
+                &settled,
+            )
+            .unwrap();
+        (block_location_summary(&blocks), stats)
+    }
+
+    #[test]
+    fn settled_byte_runs_coalesce_and_drop_ranges_past_the_file() {
+        assert_eq!(settled_byte_runs(&[], 64, 384), Vec::new());
+        assert_eq!(
+            settled_byte_runs(&[true, true, false, true, false, true], 64, 384),
+            vec![(0, 128), (192, 256), (320, 384)]
+        );
+        // A slice the set describes but the file on disk is too short to hold
+        // is a discrepancy for the scan to find, never one to seek over.
+        assert_eq!(
+            settled_byte_runs(&[true, true, true], 64, 100),
+            vec![(0, 64)]
+        );
+    }
+
+    #[test]
+    fn evidence_skip_leaves_the_ordered_scan_locations_unchanged() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let mut target = Vec::new();
+        for block in 0..8u8 {
+            target.extend(
+                (0..slice_size as usize)
+                    .map(|index| block.wrapping_mul(37).wrapping_add(index as u8)),
+            );
+        }
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let mut damaged = target.clone();
+        damaged[3 * slice_size as usize..4 * slice_size as usize].fill(0xEE);
+        fs::write(&candidate, &damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let settled_locals = [0usize, 1, 2, 4, 5, 6, 7];
+        let (read_in_full, full_stats) =
+            scan_with_settled_evidence(&state, &candidate, &settled_locals, false);
+        let (with_skips, skip_stats) =
+            scan_with_settled_evidence(&state, &candidate, &settled_locals, true);
+
+        assert_eq!(with_skips, read_in_full, "the skip must not move a block");
+        assert_eq!(full_stats.slices_settled_by_evidence, 0);
+        assert_eq!(full_stats.bytes_skipped_by_evidence, 0);
+        assert_eq!(skip_stats.slices_settled_by_evidence, 7);
+        assert!(
+            skip_stats.bytes_skipped_by_evidence > 0,
+            "a honoured skip must show up as bytes not read"
+        );
+        assert!(
+            skip_stats.bytes_skipped_by_evidence < target.len() as u64,
+            "the damaged slice still has to be read"
+        );
+        assert!(skip_stats.windows_stepped < full_stats.windows_stepped);
+    }
+
+    #[test]
+    fn an_entirely_settled_file_is_not_walked_at_all() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let target: Vec<u8> = (0..4 * slice_size as usize).map(|i| i as u8).collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (_, stats) = scan_with_settled_evidence(&state, &candidate, &[0, 1, 2, 3], true);
+
+        assert_eq!(stats.slices_settled_by_evidence, 4);
+        assert_eq!(stats.bytes_skipped_by_evidence, target.len() as u64);
+        assert_eq!(stats.windows_stepped, 0);
+    }
+
+    #[test]
+    fn a_settled_slice_with_no_recorded_location_is_never_skipped() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let target: Vec<u8> = (0..4 * slice_size as usize).map(|i| i as u8).collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let file = state.files.first().unwrap();
+        let fingerprint = stat_fingerprint(&candidate).unwrap();
+
+        let mut trust = EvidenceScanTrust::default();
+        for local in 0..4u32 {
+            trust.record(file.file_id, &candidate, local, fingerprint.clone());
+        }
+
+        // Nothing is located yet, so nothing may be skipped: a skip is only
+        // ever permitted over a block the state already holds.
+        let blocks = ScanBlockState::new(&state.blocks);
+        let settled = evidence_settled_slices(&trust, file, &candidate, &blocks, slice_size);
+        assert!(settled.iter().all(|set| !*set));
+
+        // With the locations in place the same plan settles every slice.
+        let mut located = state.blocks.clone();
+        for local in 0..4usize {
+            located[file.first_block + local].location = Some(BlockLocation {
+                source: SourceLocation::Path(candidate.clone()),
+                offset: local as u64 * slice_size,
+                len: slice_size,
+                kind: BlockLocationKind::Canonical,
+            });
+        }
+        let blocks = ScanBlockState::new(&located);
+        let settled = evidence_settled_slices(&trust, file, &candidate, &blocks, slice_size);
+        assert_eq!(settled, vec![true; 4]);
+
+        // A stat the file no longer matches refuses every one of them, with no
+        // error: the file is simply read in full.
+        bump_modified_time(&candidate);
+        let settled = evidence_settled_slices(&trust, file, &candidate, &blocks, slice_size);
+        assert!(settled.iter().all(|set| !*set));
+    }
+
+    #[test]
+    fn a_trust_plan_naming_two_paths_for_one_file_settles_nothing() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let target: Vec<u8> = (0..2 * slice_size as usize).map(|i| i as u8).collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let decoy = dir.path().join("elsewhere.bin");
+        fs::write(&candidate, &target).unwrap();
+        fs::write(&decoy, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let file = state.files.first().unwrap();
+        let fingerprint = stat_fingerprint(&candidate).unwrap();
+
+        // The conflict latches: a verdict for the canonical path arriving
+        // after the decoy must not revive the entry, whichever order the map
+        // hands them over in.
+        for order in [[&candidate, &decoy], [&decoy, &candidate]] {
+            let mut trust = EvidenceScanTrust::default();
+            trust.record(file.file_id, order[0], 0, fingerprint.clone());
+            trust.record(file.file_id, order[1], 1, fingerprint.clone());
+            trust.record(file.file_id, order[0], 2, fingerprint.clone());
+
+            let blocks = ScanBlockState::new(&state.blocks);
+            assert!(
+                evidence_settled_slices(&trust, file, &candidate, &blocks, slice_size)
+                    .iter()
+                    .all(|set| !*set)
+            );
+        }
+    }
+
     fn scan_with_buffered(
         state: &RepairState,
         path: &Path,
@@ -8917,6 +9508,7 @@ mod tests {
                 target,
                 &mut scan_state,
                 ScanSkipOptions::disabled(),
+                &[],
             )
             .unwrap();
         scan_state.apply_to_blocks(&mut blocks);
@@ -10831,6 +11423,7 @@ mod tests {
                 true,
                 DEFAULT_REPAIR_MEMORY_LIMIT,
                 None,
+                &[],
             )
             .unwrap();
         let mut mapped = ScanBlockState::new(&baseline);
