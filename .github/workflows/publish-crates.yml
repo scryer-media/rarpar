@@ -74,8 +74,6 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Hydrate the test corpus (all)
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
       - name: Check workspace version
         env:
           EXPECTED_VERSION: ${{ inputs.version }}
@@ -150,14 +148,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          case "$PUBLISH_PACKAGE" in
-            par2-rs)
-              required="fmt clippy clippy-aarch64 unit-tests fixture-tests par2-tests"
-              ;;
-            *)
-              required="fmt clippy clippy-aarch64 unit-tests fixture-tests unrar-tests par2-tests"
-              ;;
-          esac
+          required="fmt clippy clippy-aarch64 unit-tests fixture-tests unrar-tests par2-tests"
           gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
             --jq '.check_runs[] | "\(.name)\t\(.conclusion)"' > "$RUNNER_TEMP/checks.tsv"
           echo "recorded check runs for ${COMMIT_SHA}:"

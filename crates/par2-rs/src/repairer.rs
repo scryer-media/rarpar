@@ -11702,6 +11702,9 @@ mod tests {
             ("same-length content change", |path| {
                 let len = fs::metadata(path).unwrap().len() as usize;
                 fs::write(path, vec![0xA5u8; len]).unwrap();
+                // A write's automatic mtime update is not portable enough to
+                // make this same-length rewrite stat-visible on its own.
+                bump_modified_time(path);
             }),
             ("truncate", |path| {
                 let len = fs::metadata(path).unwrap().len();
