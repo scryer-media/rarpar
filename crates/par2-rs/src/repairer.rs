@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::DiskFileAccess;
 use crate::checksum::{self, Crc32Hasher, Md5State};
 use crate::error::{Par2Error, Result};
+use crate::evidence::FileStatFingerprint;
 use crate::md5_simd;
 use crate::packet::budget::packet_retained_bytes;
 use crate::packet::{
@@ -128,6 +129,9 @@ pub struct PacketDiagnostics {
 }
 
 #[derive(Debug, Clone, Default)]
+// A pass learns to report more about itself over time; a new counter should
+// not cost every consumer a major version.
+#[non_exhaustive]
 pub struct ScanDiagnostics {
     pub files_scanned: u32,
     pub bytes_scanned: u64,
@@ -151,29 +155,68 @@ pub struct ScanDiagnostics {
     /// held location the search may not displace is skipped before the match
     /// check, so a match counted here is never a futile offer.
     pub short_relocation_blocks_placed: u32,
+    /// True when this pass installed a prior pass's scan instead of running
+    /// its own. Every counter above then describes that earlier scan, and this
+    /// pass read no source bytes to analyse the set.
+    pub carried: bool,
 }
 
+/// How a pass treated the scan state it was handed.
+///
+/// A host that wants to know whether a repair cost one scan or two reads three
+/// fields together: `carry_applied` says this pass installed carried state
+/// instead of scanning, `carry_retried_fresh` says a second pass ran from a
+/// real scan anyway, and `carry_consumed_for_repair` says the mutation itself
+/// ran on the carried analysis. `carry_applied && carry_consumed_for_repair &&
+/// !carry_retried_fresh` is the single-scan shape; the accompanying
+/// [`ScanDiagnostics::carried`] flag says the same thing about the scan
+/// counters in the same outcome.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CarryDiagnostics {
     pub carry_attempted: bool,
     pub carry_applied: bool,
     pub carry_retried_fresh: bool,
     pub carry_retry_reason: Option<CarryRetryReason>,
+    /// The mutating repair ran on the carried analysis, with no second scan.
+    /// Set only after every source the repair would read was re-stat'd
+    /// immediately before mutation and still matched the fingerprint the
+    /// carried scan captured.
+    pub carry_consumed_for_repair: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// New reasons are diagnostic detail, not a contract change for matchers.
+#[non_exhaustive]
 pub enum CarryRetryReason {
     TerminalStatus(Par2RepairStatus),
     RepairRequested,
     PostRepairVerificationFailed,
+    /// A source the repair would have read no longer matches the stat
+    /// fingerprint the carried scan captured for it — it changed, was
+    /// replaced, or is gone. Also reported when validated reads found the
+    /// bytes themselves changed under a fingerprint that did not move.
+    RepairInputChanged,
+    /// A source the repair would have read carries no fingerprint the carry
+    /// can be checked against — an access-backed source, whose validity is a
+    /// property of the serving handle rather than of the filesystem.
+    RepairInputNotFingerprinted,
 }
 
 /// Scan state carried from an analyze pass to a later execute pass over the
 /// same set, letting later scheduling avoid re-scanning every source file.
 /// Application re-stats every file the scan observed (including recording
-/// nonexistence) and refuses on visible drift. Accepted carry is still a
-/// speculative optimization: mutation and final statuses are retried from a
-/// fresh content scan before they are accepted.
+/// nonexistence) and refuses on visible drift.
+///
+/// A repair consumes an applied carry only after a second, narrower check
+/// immediately before it mutates anything: every source the repair will read
+/// must still match the fingerprint the scan captured for it. That repair then
+/// reads through the validated path, so a change too subtle for `stat` is
+/// still caught on the bytes rather than written into the output.
+///
+/// Every carried result that does *not* mutate stays speculative and is
+/// re-established from a fresh content scan before it is reported.
+///
 /// A carry never discovers source files that appeared after the analyze
 /// pass — callers that allow drop-ins between passes should not supply one.
 #[derive(Debug)]
@@ -188,15 +231,27 @@ pub struct ScanCarry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CarriedFileStat {
     path: PathBuf,
-    /// `(length, modified)` when the path existed as a regular file.
-    state: Option<(u64, SystemTime)>,
+    /// The stat fingerprint when the path existed as a regular file, and
+    /// `None` when it did not. Recording nonexistence is load-bearing: a file
+    /// that appears between two passes is drift just as much as one that
+    /// changes.
+    state: Option<FileStatFingerprint>,
 }
 
+/// Fingerprint `path` as the carry gate sees it.
+///
+/// Symlinks are not followed and only regular files fingerprint, so a path
+/// that becomes a directory, a symlink, or a device reads as absent rather
+/// than as an unchanged file. What the fingerprint covers — length, mtime,
+/// and on Unix device and inode — is what `stat` can prove; a same-length
+/// rewrite that also restores the original mtime in place is invisible to it,
+/// which is why the repair that consumes a carry re-checks the bytes
+/// themselves against their slice checksums as it reads them.
 fn stat_for_carry(path: &Path) -> CarriedFileStat {
     let state = fs::symlink_metadata(path)
         .ok()
         .filter(|meta| meta.file_type().is_file())
-        .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+        .map(|meta| FileStatFingerprint::from_metadata(&meta));
     CarriedFileStat {
         path: path.to_path_buf(),
         state,
@@ -445,9 +500,11 @@ pub struct Par2RepairerOptions {
     /// Scan state from a prior pass over the same set (see
     /// [`Par2Repairer::verify_or_repair_carrying`]). Applied only when the
     /// set matches and every observed file's stat snapshot still matches;
-    /// otherwise this pass scans normally. Accepted carry is speculative:
-    /// mutating repair requests and terminal results are retried from a fresh
-    /// content scan before reporting. Must come from a pass with the same `base_dir`/
+    /// otherwise this pass scans normally. A mutating repair additionally
+    /// re-checks every source it will read immediately before mutating, and
+    /// consumes the carry only when all of them still match; every other
+    /// accepted-carry result is retried from a fresh content scan before
+    /// reporting. Must come from a pass with the same `base_dir`/
     /// `extra_paths`/`scan_skip_*` configuration.
     pub scan_carry: Option<Arc<ScanCarry>>,
 }
@@ -676,6 +733,21 @@ pub struct Par2Repairer {
 struct RepairPassSuccess {
     outcome: Par2RepairOutcome,
     carry: Option<Arc<ScanCarry>>,
+    /// Set when a carried pass refused, before installing anything, to mutate
+    /// on the carried analysis. The reason names what the pre-mutation
+    /// fingerprint gate — or a validated read — saw, and the caller retries
+    /// the whole pass from a fresh scan.
+    carry_gate_rejection: Option<CarryRetryReason>,
+}
+
+impl RepairPassSuccess {
+    fn new(outcome: Par2RepairOutcome, carry: Option<Arc<ScanCarry>>) -> Self {
+        Self {
+            outcome,
+            carry,
+            carry_gate_rejection: None,
+        }
+    }
 }
 
 enum RepairPassResult {
@@ -697,10 +769,10 @@ impl Par2Repairer {
 
     /// Like [`Self::verify_or_repair`], additionally returning this pass's
     /// scan state for reuse by a later pass over the same set
-    /// ([`Par2RepairerOptions::scan_carry`]). The carry is speculative:
-    /// it avoids a second scan when the observed file stats still match, but
-    /// mutating repair requests and terminal results are retried from a fresh
-    /// content scan before they are reported.
+    /// ([`Par2RepairerOptions::scan_carry`]). A repair consumes such a carry
+    /// when every source it will read still matches the fingerprint the scan
+    /// captured; carried results that do not mutate stay speculative and are
+    /// retried from a fresh content scan before they are reported.
     pub fn verify_or_repair_carrying(&self) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
         self.verify_or_repair_inner(true)
     }
@@ -741,7 +813,22 @@ impl Par2Repairer {
         want_carry: bool,
     ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
         let status = success.outcome.status;
-        if success.outcome.carry.carry_applied && self.options.repair {
+        if let Some(reason) = success.carry_gate_rejection {
+            debug!(
+                ?status,
+                retry_reason = ?reason,
+                "carried PAR2 pass could not prove its repair inputs; retrying from a fresh scan before mutation"
+            );
+            return self.retry_fresh(want_carry, reason);
+        }
+        // A carried pass that reached a mutating repair and proved every
+        // input still matches its scan-time fingerprint has already repaired
+        // on the carried analysis; re-running it from a fresh scan would only
+        // read the whole set a second time to reach the same place.
+        if success.outcome.carry.carry_applied
+            && self.options.repair
+            && !success.outcome.carry.carry_consumed_for_repair
+        {
             debug!(
                 ?status,
                 "carried PAR2 pass reached a repair request; retrying from a fresh scan before mutation"
@@ -772,6 +859,10 @@ impl Par2Repairer {
                     carry_applied: true,
                     carry_retried_fresh: true,
                     carry_retry_reason: Some(retry_reason),
+                    // This outcome came from a fresh scan of the tree, not
+                    // from the carried analysis, whatever the retried pass
+                    // decided about its own (absent) carry.
+                    carry_consumed_for_repair: false,
                 };
                 Ok((success.outcome, success.carry))
             }
@@ -822,7 +913,13 @@ impl Par2Repairer {
             }
             diagnostics
         }) {
-            Some(diagnostics) => diagnostics,
+            Some(mut diagnostics) => {
+                // The counters describe the pass that produced them, not this
+                // one. Say so, so a host reading a single outcome can tell a
+                // scan that happened here from one it inherited.
+                diagnostics.carried = true;
+                diagnostics
+            }
             None => state.scan(&self.options)?,
         };
         let mut verification = state.verification_result();
@@ -847,21 +944,65 @@ impl Par2Repairer {
                         Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
                     }
                 };
-            return Ok(RepairPassResult::Success(RepairPassSuccess {
-                outcome: Self::with_carry_diagnostics(
-                    state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
-                    &carry_diagnostics,
-                ),
-                carry,
-            }));
+            // Only a request that will actually rewrite the tree can consume
+            // the carried analysis. Every other carried result — a clean
+            // verify (which may still purge), an insufficient or
+            // resource-limited verdict, and any verify-only pass — is still
+            // speculative and is re-established from a real scan before it is
+            // reported, exactly as before.
+            let mutation_requested =
+                self.options.repair && status == Par2RepairStatus::RepairPossible;
+            let gate = mutation_requested
+                .then(|| {
+                    let applied = self
+                        .options
+                        .scan_carry
+                        .as_deref()
+                        .expect("carry_applied implies a supplied carry");
+                    state.carry_repair_inputs_unchanged(applied)
+                })
+                .transpose();
+            match gate {
+                // Not a mutating request: report the carried result and let
+                // the caller re-establish it from a fresh scan.
+                Ok(None) => {
+                    return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+                        Self::with_carry_diagnostics(
+                            state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                            &carry_diagnostics,
+                        ),
+                        carry,
+                    )));
+                }
+                // Every input the repair would read is still the file the scan
+                // read. Fall through and repair on the carried analysis.
+                Ok(Some(())) => {
+                    carry_diagnostics.carry_consumed_for_repair = true;
+                }
+                Err(reason) => {
+                    debug!(
+                        ?status,
+                        ?reason,
+                        "carried PAR2 repair inputs no longer match their scan-time fingerprints"
+                    );
+                    return Ok(RepairPassResult::Success(RepairPassSuccess {
+                        outcome: Self::with_carry_diagnostics(
+                            state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                            &carry_diagnostics,
+                        ),
+                        carry,
+                        carry_gate_rejection: Some(reason),
+                    }));
+                }
+            }
         }
 
         if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
             if self.options.purge {
                 purge_files_best_effort(&purge_paths);
             }
-            return Ok(RepairPassResult::Success(RepairPassSuccess {
-                outcome: Self::with_carry_diagnostics(
+            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+                Self::with_carry_diagnostics(
                     state.outcome(
                         Par2RepairStatus::Verified,
                         0,
@@ -873,7 +1014,7 @@ impl Par2Repairer {
                     &carry_diagnostics,
                 ),
                 carry,
-            }));
+            )));
         }
 
         if !self.options.repair {
@@ -883,13 +1024,13 @@ impl Par2Repairer {
                 Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
-            return Ok(RepairPassResult::Success(RepairPassSuccess {
-                outcome: Self::with_carry_diagnostics(
+            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+                Self::with_carry_diagnostics(
                     state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                     &carry_diagnostics,
                 ),
                 carry,
-            }));
+            )));
         }
 
         if matches!(
@@ -900,16 +1041,54 @@ impl Par2Repairer {
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
                 _ => Par2RepairStatus::Insufficient,
             };
-            return Ok(RepairPassResult::Success(RepairPassSuccess {
-                outcome: Self::with_carry_diagnostics(
+            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+                Self::with_carry_diagnostics(
                     state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                     &carry_diagnostics,
                 ),
                 carry,
-            }));
+            )));
         }
 
-        let repair = state.repair(&self.options, &verification)?;
+        let repair = if carry_diagnostics.carry_consumed_for_repair {
+            // The analysis feeding this repair was taken before the caller's
+            // own gap between passes, so the validated read path is used: each
+            // source slice is checked against its IFSC checksum on the way
+            // into staging and into the Reed-Solomon input stream, and every
+            // path is re-stat'd as it is opened. That covers the one drift a
+            // stat fingerprint cannot see — a same-length rewrite that also
+            // restored the original mtime in place — by catching it on the
+            // bytes instead of on the metadata. Nothing has been installed at
+            // this point, so a caught change simply falls back to a fresh
+            // scan.
+            match state.repair_validated(&self.options, &verification) {
+                Ok(repair) => repair,
+                Err(error) if is_source_changed_error(&error) => {
+                    debug!(
+                        %error,
+                        "carried PAR2 repair read a changed source; retrying from a fresh scan"
+                    );
+                    return Ok(RepairPassResult::Success(RepairPassSuccess {
+                        outcome: Self::with_carry_diagnostics(
+                            state.outcome(
+                                Par2RepairStatus::RepairPossible,
+                                0,
+                                0,
+                                packet_diagnostics,
+                                scan,
+                                verification,
+                            ),
+                            &carry_diagnostics,
+                        ),
+                        carry,
+                        carry_gate_rejection: Some(CarryRetryReason::RepairInputChanged),
+                    }));
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            state.repair(&self.options, &verification)?
+        };
         let repaired_access = RepairVerificationAccess::new(
             &state.files,
             &repair.install_dir,
@@ -953,8 +1132,8 @@ impl Par2Repairer {
             purge_files_best_effort(&purge_paths);
         }
 
-        Ok(RepairPassResult::Success(RepairPassSuccess {
-            outcome: Self::with_carry_diagnostics(
+        Ok(RepairPassResult::Success(RepairPassSuccess::new(
+            Self::with_carry_diagnostics(
                 state.outcome(
                     Par2RepairStatus::Repaired,
                     repair.bytes_copied,
@@ -966,7 +1145,7 @@ impl Par2Repairer {
                 &carry_diagnostics,
             ),
             carry,
-        }))
+        )))
     }
 
     pub(crate) fn load_inventory(&self) -> Result<PacketInventory> {
@@ -3528,26 +3707,95 @@ impl RepairState {
         })
     }
 
+    /// Every source a repair on this state would read: each recoverable file's
+    /// whole-file source, plus the source behind every located block, which
+    /// together cover the copy-only path, the staged block copies and the
+    /// Reed-Solomon input stream.
+    ///
+    /// The pre-mutation carry gate and the mid-repair change check are both
+    /// built from this one enumeration so they can never come to disagree
+    /// about what "a repair input" is.
+    fn for_each_repair_input_source<'a>(&'a self, mut visit: impl FnMut(&'a SourceLocation)) {
+        for file in self.files.iter().filter(|file| file.recoverable) {
+            if let Some(location) = file.complete_location.as_ref() {
+                visit(&location.source);
+            }
+        }
+        for block in &self.blocks {
+            if let Some(location) = block.location.as_ref() {
+                visit(&location.source);
+            }
+        }
+    }
+
     /// Stat every physical repair input so a mid-repair change is caught.
     /// Access-backed sources carry no stat: their staleness is governed by the
     /// serving handle's own coverage, not by device/inode/mtime.
     fn snapshot_repair_input_sources(&self) -> HashMap<PathBuf, CarriedFileStat> {
         let mut snapshots = HashMap::new();
-        for file in self.files.iter().filter(|file| file.recoverable) {
-            if let Some(path) = file
-                .complete_location
-                .as_ref()
-                .and_then(BlockLocation::path)
-            {
-                snapshots.insert(path.to_path_buf(), stat_for_carry(path));
+        self.for_each_repair_input_source(|source| {
+            if let Some(path) = source.path() {
+                snapshots
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| stat_for_carry(path));
             }
-        }
-        for block in &self.blocks {
-            if let Some(path) = block.location.as_ref().and_then(BlockLocation::path) {
-                snapshots.insert(path.to_path_buf(), stat_for_carry(path));
-            }
-        }
+        });
         snapshots
+    }
+
+    /// Decide whether this carried analysis may be mutated on without a fresh
+    /// scan.
+    ///
+    /// Every source the repair would read is re-stat'd and compared against
+    /// the fingerprint the carried scan captured for it. All of them matching
+    /// is what licenses the repair to skip its own scan; anything else — a
+    /// changed, replaced, truncated, renamed or deleted file, or an input the
+    /// carry holds no fingerprint for — sends the caller back to a full scan.
+    ///
+    /// This is deliberately narrower than [`Self::try_apply_carry`], which
+    /// re-stats everything the scan ever looked at: what licenses a *mutation*
+    /// is the state of the bytes the mutation will read, and this check runs
+    /// immediately before that mutation rather than at the top of the pass.
+    fn carry_repair_inputs_unchanged<'a>(
+        &'a self,
+        carry: &ScanCarry,
+    ) -> std::result::Result<(), CarryRetryReason> {
+        let expected: HashMap<&Path, &CarriedFileStat> = carry
+            .snapshot
+            .iter()
+            .map(|stat| (stat.path.as_path(), stat))
+            .collect();
+        let mut rejection = None;
+        let mut checked: HashSet<&'a Path> = HashSet::new();
+        self.for_each_repair_input_source(|source| {
+            if rejection.is_some() {
+                return;
+            }
+            let Some(path) = source.path() else {
+                // An access-backed source has no filesystem identity to
+                // re-stat, and a carry records no serving-handle generation,
+                // so nothing available here can honestly say the bytes behind
+                // it are still the ones the scan read. Refuse rather than
+                // guess.
+                rejection = Some(CarryRetryReason::RepairInputNotFingerprinted);
+                return;
+            };
+            if !checked.insert(path) {
+                return;
+            }
+            match expected.get(path) {
+                Some(expected) if stat_for_carry(path) == **expected => {}
+                // A repair input the carry never fingerprinted cannot be
+                // checked at all, so it is refused for the same reason an
+                // access-backed one is.
+                None => rejection = Some(CarryRetryReason::RepairInputNotFingerprinted),
+                Some(_) => rejection = Some(CarryRetryReason::RepairInputChanged),
+            }
+        });
+        match rejection {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn repair(
@@ -6612,6 +6860,19 @@ fn source_changed_io(path: &Path) -> io::Error {
     )
 }
 
+/// Whether an error reports that a source moved out from under a read, in
+/// either its path-backed or its access-backed spelling. A repair that
+/// consumed a carried analysis treats this as "the carry was wrong after all"
+/// and falls back to a fresh scan; nothing has been installed by the time it
+/// can be raised.
+fn is_source_changed_error(error: &Par2Error) -> bool {
+    let Par2Error::Io(source) = error else {
+        return false;
+    };
+    let message = source.to_string();
+    message.starts_with(SOURCE_CHANGED_PREFIX) || message.starts_with(VIRTUAL_SOURCE_CHANGED_PREFIX)
+}
+
 /// The location-shaped counterpart to [`source_changed_io`]. Access-backed
 /// sources have no path to name, so they report their PAR2 file identifier
 /// under a distinct prefix that path-oriented callers do not misread.
@@ -7546,8 +7807,12 @@ mod tests {
             .iter()
             .find(|stat| stat.path == path)
             .expect("path is in carried stat snapshot");
-        let Some((_, modified)) = expected.state else {
-            panic!("carried path exists as a regular file");
+        let Some(modified) = expected
+            .state
+            .as_ref()
+            .and_then(FileStatFingerprint::modified)
+        else {
+            panic!("carried path exists as a regular file with a readable mtime");
         };
         let file = fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_times(std::fs::FileTimes::new().set_modified(modified))
@@ -11311,6 +11576,13 @@ mod tests {
         );
     }
 
+    /// A carried copy-only repair whose source was rewritten to the same
+    /// length *and* had its mtime restored is exactly the change a stat
+    /// fingerprint cannot see. The pre-mutation gate accepts it — correctly,
+    /// on the evidence available to it — and the validated read that a
+    /// consumed carry always takes then catches it on the bytes, before
+    /// anything is installed. The retry reason therefore names the changed
+    /// input rather than the bare repair request.
     #[test]
     fn carried_repair_request_fresh_scans_before_mutation() {
         let dir = tempdir().unwrap();
@@ -11354,12 +11626,312 @@ mod tests {
         assert!(outcome.carry.carry_attempted);
         assert!(outcome.carry.carry_applied);
         assert!(outcome.carry.carry_retried_fresh);
+        assert!(!outcome.carry.carry_consumed_for_repair);
         assert_eq!(
             outcome.carry.carry_retry_reason,
-            Some(CarryRetryReason::RepairRequested)
+            Some(CarryRetryReason::RepairInputChanged)
         );
     }
 
+    /// A small real PAR2 set with real recovery volumes, so repairs against it
+    /// are genuine Reed-Solomon reconstructions rather than whole-file copies.
+    fn create_recoverable_set(dir: &Path, files: &[(&str, &[u8])]) {
+        let sources: Vec<PathBuf> = files
+            .iter()
+            .map(|(name, bytes)| {
+                let path = dir.join(name);
+                fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        let mut options = crate::create::Par2CreatorOptions::with_output(
+            dir.join("set"),
+            Some(dir.to_path_buf()),
+            sources,
+        );
+        options.block_sizing = crate::create::BlockSizing::Bytes(64);
+        options.recovery_amount = crate::create::RecoveryAmount::Count(16);
+        let creator = crate::create::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        creator.create(&plan).unwrap();
+    }
+
+    fn par2_paths_in(dir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                is_par2_path(&path).then_some(path)
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn copy_flat_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    fn damage_first_slice(path: &Path) {
+        let mut bytes = fs::read(path).unwrap();
+        bytes[..64].fill(0);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn bump_modified_time(path: &Path) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_secs(1)))
+            .unwrap();
+    }
+
+    /// One way a repair input can change, named for assertion messages.
+    type InputMutation = (&'static str, fn(&Path));
+
+    /// Every way a repair input can change that a `stat` call can see. Each
+    /// entry mutates the file at the given path.
+    fn stat_visible_input_mutations() -> Vec<InputMutation> {
+        vec![
+            ("mtime bump", bump_modified_time),
+            ("same-length content change", |path| {
+                let len = fs::metadata(path).unwrap().len() as usize;
+                fs::write(path, vec![0xA5u8; len]).unwrap();
+            }),
+            ("truncate", |path| {
+                let len = fs::metadata(path).unwrap().len();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(len / 2)
+                    .unwrap();
+            }),
+            ("append", |path| {
+                let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(&[0x5Au8; 64]).unwrap();
+            }),
+            ("rename away", |path| {
+                fs::rename(path, path.with_file_name("moved-aside.dat")).unwrap();
+            }),
+            ("delete", |path| {
+                fs::remove_file(path).unwrap();
+            }),
+        ]
+    }
+
+    fn scanned_state_with_carry(dir: &Path, set: &Par2FileSet) -> (RepairState, ScanCarry) {
+        let mut state = RepairState::from_set(dir, set.clone()).unwrap();
+        let options = Par2RepairerOptions::new(dir.to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+        let carry = state.scan_carry(&diagnostics);
+        (state, carry)
+    }
+
+    /// The carry exists so the execute pass costs nothing. On an unchanged
+    /// tree it must repair on the analysis it was handed rather than reading
+    /// the whole set a second time, and the bytes it writes must be exactly
+    /// the bytes the two-scan path writes.
+    ///
+    /// `carry_applied` says this pass installed carried state — which is the
+    /// arm that excludes running `scan` at all — and `!carry_retried_fresh`
+    /// says no second pass ran either, so between them no scan happened here.
+    #[test]
+    fn carried_repair_consumes_the_analysis_without_a_second_scan() {
+        let alpha: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let beta: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 11) % 241) as u8).collect();
+
+        let carried_dir = tempdir().unwrap();
+        let fresh_dir = tempdir().unwrap();
+        create_recoverable_set(
+            carried_dir.path(),
+            &[("alpha.bin", &alpha), ("beta.bin", &beta)],
+        );
+        copy_flat_dir(carried_dir.path(), fresh_dir.path());
+        for dir in [carried_dir.path(), fresh_dir.path()] {
+            damage_first_slice(&dir.join("alpha.bin"));
+        }
+
+        let par2 = par2_paths_in(carried_dir.path());
+        let mut analyze = Par2RepairerOptions::new(carried_dir.path().to_path_buf(), par2.clone());
+        analyze.repair = false;
+        let (preview, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert_eq!(preview.status, Par2RepairStatus::RepairPossible);
+        assert!(preview.verification.total_missing_blocks > 0);
+        assert!(!preview.scan.carried, "the analyze pass scans for real");
+        let carry = carry.expect("analyze pass carries scan state");
+
+        let mut execute = Par2RepairerOptions::new(carried_dir.path().to_path_buf(), par2);
+        execute.scan_carry = Some(carry);
+        let carried_outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+        assert_eq!(
+            carried_outcome.status,
+            Par2RepairStatus::Repaired,
+            "{carried_outcome:#?}"
+        );
+        assert!(carried_outcome.carry.carry_applied);
+        assert!(carried_outcome.carry.carry_consumed_for_repair);
+        assert!(
+            !carried_outcome.carry.carry_retried_fresh,
+            "consuming the carry means no second scan: {carried_outcome:#?}"
+        );
+        assert_eq!(carried_outcome.carry.carry_retry_reason, None);
+        assert!(
+            carried_outcome.scan.carried,
+            "the reported scan counters belong to the analyze pass"
+        );
+
+        let fresh_outcome = Par2Repairer::new(Par2RepairerOptions::new(
+            fresh_dir.path().to_path_buf(),
+            par2_paths_in(fresh_dir.path()),
+        ))
+        .verify_or_repair()
+        .unwrap();
+        assert_eq!(fresh_outcome.status, Par2RepairStatus::Repaired);
+        assert!(!fresh_outcome.carry.carry_attempted);
+
+        for (name, original) in [("alpha.bin", &alpha), ("beta.bin", &beta)] {
+            let carried_bytes = fs::read(carried_dir.path().join(name)).unwrap();
+            let fresh_bytes = fs::read(fresh_dir.path().join(name)).unwrap();
+            assert_eq!(carried_bytes, *original, "{name} must be restored");
+            assert_eq!(
+                carried_bytes, fresh_bytes,
+                "{name} must be byte-identical across the carried and fresh repair paths"
+            );
+        }
+    }
+
+    /// A repair input that changed visibly between the two passes must send
+    /// the execute pass back to a real scan, and must still repair correctly
+    /// from what it finds there. The carry never applies in these cases: the
+    /// snapshot check at the top of the pass already refuses, which is why the
+    /// outcome records no retry — one pass, one honest scan.
+    #[test]
+    fn stat_visible_input_change_between_passes_falls_back_to_a_fresh_scan() {
+        let alpha: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let beta: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 11) % 241) as u8).collect();
+
+        let master = tempdir().unwrap();
+        create_recoverable_set(master.path(), &[("alpha.bin", &alpha), ("beta.bin", &beta)]);
+
+        for (label, mutate) in stat_visible_input_mutations() {
+            let dir = tempdir().unwrap();
+            copy_flat_dir(master.path(), dir.path());
+            damage_first_slice(&dir.path().join("alpha.bin"));
+
+            let par2 = par2_paths_in(dir.path());
+            let mut analyze = Par2RepairerOptions::new(dir.path().to_path_buf(), par2.clone());
+            analyze.repair = false;
+            let (preview, carry) = Par2Repairer::new(analyze)
+                .verify_or_repair_carrying()
+                .unwrap();
+            assert_eq!(preview.status, Par2RepairStatus::RepairPossible, "{label}");
+            let carry = carry.expect("analyze pass carries scan state");
+
+            mutate(&dir.path().join("beta.bin"));
+
+            let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), par2);
+            execute.scan_carry = Some(carry);
+            let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+            assert_eq!(
+                outcome.status,
+                Par2RepairStatus::Repaired,
+                "{label} must still repair: {outcome:#?}"
+            );
+            assert!(outcome.carry.carry_attempted, "{label}");
+            assert!(
+                !outcome.carry.carry_applied,
+                "{label}: visible drift must refuse the carry outright"
+            );
+            assert!(!outcome.carry.carry_consumed_for_repair, "{label}");
+            assert!(
+                !outcome.scan.carried,
+                "{label}: the pass must report its own scan"
+            );
+            assert_eq!(
+                fs::read(dir.path().join("alpha.bin")).unwrap(),
+                alpha,
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(dir.path().join("beta.bin")).unwrap(),
+                beta,
+                "{label}"
+            );
+        }
+    }
+
+    /// The pre-mutation gate itself, exercised directly: it runs immediately
+    /// before repair mutates anything, and it is the check that licenses
+    /// skipping the scan. Reaching its refusal arms end-to-end is not possible
+    /// through the public entry point — the snapshot check at the top of the
+    /// pass sees the same drift first — so the arms are pinned here.
+    #[test]
+    fn carry_repair_gate_refuses_every_stat_visible_change_to_an_input() {
+        let file_data: Vec<u8> = (0..1024u32).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+
+        for (label, mutate) in stat_visible_input_mutations() {
+            let dir = tempdir().unwrap();
+            let data_path = dir.path().join("data.bin");
+            fs::write(&data_path, &file_data).unwrap();
+            let set = synthetic_set(&[("data.bin", &file_data)], 64);
+
+            let (state, carry) = scanned_state_with_carry(dir.path(), &set);
+            assert_eq!(
+                state.carry_repair_inputs_unchanged(&carry),
+                Ok(()),
+                "{label}: an untouched tree must pass the gate"
+            );
+
+            mutate(&data_path);
+            assert_eq!(
+                state.carry_repair_inputs_unchanged(&carry),
+                Err(CarryRetryReason::RepairInputChanged),
+                "{label} must refuse the carry before mutation"
+            );
+        }
+    }
+
+    /// An access-backed input has no filesystem identity to re-stat, and a
+    /// carry records no serving-handle generation, so there is no honest
+    /// signal that the bytes behind it are still the ones the scan read. The
+    /// gate refuses rather than guessing, whatever the path-backed inputs say.
+    #[test]
+    fn carry_repair_gate_refuses_an_access_backed_input() {
+        let dir = tempdir().unwrap();
+        let file_data: Vec<u8> = (0..1024u32).map(|i| ((i * 5 + 9) % 251) as u8).collect();
+        fs::write(dir.path().join("data.bin"), &file_data).unwrap();
+        let set = synthetic_set(&[("data.bin", &file_data)], 64);
+
+        let (mut state, carry) = scanned_state_with_carry(dir.path(), &set);
+        assert_eq!(state.carry_repair_inputs_unchanged(&carry), Ok(()));
+
+        let file_id = state.files[0].file_id;
+        let block = state.blocks.last_mut().expect("scanned block");
+        block
+            .location
+            .as_mut()
+            .expect("block resolved to the canonical file")
+            .source = SourceLocation::Access(file_id);
+
+        assert_eq!(
+            state.carry_repair_inputs_unchanged(&carry),
+            Err(CarryRetryReason::RepairInputNotFingerprinted)
+        );
+    }
+
+    /// The whole point of the carry on a real set: the execute pass reads no
+    /// source bytes to analyse, repairs on the analysis it was handed, and
+    /// still re-verifies clean afterwards.
     #[cfg(feature = "slow-tests")]
     #[test]
     fn carried_scan_execute_repairs_and_reverifies_clean() {
@@ -11382,10 +11954,18 @@ mod tests {
         assert_eq!(outcome.verification.total_missing_blocks, 0);
         assert!(outcome.carry.carry_attempted);
         assert!(outcome.carry.carry_applied);
-        assert!(outcome.carry.carry_retried_fresh);
-        assert_eq!(
-            outcome.carry.carry_retry_reason,
-            Some(CarryRetryReason::RepairRequested)
+        assert!(
+            outcome.carry.carry_consumed_for_repair,
+            "an unchanged tree must repair on the carried analysis"
+        );
+        assert!(
+            !outcome.carry.carry_retried_fresh,
+            "consuming the carry means no second scan: {outcome:#?}"
+        );
+        assert_eq!(outcome.carry.carry_retry_reason, None);
+        assert!(
+            outcome.scan.carried,
+            "the reported scan counters belong to the analyze pass"
         );
 
         let mut reverify = Par2RepairerOptions::new(temp.path().to_path_buf(), par2_paths);
