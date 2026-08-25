@@ -28,7 +28,10 @@ impl FileStatFingerprint {
         Ok(Self::from_metadata(&metadata))
     }
 
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    /// Build a fingerprint from metadata the caller already has. Callers that
+    /// need to distinguish "not a regular file" from "changed" must apply that
+    /// filter themselves; this records what the stat said, nothing more.
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 

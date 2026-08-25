@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.0
+
+A carried analysis that reaches a repair no longer throws itself away. Before
+this change, every damaged set whose analysis ran with a `ScanCarry` read and
+hashed the whole source set twice — once to analyse, once again from scratch
+before mutating. Repair now consumes the carried analysis when it can prove
+the inputs are still the files the scan read.
+
+### Breaking changes
+
+- `CarryDiagnostics` adds `carry_consumed_for_repair`, and `ScanDiagnostics`
+  adds `carried`. Because both public structs can be constructed
+  exhaustively, callers using struct literals must add these fields or use
+  `..Default::default()`.
+- `CarryRetryReason` adds `RepairInputChanged` and
+  `RepairInputNotFingerprinted`. Exhaustive matches on it need new arms.
+- `ScanDiagnostics`, `CarryDiagnostics` and `CarryRetryReason` are now
+  `#[non_exhaustive]`. This is the last release in which adding a counter, a
+  flag or a retry reason to them is a breaking change: construct the structs
+  with `..Default::default()` and match the enum with a wildcard arm, and
+  future additions arrive as minor versions.
+
+### Runtime behavior
+
+- A carried pass that reaches a mutating repair re-stats every source the
+  repair would read and compares it against the fingerprint the carried scan
+  captured — length, mtime, and on Unix device and inode. All matching lets
+  the repair proceed on the carried analysis with no second scan; anything
+  else retries the pass from a fresh scan and records why.
+- A repair that consumes a carry takes the validated read path: each source
+  slice is checked against its IFSC checksum on the way into staging and into
+  the Reed-Solomon input stream, and each source path is re-stat'd as it is
+  read. A source that changed in a way `stat` cannot see is caught there,
+  before anything is installed, and also retries from a fresh scan.
+- Carried results that do not mutate — a clean verify, an insufficient or
+  resource-limited verdict, any verify-only pass — are still re-established
+  from a fresh scan before they are reported, unchanged from 0.6.0.
+- `Par2RepairOutcome::scan` now says whether its counters describe this pass
+  or the pass that produced the carry.
+
+
 ## 0.6.0
 
 This release defers short-block relocation until candidate scans have merged,
