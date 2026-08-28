@@ -1,9 +1,27 @@
 # unrar-rs License
 
-unrar-rs is licensed under GPL-3.0-or-later, with the additional UnRAR
-source-code restriction below for RAR extraction and recovery code.
+## Licenses for the code in this crate
 
-## UnRAR Source-Code Restriction
+The licenses for the code in this crate are:
+
+1) The RAR archive reading, decompression, extraction, and recovery
+   engine — code developed using RARLAB's unRAR source code: the
+   GNU GPL version 3 or (at your option) any later version, with the
+   "unRAR license restriction" below.
+2) All other files: the GNU GPL version 3 or (at your option) any
+   later version.
+
+Redistributions in binary form must reproduce related license
+information from this file.
+
+## unRAR license restriction
+
+The RAR decompression engine in this crate was developed using the
+source code of the unRAR program. All copyrights to the original unRAR
+code are owned by Alexander Roshal.
+
+The license for the original unRAR code has the following restriction,
+which continues to govern the unRAR-derived portions of this crate:
 
 UnRAR source code may be used in any software to handle
 RAR archives without limitations free of charge, but cannot be

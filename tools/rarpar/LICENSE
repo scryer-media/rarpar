@@ -1,32 +1,62 @@
 # rarpar License
 
-rarpar is licensed under GPL-3.0-or-later with the additional UnRAR
-source-code restriction reproduced at the end of this file.
+## rarpar-authored code
 
-The restriction is not a property of only the binaries. `unrar-rs` is a
-default dependency of this crate: it is pulled in by the `runtime` feature,
-and `default = ["runtime", "musl-allocator"]`. An ordinary `cargo build`,
-`cargo install` or release archive therefore contains UnRAR-derived RAR
-extraction and recovery code and carries the restriction with it.
+Except where a file states otherwise, source code authored for rarpar is
+licensed under the GNU General Public License, version 3 or, at your option,
+any later version (GPL-3.0-or-later).
+
+## Additional permission to combine with unrar-rs
+
+As an additional permission under section 7 of GNU GPL version 3, the
+copyright holders of rarpar grant permission to link or combine covered
+rarpar code with the unrar-rs library, including modified versions of that
+library governed by the unRAR license restriction, and to convey the
+resulting combined work.
+
+This permission does not relicense unrar-rs or any UnRAR-derived material.
+Those portions remain governed by their applicable license terms. Nothing in
+this permission excuses a distributor from complying with those terms,
+including preservation of required license notices. The applicable unRAR
+notice is reproduced below and in the unrar-rs license.
+
+The Corresponding Source for a non-source distribution of such a combined
+work shall include the exact unrar-rs source used to build it, including any
+modifications and the scripts needed to control compilation and installation.
+
+You may remove this additional permission from a modified version of rarpar.
+Conveying that modified version combined with unrar-rs requires permission
+equivalent to this exception.
+
+## What distributed rarpar contains
+
+`unrar-rs` is a default dependency of this crate: it is pulled in by the
+`runtime` feature, and `default = ["runtime", "musl-allocator"]`. An ordinary
+`cargo build`, `cargo install` or release archive therefore contains
+UnRAR-derived RAR extraction and recovery code, and the unRAR license
+restriction travels with that component.
 
 Only a deliberate `--no-default-features` build that also omits `runtime`
-links no `unrar-rs`. That configuration is GPL-3.0-or-later alone, and it is
-not what any distributed rarpar is — so rarpar is described as
-GPL-3.0-or-later AND the UnRAR restriction, rather than as GPL-3.0-or-later
-with a caveat about binaries.
+links no `unrar-rs`. That configuration is GPL-3.0-or-later alone.
 
 Binary release archives include:
 
 - `LICENSE`: this rarpar license notice.
 - `LICENSE.GPL-3.0-or-later`: the full GNU GPL version 3 text.
 - `LICENSE.unrar-rs`: the complete unrar-rs license text, including
-  the UnRAR source-code restriction.
+  the unRAR license restriction.
 
 Source checkouts include the full GNU GPL version 3 text in the workspace root
 `LICENSE` file and the complete unrar-rs license in
 `crates/unrar-rs/LICENSE`.
 
-## UnRAR Source-Code Restriction
+## unRAR license restriction
+
+The RAR engine in unrar-rs was developed using the source code of the unRAR
+program. All copyrights to the original unRAR code are owned by Alexander
+Roshal. The license for the original unRAR code has the following
+restriction, which continues to govern the UnRAR-derived code incorporated
+into distributed rarpar builds:
 
 UnRAR source code may be used in any software to handle
 RAR archives without limitations free of charge, but cannot be

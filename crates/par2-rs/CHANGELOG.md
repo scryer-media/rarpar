@@ -1,5 +1,117 @@
 # Changelog
 
+## 0.8.0
+
+Two ways for a host that has already read the payload to stop paying for this
+crate to read it again: a verification pass can be handed across the boundary
+into a repair, and a verification can be told which slices are already proven
+and read only the rest.
+
+**Semver: a compatibility break, and takes 0.8.x rather than 0.7.2.**
+`VerifyOptions` gains a field *and* becomes `#[non_exhaustive]`, so external
+struct literals stop compiling — the same one-time move `ScanDiagnostics`,
+`CarryDiagnostics` and `CarryRetryReason` made in 0.7.0. Under Cargo's pre-1.0
+rules a `0.7.2` would have been picked up automatically by anyone requiring
+`0.7` and would have failed their build with no version signal that anything
+moved. Build the options with `..Default::default()` and future additions
+arrive as minor versions.
+
+### Breaking changes
+
+- `VerifyOptions` is now `#[non_exhaustive]` and adds `proven_slices`. Callers
+  using struct literals must switch to
+  `let mut options = VerifyOptions::default();` and assign the fields they
+  want. Nothing else about the type changed, and a default-constructed
+  `VerifyOptions` behaves exactly as before.
+
+### Added
+
+- `ScanCarry::from_verification`, which builds a repairer scan carry out of a
+  verification the host ran itself: a `Par2FileSet`, a `VerificationResult`,
+  and the per-file `FileStatFingerprint`s the host captured when it read the
+  files. A host that verifies a set and then decides to repair no longer
+  watches `Par2Repairer` scan and hash the bytes it just read — the payload is
+  read once. Refusals are reported as the new `ExternalCarryError` rather than
+  absorbed: an attestation this crate cannot make sense of must never reach a
+  repair.
+- `FileStatFingerprint::capture_path`, the public capture a host uses to build
+  those fingerprints. It is the same function every stat gate in this crate
+  calls, so a host-captured fingerprint and the gate that re-checks it cannot
+  come to disagree about what "the same file" means.
+- `VerifyOptions::proven_slices`: a per-file mask of slices the caller has
+  already proven. Verification then reads only the unproven slices, seeking
+  over the ranges the proven ones cover, and returns a result shaped exactly
+  as a full read would have — per-slice accounting exact, statuses derived
+  from evidence and read together, totals correct. A 4096-slice file with 1%
+  unproven costs roughly 1% of the read.
+- `CarryDiagnostics`, `CarryRetryReason` and `ExternalCarryError` are now
+  re-exported from the crate root alongside `ScanCarry`.
+
+### Trust contract
+
+Both features are caller-attested, and they are not attested the same way.
+
+- **`ScanCarry::from_verification`.** The caller attests that it read the bytes
+  it claims and fingerprinted each file at the moment of that read. A false
+  attestation cannot corrupt output: the carried analysis is installed only if
+  every path still matches its fingerprint, a mutating repair re-stats every
+  source it will read immediately before touching anything, and a repair that
+  consumes a carry — from any origin — reads every source slice through the
+  validated path, checking it against its IFSC checksum on the way into
+  staging and into the Reed-Solomon input stream. A wrong attestation
+  therefore degrades to a rescan, or to a caught checksum mismatch that
+  retries from a fresh scan before installing anything. The cost of being
+  wrong is the scan the carry was meant to save.
+- **`VerifyOptions::proven_slices`.** A wrong attestation *does* produce a
+  false `Complete` for the slices it covers: verification reads nothing that
+  could contradict it. That is the same trust class as the crate's existing
+  file-level evidence paths. Attest only slices whose bytes were checksummed
+  against this set's own per-slice checksums, on a file that is no longer
+  being written.
+
+### Runtime behaviour
+
+- A carry built from a host verification describes canonical placement only.
+  It cannot express a file found under another name, a copy in an extra search
+  path, or a block relocated within a file — the scanner exists to find those.
+  Those slices are not lost, only unclaimed: repair reconstructs them from
+  parity, which costs Reed-Solomon work and produces the same bytes. A
+  `FileStatus::Renamed` entry is refused outright rather than silently
+  downgraded.
+- `ScanCarry` now records the recovery set ID and slice size it was laid out
+  from, and a carry from another set is refused before its files and blocks
+  are installed. File IDs nearly settled this already; the slice size is what
+  turns a local slice index into a byte offset, and nothing else was checking
+  it.
+- `ScanDiagnostics` reports an externally-built carry honestly:
+  `bytes_scanned` is zero because this crate read nothing, and the bytes
+  behind the carried verdicts appear under `slices_settled_by_evidence` /
+  `bytes_skipped_by_evidence`, the counters that already exist to disclose an
+  analysis reached without reading its sources.
+- Per-slice evidence applies only where a per-slice verdict can mean
+  something: the file must exist, its on-disk length must equal the
+  description's, it must carry a complete IFSC set, and it must be non-empty.
+  Evidence about a missing file does not resurrect it; evidence about a file
+  whose length no longer matches is discarded rather than believed, because
+  the offsets those verdicts were about are not the offsets in the file now on
+  disk; a mask of the wrong length is dropped whole. An empty or all-`false`
+  map leaves verification byte-for-byte what it was.
+- Once any slice is skipped the whole-file MD5 arm cannot run, so completeness
+  comes from slice proof plus a matching length — the shape fast verify has
+  reported since 0.5.0. Evidence composes with fast verify by subsuming it for
+  the files it covers: both prove from the same IFSC entries, and evidence
+  reads strictly less.
+- An evidenced read batches its MD5s by lane rather than by adjacency, so a
+  mask whose unproven slices are scattered costs the same per slice as one
+  whose unproven slices are contiguous. Batching by adjacency would have
+  handed the eight-lane kernel one slice per call on an alternating mask,
+  which measured *slower* than reading the whole file — an option that is a
+  pessimisation on the masks real hosts produce is worse than no option. The
+  new `verify_slice_evidence` bench group pins this: on a 4096-slice, 128 MiB
+  file (Apple M5 Max), a full strict verify is 154 ms, 50% unproven is 69 ms,
+  1% unproven is 1.40 ms, and a fully proven file is 5.0 µs.
+- The `rarpar` CLI sets neither: its verify and repair paths are unchanged.
+
 ## 0.7.1
 
 A host that has already vouched for most of a damaged file no longer has to

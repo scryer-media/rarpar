@@ -40,6 +40,7 @@ use crate::verify::{
     self, FileAccess, FileStatus, FileVerification, Repairability, VerificationResult,
 };
 use rayon::prelude::*;
+use thiserror::Error;
 use tracing::{debug, warn};
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
@@ -159,10 +160,13 @@ pub struct ScanDiagnostics {
     /// its own. Every counter above then describes that earlier scan, and this
     /// pass read no source bytes to analyse the set.
     pub carried: bool,
-    /// Source slices this pass declined to read because seeded evidence had
-    /// already located them and the file still matched the stat fingerprint
-    /// that evidence was admitted against. Zero unless the host opted in with
-    /// [`crate::Par2RepairSessionOptions::trust_seeded_evidence_for_scan`].
+    /// Source slices this pass declined to read because evidence had already
+    /// located them and the file still matched the stat fingerprint that
+    /// evidence was admitted against. Zero unless the host opted in with
+    /// [`crate::Par2RepairSessionOptions::trust_seeded_evidence_for_scan`], or
+    /// supplied a carry built from its own verification
+    /// ([`ScanCarry::from_verification`]), where every located slice is one
+    /// this crate never read.
     pub slices_settled_by_evidence: u32,
     /// Source bytes covered by [`Self::slices_settled_by_evidence`], and
     /// therefore neither read nor hashed. [`Self::bytes_scanned`] excludes
@@ -229,8 +233,25 @@ pub enum CarryRetryReason {
 ///
 /// A carry never discovers source files that appeared after the analyze
 /// pass — callers that allow drop-ins between passes should not supply one.
+///
+/// A carry can also come from outside this crate:
+/// [`ScanCarry::from_verification`] turns a host's own verification pass into
+/// one, so a host that already read the payload does not pay for the
+/// repairer's scan to read it again. Both origins meet the same gates — the
+/// set match, the per-path stat snapshot, the pre-mutation re-stat of every
+/// repair input, and the validated read during repair — and nothing
+/// downstream can tell them apart.
 #[derive(Debug)]
 pub struct ScanCarry {
+    /// Identity of the set this carry describes. Checked before the carried
+    /// files and blocks are installed, because those vectors are swapped in
+    /// wholesale: their `first_block` offsets, expected lengths and slice
+    /// checksums are only meaningful for the set they were laid out from.
+    /// File IDs alone nearly settle this (a `FileId` hashes the file's first
+    /// 16 KiB, length and name), but they say nothing about the slice size
+    /// that turns a local slice index into a byte offset.
+    recovery_set_id: RecoverySetId,
+    slice_size: u64,
     set_file_ids: Vec<FileId>,
     snapshot: Vec<CarriedFileStat>,
     files: Vec<SourceFileEntry>,
@@ -267,11 +288,406 @@ fn stat_for_carry(path: &Path) -> CarriedFileStat {
 /// Fingerprint `path` as every stat gate in this crate compares it: symlinks
 /// are not followed and only regular files fingerprint, so a path that became
 /// a directory, a symlink or a device reads as absent rather than unchanged.
+///
+/// This is a one-line forward to [`FileStatFingerprint::capture_path`], the
+/// public capture a host uses when it builds a carry from its own verification
+/// ([`ScanCarry::from_verification`]). Having exactly one implementation is the
+/// point: a host-captured fingerprint and the gate that re-checks it must
+/// agree about what "the same file" means, and two copies of this rule would
+/// eventually stop agreeing.
 pub(crate) fn stat_fingerprint(path: &Path) -> Option<FileStatFingerprint> {
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|meta| meta.file_type().is_file())
-        .map(|meta| FileStatFingerprint::from_metadata(&meta))
+    FileStatFingerprint::capture_path(path)
+}
+
+/// Why a host's verification could not be turned into a [`ScanCarry`].
+///
+/// Every variant names a disagreement between the attestation and the set it
+/// claims to describe, not a property of the files on disk. They are caller
+/// bugs — a mismatched set, an attestation that contradicts itself — and are
+/// reported rather than absorbed, because a carry built from an attestation
+/// this crate could not make sense of is exactly the thing that must never
+/// reach a repair.
+#[derive(Debug, Error)]
+// New ways for an attestation to be inconsistent are detail, not a contract
+// change for matchers.
+#[non_exhaustive]
+pub enum ExternalCarryError {
+    /// The verification covers a file the set does not describe.
+    #[error("verification names file {file_id}, which is not in the recovery set")]
+    UnknownFile { file_id: FileId },
+    /// Two entries in the verification claim the same file.
+    #[error("verification names file {file_id} more than once")]
+    DuplicateFile { file_id: FileId },
+    /// A recoverable file in the set has no entry in the verification. A carry
+    /// must describe the whole set: what it does not mention would otherwise
+    /// be silently taken as unrecoverable.
+    #[error("verification does not cover recovery-set file {file_id}")]
+    UncoveredFile { file_id: FileId },
+    /// The per-slice validity vector is not the length the set's slice layout
+    /// requires for that file.
+    #[error(
+        "file {file_id} has {expected} slices in the set but the verification supplied {supplied}"
+    )]
+    SliceCountMismatch {
+        file_id: FileId,
+        expected: usize,
+        supplied: usize,
+    },
+    /// `missing_slice_count` disagrees with the count of invalid slices, or a
+    /// `Damaged(n)` status disagrees with either.
+    #[error(
+        "file {file_id} declares {declared} damaged slices but its validity vector shows {actual}"
+    )]
+    DamagedCountMismatch {
+        file_id: FileId,
+        declared: u32,
+        actual: u32,
+    },
+    /// A file claimed `Complete` whose validity vector is not all-valid.
+    #[error("file {file_id} is reported complete but its validity vector has invalid slices")]
+    IncompleteCompleteFile { file_id: FileId },
+    /// A file claimed `Missing` for which a stat fingerprint was supplied, or
+    /// whose validity vector claims a valid slice. A missing file has neither.
+    #[error("file {file_id} is reported missing but the verification also claims content for it")]
+    MissingFileWithContent { file_id: FileId },
+    /// A file that is not `Missing` but carries no stat fingerprint. Without
+    /// one there is nothing for the carry gate to re-check, so the carry would
+    /// be refused at repair time anyway; refusing to build it says so up front.
+    #[error("file {file_id} is present in the verification but carries no stat fingerprint")]
+    UnfingerprintedFile { file_id: FileId },
+    /// A `Renamed` status. A carry built from a host verification describes
+    /// files at their canonical paths only (see [`ScanCarry::from_verification`]).
+    #[error(
+        "file {file_id} is reported at a non-canonical path, which an external carry cannot describe"
+    )]
+    RelocatedFile { file_id: FileId },
+    /// The set could not be laid out into source files and blocks at all.
+    #[error("PAR2 set cannot be laid out for a carry: {0}")]
+    Set(#[from] Par2Error),
+}
+
+impl ScanCarry {
+    /// Build a carry from a verification pass this crate did not run.
+    ///
+    /// # What this is for
+    ///
+    /// A host that verifies a set itself — a full strict read through
+    /// [`crate::verify`] — and then decides to repair would otherwise watch
+    /// [`Par2Repairer`] scan and hash the very bytes it just read. Handing the
+    /// repairer a carry built from that verification skips the repairer's
+    /// scan: the payload is read once, by the host, and the repair proceeds on
+    /// what the host found.
+    ///
+    /// # The trust contract
+    ///
+    /// The caller attests that it read the bytes it claims: that
+    /// `verification`'s per-slice validity is what a real read of each file
+    /// produced, and that each `fingerprints` entry was captured
+    /// ([`FileStatFingerprint::capture_path`]) at the moment of that read. This
+    /// crate cannot check the first claim — that is what "attest" means — and
+    /// it does not try to.
+    ///
+    /// What it does instead is refuse to let a false attestation reach the
+    /// output, through the same three gates a natively-produced carry passes:
+    ///
+    /// 1. **The snapshot gate.** Before the carried analysis is installed,
+    ///    every path the carry names is re-stat'd and must still match the
+    ///    fingerprint the caller captured. A file that changed after the
+    ///    caller read it — including one whose length is unchanged but whose
+    ///    mtime moved — refuses the carry, and the pass scans for real.
+    /// 2. **The pre-mutation gate.** Immediately before a repair mutates
+    ///    anything, every source it will read is re-stat'd again against the
+    ///    same fingerprints. Anything else sends the pass back to a full scan
+    ///    before a byte is written.
+    /// 3. **The validated read.** A repair that consumes a carry — whatever
+    ///    produced it — reads every source slice through the validated path,
+    ///    checking it against its IFSC checksum on the way into staging and
+    ///    into the Reed-Solomon input stream. This is unconditional, and it is
+    ///    what covers the one drift `stat` cannot see: a same-length rewrite
+    ///    that also restored the original mtime.
+    ///
+    /// So a false attestation degrades to a rescan (gates 1 and 2) or to a
+    /// caught checksum mismatch that retries from a fresh scan before
+    /// installing anything (gate 3). It never produces corrupt output. The
+    /// cost of being wrong is the scan the carry was meant to save, which is
+    /// the honest price.
+    ///
+    /// # What a carry built this way describes
+    ///
+    /// Only canonical placement. A host verification reads each file at its
+    /// recorded path, so this constructor can only say "this file's slice *i*
+    /// is intact, at its canonical offset, at its canonical path". It cannot
+    /// describe a file found under a different name, a copy in an extra search
+    /// path, or a block relocated within a file — the three things the
+    /// repairer's own scanner exists to find. Those are not lost, only
+    /// unclaimed: a slice this carry does not locate is a slice the repair
+    /// reconstructs from parity, which costs Reed-Solomon work but produces
+    /// the same bytes. A [`FileStatus::Renamed`] entry is refused outright
+    /// rather than silently downgraded, because a host that found a renamed
+    /// file is describing a placement this form has no way to carry.
+    ///
+    /// Non-recovery files (those the set describes but does not protect) are
+    /// neither required in `verification` nor recorded here: they are never
+    /// repair inputs and never repair targets.
+    ///
+    /// # Consistency the constructor does check
+    ///
+    /// The attestation must agree with itself and with the set: one entry per
+    /// recoverable file, validity vectors of the length the set's slice layout
+    /// requires, damage counts that match their validity vectors, a
+    /// fingerprint for every file not reported [`FileStatus::Missing`] and
+    /// none for one that is. These are caller bugs, and each returns an
+    /// [`ExternalCarryError`] instead of a carry.
+    ///
+    /// A slice claimed valid whose bytes would fall past the end of the file
+    /// the fingerprint describes is dropped rather than carried: the caller
+    /// cannot have read bytes that are not there. Dropping it makes the
+    /// repair reconstruct that slice, which is the conservative direction.
+    ///
+    /// # Cost
+    ///
+    /// `set` is cloned to lay out the source files and blocks through exactly
+    /// the same code path [`Par2Repairer`] uses, so the two layouts cannot
+    /// drift. The clone is of the set's metadata; recovery slice payloads are
+    /// reference-counted and are not copied. No file is opened or read here,
+    /// and nothing is stat'd — the fingerprints are the caller's, by design.
+    pub fn from_verification(
+        base_dir: &Path,
+        set: &Par2FileSet,
+        verification: &VerificationResult,
+        fingerprints: &HashMap<FileId, FileStatFingerprint>,
+    ) -> std::result::Result<Self, ExternalCarryError> {
+        // Laid out by the repairer's own constructor, not by a parallel
+        // reimplementation: `try_apply_carry` swaps these vectors in wholesale,
+        // so a layout that differed by one block offset would be undetectable
+        // and catastrophic.
+        let mut state = RepairState::from_set(base_dir, set.clone())?;
+        let slice_size = state.set.slice_size;
+
+        let mut attested: HashMap<FileId, &FileVerification> =
+            HashMap::with_capacity(verification.files.len());
+        for file in &verification.files {
+            if attested.insert(file.file_id, file).is_some() {
+                return Err(ExternalCarryError::DuplicateFile {
+                    file_id: file.file_id,
+                });
+            }
+        }
+
+        let mut located_blocks = 0u32;
+        let mut located_bytes = 0u64;
+
+        for file_index in 0..state.files.len() {
+            if !state.files[file_index].recoverable {
+                continue;
+            }
+            let file_id = state.files[file_index].file_id;
+            let attestation = attested
+                .remove(&file_id)
+                .ok_or(ExternalCarryError::UncoveredFile { file_id })?;
+            let fingerprint = fingerprints.get(&file_id);
+            check_attestation(&state.files[file_index], attestation, fingerprint)?;
+
+            let Some(fingerprint) = fingerprint else {
+                // Reported missing, and checked as such above: no target, no
+                // locations. `verification_result` reads that back as
+                // `FileStatus::Missing`, which is what a scan of an absent
+                // file produces, so repair treats the file as a target rather
+                // than as an input.
+                state.files[file_index].target_exists = false;
+                continue;
+            };
+            state.files[file_index].target_exists = true;
+
+            let first_block = state.files[file_index].first_block;
+            let block_count = state.files[file_index].block_count;
+            let safe_path = state.files[file_index].safe_path.clone();
+            for local in 0..block_count {
+                if !attestation.valid_slices[local] {
+                    continue;
+                }
+                let block_index = first_block + local;
+                let expected_len = state.blocks[block_index].expected_len;
+                let offset = local as u64 * slice_size;
+                if offset.saturating_add(expected_len) > fingerprint.length() {
+                    // The caller claims a slice that does not fit in the file
+                    // it fingerprinted. It cannot have read those bytes, so
+                    // the block stays unlocated and repair rebuilds it.
+                    continue;
+                }
+                state.blocks[block_index].location = Some(BlockLocation {
+                    source: SourceLocation::Path(safe_path.clone()),
+                    offset,
+                    len: expected_len,
+                    kind: BlockLocationKind::Canonical,
+                });
+                located_blocks = located_blocks.saturating_add(1);
+                located_bytes = located_bytes.saturating_add(expected_len);
+            }
+
+            if external_carry_layout_is_complete(&state, file_index, fingerprint.length()) {
+                let file = &state.files[file_index];
+                let complete = BlockLocation {
+                    source: SourceLocation::Path(file.safe_path.clone()),
+                    offset: 0,
+                    len: file.length,
+                    kind: BlockLocationKind::Canonical,
+                };
+                state.files[file_index].complete_location = Some(complete);
+            }
+        }
+
+        if let Some(file_id) = attested.keys().next().copied() {
+            return Err(ExternalCarryError::UnknownFile { file_id });
+        }
+
+        // The snapshot is the caller's fingerprints verbatim. Re-statting the
+        // paths here would defeat the whole gate: it would record the file as
+        // it is *now* rather than as it was when the caller read it, and any
+        // change in between would become invisible.
+        let present_files = state
+            .files
+            .iter()
+            .filter(|file| file.recoverable && file.target_exists)
+            .count() as u32;
+        let absent_files = state
+            .files
+            .iter()
+            .filter(|file| file.recoverable && !file.target_exists)
+            .count() as u32;
+        let snapshot: Vec<CarriedFileStat> = state
+            .files
+            .iter()
+            .filter(|file| file.recoverable)
+            .map(|file| CarriedFileStat {
+                path: file.safe_path.clone(),
+                state: fingerprints.get(&file.file_id).cloned(),
+            })
+            .collect();
+
+        Ok(ScanCarry {
+            recovery_set_id: state.set.recovery_set_id,
+            slice_size,
+            set_file_ids: state.files.iter().map(|file| file.file_id).collect(),
+            snapshot,
+            files: state.files.clone(),
+            blocks: state.blocks.clone(),
+            diagnostics: ScanDiagnostics {
+                files_scanned: present_files,
+                // This pass read nothing. The bytes behind the carried
+                // verdicts are counted as skipped-by-evidence below, which is
+                // the counter that exists to disclose an analysis reached
+                // without reading its sources.
+                bytes_scanned: 0,
+                blocks_found: located_blocks,
+                files_skipped: absent_files,
+                slices_settled_by_evidence: located_blocks,
+                bytes_skipped_by_evidence: located_bytes,
+                ..ScanDiagnostics::default()
+            },
+        })
+    }
+}
+
+/// Check one host attestation against the set entry it claims to describe.
+///
+/// Only self-consistency is checked — whether the vector, the counts and the
+/// status agree with each other and with the set's slice layout. Whether the
+/// validity bits are *true* is the caller's attestation and is not checkable
+/// here; see [`ScanCarry::from_verification`] for what defends against a false
+/// one.
+fn check_attestation(
+    file: &SourceFileEntry,
+    attestation: &FileVerification,
+    fingerprint: Option<&FileStatFingerprint>,
+) -> std::result::Result<(), ExternalCarryError> {
+    let file_id = file.file_id;
+    if attestation.valid_slices.len() != file.expected_block_count {
+        return Err(ExternalCarryError::SliceCountMismatch {
+            file_id,
+            expected: file.expected_block_count,
+            supplied: attestation.valid_slices.len(),
+        });
+    }
+
+    let invalid = attestation
+        .valid_slices
+        .iter()
+        .filter(|valid| !**valid)
+        .count() as u32;
+    if attestation.missing_slice_count != invalid {
+        return Err(ExternalCarryError::DamagedCountMismatch {
+            file_id,
+            declared: attestation.missing_slice_count,
+            actual: invalid,
+        });
+    }
+
+    match &attestation.status {
+        FileStatus::Renamed(_) => return Err(ExternalCarryError::RelocatedFile { file_id }),
+        FileStatus::Missing => {
+            // A missing file has no bytes to have read and no file to have
+            // fingerprinted. Either claim contradicts the status.
+            if fingerprint.is_some() || attestation.valid_slices.iter().any(|valid| *valid) {
+                return Err(ExternalCarryError::MissingFileWithContent { file_id });
+            }
+            return Ok(());
+        }
+        FileStatus::Complete => {
+            if invalid != 0 {
+                return Err(ExternalCarryError::IncompleteCompleteFile { file_id });
+            }
+        }
+        FileStatus::Damaged(declared) => {
+            if *declared != invalid {
+                return Err(ExternalCarryError::DamagedCountMismatch {
+                    file_id,
+                    declared: *declared,
+                    actual: invalid,
+                });
+            }
+        }
+    }
+
+    if fingerprint.is_none() {
+        return Err(ExternalCarryError::UnfingerprintedFile { file_id });
+    }
+    Ok(())
+}
+
+/// Whether this file's carried block locations amount to a whole-file
+/// canonical source, using the caller's fingerprinted length in place of the
+/// `stat` a scan would do.
+///
+/// This mirrors `RepairState::file_has_canonical_block_layout` exactly, with
+/// the one substitution the external form requires: the length comes from the
+/// fingerprint the caller captured when it read the file, not from a fresh
+/// `stat`, for the same reason the snapshot does. A length read now would
+/// describe a file that may already have moved on.
+fn external_carry_layout_is_complete(
+    state: &RepairState,
+    file_index: usize,
+    fingerprinted_length: u64,
+) -> bool {
+    let file = &state.files[file_index];
+    if !file.target_exists {
+        return false;
+    }
+    if file.block_count == 0 {
+        return file.length == 0 && fingerprinted_length == 0;
+    }
+    if fingerprinted_length != file.length {
+        return false;
+    }
+    (0..file.block_count).all(|local| {
+        let block = &state.blocks[file.first_block + local];
+        block.location.as_ref().is_some_and(|location| {
+            location.kind == BlockLocationKind::Canonical
+                && location.source.is_path(&file.safe_path)
+                && location.offset == local as u64 * state.set.slice_size
+                && location.len == block.expected_len
+        })
+    })
 }
 
 /// Which seeded slice verdicts an analysis pass is permitted to take on trust
@@ -3813,6 +4229,8 @@ impl RepairState {
             }
         }
         ScanCarry {
+            recovery_set_id: self.set.recovery_set_id,
+            slice_size: self.set.slice_size,
             set_file_ids: self.files.iter().map(|file| file.file_id).collect(),
             snapshot: paths.iter().map(|path| stat_for_carry(path)).collect(),
             files: self.files.clone(),
@@ -3826,6 +4244,13 @@ impl RepairState {
     /// nonexistence). Returns the carried diagnostics on success; `None`
     /// means the caller must run a real scan.
     fn try_apply_carry(&mut self, carry: &ScanCarry) -> Option<ScanDiagnostics> {
+        // The carried vectors replace this state's own, so they must have been
+        // laid out from this same set: same recovery set, same slice size.
+        if carry.recovery_set_id != self.set.recovery_set_id
+            || carry.slice_size != self.set.slice_size
+        {
+            return None;
+        }
         let ids_match = self.files.len() == carry.set_file_ids.len()
             && self
                 .files
@@ -12569,5 +12994,383 @@ mod tests {
         let clean = Par2Repairer::new(reverify).verify_or_repair().unwrap();
         assert_eq!(clean.status, Par2RepairStatus::Verified, "{clean:#?}");
         assert_eq!(clean.verification.total_missing_blocks, 0, "{clean:#?}");
+    }
+
+    // --- Externally-constructed carries -----------------------------------
+
+    /// The set the repairer itself would load from `par2_paths`, so a carry
+    /// built against it is built against the same layout the repair will use.
+    fn loaded_set(dir: &Path, par2_paths: &[PathBuf]) -> Par2FileSet {
+        let options = Par2RepairerOptions::new(dir.to_path_buf(), par2_paths.to_vec());
+        Par2Repairer::new(options)
+            .load_inventory()
+            .expect("load PAR2 inventory")
+            .set
+    }
+
+    /// A host's own verification of `set` under `dir`, plus the stat
+    /// fingerprints captured for it — the two inputs
+    /// [`ScanCarry::from_verification`] takes.
+    ///
+    /// The fingerprints are captured after the read, which is the honest
+    /// order: a file that changed *during* the read ends up with a fingerprint
+    /// that no longer matches what the read saw only if it changed again, and
+    /// a file that changed after it is exactly what the gate exists to catch.
+    fn host_verification(
+        dir: &Path,
+        set: &Par2FileSet,
+    ) -> (VerificationResult, HashMap<FileId, FileStatFingerprint>) {
+        let access = DiskFileAccess::new(dir.to_path_buf(), set);
+        let verification = verify::verify_selected_file_ids(set, &access, &set.recovery_file_ids);
+        let fingerprints = set
+            .recovery_file_ids
+            .iter()
+            .filter_map(|file_id| {
+                let desc = set.files.get(file_id)?;
+                let fingerprint = FileStatFingerprint::capture_path(dir.join(&desc.filename))?;
+                Some((*file_id, fingerprint))
+            })
+            .collect();
+        (verification, fingerprints)
+    }
+
+    fn external_carry(dir: &Path, set: &Par2FileSet) -> ScanCarry {
+        let (verification, fingerprints) = host_verification(dir, set);
+        ScanCarry::from_verification(dir, set, &verification, &fingerprints)
+            .expect("host verification builds a carry")
+    }
+
+    /// The point of the whole feature: a host that already read the payload
+    /// hands its verification across the boundary, and the repair runs on it
+    /// without reading the set a second time. `carry_consumed_for_repair`
+    /// with no `carry_retried_fresh` is the single-read shape, and the bytes
+    /// written must be the bytes the ordinary two-pass path writes.
+    #[test]
+    fn external_carry_repairs_on_the_host_analysis_without_a_scan() {
+        let alpha: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let beta: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 11) % 241) as u8).collect();
+
+        let carried_dir = tempdir().unwrap();
+        let fresh_dir = tempdir().unwrap();
+        create_recoverable_set(
+            carried_dir.path(),
+            &[("alpha.bin", &alpha), ("beta.bin", &beta)],
+        );
+        copy_flat_dir(carried_dir.path(), fresh_dir.path());
+        for dir in [carried_dir.path(), fresh_dir.path()] {
+            damage_first_slice(&dir.join("alpha.bin"));
+        }
+
+        let par2 = par2_paths_in(carried_dir.path());
+        let set = loaded_set(carried_dir.path(), &par2);
+        let (verification, fingerprints) = host_verification(carried_dir.path(), &set);
+        assert!(
+            verification.total_missing_blocks > 0,
+            "the host's own pass must see the damage: {verification:#?}"
+        );
+        let carry =
+            ScanCarry::from_verification(carried_dir.path(), &set, &verification, &fingerprints)
+                .expect("host verification builds a carry");
+        assert_eq!(
+            carry.diagnostics.bytes_scanned, 0,
+            "this crate read nothing to build the carry"
+        );
+        assert!(
+            carry.diagnostics.bytes_skipped_by_evidence > 0,
+            "the bytes behind the carried verdicts are disclosed as unread"
+        );
+
+        let mut execute = Par2RepairerOptions::new(carried_dir.path().to_path_buf(), par2);
+        execute.scan_carry = Some(Arc::new(carry));
+        let carried_outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+        assert_eq!(
+            carried_outcome.status,
+            Par2RepairStatus::Repaired,
+            "{carried_outcome:#?}"
+        );
+        assert!(carried_outcome.carry.carry_applied);
+        assert!(
+            carried_outcome.carry.carry_consumed_for_repair,
+            "an unchanged tree must repair on the host's analysis: {carried_outcome:#?}"
+        );
+        assert!(
+            !carried_outcome.carry.carry_retried_fresh,
+            "consuming the carry means no scan happened here: {carried_outcome:#?}"
+        );
+        assert!(carried_outcome.scan.carried);
+
+        let fresh_outcome = Par2Repairer::new(Par2RepairerOptions::new(
+            fresh_dir.path().to_path_buf(),
+            par2_paths_in(fresh_dir.path()),
+        ))
+        .verify_or_repair()
+        .unwrap();
+        assert_eq!(fresh_outcome.status, Par2RepairStatus::Repaired);
+
+        for (name, original) in [("alpha.bin", &alpha), ("beta.bin", &beta)] {
+            let carried_bytes = fs::read(carried_dir.path().join(name)).unwrap();
+            assert_eq!(carried_bytes, *original, "{name} must be restored");
+            assert_eq!(
+                carried_bytes,
+                fs::read(fresh_dir.path().join(name)).unwrap(),
+                "{name} must be byte-identical across the external-carry and fresh paths"
+            );
+        }
+    }
+
+    /// The trust contract's first defence. The host attested that `beta.bin`
+    /// was intact and fingerprinted it; the file then changed at the same
+    /// length with a moved mtime. `stat` can see that, so the snapshot gate
+    /// refuses the carry outright and the pass scans for real — the
+    /// attestation costs the scan it was meant to save and nothing else.
+    #[test]
+    fn external_carry_with_a_stat_visible_change_falls_back_to_a_fresh_scan() {
+        let alpha: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let beta: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 11) % 241) as u8).collect();
+
+        let dir = tempdir().unwrap();
+        create_recoverable_set(dir.path(), &[("alpha.bin", &alpha), ("beta.bin", &beta)]);
+        damage_first_slice(&dir.path().join("alpha.bin"));
+
+        let par2 = par2_paths_in(dir.path());
+        let set = loaded_set(dir.path(), &par2);
+        let carry = external_carry(dir.path(), &set);
+
+        // Same length, moved mtime: the change a stat call can see.
+        bump_modified_time(&dir.path().join("beta.bin"));
+
+        let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), par2);
+        execute.scan_carry = Some(Arc::new(carry));
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+        assert_eq!(outcome.status, Par2RepairStatus::Repaired, "{outcome:#?}");
+        assert!(outcome.carry.carry_attempted);
+        assert!(
+            !outcome.carry.carry_applied,
+            "a fingerprint that no longer matches must refuse the carry outright: {outcome:#?}"
+        );
+        assert!(!outcome.carry.carry_consumed_for_repair);
+        assert!(
+            !outcome.scan.carried,
+            "the pass must report the scan it actually ran"
+        );
+        assert_eq!(fs::read(dir.path().join("alpha.bin")).unwrap(), alpha);
+        assert_eq!(fs::read(dir.path().join("beta.bin")).unwrap(), beta);
+    }
+
+    /// The trust contract's last defence, and the one that makes a false
+    /// attestation harmless rather than merely unlikely to be believed.
+    ///
+    /// Here the host attested `beta.bin` intact, its bytes were then replaced
+    /// at the same length, and its mtime was restored — the one drift a stat
+    /// fingerprint provably cannot see. Both stat gates therefore accept, on
+    /// the evidence available to them, and the repair proceeds on the carried
+    /// analysis. The validated read that a consumed carry always takes then
+    /// catches the change on the bytes, against `beta.bin`'s own IFSC
+    /// checksums, before anything is installed: the pass retries from a fresh
+    /// scan naming the changed input, and the output is correct.
+    #[test]
+    fn external_carry_validated_read_catches_a_stat_invisible_byte_flip() {
+        let alpha: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let beta: Vec<u8> = (0..512u32).map(|i| ((i * 7 + 11) % 241) as u8).collect();
+
+        let dir = tempdir().unwrap();
+        create_recoverable_set(dir.path(), &[("alpha.bin", &alpha), ("beta.bin", &beta)]);
+        damage_first_slice(&dir.path().join("alpha.bin"));
+
+        let par2 = par2_paths_in(dir.path());
+        let set = loaded_set(dir.path(), &par2);
+        let carry = external_carry(dir.path(), &set);
+
+        let beta_path = dir.path().join("beta.bin");
+        let mut flipped = beta.clone();
+        flipped[100] ^= 0xFF;
+        fs::write(&beta_path, &flipped).unwrap();
+        restore_carried_modified_time(&carry, &beta_path);
+
+        let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), par2);
+        execute.scan_carry = Some(Arc::new(carry));
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+
+        assert!(outcome.carry.carry_applied, "{outcome:#?}");
+        assert!(
+            outcome.carry.carry_retried_fresh,
+            "the validated read must send the pass back to a real scan: {outcome:#?}"
+        );
+        assert_eq!(
+            outcome.carry.carry_retry_reason,
+            Some(CarryRetryReason::RepairInputChanged),
+            "{outcome:#?}"
+        );
+        assert!(
+            !outcome.carry.carry_consumed_for_repair,
+            "a repair that read a changed source did not consume the carry"
+        );
+        // Whatever the retried pass could make of the tree, the one thing that
+        // must never happen is a file written from bytes nothing checked.
+        assert_ne!(
+            fs::read(&beta_path).unwrap(),
+            flipped,
+            "the corrupted source must not survive as the installed file"
+        );
+    }
+
+    /// A carry built from a host verification must place missing and damaged
+    /// files in exactly the internal states a real scan of the same tree
+    /// produces, or repair would treat a target as an input. Comparing the
+    /// two verification results end to end is the check: they are what every
+    /// downstream decision reads.
+    #[test]
+    fn external_carry_reproduces_a_native_scan_for_missing_and_damaged_files() {
+        let intact: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let damaged_source: Vec<u8> = (0..1024u32).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+        let gone: Vec<u8> = (0..1024u32).map(|i| ((i * 5 + 2) % 251) as u8).collect();
+
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let set = synthetic_set(
+            &[
+                ("intact.bin", &intact),
+                ("damaged.bin", &damaged_source),
+                ("gone.bin", &gone),
+            ],
+            slice_size,
+        );
+        fs::write(dir.path().join("intact.bin"), &intact).unwrap();
+        let mut damaged = damaged_source.clone();
+        damaged[128..192].fill(0);
+        fs::write(dir.path().join("damaged.bin"), &damaged).unwrap();
+        // `gone.bin` is never written.
+
+        let mut scanned = RepairState::from_set(dir.path(), set.clone()).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        scanned.scan(&options).unwrap();
+        let native = format!("{:?}", scanned.verification_result());
+
+        let carry = external_carry(dir.path(), &set);
+        let mut carried = RepairState::from_set(dir.path(), set).unwrap();
+        assert!(
+            carried.try_apply_carry(&carry).is_some(),
+            "a carry built from an unchanged tree must apply"
+        );
+        assert_eq!(
+            format!("{:?}", carried.verification_result()),
+            native,
+            "an external carry must reproduce the scan's verdicts exactly"
+        );
+    }
+
+    /// An attestation that contradicts itself, or the set it claims to
+    /// describe, is a caller bug and is refused rather than absorbed: a carry
+    /// this crate could not make sense of is the one thing that must never
+    /// reach a repair.
+    #[test]
+    fn external_carry_refuses_inconsistent_attestations() {
+        let data: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempdir().unwrap();
+        let set = synthetic_set(&[("data.bin", &data)], 64);
+        fs::write(dir.path().join("data.bin"), &data).unwrap();
+        let (verification, fingerprints) = host_verification(dir.path(), &set);
+        assert!(matches!(verification.files[0].status, FileStatus::Complete));
+
+        let build = |verification: &VerificationResult,
+                     fingerprints: &HashMap<FileId, FileStatFingerprint>| {
+            ScanCarry::from_verification(dir.path(), &set, verification, fingerprints)
+        };
+
+        assert!(
+            build(&verification, &fingerprints).is_ok(),
+            "the consistent attestation must build"
+        );
+
+        let mut short = verification.clone();
+        short.files[0].valid_slices.pop();
+        assert!(matches!(
+            build(&short, &fingerprints),
+            Err(ExternalCarryError::SliceCountMismatch { .. })
+        ));
+
+        let mut miscounted = verification.clone();
+        miscounted.files[0].missing_slice_count = 1;
+        assert!(matches!(
+            build(&miscounted, &fingerprints),
+            Err(ExternalCarryError::DamagedCountMismatch { .. })
+        ));
+
+        let mut lying_complete = verification.clone();
+        lying_complete.files[0].valid_slices[0] = false;
+        lying_complete.files[0].missing_slice_count = 1;
+        assert!(matches!(
+            build(&lying_complete, &fingerprints),
+            Err(ExternalCarryError::IncompleteCompleteFile { .. })
+        ));
+
+        let mut renamed = verification.clone();
+        renamed.files[0].status = FileStatus::Renamed(dir.path().join("elsewhere.bin"));
+        assert!(matches!(
+            build(&renamed, &fingerprints),
+            Err(ExternalCarryError::RelocatedFile { .. })
+        ));
+
+        let mut missing_with_content = verification.clone();
+        missing_with_content.files[0].status = FileStatus::Missing;
+        assert!(matches!(
+            build(&missing_with_content, &fingerprints),
+            Err(ExternalCarryError::MissingFileWithContent { .. })
+        ));
+
+        assert!(
+            matches!(
+                build(&verification, &HashMap::new()),
+                Err(ExternalCarryError::UnfingerprintedFile { .. })
+            ),
+            "a present file with no fingerprint has nothing for the gate to check"
+        );
+
+        let mut uncovered = verification.clone();
+        uncovered.files.clear();
+        assert!(matches!(
+            build(&uncovered, &fingerprints),
+            Err(ExternalCarryError::UncoveredFile { .. })
+        ));
+
+        let mut unknown = verification.clone();
+        let mut stranger = unknown.files[0].clone();
+        stranger.file_id = FileId::from_bytes([0xEE; 16]);
+        unknown.files.push(stranger);
+        assert!(matches!(
+            build(&unknown, &fingerprints),
+            Err(ExternalCarryError::UnknownFile { .. })
+        ));
+
+        let mut duplicated = verification.clone();
+        duplicated.files.push(duplicated.files[0].clone());
+        assert!(matches!(
+            build(&duplicated, &fingerprints),
+            Err(ExternalCarryError::DuplicateFile { .. })
+        ));
+    }
+
+    /// The carried files and blocks replace the receiving state's own, so a
+    /// carry laid out from a different set must never be installed. File IDs
+    /// nearly settle it; the recovery set ID and slice size close what they
+    /// leave open.
+    #[test]
+    fn external_carry_from_another_set_is_refused() {
+        let data: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("data.bin"), &data).unwrap();
+
+        let coarse = synthetic_set(&[("data.bin", &data)], 128);
+        let carry = external_carry(dir.path(), &coarse);
+
+        let mut fine_set = synthetic_set(&[("data.bin", &data)], 64);
+        fine_set.recovery_set_id = RecoverySetId::from_bytes([9; 16]);
+        let mut fine = RepairState::from_set(dir.path(), fine_set).unwrap();
+        assert!(
+            fine.try_apply_carry(&carry).is_none(),
+            "a carry from another set must not be installed"
+        );
     }
 }

@@ -279,10 +279,8 @@ fn bench_single_file_verify_shape(c: &mut Criterion) {
         });
     });
 
-    let fast = par2_rs::VerifyOptions {
-        fast_verify: true,
-        ..Default::default()
-    };
+    let mut fast = par2_rs::VerifyOptions::default();
+    fast.fast_verify = true;
     group.bench_function("slice_proof_multi_buffer", |b| {
         b.iter(|| {
             let result = par2_rs::verify::verify_selected_file_ids_parallel_with_options(
@@ -301,6 +299,69 @@ fn bench_single_file_verify_shape(c: &mut Criterion) {
             black_box(bytes.len());
         });
     });
+
+    group.finish();
+}
+
+/// What per-slice evidence is worth: a verification whose cost tracks the
+/// unproven fraction of a file rather than the file's size.
+///
+/// One 4096-slice file is verified four ways — nothing proven, half proven,
+/// 99% proven, and everything proven. The claim the arms exist to check is
+/// that the curve is roughly linear in the unproven fraction and flat in the
+/// file size: `evidence_1pct_unproven` should land near
+/// `evidence_none_proven` divided by a hundred, and `evidence_all_proven`
+/// should be a fixed cost with no read in it at all. The proven slices are
+/// spread across the file rather than kept contiguous, so the measurement
+/// includes the seeks a realistic evidence mask forces and not just one long
+/// sequential read of the tail.
+fn bench_verify_with_slice_evidence(c: &mut Criterion) {
+    let mut group = c.benchmark_group("verify_slice_evidence");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    let slice_size = 32 * 1024u64;
+    let slice_count = 4096usize;
+    let data = (0..(slice_count * slice_size as usize))
+        .map(|index| (index as u8).wrapping_mul(19).wrapping_add(5))
+        .collect::<Vec<_>>();
+    let filename = "evidence-verify.bin".to_string();
+    let (set, file_id) = synthetic_par2_file(&filename, &data, slice_size);
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join(&filename), &data).expect("write benchmark data");
+    let access = DiskFileAccess::new(dir.path().to_path_buf(), &set);
+    let ids = [file_id];
+
+    // `stride == 0` proves nothing; otherwise every slice is proven except
+    // every `stride`-th one, so the unproven slices stay spread out.
+    let mask = |stride: usize| -> Vec<bool> {
+        (0..slice_count)
+            .map(|index| stride == 0 || !index.is_multiple_of(stride))
+            .collect()
+    };
+
+    for (label, proven) in [
+        ("evidence_none_proven", None),
+        ("evidence_50pct_unproven", Some(mask(2))),
+        ("evidence_1pct_unproven", Some(mask(100))),
+        ("evidence_all_proven", Some(vec![true; slice_count])),
+    ] {
+        let mut options = par2_rs::VerifyOptions::default();
+        if let Some(proven) = proven {
+            options.proven_slices = std::collections::HashMap::from([(file_id, proven)]);
+        }
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let result = par2_rs::verify_selected_file_ids_with_options(
+                    black_box(&set),
+                    black_box(&access),
+                    black_box(&ids),
+                    black_box(&options),
+                );
+                black_box(result);
+            });
+        });
+    }
 
     group.finish();
 }
@@ -460,6 +521,7 @@ criterion_group!(
     bench_repair_workflow,
     bench_verify_slices_batched_io,
     bench_single_file_verify_shape,
+    bench_verify_with_slice_evidence,
     bench_gf_kernel,
     bench_md5_hotloop,
     bench_matrix_solve

@@ -839,11 +839,54 @@ pub fn verify_slices_from_crcs(
 
 /// Options controlling verification behavior.
 #[derive(Default)]
+// Verification learns new dials over time; a new one should not cost every
+// consumer a major version. Build with `..Default::default()`.
+#[non_exhaustive]
 pub struct VerifyOptions {
     /// If set, verification will check this token and stop early if cancelled.
     pub cancel: Option<CancellationToken>,
     /// If set, called with progress updates after each file is verified.
     pub progress: Option<ProgressCallback>,
+    /// Per-file slices the caller has already proven, keyed by [`FileId`].
+    ///
+    /// Each vector is one entry per slice of that file, in the set's slice
+    /// order and of exactly the length the set's layout gives that file —
+    /// the same shape as [`FileVerification::valid_slices`], so a caller can
+    /// feed back what an earlier pass produced. `true` means "this slice is
+    /// proven intact and need not be read"; `false` means "say nothing about
+    /// it", which is what an entirely absent entry means for every slice.
+    ///
+    /// Verification then **reads only the unproven slices**, seeking over the
+    /// byte ranges the proven ones cover, and reports a result shaped exactly
+    /// as a full read would have: per-slice accounting is exact, and the file
+    /// is `Complete` only when every one of its slices is accounted for by
+    /// evidence or by a read that matched.
+    ///
+    /// # Trust contract
+    ///
+    /// This is caller-attested and is not re-derived. A wrong attestation
+    /// produces a false `Complete` for the slices it covers — verification
+    /// reads nothing that could contradict it. That is the same trust class
+    /// as the crate's other evidence paths: what a caller vouches for, it
+    /// vouches for. Attest only slices whose bytes you checksummed against
+    /// this set's own per-slice checksums, on a file that is no longer being
+    /// written.
+    ///
+    /// # When it is ignored
+    ///
+    /// Evidence applies only where a per-slice verdict can mean anything: the
+    /// file must exist, its on-disk length must equal the description's, it
+    /// must carry a complete IFSC checksum set, and it must be non-empty. A
+    /// file failing any of those takes the pipeline it always took, evidence
+    /// or no evidence — in particular, evidence about a **missing** file does
+    /// not resurrect it, and evidence about a file whose length no longer
+    /// matches is discarded rather than believed, because the offsets those
+    /// verdicts were about are not the offsets in the file now on disk. A
+    /// vector of the wrong length is ignored in full for the same reason.
+    ///
+    /// An entry that proves nothing (all `false`) is treated as absent, so an
+    /// empty or all-`false` map leaves verification byte-for-byte what it was.
+    pub proven_slices: HashMap<FileId, Vec<bool>>,
     /// Opt-in fast-verify mode (default `false`). When enabled, an intact
     /// candidate file whose on-disk length already matches the description is
     /// proven complete from its per-slice IFSC checksums (CRC32 + MD5, tail
@@ -853,6 +896,46 @@ pub struct VerifyOptions {
     /// `WEAVER_PAR2_FAST_VERIFY` environment variable overrides this per verify
     /// call, taking precedence over whatever is set here.
     pub fast_verify: bool,
+}
+
+impl VerifyOptions {
+    /// The proven-slice evidence that applies to `file_id` under a layout of
+    /// `slice_count` slices, or `None` when this call has nothing usable to
+    /// say about that file.
+    ///
+    /// A vector of the wrong length describes a different layout than the one
+    /// being verified, and there is no honest way to line the two up, so it is
+    /// dropped whole rather than truncated or padded. A vector that proves
+    /// nothing is dropped too, so that the no-evidence path is reached by
+    /// exactly the same branch whether the caller passed no map, an empty map,
+    /// or a map of all-`false` vectors.
+    fn proven_slices_for(&self, file_id: &FileId, slice_count: usize) -> Option<&[bool]> {
+        if slice_count == 0 {
+            return None;
+        }
+        let proven = self.proven_slices.get(file_id)?;
+        if proven.len() != slice_count {
+            return None;
+        }
+        proven
+            .iter()
+            .any(|proven| *proven)
+            .then_some(proven.as_slice())
+    }
+}
+
+/// [`VerifyOptions::proven_slices_for`] for a caller that has not already
+/// computed the file's slice count. Returns `None` for a file the set does not
+/// describe or whose slice count exceeds the verifier's limits, which are the
+/// same files evidence could not be applied to anyway.
+fn proven_slices_for_file<'a>(
+    par2: &Par2FileSet,
+    options: &'a VerifyOptions,
+    file_id: &FileId,
+) -> Option<&'a [bool]> {
+    let desc = par2.file_description(file_id)?;
+    let slice_count = bounded_slice_count(par2, desc.length)?;
+    options.proven_slices_for(file_id, slice_count)
 }
 
 /// Resolve whether the fast-verify path runs for this call. Precedence: the
@@ -920,8 +1003,11 @@ pub fn verify_selected_file_ids_parallel(
 }
 
 /// Like [`verify_selected_file_ids_parallel`] but honoring [`VerifyOptions`].
-/// The only option consulted on this path is `fast_verify` (cancellation and
-/// progress are not surfaced here, as documented on the base function): when
+/// The options consulted on this path are `fast_verify` and `proven_slices`
+/// (cancellation and progress are not surfaced here, as documented on the base
+/// function). Per-slice evidence is applied first and reads only the slices it
+/// does not already prove; it subsumes the fast arm for the files it covers,
+/// because both prove completeness from the same IFSC entries. When
 /// fast verify resolves on (via the flag or `WEAVER_PAR2_FAST_VERIFY`), each
 /// eligible file is proven complete from its IFSC slice checksums instead of a
 /// full-file MD5 — span-parallel for a lone file and file-parallel otherwise,
@@ -943,6 +1029,19 @@ pub fn verify_selected_file_ids_parallel_with_options(
     let partials: Vec<VerificationResult> = file_ids
         .par_iter()
         .map(|file_id| {
+            // Per-slice evidence first: it subsumes the fast arm (both prove
+            // from the same IFSC entries) and reads strictly less.
+            if let Some(proven) = proven_slices_for_file(par2, options, file_id)
+                && let Some(file) = verify_file_sliced_with_evidence(
+                    par2,
+                    access,
+                    file_id,
+                    span_parallel,
+                    Some(proven),
+                )
+            {
+                return single_file_result(par2, file);
+            }
             if fast_verify
                 && let Some(file) = verify_file_sliced(par2, access, file_id, span_parallel)
             {
@@ -1002,15 +1101,47 @@ pub fn verify_repaired_file_ids_parallel(
     combine_partial_results(par2, partials)
 }
 
-/// Precomputed layout for slice-span verification of one eligible file: its
-/// filename, on-disk length, slice size, and the `(start, count)` slice spans
-/// to check. Produced by [`sliced_verify_plan`] only for files that pass the
-/// shared fast-path / post-repair preconditions.
+/// Precomputed layout for slice-proof verification of one eligible file: its
+/// filename, on-disk length, slice size, slice count, and the work to do.
+/// Produced by [`sliced_verify_plan`] only for files that pass the shared
+/// fast-path / post-repair preconditions.
 struct SlicedVerifyPlan {
     filename: String,
     length: u64,
     slice_size: u64,
-    spans: Vec<(usize, usize)>,
+    slice_count: usize,
+    work: SlicedVerifyWork,
+    /// Caller-attested per-slice verdicts, or `None` when this plan reads the
+    /// whole file. When present it is exactly `slice_count` long, and every
+    /// `true` entry names a slice the work does not cover.
+    proven: Option<Vec<bool>>,
+}
+
+/// What one file's slice-proof pass has to read.
+///
+/// The two shapes are not interchangeable, and the difference is the whole
+/// reason evidence pays off instead of costing.
+///
+/// Without evidence every slice is read, so the work is contiguous spans: one
+/// span read fills one buffer that many slices are then hashed out of, in SIMD
+/// lanes. That is the shape the fast-verify and post-repair readbacks have
+/// always used, and it is untouched here.
+///
+/// With evidence the slices still to read can be scattered anywhere in the
+/// file, and spanning them the same way would hand `md5_multi` one slice per
+/// call for a mask that alternates — one lane of an eight-lane engine. That is
+/// slower than reading the whole file, which would make the option a
+/// pessimisation on exactly the masks a real host produces. So evidence work is
+/// a list of slice indices instead, and the lanes are filled from wherever
+/// those slices are: batching by lane rather than by adjacency. Reading one
+/// slice per lane at an arbitrary offset is the same I/O discipline
+/// [`verify_slices_batched_md5`] already uses for a whole file.
+enum SlicedVerifyWork {
+    /// `(start, count)` runs that together cover every slice, in order.
+    Spans(Vec<(usize, usize)>),
+    /// The slice indices to read, ascending. May be non-contiguous, and is
+    /// empty for a fully proven file — the zero-read case.
+    Slices(Vec<usize>),
 }
 
 /// Build the [`SlicedVerifyPlan`] for `file_id`, or `None` when the file is
@@ -1020,10 +1151,22 @@ struct SlicedVerifyPlan {
 /// description. These are exactly the preconditions the opt-in fast-verify
 /// path and the post-repair readback share; an ineligible file falls back to
 /// the serial full-hash pipeline.
+///
+/// `proven` folds in caller-attested per-slice evidence: the work then names
+/// only the unproven slices. The eligibility gate above is deliberately
+/// unchanged by it — evidence buys a shorter read of a file that was already
+/// verifiable slice by slice, and buys nothing anywhere else. In particular the
+/// on-disk length must still equal the description's, which is what makes a
+/// per-slice verdict addressable at all: the offsets the caller's verdicts were
+/// about are the offsets in this file only while its length is the described
+/// one. `proven` must be `slice_count` long; callers reach this through
+/// [`VerifyOptions::proven_slices_for`], which drops any other shape, and it is
+/// re-checked here so no future caller can route around that.
 fn sliced_verify_plan(
     par2: &Par2FileSet,
     access: &dyn FileAccess,
     file_id: &FileId,
+    proven: Option<&[bool]>,
 ) -> Option<SlicedVerifyPlan> {
     let desc = par2.file_description(file_id)?;
     let checksums = par2.file_checksums(file_id)?;
@@ -1038,19 +1181,172 @@ fn sliced_verify_plan(
     if access.file_length(file_id) != Some(desc.length) {
         return None;
     }
+    let proven = proven.filter(|proven| proven.len() == expected_slices);
 
-    let span_slices =
-        ((VERIFY_SPAN_TARGET_BYTES as u64 / slice_size).max(1) as usize).min(expected_slices);
-    let spans: Vec<(usize, usize)> = (0..expected_slices)
-        .step_by(span_slices)
-        .map(|start| (start, span_slices.min(expected_slices - start)))
-        .collect();
+    let work = match proven {
+        None => {
+            let span_slices = ((VERIFY_SPAN_TARGET_BYTES as u64 / slice_size).max(1) as usize)
+                .min(expected_slices);
+            SlicedVerifyWork::Spans(
+                (0..expected_slices)
+                    .step_by(span_slices)
+                    .map(|start| (start, span_slices.min(expected_slices - start)))
+                    .collect(),
+            )
+        }
+        Some(proven) => SlicedVerifyWork::Slices(
+            proven
+                .iter()
+                .enumerate()
+                .filter_map(|(index, proven)| (!*proven).then_some(index))
+                .collect(),
+        ),
+    };
     Some(SlicedVerifyPlan {
         filename: desc.filename.clone(),
         length: desc.length,
         slice_size,
-        spans,
+        slice_count: expected_slices,
+        work,
+        proven: proven.map(<[bool]>::to_vec),
     })
+}
+
+/// How many slices one [`md5_simd::md5_multi`] call takes at this slice size:
+/// the narrower of what the kernel offers and what the batch memory budget
+/// affords, and never zero. Identical to the rule
+/// [`verify_slices_batched_md5`] uses, so a scattered evidence read and a
+/// whole-file read cost the same per slice and hold the same working set.
+fn slice_batch_lanes(slice_size: u64) -> usize {
+    let Ok(slice_size) = usize::try_from(slice_size) else {
+        return 1;
+    };
+    if slice_size == 0 {
+        return 1;
+    }
+    (VERIFY_SIMD_BATCH_MEMORY_BYTES / slice_size)
+        .min(md5_simd::max_lanes())
+        .clamp(1, VERIFY_SIMD_MAX_LANES)
+}
+
+/// How many slices one parallel task takes, so a scattered read fans out in
+/// units comparable to a span rather than one lane batch at a time. Always a
+/// whole number of lane batches, so no task ends mid-batch.
+fn slice_task_slices(slice_size: u64, lanes: usize) -> usize {
+    let per_task = (VERIFY_SPAN_TARGET_BYTES as u64 / slice_size.max(1)).max(1) as usize;
+    per_task.div_ceil(lanes).max(1) * lanes
+}
+
+/// Weave the read-backs into one per-slice validity vector.
+///
+/// The starting point is the caller's evidence, so a proven slice keeps its
+/// attested verdict, and every slice the work covered is overwritten by what
+/// the read found. Without evidence the spans tile the file, so this is a
+/// scatter-shaped `concat`: the result is identical to the full-read vector,
+/// which is the property `verify_selected_file_ids` with no evidence relies on.
+fn assemble_valid_slices(plan: &SlicedVerifyPlan, results: Vec<Vec<bool>>) -> Vec<bool> {
+    let mut valid = match &plan.proven {
+        Some(proven) => proven.clone(),
+        None => vec![false; plan.slice_count],
+    };
+    match &plan.work {
+        SlicedVerifyWork::Spans(spans) => {
+            for (&(start, count), results) in spans.iter().zip(results) {
+                debug_assert_eq!(results.len(), count, "a span reports one verdict per slice");
+                let end = (start + count).min(valid.len());
+                valid[start..end].copy_from_slice(&results[..end - start]);
+            }
+        }
+        SlicedVerifyWork::Slices(indices) => {
+            for (index, result) in indices.iter().zip(results.into_iter().flatten()) {
+                valid[*index] = result;
+            }
+        }
+    }
+    valid
+}
+
+/// Verify one lane batch of slices, wherever in the file they are.
+///
+/// Each slice is read into its own lane buffer at its own offset and the
+/// batch is hashed in one [`md5_simd::md5_multi`] call, so a scattered set of
+/// slices costs the same per slice as an adjacent one. Padding semantics match
+/// [`check_slice_span`] exactly — `md5_multi(.., Some(slice_size))` and
+/// [`checksum::crc32_padded`] zero-pad a short tail slice — so a slice this
+/// judges is judged the same way the whole-file paths judge it.
+///
+/// A read error or a short read fails only the slice it happened to, not the
+/// batch: a lane batch is an arbitrary grouping, not a contiguous run, so
+/// failing its neighbours would report damage that was never observed.
+fn check_slice_batch(
+    access: &dyn FileAccess,
+    file_id: &FileId,
+    checksums: &[SliceChecksum],
+    plan: &SlicedVerifyPlan,
+    indices: &[usize],
+    buffers: &mut Vec<Vec<u8>>,
+) -> Vec<bool> {
+    let slice_size = plan.slice_size;
+    let Ok(slice_len) = usize::try_from(slice_size) else {
+        return vec![false; indices.len()];
+    };
+    while buffers.len() < indices.len() {
+        buffers.push(vec![0u8; slice_len]);
+    }
+
+    let mut read_lens = Vec::with_capacity(indices.len());
+    let mut read_complete = Vec::with_capacity(indices.len());
+    for (lane, &index) in indices.iter().enumerate() {
+        let offset = index as u64 * slice_size;
+        let want = plan.length.saturating_sub(offset).min(slice_size);
+        let buffer = &mut buffers[lane];
+        if buffer.len() < slice_len {
+            buffer.resize(slice_len, 0);
+        }
+        match read_file_slice_into(file_id, offset, want, access, &mut buffer[..slice_len]) {
+            Ok(read) => {
+                read_lens.push(read);
+                read_complete.push(read as u64 == want);
+            }
+            Err(_) => {
+                read_lens.push(0);
+                read_complete.push(false);
+            }
+        }
+    }
+
+    let inputs: Vec<&[u8]> = buffers
+        .iter()
+        .zip(read_lens.iter())
+        .map(|(buffer, read)| &buffer[..*read])
+        .collect();
+    let md5s = md5_simd::md5_multi(&inputs, Some(slice_size));
+    indices
+        .iter()
+        .enumerate()
+        .map(|(lane, index)| {
+            let expected = &checksums[*index];
+            read_complete[lane]
+                && checksum::crc32_padded(inputs[lane], slice_size) == expected.crc32
+                && md5s[lane] == expected.md5
+        })
+        .collect()
+}
+
+/// Verify a run of slice indices serially, lane batch by lane batch.
+fn check_slice_indices(
+    access: &dyn FileAccess,
+    file_id: &FileId,
+    checksums: &[SliceChecksum],
+    plan: &SlicedVerifyPlan,
+    indices: &[usize],
+    buffers: &mut Vec<Vec<u8>>,
+) -> Vec<bool> {
+    let lanes = slice_batch_lanes(plan.slice_size);
+    indices
+        .chunks(lanes)
+        .flat_map(|batch| check_slice_batch(access, file_id, checksums, plan, batch, buffers))
+        .collect()
 }
 
 /// Verify one `(start, count)` slice span against its IFSC checksums (CRC32 +
@@ -1214,36 +1510,76 @@ fn verify_file_sliced(
     file_id: &FileId,
     span_parallel: bool,
 ) -> Option<FileVerification> {
+    verify_file_sliced_with_evidence(par2, access, file_id, span_parallel, None)
+}
+
+/// [`verify_file_sliced`] over only the slices the caller has not proven.
+///
+/// The slices that *are* read are checked against the identical IFSC entries
+/// with the identical padding, so a slice's verdict does not depend on whether
+/// its neighbours were skipped; only which slices get read changes.
+/// `Complete` still means every slice is accounted for — the difference is
+/// that some are accounted for by the caller's attestation rather than by this
+/// read. See [`VerifyOptions::proven_slices`] for what that costs if the
+/// attestation is wrong.
+fn verify_file_sliced_with_evidence(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_id: &FileId,
+    span_parallel: bool,
+    proven: Option<&[bool]>,
+) -> Option<FileVerification> {
     use rayon::prelude::*;
-    let plan = sliced_verify_plan(par2, access, file_id)?;
+    let plan = sliced_verify_plan(par2, access, file_id, proven)?;
     let checksums = par2.file_checksums(file_id)?;
-    let per_span: Vec<Vec<bool>> = if span_parallel {
+    let results: Vec<Vec<bool>> = match (&plan.work, span_parallel) {
         // `map_init` hands each rayon job its own read buffer, reused across
-        // the spans that job takes; `collect` preserves span order.
-        plan.spans
+        // the units that job takes; `collect` preserves order.
+        (SlicedVerifyWork::Spans(spans), true) => spans
             .par_iter()
             .map_init(Vec::new, |scratch, &(start, count)| {
                 check_slice_span(access, file_id, checksums, &plan, start, count, scratch)
             })
-            .collect()
-    } else {
-        let mut scratch = Vec::new();
-        plan.spans
-            .iter()
-            .map(|&(start, count)| {
-                check_slice_span(
-                    access,
-                    file_id,
-                    checksums,
-                    &plan,
-                    start,
-                    count,
-                    &mut scratch,
-                )
-            })
-            .collect()
+            .collect(),
+        (SlicedVerifyWork::Spans(spans), false) => {
+            let mut scratch = Vec::new();
+            spans
+                .iter()
+                .map(|&(start, count)| {
+                    check_slice_span(
+                        access,
+                        file_id,
+                        checksums,
+                        &plan,
+                        start,
+                        count,
+                        &mut scratch,
+                    )
+                })
+                .collect()
+        }
+        (SlicedVerifyWork::Slices(indices), true) => {
+            let lanes = slice_batch_lanes(plan.slice_size);
+            indices
+                .par_chunks(slice_task_slices(plan.slice_size, lanes))
+                .map_init(Vec::new, |buffers, chunk| {
+                    check_slice_indices(access, file_id, checksums, &plan, chunk, buffers)
+                })
+                .collect()
+        }
+        (SlicedVerifyWork::Slices(indices), false) => {
+            let mut buffers = Vec::new();
+            vec![check_slice_indices(
+                access,
+                file_id,
+                checksums,
+                &plan,
+                indices,
+                &mut buffers,
+            )]
+        }
     };
-    let valid_slices: Vec<bool> = per_span.concat();
+    let valid_slices = assemble_valid_slices(&plan, results);
     Some(finish_sliced_verification(file_id, &plan, valid_slices))
 }
 
@@ -1257,24 +1593,52 @@ fn verify_file_sliced_serial(
     access: &dyn FileAccess,
     file_id: &FileId,
 ) -> Option<FileVerification> {
-    let plan = sliced_verify_plan(par2, access, file_id)?;
+    verify_file_sliced_serial_with_evidence(par2, access, file_id, None)
+}
+
+/// [`verify_file_sliced_serial`] over only the slices the caller has not
+/// proven — the span-serial sibling of
+/// [`verify_file_sliced_with_evidence`], used by the per-file verify loop
+/// which may itself be running inside a file-parallel `par_iter`.
+fn verify_file_sliced_serial_with_evidence(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    file_id: &FileId,
+    proven: Option<&[bool]>,
+) -> Option<FileVerification> {
+    let plan = sliced_verify_plan(par2, access, file_id, proven)?;
     let checksums = par2.file_checksums(file_id)?;
-    let mut scratch = Vec::new();
-    let valid_slices: Vec<bool> = plan
-        .spans
-        .iter()
-        .flat_map(|&(start, count)| {
-            check_slice_span(
+    let results: Vec<Vec<bool>> = match &plan.work {
+        SlicedVerifyWork::Spans(spans) => {
+            let mut scratch = Vec::new();
+            spans
+                .iter()
+                .map(|&(start, count)| {
+                    check_slice_span(
+                        access,
+                        file_id,
+                        checksums,
+                        &plan,
+                        start,
+                        count,
+                        &mut scratch,
+                    )
+                })
+                .collect()
+        }
+        SlicedVerifyWork::Slices(indices) => {
+            let mut buffers = Vec::new();
+            vec![check_slice_indices(
                 access,
                 file_id,
                 checksums,
                 &plan,
-                start,
-                count,
-                &mut scratch,
-            )
-        })
-        .collect();
+                indices,
+                &mut buffers,
+            )]
+        }
+    };
+    let valid_slices = assemble_valid_slices(&plan, results);
     Some(finish_sliced_verification(file_id, &plan, valid_slices))
 }
 
@@ -1542,6 +1906,43 @@ fn verify_selected_file_ids_resolved(
                 valid_slices: valid,
                 missing_slice_count: damaged,
             });
+            continue;
+        }
+
+        // Per-slice evidence (opt-in): the caller has already proven some of
+        // this file's slices, so read only the ones it has not. The spans that
+        // are read take the same `check_slice_span` against the same IFSC
+        // entries the fast and strict arms use, which is why composing this
+        // with either is not a third verdict rule but the same one over fewer
+        // slices. The whole-file MD5 arm cannot run once any slice is skipped —
+        // there is no way to hash bytes that were never read — so completeness
+        // is decided from slice proof, exactly the shape fast verify already
+        // reports (see `verify_file_sliced` for why slice proof plus a matching
+        // length is sound). An entry that proves nothing, or is the wrong shape
+        // for this file's layout, never reaches here: `proven_slices_for` drops
+        // it, and the file takes the pipeline it always took.
+        if let Some(proven) = options.proven_slices_for(file_id, slice_count)
+            && let Some(evidenced) =
+                verify_file_sliced_serial_with_evidence(par2, access, file_id, Some(proven))
+        {
+            total_missing_blocks =
+                total_missing_blocks.saturating_add(evidenced.missing_slice_count);
+            files.push(evidenced);
+            // Progress counts the file's coverage, not this pass's reads: the
+            // evidence accounts for the bytes it did not read, and a progress
+            // stream that stalled on a skipped range would misreport the work
+            // remaining.
+            bytes_processed += desc.length;
+            if let Some(ref progress) = options.progress {
+                progress(ProgressUpdate {
+                    stage: ProgressStage::Verifying,
+                    current: file_index as u32 + 1,
+                    total: total_files,
+                    bytes_processed,
+                    total_bytes: None,
+                    phase: ProgressPhase::Whole,
+                });
+            }
             continue;
         }
 
@@ -3038,5 +3439,489 @@ mod tests {
             assert!(chunk <= VERIFY_FULL_HASH_CHUNK_BYTES);
             assert_eq!(chunk as u64 % slice_size, 0);
         }
+    }
+
+    // --- Per-slice evidence intake ----------------------------------------
+
+    /// A [`FileAccess`] that counts the bytes its reads actually deliver, so a
+    /// test can assert on what a pipeline *read* and not only on what it
+    /// concluded. It changes nothing else about the access it wraps: the
+    /// evidence path's whole claim is that it reads less for the same verdict,
+    /// and only a counter can hold it to that.
+    struct CountingAccess {
+        inner: MemoryFileAccess,
+        bytes_read: AtomicUsize,
+    }
+
+    impl CountingAccess {
+        fn new(inner: MemoryFileAccess) -> Self {
+            Self {
+                inner,
+                bytes_read: AtomicUsize::new(0),
+            }
+        }
+
+        fn take_bytes_read(&self) -> usize {
+            self.bytes_read.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    impl FileAccess for CountingAccess {
+        fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+            let data = self.inner.read_file_range(file_id, offset, len)?;
+            self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
+            Ok(data)
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> io::Result<usize> {
+            let read = self.inner.read_file_range_into(file_id, offset, dst)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.inner.file_exists(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.inner.file_length(file_id)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+            let data = self.inner.read_file(file_id)?;
+            self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
+            Ok(data)
+        }
+
+        fn write_file_range(
+            &mut self,
+            file_id: &FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> io::Result<()> {
+            self.inner.write_file_range(file_id, offset, data)
+        }
+    }
+
+    fn evidence_opts(proven: HashMap<FileId, Vec<bool>>) -> VerifyOptions {
+        VerifyOptions {
+            proven_slices: proven,
+            ..Default::default()
+        }
+    }
+
+    fn deterministic_bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|index| ((index as u8).wrapping_mul(31)).wrapping_add(seed))
+            .collect()
+    }
+
+    /// One corpus covering the shapes a verify has to get right: an intact
+    /// file, a damaged one, one with a short tail slice, and one that is not
+    /// there at all. Returns the set, an access holding only the files that
+    /// exist, and the ids in corpus order.
+    fn evidence_corpus(slice_size: u64) -> (Par2FileSet, MemoryFileAccess, Vec<FileId>) {
+        let intact = deterministic_bytes(4 * slice_size as usize, 1);
+        let damaged_source = deterministic_bytes(4 * slice_size as usize, 2);
+        let short_tail = deterministic_bytes(3 * slice_size as usize - 7, 3);
+        let absent = deterministic_bytes(2 * slice_size as usize, 4);
+
+        let (set, _, ids) = setup_test_set_multi(
+            &[
+                (&intact, "intact.bin"),
+                (&damaged_source, "damaged.bin"),
+                (&short_tail, "short-tail.bin"),
+                (&absent, "absent.bin"),
+            ],
+            slice_size,
+        );
+
+        // Damage slice 2 of `damaged.bin` and slice 0 of `short-tail.bin`, and
+        // never add `absent.bin` at all.
+        let mut damaged = damaged_source.clone();
+        let start = 2 * slice_size as usize;
+        damaged[start..start + slice_size as usize].fill(0);
+        let mut short_tail_damaged = short_tail.clone();
+        short_tail_damaged[..slice_size as usize].fill(0xFF);
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(ids[0], intact);
+        access.add_file(ids[1], damaged);
+        access.add_file(ids[2], short_tail_damaged);
+
+        (set, access, ids)
+    }
+
+    /// Per-slice evidence for every slice a full read found valid — the
+    /// attestation a host that had genuinely proven those slices would make.
+    fn evidence_from(result: &VerificationResult) -> HashMap<FileId, Vec<bool>> {
+        result
+            .files
+            .iter()
+            .map(|file| (file.file_id, file.valid_slices.clone()))
+            .collect()
+    }
+
+    /// Property (a): with nothing proven, verification is what it always was.
+    /// An absent map, an empty map, an all-`false` map and a map whose vectors
+    /// are the wrong shape must every one of them reach the same branch and
+    /// produce the same result, byte for byte.
+    #[test]
+    fn absent_evidence_leaves_verification_unchanged() {
+        let slice_size = 512u64;
+        let (set, access, ids) = evidence_corpus(slice_size);
+        let baseline = verify_selected_file_ids_with_options(&set, &access, &ids, &strict_opts());
+        assert!(baseline.total_missing_blocks > 0, "{baseline:#?}");
+
+        let nothing_proven: HashMap<FileId, Vec<bool>> = baseline
+            .files
+            .iter()
+            .map(|file| (file.file_id, vec![false; file.valid_slices.len()]))
+            .collect();
+        let wrong_shape: HashMap<FileId, Vec<bool>> = baseline
+            .files
+            .iter()
+            .map(|file| (file.file_id, vec![true; file.valid_slices.len() + 1]))
+            .collect();
+
+        for (label, proven) in [
+            ("empty map", HashMap::new()),
+            ("all-false vectors", nothing_proven),
+            ("wrong-length vectors", wrong_shape),
+        ] {
+            let with_evidence =
+                verify_selected_file_ids_with_options(&set, &access, &ids, &evidence_opts(proven));
+            assert_eq!(
+                format!("{with_evidence:?}"),
+                format!("{baseline:?}"),
+                "{label} must leave verification unchanged"
+            );
+        }
+    }
+
+    /// Property (b): correct evidence for the slices a full read would have
+    /// found valid produces the same verdicts from strictly fewer bytes read.
+    #[test]
+    fn correct_evidence_keeps_the_verdicts_and_reads_fewer_bytes() {
+        let slice_size = 512u64;
+        let (set, memory, ids) = evidence_corpus(slice_size);
+        let access = CountingAccess::new(memory);
+
+        let baseline = verify_selected_file_ids_with_options(&set, &access, &ids, &strict_opts());
+        let baseline_bytes = access.take_bytes_read();
+        assert!(baseline_bytes > 0, "the unevidenced pass reads the corpus");
+
+        let evidenced = verify_selected_file_ids_with_options(
+            &set,
+            &access,
+            &ids,
+            &evidence_opts(evidence_from(&baseline)),
+        );
+        let evidenced_bytes = access.take_bytes_read();
+
+        assert_eq!(
+            format!("{evidenced:?}"),
+            format!("{baseline:?}"),
+            "correct evidence must not change a single verdict"
+        );
+        assert!(
+            evidenced_bytes < baseline_bytes,
+            "evidence must save reads: {evidenced_bytes} vs {baseline_bytes} bytes"
+        );
+    }
+
+    /// Property (c): damage in a slice the evidence says nothing about is
+    /// still found, and the whole result — statuses, per-slice vectors, totals
+    /// and repairability — matches the full read exactly. Every damage
+    /// position is walked, because an off-by-one in span reassembly would only
+    /// show at some of them.
+    #[test]
+    fn damage_in_an_unproven_slice_matches_the_full_read_at_every_position() {
+        let slice_size = 256u64;
+        let slice_count = 6usize;
+        let clean = deterministic_bytes(slice_count * slice_size as usize, 9);
+        let (set, _, ids) = setup_test_set_multi(&[(&clean, "walked.bin")], slice_size);
+        let file_id = ids[0];
+
+        for damaged_index in 0..slice_count {
+            let mut damaged = clean.clone();
+            let start = damaged_index * slice_size as usize;
+            damaged[start..start + slice_size as usize].fill(0x5A);
+            let mut memory = MemoryFileAccess::new();
+            memory.add_file(file_id, damaged);
+            let access = CountingAccess::new(memory);
+
+            let baseline =
+                verify_selected_file_ids_with_options(&set, &access, &ids, &strict_opts());
+            let baseline_bytes = access.take_bytes_read();
+            assert_eq!(
+                baseline.files[0].missing_slice_count, 1,
+                "slice {damaged_index} must read as damaged"
+            );
+
+            // Prove everything the full read found valid — that is, every
+            // slice except the damaged one — and leave the damaged one to be
+            // read.
+            let evidenced = verify_selected_file_ids_with_options(
+                &set,
+                &access,
+                &ids,
+                &evidence_opts(evidence_from(&baseline)),
+            );
+            let evidenced_bytes = access.take_bytes_read();
+
+            assert_eq!(
+                format!("{evidenced:?}"),
+                format!("{baseline:?}"),
+                "slice {damaged_index}: the evidenced result must match the full read exactly"
+            );
+            assert_eq!(
+                evidenced_bytes, slice_size as usize,
+                "slice {damaged_index}: only the unproven slice should be read \
+                 (full read was {baseline_bytes} bytes)"
+            );
+        }
+    }
+
+    /// Property (d): a file that is not there cannot be attested into
+    /// existence. The existence check runs before evidence is consulted, so
+    /// all-`true` evidence for a missing file leaves it `Missing` with every
+    /// slice invalid, exactly as with no evidence at all.
+    #[test]
+    fn evidence_cannot_resurrect_a_missing_file() {
+        let slice_size = 512u64;
+        let data = deterministic_bytes(3 * slice_size as usize, 5);
+        let (set, _, ids) = setup_test_set_multi(&[(&data, "gone.bin")], slice_size);
+        let access = CountingAccess::new(MemoryFileAccess::new());
+
+        let baseline = verify_selected_file_ids_with_options(&set, &access, &ids, &strict_opts());
+        let proven: HashMap<FileId, Vec<bool>> = [(ids[0], vec![true; 3])].into_iter().collect();
+        let evidenced =
+            verify_selected_file_ids_with_options(&set, &access, &ids, &evidence_opts(proven));
+
+        assert!(matches!(evidenced.files[0].status, FileStatus::Missing));
+        assert_eq!(evidenced.files[0].valid_slices, vec![false; 3]);
+        assert_eq!(evidenced.total_missing_blocks, 3);
+        assert_eq!(format!("{evidenced:?}"), format!("{baseline:?}"));
+        assert_eq!(access.take_bytes_read(), 0);
+    }
+
+    /// A file whose on-disk length no longer matches the description is not
+    /// the file those per-slice verdicts were about — the offsets have moved
+    /// under them — so the evidence is discarded and the file takes the
+    /// pipeline it always took.
+    #[test]
+    fn evidence_for_a_length_mismatched_file_is_ignored() {
+        let slice_size = 512u64;
+        let data = deterministic_bytes(3 * slice_size as usize, 6);
+        let (set, _, ids) = setup_test_set_multi(&[(&data, "truncated.bin")], slice_size);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(ids[0], data[..data.len() - 100].to_vec());
+        let access = CountingAccess::new(memory);
+
+        let baseline = verify_selected_file_ids_with_options(&set, &access, &ids, &strict_opts());
+        let proven: HashMap<FileId, Vec<bool>> = [(ids[0], vec![true; 3])].into_iter().collect();
+        let evidenced =
+            verify_selected_file_ids_with_options(&set, &access, &ids, &evidence_opts(proven));
+
+        assert!(matches!(baseline.files[0].status, FileStatus::Damaged(_)));
+        assert_eq!(
+            format!("{evidenced:?}"),
+            format!("{baseline:?}"),
+            "a length mismatch must discard the evidence, not believe it"
+        );
+    }
+
+    /// The degenerate end of the range: a file whose every slice is proven is
+    /// `Complete` without a byte being read. The whole-file MD5 arm cannot run
+    /// once any slice is skipped, so completeness comes from slice proof — the
+    /// same shape fast verify already reports.
+    #[test]
+    fn a_fully_proven_file_is_complete_without_a_read() {
+        let slice_size = 512u64;
+        let data = deterministic_bytes(4 * slice_size as usize, 7);
+        let (set, memory, ids) = setup_test_set_multi(&[(&data, "proven.bin")], slice_size);
+        let access = CountingAccess::new(memory);
+
+        let proven: HashMap<FileId, Vec<bool>> = [(ids[0], vec![true; 4])].into_iter().collect();
+        let evidenced =
+            verify_selected_file_ids_with_options(&set, &access, &ids, &evidence_opts(proven));
+
+        assert!(matches!(evidenced.files[0].status, FileStatus::Complete));
+        assert_eq!(evidenced.files[0].valid_slices, vec![true; 4]);
+        assert_eq!(evidenced.total_missing_blocks, 0);
+        assert!(matches!(evidenced.repairable, Repairability::NotNeeded));
+        assert_eq!(
+            access.take_bytes_read(),
+            0,
+            "a fully proven file must cost no reads"
+        );
+    }
+
+    /// Evidence composes with the fast arm the way it composes with the strict
+    /// one: the proven slices are skipped, the rest go through the same
+    /// per-slice checks, and the verdict is the same either way. It also
+    /// composes with the file-parallel driver, which consults the same option.
+    #[test]
+    fn evidence_composes_with_fast_verify_and_the_parallel_driver() {
+        let slice_size = 512u64;
+        let (set, memory, ids) = evidence_corpus(slice_size);
+        let baseline = verify_selected_file_ids_with_options(&set, &memory, &ids, &strict_opts());
+        let proven = evidence_from(&baseline);
+
+        let mut fast_with_evidence = fast_opts();
+        fast_with_evidence.proven_slices = proven.clone();
+        let fast = verify_selected_file_ids_with_options(&set, &memory, &ids, &fast_with_evidence);
+        assert_eq!(
+            format!("{fast:?}"),
+            format!("{baseline:?}"),
+            "evidence under fast verify must reach the same verdicts"
+        );
+
+        let access = CountingAccess::new(memory);
+        let parallel_baseline =
+            verify_selected_file_ids_parallel_with_options(&set, &access, &ids, &strict_opts());
+        let parallel_bytes = access.take_bytes_read();
+        let parallel = verify_selected_file_ids_parallel_with_options(
+            &set,
+            &access,
+            &ids,
+            &evidence_opts(proven),
+        );
+        let parallel_evidenced_bytes = access.take_bytes_read();
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{parallel_baseline:?}"),
+            "the parallel driver must honour evidence without changing verdicts"
+        );
+        assert!(
+            parallel_evidenced_bytes < parallel_bytes,
+            "the parallel driver must also save reads: \
+             {parallel_evidenced_bytes} vs {parallel_bytes}"
+        );
+    }
+
+    /// A plan built with evidence must name exactly the unproven slices, in
+    /// order, and a plan built without it must still tile the whole file in
+    /// spans — the shape every existing caller depends on.
+    #[test]
+    fn the_plan_names_exactly_the_unproven_slices() {
+        let slice_size = 512u64;
+        let data = deterministic_bytes(6 * slice_size as usize, 11);
+        let (set, access, ids) = setup_test_set_multi(&[(&data, "planned.bin")], slice_size);
+        let file_id = ids[0];
+
+        let full = sliced_verify_plan(&set, &access, &file_id, None).expect("plan");
+        match full.work {
+            SlicedVerifyWork::Spans(spans) => {
+                let covered: usize = spans.iter().map(|(_, count)| count).sum();
+                assert_eq!(covered, 6, "spans must tile every slice: {spans:?}");
+                assert_eq!(spans[0].0, 0);
+            }
+            SlicedVerifyWork::Slices(_) => panic!("a plan with no evidence reads spans"),
+        }
+        assert!(full.proven.is_none());
+
+        for mask in [
+            vec![false; 6],
+            vec![true, false, true, false, true, false],
+            vec![true, true, false, false, false, true],
+            vec![true; 6],
+        ] {
+            let plan = sliced_verify_plan(&set, &access, &file_id, Some(&mask)).expect("plan");
+            let expected: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(index, proven)| (!*proven).then_some(index))
+                .collect();
+            match plan.work {
+                SlicedVerifyWork::Slices(indices) => assert_eq!(indices, expected, "{mask:?}"),
+                SlicedVerifyWork::Spans(_) => panic!("an evidenced plan reads named slices"),
+            }
+            assert_eq!(plan.proven.as_deref(), Some(mask.as_slice()));
+        }
+    }
+
+    /// A lane batch is an arbitrary grouping, so a slice whose read fails must
+    /// fail alone. Reading past the end of a truncated file is the reachable
+    /// version of that, and the slices batched alongside it must keep the
+    /// verdicts their own bytes earned.
+    #[test]
+    fn a_failed_read_fails_only_its_own_slice_in_a_batch() {
+        let slice_size = 512u64;
+        let slice_count = 6usize;
+        let data = deterministic_bytes(slice_count * slice_size as usize, 13);
+        let (set, _, ids) = setup_test_set_multi(&[(&data, "cut-short.bin")], slice_size);
+        let file_id = ids[0];
+
+        // The access reports the described length but only holds the first
+        // four slices, so reads of slices 4 and 5 come up short.
+        struct ShortAccess {
+            data: Vec<u8>,
+            reported_len: u64,
+            file_id: FileId,
+        }
+        impl FileAccess for ShortAccess {
+            fn read_file_range(
+                &self,
+                _file_id: &FileId,
+                offset: u64,
+                len: u64,
+            ) -> io::Result<Vec<u8>> {
+                let start = (offset as usize).min(self.data.len());
+                let end = (start + len as usize).min(self.data.len());
+                Ok(self.data[start..end].to_vec())
+            }
+            fn read_file_range_into(
+                &self,
+                _file_id: &FileId,
+                offset: u64,
+                dst: &mut [u8],
+            ) -> io::Result<usize> {
+                let start = (offset as usize).min(self.data.len());
+                let end = (start + dst.len()).min(self.data.len());
+                dst[..end - start].copy_from_slice(&self.data[start..end]);
+                Ok(end - start)
+            }
+            fn file_exists(&self, file_id: &FileId) -> bool {
+                *file_id == self.file_id
+            }
+            fn file_length(&self, _file_id: &FileId) -> Option<u64> {
+                Some(self.reported_len)
+            }
+            fn read_file(&self, _file_id: &FileId) -> io::Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn write_file_range(
+                &mut self,
+                _file_id: &FileId,
+                _offset: u64,
+                _data: &[u8],
+            ) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "read-only"))
+            }
+        }
+
+        let access = ShortAccess {
+            data: data[..4 * slice_size as usize].to_vec(),
+            reported_len: data.len() as u64,
+            file_id,
+        };
+        let proven: HashMap<FileId, Vec<bool>> =
+            [(file_id, vec![false; slice_count])].into_iter().collect();
+        let result =
+            verify_selected_file_ids_with_options(&set, &access, &ids, &evidence_opts(proven));
+
+        assert_eq!(
+            result.files[0].valid_slices,
+            vec![true, true, true, true, false, false],
+            "a short read must condemn only the slices it actually cut short"
+        );
+        assert_eq!(result.files[0].missing_slice_count, 2);
     }
 }

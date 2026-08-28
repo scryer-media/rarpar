@@ -177,7 +177,10 @@ Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer
 
 ## License
 
-GPL-3.0-or-later, with the additional UnRAR source-code restriction:
+GPL-3.0-or-later. The RAR engine was developed using the source code of the
+unRAR program; all copyrights to the original unRAR code are owned by
+Alexander Roshal, and its license restriction continues to govern the
+unRAR-derived code in this crate:
 
 > UnRAR source code may be used in any software to handle RAR archives without
 > limitations free of charge, but cannot be used to develop RAR (WinRAR)
