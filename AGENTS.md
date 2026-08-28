@@ -19,10 +19,12 @@ and PAR2 workflows.
 
 - `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
   GPL-3.0-or-later.
-- `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
-  restriction documented in `crates/unrar-rs/LICENSE`.
-- `rarpar` binary distributions link `unrar-rs` and must carry that
-  additional restriction too.
+- `unrar-rs` is GPL-3.0-or-later; its RAR engine is developed from RARLAB's
+  unRAR source code, which remains governed by the unRAR license restriction
+  documented in `crates/unrar-rs/LICENSE`.
+- `rarpar` carries a GPLv3 section 7 permission to combine with `unrar-rs`
+  (`tools/rarpar/LICENSE`); binary distributions link `unrar-rs` and must
+  preserve the unRAR restriction notice.
 - Never bypass signed commit or signed tag requirements.
 - Run the repo release script if one exists; do not hand-roll releases.
 

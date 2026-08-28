@@ -1425,9 +1425,10 @@ Zsh completion script.
 \fB/usr/share/fish/vendor_completions.d/rarpar.fish\fR
 Fish completion script.
 .SH LICENSE
-\fBrarpar\fR source is GPL-3.0-or-later. Normal binary builds link
-\fBunrar-rs\fR, so distributed \fBrarpar\fR binaries also carry the
-additional UnRAR source-code restriction for RAR extraction and recovery code.
+\fBrarpar\fR source is GPL-3.0-or-later with a GPLv3 section 7 permission to
+combine with \fBunrar-rs\fR. Normal binary builds link \fBunrar-rs\fR, so
+distributed \fBrarpar\fR binaries contain UnRAR-derived RAR extraction and
+recovery code that remains subject to the unRAR license restriction.
 Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
 \fBLICENSE.unrar-rs\fR.
 "#;

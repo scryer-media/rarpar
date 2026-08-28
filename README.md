@@ -330,13 +330,14 @@ the archive set; it waits for each later volume instead.
 - `crates/reedsolomon-rs`: Reed-Solomon finite-field kernels shared by
   RAR recovery and PAR2 repair. Licensed GPL-3.0-or-later.
 - `crates/unrar-rs`: RAR reading, probing, extraction, and recovery only.
-  Licensed GPL-3.0-or-later with the additional UnRAR source-code restriction.
+  Licensed GPL-3.0-or-later; its RAR engine was developed using RARLAB's
+  unRAR source code, which remains governed by the unRAR license restriction.
 - `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
-- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with the
-  additional UnRAR source-code restriction — `unrar-rs` is a default
-  dependency, so an ordinary build carries it.
+- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
+  GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
+  default dependency, so an ordinary build carries the unRAR restriction.
 
 ## Development
 
@@ -382,9 +383,11 @@ The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
 
 - `reedsolomon-rs` and `par2-rs` are GPL-3.0-or-later. Neither depends on
   `unrar-rs`, so neither carries the restriction.
-- `unrar-rs` is GPL-3.0-or-later with the additional UnRAR source-code
-  restriction documented in `crates/unrar-rs/LICENSE`.
-- `rarpar` is GPL-3.0-or-later with that same additional restriction.
+- `unrar-rs` is GPL-3.0-or-later; its RAR engine was developed using
+  RARLAB's unRAR source code, and the unRAR license restriction continues to
+  govern that derived code — see `crates/unrar-rs/LICENSE`.
+- `rarpar` is GPL-3.0-or-later with a GPLv3 section 7 additional permission
+  to combine with `unrar-rs` — see `tools/rarpar/LICENSE`.
   `unrar-rs` is a default dependency — `default` enables `runtime`, which
   enables `dep:unrar-rs` — so an ordinary `cargo build`, `cargo install` or
   release archive contains UnRAR-derived code. Release archives include
