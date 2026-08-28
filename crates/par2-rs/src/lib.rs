@@ -198,9 +198,9 @@ pub use repair_session::{
     Par2RepairSessionOptions, Par2SessionError,
 };
 pub use repairer::{
-    BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
-    Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock,
-    SourceFileEntry, SourceLocation,
+    BlockLocation, BlockLocationKind, CarryDiagnostics, CarryRetryReason, ExternalCarryError,
+    PacketDiagnostics, PacketInventory, Par2RepairOutcome, Par2RepairStatus, Par2Repairer,
+    Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock, SourceFileEntry, SourceLocation,
 };
 pub use session::{
     FeedDisposition, FeedOutcome, InStreamCrc32Proof, InStreamCrc32ProofError, SettleRead,

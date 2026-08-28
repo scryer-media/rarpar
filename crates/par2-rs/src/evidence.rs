@@ -28,6 +28,31 @@ impl FileStatFingerprint {
         Ok(Self::from_metadata(&metadata))
     }
 
+    /// Fingerprint `path` exactly as this crate's stat gates compare it.
+    ///
+    /// Symlinks are not followed and only regular files fingerprint, so a path
+    /// that is (or became) a directory, a symlink or a device reads as `None`
+    /// rather than as a file — the same rule the carry gate applies, because
+    /// this *is* the function that gate calls.
+    ///
+    /// Callers building a [`crate::ScanCarry`] from their own verification pass
+    /// must capture the fingerprint at the moment they read the file's bytes,
+    /// not afterwards: the gate's whole guarantee is that the file the repair
+    /// reads is the file the fingerprint describes, and a fingerprint taken
+    /// late silently covers whatever changed in between.
+    ///
+    /// What this can prove is what `stat` can prove — length, mtime, and on
+    /// Unix device and inode. A same-length rewrite that also restores the
+    /// original mtime in place is invisible to it, which is why a repair that
+    /// consumes a carry re-checks the bytes themselves against their slice
+    /// checksums as it reads them.
+    pub fn capture_path(path: impl AsRef<Path>) -> Option<Self> {
+        fs::symlink_metadata(path.as_ref())
+            .ok()
+            .filter(|meta| meta.file_type().is_file())
+            .map(|meta| Self::from_metadata(&meta))
+    }
+
     /// Build a fingerprint from metadata the caller already has. Callers that
     /// need to distinguish "not a regular file" from "changed" must apply that
     /// filter themselves; this records what the stat said, nothing more.
