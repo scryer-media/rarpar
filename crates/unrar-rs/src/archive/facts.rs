@@ -141,7 +141,20 @@ pub struct RarVolumeUnixOwnerFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RarVolumeFacts {
     pub format: u8,
-    pub volume_number: u32,
+    /// The volume index the headers themselves state, when the format states
+    /// one. RAR5 carries it in the main header behind `MAIN_VOLNR`; RAR4
+    /// carries it only in an end record behind `VOLUME_NUMBER`. An
+    /// old-numbering RAR4 set (`.rar`/`.rNN`) states nothing anywhere, and a
+    /// RAR5 first volume routinely omits the field — `None` in both cases,
+    /// which is a different fact from "the header said volume 0". A caller
+    /// that needs an identity for an unnumbered volume must take it from the
+    /// layout (the filename), not from here.
+    ///
+    /// Cache compatibility: facts encoded by pre-0.6 binaries carry a bare
+    /// integer (their parse defaulted an absent number to 0) and decode here
+    /// as `Some(n)`. `None` encodes as nil, which pre-0.6 readers reject —
+    /// they drop that cached row and re-parse.
+    pub volume_number: Option<u32>,
     pub more_volumes: bool,
     pub is_solid: bool,
     pub is_encrypted: bool,
@@ -693,8 +706,7 @@ impl RarArchive {
                 .end
                 .as_ref()
                 .and_then(|end| end.volume_number)
-                .map(|value| value as u32)
-                .unwrap_or(0);
+                .map(u32::from);
             let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes)
                 || (format == ArchiveFormat::Rar14 && parsed.files.iter().any(|f| f.split_after));
             let has_rar4_uowner_payload =
@@ -821,7 +833,9 @@ impl RarArchive {
 
         let parsed = crate::header::parse_all_headers(&mut reader, password)?;
         let main = parsed.main.as_ref();
-        let volume_number = main.and_then(|main| main.volume_number).unwrap_or(0) as u32;
+        let volume_number = main
+            .and_then(|main| main.volume_number)
+            .map(|value| value as u32);
         let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes);
         let is_solid = main.is_some_and(|main| main.is_solid);
         let is_volume = main.is_some_and(|main| main.is_volume);
@@ -1108,6 +1122,9 @@ mod tests {
 
         let decoded: RarVolumeFacts = rmp_serde::from_slice(&encoded).unwrap();
 
+        // A pre-0.6 cache states a bare integer — its parse defaulted an
+        // absent number to 0 — and it decodes as a stated number.
+        assert_eq!(decoded.volume_number, Some(2));
         assert!(decoded.services.is_empty());
         assert!(!decoded.is_volume);
         assert!(!decoded.has_recovery_record);
@@ -1238,6 +1255,9 @@ mod tests {
 
         assert_eq!(facts.format, 4);
         assert!(facts.has_authenticity_verification);
+        // The end record carries no `VOLUME_NUMBER` flag: the format stated
+        // nothing, which is a different fact from "the header said volume 0".
+        assert_eq!(facts.volume_number, None);
     }
 
     /// Key material the encrypted synthetic archives below state. Distinct

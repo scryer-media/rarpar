@@ -771,28 +771,30 @@ fn header_volume_number_and_filename_part_number_disagree_by_a_constant() {
             .facts
             .iter()
             .zip(&files)
-            .map(|(facts, file)| {
+            .filter_map(|(facts, file)| {
                 let named: i64 = file
                     .rsplit_once(".part")
                     .and_then(|(_, tail)| tail.split('.').next())
                     .expect("fixture names carry a part number")
                     .parse()
                     .expect("part number parses");
-                named - i64::from(facts.volume_number)
+                facts.volume_number.map(|stated| named - i64::from(stated))
             })
             .collect();
 
-        // Both signals are present, they disagree, and they disagree the same
-        // way on every volume — which is exactly what makes a modal delta the
-        // right reconciliation and a literal match the wrong one.
+        // Wherever a header states a number it disagrees with the filename,
+        // and it disagrees the same way on every volume — which is exactly
+        // what makes a modal delta the right reconciliation and a literal
+        // match the wrong one. (An empty delta set would fail here too: these
+        // sets do state numbers.)
         assert_eq!(
             deltas,
             BTreeSet::from([1]),
             "{name}: filename part numbers run one ahead of header volume numbers"
         );
-        assert_eq!(
-            fixture.facts[0].volume_number, 0,
-            "{name}: headers number volumes from zero"
+        assert!(
+            matches!(fixture.facts[0].volume_number, None | Some(0)),
+            "{name}: headers number volumes from zero when the first volume states one"
         );
     }
 }

@@ -1,6 +1,27 @@
 # Changelog
 
 
+## 0.6.0
+
+A breaking change to one field, made so an absent fact stops impersonating a
+stated one.
+
+### Changed
+
+- **Breaking:** `RarVolumeFacts::volume_number` is now `Option<u32>`. RAR5
+  states a volume number in the main header behind `MAIN_VOLNR` and RAR4
+  states one only in an end record behind `VOLUME_NUMBER`; an old-numbering
+  RAR4 set (`.rar`/`.rNN`) states nothing anywhere, and a RAR5 first volume
+  routinely omits the field. Those volumes previously parsed as volume 0 —
+  indistinguishable from a header that genuinely said 0 — which invited
+  callers to adopt 0 as an identity the format never stated. `None` now means
+  "the format stated nothing"; take an unnumbered volume's identity from the
+  layout instead.
+
+  Cache compatibility: facts encoded by pre-0.6 binaries carry a bare integer
+  and decode as `Some(n)`. `None` encodes as nil, which pre-0.6 readers
+  reject — they drop that cached row and re-parse the volume.
+
 ## 0.5.5
 
 A correctness release from 0.5.4, plus a simpler way to extract a solid

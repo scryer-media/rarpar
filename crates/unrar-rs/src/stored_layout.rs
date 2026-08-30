@@ -1604,7 +1604,7 @@ mod tests {
     fn volume(members: Vec<RarVolumeMemberFacts>) -> RarVolumeFacts {
         RarVolumeFacts {
             format: 5,
-            volume_number: 0,
+            volume_number: None,
             more_volumes: false,
             is_solid: false,
             is_encrypted: false,
