@@ -1817,63 +1817,6 @@ impl RarArchive {
         std::fs::File::create(out_path).map_err(RarError::Io)
     }
 
-    /// Best-effort physical preallocation of an output file. Reserves blocks
-    /// only — the logical file size is untouched, so short writes on
-    /// unknown-size members stay correct. Failures are ignored. Exposed so
-    /// callers that own their output files (e.g. the server's extraction
-    /// writers) can apply the same policy before streaming into them.
-    pub fn preallocate_output_file(file: &std::fs::File, expected_len: u64) {
-        const PREALLOCATE_MIN_BYTES: u64 = 8 * 1024 * 1024;
-        if expected_len < PREALLOCATE_MIN_BYTES || expected_len > i64::MAX as u64 {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd;
-            let mut store = libc::fstore_t {
-                fst_flags: libc::F_ALLOCATECONTIG,
-                fst_posmode: libc::F_PEOFPOSMODE,
-                fst_offset: 0,
-                fst_length: expected_len as libc::off_t,
-                fst_bytesalloc: 0,
-            };
-            // Contiguous first, then any-blocks fallback.
-            let contiguous = unsafe {
-                libc::fcntl(
-                    file.as_raw_fd(),
-                    libc::F_PREALLOCATE,
-                    &mut store as *mut libc::fstore_t,
-                )
-            };
-            if contiguous == -1 {
-                store.fst_flags = libc::F_ALLOCATEALL;
-                let _ = unsafe {
-                    libc::fcntl(
-                        file.as_raw_fd(),
-                        libc::F_PREALLOCATE,
-                        &mut store as *mut libc::fstore_t,
-                    )
-                };
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let _ = unsafe {
-                libc::fallocate(
-                    file.as_raw_fd(),
-                    libc::FALLOC_FL_KEEP_SIZE,
-                    0,
-                    expected_len as libc::off_t,
-                )
-            };
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (file, expected_len);
-        }
-    }
-
     fn create_regular_output_file_for_member(
         member_name: &str,
         out_path: &std::path::Path,
@@ -4690,7 +4633,6 @@ impl RarArchive {
         let (file, resolved_out_path) =
             Self::create_regular_output_file_for_member(&member_name, out_path)?;
         let out_path = resolved_out_path.as_path();
-        Self::preallocate_output_file(&file, self.target_unpacked_size(&fh));
         let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
 
         if fh.compression.method == CompressionMethod::Store && !is_solid {
@@ -8435,6 +8377,46 @@ mod tests {
             reader: Box::new(Cursor::new(data.to_vec())),
         })];
         archive
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn truncated_direct_to_file_does_not_allocate_declared_output_size() {
+        use std::os::unix::fs::MetadataExt;
+
+        const DECLARED_UNPACKED_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+        let payload = b"tiny";
+        let mut archive = archive_with_single_volume(payload);
+        let service = test_rar5_service(
+            "truncated.bin",
+            DECLARED_UNPACKED_SIZE,
+            payload.len() as u64,
+        );
+        archive.members.push(MemberEntry {
+            file_header: service.file_header,
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: vec![DataSegment::new(0, 0, payload.len() as u64)],
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("truncated.bin");
+        assert!(
+            archive
+                .extract_member_to_file(0, &ExtractOptions::default(), None, &out_path)
+                .is_err()
+        );
+
+        let metadata = std::fs::metadata(&out_path).unwrap();
+        assert_eq!(metadata.len(), payload.len() as u64);
+        assert!(
+            metadata.blocks() * 512 < 8 * 1024 * 1024,
+            "allocated blocks must track written bytes, not the declared {DECLARED_UNPACKED_SIZE}-byte size"
+        );
     }
 
     #[test]
