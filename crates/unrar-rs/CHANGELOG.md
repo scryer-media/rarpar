@@ -1,6 +1,26 @@
 # Changelog
 
 
+## 0.7.0
+
+A resource-hardening release that stops trusting an archive member's declared
+expanded size as a reason to reserve disk blocks before any output is written.
+
+### Changed
+
+- **Breaking:** removed `RarArchive::preallocate_output_file`. It exposed the
+  same eager physical-allocation policy that direct-to-file extraction used,
+  and a caller could not apply it safely to an untrusted declared size before
+  extraction had established how much output was actually available.
+
+### Fixed
+
+- Direct-to-file extraction no longer preallocates the member's declared
+  expanded size. Truncated or malformed input now consumes disk space in
+  proportion to bytes actually written instead of potentially reserving a
+  large sparse member's full advertised size before extraction fails.
+
+
 ## 0.6.0
 
 A breaking change to one field, made so an absent fact stops impersonating a

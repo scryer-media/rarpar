@@ -39,7 +39,7 @@ musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
 par2-rs = { path = "../../crates/par2-rs", version = "0.8.0", default-features = false, optional = true }
-unrar-rs = { path = "../../crates/unrar-rs", version = "0.6.0", default-features = false, optional = true }
+unrar-rs = { path = "../../crates/unrar-rs", version = "0.7.0", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
