@@ -223,6 +223,12 @@
 //! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 pub mod archive;
+/// Embedder-supplied crypto/CRC delegation for WASI Preview 2 components.
+///
+/// Present only with `host-abi-component`. See the module docs for the seam an
+/// embedding component plugin wires up.
+#[cfg(feature = "host-abi-component")]
+pub mod component_abi;
 pub(crate) mod crc;
 pub(crate) mod crc_simd;
 extern crate self as crc32fast;
