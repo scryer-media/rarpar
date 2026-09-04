@@ -262,12 +262,13 @@ impl<'a> Entry<'a> {
 
     /// Write this member under `dir`, at the path its name states.
     ///
-    /// The name is sanitized first, so a member whose stored name reaches
-    /// outside the directory lands inside it instead. Intermediate directories
-    /// are created. Returns the path written.
+    /// The path is `dir` joined with [`name`](Entry::name): the sanitized,
+    /// host-aware name, so a member whose stored name reaches outside the
+    /// directory lands inside it instead, and a backslash in a name written on
+    /// Unix stays one literal component rather than becoming a separator.
+    /// Intermediate directories are created. Returns the path written.
     pub fn unpack_in<P: AsRef<Path>>(self, dir: P) -> RarResult<PathBuf> {
-        let relative = crate::path::sanitize_path(&self.info.raw_name);
-        let destination = dir.as_ref().join(&relative);
+        let destination = dir.as_ref().join(&self.info.name);
         self.unpack_to(&destination)?;
         Ok(destination)
     }
