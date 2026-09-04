@@ -39,11 +39,6 @@ pub fn validate_extracted_outputs(
 ) -> Result<(), RarparError> {
     crate::rar::with_password_retry(rar, passwords, |mut archive| {
         let tempdir = tempfile::tempdir()?;
-        let options = unrar_rs::ExtractOptions {
-            verify: true,
-            password: None,
-            restore_owners: false,
-        };
         let members = archive.metadata().members;
         for (index, member) in members.iter().enumerate() {
             let output_path = output_dir.join(&member.name);
@@ -113,7 +108,7 @@ pub fn validate_extracted_outputs(
             }
 
             let expected_path = tempdir.path().join(format!("member-{index}"));
-            archive.extract_member_to_file(index, &options, None, &expected_path)?;
+            archive.by_index(index)?.unpack_to(&expected_path)?;
             if !files_equal(&expected_path, &output_path)? {
                 return Err(RarparError::Data(format!(
                     "extracted file content mismatch for {}",

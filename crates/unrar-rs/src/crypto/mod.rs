@@ -16,7 +16,7 @@
 //! seam, so a second backend can be added without editing shared logic.
 //!
 //! One deliberate exception: the RAR5 PBKDF2 loop. Its per-iteration
-//! HMAC-SHA256 is [`kdf_hmac`], which runs on the `sha2` crate on *every*
+//! HMAC-SHA256 is `kdf_hmac`, which runs on the `sha2` crate on *every*
 //! backend so that a derivation of up to 2^24 iterations never crosses FFI.
 //! That module is not a backend and has no alternative implementation; see its
 //! docs. Everything else — AES, SHA-1, the non-KDF SHA-256 and HMAC uses — is

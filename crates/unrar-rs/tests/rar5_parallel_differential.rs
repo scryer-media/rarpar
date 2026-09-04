@@ -5,6 +5,11 @@
 //! Private decoder tests prove controller dispatch. This suite verifies only
 //! public archive behavior and does not assume every fixture enters that path.
 
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
@@ -138,6 +143,9 @@ enum StableError {
         member: String,
         link_type: String,
     },
+    /// Any error variant added since this mapping was written. Compared by its
+    /// rendered message, so a new kind still has to agree across decode paths.
+    Other(String),
 }
 
 fn stable_error(error: &RarError) -> StableError {
@@ -236,6 +244,7 @@ fn stable_error(error: &RarError) -> StableError {
             member: member.clone(),
             link_type: link_type.clone(),
         },
+        other => StableError::Other(other.to_string()),
     }
 }
 

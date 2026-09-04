@@ -2,7 +2,7 @@
 name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 readme = "README.md"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -39,6 +39,11 @@ crc-host = []
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]
 slow-tests = []
+# Exposes `__internals`, the decoder/RAR4 entry points this crate's own benches
+# and examples reach for. Off by default and never a dependency's business: it
+# is not public API and carries no semver guarantee. The targets that need it
+# declare it in `required-features`, so a build without it simply skips them.
+unstable-internals = []
 # Compile the forensic per-symbol PPMd trace hooks. The hooks remain runtime
 # controlled by UNRAR_RS_RAR4_DEBUG_PPM, but ordinary builds carry no trace
 # state, branches, counters, or formatting code.
@@ -116,9 +121,14 @@ required-features = ["crypto-host"]
 name = "wasm_extract_conformance"
 required-features = ["crypto-host", "crc-host"]
 
+[[example]]
+name = "probe_volumes"
+required-features = ["unstable-internals"]
+
 [[bench]]
 name = "archive_hotspots"
 harness = false
+required-features = ["unstable-internals"]
 
 [[bench]]
 name = "ppmd_compare"

@@ -321,6 +321,11 @@ fn is_data_member(m: &MemberInfo) -> bool {
 
 fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
     let mut archive = open_archive(root, case)?;
+    // The archive already carries the password and verifies by default. These
+    // options exist for `extract_member` alone, which the non-solid arm below
+    // still needs: whether a member spooled to a temporary file is only
+    // observable through the `ExtractedMember` it returns, and that is what
+    // this check is here to report on wasm.
     let options = ExtractOptions {
         verify: true,
         password: case.password.map(String::from),
@@ -350,8 +355,11 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
             let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
             let writer_buf = Rc::clone(&buf);
             archive
-                .extract_member_solid_chunked(idx, &options, move |_transition| {
-                    Ok(Box::new(SharedVecWriter(Rc::clone(&writer_buf))) as Box<dyn Write>)
+                .by_index(idx)
+                .and_then(|entry| {
+                    entry.copy_to_volumes(move |_transition| {
+                        Ok(SharedVecWriter(Rc::clone(&writer_buf)))
+                    })
                 })
                 .map_err(|e| {
                     format!(
@@ -364,6 +372,9 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
             out.digest = digest64(out.digest, member.name.as_bytes());
             out.digest = digest64(out.digest, &buf.borrow());
         } else {
+            // Deliberately the buffered entry point: the spool decision this
+            // check reports is carried by `ExtractedMember` and nothing else.
+            #[allow(deprecated)]
             let extracted = archive.extract_member(idx, &options, None).map_err(|e| {
                 format!(
                     "[{}] extract_member {idx} ({}): {e:?}",

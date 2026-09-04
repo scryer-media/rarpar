@@ -1,4 +1,8 @@
 #![cfg(feature = "slow-tests")]
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
 
 //! Encrypted RAR4/RAR5 extraction, split out of `integration.rs`.
 //!

@@ -196,6 +196,9 @@ impl RarArchive {
             solid_decoder: None,
             solid_decoder_rar4: None,
             solid_next_index: 0,
+            solid_poison: None,
+            verify: true,
+            restore_owners: false,
             limits: Limits::default(),
             password: password.map(String::from),
             kdf_cache,
@@ -328,6 +331,9 @@ impl RarArchive {
             solid_decoder: None,
             solid_decoder_rar4: None,
             solid_next_index: 0,
+            solid_poison: None,
+            verify: true,
+            restore_owners: false,
             limits: Limits::default(),
             password: password.map(String::from),
             kdf_cache,
@@ -749,6 +755,10 @@ impl RarArchive {
 
 #[cfg(test)]
 mod tests {
+    // These tests drive the pre-0.9.0 buffered entry point on purpose: it is
+    // still part of the crate's surface until 0.10.0, and holding the decoder
+    // to it here is what proves the wrappers stay honest.
+    #![allow(deprecated)]
     use super::*;
     use crate::header::file::FileHeader as Rar5FileHeader;
     use crate::header::{ParsedService, service::ServiceHeader};

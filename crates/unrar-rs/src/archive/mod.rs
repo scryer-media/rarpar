@@ -4,12 +4,15 @@
 //! archives, volumes can be added incrementally as they become available.
 
 mod cache;
+mod entry;
 mod facts;
+mod legacy;
 mod member;
 mod parse;
 mod volume;
 
 pub use cache::CachedArchiveHeaders;
+pub use entry::Entry;
 pub use facts::{
     RarVolumeFacts, RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
     RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
@@ -254,10 +257,21 @@ pub struct RarArchive {
     pub(super) solid_decoder_rar4: Option<Rar4Decoder>,
     /// Index of the next member that must be extracted in a solid archive.
     pub(super) solid_next_index: usize,
+    /// The member that left the solid decoder mid-stream, and why.
+    ///
+    /// Set when a solid member's consumption fails after the decoder has begun
+    /// producing its bytes. While it is set, the carried-over dictionary no
+    /// longer corresponds to any member boundary, so every later solid
+    /// consumption is refused until [`RarArchive::reset_solid_state`] clears it.
+    pub(super) solid_poison: Option<(usize, String)>,
     /// Resource limits for archive processing.
     pub(super) limits: Limits,
     /// Password for decrypting encrypted archives/members.
     pub(super) password: Option<String>,
+    /// Whether extraction checks a member against its stored checksum.
+    pub(super) verify: bool,
+    /// Whether extraction applies archived Unix owner and group.
+    pub(super) restore_owners: bool,
     /// Cache for expensive key derivation (shared across member extractions).
     pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
 }
@@ -316,9 +330,45 @@ impl RarArchive {
         self.password = Some(password.into());
     }
 
+    /// Check each extracted member against the checksum its header states.
+    ///
+    /// On by default. With it off, a member whose CRC32 or BLAKE2sp does not
+    /// match is handed back as decoded instead of raising
+    /// [`RarError::DataCrcMismatch`] or [`RarError::Blake2Mismatch`].
+    pub fn set_verify(&mut self, verify: bool) {
+        self.verify = verify;
+    }
+
+    /// Whether extraction checks members against their stored checksums.
+    pub fn verify(&self) -> bool {
+        self.verify
+    }
+
+    /// Apply the archived Unix owner and group to files written to disk.
+    ///
+    /// Off by default: restoring ownership needs privileges the caller may not
+    /// hold, and touches files an ordinary extraction leaves alone.
+    pub fn set_restore_owners(&mut self, restore_owners: bool) {
+        self.restore_owners = restore_owners;
+    }
+
+    /// Whether extraction applies the archived Unix owner and group.
+    pub fn restore_owners(&self) -> bool {
+        self.restore_owners
+    }
+
     /// Set resource limits for archive processing.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// The settings an [`Entry`](crate::Entry) extracts under.
+    pub(crate) fn effective_options(&self) -> ExtractOptions {
+        ExtractOptions {
+            verify: self.verify,
+            password: self.password.clone(),
+            restore_owners: self.restore_owners,
+        }
     }
 
     /// Check if a member is extractable (all required volumes are present).
@@ -688,10 +738,50 @@ impl RarArchive {
     }
 
     /// Reset solid decoder state (e.g. if starting a fresh extraction pass).
+    ///
+    /// Drops the carried-over dictionary, rewinds the solid cursor to the first
+    /// member, and clears a [`RarError::SolidStatePoisoned`] condition. The next
+    /// solid member consumed is decoded from the start of the archive again.
     pub fn reset_solid_state(&mut self) {
         self.solid_decoder = None;
         self.solid_decoder_rar4 = None;
         self.solid_next_index = 0;
+        self.solid_poison = None;
+    }
+
+    /// The number of members the archive lists, directories included.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether the archive lists no members at all.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Walk the archive's members in index order.
+    ///
+    /// The index an item is yielded at is the index [`by_index`](Self::by_index)
+    /// takes. Reading headers decompresses nothing, so this costs the same on a
+    /// 50 GB set as on a small one.
+    pub fn entries(&self) -> impl Iterator<Item = MemberInfo> + '_ {
+        self.members
+            .iter()
+            .map(|entry| self.make_member_info(entry))
+    }
+
+    /// The member at `index`, or `None` when the archive has no such member.
+    pub fn entry_info(&self, index: usize) -> Option<MemberInfo> {
+        self.member_info(index)
+    }
+
+    /// The index of the member stored under `name`, matched on the raw header
+    /// name.
+    ///
+    /// Use [`find_member_sanitized`](Self::find_member_sanitized) when the name
+    /// in hand has already been through [`sanitize_path`](crate::sanitize_path).
+    pub fn index_for_name(&self, name: &str) -> Option<usize> {
+        self.find_member(name)
     }
 
     /// Get the data segments for a member by index.
@@ -893,6 +983,9 @@ mod tests {
             solid_decoder: None,
             solid_decoder_rar4: None,
             solid_next_index: 0,
+            solid_poison: None,
+            verify: true,
+            restore_owners: false,
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),

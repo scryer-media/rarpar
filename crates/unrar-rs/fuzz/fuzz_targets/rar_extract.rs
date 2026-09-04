@@ -16,7 +16,7 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use unrar_rs::{ExtractOptions, RarArchive};
+use unrar_rs::RarArchive;
 
 /// Inputs above this are the fuzzer wandering rather than finding structure.
 const MAX_INPUT_BYTES: usize = 1 << 20;
@@ -32,11 +32,13 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let members = archive.member_names().len().min(MAX_MEMBERS);
-    let options = ExtractOptions::default();
+    let members = archive.len().min(MAX_MEMBERS);
     for index in 0..members {
         // Errors are the normal outcome for a mutated archive and say nothing;
-        // a panic, an abort, or a hang is the finding.
-        let _ = archive.extract_member(index, &options, None);
+        // a panic, an abort, or a hang is the finding. The bytes go to a sink:
+        // what is under test is the decode, not the destination.
+        let _ = archive
+            .by_index(index)
+            .and_then(|entry| entry.copy_to(&mut std::io::sink()));
     }
 });
