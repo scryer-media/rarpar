@@ -38,7 +38,7 @@ metal = ["runtime", "par2-rs/metal"]
 musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
-par2-rs = { path = "../../crates/par2-rs", version = "0.8.0", default-features = false, optional = true }
+par2-rs = { path = "../../crates/par2-rs", version = "0.9.0", default-features = false, optional = true }
 unrar-rs = { path = "../../crates/unrar-rs", version = "0.8.0", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }

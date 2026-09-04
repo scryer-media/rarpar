@@ -2,37 +2,25 @@
 //!
 //! Selected on `wasm32` when the `crypto-host` feature is on. It mirrors the
 //! other backends' 8-item seam, but the *bulk* AES-CBC decrypt crosses the wasm
-//! boundary to a host function (the embedding host's AES), while the KDF primitives
+//! boundary to the embedding host's AES, while the KDF primitives
 //! (HMAC-SHA256 / SHA-256 / the test encrypt helpers) stay in-wasm and are
 //! re-exported verbatim from the portable RustCrypto backend. Delegating only
-//! the AES keeps the hot bulk path on the host's AES-NI without a copy, and
-//! leaves the RAR5/RAR4 key-derivation loops running locally where their
-//! clone-per-sign HMAC reuse is cheap.
+//! the AES keeps the hot bulk path on the host's AES-NI, and leaves the
+//! RAR5/RAR4 key-derivation loops running locally where their clone-per-sign
+//! HMAC reuse is cheap.
 //!
-//! ## The host ABI (fixed contract, shared with the host side)
+//! ## The seam
 //!
-//! Import module (namespace): `host` — embedder-neutral, satisfiable by any
-//! wasm runtime that can register imports (wasmtime, wasmer, …). The
-//! `host-abi-extism` feature switches only the namespace to
-//! `extism:host/user`, for Extism SDKs whose user host functions are pinned
-//! to that module; the function name and signature are identical in both.
-//! One import is declared:
-//!
-//! ```text
-//! host_aes_cbc_decrypt(key_ptr, key_len, iv_ptr, buf_ptr, buf_len) -> i64
-//! ```
-//!
-//! All args/returns are raw `i64`; every `*_ptr` is a byte offset into the
-//! plugin's own linear memory, which the host slices in place (zero-copy — no
-//! SDK `Vec<u8>` marshalling). AES-CBC, no padding, decrypt IN PLACE.
-//! `key_len` is 16 (AES-128) or 32 (AES-256); `iv` is 16 bytes at `iv_ptr`;
-//! `buf_len` must be a multiple of 16 and may be 0. The host is STATELESS per
-//! call. Returns `0` ok, `-1` bad `key_len`, `-2` `buf_len % 16 != 0`, `-3`
-//! out-of-bounds.
+//! The bulk decrypt reaches the host through the embedder-installed
+//! `aes_cbc_decrypt` hook (see `crate::hooks`): `(key, iv, data) ->
+//! plaintext`, AES-CBC, no padding, `key` 16 (AES-128) or 32 (AES-256) bytes,
+//! `iv` 16 bytes, `data` a whole number of blocks (may be empty). The hook is
+//! STATELESS per call and returns a fresh buffer, which this module copies back
+//! over `data` so the IV-chaining logic below keeps its in-place shape.
 //!
 //! ## Guest-tracked CBC IV chaining (the load-bearing subtlety)
 //!
-//! Because the host is stateless per call, this guest must thread the CBC IV
+//! Because the hook is stateless per call, this guest must thread the CBC IV
 //! across chunks itself. The in-place decrypt overwrites the ciphertext with
 //! plaintext, so before each call we SAVE the last 16 bytes of the *input*
 //! (the ciphertext) — that block is the IV for the next chunk — then set it as
@@ -60,91 +48,35 @@ pub(crate) use super::rust::{
 use crate::crypto::AES_BLOCK;
 
 // ---------------------------------------------------------------------------
-// The host import (real, wasm-only) and its native test-reference stand-in.
+// The embedder hook (the real seam) and its native test-reference stand-in.
 //
 // `decrypt_chunk` is the single seam point the `Aes*CbcDec` IV-chaining logic
-// calls. On `wasm32 + crypto-host` it is the raw host import; in a native
-// `#[cfg(test)]` build it is a reference CBC decrypt (RustCrypto `cbc`) so the
-// chaining logic is exercised end-to-end without a wasm host. Exactly one of
-// the two definitions is compiled.
+// calls. With `crypto-host` it is the embedder-installed hook; in a native
+// `#[cfg(test)]` build without the feature it is a reference CBC decrypt
+// (RustCrypto `cbc`) so the chaining logic is exercised end-to-end without a
+// host. Exactly one of the two definitions is compiled.
 // ---------------------------------------------------------------------------
 
-// Raw host import: a bare `#[link]` extern (no embedder SDK dependency), so
-// any wasm runtime satisfies it by exposing a function of this name in the
-// import namespace. The namespace is `host` unless `host-abi-extism` retargets
-// it for Extism SDKs. (A `//` comment, not `///`: doc comments are not allowed
-// on the items inside a `#[link]` extern block.)
-#[cfg(all(
-    target_arch = "wasm32",
-    feature = "crypto-host",
-    not(feature = "host-abi-component")
-))]
-#[cfg_attr(
-    feature = "host-abi-extism",
-    link(wasm_import_module = "extism:host/user")
-)]
-#[cfg_attr(not(feature = "host-abi-extism"), link(wasm_import_module = "host"))]
-unsafe extern "C" {
-    fn host_aes_cbc_decrypt(
-        key_ptr: u64,
-        key_len: u64,
-        iv_ptr: u64,
-        buf_ptr: u64,
-        buf_len: u64,
-    ) -> i64;
-}
-
-/// Decrypt one block-aligned `data` chunk in place with (`key`, `iv`) via the
-/// host, using the raw offset ABI (zero-copy: the host reads/writes the
-/// plugin's linear memory at these offsets). Panics on any negative return —
-/// that is a host contract violation, not a recoverable condition.
-#[cfg(all(
-    target_arch = "wasm32",
-    feature = "crypto-host",
-    not(feature = "host-abi-component")
-))]
-#[inline]
-fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
-    debug_assert!(key.len() == 16 || key.len() == 32);
-    debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-    // SAFETY: all pointers are valid offsets into this module's own linear
-    // memory for the stated lengths; the host slices them in place and never
-    // retains them past the call. `key`/`iv` are read-only to the host;
-    // `data` is written in place.
-    let rc = unsafe {
-        host_aes_cbc_decrypt(
-            key.as_ptr() as u64,
-            key.len() as u64,
-            iv.as_ptr() as u64,
-            data.as_mut_ptr() as u64,
-            data.len() as u64,
-        )
-    };
-    assert_eq!(
-        rc, 0,
-        "host_aes_cbc_decrypt failed (contract violation): rc={rc}"
-    );
-}
-
-/// Component-model seam: decrypt one block-aligned chunk through the
-/// embedder-installed hook (see [`crate::component_abi`]).
+/// Decrypt one block-aligned chunk through the embedder-installed hook (see
+/// `crate::hooks`).
 ///
-/// A component cannot hand the host guest pointers, so the buffer crosses by
-/// value and comes back as a fresh list — the in-place decrypt of the raw ABI
-/// is not expressible. Copying the result back over `data` restores the
-/// in-place contract the shared IV-chaining logic below is written against, so
-/// nothing else in this module changes shape between the two ABIs.
+/// The hook returns a fresh buffer rather than decrypting in place — that is
+/// the shape every transport can satisfy, including ones that cannot hand the
+/// host a guest pointer. Copying the result back over `data` restores the
+/// in-place contract the shared IV-chaining logic below is written against.
+/// Panics on a hook error or a wrong-length result: that is an embedder
+/// contract violation, not a recoverable condition.
 ///
-/// Unlike the raw import this compiles on any target: `fn` pointers link
-/// everywhere, which is what lets the chaining differential at the bottom of
-/// this file exercise the real component path natively.
-#[cfg(all(feature = "crypto-host", feature = "host-abi-component"))]
+/// `fn` pointers link on any target, which is what lets the chaining
+/// differential at the bottom of this file exercise the real hook path
+/// natively.
+#[cfg(feature = "crypto-host")]
 #[inline]
 fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     debug_assert!(key.len() == 16 || key.len() == 32);
     debug_assert!(data.len().is_multiple_of(AES_BLOCK));
 
-    let hooks = crate::component_abi::hooks();
+    let hooks = crate::hooks::hooks();
     let plaintext = match (hooks.aes_cbc_decrypt)(key, iv.as_slice(), data) {
         Ok(plaintext) => plaintext,
         Err(error) => panic!("host aes-cbc-decrypt failed (contract violation): {error}"),
@@ -159,19 +91,14 @@ fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     data.copy_from_slice(&plaintext);
 }
 
-/// Native `#[cfg(test)]` reference stand-in for the host import: a one-shot
-/// RustCrypto `cbc` decrypt of `data` in place with a FRESH context seeded by
-/// `iv` (stateless per call, exactly like the host). This lets the differential
+/// Native `#[cfg(test)]` reference stand-in for the hook: a one-shot RustCrypto
+/// `cbc` decrypt of `data` in place with a FRESH context seeded by `iv`
+/// (stateless per call, exactly like the hook). This lets the differential
 /// test drive the real `Aes*CbcDec` IV-chaining logic on a native target.
 ///
-/// Compiled only when neither real seam is active — with `host-abi-component`
-/// the differential drives the component hook itself, which is strictly better
-/// coverage than a stand-in.
-#[cfg(all(
-    test,
-    not(all(target_arch = "wasm32", feature = "crypto-host")),
-    not(all(feature = "crypto-host", feature = "host-abi-component"))
-))]
+/// Compiled only without `crypto-host` — with the feature the differential
+/// drives the hook itself, which is strictly better coverage than a stand-in.
+#[cfg(all(test, not(feature = "crypto-host")))]
 #[inline]
 fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     use aes::cipher::block::BlockModeDecrypt;
@@ -279,7 +206,8 @@ impl Drop for Aes128CbcDec {
 //
 // This is the executable proof of the save-last-block + IV-thread logic; the
 // wasm smoke test (examples/host_aes_smoke.rs + tests/wasm_host_aes_smoke.rs)
-// separately proves the raw import links end-to-end over the real ABI.
+// separately proves the whole chain — hook, guest import, host function —
+// links end to end in a real wasm guest.
 // ===========================================================================
 #[cfg(all(test, not(all(target_arch = "wasm32", feature = "crypto-host"))))]
 mod chaining_tests {
@@ -287,14 +215,14 @@ mod chaining_tests {
 
     /// Make `decrypt_chunk` callable in this build.
     ///
-    /// With `host-abi-component` the per-chunk primitive is the embedder hook,
-    /// so the differential below is only meaningful once a hook is installed —
-    /// and installing one turns these tests into the component backend's
+    /// With `crypto-host` the per-chunk primitive is the embedder hook, so the
+    /// differential below is only meaningful once a hook is installed — and
+    /// installing the reference pair turns these tests into the hook path's
     /// end-to-end proof. Without the feature `decrypt_chunk` is the local
     /// reference stand-in and this is a no-op.
     fn prepare_chunk_primitive() {
-        #[cfg(feature = "host-abi-component")]
-        crate::component_abi::install_reference_hooks_for_test();
+        #[cfg(feature = "crypto-host")]
+        crate::hooks::install_reference_hooks_for_test();
     }
 
     /// Deterministic xorshift64* PRNG — reproducible, adds no dependency.

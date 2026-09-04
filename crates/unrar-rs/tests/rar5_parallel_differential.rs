@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use sha2::{Digest, Sha256};
 use unrar_rs::{ExtractOptions, RarArchive, RarError, ReadSeek, StaticVolumeProvider};
 
-const DISABLE_PARALLEL: &str = "WEAVER_RAR_DISABLE_PARALLEL";
+const DISABLE_PARALLEL: &str = "UNRAR_RS_DISABLE_PARALLEL";
 const FIXTURE_PASSWORD: &str = "testpass123";
 const RAR5_SIGNATURE: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00];
 

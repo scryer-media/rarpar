@@ -48,7 +48,7 @@ const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1024 * 1024;
 const MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES: usize = 512 * 1024 * 1024;
 
 fn spool_threshold_bytes() -> usize {
-    std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
+    std::env::var("UNRAR_RS_SPOOL_THRESHOLD_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1321,18 +1321,18 @@ mod tests {
     #[test]
     fn default_limits_accept_500_gib_members_and_reject_larger_members() {
         let mut fh = make_stored_file_header("boundary.bin", b"", 0);
-        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE;
-        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE);
+        fh.data_size = crate::limits::MAX_MEMBER_DATA_SIZE;
+        fh.unpacked_size = Some(crate::limits::MAX_MEMBER_DATA_SIZE);
         enforce_member_limits(&fh, &Limits::default()).unwrap();
 
-        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1;
+        fh.data_size = crate::limits::MAX_MEMBER_DATA_SIZE + 1;
         assert!(matches!(
             enforce_member_limits(&fh, &Limits::default()),
             Err(RarError::ResourceLimit { .. })
         ));
 
         fh.data_size = 0;
-        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1);
+        fh.unpacked_size = Some(crate::limits::MAX_MEMBER_DATA_SIZE + 1);
         assert!(matches!(
             enforce_member_limits(&fh, &Limits::default()),
             Err(RarError::ResourceLimit { .. })

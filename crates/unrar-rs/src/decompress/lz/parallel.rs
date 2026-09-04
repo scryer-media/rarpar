@@ -162,7 +162,7 @@ struct WorkerOptions {
 /// Whether block-parallel decode is available for this process.
 ///
 /// Deliberately *not* memoized in a `OnceLock`: the public differential suite
-/// flips `WEAVER_RAR_DISABLE_PARALLEL` between extractions inside one process
+/// flips `UNRAR_RS_DISABLE_PARALLEL` between extractions inside one process
 /// to prove the two engines agree, and a cached value would silently run both
 /// halves in the same mode. The lookup is instead hoisted to once per member —
 /// every per-round caller is already inside a `parallel_enabled()` branch.
@@ -173,7 +173,7 @@ pub(super) fn parallel_enabled() -> bool {
     // `rar_decode_pool` is never built (wasip1 has no thread spawn).
     !cfg!(target_family = "wasm")
         && parallel_enabled_from_disable_env(
-            std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").as_deref(),
+            std::env::var_os("UNRAR_RS_DISABLE_PARALLEL").as_deref(),
         )
 }
 

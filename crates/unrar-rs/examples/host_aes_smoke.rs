@@ -3,15 +3,22 @@
 //! Built for `wasm32-wasip1` with `--features crypto-host`, this decrypts a
 //! KNOWN AES-256-CBC (no-padding) vector through the public
 //! [`unrar_rs::crypto::CbcDecryptor`], which on this build routes into the
-//! `backend::host` `Aes256CbcDec` and therefore calls the real host import
-//! `host::host_aes_cbc_decrypt` over the fixed raw-offset ABI.
+//! `backend::host` `Aes256CbcDec` and therefore calls the embedder-installed
+//! `aes_cbc_decrypt` hook (see [`unrar_rs::hooks`]).
+//!
+//! This example is also the reference embedding of that seam for a core wasm
+//! module: it declares one raw import, `host_aes_cbc_decrypt`, in a `host`
+//! namespace and installs a hook that forwards to it. The import takes guest
+//! pointers because a core module's linear memory is addressable by the host,
+//! so the host decrypts in place with no marshalling — that ABI belongs to
+//! this example, not to `unrar-rs`, which only ever sees the hook.
 //!
 //! The ciphertext is decrypted in SEVERAL block-sized chunks so the guest CBC
 //! IV chaining is exercised end-to-end across host calls, not just a single
 //! shot. It prints a one-line `PASS`/`FAIL` and exits non-zero on any mismatch,
 //! so the native `wasmtime` harness (tests/wasm_host_aes_smoke.rs) can assert on
 //! it. That harness supplies a reference `host_aes_cbc_decrypt`, making this
-//! example the executable reference the host-side agent must satisfy.
+//! example the executable reference an embedding host must satisfy.
 //!
 //! Build & run (from the workspace root):
 //!   cargo build --release --example host_aes_smoke \
@@ -25,6 +32,78 @@
 //! that is expected; the module is only meaningful with a host that provides it.
 
 use unrar_rs::crypto::CbcDecryptor;
+
+/// The example's own raw import and the hook that forwards to it.
+///
+/// ABI (fixed contract, shared with the harness):
+///
+/// ```text
+/// host_aes_cbc_decrypt(key_ptr, key_len, iv_ptr, buf_ptr, buf_len) -> i64
+/// ```
+///
+/// Every `*_ptr` is a byte offset into this module's linear memory, which the
+/// host slices in place. AES-CBC, no padding, decrypt IN PLACE. `key_len` is
+/// 16 or 32; `iv` is 16 bytes at `iv_ptr`; `buf_len` is a multiple of 16 and
+/// may be 0. The host is stateless per call. Returns `0` ok, `-1` bad
+/// `key_len`, `-2` `buf_len % 16 != 0`, `-3` out-of-bounds.
+#[cfg(target_arch = "wasm32")]
+mod embedding {
+    use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+
+    #[link(wasm_import_module = "host")]
+    unsafe extern "C" {
+        fn host_aes_cbc_decrypt(
+            key_ptr: u64,
+            key_len: u64,
+            iv_ptr: u64,
+            buf_ptr: u64,
+            buf_len: u64,
+        ) -> i64;
+    }
+
+    /// Forward the hook to the raw import: copy `data` into a fresh buffer, let
+    /// the host decrypt that buffer in place, and hand it back.
+    fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
+        let mut out = data.to_vec();
+        // SAFETY: all pointers are valid offsets into this module's own linear
+        // memory for the stated lengths; the host slices them in place and
+        // never retains them past the call. `key`/`iv` are read-only to the
+        // host; `out` is written in place.
+        let rc = unsafe {
+            host_aes_cbc_decrypt(
+                key.as_ptr() as u64,
+                key.len() as u64,
+                iv.as_ptr() as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+            )
+        };
+        match rc {
+            0 => Ok(out),
+            -1 => Err(HostAesError::BadKeyLength),
+            -2 => Err(HostAesError::BadBlockLength),
+            other => panic!("host_aes_cbc_decrypt returned {other} (contract violation)"),
+        }
+    }
+
+    /// Never called here (`crc-host` is off in this build), but the hook pair
+    /// is installed whole; `crc-fast` stands in so the pair is still honest.
+    fn crc32(seed: u32, data: &[u8]) -> u32 {
+        let mut hasher = crc_fast::Digest::new_with_init_state(
+            crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+            u64::from(!seed),
+        );
+        hasher.update(data);
+        hasher.finalize() as u32
+    }
+
+    pub(super) fn install() {
+        install_host_crypto_hooks(HostCryptoHooks {
+            aes_cbc_decrypt,
+            crc32,
+        });
+    }
+}
 
 // Known AES-256-CBC (no padding) vector, generated with RustCrypto AES-256-CBC.
 // 5 blocks (80 bytes) so a chunked decrypt threads the IV across boundaries.
@@ -56,6 +135,9 @@ const EXPECTED_PLAINTEXT: [u8; 80] = [
 const CHUNK_BLOCKS: [usize; 4] = [1, 2, 1, 1];
 
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    embedding::install();
+
     let mut buf = CIPHERTEXT.to_vec();
     let mut dec = CbcDecryptor::new(&KEY, &IV);
 
@@ -69,7 +151,7 @@ fn main() {
 
     if buf == EXPECTED_PLAINTEXT {
         println!(
-            "PASS host_aes_smoke: AES-256-CBC via host import, {} bytes, IV chained across {} chunks",
+            "PASS host_aes_smoke: AES-256-CBC via host hook, {} bytes, IV chained across {} chunks",
             buf.len(),
             CHUNK_BLOCKS.len()
         );
