@@ -1,35 +1,40 @@
-//! Component-model host delegation: the embedder-supplied crypto/CRC hooks.
+//! Embedder-supplied delegation hooks for the bulk AES-CBC decrypt and the
+//! bulk member-data CRC-32.
 //!
-//! `crypto-host` and `crc-host` delegate the bulk AES-CBC decrypt and the bulk
-//! member-data CRC-32 to the embedding host. The `host-abi-extism` /
-//! default-`host` namespaces reach the host through raw wasm imports that take
-//! guest pointers, which works for a core wasm module because the host can
-//! slice the guest's exported linear memory in place.
+//! With `crypto-host` and/or `crc-host` enabled, a wasm guest build of this
+//! crate does not run those two hot primitives itself: it calls a pair of
+//! plain Rust function pointers that the embedding program installs at
+//! start-up. Whatever sits behind the pointers — a raw wasm import in some
+//! namespace, a `wit-bindgen`-generated component import, a host SDK call — is
+//! the embedder's business. `unrar-rs` takes no dependency on any runtime,
+//! SDK, or interface definition; it only calls the two `fn` pointers it was
+//! handed.
 //!
-//! A **WASI Preview 2 component** cannot do that: a component has no exported
-//! memory the host may address, and every value crosses the boundary through
-//! the canonical ABI. The `host-abi-component` feature therefore replaces the
-//! raw imports with plain Rust function pointers that the embedding *plugin*
-//! installs at startup. The plugin owns the transport — typically a
-//! `wit_bindgen`-generated import such as `scryer:archive/crypto@1.0.0` — and
-//! this crate never learns what that transport is. `unrar-rs` depends on
-//! neither `wit-bindgen` nor any WIT world; it only calls the two `fn` pointers
-//! it was handed.
+//! This module is present whenever at least one of `crypto-host` / `crc-host`
+//! is enabled. Only the hook a feature consumes is ever called: with
+//! `crc-host` alone, `aes_cbc_decrypt` is never invoked, and vice versa.
+//! On native targets the features are accepted but the in-process backends
+//! stay active, so installed hooks are never called there.
 //!
 //! ## The seam
 //!
 //! ```ignore
-//! use unrar_rs::component_abi::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+//! use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
 //!
 //! fn aes(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
-//!     // forward to the component's `crypto.aes-cbc-decrypt` import
+//!     // forward to the embedder's AES-CBC decrypt
 //! }
 //! fn crc(seed: u32, data: &[u8]) -> u32 {
-//!     // forward to the component's `crypto.crc32` import
+//!     // forward to the embedder's CRC-32
 //! }
 //!
 //! install_host_crypto_hooks(HostCryptoHooks { aes_cbc_decrypt: aes, crc32: crc });
 //! ```
+//!
+//! `examples/wasm_extract_conformance.rs` is a complete reference embedding: a
+//! `wasm32-wasip1` guest that declares two raw imports in a `host` namespace
+//! and installs hooks that forward to them, driven by the native `wasmtime`
+//! harness in `tests/wasm_host_extract_conformance.rs`.
 //!
 //! ## Contract the hooks must satisfy
 //!
@@ -38,23 +43,15 @@
 //!   bytes. `key` is 16 or 32 bytes, `iv` is exactly 16, `data` is a whole
 //!   number of 16-byte blocks and may be empty. The hook is STATELESS per call:
 //!   this crate threads the CBC IV across chunks itself (see
-//!   `crate::crypto::backend::host`), exactly as the raw-import backend does.
+//!   `crate::crypto::backend::host`).
 //! * `crc32(seed, data)` returns the reflected IEEE CRC-32 (polynomial
 //!   `0xEDB88320`) of `data` resumed from `seed`. Empty `data` returns `seed`.
 //!   It must chain: `crc32(crc32(0, a), b) == crc32(0, a ++ b)`.
 //!
 //! A hook that reports an error, returns the wrong length, or is missing
-//! entirely is a host contract violation and panics — matching the raw-import
-//! backend, which likewise treats a negative status as unrecoverable.
-
-// The two host ABIs are alternatives, not layers: one declares raw wasm imports
-// in a namespace, the other declares none at all. Cargo features must stay
-// additive (feature unification across a dependency graph, `--all-features`
-// tooling such as cargo-semver-checks and rustdoc), so enabling both is not an
-// error: this feature takes precedence. Every raw-import declaration in
-// `crate::crc` and `crate::crypto::backend::host` is compiled only under
-// `not(feature = "host-abi-component")`, which leaves `host-abi-extism` with
-// nothing to rename — it selects a namespace for imports that are not declared.
+//! entirely is an embedder contract violation and panics: a guest that reaches
+//! bulk crypto without a working host has no recoverable state, and a silent
+//! in-guest fallback would quietly defeat the whole point of delegation.
 
 use std::sync::RwLock;
 
@@ -97,8 +94,8 @@ pub type Crc32Hook = fn(seed: u32, data: &[u8]) -> u32;
 ///
 /// Both are plain `fn` pointers rather than trait objects or closures: they
 /// carry no state, are `Copy`, and can therefore be read on the hot path
-/// without allocation. State the hooks need belongs to the embedding plugin,
-/// which is a single component instance per invocation.
+/// without allocation. Any state the hooks need belongs to the embedding
+/// program.
 #[derive(Clone, Copy)]
 pub struct HostCryptoHooks {
     /// Bulk AES-CBC decrypt (consumed when `crypto-host` is enabled).
@@ -115,9 +112,9 @@ impl std::fmt::Debug for HostCryptoHooks {
 
 /// Process-wide hook registry.
 ///
-/// A component instance is single-threaded and short-lived, so this is written
-/// exactly once per instantiation in the shipping configuration. The lock keeps
-/// the seam sound in native builds (where this crate's own tests are
+/// A wasm guest is single-threaded and short-lived, so this is written exactly
+/// once per instantiation in the shipping configuration. The lock keeps the
+/// seam sound in native builds (where this crate's own tests are
 /// multi-threaded) without any `unsafe`; a read guard per bulk chunk is
 /// negligible next to the AES/CRC work the chunk represents.
 static HOOKS: RwLock<Option<HostCryptoHooks>> = RwLock::new(None);
@@ -125,8 +122,8 @@ static HOOKS: RwLock<Option<HostCryptoHooks>> = RwLock::new(None);
 /// Install (or replace) the embedder's crypto/CRC hooks.
 ///
 /// Call this before any extraction that could touch an encrypted member or
-/// verify a member CRC — in practice, once at the top of the component's
-/// exported entry point.
+/// verify a member CRC — in practice, once at the top of the guest's entry
+/// point.
 pub fn install_host_crypto_hooks(hooks: HostCryptoHooks) {
     let mut slot = HOOKS
         .write()
@@ -154,23 +151,17 @@ pub fn clear_host_crypto_hooks() {
 
 /// The installed hooks, or a panic naming the missing wiring.
 ///
-/// Panicking matches the raw-import backends: a guest that reaches bulk crypto
-/// without a working host has no recoverable state, and a silent in-guest
-/// fallback would quietly defeat the whole point of delegation.
-#[cfg_attr(
-    not(any(
-        all(feature = "crypto-host", feature = "host-abi-component"),
-        all(feature = "crc-host", feature = "host-abi-component"),
-    )),
-    allow(dead_code)
-)]
+/// Only a wasm guest build calls this outside `#[cfg(test)]`: on native targets
+/// the in-process backends stay active (see `crate::crypto::backend`), so the
+/// delegating seams there are dead code by design.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn hooks() -> HostCryptoHooks {
     HOOKS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .expect(
-            "unrar-rs host-abi-component: no host crypto hooks installed; the embedding component \
-             must call unrar_rs::component_abi::install_host_crypto_hooks before extraction",
+            "unrar-rs: no host crypto hooks installed; the embedding program must call \
+             unrar_rs::hooks::install_host_crypto_hooks before extraction",
         )
 }
 

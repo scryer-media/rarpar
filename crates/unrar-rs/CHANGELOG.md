@@ -3,25 +3,68 @@
 
 ## 0.8.0
 
-An additive release that lets a WASI Preview 2 component keep delegating
-AES-CBC decryption and bulk CRC-32 to its host.
+A breaking release that removes every embedder-specific transport from the
+crate. Host delegation of the two bulk primitives (AES-CBC decrypt and the
+member CRC-32) now has exactly one shape — a pair of embedder-installed Rust
+function pointers — and the crate no longer knows or cares whether the
+embedder is a core wasm module, a WASI Preview 2 component, an Extism plugin,
+or something else. The runtime escape hatches lose their former owner's name.
 
-### Added
+### Removed
 
-- `host-abi-component` feature. `crypto-host` and `crc-host` delegation
-  rides embedder-installed Rust function pointers (the new `component_abi`
-  module: `HostCryptoHooks`, `install_host_crypto_hooks`,
-  `host_crypto_hooks_installed`, `clear_host_crypto_hooks`) instead of the
-  raw guest-pointer wasm imports. A component exports no linear memory for a
-  host to slice, so the pointer ABI cannot exist there; the embedding plugin
-  owns the transport and this crate takes no `wit-bindgen` or WIT dependency.
-  Takes precedence over `host-abi-extism` when both are enabled, so the
-  feature set stays additive under Cargo feature unification. Unlike the
-  raw-import backends the hook path links on native targets too, which is how
-  the existing AES/CRC chaining differentials now exercise it in process.
+- The raw wasm imports `host_aes_cbc_decrypt` and `host_crc32` that
+  `crypto-host` / `crc-host` used to declare, together with the features
+  that only selected their import namespace: `host-abi-extism`
+  (`extism:host/user`) and the never-published `host-abi-component`. The
+  guest-pointer ABI those imports encoded is a property of one particular
+  embedding, not of RAR extraction; it now lives in
+  `examples/wasm_extract_conformance.rs`, which is the reference embedding for
+  a core module and is still driven end to end by the `wasmtime` harnesses in
+  `tests/`.
 
-Without the feature nothing changes: the raw-import backends, active backend
-selection, and every default remain as in 0.7.0.
+### Changed
+
+- `crypto-host` and `crc-host` delegate through the `hooks` module
+  (`HostCryptoHooks`, `install_host_crypto_hooks`,
+  `host_crypto_hooks_installed`, `clear_host_crypto_hooks`, `HostAesError`),
+  which is present whenever either feature is enabled. The embedder installs
+  the pair once at start-up and owns whatever transport sits behind it. The
+  features stay wasm32-only in effect: on a native target they are accepted
+  but inert, so feature unification in a mixed workspace cannot turn a native
+  build into a delegating one. Every feature is additive; the crate builds
+  with `--all-features`.
+- The runtime override knobs are renamed from `WEAVER_*` to `UNRAR_RS_*`.
+  Values and semantics are unchanged; there are no aliases.
+
+  | 0.7.0                              | 0.8.0                           |
+  |------------------------------------|---------------------------------|
+  | `WEAVER_UNRAR_SHA1_HW`             | `UNRAR_RS_SHA1_HW`              |
+  | `WEAVER_UNRAR_SHA1_X86`            | `UNRAR_RS_SHA1_X86`             |
+  | `WEAVER_RAR_DISABLE_PARALLEL`      | `UNRAR_RS_DISABLE_PARALLEL`     |
+  | `WEAVER_RAR_SPOOL_THRESHOLD_BYTES` | `UNRAR_RS_SPOOL_THRESHOLD_BYTES`|
+  | `WEAVER_RAR4_MT_THREADS`           | `UNRAR_RS_RAR4_MT_THREADS`      |
+  | `WEAVER_RAR4_DEBUG_PPM`            | `UNRAR_RS_RAR4_DEBUG_PPM`       |
+  | `WEAVER_RAR4_DEBUG_FILTERS`        | `UNRAR_RS_RAR4_DEBUG_FILTERS`   |
+  | `WEAVER_RAR4_DEBUG_DUMP_PATH`      | `UNRAR_RS_RAR4_DEBUG_DUMP_PATH` |
+
+  `WEAVER_CRC32_VPCLMUL` keeps its name for now: it lives inside the CRC
+  kernel region that is byte-identical with the `par2-rs` copy, so it can only
+  move together with that crate.
+- `limits::WEAVER_MAX_MEMBER_DATA_SIZE` is renamed to
+  `limits::MAX_MEMBER_DATA_SIZE`; the value is unchanged.
+
+### Migration
+
+- Native embedders (the default `crypto-aws-lc` or `crypto-rust` backends)
+  are unaffected apart from the renames above.
+- A wasm guest that built with `crypto-host` / `crc-host` and satisfied the
+  raw imports from its runtime now declares those imports itself and installs
+  hooks that forward to them — the `embedding` module in
+  `examples/wasm_extract_conformance.rs` is a drop-in for the `host`
+  namespace, and changing the `#[link(wasm_import_module = ...)]` string is
+  all an Extism embedding needs. A component embedding installs hooks that
+  forward to its generated imports and drops `host-abi-component` from its
+  feature list.
 
 
 ## 0.7.0

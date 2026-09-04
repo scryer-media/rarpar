@@ -1,9 +1,11 @@
 //! Native `wasmtime` harness for the wasm `crypto-host` AES smoke test.
 //!
-//! This is the end-to-end proof that the guest's raw `#[link]` import
-//! (`host::host_aes_cbc_decrypt`) links and round-trips over the
-//! real ABI — and it DOUBLES as the executable reference the host-side agent
-//! must satisfy: it implements `host_aes_cbc_decrypt` exactly to the fixed
+//! This is the end-to-end proof that the whole delegation chain — the crate's
+//! `crypto-host` backend, the embedder hook it calls (`unrar_rs::hooks`), and
+//! the example's own raw `#[link]` import (`host::host_aes_cbc_decrypt`) the
+//! hook forwards to — links and round-trips in a real wasm guest. It DOUBLES
+//! as the executable reference an embedding host must satisfy for that
+//! example's ABI: it implements `host_aes_cbc_decrypt` exactly to the fixed
 //! contract (raw offsets into the guest's linear memory, in-place AES-CBC, no
 //! padding, stateless per call) using a RustCrypto reference, then runs the
 //! `host_aes_smoke` wasm example under it and asserts the example prints PASS
@@ -252,7 +254,7 @@ fn wasm_host_aes_smoke_round_trips_over_the_real_abi() {
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
         .expect("add wasi preview1 to linker");
 
-    // The one custom import, in the fixed namespace, satisfying the guest's
+    // The one custom import, in the fixed namespace, satisfying the example's
     // raw `#[link(wasm_import_module = "host")]` extern.
     linker
         .func_wrap(

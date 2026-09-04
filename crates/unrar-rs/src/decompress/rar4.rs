@@ -26,7 +26,7 @@ use crate::error::{RarError, RarResult};
 
 fn rar4_debug_filters_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("UNRAR_RS_RAR4_DEBUG_FILTERS").is_some())
 }
 
 /// RAR4 Huffman table sizes.
@@ -380,7 +380,7 @@ fn mt_batch_items() -> usize {
 /// improvement — not enough to admit on, and not detectable before decoding.
 ///
 /// The mechanism is kept, tested and reachable through
-/// `WEAVER_RAR4_MT_THREADS`, because what it establishes — that RAR4 decode can
+/// `UNRAR_RS_RAR4_MT_THREADS`, because what it establishes — that RAR4 decode can
 /// be lifted off the window thread byte-exactly — is the prerequisite for any
 /// future arc that finds *more* work to move. What it does not do is pay for
 /// itself today, so it does not run today.
@@ -712,13 +712,13 @@ fn rar4_mt_threads() -> usize {
     if let Some(forced) = mt_test_hooks::forced_threads() {
         return forced;
     }
-    if let Some(raw) = std::env::var_os("WEAVER_RAR4_MT_THREADS")
+    if let Some(raw) = std::env::var_os("UNRAR_RS_RAR4_MT_THREADS")
         && let Some(text) = raw.to_str()
         && let Ok(value) = text.trim().parse::<usize>()
     {
         return value;
     }
-    if std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_some() {
+    if std::env::var_os("UNRAR_RS_DISABLE_PARALLEL").is_some() {
         return 1;
     }
     // `parallel_enabled` const-folds to `true` on native and probes once on
@@ -753,7 +753,7 @@ fn rar4_mt_admitted(unpacked_size: u64) -> bool {
     if mt_test_hooks::forced_threads().is_some() {
         return true;
     }
-    if std::env::var_os("WEAVER_RAR4_MT_THREADS").is_some() {
+    if std::env::var_os("UNRAR_RS_RAR4_MT_THREADS").is_some() {
         return true;
     }
     RAR4_MT_ADMITTED_BY_DEFAULT
@@ -3628,7 +3628,7 @@ impl Rar4LzDecoder {
                 let Some(ch) = ppm_model.decode_char_result(&mut rc)? else {
                     if rar4_debug_filters_enabled() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
-                        if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
+                        if let Some(path) = std::env::var_os("UNRAR_RS_RAR4_DEBUG_DUMP_PATH") {
                             let bytes = self
                                 .window
                                 .try_copy_output(0, output_size as usize)
@@ -3661,7 +3661,7 @@ impl Rar4LzDecoder {
                     let Some(next_ch) = ppm_model.decode_char_result(&mut rc)? else {
                         if rar4_debug_filters_enabled() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
-                            if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
+                            if let Some(path) = std::env::var_os("UNRAR_RS_RAR4_DEBUG_DUMP_PATH") {
                                 let bytes = self
                                     .window
                                     .try_copy_output(0, output_size as usize)

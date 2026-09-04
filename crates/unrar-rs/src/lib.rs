@@ -183,7 +183,15 @@
 //! - `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
 //! - `crypto-rust`: pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
 //!   targets where AWS-LC will not build.
-//! - `crypto-host`: host-provided crypto, implying `crypto-rust`.
+//! - `crypto-host`: on `wasm32`, delegate the bulk AES-CBC decrypt to an
+//!   embedder-installed hook (see `hooks`); implies `crypto-rust` for the
+//!   in-guest key derivation. Accepted but inert on native targets.
+//! - `crc-host`: on `wasm32`, delegate the bulk member CRC-32 to an
+//!   embedder-installed hook (see `hooks`). Accepted but inert on native
+//!   targets.
+//! - `ppmd-debug`: compile the per-symbol PPMd trace hooks, enabled at run
+//!   time by `UNRAR_RS_RAR4_DEBUG_PPM`.
+//! - `slow-tests`: opt in to the long-running parts of the test suite.
 //!
 //! # Provenance
 //!
@@ -223,14 +231,10 @@
 //! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 pub mod archive;
-/// Embedder-supplied crypto/CRC delegation for WASI Preview 2 components.
-///
-/// Present only with `host-abi-component`. See the module docs for the seam an
-/// embedding component plugin wires up.
-#[cfg(feature = "host-abi-component")]
-pub mod component_abi;
 pub(crate) mod crc;
 pub(crate) mod crc_simd;
+#[cfg(any(feature = "crypto-host", feature = "crc-host"))]
+pub mod hooks;
 extern crate self as crc32fast;
 pub(crate) use crc::{Crc32 as Hasher, hash};
 pub mod crypto;

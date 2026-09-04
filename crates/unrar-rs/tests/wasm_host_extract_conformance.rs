@@ -1,21 +1,22 @@
 //! Native `wasmtime` driver for the encrypted-extraction CONFORMANCE test.
 //!
 //! This is the executable proof that a FULL encrypted RAR extraction runs
-//! correctly through BOTH wasm host functions at once — the `crypto-host` bulk
-//! AES (`host::host_aes_cbc_decrypt`) AND the `crc-host` bulk
-//! member CRC-32 (`host::host_crc32`) — over their fixed raw-offset
-//! ABIs. It DOUBLES as the reference contract the embedding host must satisfy:
-//! it implements both host functions exactly to spec, then runs the
+//! correctly through BOTH embedder hooks at once — the `crypto-host` bulk AES
+//! AND the `crc-host` bulk member CRC-32 (`unrar_rs::hooks`) — as wired by the
+//! example's reference embedding, whose hooks forward to its own raw-offset
+//! imports `host::host_aes_cbc_decrypt` and `host::host_crc32`. It DOUBLES as
+//! the reference contract an embedding host must satisfy for that ABI: it
+//! implements both host functions exactly to spec, then runs the
 //! `wasm_extract_conformance` example (built with `crypto-host,crc-host`) under
 //! `wasmtime`, which extracts every encrypted fixture (rar5 + rar4, store + lz,
 //! single + multivolume) and byte-compares each recovered plaintext against
 //! `tests/fixtures/originals/`. The example exits 0 only if every fixture
 //! matched.
 //!
-//! Contrast with `wasm_host_aes_smoke.rs`, which proves only that the AES import
-//! links and round-trips on a single known-answer decrypt. This test exercises
-//! the whole pipeline: header parse -> in-wasm KDF -> host AES -> in-wasm LZ ->
-//! host CRC verify, for real fixtures, end to end.
+//! Contrast with `wasm_host_aes_smoke.rs`, which proves only that the AES hook
+//! chain links and round-trips on a single known-answer decrypt. This test
+//! exercises the whole pipeline: header parse -> in-wasm KDF -> host AES ->
+//! in-wasm LZ -> host CRC verify, for real fixtures, end to end.
 //!
 //! Flow:
 //!   1. Build `examples/wasm_extract_conformance.rs` for `wasm32-wasip1` with
@@ -42,7 +43,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 const AES_BLOCK: usize = 16;
 
-/// AES ABI return codes (see `crypto/backend/host.rs`).
+/// AES ABI return codes (see the `embedding` module in the example).
 const AES_RC_OK: i64 = 0;
 const AES_RC_BAD_KEY_LEN: i64 = -1;
 const AES_RC_BAD_BUF_LEN: i64 = -2;
@@ -314,7 +315,7 @@ fn wasm_host_extract_conformance_encrypted_fixtures() {
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
         .expect("add wasi preview1 to linker");
 
-    // Both custom imports, in the fixed namespace, satisfying the guest's raw
+    // Both custom imports, in the fixed namespace, satisfying the example's raw
     // `#[link(wasm_import_module = "host")]` externs.
     linker
         .func_wrap(

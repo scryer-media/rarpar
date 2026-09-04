@@ -11,37 +11,16 @@
 //!     branch every non-wasm build
 //!     and every plain-`crypto-rust` wasm build takes).
 //!   * **`wasm32` + `crc-host`** — holds a running `u32` (IEEE reflected CRC,
-//!     init 0) and delegates each [`update`](Crc32::update) to the host import
-//!     `host_crc32`, threading the returned CRC forward. `finalize` returns the
-//!     running value. This puts the bulk CRC on the host's (potentially
-//!     hardware-accelerated) implementation, mirroring how the `crypto-host`
-//!     backend delegates bulk AES.
+//!     init 0) and delegates each [`update`](Crc32::update) to the embedder's
+//!     `crc32` hook (see `crate::hooks`), threading the returned CRC
+//!     forward. `finalize` returns the running value. This puts the bulk CRC
+//!     on the host's (potentially hardware-accelerated) implementation,
+//!     mirroring how the `crypto-host` backend delegates bulk AES.
 //!
-//! Because `crc32(A ++ B) == crc32(crc32(0, A), B)`, feeding the host
-//! import successive chunks with the running CRC as the seed reproduces the
-//! whole-stream CRC exactly. The native reference stand-in below proves that
-//! chunk-chaining equivalence without a wasm host.
-//!
-//! ## The host ABI (fixed contract, shared with the host side)
-//!
-//! Import module (namespace): `host` — embedder-neutral, satisfiable by any
-//! wasm runtime that can register imports (wasmtime, wasmer, …). The
-//! `host-abi-extism` feature switches only the namespace to
-//! `extism:host/user`, for Extism SDKs whose user host functions are pinned
-//! to that module; the function name and signature are identical in both.
-//! One import is declared:
-//!
-//! ```text
-//! host_crc32(seed, buf_ptr, buf_len) -> i64
-//! ```
-//!
-//! All args/returns are raw `i64`/`u64`; `buf_ptr` is a byte offset into the
-//! plugin's own linear memory which the host slices in place (READ-ONLY —
-//! zero-copy, no marshalling). The CRC is IEEE CRC-32 reflected (polynomial
-//! `0xEDB88320`, as used by RAR / ZIP / gzip). `seed` is the running CRC (0 to
-//! start); the result is the updated CRC in the low 32 bits. It chains:
-//! `crc32(crc32(0, A), B) == crc32(0, A ++ B)`. `buf_len` may be 0 (returns the
-//! seed unchanged).
+//! Because `crc32(A ++ B) == crc32(crc32(0, A), B)`, feeding the hook
+//! successive chunks with the running CRC as the seed reproduces the
+//! whole-stream CRC exactly. The native test below proves that chunk-chaining
+//! equivalence, through the real hook registry, without a wasm host.
 //!
 //! ## The accelerated tier
 //!
@@ -55,75 +34,30 @@
 
 use crate::crc_simd;
 
-// Raw host import: a bare `#[link]` extern (no embedder SDK dependency), so
-// any wasm runtime satisfies it by exposing a function of this name in the
-// import namespace. The namespace is `host` unless `host-abi-extism` retargets
-// it for Extism SDKs. (A `//` comment, not `///`: doc comments are not allowed
-// on the items inside a `#[link]` extern block.)
-#[cfg(all(
-    target_arch = "wasm32",
-    feature = "crc-host",
-    not(feature = "host-abi-component")
-))]
-#[cfg_attr(
-    feature = "host-abi-extism",
-    link(wasm_import_module = "extism:host/user")
-)]
-#[cfg_attr(not(feature = "host-abi-extism"), link(wasm_import_module = "host"))]
-unsafe extern "C" {
-    fn host_crc32(seed: u64, buf_ptr: u64, buf_len: u64) -> i64;
-}
-
-/// Update the running CRC over `data` via the host, using the raw offset ABI
-/// (zero-copy: the host reads the plugin's linear memory at this offset). The
-/// host reads `data` read-only and returns the updated CRC in the low 32 bits.
-#[cfg(all(
-    target_arch = "wasm32",
-    feature = "crc-host",
-    not(feature = "host-abi-component")
-))]
-#[inline]
-fn crc32_update_host(running: u32, data: &[u8]) -> u32 {
-    // SAFETY: `data.as_ptr()`/`data.len()` are a valid read-only offset+length
-    // into this module's own linear memory; the host slices them in place and
-    // never retains them past the call.
-    let rc = unsafe { host_crc32(running as u64, data.as_ptr() as u64, data.len() as u64) };
-    // The contract returns the updated CRC in the low 32 bits; the high bits are
-    // reserved and ignored here.
-    rc as u64 as u32
-}
-
-/// Component-model seam: fold `data` into the running CRC through the
-/// embedder-installed hook (see [`crate::component_abi`]).
-///
-/// The buffer crosses by value rather than as a guest pointer, which is the
-/// only difference from the raw import above — the seeded-resume contract, and
-/// therefore the chaining this module depends on, is identical.
+/// Fold `data` into the running CRC through the embedder-installed hook (see
+/// `crate::hooks`). The seeded-resume contract is what makes the chunk
+/// chaining this module depends on hold.
 ///
 /// On a native target this is dead outside `#[cfg(test)]`: `Crc32` selects the
 /// portable `crc-fast` wrapper there (only a wasm guest has a host to delegate
-/// to), while the tests below still drive this function directly so the hook is
-/// proven without a wasm runtime.
-#[cfg(all(feature = "crc-host", feature = "host-abi-component"))]
+/// to), while the tests below still drive this function directly so the hook
+/// path is proven without a wasm runtime.
+#[cfg(feature = "crc-host")]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[inline]
 fn crc32_update_host(running: u32, data: &[u8]) -> u32 {
-    (crate::component_abi::hooks().crc32)(running, data)
+    (crate::hooks::hooks().crc32)(running, data)
 }
 
-/// Native `#[cfg(test)]` reference stand-in for the host import: resume a
-/// CRC-32/ISO-HDLC from `running` over `data` and return the updated value. This
-/// is exactly what the host promises (seeded IEEE CRC-32, chainable), so the
-/// native chaining test can drive the wasm-shaped `Crc32` seam WITHOUT a wasm
-/// host and prove the chunk-chaining equivalence.
+/// Native `#[cfg(test)]` reference stand-in for the hook: resume a
+/// CRC-32/ISO-HDLC from `running` over `data` and return the updated value.
+/// This is exactly what the hook promises (seeded IEEE CRC-32, chainable), so
+/// the chaining test can drive the delegating `Crc32` seam shape WITHOUT
+/// `crc-host` and prove the chunk-chaining equivalence.
 ///
-/// Compiled only when neither real seam is active — with `host-abi-component`
-/// the chaining test drives the embedder hook itself instead.
-#[cfg(all(
-    test,
-    not(all(target_arch = "wasm32", feature = "crc-host")),
-    not(all(feature = "crc-host", feature = "host-abi-component"))
-))]
+/// Compiled only without `crc-host` — with the feature the chaining test drives
+/// the embedder hook itself instead.
+#[cfg(all(test, not(feature = "crc-host")))]
 #[inline]
 fn crc32_update_host(running: u32, data: &[u8]) -> u32 {
     let mut hasher = crc_fast::Digest::new_with_init_state(
@@ -155,7 +89,7 @@ impl Crc32 {
         Self { running: 0 }
     }
 
-    /// Fold `data` into the running CRC via the host import.
+    /// Fold `data` into the running CRC via the embedder hook.
     #[inline]
     pub(crate) fn update(&mut self, data: &[u8]) {
         if data.is_empty() {
@@ -457,19 +391,18 @@ mod tests {
         }
     }
 
-    /// The `crc32_update_host` reference stand-in (native twin of the wasm host
-    /// import) must satisfy the seeded-resume chaining contract the host side is
-    /// required to meet: folding successive chunks with the running CRC as the
-    /// seed equals the whole-stream CRC.
+    /// The `crc32_update_host` seam must satisfy the seeded-resume chaining
+    /// contract the embedder's hook is required to meet: folding successive
+    /// chunks with the running CRC as the seed equals the whole-stream CRC.
     ///
-    /// With `host-abi-component` this drives the embedder hook itself rather
-    /// than a stand-in, so it is also the component CRC backend's proof that a
-    /// host reached through function pointers chains exactly like the raw
-    /// pointer import it replaces.
+    /// With `crc-host` this drives the real hook registry (loaded with the
+    /// reference hook pair) rather than the native stand-in, so it is also the
+    /// delegating CRC seam's proof that a host reached through function
+    /// pointers chains exactly like an in-process CRC.
     #[test]
     fn host_reference_crc_chains_like_whole_stream() {
-        #[cfg(all(feature = "crc-host", feature = "host-abi-component"))]
-        crate::component_abi::install_reference_hooks_for_test();
+        #[cfg(feature = "crc-host")]
+        crate::hooks::install_reference_hooks_for_test();
 
         let mut rng = XorShift64::new(0x5EED_C0DE_1234_9001);
         for &len in &[0usize, 1, 16, 17, 4096, 100_003] {

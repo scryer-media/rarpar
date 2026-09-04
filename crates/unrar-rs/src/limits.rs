@@ -10,8 +10,8 @@ pub const RAR_UNPACK_MAX_DICT_SIZE: u64 = 0x1000000000;
 /// Maximum RAR5 header body size accepted by the parser.
 pub const RAR5_MAX_HEADER_BODY: u64 = 0x200000;
 
-/// Weaver's finite anti-abuse ceiling for a single packed or unpacked member.
-pub const WEAVER_MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
+/// Finite anti-abuse ceiling for a single packed or unpacked member.
+pub const MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
 
 /// Maximum volume number accepted from an archive header.
 ///
@@ -19,7 +19,7 @@ pub const WEAVER_MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
 /// vectors, so a volume number lifted straight out of a header sizes an allocation.
 /// RAR5 encodes that field as an unbounded vint, so a 130-byte file can declare volume
 /// 5e17 and ask for hundreds of thousands of terabytes before a single member byte is
-/// read. Real sets stay far below this ceiling: [`WEAVER_MAX_MEMBER_DATA_SIZE`] split
+/// read. Real sets stay far below this ceiling: [`MAX_MEMBER_DATA_SIZE`] split
 /// into 512 KiB volumes is still only ~1M parts.
 pub const RAR_MAX_VOLUME_NUMBER: u64 = 1 << 20;
 
@@ -55,8 +55,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_header_size: RAR5_MAX_HEADER_BODY,
-            max_data_segment: WEAVER_MAX_MEMBER_DATA_SIZE,
-            max_unpacked_size: WEAVER_MAX_MEMBER_DATA_SIZE,
+            max_data_segment: MAX_MEMBER_DATA_SIZE,
+            max_unpacked_size: MAX_MEMBER_DATA_SIZE,
             max_dict_size: 256 * 1024 * 1024, // 256 MB
         }
     }
@@ -70,8 +70,8 @@ mod tests {
     fn test_default_limits() {
         let limits = Limits::default();
         assert_eq!(limits.max_header_size, RAR5_MAX_HEADER_BODY);
-        assert_eq!(limits.max_data_segment, WEAVER_MAX_MEMBER_DATA_SIZE);
-        assert_eq!(limits.max_unpacked_size, WEAVER_MAX_MEMBER_DATA_SIZE);
+        assert_eq!(limits.max_data_segment, MAX_MEMBER_DATA_SIZE);
+        assert_eq!(limits.max_unpacked_size, MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_dict_size, 256 * 1024 * 1024);
     }
 
@@ -79,7 +79,7 @@ mod tests {
     fn default_member_data_limit_covers_large_media_members() {
         let observed_bluray_member_size = 68_325_814_272;
         assert!(observed_bluray_member_size <= Limits::default().max_unpacked_size);
-        assert_eq!(WEAVER_MAX_MEMBER_DATA_SIZE, 500 * 1024 * 1024 * 1024);
+        assert_eq!(MAX_MEMBER_DATA_SIZE, 500 * 1024 * 1024 * 1024);
     }
 
     #[test]
