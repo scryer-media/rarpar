@@ -15,9 +15,10 @@ AES-CBC decryption and bulk CRC-32 to its host.
   raw guest-pointer wasm imports. A component exports no linear memory for a
   host to slice, so the pointer ABI cannot exist there; the embedding plugin
   owns the transport and this crate takes no `wit-bindgen` or WIT dependency.
-  Mutually exclusive with `host-abi-extism`. Unlike the raw-import backends
-  the hook path links on native targets too, which is how the existing
-  AES/CRC chaining differentials now exercise it in process.
+  Takes precedence over `host-abi-extism` when both are enabled, so the
+  feature set stays additive under Cargo feature unification. Unlike the
+  raw-import backends the hook path links on native targets too, which is how
+  the existing AES/CRC chaining differentials now exercise it in process.
 
 Without the feature nothing changes: the raw-import backends, active backend
 selection, and every default remain as in 0.7.0.

@@ -38,7 +38,7 @@
 //!   bytes. `key` is 16 or 32 bytes, `iv` is exactly 16, `data` is a whole
 //!   number of 16-byte blocks and may be empty. The hook is STATELESS per call:
 //!   this crate threads the CBC IV across chunks itself (see
-//!   [`crate::crypto::backend::host`]), exactly as the raw-import backend does.
+//!   `crate::crypto::backend::host`), exactly as the raw-import backend does.
 //! * `crc32(seed, data)` returns the reflected IEEE CRC-32 (polynomial
 //!   `0xEDB88320`) of `data` resumed from `seed`. Empty `data` returns `seed`.
 //!   It must chain: `crc32(crc32(0, a), b) == crc32(0, a ++ b)`.
@@ -48,14 +48,13 @@
 //! backend, which likewise treats a negative status as unrecoverable.
 
 // The two host ABIs are alternatives, not layers: one declares raw wasm imports
-// in a namespace, the other declares none at all. Enabling both would silently
-// pick one and leave the other's wiring inert.
-#[cfg(feature = "host-abi-extism")]
-compile_error!(
-    "unrar-rs: `host-abi-component` and `host-abi-extism` select different host ABIs and cannot \
-     both be enabled; components use `host-abi-component`, Extism core modules use \
-     `host-abi-extism`."
-);
+// in a namespace, the other declares none at all. Cargo features must stay
+// additive (feature unification across a dependency graph, `--all-features`
+// tooling such as cargo-semver-checks and rustdoc), so enabling both is not an
+// error: this feature takes precedence. Every raw-import declaration in
+// `crate::crc` and `crate::crypto::backend::host` is compiled only under
+// `not(feature = "host-abi-component")`, which leaves `host-abi-extism` with
+// nothing to rename — it selects a namespace for imports that are not declared.
 
 use std::sync::RwLock;
 

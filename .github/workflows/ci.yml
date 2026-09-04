@@ -264,6 +264,11 @@ jobs:
           sccache --zero-stats || true
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Check unrar-rs with every feature enabled
+        # The publish preflight's cargo-semver-checks and rustdoc build the crate
+        # with all features unified, so alternative host-ABI features must stay
+        # additive. Catch a conflict at PR time instead of at publish time.
+        run: cargo check --locked -p unrar-rs --all-features --all-targets
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
