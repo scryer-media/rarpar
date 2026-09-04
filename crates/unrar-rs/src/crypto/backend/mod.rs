@@ -38,12 +38,16 @@ pub(crate) mod aws_lc;
 )]
 pub(crate) mod rust;
 // Host-delegated backend (wasm guest side). Active only on `wasm32` with
-// `crypto-host`. It is ALSO compiled in a native `#[cfg(test)]` build (whenever
-// the RustCrypto deps it borrows are available) purely so its CBC IV-chaining
-// differential test can run natively; in that configuration it is not the
-// active backend, so its re-exported seam is dead code — allow that.
+// `crypto-host` — under either host ABI, since `host-abi-component` changes how
+// the chunk primitive reaches the host, not which backend is selected. It is
+// ALSO compiled in a native build whenever the RustCrypto deps it borrows are
+// available: in `#[cfg(test)]` so its CBC IV-chaining differential can run
+// natively, and with `host-abi-component` because that ABI is plain function
+// pointers and links on any target. In both of those configurations it is not
+// the active backend, so its re-exported seam is dead code — allow that.
 #[cfg(any(
     all(target_arch = "wasm32", feature = "crypto-host"),
+    all(feature = "crypto-host", feature = "host-abi-component"),
     all(test, feature = "crypto-rust")
 ))]
 #[cfg_attr(

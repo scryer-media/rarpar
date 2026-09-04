@@ -1,6 +1,28 @@
 # Changelog
 
 
+## 0.8.0
+
+An additive release that lets a WASI Preview 2 component keep delegating
+AES-CBC decryption and bulk CRC-32 to its host.
+
+### Added
+
+- `host-abi-component` feature. `crypto-host` and `crc-host` delegation
+  rides embedder-installed Rust function pointers (the new `component_abi`
+  module: `HostCryptoHooks`, `install_host_crypto_hooks`,
+  `host_crypto_hooks_installed`, `clear_host_crypto_hooks`) instead of the
+  raw guest-pointer wasm imports. A component exports no linear memory for a
+  host to slice, so the pointer ABI cannot exist there; the embedding plugin
+  owns the transport and this crate takes no `wit-bindgen` or WIT dependency.
+  Mutually exclusive with `host-abi-extism`. Unlike the raw-import backends
+  the hook path links on native targets too, which is how the existing
+  AES/CRC chaining differentials now exercise it in process.
+
+Without the feature nothing changes: the raw-import backends, active backend
+selection, and every default remain as in 0.7.0.
+
+
 ## 0.7.0
 
 A resource-hardening release that stops trusting an archive member's declared

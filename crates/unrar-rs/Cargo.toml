@@ -2,7 +2,7 @@
 name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 readme = "README.md"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -41,6 +41,16 @@ crc-host = []
 # that module. Function names and signatures are identical either way; this
 # changes only the wasm import module string.
 host-abi-extism = []
+# Route `crypto-host` / `crc-host` delegation through embedder-supplied Rust
+# function pointers instead of raw wasm imports. This is the WASI Preview 2
+# component path: a component has no exported linear memory for a host to slice,
+# so the guest-pointer ABI above cannot exist there. The embedding plugin
+# installs the hooks (see the `component_abi` module) and owns the transport, so
+# this crate stays free of `wit-bindgen` and of any WIT world. Mutually
+# exclusive with `host-abi-extism`. Unlike the raw-import backends it is not
+# wasm-only — plain function pointers link anywhere — which is what lets the
+# delegation path be proven in process on a native target.
+host-abi-component = []
 # Back-compat alias for existing workspace dependency declarations (was a
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]

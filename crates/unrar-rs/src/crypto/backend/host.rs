@@ -74,7 +74,11 @@ use crate::crypto::AES_BLOCK;
 // import namespace. The namespace is `host` unless `host-abi-extism` retargets
 // it for Extism SDKs. (A `//` comment, not `///`: doc comments are not allowed
 // on the items inside a `#[link]` extern block.)
-#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "crypto-host",
+    not(feature = "host-abi-component")
+))]
 #[cfg_attr(
     feature = "host-abi-extism",
     link(wasm_import_module = "extism:host/user")
@@ -94,7 +98,11 @@ unsafe extern "C" {
 /// host, using the raw offset ABI (zero-copy: the host reads/writes the
 /// plugin's linear memory at these offsets). Panics on any negative return —
 /// that is a host contract violation, not a recoverable condition.
-#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "crypto-host",
+    not(feature = "host-abi-component")
+))]
 #[inline]
 fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     debug_assert!(key.len() == 16 || key.len() == 32);
@@ -118,11 +126,52 @@ fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     );
 }
 
+/// Component-model seam: decrypt one block-aligned chunk through the
+/// embedder-installed hook (see [`crate::component_abi`]).
+///
+/// A component cannot hand the host guest pointers, so the buffer crosses by
+/// value and comes back as a fresh list — the in-place decrypt of the raw ABI
+/// is not expressible. Copying the result back over `data` restores the
+/// in-place contract the shared IV-chaining logic below is written against, so
+/// nothing else in this module changes shape between the two ABIs.
+///
+/// Unlike the raw import this compiles on any target: `fn` pointers link
+/// everywhere, which is what lets the chaining differential at the bottom of
+/// this file exercise the real component path natively.
+#[cfg(all(feature = "crypto-host", feature = "host-abi-component"))]
+#[inline]
+fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
+    debug_assert!(key.len() == 16 || key.len() == 32);
+    debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+
+    let hooks = crate::component_abi::hooks();
+    let plaintext = match (hooks.aes_cbc_decrypt)(key, iv.as_slice(), data) {
+        Ok(plaintext) => plaintext,
+        Err(error) => panic!("host aes-cbc-decrypt failed (contract violation): {error}"),
+    };
+    assert_eq!(
+        plaintext.len(),
+        data.len(),
+        "host aes-cbc-decrypt returned {} bytes for a {}-byte input (contract violation)",
+        plaintext.len(),
+        data.len(),
+    );
+    data.copy_from_slice(&plaintext);
+}
+
 /// Native `#[cfg(test)]` reference stand-in for the host import: a one-shot
 /// RustCrypto `cbc` decrypt of `data` in place with a FRESH context seeded by
 /// `iv` (stateless per call, exactly like the host). This lets the differential
 /// test drive the real `Aes*CbcDec` IV-chaining logic on a native target.
-#[cfg(all(test, not(all(target_arch = "wasm32", feature = "crypto-host"))))]
+///
+/// Compiled only when neither real seam is active — with `host-abi-component`
+/// the differential drives the component hook itself, which is strictly better
+/// coverage than a stand-in.
+#[cfg(all(
+    test,
+    not(all(target_arch = "wasm32", feature = "crypto-host")),
+    not(all(feature = "crypto-host", feature = "host-abi-component"))
+))]
 #[inline]
 fn decrypt_chunk(key: &[u8], iv: &[u8; AES_BLOCK], data: &mut [u8]) {
     use aes::cipher::block::BlockModeDecrypt;
@@ -235,6 +284,18 @@ impl Drop for Aes128CbcDec {
 #[cfg(all(test, not(all(target_arch = "wasm32", feature = "crypto-host"))))]
 mod chaining_tests {
     use super::*;
+
+    /// Make `decrypt_chunk` callable in this build.
+    ///
+    /// With `host-abi-component` the per-chunk primitive is the embedder hook,
+    /// so the differential below is only meaningful once a hook is installed —
+    /// and installing one turns these tests into the component backend's
+    /// end-to-end proof. Without the feature `decrypt_chunk` is the local
+    /// reference stand-in and this is a no-op.
+    fn prepare_chunk_primitive() {
+        #[cfg(feature = "host-abi-component")]
+        crate::component_abi::install_reference_hooks_for_test();
+    }
 
     /// Deterministic xorshift64* PRNG — reproducible, adds no dependency.
     struct XorShift64 {
@@ -356,6 +417,7 @@ mod chaining_tests {
     /// never silently landed.
     #[test]
     fn aes256_cbc_chaining_matches_reference() {
+        prepare_chunk_primitive();
         let mut rng = XorShift64::new(0x2565_AE50_1234_9001);
         let mut cases = 0usize;
 
@@ -410,6 +472,7 @@ mod chaining_tests {
     /// AES-128 (RAR4): same randomized-split chaining differential as AES-256.
     #[test]
     fn aes128_cbc_chaining_matches_reference() {
+        prepare_chunk_primitive();
         let mut rng = XorShift64::new(0x2565_AE50_1234_9128);
         let mut cases = 0usize;
 
