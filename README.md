@@ -117,18 +117,11 @@ GitHub Releases and place it on your `PATH`.
 Release archives include a `rarpar(1)` manpage and shell completions under
 `share/`. Homebrew installs those automatically.
 
-Linux direct archives are available in GNU and musl forms. The portable musl
-archives are also the inputs used to build the CPU-only container image.
+Linux direct archives are available in GNU and musl forms.
 
-With Docker or another OCI runtime:
-
-```bash
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work \
-  ghcr.io/scryer-media/rarpar:latest ./release
-```
-
-The container image is CPU-only by design and carries the same manpage,
-completions, README, and license notices as the Docker-focused release archive.
+Releases include signed checksums and SLSA provenance for all eight platform
+archives. See [release verification](.github/release-signing/verification.md)
+for verification commands and retry behavior.
 
 From source:
 
