@@ -2,6 +2,20 @@
 //!
 //! Routes compressed data to the appropriate decompressor based on the
 //! archive format and compression method.
+//!
+//! Crate-private since 0.9.0: an archive is read through [`RarArchive`] and its
+//! [`Entry`] handle, never by driving a decoder directly.
+//!
+//! [`RarArchive`]: crate::RarArchive
+//! [`Entry`]: crate::Entry
+
+// Losing `pub` left a set of decoder entry points with no caller inside the
+// crate. They are silenced here rather than deleted because the set is
+// feature-dependent (it differs between a default build and one with
+// `slow-tests` / `ppmd-debug` / `crypto-rust`), and removing decoder entry
+// points is a deliberate change, not a visibility one. The full inventory is
+// the 0.10.0 removal list, recorded in CHANGELOG.md under 0.9.0.
+#![allow(dead_code)]
 
 pub mod lz;
 pub mod ppmd;
@@ -255,7 +269,7 @@ fn decompress_to_writer_with_max_dict_size<W: Write>(
 /// the next volume's chunk. Returns `(volume_index, bytes_written)` per chunk.
 ///
 /// Only supports LZ methods (Store is handled directly in the extraction path).
-pub fn decompress_to_writer_chunked<F>(
+pub fn decompress_to_writer_chunked<F, W>(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
@@ -264,7 +278,8 @@ pub fn decompress_to_writer_chunked<F>(
     writer_factory: F,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     enforce_supported_compression(info)?;
 

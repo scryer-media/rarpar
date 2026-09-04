@@ -102,7 +102,6 @@ pub fn extract_set(
         // allocates a name per entry, so the preflight reuses this list.
         let members = archive.metadata().members;
         preflight_outputs(&members, output_dir, cli.overwrite)?;
-        let options = extract_options(archive_password(&archive));
         for (index, member) in members.iter().enumerate() {
             let out_path = output_dir.join(&member.name);
             if !cli.json && !cli.quiet {
@@ -120,7 +119,7 @@ pub fn extract_set(
                 std::fs::create_dir_all(&out_path)?;
                 continue;
             }
-            archive.extract_member_to_file(index, &options, None, &out_path)?;
+            archive.by_index(index)?.unpack_to(&out_path)?;
         }
         Ok(())
     })?;
@@ -203,7 +202,6 @@ pub fn test_set(set: &RarSet, passwords: &mut PasswordResolver) -> Result<RarOut
     let started = std::time::Instant::now();
     with_password_retry(set, passwords, |mut archive| {
         let tempdir = tempfile::tempdir()?;
-        let options = extract_options(archive_password(&archive));
         let members = archive.metadata().members;
         for (index, member) in members.iter().enumerate() {
             let out_path = tempdir.path().join(&member.name);
@@ -211,7 +209,7 @@ pub fn test_set(set: &RarSet, passwords: &mut PasswordResolver) -> Result<RarOut
                 std::fs::create_dir_all(&out_path)?;
                 continue;
             }
-            archive.extract_member_to_file(index, &options, None, &out_path)?;
+            archive.by_index(index)?.unpack_to(&out_path)?;
         }
         Ok(())
     })?;
@@ -373,18 +371,6 @@ pub fn cli_extraction_limits() -> unrar_rs::Limits {
         max_dict_size: unrar_rs::limits::RAR_UNPACK_MAX_DICT_SIZE,
         ..unrar_rs::Limits::default()
     }
-}
-
-fn extract_options(password: Option<String>) -> unrar_rs::ExtractOptions {
-    unrar_rs::ExtractOptions {
-        verify: true,
-        password,
-        restore_owners: false,
-    }
-}
-
-fn archive_password(_archive: &unrar_rs::RarArchive) -> Option<String> {
-    None
 }
 
 fn is_password_error(error: &RarparError) -> bool {

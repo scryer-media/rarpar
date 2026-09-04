@@ -64,7 +64,7 @@ fn print_volume(
             }
         }
         ArchiveFormat::Rar14 => {
-            let parsed = unrar_rs::rar4::parse_rar14_headers(file)?;
+            let parsed = unrar_rs::__internals::parse_rar14_headers(file)?;
             println!(
                 "{} format=rar14 vol=0 files={}",
                 path.file_name()
@@ -80,7 +80,7 @@ fn print_volume(
             }
         }
         ArchiveFormat::Rar4 => {
-            let parsed = unrar_rs::rar4::parse_rar4_headers(file, password)?;
+            let parsed = unrar_rs::__internals::parse_rar4_headers(file, password)?;
             println!(
                 "{} format=rar4 vol={:?} files={}",
                 path.file_name()

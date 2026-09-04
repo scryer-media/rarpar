@@ -23,92 +23,89 @@ headers.
 use unrar_rs::RarArchive;
 
 let archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
-for member in &archive.metadata().members {
+for member in archive.entries() {
     println!("{} ({:?} bytes)", member.name, member.unpacked_size);
 }
 ```
 
 ## Extracting
 
-`extract_member` is the entry point. It returns an `ExtractedMember`, and
-`into_reader` turns that into a `Read` — from memory for a small member,
-straight from a temporary file for one too large to hold.
+Take an `Entry` for the member you want, then say where its bytes go.
+`by_index` and `by_name` decode nothing on their own; the handle they return is
+consumed by exactly one of `copy_to`, `unpack_to`, `unpack_in`,
+`copy_to_volumes`, `skip`, or reading it as a `Read`.
 
 ```rust
-use unrar_rs::{ExtractOptions, RarArchive};
+use unrar_rs::RarArchive;
 
 let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
-let options = ExtractOptions { verify: true, password: None, restore_owners: false };
 
-let members = archive.metadata().members;
-for (index, info) in members.iter().enumerate() {
-    if info.is_directory {
-        continue;
-    }
-    let member = archive.extract_member(index, &options, None)?;
-    let mut reader = member.into_reader()?;
-    std::io::copy(&mut reader, &mut std::io::sink())?;
+for index in 0..archive.len() {
+    let mut sink = std::io::sink();
+    archive.by_index(index)?.copy_to(&mut sink)?;
 }
 ```
 
-With `verify` set, a member whose CRC32 or BLAKE2sp does not match is an error
-rather than a silently wrong result.
+`copy_to` hands each span the decoder produces straight to the writer: nothing
+is buffered in memory or spooled to a temporary file on the way. When there is
+no writer to give, the entry is itself a `Read`, served from a spool it fills on
+the first read.
 
-To land a member directly on disk, `extract_member_to_file` applies the
-archived metadata as it writes; `extract_by_name` looks a member up by name
-instead of index.
+Verification is on by default, so a member whose CRC32 or BLAKE2sp does not
+match is an error rather than a silently wrong result. `set_verify` turns it
+off; `set_password` and `set_restore_owners` are the other two settings an
+entry extracts under.
+
+To land a member on disk with the metadata the archive carries — times,
+permissions, Windows attributes, and symlinks and hardlinks as such — use
+`unpack_to`, or `unpack_in` to let the member's own sanitized name choose the
+file.
 
 ```rust
-use unrar_rs::{ExtractOptions, RarArchive};
+use unrar_rs::RarArchive;
 
 let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
-let index = archive.find_member("movie.mkv").expect("member present");
-archive.extract_member_to_file(
-    index,
-    &ExtractOptions { verify: true, password: None, restore_owners: false },
-    None,
-    "movie.mkv".as_ref(),
-)?;
+archive.by_name("movie.mkv")?.unpack_to("movie.mkv".as_ref())?;
 ```
 
-### Writing straight into your own sink
+### Volumes that are not files yet
 
-`extract_member_streaming` decodes a member directly into a writer you hold, so
-nothing is buffered in memory or spooled to a temporary file on the way. Point
-it at a `VolumeProvider`; `StaticVolumeProvider` wraps a list of paths.
+`by_index_via` reads a member's volumes from a `VolumeProvider` instead of from
+the archive's own, which is how a member is extracted while its volumes are
+still arriving, or from volumes that never exist as files at all.
+`StaticVolumeProvider` wraps a list of paths.
 
 ```rust
-use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+use unrar_rs::{RarArchive, StaticVolumeProvider};
 
 let path = std::path::PathBuf::from("release.rar");
 let mut archive = RarArchive::open(std::fs::File::open(&path)?)?;
 let provider = StaticVolumeProvider::from_ordered(vec![path]);
-let options = ExtractOptions { verify: true, password: None, restore_owners: false };
 
-let members = archive.metadata().members;
-for (index, info) in members.iter().enumerate() {
-    if info.is_directory {
-        continue;
-    }
+for index in 0..archive.len() {
     let mut sink = std::io::sink();
-    archive.extract_member_streaming(index, &options, &provider, &mut sink)?;
+    archive.by_index_via(index, &provider)?.copy_to(&mut sink)?;
 }
 ```
 
-The provider is also how a member is extracted while its volumes are still
-arriving, or from volumes that never exist as files at all.
+`copy_to_volumes` takes that further and gives each volume its own writer, so a
+member spanning five volumes lands as five pieces attributed to the volumes they
+came from. The writer type is yours: it needs neither `Send` nor `'static`, so
+writers sharing one sink through a borrow are fine.
 
 ### Solid archives
 
-Every call above handles solid and non-solid archives alike. The difference is
-ordering: a solid archive compresses its members against one shared dictionary,
-so extract those in ascending index order and that shared state is carried
-across members for you. Members of a non-solid archive can be extracted in any
-order.
+Every call above handles solid and non-solid archives alike. What solidity adds
+is an order: a solid archive compresses its members against one shared
+dictionary, so they are consumed in ascending index order. Reaching forward
+decodes the members in between for you; reaching backwards is refused. `skip`
+walks past a member you do not want without producing its bytes, and dropping an
+entry unconsumed costs nothing.
 
-`skip_member_solid` advances past a member you do not want without
-materialising it, and `extract_member_solid_to_writer` streams one into a writer
-when every volume is already attached and you have no provider to hand.
+If a solid member fails partway — a decode error, or a writer that returns one —
+the carried-over dictionary no longer lines up with any member boundary, so the
+archive is poisoned: later solid extractions are refused until
+`reset_solid_state` clears it and extraction restarts from the first member.
 
 ## Capabilities
 

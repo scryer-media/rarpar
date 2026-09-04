@@ -1,16 +1,21 @@
 #![cfg(feature = "slow-tests")]
-
 //! Cross-API extraction parity sweep.
 //!
 //! Every archive must produce identical bytes through each extraction API:
 //! `extract_member` (buffered solid-chain walk), `extract_member_streaming`
-//! (per-member streaming), and `extract_member_solid_chunked` (volume-chunked
-//! solid path). The RAR4 solid member-boundary bug shipped because only one
-//! of these paths was exercised per fixture; this sweep pins all of them to
-//! the CRC-verified `extract_member` output.
+//! (per-member streaming), `extract_member_solid_chunked` (volume-chunked
+//! solid path), and the [`Entry`](unrar_rs::Entry) handle through `copy_to`,
+//! `copy_to_volumes` and `Read`. The RAR4 solid member-boundary bug shipped
+//! because only one of these paths was exercised per fixture; this sweep pins
+//! all of them to the CRC-verified `extract_member` output.
+//!
+//! The pre-0.9.0 entry points are deliberately still called here: holding them
+//! to the same bytes as the handle is exactly what this file is for.
+#![allow(deprecated)]
 
+use std::cell::RefCell;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -228,6 +233,21 @@ fn options(case: &Case) -> unrar_rs::ExtractOptions {
     }
 }
 
+/// A per-volume writer that borrows its sink, so it carries neither `Send` nor
+/// `'static` — the shape the handle's `copy_to_volumes` exists to allow.
+struct BorrowedSink<'a>(&'a RefCell<Vec<u8>>);
+
+impl Write for BorrowedSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 struct SharedSink(Arc<Mutex<Vec<u8>>>);
 
@@ -316,6 +336,106 @@ fn all_extraction_apis_agree_on_every_fixture_member() {
                     "{label} member {index} ({name}): chunked output diverges from buffered"
                 );
             }
+        }
+
+        // Pass 4: the handle, writing straight into a borrowed writer.
+        archive.reset_solid_state();
+        for (index, name, is_directory) in &members {
+            if *is_directory {
+                continue;
+            }
+            let mut produced = Vec::new();
+            archive
+                .by_index(*index)
+                .unwrap_or_else(|err| panic!("{label} member {index} ({name}): by_index: {err}"))
+                .copy_to(&mut produced)
+                .unwrap_or_else(|err| {
+                    panic!("{label} member {index} ({name}): handle copy_to: {err}")
+                });
+            assert_eq!(
+                produced, references[*index],
+                "{label} member {index} ({name}): handle copy_to diverges from buffered"
+            );
+        }
+
+        // Pass 5: the handle over a volume provider.
+        archive.reset_solid_state();
+        for (index, name, is_directory) in &members {
+            if *is_directory {
+                continue;
+            }
+            let mut produced = Vec::new();
+            archive
+                .by_index_via(*index, &provider)
+                .unwrap_or_else(|err| {
+                    panic!("{label} member {index} ({name}): by_index_via: {err}")
+                })
+                .copy_to(&mut produced)
+                .unwrap_or_else(|err| {
+                    panic!("{label} member {index} ({name}): handle streaming copy_to: {err}")
+                });
+            assert_eq!(
+                produced, references[*index],
+                "{label} member {index} ({name}): handle streaming copy_to diverges from buffered"
+            );
+        }
+
+        // Pass 6: the handle read as a `Read`.
+        archive.reset_solid_state();
+        for (index, name, is_directory) in &members {
+            if *is_directory {
+                continue;
+            }
+            let mut produced = Vec::new();
+            let mut entry = archive
+                .by_index(*index)
+                .unwrap_or_else(|err| panic!("{label} member {index} ({name}): by_index: {err}"));
+            entry.read_to_end(&mut produced).unwrap_or_else(|err| {
+                panic!("{label} member {index} ({name}): handle read: {err}")
+            });
+            assert_eq!(
+                produced, references[*index],
+                "{label} member {index} ({name}): handle Read output diverges from buffered"
+            );
+        }
+
+        // Pass 7: the handle splitting output per volume, into a writer that is
+        // neither `Send` nor `'static`.
+        archive.reset_solid_state();
+        for (index, name, is_directory) in &members {
+            if *is_directory {
+                continue;
+            }
+            let sink = RefCell::new(Vec::new());
+            let chunks = if is_solid {
+                archive
+                    .by_index(*index)
+                    .unwrap_or_else(|err| {
+                        panic!("{label} member {index} ({name}): by_index: {err}")
+                    })
+                    .copy_to_volumes(|_| Ok(BorrowedSink(&sink)))
+            } else {
+                archive
+                    .by_index_via(*index, &provider)
+                    .unwrap_or_else(|err| {
+                        panic!("{label} member {index} ({name}): by_index_via: {err}")
+                    })
+                    .copy_to_volumes(|_| Ok(BorrowedSink(&sink)))
+            }
+            .unwrap_or_else(|err| {
+                panic!("{label} member {index} ({name}): handle copy_to_volumes: {err}")
+            });
+            assert_eq!(
+                sink.borrow().as_slice(),
+                references[*index].as_slice(),
+                "{label} member {index} ({name}): handle chunked output diverges from buffered"
+            );
+            let total: u64 = chunks.iter().map(|(_, written)| *written).sum();
+            assert_eq!(
+                total as usize,
+                references[*index].len(),
+                "{label} member {index} ({name}): handle chunk totals do not add up"
+            );
         }
     }
 }

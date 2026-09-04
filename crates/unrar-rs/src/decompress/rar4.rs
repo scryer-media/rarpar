@@ -2245,7 +2245,7 @@ impl Rar4LzDecoder {
     ///
     /// Same as `decompress_to_writer` but switches output writers when the
     /// compressed byte position crosses volume boundaries.
-    pub fn decompress_to_writer_chunked<F>(
+    pub fn decompress_to_writer_chunked<F, W>(
         &mut self,
         input: &[u8],
         unpacked_size: u64,
@@ -2254,7 +2254,8 @@ impl Rar4LzDecoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -2271,7 +2272,7 @@ impl Rar4LzDecoder {
         )
     }
 
-    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F>(
+    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F, W>(
         &mut self,
         input: Rd,
         unpacked_size: u64,
@@ -2280,7 +2281,8 @@ impl Rar4LzDecoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -2301,7 +2303,7 @@ impl Rar4LzDecoder {
         result
     }
 
-    fn decompress_to_writer_chunked_with_reader<R: BitRead, F>(
+    fn decompress_to_writer_chunked_with_reader<R: BitRead, F, W>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
@@ -2310,7 +2312,8 @@ impl Rar4LzDecoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -2355,7 +2358,7 @@ impl Rar4LzDecoder {
                             limit,
                             output_size,
                             Some(flush_threshold),
-                            &mut *current_writer,
+                            &mut current_writer,
                         )?;
                     }
                 }
@@ -2372,7 +2375,7 @@ impl Rar4LzDecoder {
                 if pending_boundary_volume.is_some()
                     || self.window.unflushed_bytes() as usize >= flush_threshold
                 {
-                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                    self.flush_ready_output_to_writer(&mut current_writer, false)?;
                     if self.window.unflushed_bytes() as usize > self.window.dict_size() {
                         return Err(RarError::CorruptArchive {
                             detail:
@@ -2409,7 +2412,7 @@ impl Rar4LzDecoder {
             }
         }
         let prev_emitted = self.current_file_emitted;
-        self.flush_ready_output_to_writer(&mut *current_writer, true)?;
+        self.flush_ready_output_to_writer(&mut current_writer, true)?;
         chunk_bytes += self.current_file_emitted - prev_emitted;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -2418,7 +2421,7 @@ impl Rar4LzDecoder {
         Ok(chunks)
     }
 
-    fn decompress_to_writer_chunked_with_shared_transitions<R: BitRead, F>(
+    fn decompress_to_writer_chunked_with_shared_transitions<R: BitRead, F, W>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
@@ -2427,7 +2430,8 @@ impl Rar4LzDecoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -2472,7 +2476,7 @@ impl Rar4LzDecoder {
                             limit,
                             output_size,
                             Some(flush_threshold),
-                            &mut *current_writer,
+                            &mut current_writer,
                         )?;
                     }
                 }
@@ -2499,7 +2503,7 @@ impl Rar4LzDecoder {
                 if pending_boundary_volume.is_some()
                     || self.window.unflushed_bytes() as usize >= flush_threshold
                 {
-                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                    self.flush_ready_output_to_writer(&mut current_writer, false)?;
                     if self.window.unflushed_bytes() as usize > self.window.dict_size() {
                         return Err(RarError::CorruptArchive {
                             detail:
@@ -2533,7 +2537,7 @@ impl Rar4LzDecoder {
             }
         }
         let prev_emitted = self.current_file_emitted;
-        self.flush_ready_output_to_writer(&mut *current_writer, true)?;
+        self.flush_ready_output_to_writer(&mut current_writer, true)?;
         chunk_bytes += self.current_file_emitted - prev_emitted;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -4045,7 +4049,7 @@ pub fn decompress_rar4_lz_reader_to_writer<R: std::io::Read, W: Write>(
     decoder.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
 }
 
-pub fn decompress_rar4_lz_reader_to_writer_chunked<R: std::io::Read, F>(
+pub fn decompress_rar4_lz_reader_to_writer_chunked<R: std::io::Read, F, W>(
     input: R,
     unpacked_size: u64,
     dict_size: u64,
@@ -4054,7 +4058,8 @@ pub fn decompress_rar4_lz_reader_to_writer_chunked<R: std::io::Read, F>(
     writer_factory: F,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     let dict_size = effective_lz_dict_size(dict_size)?;
     let mut decoder = Rar4LzDecoder::try_new(dict_size)?;
@@ -4082,6 +4087,10 @@ fn effective_lz_dict_size(dict_size: u64) -> RarResult<usize> {
 
 #[cfg(test)]
 mod tests {
+    // These tests drive the pre-0.9.0 buffered entry point on purpose: it is
+    // still part of the crate's surface until 0.10.0, and holding the decoder
+    // to it here is what proves the wrappers stay honest.
+    #![allow(deprecated)]
     use super::*;
 
     #[test]

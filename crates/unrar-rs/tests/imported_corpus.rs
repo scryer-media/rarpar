@@ -1,3 +1,7 @@
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};

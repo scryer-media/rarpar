@@ -3165,7 +3165,8 @@ impl RarArchive {
         }
 
         let temp_path = Self::unique_filecopy_temp_path(out_path, index);
-        let extract_result = self.extract_member_to_file(source_index, options, None, &temp_path);
+        let extract_result =
+            self.extract_member_to_file_core(source_index, options, None, &temp_path);
         if let Err(error) = extract_result {
             let _ = Self::remove_output_file(&temp_path);
             return Err(error);
@@ -3586,7 +3587,15 @@ impl RarArchive {
     /// leaves the solid cursor at 0 — the next member then re-decodes it
     /// from scratch (measured: exactly one member-equivalent of extra PPMd
     /// work per solid archive, +33% wall on 3-member fixtures).
-    fn member_is_solid(&self, fh: &FileHeader) -> bool {
+    /// Whether the member at `index` is decoded against the shared solid
+    /// dictionary.
+    pub(super) fn member_is_solid_at(&self, index: usize) -> bool {
+        self.members
+            .get(index)
+            .is_some_and(|entry| self.member_is_solid(&entry.file_header))
+    }
+
+    pub(super) fn member_is_solid(&self, fh: &FileHeader) -> bool {
         self.is_solid || fh.compression.solid
     }
 
@@ -3914,7 +3923,7 @@ impl RarArchive {
         Ok(written)
     }
 
-    fn copy_reader_to_writer_chunked<R: Read, F>(
+    fn copy_reader_to_writer_chunked<R: Read, F, W>(
         mut reader: R,
         volume_tracker: Arc<AtomicUsize>,
         first_volume_index: usize,
@@ -3923,7 +3932,8 @@ impl RarArchive {
         member_name: &str,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let mut buffer = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
         let mut current_volume = first_volume_index;
@@ -3980,24 +3990,11 @@ impl RarArchive {
         Ok(chunks)
     }
 
-    /// Extract a member by index, handling any supported compression method.
-    ///
-    /// For multi-volume archives, this seamlessly reads data across volumes.
-    /// Returns the decompressed data as a `Vec<u8>`.
-    pub fn extract_member(
-        &mut self,
-        index: usize,
-        options: &ExtractOptions,
-        progress: Option<&dyn ProgressHandler>,
-    ) -> RarResult<crate::extract::ExtractedMember> {
-        self.extract_member_with_link_policy(index, options, progress, false, None)
-    }
-
     /// `link_output_ceiling` caps what the decoder may write, for callers whose
     /// payload is bounded by something smaller than the archive's limits. Only
     /// the RAR3 link path passes one; `None` is ordinary extraction and takes
     /// exactly the code it always took.
-    fn extract_member_with_link_policy(
+    pub(super) fn extract_member_with_link_policy(
         &mut self,
         index: usize,
         options: &ExtractOptions,
@@ -4549,7 +4546,7 @@ impl RarArchive {
     ///
     /// For Store method without encryption: reads segments directly from volumes
     /// and writes to disk without buffering the full file.
-    pub fn extract_member_to_file(
+    pub(crate) fn extract_member_to_file_core(
         &mut self,
         index: usize,
         options: &ExtractOptions,
@@ -4578,26 +4575,20 @@ impl RarArchive {
 
         let fh = entry.file_header.clone();
         let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
-        let hash = entry.hash.clone();
         let file_enc = entry.file_encryption.clone();
         let redirection = entry.redirection.clone();
         let owner = entry.owner.clone();
-        let rar4_salt = entry.rar4_salt;
         let mi = self.member_info(index);
-        let is_solid = self.member_is_solid(&fh);
         let archive_format = self.format;
         self.enforce_archive_member_limits(&fh)?;
-        let unpacked_size = self.target_unpacked_size(&fh);
-        let store_limit = self.store_copy_limit(&fh);
-        let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
-            member_password
-                .as_deref()
-                .map(|pwd| self.prepare_rar5_encrypted_member(&fh.name, pwd, file_enc.as_ref()))
-                .transpose()?
-        } else {
-            None
-        };
-        let use_hash_mac = file_enc.as_ref().is_some_and(|enc| enc.use_hash_mac);
+        // Derived here as well as in the decode helper so that a wrong password
+        // is refused before any output file exists, not after one has been
+        // created and left empty.
+        if archive_format == ArchiveFormat::Rar5
+            && let Some(pwd) = member_password.as_deref()
+        {
+            self.prepare_rar5_encrypted_member(&fh.name, pwd, file_enc.as_ref())?;
+        }
 
         if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
             p.on_member_start(mi);
@@ -4634,6 +4625,72 @@ impl RarArchive {
             Self::create_regular_output_file_for_member(&member_name, out_path)?;
         let out_path = resolved_out_path.as_path();
         let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
+
+        let written = self.extract_member_attached_to_writer(index, options, &mut writer)?;
+
+        Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+        self.restore_ntfs_acl_for_member(index, options, out_path)?;
+        self.restore_ntfs_streams_for_member(index, options, out_path)?;
+        if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
+            p.on_member_progress(mi, written);
+            p.on_member_complete(mi, &Ok(()));
+        }
+        Ok(written)
+    }
+
+    /// Decode one member of an attached archive straight into `writer`.
+    ///
+    /// The four decode routes an attached archive has — non-solid Store,
+    /// non-solid RAR5 LZ, non-solid RAR4 LZ, and the solid cursor — with the
+    /// verification each one owes and nothing else. Callers that also want a
+    /// file on disk wrap this with the output-metadata work.
+    ///
+    /// Returns what the member contributed: bytes written for every route
+    /// except non-solid RAR5 LZ, which reports the declared unpacked size.
+    pub(super) fn extract_member_attached_to_writer<W: Write + ?Sized>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        mut writer: &mut W,
+    ) -> RarResult<u64> {
+        let entry = self
+            .members
+            .get(index)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: format!("member index {index} out of range"),
+            })?;
+
+        let member_password = if entry.is_encrypted {
+            let pwd = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: entry.file_header.name.clone(),
+                })?;
+            Some(pwd.to_string())
+        } else {
+            None
+        };
+
+        let fh = entry.file_header.clone();
+        let hash = entry.hash.clone();
+        let file_enc = entry.file_encryption.clone();
+        let rar4_salt = entry.rar4_salt;
+        let is_solid = self.member_is_solid(&fh);
+        let archive_format = self.format;
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
+        let store_limit = self.store_copy_limit(&fh);
+        let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
+            member_password
+                .as_deref()
+                .map(|pwd| self.prepare_rar5_encrypted_member(&fh.name, pwd, file_enc.as_ref()))
+                .transpose()?
+        } else {
+            None
+        };
+        let use_hash_mac = file_enc.as_ref().is_some_and(|enc| enc.use_hash_mac);
 
         if fh.compression.method == CompressionMethod::Store && !is_solid {
             let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -4751,13 +4808,6 @@ impl RarArchive {
             )?;
 
             writer.flush().map_err(RarError::Io)?;
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
-            self.restore_ntfs_acl_for_member(index, options, out_path)?;
-            self.restore_ntfs_streams_for_member(index, options, out_path)?;
-            if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, written);
-                p.on_member_complete(mi, &Ok(()));
-            }
             return Ok(written);
         }
 
@@ -4834,13 +4884,6 @@ impl RarArchive {
                 rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
             )?;
 
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
-            self.restore_ntfs_acl_for_member(index, options, out_path)?;
-            self.restore_ntfs_streams_for_member(index, options, out_path)?;
-            if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, unpacked_size);
-                p.on_member_complete(mi, &Ok(()));
-            }
             return Ok(unpacked_size);
         }
 
@@ -4933,26 +4976,12 @@ impl RarArchive {
             )?;
             Self::verify_member_blake2(&fh.name, expected_blake, actual_blake, false, None)?;
 
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
-            self.restore_ntfs_acl_for_member(index, options, out_path)?;
-            self.restore_ntfs_streams_for_member(index, options, out_path)?;
-            if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, written);
-                p.on_member_complete(mi, &Ok(()));
-            }
             return Ok(written);
         }
 
         if is_solid {
             let written = self.extract_member_solid_to_writer_local(index, options, &mut writer)?;
 
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
-            self.restore_ntfs_acl_for_member(index, options, out_path)?;
-            self.restore_ntfs_streams_for_member(index, options, out_path)?;
-            if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, written);
-                p.on_member_complete(mi, &Ok(()));
-            }
             return Ok(written);
         }
 
@@ -4964,36 +4993,17 @@ impl RarArchive {
         })
     }
 
-    /// Extract one member from an attached solid archive into a borrowed writer.
-    ///
-    /// Requests follow the archive's forward-only solid cursor. Prerequisite
-    /// members are decoded internally when needed, while `writer` receives
-    /// only the requested member's bytes.
-    pub fn extract_member_solid_to_writer<W: Write + ?Sized>(
-        &mut self,
-        index: usize,
-        options: &ExtractOptions,
-        writer: &mut W,
-    ) -> RarResult<u64> {
-        self.extract_member_solid_to_writer_local(index, options, writer)
-    }
-
-    /// Advance through a solid member while discarding its produced bytes.
-    pub fn skip_member_solid(&mut self, index: usize, options: &ExtractOptions) -> RarResult<u64> {
-        let mut sink = std::io::sink();
-        self.extract_member_solid_to_writer_local(index, options, &mut sink)
-    }
-
     /// Extract a solid member into per-volume chunk writers while preserving
     /// the archive's solid decoder state across sequential members.
-    pub fn extract_member_solid_chunked<F>(
+    pub(crate) fn extract_member_solid_chunked_core<F, W>(
         &mut self,
         index: usize,
         options: &ExtractOptions,
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let entry = self
             .members
@@ -5271,7 +5281,7 @@ impl RarArchive {
         Ok(chunks)
     }
 
-    fn extract_member_solid_to_writer_local<W: Write + ?Sized>(
+    pub(super) fn extract_member_solid_to_writer_local<W: Write + ?Sized>(
         &mut self,
         index: usize,
         options: &ExtractOptions,
@@ -5567,7 +5577,7 @@ impl RarArchive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn solid_decode_reader_to_writer_chunked<R: Read, F>(
+    fn solid_decode_reader_to_writer_chunked<R: Read, F, W>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
         max_dict_size: u64,
@@ -5580,7 +5590,8 @@ impl RarArchive {
         shared_hash: Option<Arc<SharedHashStream>>,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let dict_size = Self::effective_member_dict_size(fh);
         if dict_size > max_dict_size {
@@ -5610,14 +5621,12 @@ impl RarArchive {
                 Arc::clone(&shared_transitions),
                 |volume_index| {
                     let writer = writer_factory(volume_index)?;
-                    if hash_clone.is_some() {
-                        Ok(Box::new(HashTrackingWriter {
-                            inner: writer,
-                            hash: hash_clone.clone(),
-                        }))
-                    } else {
-                        Ok(writer)
-                    }
+                    // `hash` is `None` when nothing is being verified, and the
+                    // wrapper is then a straight forward to `writer`.
+                    Ok(HashTrackingWriter {
+                        inner: writer,
+                        hash: hash_clone.clone(),
+                    })
                 },
             )?
         } else {
@@ -5636,35 +5645,17 @@ impl RarArchive {
                 Arc::clone(&shared_transitions),
                 |volume_index| {
                     let writer = writer_factory(volume_index)?;
-                    if hash_clone.is_some() {
-                        Ok(Box::new(HashTrackingWriter {
-                            inner: writer,
-                            hash: hash_clone.clone(),
-                        }))
-                    } else {
-                        Ok(writer)
-                    }
+                    // `hash` is `None` when nothing is being verified, and the
+                    // wrapper is then a straight forward to `writer`.
+                    Ok(HashTrackingWriter {
+                        inner: writer,
+                        hash: hash_clone.clone(),
+                    })
                 },
             )?
         };
 
         Ok(chunks)
-    }
-    /// Extract a member by name, handling any supported compression method.
-    ///
-    /// Returns the decompressed data as a `Vec<u8>`.
-    pub fn extract_by_name(
-        &mut self,
-        name: &str,
-        options: &ExtractOptions,
-        progress: Option<&dyn ProgressHandler>,
-    ) -> RarResult<crate::extract::ExtractedMember> {
-        let index = self
-            .find_member(name)
-            .ok_or_else(|| RarError::MemberNotFound {
-                name: name.to_string(),
-            })?;
-        self.extract_member(index, options, progress)
     }
 
     /// Extract a member by streaming segments through a [`VolumeProvider`].
@@ -5688,7 +5679,7 @@ impl RarArchive {
     ///   for on-the-fly AES-CBC decryption.
     ///
     /// Falls back to the buffered path for solid archives.
-    pub fn extract_member_streaming<W: Write>(
+    pub(crate) fn extract_member_streaming_core<W: Write>(
         &mut self,
         index: usize,
         options: &ExtractOptions,
@@ -6256,7 +6247,7 @@ impl RarArchive {
     /// For LZ mode: wraps the compressed reader in a `VolumeTrackingReader`
     /// to record compressed byte offsets at volume transitions, then uses
     /// `decompress_to_writer_chunked` to split output at those boundaries.
-    pub fn extract_member_streaming_chunked<F>(
+    pub(crate) fn extract_member_streaming_chunked_core<F, W>(
         &mut self,
         index: usize,
         options: &ExtractOptions,
@@ -6264,7 +6255,8 @@ impl RarArchive {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let entry = self
             .members
@@ -6366,7 +6358,7 @@ impl RarArchive {
 
     /// Chunked Store extraction: switches writers at volume boundaries.
     #[allow(clippy::too_many_arguments)]
-    fn extract_member_streaming_store_chunked<F>(
+    fn extract_member_streaming_store_chunked<F, W>(
         &self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
@@ -6382,7 +6374,8 @@ impl RarArchive {
         split_after: bool,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6522,7 +6515,7 @@ impl RarArchive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn extract_member_streaming_solid_chunked<F>(
+    fn extract_member_streaming_solid_chunked<F, W>(
         &mut self,
         index: usize,
         fh: &FileHeader,
@@ -6536,7 +6529,8 @@ impl RarArchive {
         split_after: bool,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6692,7 +6686,7 @@ impl RarArchive {
     /// Chunked LZ extraction: records volume transitions during compressed read,
     /// then splits decompressed output at those boundaries.
     #[allow(clippy::too_many_arguments)]
-    fn extract_member_streaming_lz_chunked<F>(
+    fn extract_member_streaming_lz_chunked<F, W>(
         &mut self,
         fh: &FileHeader,
         hash: Option<&FileHash>,
@@ -6708,7 +6702,8 @@ impl RarArchive {
         split_after: bool,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6798,14 +6793,12 @@ impl RarArchive {
                 shared_transitions,
                 |vol_idx| {
                     let writer = writer_factory(vol_idx)?;
-                    if hash_clone.is_some() {
-                        Ok(Box::new(HashTrackingWriter {
-                            inner: writer,
-                            hash: hash_clone.clone(),
-                        }))
-                    } else {
-                        Ok(writer)
-                    }
+                    // `hash` is `None` when nothing is being verified, and the
+                    // wrapper is then a straight forward to `writer`.
+                    Ok(HashTrackingWriter {
+                        inner: writer,
+                        hash: hash_clone.clone(),
+                    })
                 },
             )?
         } else {
@@ -6828,14 +6821,12 @@ impl RarArchive {
                 shared_transitions,
                 |vol_idx| {
                     let writer = writer_factory(vol_idx)?;
-                    if hash_clone.is_some() {
-                        Ok(Box::new(HashTrackingWriter {
-                            inner: writer,
-                            hash: hash_clone.clone(),
-                        }))
-                    } else {
-                        Ok(writer)
-                    }
+                    // `hash` is `None` when nothing is being verified, and the
+                    // wrapper is then a straight forward to `writer`.
+                    Ok(HashTrackingWriter {
+                        inner: writer,
+                        hash: hash_clone.clone(),
+                    })
                 },
                 // The writer factory above already wraps each volume writer in
                 // a HashTrackingWriter, so the helper must not wrap it again.
@@ -8322,6 +8313,9 @@ mod tests {
             solid_decoder: None,
             solid_decoder_rar4: None,
             solid_next_index: 0,
+            solid_poison: None,
+            verify: true,
+            restore_owners: false,
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),

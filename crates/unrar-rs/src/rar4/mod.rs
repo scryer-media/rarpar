@@ -9,6 +9,14 @@
 //!
 //! This module lives separately from the RAR5 code so it can be removed when
 //! RAR4 becomes obsolete.
+//!
+//! Crate-private since 0.9.0: a RAR4 archive is opened through
+//! [`RarArchive::open`](crate::RarArchive::open) like any other.
+
+// Same reason as `decompress`: losing `pub` left header/decode entry points
+// with no in-crate caller. Silenced, not deleted; see `decompress/mod.rs` and
+// CHANGELOG.md under 0.9.0.
+#![allow(dead_code)]
 
 pub mod header;
 pub mod types;

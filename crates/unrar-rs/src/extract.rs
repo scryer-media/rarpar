@@ -15,6 +15,14 @@ use crate::progress::ProgressHandler;
 use crate::types::{CompressionInfo, CompressionMethod, FileHash, MemberInfo};
 
 /// Options for extraction.
+///
+/// [`RarArchive`](crate::RarArchive) carries the same three settings —
+/// [`set_verify`](crate::RarArchive::set_verify),
+/// [`set_password`](crate::RarArchive::set_password) and
+/// [`set_restore_owners`](crate::RarArchive::set_restore_owners) — and the
+/// entry handle reads them from there, so this type is only needed by the
+/// deprecated extraction methods that still take it.
+#[derive(Debug, Clone)]
 pub struct ExtractOptions {
     /// Whether to verify CRC32/BLAKE2 after extraction.
     pub verify: bool,
@@ -35,6 +43,44 @@ impl Default for ExtractOptions {
             password: None,
             restore_owners: false,
         }
+    }
+}
+
+impl ExtractOptions {
+    /// Whether a member's stored checksum is checked against what was decoded.
+    pub fn verify(&self) -> bool {
+        self.verify
+    }
+
+    /// The password used for encrypted members, if one was set.
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    /// Whether archived Unix owner and group are applied to extracted files.
+    pub fn restore_owners(&self) -> bool {
+        self.restore_owners
+    }
+
+    /// Check every extracted member against its stored checksum, or do not.
+    #[must_use]
+    pub fn with_verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// Supply the password for encrypted members.
+    #[must_use]
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Apply the archived Unix owner and group to extracted files.
+    #[must_use]
+    pub fn with_restore_owners(mut self, restore_owners: bool) -> Self {
+        self.restore_owners = restore_owners;
+        self
     }
 }
 

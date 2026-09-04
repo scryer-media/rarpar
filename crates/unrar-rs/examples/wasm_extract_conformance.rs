@@ -45,7 +45,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use unrar_rs::{ExtractOptions, MemberInfo, RarArchive};
+use unrar_rs::{MemberInfo, RarArchive};
 
 /// The example's own raw imports and the hooks that forward to them.
 ///
@@ -244,15 +244,12 @@ fn is_data_member(m: &MemberInfo) -> bool {
 /// number of bytes verified.
 fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
     let mut archive = open_archive(root, case)?;
-    // `verify: true` makes the extractor recompute and check each member's CRC
-    // — on wasm that CRC crosses through the hook to `host_crc32`, so a clean extract
-    // already proves the host CRC path; the explicit byte-compare below is the
-    // stronger, independent check that the recovered plaintext is exactly right.
-    let options = ExtractOptions {
-        verify: true,
-        password: Some(PW.to_string()),
-        restore_owners: false,
-    };
+    // Verification is on by default, so the extractor recomputes and checks
+    // each member's CRC — on wasm that CRC crosses to the host `host_crc32`, so
+    // a clean extract already proves the host CRC path. The explicit
+    // byte-compare below is the stronger, independent check that the recovered
+    // plaintext is exactly right.
+    assert!(archive.verify(), "this check needs CRC verification on");
 
     let expected = {
         let p = root.join("originals").join(case.original);
@@ -268,15 +265,11 @@ fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
         if !is_data_member(member) {
             continue;
         }
-        let extracted = archive.extract_member(idx, &options, None).map_err(|e| {
-            format!(
-                "[{}] extract_member {idx} ({}): {e:?}",
-                case.label, member.name
-            )
-        })?;
-        let bytes = extracted
-            .into_bytes()
-            .map_err(|e| format!("[{}] into_bytes {idx}: {e:?}", case.label))?;
+        let mut bytes = Vec::new();
+        archive
+            .by_index(idx)
+            .and_then(|entry| entry.copy_to(&mut bytes))
+            .map_err(|e| format!("[{}] extract {idx} ({}): {e:?}", case.label, member.name))?;
 
         if bytes != expected {
             return Err(format!(

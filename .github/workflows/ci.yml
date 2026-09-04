@@ -263,7 +263,11 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        # `unstable-internals` is off by default and gates `unrar-rs`'s
+        # `__internals` module. Without it the bench and example that name it
+        # carry `required-features` cargo cannot satisfy, so `--all-targets`
+        # would silently stop linting them.
+        run: cargo clippy --locked --workspace --all-targets --features unrar-rs/unstable-internals -- -D warnings
       - name: Check unrar-rs with every feature enabled
         # The publish preflight's cargo-semver-checks and rustdoc build the crate
         # with all features unified, so every feature must stay additive. Catch
@@ -322,7 +326,9 @@ jobs:
       - name: Hydrate the test corpus (unit)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit
       - name: Run no-fixture Rust tests
-        run: cargo test --locked --workspace --lib --bins --examples --no-fail-fast
+        # `--features unrar-rs/unstable-internals`: see the clippy lane. Without
+        # it the `probe_volumes` example is skipped rather than compiled.
+        run: cargo test --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -376,7 +382,11 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        # `unstable-internals` is off by default and gates `unrar-rs`'s
+        # `__internals` module. Without it the bench and example that name it
+        # carry `required-features` cargo cannot satisfy, so `--all-targets`
+        # would silently stop linting them.
+        run: cargo clippy --locked --workspace --all-targets --features unrar-rs/unstable-internals -- -D warnings
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
