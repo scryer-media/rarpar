@@ -40,6 +40,7 @@ or something else. The runtime escape hatches lose their former owner's name.
   |------------------------------------|---------------------------------|
   | `WEAVER_UNRAR_SHA1_HW`             | `UNRAR_RS_SHA1_HW`              |
   | `WEAVER_UNRAR_SHA1_X86`            | `UNRAR_RS_SHA1_X86`             |
+  | `WEAVER_CRC32_VPCLMUL`             | `RARPAR_CRC32_VPCLMUL`          |
   | `WEAVER_RAR_DISABLE_PARALLEL`      | `UNRAR_RS_DISABLE_PARALLEL`     |
   | `WEAVER_RAR_SPOOL_THRESHOLD_BYTES` | `UNRAR_RS_SPOOL_THRESHOLD_BYTES`|
   | `WEAVER_RAR4_MT_THREADS`           | `UNRAR_RS_RAR4_MT_THREADS`      |
@@ -47,9 +48,9 @@ or something else. The runtime escape hatches lose their former owner's name.
   | `WEAVER_RAR4_DEBUG_FILTERS`        | `UNRAR_RS_RAR4_DEBUG_FILTERS`   |
   | `WEAVER_RAR4_DEBUG_DUMP_PATH`      | `UNRAR_RS_RAR4_DEBUG_DUMP_PATH` |
 
-  `WEAVER_CRC32_VPCLMUL` keeps its name for now: it lives inside the CRC
-  kernel region that is byte-identical with the `par2-rs` copy, so it can only
-  move together with that crate.
+  `RARPAR_CRC32_VPCLMUL` takes the workspace prefix because the CRC kernel it
+  lives in is shared byte for byte with `par2-rs`, which renames it in the
+  same release (0.9.0).
 - `limits::WEAVER_MAX_MEMBER_DATA_SIZE` is renamed to
   `limits::MAX_MEMBER_DATA_SIZE`; the value is unchanged.
 

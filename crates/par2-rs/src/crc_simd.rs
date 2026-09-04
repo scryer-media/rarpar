@@ -179,7 +179,7 @@ pub(crate) mod x86_vpclmul {
     /// `1` widens the *policy* and leaves the *capability* check intact. Same
     /// `OnceLock` + `WEAVER_*` escape-hatch shape as `WEAVER_GF16_CLMUL_BATCH`
     /// and `WEAVER_GF16_FOLDED_AVX512` in `reedsolomon-rs`.
-    const FORCE_ENV: &str = "WEAVER_CRC32_VPCLMUL";
+    const FORCE_ENV: &str = "RARPAR_CRC32_VPCLMUL";
 
     pub(crate) fn available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -541,7 +541,7 @@ mod tests {
         if !x86_vpclmul::available() {
             eprintln!(
                 "skipping vpclmul_matches_crc_fast_exhaustive_short_lengths: \
-                 VPCLMULQDQ tier inactive (set WEAVER_CRC32_VPCLMUL=1 on a \
+                 VPCLMULQDQ tier inactive (set RARPAR_CRC32_VPCLMUL=1 on a \
                  VPCLMULQDQ host to force it)"
             );
             return;
