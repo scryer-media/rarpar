@@ -7,6 +7,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- GPU acceleration is disabled on every platform. The `metal` and `wgpu`
+  features are gone from the tool, `par create --backend metal` is no longer
+  accepted, and the Apple Silicon release archive is CPU-only like every other
+  archive. `--backend auto` still parses and resolves to the CPU path. The
+  release feature audit now refuses any GPU feature request instead of
+  admitting Metal on Apple Silicon.
 - The VPCLMULQDQ CRC tier override the binary honours is renamed from
   `WEAVER_CRC32_VPCLMUL` to `RARPAR_CRC32_VPCLMUL`; values and semantics are
   unchanged and there is no alias. The `unrar-rs` runtime override knobs the

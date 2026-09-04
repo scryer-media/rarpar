@@ -29,8 +29,6 @@ runtime = [
     "dep:unrar-rs",
     "unrar-rs/native-crypto",
 ]
-wgpu = ["runtime", "par2-rs/wgpu"]
-metal = ["runtime", "par2-rs/metal"]
 # musl-only global allocator. The dependency is declared under a
 # `cfg(target_env = "musl")` target table, so enabling this feature is a
 # provable no-op for every non-musl target: glibc, macOS and Windows builds
