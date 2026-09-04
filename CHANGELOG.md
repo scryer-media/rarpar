@@ -3,6 +3,41 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.4.0
+
+### CLI Changes
+
+- The VPCLMULQDQ CRC tier override the binary honours is renamed from
+  `WEAVER_CRC32_VPCLMUL` to `RARPAR_CRC32_VPCLMUL`; values and semantics are
+  unchanged and there is no alias. The `unrar-rs` runtime override knobs the
+  binary inherits move from `WEAVER_*` to `UNRAR_RS_*` at the same time. A
+  deployment that set the old names must rename them, which is why this is a
+  minor release rather than a patch.
+- A password named on the command line is now asserted on the archive after
+  it opens, so members encrypted behind readable headers extract with it.
+- RAR extraction goes through the `unrar-rs` 0.9.0 entry API. Output files are
+  no longer preallocated to the member's declared size before extraction.
+
+### Libraries
+
+- `unrar-rs` moves from 0.5.5 to 0.9.0: the entry-handle extraction API, solid
+  archives that refuse further extraction after an interrupted member instead
+  of decoding wrong bytes, `volume_number` reported as absent when the format
+  states nothing, and the `WEAVER_*` to `UNRAR_RS_*` knob rename. See its
+  [changelog](crates/unrar-rs/CHANGELOG.md).
+- `par2-rs` moves from 0.6.0 to 0.9.0: verification carried into repair without
+  re-reading the payload, proven-slice verification, seeded-evidence scan
+  settlement, and the CRC knob rename. See its
+  [changelog](crates/par2-rs/CHANGELOG.md).
+- `reedsolomon-rs` stays at 0.4.3.
+
+### Dependencies
+
+- Third-party crates move to their latest releases: `aws-lc-rs` 1.18.1 on
+  `aws-lc-sys` 0.45, `cap-std` 4.0.3, `wgpu` 30.0.1, and the `wasmtime` test
+  harness on 48, whose conformance test adopts wasmtime-wasi's `FsPerms`
+  preopen API.
+
 ## rarpar 0.3.4
 
 ### Libraries
