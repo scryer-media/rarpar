@@ -668,10 +668,17 @@ fn options_can_be_built_and_set_on_the_archive() {
     assert_eq!(options.password(), Some("hunter2"));
     assert!(!options.verify());
     assert!(options.restore_owners());
+    // The formatted text is deliberately kept out of the assertion messages: a
+    // panic would otherwise echo it, which is the exact leak this test guards
+    // against.
     let debug = format!("{options:?}");
     assert!(
-        !debug.contains("hunter2") && debug.contains("<redacted>"),
-        "Debug must say a password is set without printing it: {debug}"
+        !debug.contains("hunter2"),
+        "Debug must never print the password"
+    );
+    assert!(
+        debug.contains("<redacted>"),
+        "Debug must say a password is set"
     );
     assert!(
         format!("{:?}", ExtractOptions::default()).contains("password: None"),
