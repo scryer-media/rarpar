@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 #[cfg(feature = "ppmd-debug")]
 fn ppmd_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("UNRAR_RS_RAR4_DEBUG_PPM").is_some())
 }
 
 // --- Constants ---
@@ -130,7 +130,7 @@ pub struct Model {
     #[cfg(feature = "ppmd-debug")]
     debug_output_index: u64,
     model_fault: bool,
-    // Cached WEAVER_RAR4_DEBUG_PPM flag; the OnceLock lookup is too hot for
+    // Cached UNRAR_RS_RAR4_DEBUG_PPM flag; the OnceLock lookup is too hot for
     // the per-symbol decode paths.
     #[cfg(feature = "ppmd-debug")]
     debug: bool,

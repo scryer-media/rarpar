@@ -25,7 +25,7 @@
 //!
 //! # fn main() -> unrar_rs::RarResult<()> {
 //! let archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
-//! for member in &archive.metadata().members {
+//! for member in archive.entries() {
 //!     // `unpacked_size` is `None` until the header that states it arrives,
 //!     // which for a split member is its final part.
 //!     println!("{} ({:?} bytes)", member.name, member.unpacked_size);
@@ -36,113 +36,113 @@
 //!
 //! # Extracting
 //!
-//! [`extract_member`](RarArchive::extract_member) is the entry point. It hands
-//! back an [`ExtractedMember`], and [`into_reader`](ExtractedMember::into_reader)
-//! turns that into a `Read` — from memory for a small member, straight from a
-//! temporary file for one too large to hold:
+//! Take an [`Entry`] for the member you want, then say where its bytes go.
+//! [`by_index`](RarArchive::by_index) and [`by_name`](RarArchive::by_name)
+//! decode nothing on their own; the handle they return is consumed by exactly
+//! one of [`copy_to`](Entry::copy_to), [`unpack_to`](Entry::unpack_to),
+//! [`unpack_in`](Entry::unpack_in),
+//! [`copy_to_volumes`](Entry::copy_to_volumes), [`skip`](Entry::skip), or
+//! reading it as a `Read`.
 //!
 //! ```no_run
-//! use unrar_rs::{ExtractOptions, RarArchive};
+//! use unrar_rs::RarArchive;
 //!
 //! # fn main() -> unrar_rs::RarResult<()> {
 //! let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
-//! let options = ExtractOptions { verify: true, password: None, restore_owners: false };
 //!
-//! let members = archive.metadata().members;
-//! for (index, info) in members.iter().enumerate() {
-//!     if info.is_directory {
-//!         continue;
-//!     }
-//!     let member = archive.extract_member(index, &options, None)?;
-//!     let mut reader = member.into_reader()?;
-//!     std::io::copy(&mut reader, &mut std::io::sink())?;
+//! for index in 0..archive.len() {
+//!     let mut sink = std::io::sink();
+//!     archive.by_index(index)?.copy_to(&mut sink)?;
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Verification is part of extraction: with [`ExtractOptions::verify`] set, a
-//! member whose CRC32 or BLAKE2sp does not match is an error rather than a
-//! silently wrong result.
+//! `copy_to` hands each span the decoder produces straight to the writer:
+//! nothing is buffered in memory or spooled to a temporary file on the way.
+//! When there is no writer to give — a caller that wants a `Read` — the entry
+//! is itself a `Read`, served from a spool it fills on the first read.
 //!
-//! To land a member directly on disk, use
-//! [`extract_member_to_file`](RarArchive::extract_member_to_file), which
-//! applies the archived metadata as it writes:
+//! Verification is part of extraction and is on by default: a member whose
+//! CRC32 or BLAKE2sp does not match is an error rather than a silently wrong
+//! result. [`set_verify`](RarArchive::set_verify) turns it off.
+//!
+//! To land a member on disk with the metadata the archive carries — times,
+//! permissions, Windows attributes, and symlinks and hardlinks as such — use
+//! [`unpack_to`](Entry::unpack_to):
 //!
 //! ```no_run
-//! use unrar_rs::{ExtractOptions, RarArchive};
+//! use unrar_rs::RarArchive;
 //!
 //! # fn main() -> unrar_rs::RarResult<()> {
 //! let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
-//! let index = archive.find_member("movie.mkv").expect("member present");
-//! archive.extract_member_to_file(
-//!     index,
-//!     &ExtractOptions { verify: true, password: None, restore_owners: false },
-//!     None, // optional `&dyn ProgressHandler`
-//!     std::path::Path::new("movie.mkv"),
-//! )?;
+//! archive
+//!     .by_name("movie.mkv")?
+//!     .unpack_to(std::path::Path::new("movie.mkv"))?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! [`extract_by_name`](RarArchive::extract_by_name) looks a member up by name
-//! instead of index.
+//! ## Volumes that are not files yet
 //!
-//! ## Writing straight into your own sink
-//!
-//! [`extract_member_streaming`](RarArchive::extract_member_streaming) decodes a
-//! member directly into a writer you hold, so nothing is buffered in memory or
-//! spooled to a temporary file on the way. Point it at a
-//! [`volume::VolumeProvider`] — [`StaticVolumeProvider`] wraps a list of paths:
+//! [`by_index_via`](RarArchive::by_index_via) reads a member's volumes from a
+//! [`volume::VolumeProvider`] instead of from the archive's own — which is how
+//! a member is extracted while its volumes are still arriving, or from volumes
+//! that never exist as files at all. [`StaticVolumeProvider`] wraps a list of
+//! paths:
 //!
 //! ```no_run
-//! use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+//! use unrar_rs::{RarArchive, StaticVolumeProvider};
 //!
 //! # fn main() -> unrar_rs::RarResult<()> {
 //! let path = std::path::PathBuf::from("release.rar");
 //! let mut archive = RarArchive::open(std::fs::File::open(&path)?)?;
 //! let provider = StaticVolumeProvider::from_ordered(vec![path]);
-//! let options = ExtractOptions { verify: true, password: None, restore_owners: false };
 //!
-//! let members = archive.metadata().members;
-//! for (index, info) in members.iter().enumerate() {
-//!     if info.is_directory {
-//!         continue;
-//!     }
+//! for index in 0..archive.len() {
 //!     let mut sink = std::io::sink();
-//!     archive.extract_member_streaming(index, &options, &provider, &mut sink)?;
+//!     archive.by_index_via(index, &provider)?.copy_to(&mut sink)?;
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The provider is also how a member is extracted while its volumes are still
-//! arriving, or from volumes that never exist as files at all. Volumes are
-//! addressed in the **set's own numbering** throughout, the same one
-//! [`RarVolumeFacts`] reports and `add_volume` accepts: a member whose first
-//! segment lives in volume 5 asks the provider for volume 5. Do not re-key a
-//! provider to the member's first volume.
+//! Volumes are addressed in the **set's own numbering** throughout, the same
+//! one [`RarVolumeFacts`] reports and `add_volume` accepts: a member whose
+//! first segment lives in volume 5 asks the provider for volume 5. Do not
+//! re-key a provider to the member's first volume.
+//!
+//! [`copy_to_volumes`](Entry::copy_to_volumes) takes that further and gives
+//! each volume its own writer, so a member spanning five volumes lands as five
+//! pieces attributed to the volumes they came from. The writer type is yours:
+//! it needs neither `Send` nor `'static`, so writers sharing one sink through
+//! a borrow are fine.
 //!
 //! ## Solid archives
 //!
-//! Every call above handles solid and non-solid archives alike. The difference
-//! is ordering: a solid archive compresses its members against one shared
-//! dictionary, so extract those in ascending index order and that shared state
-//! is carried across members for you. Members of a non-solid archive can be
-//! extracted in any order.
+//! Every call above handles solid and non-solid archives alike. What solidity
+//! adds is an order: a solid archive compresses its members against one shared
+//! dictionary, so they are consumed in ascending index order. Reaching forward
+//! decodes the members in between for you; reaching backwards raises
+//! [`RarError::SolidOrderViolation`]. [`skip`](Entry::skip) walks past a member
+//! you do not want without producing its bytes, and dropping an entry
+//! unconsumed costs nothing.
 //!
-//! [`skip_member_solid`](RarArchive::skip_member_solid) advances past a member
-//! you do not want without materialising it, and
-//! [`extract_member_solid_to_writer`](RarArchive::extract_member_solid_to_writer)
-//! streams one into a writer when every volume is already attached and you have
-//! no provider to hand.
+//! If a solid member fails partway — a decode error, or a writer that returns
+//! one — the carried-over dictionary no longer lines up with any member
+//! boundary, so the archive is poisoned: later solid extractions raise
+//! [`RarError::SolidStatePoisoned`] until
+//! [`reset_solid_state`](RarArchive::reset_solid_state) clears it and
+//! extraction restarts from the first member.
 //!
 //! # Encrypted archives
 //!
 //! Both shapes are supported: file-data encryption (`rar -p`) and encrypted
-//! headers (`rar -hp`). Pass the password through
-//! [`ExtractOptions::password`], or [`RarArchive::open_with_password`] when the
-//! headers themselves are encrypted.
+//! headers (`rar -hp`). Set the password with
+//! [`set_password`](RarArchive::set_password), or open with
+//! [`RarArchive::open_with_password`] when the headers themselves are
+//! encrypted. A single member can override it with
+//! [`with_password`](Entry::with_password).
 //!
 //! For callers that route bytes themselves rather than extracting, the [`crypto`]
 //! module exposes the pieces directly — derive a member's key from header facts,
@@ -183,7 +183,15 @@
 //! - `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
 //! - `crypto-rust`: pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
 //!   targets where AWS-LC will not build.
-//! - `crypto-host`: host-provided crypto, implying `crypto-rust`.
+//! - `crypto-host`: on `wasm32`, delegate the bulk AES-CBC decrypt to an
+//!   embedder-installed hook (see `hooks`); implies `crypto-rust` for the
+//!   in-guest key derivation. Accepted but inert on native targets.
+//! - `crc-host`: on `wasm32`, delegate the bulk member CRC-32 to an
+//!   embedder-installed hook (see `hooks`). Accepted but inert on native
+//!   targets.
+//! - `ppmd-debug`: compile the per-symbol PPMd trace hooks, enabled at run
+//!   time by `UNRAR_RS_RAR4_DEBUG_PPM`.
+//! - `slow-tests`: opt in to the long-running parts of the test suite.
 //!
 //! # Provenance
 //!
@@ -225,10 +233,15 @@
 pub mod archive;
 pub(crate) mod crc;
 pub(crate) mod crc_simd;
+#[cfg(any(feature = "crypto-host", feature = "crc-host"))]
+pub mod hooks;
 extern crate self as crc32fast;
 pub(crate) use crc::{Crc32 as Hasher, hash};
 pub mod crypto;
-pub mod decompress;
+// The decoders. Nothing outside this crate drives them directly — an archive is
+// read through `RarArchive` and its `Entry` handle — and their surface is the
+// crate's largest by a wide margin, so it is not part of the public API.
+pub(crate) mod decompress;
 pub mod early;
 pub mod error;
 pub mod extract;
@@ -238,13 +251,28 @@ pub mod limits;
 pub mod path;
 pub mod probe;
 pub mod progress;
-pub mod rar4;
+// RAR4/RAR1.4 header parsing and decode entry points, reached through
+// `RarArchive`. `header` stays public because a caller can legitimately walk a
+// RAR5 volume's headers without opening it; there is no such use for these.
+pub(crate) mod rar4;
 pub mod recovery;
 pub mod signature;
 pub mod stored_layout;
 pub mod types;
-pub mod vint;
+pub(crate) mod vint;
 pub mod volume;
+
+/// Internals exposed for this crate's own benches and examples.
+///
+/// Not public API, not covered by semver, and absent unless the non-default
+/// `unstable-internals` feature is on. Nothing outside this repository should
+/// name it.
+#[cfg(feature = "unstable-internals")]
+#[doc(hidden)]
+pub mod __internals {
+    pub use crate::decompress::lz::filter::apply_e8e9;
+    pub use crate::rar4::{parse_rar4_headers, parse_rar14_headers};
+}
 
 /// Test-only helpers exposed for integration tests in this crate.
 ///
@@ -267,9 +295,10 @@ pub mod test_support {
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeHeaderEncryption,
-    RarVolumeHeaderEncryptionFacts, RarVolumeHostOs, RarVolumeMemberEncryptionFacts,
-    RarVolumeMemberFacts, RarVolumeServiceFacts, RarVolumeUnixOwnerFacts, ReadSeek,
+    CachedArchiveHeaders, DataSegment, Entry, RarArchive, RarVolumeFacts,
+    RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
+    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeUnixOwnerFacts, ReadSeek,
 };
 /// The encrypted-member surface a one-pass router needs: derive a member's key
 /// material from a password and the facts its headers state, decide up front

@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
-use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+use unrar_rs::{RarArchive, StaticVolumeProvider};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args().nth(1).ok_or("usage: test-e01 <dir>")?;
@@ -37,24 +37,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let provider = StaticVolumeProvider::from_ordered(paths.clone());
-    let options = ExtractOptions {
-        verify: true,
-        password: Some(password.clone()),
-        restore_owners: false,
-    };
 
     let start = std::time::Instant::now();
     let result: Result<(), unrar_rs::RarError> = match mode.as_str() {
         "streaming" => {
             let mut sink = io::sink();
             archive
-                .extract_member_streaming(member_idx, &options, &provider, &mut sink)
+                .by_index_via(member_idx, &provider)
+                .and_then(|entry| entry.copy_to(&mut sink))
                 .map(|_| ())
         }
         "chunked" => archive
-            .extract_member_streaming_chunked(member_idx, &options, &provider, |vol_idx| {
-                eprintln!("  writer for vol {}", vol_idx);
-                Ok(Box::new(io::sink()) as Box<dyn io::Write>)
+            .by_index_via(member_idx, &provider)
+            .and_then(|entry| {
+                entry.copy_to_volumes(|vol_idx| {
+                    eprintln!("  writer for vol {}", vol_idx);
+                    Ok(io::sink())
+                })
             })
             .map(|chunks| {
                 eprintln!("  chunks: {:?}", chunks);

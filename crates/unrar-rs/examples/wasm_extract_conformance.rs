@@ -1,15 +1,19 @@
 //! Encrypted-extraction conformance harness for the wasm host backends.
 //!
-//! This is the guest half of the `crypto-host` + `crc-host` CONFORMANCE test.
-//! Built for `wasm32-wasip1` with `--no-default-features --features
-//! crypto-host,crc-host`, it drives a FULL encrypted RAR extraction so that:
+//! This is the guest half of the `crypto-host` + `crc-host` CONFORMANCE test,
+//! and the reference embedding of the [`unrar_rs::hooks`] seam for a core wasm
+//! module. Built for `wasm32-wasip1` with `--no-default-features --features
+//! crypto-host,crc-host`, it installs hooks that forward to two raw imports it
+//! declares itself in a `host` namespace (see the `embedding` module below),
+//! then drives a FULL encrypted RAR extraction so that:
 //!
-//!   * every bulk AES-CBC decrypt crosses the wasm boundary to the host import
-//!     `host::host_aes_cbc_decrypt` (the `crypto-host` backend),
-//!     and
-//!   * every bulk member-data CRC-32 crosses to `host::host_crc32`
-//!     (the `crc-host` seam) — because `verify: true` makes the extractor check
-//!     each member's stored CRC, and on wasm that CRC runs through the host.
+//!   * every bulk AES-CBC decrypt crosses the wasm boundary through the
+//!     `aes_cbc_decrypt` hook to `host::host_aes_cbc_decrypt` (the
+//!     `crypto-host` backend), and
+//!   * every bulk member-data CRC-32 crosses through the `crc32` hook to
+//!     `host::host_crc32` (the `crc-host` seam) — because `verify: true` makes
+//!     the extractor check each member's stored CRC, and on wasm that CRC runs
+//!     through the host.
 //!
 //! The KDF (PBKDF2 / RAR29 SHA-1) and the LZ decode stay in-wasm; only the two
 //! bulk primitives are delegated. For each encrypted fixture it extracts the
@@ -32,14 +36,90 @@
 //! it through the native driver, which provides both reference host functions:
 //!   cargo test -p unrar-rs --test wasm_host_extract_conformance
 //!
-//! Also runnable natively for parity debugging (uses the portable backends):
-//!   cargo run --release -p unrar-rs --example wasm_extract_conformance -- <tests/fixtures>
+//! Also runnable natively for parity debugging (the delegating features are
+//! inert there, so the in-process backends run and no hook is called):
+//!   cargo run --release -p unrar-rs --features crypto-host,crc-host \
+//!     --example wasm_extract_conformance -- <tests/fixtures>
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use unrar_rs::{ExtractOptions, MemberInfo, RarArchive};
+use unrar_rs::{MemberInfo, RarArchive};
+
+/// The example's own raw imports and the hooks that forward to them.
+///
+/// ABI (fixed contract, shared with the harness in
+/// `tests/wasm_host_extract_conformance.rs`):
+///
+/// ```text
+/// host_aes_cbc_decrypt(key_ptr, key_len, iv_ptr, buf_ptr, buf_len) -> i64
+/// host_crc32(seed, buf_ptr, buf_len) -> i64
+/// ```
+///
+/// Every `*_ptr` is a byte offset into this module's linear memory, which the
+/// host slices in place — the zero-copy shape a core wasm module can offer and
+/// a component cannot, which is exactly why the ABI lives here and `unrar-rs`
+/// only ever sees the hooks. AES: no padding, decrypt IN PLACE, `key_len` 16
+/// or 32, 16-byte IV, block-aligned `buf_len` (may be 0), stateless per call;
+/// returns `0` ok, `-1` bad `key_len`, `-2` `buf_len % 16 != 0`, `-3`
+/// out-of-bounds. CRC: reflected IEEE CRC-32 resumed from `seed`, result in
+/// the low 32 bits; the buffer is read-only to the host.
+#[cfg(target_arch = "wasm32")]
+mod embedding {
+    use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+
+    #[link(wasm_import_module = "host")]
+    unsafe extern "C" {
+        fn host_aes_cbc_decrypt(
+            key_ptr: u64,
+            key_len: u64,
+            iv_ptr: u64,
+            buf_ptr: u64,
+            buf_len: u64,
+        ) -> i64;
+        fn host_crc32(seed: u64, buf_ptr: u64, buf_len: u64) -> i64;
+    }
+
+    fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
+        let mut out = data.to_vec();
+        // SAFETY: all pointers are valid offsets into this module's own linear
+        // memory for the stated lengths; the host slices them in place and
+        // never retains them past the call. `key`/`iv` are read-only to the
+        // host; `out` is written in place.
+        let rc = unsafe {
+            host_aes_cbc_decrypt(
+                key.as_ptr() as u64,
+                key.len() as u64,
+                iv.as_ptr() as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+            )
+        };
+        match rc {
+            0 => Ok(out),
+            -1 => Err(HostAesError::BadKeyLength),
+            -2 => Err(HostAesError::BadBlockLength),
+            other => panic!("host_aes_cbc_decrypt returned {other} (contract violation)"),
+        }
+    }
+
+    fn crc32(seed: u32, data: &[u8]) -> u32 {
+        // SAFETY: `data.as_ptr()`/`data.len()` are a valid read-only
+        // offset+length into this module's own linear memory; the host slices
+        // them in place and never retains them past the call.
+        let rc = unsafe { host_crc32(u64::from(seed), data.as_ptr() as u64, data.len() as u64) };
+        // The contract returns the updated CRC in the low 32 bits.
+        rc as u64 as u32
+    }
+
+    pub(super) fn install() {
+        install_host_crypto_hooks(HostCryptoHooks {
+            aes_cbc_decrypt,
+            crc32,
+        });
+    }
+}
 
 /// The encrypted fixture password (see the `encrypted` and `generated_matrix`
 /// recipes in bench/rarpar-bench/internal/testcorpus — all encrypted fixtures
@@ -164,15 +244,12 @@ fn is_data_member(m: &MemberInfo) -> bool {
 /// number of bytes verified.
 fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
     let mut archive = open_archive(root, case)?;
-    // `verify: true` makes the extractor recompute and check each member's CRC
-    // — on wasm that CRC crosses to the host `host_crc32`, so a clean extract
-    // already proves the host CRC path; the explicit byte-compare below is the
-    // stronger, independent check that the recovered plaintext is exactly right.
-    let options = ExtractOptions {
-        verify: true,
-        password: Some(PW.to_string()),
-        restore_owners: false,
-    };
+    // Verification is on by default, so the extractor recomputes and checks
+    // each member's CRC — on wasm that CRC crosses to the host `host_crc32`, so
+    // a clean extract already proves the host CRC path. The explicit
+    // byte-compare below is the stronger, independent check that the recovered
+    // plaintext is exactly right.
+    assert!(archive.verify(), "this check needs CRC verification on");
 
     let expected = {
         let p = root.join("originals").join(case.original);
@@ -188,15 +265,11 @@ fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
         if !is_data_member(member) {
             continue;
         }
-        let extracted = archive.extract_member(idx, &options, None).map_err(|e| {
-            format!(
-                "[{}] extract_member {idx} ({}): {e:?}",
-                case.label, member.name
-            )
-        })?;
-        let bytes = extracted
-            .into_bytes()
-            .map_err(|e| format!("[{}] into_bytes {idx}: {e:?}", case.label))?;
+        let mut bytes = Vec::new();
+        archive
+            .by_index(idx)
+            .and_then(|entry| entry.copy_to(&mut bytes))
+            .map_err(|e| format!("[{}] extract {idx} ({}): {e:?}", case.label, member.name))?;
 
         if bytes != expected {
             return Err(format!(
@@ -222,6 +295,9 @@ fn verify_case(root: &Path, case: &Case) -> Result<u64, String> {
 }
 
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    embedding::install();
+
     let root = std::env::args()
         .nth(1)
         .map(PathBuf::from)

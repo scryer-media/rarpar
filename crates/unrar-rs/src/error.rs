@@ -1,7 +1,11 @@
 use std::io;
 
 /// Errors that can occur when parsing or extracting RAR archives.
+///
+/// The set of variants grows with the formats and failure modes the crate
+/// recognises, so a `match` over it needs a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RarError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -89,6 +93,14 @@ pub enum RarError {
     #[error("member not found: {name}")]
     MemberNotFound { name: String },
 
+    #[error("member index {index} is out of range: the archive lists {len} members")]
+    MemberIndexOutOfRange { index: usize, len: usize },
+
+    #[error(
+        "per-volume extraction of {member} needs a volume provider: the archive is not solid, so volume attribution comes from the provider's segment stream (acquire the entry with by_index_via)"
+    )]
+    VolumeProviderRequired { member: String },
+
     #[error(
         "solid archive requires sequential extraction: must extract {required} before {requested}"
     )]
@@ -99,6 +111,11 @@ pub enum RarError {
 
     #[error("unsupported link type for {member}: {link_type}")]
     UnsupportedLinkType { member: String, link_type: String },
+
+    #[error(
+        "solid decoder state was left mid-member by {member} and no longer describes the archive: {detail}"
+    )]
+    SolidStatePoisoned { member: String, detail: String },
 }
 
 pub type RarResult<T> = Result<T, RarError>;

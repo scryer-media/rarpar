@@ -5,6 +5,11 @@
 //! Private decoder tests prove controller dispatch. This suite verifies only
 //! public archive behavior and does not assume every fixture enters that path.
 
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
@@ -15,7 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use sha2::{Digest, Sha256};
 use unrar_rs::{ExtractOptions, RarArchive, RarError, ReadSeek, StaticVolumeProvider};
 
-const DISABLE_PARALLEL: &str = "WEAVER_RAR_DISABLE_PARALLEL";
+const DISABLE_PARALLEL: &str = "UNRAR_RS_DISABLE_PARALLEL";
 const FIXTURE_PASSWORD: &str = "testpass123";
 const RAR5_SIGNATURE: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00];
 
@@ -138,6 +143,9 @@ enum StableError {
         member: String,
         link_type: String,
     },
+    /// Any error variant added since this mapping was written. Compared by its
+    /// rendered message, so a new kind still has to agree across decode paths.
+    Other(String),
 }
 
 fn stable_error(error: &RarError) -> StableError {
@@ -236,6 +244,7 @@ fn stable_error(error: &RarError) -> StableError {
             member: member.clone(),
             link_type: link_type.clone(),
         },
+        other => StableError::Other(other.to_string()),
     }
 }
 

@@ -16,7 +16,7 @@
 //! seam, so a second backend can be added without editing shared logic.
 //!
 //! One deliberate exception: the RAR5 PBKDF2 loop. Its per-iteration
-//! HMAC-SHA256 is [`kdf_hmac`], which runs on the `sha2` crate on *every*
+//! HMAC-SHA256 is `kdf_hmac`, which runs on the `sha2` crate on *every*
 //! backend so that a derivation of up to 2^24 iterations never crosses FFI.
 //! That module is not a backend and has no alternative implementation; see its
 //! docs. Everything else — AES, SHA-1, the non-KDF SHA-256 and HMAC uses — is
@@ -1402,22 +1402,22 @@ impl Rar29Sha1 {
     }
 }
 
-/// Setting `WEAVER_UNRAR_SHA1_HW=0` pins the scalar fallback so SHA-capable
+/// Setting `UNRAR_RS_SHA1_HW=0` pins the scalar fallback so SHA-capable
 /// hardware can A/B the no-SHA-extension tier without a rebuild.
 #[cfg(target_arch = "aarch64")]
 fn sha1_hw_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|v| v == "0") {
+        if std::env::var_os("UNRAR_RS_SHA1_HW").is_some_and(|v| v == "0") {
             return false;
         }
         std::arch::is_aarch64_feature_detected!("sha2")
     })
 }
 
-/// Setting `WEAVER_UNRAR_SHA1_HW=0` pins the scalar fallback so SHA-capable
+/// Setting `UNRAR_RS_SHA1_HW=0` pins the scalar fallback so SHA-capable
 /// hardware can A/B the no-SHA-NI tier without a rebuild. Setting
-/// `WEAVER_UNRAR_SHA1_X86` to a tier name stands this path down too — without
+/// `UNRAR_RS_SHA1_X86` to a tier name stands this path down too — without
 /// that, the vector tiers below would be unmeasurable end to end on exactly
 /// the hosts most likely to be doing the measuring, since SHA-NI would always
 /// take the block first.
@@ -1425,10 +1425,10 @@ fn sha1_hw_enabled() -> bool {
 fn sha1_hw_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|v| v == "0") {
+        if std::env::var_os("UNRAR_RS_SHA1_HW").is_some_and(|v| v == "0") {
             return false;
         }
-        if std::env::var_os("WEAVER_UNRAR_SHA1_X86").is_some_and(|v| v == "ssse3" || v == "avx2") {
+        if std::env::var_os("UNRAR_RS_SHA1_X86").is_some_and(|v| v == "ssse3" || v == "avx2") {
             return false;
         }
         std::arch::is_x86_feature_detected!("sha")
@@ -1709,15 +1709,15 @@ mod sha1_hw {
 /// * Otherwise — [`Tier::None`], and the unrolled scalar runs. That is the
 ///   x86-64 parts predating SSSE3: Intel before Core 2, AMD before K10.
 ///
-/// `WEAVER_UNRAR_SHA1_HW=0` keeps its existing whole-ladder meaning and pins
-/// plain scalar. `WEAVER_UNRAR_SHA1_X86` selects within this module: `0`
+/// `UNRAR_RS_SHA1_HW=0` keeps its existing whole-ladder meaning and pins
+/// plain scalar. `UNRAR_RS_SHA1_X86` selects within this module: `0`
 /// stands the module down, `ssse3` and `avx2` force one tier so a single
 /// binary can A/B them — and a named tier also stands the SHA-extension path
 /// down, so the A/B works on a SHA-capable host instead of being silently
 /// overridden by it. The ISA probe is never bypassed in either direction —
 /// forcing a tier the CPU cannot execute would be an undefined opcode, so the
 /// override widens the *policy* and leaves the *capability* check intact.
-/// Same `OnceLock` + `WEAVER_*` shape as [`crate::crc_simd`].
+/// Same `OnceLock` + environment-override shape as [`crate::crc_simd`].
 #[cfg(target_arch = "x86_64")]
 mod sha1_x86_vec {
     // Each kernel is one contiguous unsafe region under a single precondition
@@ -1736,7 +1736,7 @@ mod sha1_x86_vec {
     const K: [u32; 4] = [0x5a82_7999, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c1d6];
 
     /// Override knob for the tier gate, read once. See the module docs.
-    const FORCE_ENV: &str = "WEAVER_UNRAR_SHA1_X86";
+    const FORCE_ENV: &str = "UNRAR_RS_SHA1_X86";
 
     /// The selected vector tier for this process.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1754,7 +1754,7 @@ mod sha1_x86_vec {
         static TIER: OnceLock<Tier> = OnceLock::new();
         *TIER.get_or_init(|| {
             let hw_pinned_off =
-                std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|value| value == "0");
+                std::env::var_os("UNRAR_RS_SHA1_HW").is_some_and(|value| value == "0");
             let forced = std::env::var_os(FORCE_ENV);
 
             // Capability floor. Never widened by the override below: these
@@ -1777,9 +1777,9 @@ mod sha1_x86_vec {
     /// The tier policy, split out from the environment and the CPUID probe so
     /// the matrix is testable on any host.
     ///
-    /// `hw_pinned_off` is `WEAVER_UNRAR_SHA1_HW=0`, which predates this module
+    /// `hw_pinned_off` is `UNRAR_RS_SHA1_HW=0`, which predates this module
     /// and means "plain scalar" — not "one tier down" — so it wins over
-    /// everything. `forced` is `WEAVER_UNRAR_SHA1_X86`. An unknown value is
+    /// everything. `forced` is `UNRAR_RS_SHA1_X86`. An unknown value is
     /// ignored rather than fatal, and a forced tier the CPU cannot execute
     /// stands the module down instead of issuing an undefined opcode.
     fn select_tier(hw_pinned_off: bool, forced: Option<&str>, ssse3: bool, avx2: bool) -> Tier {
@@ -1799,7 +1799,7 @@ mod sha1_x86_vec {
         // 1.002x/1.20-1.24x vs SSSE3 1.265x/1.37-1.38x) and Haswell (fleet
         // run c4reval-20260815T200644Z: SSSE3 1.284-1.335 vs AVX2
         // 1.211-1.247 against the oracle, all four encrypted cases). The
-        // AVX2 kernel stays selectable via WEAVER_UNRAR_SHA1_X86=avx2 for
+        // AVX2 kernel stays selectable via UNRAR_RS_SHA1_X86=avx2 for
         // silicon that upends this ordering.
         if ssse3 {
             Tier::Ssse3
@@ -3133,15 +3133,15 @@ mod tests {
 
         // The gate and the kernels must agree about what this host can run.
         // Only meaningful when nothing is pinning the ladder off.
-        let pinned = std::env::var_os("WEAVER_UNRAR_SHA1_HW").is_some_and(|value| value == "0")
-            || std::env::var_os("WEAVER_UNRAR_SHA1_X86").is_some();
+        let pinned = std::env::var_os("UNRAR_RS_SHA1_HW").is_some_and(|value| value == "0")
+            || std::env::var_os("UNRAR_RS_SHA1_X86").is_some();
         if !pinned {
             // Measured preference, not widest-first: the default ladder takes
             // SSSE3 whenever the CPU has it, including on AVX2-capable parts —
             // see the benchmark rationale at `select_tier`, which the sibling
             // unit test `tier_tests::default_policy_prefers_the_measured_faster_tier`
             // pins directly. AVX2 is reachable only through
-            // WEAVER_UNRAR_SHA1_X86=avx2, which `pinned` already excludes, and
+            // UNRAR_RS_SHA1_X86=avx2, which `pinned` already excludes, and
             // SSSE3 is guaranteed here by the early return above.
             assert_eq!(sha1_x86_vec::tier(), sha1_x86_vec::Tier::Ssse3);
         }

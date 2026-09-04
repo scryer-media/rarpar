@@ -42,6 +42,20 @@ use huffman::HuffmanTable;
 use staged_input::StagedInput;
 use window::Window;
 
+/// Hand the decode loop a type-erased view of the caller's writer.
+///
+/// The chunked entry points take the writer factory as a plain generic — that
+/// is what lets an embedder return a writer that borrows, with no `Box` and no
+/// `'static`. The decode loop underneath does not want that generic: it is the
+/// crate's hottest code, and monomorphising it per writer type measurably costs
+/// more than the one indirect call per flush that erasure costs. So the
+/// genericity stops here, at the boundary, and everything below sees a single
+/// `dyn Write`.
+#[inline]
+fn erase<W: Write>(writer: &mut W) -> &mut dyn Write {
+    writer
+}
+
 /// Maximum number of length slots.
 const NUM_LENGTH_SLOTS: usize = 44;
 
@@ -1243,7 +1257,7 @@ impl LzDecoder {
     ///
     /// Returns a list of `(volume_index, bytes_written)` for each chunk. The first
     /// chunk starts at `first_volume_index`.
-    pub fn decompress_to_writer_chunked<F>(
+    pub fn decompress_to_writer_chunked<F, W>(
         &mut self,
         input: &[u8],
         unpacked_size: u64,
@@ -1252,7 +1266,8 @@ impl LzDecoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -1282,7 +1297,7 @@ impl LzDecoder {
                 &mut reader,
                 unpacked_size,
                 &mut output_size,
-                &mut *current_writer,
+                erase(&mut current_writer),
             )?;
             let decoded_this_round = output_size - prev_output;
 
@@ -1292,7 +1307,7 @@ impl LzDecoder {
                 && byte_pos >= boundaries[boundary_idx].compressed_offset
             {
                 // Flush current writer and record chunk.
-                self.flush_filters_and_write(&mut *current_writer)?;
+                self.flush_filters_and_write(erase(&mut current_writer))?;
                 chunk_bytes += decoded_this_round;
                 chunks.push((current_vol, chunk_bytes));
 
@@ -1310,7 +1325,7 @@ impl LzDecoder {
         }
 
         // Final flush.
-        self.flush_filters_and_write(&mut *current_writer)?;
+        self.flush_filters_and_write(erase(&mut current_writer))?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1318,7 +1333,7 @@ impl LzDecoder {
         Ok(chunks)
     }
 
-    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F>(
+    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F, W>(
         &mut self,
         input: Rd,
         unpacked_size: u64,
@@ -1327,7 +1342,8 @@ impl LzDecoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -1356,7 +1372,7 @@ impl LzDecoder {
     /// blocks before the next volume boundary fan out to rayon (same engine
     /// as `decompress_reader_to_writer`), while boundary-straddling blocks and
     /// writer switching stay on the sequential path at block granularity.
-    fn decompress_reader_to_writer_chunked_parallel<Rd: std::io::Read, F>(
+    fn decompress_reader_to_writer_chunked_parallel<Rd: std::io::Read, F, W>(
         &mut self,
         mut input: Rd,
         unpacked_size: u64,
@@ -1365,7 +1381,8 @@ impl LzDecoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let mut staged = self.take_staged_input();
         let result = self.decompress_reader_to_writer_chunked_staged(
@@ -1386,7 +1403,7 @@ impl LzDecoder {
     /// [`Self::decompress_reader_to_writer_staged`]: the staging allocation
     /// belongs to the decoder and returns to it on every exit path.
     #[allow(clippy::too_many_arguments)]
-    fn decompress_reader_to_writer_chunked_staged<Rd: std::io::Read, F>(
+    fn decompress_reader_to_writer_chunked_staged<Rd: std::io::Read, F, W>(
         &mut self,
         input: &mut Rd,
         unpacked_size: u64,
@@ -1396,7 +1413,8 @@ impl LzDecoder {
         staged: &mut StagedInput,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         self.begin_file_decode(unpacked_size);
 
@@ -1461,7 +1479,7 @@ impl LzDecoder {
                 && staged_bit_offset == 0
                 && abs_cursor >= b.compressed_offset
             {
-                self.flush_filters_and_write(&mut *current_writer)?;
+                self.flush_filters_and_write(erase(&mut current_writer))?;
                 chunks.push((current_vol, chunk_bytes));
                 current_vol = b.volume_index;
                 boundary_idx += 1;
@@ -1500,7 +1518,7 @@ impl LzDecoder {
                     &mut reader,
                     unpacked_size,
                     &mut output_size,
-                    &mut *current_writer,
+                    erase(&mut current_writer),
                 );
                 let consumed_bits = (reader.position() - staged_bit_offset) as i64;
                 self.block_bits_remaining = full_remaining - consumed_bits;
@@ -1508,7 +1526,7 @@ impl LzDecoder {
 
                 match decode_result {
                     Ok(()) => {
-                        self.flush_stream_output(&mut current_writer)?;
+                        self.flush_stream_output(erase(&mut current_writer))?;
                         staged_bit_offset = reader.position();
                         Self::advance_staged_prefix(
                             staged,
@@ -1560,7 +1578,7 @@ impl LzDecoder {
                     span,
                     unpacked_size,
                     &mut output_size,
-                    &mut current_writer,
+                    erase(&mut current_writer),
                 )?;
                 if consumed > 0 {
                     chunk_bytes += output_size - prev_output;
@@ -1605,7 +1623,7 @@ impl LzDecoder {
             staged_bit_offset = reader.position();
         }
 
-        self.flush_filters_and_write(&mut *current_writer)?;
+        self.flush_filters_and_write(erase(&mut current_writer))?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1613,7 +1631,7 @@ impl LzDecoder {
         Ok(chunks)
     }
 
-    fn decompress_reader_to_writer_chunked_single_thread<Rd: std::io::Read, F>(
+    fn decompress_reader_to_writer_chunked_single_thread<Rd: std::io::Read, F, W>(
         &mut self,
         input: Rd,
         unpacked_size: u64,
@@ -1622,7 +1640,8 @@ impl LzDecoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         self.begin_file_decode(unpacked_size);
         let mut reader = StreamingBitReader::new(input);
@@ -1647,7 +1666,7 @@ impl LzDecoder {
                 &mut reader,
                 unpacked_size,
                 &mut output_size,
-                &mut *current_writer,
+                erase(&mut current_writer),
             )?;
             let decoded_this_round = output_size - prev_output;
 
@@ -1662,7 +1681,7 @@ impl LzDecoder {
             if let Some(boundary) = boundary
                 && byte_pos >= boundary.compressed_offset
             {
-                self.flush_filters_and_write(&mut *current_writer)?;
+                self.flush_filters_and_write(erase(&mut current_writer))?;
                 chunk_bytes += decoded_this_round;
                 chunks.push((current_vol, chunk_bytes));
 
@@ -1678,7 +1697,7 @@ impl LzDecoder {
             }
         }
 
-        self.flush_filters_and_write(&mut *current_writer)?;
+        self.flush_filters_and_write(erase(&mut current_writer))?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1996,7 +2015,7 @@ pub(crate) fn decompress_lz_reader_to_writer_with_max_dict_size<Rd: std::io::Rea
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
 }
 
-pub fn decompress_lz_reader_to_writer_chunked<Rd: std::io::Read, F>(
+pub fn decompress_lz_reader_to_writer_chunked<Rd: std::io::Read, F, W>(
     input: Rd,
     unpacked_size: u64,
     info: &CompressionInfo,
@@ -2005,7 +2024,8 @@ pub fn decompress_lz_reader_to_writer_chunked<Rd: std::io::Read, F>(
     writer_factory: F,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     decompress_lz_reader_to_writer_chunked_with_max_dict_size(
         input,
@@ -2018,7 +2038,7 @@ where
     )
 }
 
-pub(crate) fn decompress_lz_reader_to_writer_chunked_with_max_dict_size<Rd: std::io::Read, F>(
+pub(crate) fn decompress_lz_reader_to_writer_chunked_with_max_dict_size<Rd: std::io::Read, F, W>(
     input: Rd,
     unpacked_size: u64,
     info: &CompressionInfo,
@@ -2028,7 +2048,8 @@ pub(crate) fn decompress_lz_reader_to_writer_chunked_with_max_dict_size<Rd: std:
     max_dict_size: u64,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     let dict_size = checked_lz_dict_size(info, max_dict_size)?;
     let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
@@ -2041,7 +2062,7 @@ where
     )
 }
 
-pub(crate) fn decompress_lz_to_writer_chunked_with_max_dict_size<F>(
+pub(crate) fn decompress_lz_to_writer_chunked_with_max_dict_size<F, W>(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
@@ -2051,7 +2072,8 @@ pub(crate) fn decompress_lz_to_writer_chunked_with_max_dict_size<F>(
     max_dict_size: u64,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     let dict_size = checked_lz_dict_size(info, max_dict_size)?;
     let mut decoder = LzDecoder::try_new(dict_size, info.version)?;

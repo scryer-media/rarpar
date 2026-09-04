@@ -3,6 +3,11 @@
 //! These tests construct RAR5 archives programmatically and verify
 //! that the parser + decompressor produce correct output.
 
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
+
 use std::cell::Cell;
 use std::io::{Cursor, Write};
 use std::rc::Rc;
@@ -6914,4 +6919,37 @@ fn rar4_grouped_solid_members_extract_exactly_through_the_shared_decoder() {
             "cold-cursor member {index} ({name}) diverged"
         );
     }
+}
+
+/// `unpack_in` lands the member at the same host-aware name the file writer
+/// guards, so a backslash in a Unix-authored RAR5 name is one literal
+/// component and cannot be steered through a parent symlink.
+#[test]
+#[cfg(unix)]
+fn test_unpack_in_keeps_a_unix_backslash_name_as_one_component() {
+    let archive_bytes = build_stored_archive_with_extra("link\\poc.txt", b"protected bytes", &[]);
+    let cursor = Cursor::new(archive_bytes);
+    let mut archive = unrar_rs::RarArchive::open(cursor).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir.path().join("dir");
+    let outside = temp_dir.path().join("outside");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink("../outside", dir.join("link")).unwrap();
+
+    let written = archive.by_index(0).unwrap().unpack_in(&dir).unwrap();
+
+    assert_eq!(written, dir.join("link\\poc.txt"));
+    assert_eq!(std::fs::read(&written).unwrap(), b"protected bytes");
+    assert!(
+        !outside.join("poc.txt").exists(),
+        "the member must not be written through the parent symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "an unrelated symlink beside the member must be left alone"
+    );
 }

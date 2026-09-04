@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+### Changed
+
+- The VPCLMULQDQ CRC tier override is renamed from `WEAVER_CRC32_VPCLMUL` to
+  `RARPAR_CRC32_VPCLMUL`; values and semantics are unchanged and there is no
+  alias. The knob sits in the CRC kernel shared byte for byte with `unrar-rs`,
+  which makes the same rename in its 0.8.0.
+
 ## 0.8.0
 
 Two ways for a host that has already read the payload to stop paying for this

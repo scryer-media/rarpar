@@ -162,7 +162,7 @@ struct WorkerOptions {
 /// Whether block-parallel decode is available for this process.
 ///
 /// Deliberately *not* memoized in a `OnceLock`: the public differential suite
-/// flips `WEAVER_RAR_DISABLE_PARALLEL` between extractions inside one process
+/// flips `UNRAR_RS_DISABLE_PARALLEL` between extractions inside one process
 /// to prove the two engines agree, and a cached value would silently run both
 /// halves in the same mode. The lookup is instead hoisted to once per member —
 /// every per-round caller is already inside a `parallel_enabled()` branch.
@@ -173,7 +173,7 @@ pub(super) fn parallel_enabled() -> bool {
     // `rar_decode_pool` is never built (wasip1 has no thread spawn).
     !cfg!(target_family = "wasm")
         && parallel_enabled_from_disable_env(
-            std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").as_deref(),
+            std::env::var_os("UNRAR_RS_DISABLE_PARALLEL").as_deref(),
         )
 }
 
@@ -1837,7 +1837,7 @@ impl LzDecoder {
     }
 
     /// Staged (single-writer) entry point: batches are round-pipelined.
-    pub(super) fn process_buffered_blocks<W: std::io::Write>(
+    pub(super) fn process_buffered_blocks<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         logical_len: usize,
@@ -1863,7 +1863,7 @@ impl LzDecoder {
     /// counts as apply progresses, so a batch decoded ahead of the boundary
     /// check would be attributed to the wrong volume. Overlap buys nothing
     /// there either — the drivers stop at every boundary anyway.
-    pub(super) fn process_buffered_blocks_sequential<W: std::io::Write>(
+    pub(super) fn process_buffered_blocks_sequential<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         logical_len: usize,
@@ -1884,7 +1884,7 @@ impl LzDecoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_buffered_blocks_with<W: std::io::Write>(
+    fn process_buffered_blocks_with<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         logical_len: usize,
@@ -1946,7 +1946,7 @@ impl LzDecoder {
     /// buffer set — `front_set` holds the pending batch, `back_set` receives
     /// the batch being decoded, and the two swap once the scope joins.
     #[allow(clippy::too_many_arguments)]
-    fn run_block_controller<W: std::io::Write>(
+    fn run_block_controller<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         blocks: &[BlockInfo],
@@ -2109,7 +2109,7 @@ impl LzDecoder {
     ///
     /// A no-op when nothing is pending, which is every call on the sequential
     /// path and the drains that bracket inline spans.
-    fn drain_pending_batch<W: std::io::Write>(
+    fn drain_pending_batch<W: std::io::Write + ?Sized>(
         &mut self,
         pending: &mut Option<PendingBatch>,
         items: &[Vec<DecodedItem>],
@@ -2212,7 +2212,7 @@ impl LzDecoder {
     /// by construction, so for a pipelined round their sum exceeds the wall
     /// clock; neither is inflated, but they can no longer be added up.
     #[allow(clippy::too_many_arguments)]
-    fn decode_next_batch_while_applying<W: std::io::Write>(
+    fn decode_next_batch_while_applying<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         blocks: &[BlockInfo],
@@ -2358,7 +2358,7 @@ impl LzDecoder {
         self.rc_table = Some(Arc::clone(&tables.rc));
     }
 
-    fn decode_span_inline<W: std::io::Write>(
+    fn decode_span_inline<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         span: &[BlockInfo],
@@ -2401,7 +2401,7 @@ impl LzDecoder {
     /// failure-semantics tests that pin its exact ordering. The pipelined path
     /// splits the same work across [`Self::decode_static_batch_into`] and
     /// [`Self::decode_next_batch_while_applying`] instead.
-    fn decode_and_apply_static_batch<W: std::io::Write>(
+    fn decode_and_apply_static_batch<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         blocks: &[BlockInfo],
@@ -2471,7 +2471,7 @@ impl LzDecoder {
     /// whose bit accessors are branch-free loads. It reads the same bits as the
     /// checked reader over the same slice, so the output is identical; the
     /// checked [`BitReader`] remains the fallback for tail blocks.
-    fn decode_block_inline<W: std::io::Write>(
+    fn decode_block_inline<W: std::io::Write + ?Sized>(
         &mut self,
         input: &[u8],
         block: &BlockInfo,
@@ -2507,7 +2507,7 @@ impl LzDecoder {
     /// it counts every byte a match copies into the dictionary. What of it
     /// reaches the caller is the write layer's decision, not this loop's — the
     /// bound comes from `decode_limit`, which the serial loop uses too.
-    fn apply_decoded_items_parallel<W: std::io::Write>(
+    fn apply_decoded_items_parallel<W: std::io::Write + ?Sized>(
         &mut self,
         all_items: &[Vec<DecodedItem>],
         output_size: &mut u64,
@@ -2635,6 +2635,10 @@ impl LzDecoder {
 
 #[cfg(test)]
 mod tests {
+    // These tests drive the pre-0.9.0 buffered entry point on purpose: it is
+    // still part of the crate's surface until 0.10.0, and holding the decoder
+    // to it here is what proves the wrappers stay honest.
+    #![allow(deprecated)]
     use super::*;
 
     fn reset_dispatch_count() {

@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
-use unrar_rs::{ExtractOptions, Limits, RarArchive, StaticVolumeProvider};
+use unrar_rs::{Limits, RarArchive, StaticVolumeProvider};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -59,21 +59,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider = StaticVolumeProvider::from_ordered(paths.clone());
-    let options = ExtractOptions {
-        verify: true,
-        password,
-        restore_owners: false,
-    };
 
-    let member_count = archive.metadata().members.len();
+    let member_count = archive.len();
     let mut sink = io::sink();
     if archive.is_solid() {
+        // A solid archive decodes from the volumes attached above, in order.
         for member_index in 0..member_count {
-            archive.extract_member_solid_to_writer(member_index, &options, &mut sink)?;
+            archive.by_index(member_index)?.copy_to(&mut sink)?;
         }
     } else {
         for member_index in 0..member_count {
-            archive.extract_member_streaming(member_index, &options, &provider, &mut sink)?;
+            archive
+                .by_index_via(member_index, &provider)?
+                .copy_to(&mut sink)?;
         }
     }
 

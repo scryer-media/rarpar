@@ -254,7 +254,7 @@ impl Rar4Decoder {
         }
     }
 
-    pub(crate) fn decompress_reader_to_writer_chunked<R: Read, F>(
+    pub(crate) fn decompress_reader_to_writer_chunked<R: Read, F, W>(
         &mut self,
         input: R,
         unpacked_size: u64,
@@ -263,7 +263,8 @@ impl Rar4Decoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         match self {
             Self::V15(decoder) => decoder.decompress_reader_to_writer_chunked(
@@ -331,7 +332,7 @@ pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decompress_rar4_to_writer_chunked<F>(
+pub(crate) fn decompress_rar4_to_writer_chunked<F, W>(
     input: &[u8],
     unpacked_size: u64,
     version: u8,
@@ -342,7 +343,8 @@ pub(crate) fn decompress_rar4_to_writer_chunked<F>(
     writer_factory: F,
 ) -> RarResult<Vec<(usize, u64)>>
 where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    W: Write,
+    F: FnMut(usize) -> RarResult<W>,
 {
     check_dict_size(dict_size)?;
     let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
@@ -623,7 +625,7 @@ impl Rar20Decoder {
         Ok(output_size)
     }
 
-    fn decompress_to_writer_chunked<F>(
+    fn decompress_to_writer_chunked<F, W>(
         &mut self,
         input: &[u8],
         unpacked_size: u64,
@@ -632,7 +634,8 @@ impl Rar20Decoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let mut reader = BitReader::new(input);
         self.decompress_chunked_with_reader(
@@ -644,7 +647,7 @@ impl Rar20Decoder {
         )
     }
 
-    fn decompress_reader_to_writer_chunked<Rd: Read, F>(
+    fn decompress_reader_to_writer_chunked<Rd: Read, F, W>(
         &mut self,
         input: Rd,
         unpacked_size: u64,
@@ -653,7 +656,8 @@ impl Rar20Decoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         // Recycled 512 KiB input buffer, handed back on every exit path.
         let buf = take_input_buffer(&mut self.input_buffer);
@@ -676,7 +680,7 @@ impl Rar20Decoder {
         result
     }
 
-    fn decompress_chunked_with_reader<R: BitRead, F, G>(
+    fn decompress_chunked_with_reader<R: BitRead, F, G, W>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
@@ -685,7 +689,8 @@ impl Rar20Decoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
         G: FnMut(usize) -> RarResult<Option<super::VolumeTransition>>,
     {
         if unpacked_size == 0 {
@@ -732,7 +737,7 @@ impl Rar20Decoder {
                 || self.window.unflushed_bytes() as usize >= flush_threshold
             {
                 self.window
-                    .flush_to_writer(&mut *current_writer)
+                    .flush_to_writer(&mut current_writer)
                     .map_err(RarError::Io)?;
             }
 
@@ -746,7 +751,7 @@ impl Rar20Decoder {
 
         self.read_last_tables(reader)?;
         self.window
-            .flush_to_writer(&mut *current_writer)
+            .flush_to_writer(&mut current_writer)
             .map_err(RarError::Io)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -1299,7 +1304,7 @@ impl Rar15Decoder {
         Ok(output_size)
     }
 
-    fn decompress_to_writer_chunked<F>(
+    fn decompress_to_writer_chunked<F, W>(
         &mut self,
         input: &[u8],
         unpacked_size: u64,
@@ -1308,7 +1313,8 @@ impl Rar15Decoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         let mut reader = BitReader::new(input);
         self.decompress_chunked_with_reader(
@@ -1320,7 +1326,7 @@ impl Rar15Decoder {
         )
     }
 
-    fn decompress_reader_to_writer_chunked<Rd: Read, F>(
+    fn decompress_reader_to_writer_chunked<Rd: Read, F, W>(
         &mut self,
         input: Rd,
         unpacked_size: u64,
@@ -1329,7 +1335,8 @@ impl Rar15Decoder {
         writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
     {
         // Recycled 512 KiB input buffer, handed back on every exit path.
         let buf = take_input_buffer(&mut self.input_buffer);
@@ -1352,7 +1359,7 @@ impl Rar15Decoder {
         result
     }
 
-    fn decompress_chunked_with_reader<R: BitRead, F, G>(
+    fn decompress_chunked_with_reader<R: BitRead, F, G, W>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
@@ -1361,7 +1368,8 @@ impl Rar15Decoder {
         mut writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
-        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
         G: FnMut(usize) -> RarResult<Option<super::VolumeTransition>>,
     {
         if unpacked_size == 0 {
@@ -1402,7 +1410,7 @@ impl Rar15Decoder {
                 || self.window.unflushed_bytes() as usize >= flush_threshold
             {
                 self.window
-                    .flush_to_writer(&mut *current_writer)
+                    .flush_to_writer(&mut current_writer)
                     .map_err(RarError::Io)?;
             }
 
@@ -1415,7 +1423,7 @@ impl Rar15Decoder {
         }
 
         self.window
-            .flush_to_writer(&mut *current_writer)
+            .flush_to_writer(&mut current_writer)
             .map_err(RarError::Io)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));

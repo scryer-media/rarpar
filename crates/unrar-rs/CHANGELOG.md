@@ -1,6 +1,177 @@
 # Changelog
 
 
+## 0.9.0
+
+Extraction is now reached the way the Rust archive ecosystem reaches it: take
+a member handle from the archive, then say where its bytes go. The eight entry
+points that came before are kept as deprecated wrappers over the same engines,
+so nothing has to move today.
+
+### Added
+
+- `RarArchive::by_index`, `by_name` and `by_index_via` hand back an `Entry`.
+  Taking one decodes nothing; it resolves the member and borrows the archive.
+- `Entry` consumes itself into a destination: `copy_to` writes straight into a
+  writer, `copy_to_volumes` splits the member across one writer per volume it
+  spans, `unpack_to` and `unpack_in` write it to disk with the metadata the
+  archive carries, `skip` advances past it, and `Read` serves it from a spool
+  for callers that have no writer to hand. `index`, `info`, `name`, `size`
+  and `is_dir` describe one entry; `with_progress` and `with_password` steer
+  it. Every consuming call reports to the handler `with_progress` names: a
+  start event, the running byte count as the destination receives it, and a
+  completion event carrying the outcome.
+- The per-volume writer is a plain generic. It needs neither `Box`, `Send`,
+  nor `'static`, so a writer holding `&RefCell<_>` or `Rc<_>` is accepted.
+- Extraction settings live on the archive: `set_verify`/`verify` and
+  `set_restore_owners`/`restore_owners`, joining `set_password`. An `Entry`
+  extracts under those settings, so no options value is threaded through a
+  call chain.
+- `ExtractOptions` gains `with_verify`, `with_password`, `with_restore_owners`
+  and matching getters, and is `Clone` and `Debug`. The `Debug` form says
+  whether a password is set and never prints it.
+- Listing without building the whole metadata document: `len`, `is_empty`,
+  `entries`, `entry_info` and `index_for_name`.
+- `RarError::SolidStatePoisoned` reports a solid archive whose decoder was
+  left mid-member. `RarError::MemberIndexOutOfRange` is what `by_index`
+  raises for an index the archive does not list, and
+  `RarError::VolumeProviderRequired` is what `copy_to_volumes` raises for a
+  non-solid member taken without a provider; neither is a corruption report.
+
+### Changed
+
+- `RarError` is `#[non_exhaustive]`. A `match` over it outside this crate
+  needs a wildcard arm; the crate's failure modes grow with the formats it
+  recognises, and adding one should not be a breaking change.
+- A solid member that fails partway — a decode error, or a writer that
+  refuses — poisons the archive. Every later solid extraction raises
+  `SolidStatePoisoned` until `reset_solid_state` clears it and extraction
+  restarts from the first member. Before this, the carried-over dictionary was
+  reused as if the interrupted member had completed, so the members after it
+  could decode to plausible but wrong bytes. Non-solid members are unaffected.
+- The `decompress`, `rar4` and `vint` modules are crate-private. An archive is
+  read through `RarArchive` and its `Entry`; nothing outside this crate drove
+  the decoders directly, and their surface was the crate's largest by a wide
+  margin. `header` stays public — walking a RAR5 volume's headers without
+  opening the archive is a real use, and its result type is public API.
+- The decoder and RAR4 entry points that lost their last caller when those
+  modules went private are still compiled, under one `#![allow(dead_code)]`
+  per module tree (`decompress`, `rar4`). They are the 0.10.0 removal list:
+  which of them is dead depends on the feature set, so removing them is a
+  deliberate change rather than part of a visibility sweep.
+- New non-default feature `unstable-internals` exposes `__internals`, which is
+  what this crate's own bench and `probe_volumes` example reach for. It is not
+  public API and carries no semver guarantee.
+
+### Deprecated
+
+- `extract_member`, `extract_by_name`, `extract_member_to_file`,
+  `extract_member_streaming`, `extract_member_streaming_chunked`,
+  `extract_member_solid_to_writer`, `extract_member_solid_chunked` and
+  `skip_member_solid`. Each still behaves exactly as it did and calls the same
+  engine the handle calls. They are removed in 0.10.0.
+
+### Migration
+
+Take a handle, then consume it. The archive holds the password, the
+verification setting and the owner-restoration setting, so the
+`ExtractOptions` value most call sites threaded through disappears.
+
+- `extract_member(i, &options, progress)?.to_bytes()?` becomes
+  `let mut bytes = Vec::new(); archive.by_index(i)?.copy_to(&mut bytes)?;`
+  — or `read_to_end` on the entry when a `Read` is what the caller wants.
+- `extract_by_name(name, &options, progress)?` becomes `archive.by_name(name)?`
+  followed by the same consumption.
+- `extract_member_to_file(i, &options, progress, path)?` becomes
+  `archive.by_index(i)?.unpack_to(path)?`, or `.unpack_in(dir)?` to let the
+  member's own sanitized name choose the file.
+- `extract_member_solid_to_writer(i, &options, w)?` becomes
+  `archive.by_index(i)?.copy_to(w)?`.
+- `extract_member_streaming(i, &options, provider, w)?` becomes
+  `archive.by_index_via(i, provider)?.copy_to(w)?`.
+- `extract_member_streaming_chunked(i, &options, provider, factory)?` becomes
+  `archive.by_index_via(i, provider)?.copy_to_volumes(factory)?`, and
+  `extract_member_solid_chunked(i, &options, factory)?` becomes
+  `archive.by_index(i)?.copy_to_volumes(factory)?`. The factory no longer has
+  to return `Box<dyn Write>`: return the writer itself, and drop the
+  `Rc<RefCell<_>>` or `Arc<Mutex<_>>` that boxing forced on a shared sink — a
+  writer that borrows the sink is now accepted.
+- `skip_member_solid(i, &options)?` becomes `archive.by_index(i)?.skip()?`.
+- Options that were passed per call are set once instead: `options.verify`
+  becomes `archive.set_verify(..)`, `options.password` becomes
+  `archive.set_password(..)`, and `options.restore_owners` becomes
+  `archive.set_restore_owners(..)`. A single entry can still override the
+  password with `by_index(i)?.with_password(..)`.
+- A `match` over `RarError` in another crate needs a wildcard arm.
+
+
+## 0.8.0
+
+A breaking release that removes every embedder-specific transport from the
+crate. Host delegation of the two bulk primitives (AES-CBC decrypt and the
+member CRC-32) now has exactly one shape — a pair of embedder-installed Rust
+function pointers — and the crate no longer knows or cares whether the
+embedder is a core wasm module, a WASI Preview 2 component, an Extism plugin,
+or something else. The runtime escape hatches lose their former owner's name.
+
+### Removed
+
+- The raw wasm imports `host_aes_cbc_decrypt` and `host_crc32` that
+  `crypto-host` / `crc-host` used to declare, together with the features
+  that only selected their import namespace: `host-abi-extism`
+  (`extism:host/user`) and the never-published `host-abi-component`. The
+  guest-pointer ABI those imports encoded is a property of one particular
+  embedding, not of RAR extraction; it now lives in
+  `examples/wasm_extract_conformance.rs`, which is the reference embedding for
+  a core module and is still driven end to end by the `wasmtime` harnesses in
+  `tests/`.
+
+### Changed
+
+- `crypto-host` and `crc-host` delegate through the `hooks` module
+  (`HostCryptoHooks`, `install_host_crypto_hooks`,
+  `host_crypto_hooks_installed`, `clear_host_crypto_hooks`, `HostAesError`),
+  which is present whenever either feature is enabled. The embedder installs
+  the pair once at start-up and owns whatever transport sits behind it. The
+  features stay wasm32-only in effect: on a native target they are accepted
+  but inert, so feature unification in a mixed workspace cannot turn a native
+  build into a delegating one. Every feature is additive; the crate builds
+  with `--all-features`.
+- The runtime override knobs are renamed from `WEAVER_*` to `UNRAR_RS_*`.
+  Values and semantics are unchanged; there are no aliases.
+
+  | 0.7.0                              | 0.8.0                           |
+  |------------------------------------|---------------------------------|
+  | `WEAVER_UNRAR_SHA1_HW`             | `UNRAR_RS_SHA1_HW`              |
+  | `WEAVER_UNRAR_SHA1_X86`            | `UNRAR_RS_SHA1_X86`             |
+  | `WEAVER_CRC32_VPCLMUL`             | `RARPAR_CRC32_VPCLMUL`          |
+  | `WEAVER_RAR_DISABLE_PARALLEL`      | `UNRAR_RS_DISABLE_PARALLEL`     |
+  | `WEAVER_RAR_SPOOL_THRESHOLD_BYTES` | `UNRAR_RS_SPOOL_THRESHOLD_BYTES`|
+  | `WEAVER_RAR4_MT_THREADS`           | `UNRAR_RS_RAR4_MT_THREADS`      |
+  | `WEAVER_RAR4_DEBUG_PPM`            | `UNRAR_RS_RAR4_DEBUG_PPM`       |
+  | `WEAVER_RAR4_DEBUG_FILTERS`        | `UNRAR_RS_RAR4_DEBUG_FILTERS`   |
+  | `WEAVER_RAR4_DEBUG_DUMP_PATH`      | `UNRAR_RS_RAR4_DEBUG_DUMP_PATH` |
+
+  `RARPAR_CRC32_VPCLMUL` takes the workspace prefix because the CRC kernel it
+  lives in is shared byte for byte with `par2-rs`, which renames it in the
+  same release (0.9.0).
+- `limits::WEAVER_MAX_MEMBER_DATA_SIZE` is renamed to
+  `limits::MAX_MEMBER_DATA_SIZE`; the value is unchanged.
+
+### Migration
+
+- Native embedders (the default `crypto-aws-lc` or `crypto-rust` backends)
+  are unaffected apart from the renames above.
+- A wasm guest that built with `crypto-host` / `crc-host` and satisfied the
+  raw imports from its runtime now declares those imports itself and installs
+  hooks that forward to them — the `embedding` module in
+  `examples/wasm_extract_conformance.rs` is a drop-in for the `host`
+  namespace, and changing the `#[link(wasm_import_module = ...)]` string is
+  all an Extism embedding needs. A component embedding installs hooks that
+  forward to its generated imports and drops `host-abi-component` from its
+  feature list.
+
+
 ## 0.7.0
 
 A resource-hardening release that stops trusting an archive member's declared

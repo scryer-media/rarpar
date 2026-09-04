@@ -2,7 +2,7 @@
 name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 readme = "README.md"
-version = "0.7.0"
+version = "0.9.0"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -21,32 +21,31 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 default = ["crypto-aws-lc"]
 crypto-aws-lc = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
 crypto-rust = ["dep:hmac", "dep:aes", "dep:cbc"]
-# WASM-only backend that delegates bulk AES-CBC to a host function
-# (`host_aes_cbc_decrypt`, in the embedder-neutral `host` import namespace)
-# while reusing the RustCrypto KDF primitives in-wasm. It therefore pulls in
-# `crypto-rust`. The host backend module itself is target-gated to wasm;
-# enabling this feature on a native target is harmless (the module is cfg'd
-# out and AWS-LC or the RustCrypto backend is selected instead).
+# Delegate the bulk AES-CBC decrypt to an embedder-installed hook (see the
+# `hooks` module) while reusing the RustCrypto KDF primitives in-guest; it
+# therefore pulls in `crypto-rust`. Engaged on `wasm32` only: on a native
+# target the feature is accepted but inert (AWS-LC or the RustCrypto backend
+# stays active and the hook is never called), so feature unification in a
+# mixed workspace cannot silently turn a native build into a delegating one.
 crypto-host = ["crypto-rust"]
-# WASM-only: delegate the bulk member-data CRC-32 to a host function
-# (`host_crc32`, same neutral `host` namespace as `crypto-host`'s AES) instead
-# of computing it in-wasm with `crc-fast`. Opt-in and wasm-only in intent; on
-# native targets it is a harmless no-op — the `crate::crc::Crc32` seam keeps
-# its portable `crc-fast` backend regardless. Adds NO new dependency:
-# `crc-fast` is already a normal dep that the native/portable seam path (and
-# the header/probe CRCs) use unchanged.
+# Delegate the bulk member-data CRC-32 to an embedder-installed hook (see the
+# `hooks` module) instead of computing it in-guest with `crc-fast`. Same
+# wasm32-only engagement as `crypto-host`; on native targets the
+# `crate::crc::Crc32` seam keeps its portable `crc-fast` backend regardless.
+# Adds NO new dependency: `crc-fast` is already a normal dep that the
+# native/portable seam path (and the header/probe CRCs) use unchanged.
 crc-host = []
-# Retarget the host imports' namespace from the embedder-neutral `host` to
-# `extism:host/user`, for Extism SDKs whose user host functions are pinned to
-# that module. Function names and signatures are identical either way; this
-# changes only the wasm import module string.
-host-abi-extism = []
 # Back-compat alias for existing workspace dependency declarations (was a
 # no-op); selects the native AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]
 slow-tests = []
+# Exposes `__internals`, the decoder/RAR4 entry points this crate's own benches
+# and examples reach for. Off by default and never a dependency's business: it
+# is not public API and carries no semver guarantee. The targets that need it
+# declare it in `required-features`, so a build without it simply skips them.
+unstable-internals = []
 # Compile the forensic per-symbol PPMd trace hooks. The hooks remain runtime
-# controlled by WEAVER_RAR4_DEBUG_PPM, but ordinary builds carry no trace
+# controlled by UNRAR_RS_RAR4_DEBUG_PPM, but ordinary builds carry no trace
 # state, branches, counters, or formatting code.
 ppmd-debug = []
 
@@ -98,11 +97,12 @@ tracing-subscriber.workspace = true
 # crate's dev-dependencies, so criterion is scoped to non-wasm targets; the
 # `archive_hotspots` bench only runs natively anyway.
 #
-# The `wasm_host_aes_smoke` integration test drives the wasm `crypto-host`
-# example through a native `wasmtime` host that supplies a reference
-# `host_aes_cbc_decrypt`. Those deps (wasmtime + WASI preview1 + a RustCrypto
-# reference AES) are native-only tooling for that harness and, like criterion,
-# MUST stay off the wasm example build — hence this same non-wasm target gate.
+# The `wasm_host_aes_smoke` and `wasm_host_extract_conformance` integration
+# tests drive the wasm `crypto-host` / `crc-host` examples through a native
+# `wasmtime` host that supplies the reference host functions the examples
+# import. Those deps (wasmtime + WASI preview1 + a RustCrypto reference AES)
+# are native-only tooling for that harness and, like criterion, MUST stay off
+# the wasm example build — hence this same non-wasm target gate.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.8"
 wasmtime = "47"
@@ -110,9 +110,25 @@ wasmtime-wasi = "47"
 aes = { workspace = true }
 cbc = { workspace = true }
 
+# The two wasm guest examples are reference embeddings of the `hooks` seam:
+# each declares raw imports in a `host` namespace and installs hooks that
+# forward to them. They only make sense with the delegating features on.
+[[example]]
+name = "host_aes_smoke"
+required-features = ["crypto-host"]
+
+[[example]]
+name = "wasm_extract_conformance"
+required-features = ["crypto-host", "crc-host"]
+
+[[example]]
+name = "probe_volumes"
+required-features = ["unstable-internals"]
+
 [[bench]]
 name = "archive_hotspots"
 harness = false
+required-features = ["unstable-internals"]
 
 [[bench]]
 name = "ppmd_compare"

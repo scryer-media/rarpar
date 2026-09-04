@@ -15,6 +15,17 @@ use crate::progress::ProgressHandler;
 use crate::types::{CompressionInfo, CompressionMethod, FileHash, MemberInfo};
 
 /// Options for extraction.
+///
+/// [`RarArchive`](crate::RarArchive) carries the same three settings —
+/// [`set_verify`](crate::RarArchive::set_verify),
+/// [`set_password`](crate::RarArchive::set_password) and
+/// [`set_restore_owners`](crate::RarArchive::set_restore_owners) — and the
+/// entry handle reads them from there, so this type is only needed by the
+/// deprecated extraction methods that still take it.
+///
+/// The `Debug` form says whether a password is set and never prints it, so an
+/// options value can go into a log line or a panic message.
+#[derive(Clone)]
 pub struct ExtractOptions {
     /// Whether to verify CRC32/BLAKE2 after extraction.
     pub verify: bool,
@@ -38,6 +49,55 @@ impl Default for ExtractOptions {
     }
 }
 
+/// Reports whether a password is set, never what it is.
+impl std::fmt::Debug for ExtractOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractOptions")
+            .field("verify", &self.verify)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("restore_owners", &self.restore_owners)
+            .finish()
+    }
+}
+
+impl ExtractOptions {
+    /// Whether a member's stored checksum is checked against what was decoded.
+    pub fn verify(&self) -> bool {
+        self.verify
+    }
+
+    /// The password used for encrypted members, if one was set.
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    /// Whether archived Unix owner and group are applied to extracted files.
+    pub fn restore_owners(&self) -> bool {
+        self.restore_owners
+    }
+
+    /// Check every extracted member against its stored checksum, or do not.
+    #[must_use]
+    pub fn with_verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// Supply the password for encrypted members.
+    #[must_use]
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Apply the archived Unix owner and group to extracted files.
+    #[must_use]
+    pub fn with_restore_owners(mut self, restore_owners: bool) -> Self {
+        self.restore_owners = restore_owners;
+        self
+    }
+}
+
 /// Buffer size for copying data during store extraction.
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
@@ -48,7 +108,7 @@ const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1024 * 1024;
 const MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES: usize = 512 * 1024 * 1024;
 
 fn spool_threshold_bytes() -> usize {
-    std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
+    std::env::var("UNRAR_RS_SPOOL_THRESHOLD_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1321,18 +1381,18 @@ mod tests {
     #[test]
     fn default_limits_accept_500_gib_members_and_reject_larger_members() {
         let mut fh = make_stored_file_header("boundary.bin", b"", 0);
-        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE;
-        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE);
+        fh.data_size = crate::limits::MAX_MEMBER_DATA_SIZE;
+        fh.unpacked_size = Some(crate::limits::MAX_MEMBER_DATA_SIZE);
         enforce_member_limits(&fh, &Limits::default()).unwrap();
 
-        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1;
+        fh.data_size = crate::limits::MAX_MEMBER_DATA_SIZE + 1;
         assert!(matches!(
             enforce_member_limits(&fh, &Limits::default()),
             Err(RarError::ResourceLimit { .. })
         ));
 
         fh.data_size = 0;
-        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1);
+        fh.unpacked_size = Some(crate::limits::MAX_MEMBER_DATA_SIZE + 1);
         assert!(matches!(
             enforce_member_limits(&fh, &Limits::default()),
             Err(RarError::ResourceLimit { .. })

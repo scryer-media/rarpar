@@ -505,12 +505,12 @@ fn extract_all_ready(
         return Err(CompatFailure::stdout(EXIT_NO_FILES, "No files to extract"));
     }
 
-    let password = password_candidate(&invocation.password);
-    let options = unrar_rs::ExtractOptions {
-        verify: true,
-        password,
-        restore_owners: false,
-    };
+    // The archive already carries whatever password opened it; a password
+    // named on the command line is asserted here too, for the case where the
+    // headers were readable without one but the members are encrypted.
+    if let Some(password) = password_candidate(&invocation.password) {
+        archive.set_password(password);
+    }
 
     for member in &members {
         if extracted.contains(&member.index) {
@@ -523,7 +523,8 @@ fn extract_all_ready(
         let out_path = prepare_output_path(&out_path, &member.info, invocation.overwrite)?;
         if let Some(out_path) = out_path {
             archive
-                .extract_member_to_file(member.index, &options, None, &out_path)
+                .by_index(member.index)
+                .and_then(|entry| entry.unpack_to(&out_path))
                 .map_err(map_rar_error)?;
             if invocation.suppression.shows_member_lines() {
                 print_member_ok(&member.info, &out_path);

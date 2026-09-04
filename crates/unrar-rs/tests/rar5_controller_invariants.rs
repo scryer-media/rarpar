@@ -1,4 +1,8 @@
 #![cfg(not(target_family = "wasm"))]
+// The pre-0.9.0 entry points are called throughout this file on purpose: they
+// are still part of the crate's surface until 0.10.0 removes them, and this is
+// where their behaviour is held to its contract.
+#![allow(deprecated)]
 
 use std::env;
 use std::fs;
@@ -12,7 +16,7 @@ use unrar_rs::{ExtractOptions, RarArchive, ReadSeek};
 
 const RAR5_DIR: &str = "rar5";
 const LARGE_PASSWORD: &str = "e2e-test-password";
-const DISABLE_PARALLEL: &str = "WEAVER_RAR_DISABLE_PARALLEL";
+const DISABLE_PARALLEL: &str = "UNRAR_RS_DISABLE_PARALLEL";
 
 fn fixture(name: &str) -> Option<Arc<Vec<u8>>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
