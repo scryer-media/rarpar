@@ -8401,7 +8401,8 @@ mod tests {
         let out_path = temp.path().join("truncated.bin");
         assert!(
             archive
-                .extract_member_to_file(0, &ExtractOptions::default(), None, &out_path)
+                .by_index(0)
+                .and_then(|entry| entry.unpack_to(&out_path))
                 .is_err()
         );
 
