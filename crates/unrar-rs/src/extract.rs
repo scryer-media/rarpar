@@ -22,7 +22,10 @@ use crate::types::{CompressionInfo, CompressionMethod, FileHash, MemberInfo};
 /// [`set_restore_owners`](crate::RarArchive::set_restore_owners) — and the
 /// entry handle reads them from there, so this type is only needed by the
 /// deprecated extraction methods that still take it.
-#[derive(Debug, Clone)]
+///
+/// The `Debug` form says whether a password is set and never prints it, so an
+/// options value can go into a log line or a panic message.
+#[derive(Clone)]
 pub struct ExtractOptions {
     /// Whether to verify CRC32/BLAKE2 after extraction.
     pub verify: bool,
@@ -43,6 +46,17 @@ impl Default for ExtractOptions {
             password: None,
             restore_owners: false,
         }
+    }
+}
+
+/// Reports whether a password is set, never what it is.
+impl std::fmt::Debug for ExtractOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractOptions")
+            .field("verify", &self.verify)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("restore_owners", &self.restore_owners)
+            .finish()
     }
 }
 

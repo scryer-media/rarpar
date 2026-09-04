@@ -28,7 +28,8 @@ so nothing has to move today.
   extracts under those settings, so no options value is threaded through a
   call chain.
 - `ExtractOptions` gains `with_verify`, `with_password`, `with_restore_owners`
-  and matching getters, and derives `Debug` and `Clone`.
+  and matching getters, and is `Clone` and `Debug`. The `Debug` form says
+  whether a password is set and never prints it.
 - Listing without building the whole metadata document: `len`, `is_empty`,
   `entries`, `entry_info` and `index_for_name`.
 - `RarError::SolidStatePoisoned` reports a solid archive whose decoder was

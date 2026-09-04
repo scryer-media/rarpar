@@ -668,6 +668,15 @@ fn options_can_be_built_and_set_on_the_archive() {
     assert_eq!(options.password(), Some("hunter2"));
     assert!(!options.verify());
     assert!(options.restore_owners());
+    let debug = format!("{options:?}");
+    assert!(
+        !debug.contains("hunter2") && debug.contains("<redacted>"),
+        "Debug must say a password is set without printing it: {debug}"
+    );
+    assert!(
+        format!("{:?}", ExtractOptions::default()).contains("password: None"),
+        "Debug must say when no password is set"
+    );
 
     let mut archive = open(NON_SOLID);
     assert!(archive.verify(), "verification is on by default");
