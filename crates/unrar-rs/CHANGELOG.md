@@ -1,6 +1,42 @@
 # Changelog
 
 
+## 0.10.0
+
+A parse result now says whether it came from the archive's Quick Open cache.
+Until now a caller could only see that a *locator* was present, which says
+nothing about provenance: `rar` writes a `QO` block holding file records and no
+end-of-archive record, this crate refuses such a cache and walks the headers
+physically, and the caller was left re-walking every locator-bearing volume to
+find out what it had already been given.
+
+### Added
+
+- `ParsedHeaders::headers_from_quick_open` and
+  `RarVolumeFacts::headers_from_quick_open` report where the returned headers
+  came from: `true` only when the whole result was read out of the `QO` block,
+  `false` for every physical walk — a cache that was present but rejected, an
+  encrypted cache that could not be opened, a parse under
+  `HeaderParseOptions { allow_quick_open: false }`, and every RAR4/RAR1.4
+  volume, which has no such cache. Cache-derived headers stay
+  non-authoritative, and a caller that routes bytes by them should re-parse
+  with Quick Open disabled; it can now skip that second walk when the flag is
+  `false`. `quick_open_offset.is_some()` is not a substitute — it reports a
+  locator record, not provenance.
+
+### Changed
+
+- **Breaking.** `ParsedHeaders` and `RarVolumeFacts` are ordinary structs with
+  all-public fields and no `#[non_exhaustive]`, so adding a field breaks any
+  downstream code that builds one as a struct literal. Hence the minor bump
+  rather than a patch. Nothing else about parsing changed: the same caches are
+  accepted and the same ones refused.
+- `RarVolumeFacts::headers_from_quick_open` decodes as `false` on facts a
+  pre-0.10 binary serialized, and those binaries did consult the cache by
+  default — so such a row can report a physical walk it never performed. A
+  store that persists these facts across an upgrade should key entries by
+  crate version and re-parse anything older.
+
 ## 0.9.1
 
 A recovery-volume fix for header-encrypted sets.

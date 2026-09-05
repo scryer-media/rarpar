@@ -121,6 +121,27 @@ pub struct ParsedHeaders {
     pub end: Option<end_archive::EndArchiveHeader>,
     /// Whether the archive is encrypted at the header level.
     pub is_encrypted: bool,
+    /// Whether the headers above were read out of the archive's Quick Open
+    /// cache rather than off the physical header chain.
+    ///
+    /// `true` only when the whole result came from the `QO` service block;
+    /// `false` whenever the physical walk produced it — including when a `QO`
+    /// block was present but rejected, and whenever
+    /// [`HeaderParseOptions::allow_quick_open`] was `false`.
+    ///
+    /// **Cache-derived headers are not authoritative.** The RAR5 format binds
+    /// no `QO` record to the physical header it claims to describe, and the
+    /// specification itself warns that the cached copies may deliberately
+    /// differ from the real ones. A caller deciding where bytes are written —
+    /// member names, data offsets, what is admitted downstream — must treat a
+    /// `true` here as "re-read physically before trusting this", and can skip
+    /// that second walk when it is `false`.
+    ///
+    /// This is the provenance answer; the presence of a locator record is not.
+    /// A main header can carry a Quick Open locator whose cache was then
+    /// rejected, so `quick_open_offset.is_some()` says only that a locator
+    /// exists, never that these headers came from it.
+    pub headers_from_quick_open: bool,
 }
 
 fn empty_parsed_headers() -> ParsedHeaders {
@@ -131,6 +152,7 @@ fn empty_parsed_headers() -> ParsedHeaders {
         encryption: None,
         end: None,
         is_encrypted: false,
+        headers_from_quick_open: false,
     }
 }
 
@@ -365,6 +387,14 @@ fn walk_all_headers<R: Read + Seek>(
                     && let Some(quick_open) =
                         try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
                 {
+                    // This is the one path that answers from the cache, so it
+                    // is the one path whose result is flagged cache-derived.
+                    // `parse_quick_open_records` sets the flag where it builds
+                    // the result; this pins that it did.
+                    debug_assert!(
+                        quick_open.headers_from_quick_open,
+                        "headers answered from the QuickOpen cache must be flagged as such"
+                    );
                     return Ok(HeaderWalk::Parsed(quick_open));
                 }
                 common::skip_data_area(reader, &raw)?;
@@ -714,6 +744,11 @@ fn parse_quick_open_records<R: Read>(
     let mut remaining = remaining;
     let mut result = empty_parsed_headers();
     result.main = Some(main);
+    // Every header this function appends is a cached copy, so the provenance
+    // is fixed here at construction rather than at the return: the value is
+    // then true of the result at every point it exists, encrypted `QO` block
+    // included (that path decrypts into this same builder).
+    result.headers_from_quick_open = true;
 
     while let Some(raw) = read_quick_open_record(reader, &mut remaining, qopen_header_offset)? {
         let data_offset = raw.offset + 4 + raw.header_size_vint_len as u64 + raw.header_size;
@@ -1617,6 +1652,135 @@ mod tests {
         // member present only in the `QO` block is reported as if it were real.
         assert_eq!(parsed_file_names(&parsed), ["physical.bin", "forged.bin"]);
         assert!(parsed.end.is_some());
+        assert!(
+            parsed.headers_from_quick_open,
+            "headers taken from the cache must say so"
+        );
+    }
+
+    /// Build an archive whose `QO` block is shaped the way `rar` actually
+    /// writes one: file records only, with no cached end-of-archive record to
+    /// terminate them. Alongside it sits a complete physical header chain.
+    ///
+    /// The cached member deliberately carries a different name from the
+    /// physical one. Real `rar` echoes the real headers faithfully, so this
+    /// divergence is not realistic — it is what makes the assertion
+    /// non-vacuous, by making a cache-derived answer visibly different from a
+    /// physically walked one.
+    ///
+    /// Returns the archive bytes and the data offset the physical walk should
+    /// report for `silver.horizon.mkv`.
+    fn build_test_archive_with_end_less_quick_open_cache() -> (Vec<u8>, u64) {
+        let qopen_offset = 256u64;
+        let cached_file_offset = 160u64;
+
+        let main = build_test_main_with_qopen_locator(qopen_offset - 8);
+        let physical_file = build_test_file_header("silver.horizon.mkv", 0, 0);
+        let physical_end = build_test_end_header();
+        let physical_file_offset = RAR5_SIGNATURE.len() as u64 + main.len() as u64;
+
+        let cached_file = build_test_file_header("silver.horizon.nfo", 4, 4);
+        let qopen_payload = build_test_qopen_record(qopen_offset, cached_file_offset, &cached_file);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&main);
+        archive.extend_from_slice(&physical_file);
+        archive.extend_from_slice(&physical_end);
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_qopen_service(&qopen_payload));
+        archive.extend_from_slice(&qopen_payload);
+
+        (archive, physical_file_offset + physical_file.len() as u64)
+    }
+
+    #[test]
+    fn quick_open_cache_without_an_end_record_is_rejected_and_reports_physical_provenance() {
+        let (archive, physical_data_offset) = build_test_archive_with_end_less_quick_open_cache();
+
+        let mut cursor = std::io::Cursor::new(archive.clone());
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, None).unwrap();
+
+        // The shape every real `rar`-written archive has: the cache is there,
+        // it is well formed, and it is still refused for want of an end
+        // record — so the walk that produced these headers was the physical
+        // one, and the flag must not claim otherwise.
+        assert_eq!(parsed_file_names(&parsed), ["silver.horizon.mkv"]);
+        assert_eq!(parsed.files[0].header.data_offset, physical_data_offset);
+        assert!(parsed.end.is_some());
+        assert!(
+            !parsed.headers_from_quick_open,
+            "a rejected cache leaves the result physically walked"
+        );
+
+        // A locator is present all the same, which is exactly why the locator
+        // cannot stand in for provenance.
+        assert!(
+            parsed
+                .main
+                .as_ref()
+                .is_some_and(|main| main.quick_open_offset.is_some()),
+            "non-vacuity: this archive really does carry a QuickOpen locator"
+        );
+
+        // And the headers are the ones an opted-out parse returns, field for
+        // field on the parts a caller routes bytes by.
+        let mut opted_out = std::io::Cursor::new(archive);
+        opted_out
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let physical = parse_all_headers_with_options(
+            &mut opted_out,
+            None,
+            HeaderParseOptions {
+                allow_quick_open: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed_file_names(&parsed), parsed_file_names(&physical));
+        assert_eq!(
+            parsed
+                .files
+                .iter()
+                .map(|file| (file.header.data_offset, file.header.data_size))
+                .collect::<Vec<_>>(),
+            physical
+                .files
+                .iter()
+                .map(|file| (file.header.data_offset, file.header.data_size))
+                .collect::<Vec<_>>()
+        );
+        assert!(!physical.headers_from_quick_open);
+    }
+
+    #[test]
+    fn volume_facts_carry_quick_open_provenance_rather_than_locator_presence() {
+        let (adopted_archive, _) = build_test_archive_with_forged_quick_open_member();
+        let adopted = crate::archive::RarArchive::parse_volume_facts(
+            std::io::Cursor::new(adopted_archive),
+            None,
+        )
+        .unwrap();
+        assert!(adopted.headers_from_quick_open);
+
+        let (rejected_archive, _) = build_test_archive_with_end_less_quick_open_cache();
+        let rejected = crate::archive::RarArchive::parse_volume_facts(
+            std::io::Cursor::new(rejected_archive),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !rejected.headers_from_quick_open,
+            "facts from a rejected cache are physically walked"
+        );
+
+        // Both volumes carry a locator, so the two facts differ only in
+        // provenance — the distinction the field exists to draw.
+        assert!(adopted.quick_open_offset.is_some());
+        assert!(rejected.quick_open_offset.is_some());
     }
 
     #[test]
@@ -1639,6 +1803,10 @@ mod tests {
         assert_eq!(parsed_file_names(&parsed), ["physical.bin"]);
         assert_eq!(parsed.files[0].header.data_offset, physical_data_offset);
         assert!(parsed.end.is_some());
+        assert!(
+            !parsed.headers_from_quick_open,
+            "an opted-out parse is physical even where a usable cache exists"
+        );
     }
 
     #[test]
@@ -1696,6 +1864,10 @@ mod tests {
             cached_file_offset + cached_file.len() as u64
         );
         assert!(parsed.end.is_some());
+        assert!(
+            parsed.headers_from_quick_open,
+            "an encrypted cache is still a cache"
+        );
         assert!(
             cache.rar5_cached_entry_count() > 0,
             "encrypted QuickOpen should use the caller-provided RAR5 KDF cache"
@@ -1808,6 +1980,10 @@ mod tests {
                 physical_file_offset + physical_file.len() as u64
             );
             assert!(parsed.end.is_some());
+            assert!(
+                !parsed.headers_from_quick_open,
+                "an unopenable encrypted cache leaves the result physically walked"
+            );
         }
     }
 
@@ -1835,6 +2011,7 @@ mod tests {
             encryption: None,
             end: None,
             is_encrypted: true,
+            headers_from_quick_open: false,
         };
 
         let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed);
