@@ -41,6 +41,23 @@ jobs:
       - name: Test binary release verification and publication gates
         run: python3 -B -m unittest discover -s .github/release-signing -p 'test_*.py' -v
 
+  # The renderer that turns ClusterFuzzLite reproducers into the SARIF the
+  # batch lane uploads (.github/workflows/cflite-batch.yml). It runs on the
+  # nightly runner after the fuzzing container has exited, where a bug in it
+  # would surface as a night of findings that never reached the Security tab
+  # — the failure mode it exists to fix — so it is tested here, on every
+  # change, instead.
+  cflite-sarif:
+    name: cflite-sarif
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the ClusterFuzzLite SARIF renderer
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
   zizmor:
     name: zizmor
     runs-on: ubuntu-24.04
