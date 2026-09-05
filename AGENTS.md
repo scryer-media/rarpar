@@ -40,10 +40,11 @@ and PAR2 workflows.
 
 ## PAR3 Rules
 
-- `par3-rs` is read-only: parsing, set inspection, and verification. Do not add
-  creation, recovery, or repair APIs to it without an explicit decision to widen
-  its scope, and update its README and crate docs in the same change if that
-  happens.
+- `par3-rs` 0.1 is read-only: parsing, set inspection, and verification. The
+  crate is intended to grow into a full PAR3 implementation (creation and
+  repair), but each widening of scope is a deliberate, separately planned step:
+  update the README and crate docs in the same change, and keep the "what does
+  not work yet" statements accurate.
 - Where the PAR3 specification draft and the `par3cmdline` reference
   implementation disagree, follow the reference: it produced the files that
   exist. Record any newly found difference in the deviation table in the crate's
