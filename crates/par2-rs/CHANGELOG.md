@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.1
+
+### Changed
+
+- The optional `native-crypto` backend requires `aws-lc-sys` 0.45 rather than
+  0.44. The workspace moved to 0.45 when `unrar-rs` 0.9.1 was published, but
+  this crate was not republished, so the copy of 0.9.0 on crates.io still asked
+  for 0.44 while its sibling asked for 0.45. Those are incompatible ranges, so
+  anything depending on both resolved two `aws-lc-sys` builds and linked two
+  copies of the same native library; the `rarpar` release audit refuses that,
+  which is how it was found. No API or behaviour change.
+
 ## 0.9.0
 
 ### Changed
