@@ -39,7 +39,7 @@ use std::process::Command;
 
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
+use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
 
 const AES_BLOCK: usize = 16;
 
@@ -335,14 +335,9 @@ fn wasm_host_extract_conformance_encrypted_fixtures() {
         .inherit_stdio()
         .args(&["wasm_extract_conformance", "/fixtures"])
         .env("TMPDIR", "/tmp")
-        .preopened_dir(&fixtures_dir, "/fixtures", DirPerms::READ, FilePerms::READ)
+        .preopened_dir(&fixtures_dir, "/fixtures", FsPerms::ReadOnly)
         .expect("preopen fixtures dir")
-        .preopened_dir(
-            &tmp_dir,
-            "/tmp",
-            DirPerms::READ | DirPerms::MUTATE,
-            FilePerms::READ | FilePerms::WRITE,
-        )
+        .preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)
         .expect("preopen tmp dir")
         .build_p1();
     let mut store = Store::new(&engine, wasi);

@@ -53,7 +53,7 @@ aws-lc-sys = { workspace = true, optional = true }
 # Capability-relative path resolution prevents repair destinations from
 # escaping the caller-selected working directory through Windows reparse
 # points while preserving support for a caller-selected symlinked root.
-cap-std = "4.0.2"
+cap-std = "4.0.3"
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }

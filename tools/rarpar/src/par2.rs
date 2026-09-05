@@ -140,7 +140,6 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
     options.backend = match args.backend {
         ParCreationBackend::Cpu => CreationBackend::Cpu,
         ParCreationBackend::Auto => CreationBackend::Auto,
-        ParCreationBackend::Metal => CreationBackend::Metal,
     };
     options.overwrite = cli.overwrite;
     options.dry_run = cli.dry_run;
