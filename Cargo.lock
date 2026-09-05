@@ -1947,12 +1947,31 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.3",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
- "unrar-rs",
+ "unrar-rs 0.10.0",
+]
+
+[[package]]
+name = "par2-rs"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b12ba7c7fe4afe720eeb9157b48cc14b0ae71eba0a2173524fafb54d21eb51bc"
+dependencies = [
+ "aws-lc-sys",
+ "bytes",
+ "cap-std",
+ "crc-fast",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -2170,18 +2189,18 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "rarpar"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "mimalloc",
- "par2-rs",
+ "par2-rs 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
- "unrar-rs",
+ "unrar-rs 0.9.2",
 ]
 
 [[package]]
@@ -2254,6 +2273,16 @@ dependencies = [
  "pollster",
  "rayon",
  "wgpu",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9884b16620acba60129b537d7853b864293fbcd17080749f81a8662f3e72061"
+dependencies = [
+ "memmap2",
+ "rayon",
 ]
 
 [[package]]
@@ -2888,6 +2917,33 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unrar-rs"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f6ffb90d0e69ea2ef133efe575e853a61dc4bdfd629506e4ffb8eb4aa1f6a00"
+dependencies = [
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "blake2s_simd",
+ "crc-fast",
+ "filetime",
+ "libc",
+ "memchr",
+ "rayon",
+ "reedsolomon-rs 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rmp-serde",
+ "serde",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "unrar-rs"
 version = "0.10.0"
 dependencies = [
  "aes",
@@ -2902,7 +2958,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.3",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",

@@ -734,6 +734,8 @@ struct CargoPackage {
 
 #[derive(Deserialize)]
 struct CargoResolve {
+    #[serde(default)]
+    root: Option<String>,
     nodes: Vec<CargoNode>,
 }
 
@@ -741,6 +743,38 @@ struct CargoResolve {
 struct CargoNode {
     id: String,
     features: Vec<String>,
+    #[serde(default)]
+    deps: Vec<CargoNodeDep>,
+}
+
+#[derive(Deserialize)]
+struct CargoNodeDep {
+    pkg: String,
+    #[serde(default)]
+    dep_kinds: Vec<CargoDepKind>,
+}
+
+#[derive(Deserialize)]
+struct CargoDepKind {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+impl CargoNodeDep {
+    /// Whether this edge reaches code the release artifact is built from.
+    ///
+    /// `cargo metadata` reports dev-dependencies alongside the rest, and they
+    /// pull in crates the shipped binary never contains — `par2-rs` keeps
+    /// `unrar-rs` as test tooling, which is how a second copy of it reaches
+    /// the graph. An edge with no recorded kinds is kept, so hand-built
+    /// metadata still traverses.
+    fn is_built(&self) -> bool {
+        self.dep_kinds.is_empty()
+            || self
+                .dep_kinds
+                .iter()
+                .any(|dep_kind| dep_kind.kind.as_deref() != Some("dev"))
+    }
 }
 
 fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
@@ -858,14 +892,53 @@ fn reject_resolved_package(metadata: &CargoMetadata, package: &str) -> Result<()
     Ok(())
 }
 
+/// Package ids the audited binary actually links.
+///
+/// `cargo metadata` on a workspace member reports the whole workspace, so a
+/// crate that appears twice across the workspace — once as a member, once
+/// pulled from the registry by the audited binary — shows up as two packages
+/// of the same name. Only the copy inside the root's dependency closure is
+/// linked into the artifact, so every name lookup below is restricted to it.
+/// A virtual workspace has no root; there the whole graph stands in, which is
+/// the behaviour this had before.
+fn resolved_closure(metadata: &CargoMetadata) -> HashSet<&str> {
+    let Some(root) = metadata.resolve.root.as_deref() else {
+        return metadata
+            .resolve
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+    };
+    let mut reachable = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        let Some(node) = metadata.resolve.nodes.iter().find(|node| node.id == id) else {
+            continue;
+        };
+        pending.extend(
+            node.deps
+                .iter()
+                .filter(|dep| dep.is_built())
+                .map(|dep| dep.pkg.as_str()),
+        );
+    }
+    reachable
+}
+
 fn resolved_package_node<'a>(
     metadata: &'a CargoMetadata,
     name: &str,
 ) -> Result<(&'a CargoPackage, &'a CargoNode)> {
+    let closure = resolved_closure(metadata);
     let candidates = metadata
         .packages
         .iter()
         .filter(|package| package.name == name)
+        .filter(|package| closure.contains(package.id.as_str()))
         .filter_map(|package| {
             metadata
                 .resolve
@@ -883,12 +956,7 @@ fn resolved_package_node<'a>(
 }
 
 fn resolved_package_versions(metadata: &CargoMetadata, name: &str) -> BTreeSet<String> {
-    let resolved_ids = metadata
-        .resolve
-        .nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<HashSet<_>>();
+    let resolved_ids = resolved_closure(metadata);
     metadata
         .packages
         .iter()
@@ -1544,6 +1612,49 @@ mod tests {
     }
 
     #[test]
+    fn feature_audit_ignores_a_same_named_package_outside_the_closure() -> Result<()> {
+        // The workspace can carry a member the audited binary does not link:
+        // `rarpar` takes `unrar-rs` from the registry while `crates/unrar-rs`
+        // develops a newer version. Both land in `cargo metadata`, and only
+        // the one inside rarpar's closure is linked.
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        let mut metadata = feature_metadata(&["0.45.0"]);
+        metadata.packages.push(CargoPackage {
+            id: "unrar-rs-workspace".to_owned(),
+            name: "unrar-rs".to_owned(),
+            version: "0.10.0".to_owned(),
+        });
+        metadata.resolve.nodes.push(CargoNode {
+            id: "unrar-rs-workspace".to_owned(),
+            features: Vec::new(),
+            deps: Vec::new(),
+        });
+        audit_feature_metadata(&metadata, &options)
+    }
+
+    #[test]
+    fn feature_audit_still_rejects_a_duplicate_inside_the_closure() {
+        // Scoping to the closure must not blunt the check that caught the
+        // 0.4.0 release: two `aws-lc-sys` builds rarpar really does link.
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        let error = audit_feature_metadata(&feature_metadata(&["0.44.0", "0.45.0"]), &options)
+            .expect_err("two linked aws-lc-sys versions must fail the audit");
+        assert!(
+            error
+                .to_string()
+                .contains("one resolved aws-lc-sys version")
+        );
+    }
+
+    #[test]
     fn feature_audit_rejects_duplicate_aws_lc_bindings() {
         let options = FeatureAuditOptions {
             manifest: PathBuf::from("Cargo.toml"),
@@ -1679,18 +1790,22 @@ mod tests {
             CargoNode {
                 id: "rarpar".to_owned(),
                 features: vec!["runtime".to_owned()],
+                deps: deps(&["par2-rs", "unrar-rs", "reedsolomon-rs"]),
             },
             CargoNode {
                 id: "par2-rs".to_owned(),
                 features: vec!["native-crypto".to_owned()],
+                deps: deps(&["reedsolomon-rs"]),
             },
             CargoNode {
                 id: "unrar-rs".to_owned(),
                 features: vec!["crypto-aws-lc".to_owned()],
+                deps: Vec::new(),
             },
             CargoNode {
                 id: "reedsolomon-rs".to_owned(),
                 features: Vec::new(),
+                deps: Vec::new(),
             },
         ];
 
@@ -1701,16 +1816,34 @@ mod tests {
                 name: "aws-lc-sys".to_owned(),
                 version: (*version).to_owned(),
             });
+            nodes[2].deps.push(CargoNodeDep {
+                pkg: id.clone(),
+                dep_kinds: Vec::new(),
+            });
             nodes.push(CargoNode {
                 id,
                 features: Vec::new(),
+                deps: Vec::new(),
             });
         }
 
         CargoMetadata {
             packages,
-            resolve: CargoResolve { nodes },
+            resolve: CargoResolve {
+                root: Some("rarpar".to_owned()),
+                nodes,
+            },
         }
+    }
+
+    fn deps(names: &[&str]) -> Vec<CargoNodeDep> {
+        names
+            .iter()
+            .map(|name| CargoNodeDep {
+                pkg: (*name).to_owned(),
+                dep_kinds: Vec::new(),
+            })
+            .collect()
     }
 
     fn metal_feature_metadata() -> CargoMetadata {
@@ -1733,7 +1866,19 @@ mod tests {
         metadata.resolve.nodes.push(CargoNode {
             id: "objc2-metal".to_owned(),
             features: Vec::new(),
+            deps: Vec::new(),
         });
+        if let Some(node) = metadata
+            .resolve
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "reedsolomon-rs")
+        {
+            node.deps.push(CargoNodeDep {
+                pkg: "objc2-metal".to_owned(),
+                dep_kinds: Vec::new(),
+            });
+        }
         metadata
     }
 
