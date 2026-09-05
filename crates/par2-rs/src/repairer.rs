@@ -1084,6 +1084,42 @@ pub struct Par2RepairerOptions {
     pub par2_paths: Vec<PathBuf>,
     pub recovery_paths: Vec<PathBuf>,
     pub extra_paths: Vec<PathBuf>,
+    /// Paths that must never be offered to the scan as extra candidates, even
+    /// though they sit under [`base_dir`].
+    ///
+    /// An extra candidate is a file the set does not describe, rolling-scanned
+    /// window by window on the chance that it holds a copy of some slice. That
+    /// is worth doing for a renamed or concatenated source. It is pure waste
+    /// for a file whose bytes provably belong to something else — most often a
+    /// *different* recovery set's volumes sitting in the same directory, which
+    /// cannot contain this set's slices at any offset. Without a way to say so,
+    /// a directory holding two sets makes each set read the other set's
+    /// payload end to end, finding nothing, once per scanning pass.
+    ///
+    /// Entries are canonicalised the same way discovered candidates and
+    /// [`extra_paths`] are, so a symlink and its target name the same
+    /// exclusion. An entry that names nothing, or that names a file the set
+    /// itself describes, is inert: source files are never extra candidates.
+    ///
+    /// This bounds only the *extra* scan. Canonical source files, `.par2`
+    /// packet inputs, and explicit [`recovery_paths`] are unaffected.
+    ///
+    /// [`base_dir`]: Self::base_dir
+    /// [`extra_paths`]: Self::extra_paths
+    /// [`recovery_paths`]: Self::recovery_paths
+    pub exclude_paths: Vec<PathBuf>,
+    /// Whether the extra scan walks [`base_dir`] looking for candidates.
+    ///
+    /// `true` — the default, and what every release before this field did —
+    /// enrols every non-`.par2` file under the directory. `false` restricts the
+    /// extra scan to the explicit [`extra_paths`], for a caller that already
+    /// knows what the directory holds and does not want the walk to enrol
+    /// anything else. Canonical source files are scanned either way; only the
+    /// extra candidates come from this walk.
+    ///
+    /// [`base_dir`]: Self::base_dir
+    /// [`extra_paths`]: Self::extra_paths
+    pub discover_extras: bool,
     pub repair: bool,
     /// Working-memory budget applied to scanning and repair. Parallel ordered
     /// scans fall back to the bounded serial scanner when their fixed
@@ -1107,7 +1143,10 @@ pub struct Par2RepairerOptions {
     /// consumes the carry only when all of them still match; every other
     /// accepted-carry result is retried from a fresh content scan before
     /// reporting. Must come from a pass with the same `base_dir`/
-    /// `extra_paths`/`scan_skip_*` configuration.
+    /// `extra_paths`/`exclude_paths`/`discover_extras`/`scan_skip_*`
+    /// configuration: those five decide which files the scan was allowed to
+    /// look at, and carried block locations are only a complete account of the
+    /// tree for a pass that was allowed to look at the same ones.
     pub scan_carry: Option<Arc<ScanCarry>>,
 }
 
@@ -1119,6 +1158,8 @@ impl Par2RepairerOptions {
             par2_paths,
             recovery_paths: Vec::new(),
             extra_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            discover_extras: true,
             repair: true,
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
             packet_scan_limits: PacketScanLimits::default(),
@@ -3459,6 +3500,58 @@ impl RepairState {
             })
     }
 
+    /// The files this pass may rolling-scan as extra candidates: everything
+    /// under `base_dir` that carries no `.par2` marker, plus the caller's
+    /// explicit `extra_paths`, minus the set's own source files and minus
+    /// `exclude_paths`.
+    ///
+    /// Every membership test runs on the canonicalised path, so a discovered
+    /// path, an explicit extra, a source file and an exclusion that all resolve
+    /// to the same inode collapse to one entry rather than being scanned twice
+    /// or excluded by name only.
+    ///
+    /// `discover_extras == false` skips the directory walk entirely: the
+    /// caller's explicit extras are then the whole candidate list.
+    fn extra_scan_candidates(&self, options: &Par2RepairerOptions) -> Result<Vec<ScanCandidate>> {
+        let source_file_keys: HashSet<PathBuf> = self
+            .files
+            .iter()
+            .map(|file| canonical_extra_path(&file.safe_path))
+            .collect();
+        let excluded_keys: HashSet<PathBuf> = options
+            .exclude_paths
+            .iter()
+            .map(|path| canonical_extra_path(path))
+            .collect();
+        let mut extra_candidates = BTreeMap::new();
+        if options.discover_extras {
+            for path in discover_candidate_files(&options.base_dir)? {
+                extra_candidates
+                    .entry(canonical_extra_path(&path))
+                    .or_insert(path);
+            }
+        }
+        for path in &options.extra_paths {
+            if !has_par2_marker(path)
+                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                let canonical = canonical_extra_path(path);
+                extra_candidates.insert(canonical.clone(), canonical);
+            }
+        }
+        Ok(extra_candidates
+            .into_iter()
+            .filter_map(|(key, path)| {
+                (!source_file_keys.contains(&key) && !excluded_keys.contains(&key)).then_some(
+                    ScanCandidate {
+                        path,
+                        kind: BlockLocationKind::Extra,
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Scan only files that do not already have committed whole-file or
     /// per-slice evidence. This is deliberately separate from `scan`, which
     /// remains the one-shot scanner and preserves its existing behaviour.
@@ -3496,34 +3589,7 @@ impl RepairState {
             return Ok(diagnostics);
         }
 
-        let source_file_keys: HashSet<PathBuf> = self
-            .files
-            .iter()
-            .map(|file| canonical_extra_path(&file.safe_path))
-            .collect();
-        let mut extra_candidates = BTreeMap::new();
-        for path in discover_candidate_files(&options.base_dir)? {
-            extra_candidates
-                .entry(canonical_extra_path(&path))
-                .or_insert(path);
-        }
-        for path in &options.extra_paths {
-            if !has_par2_marker(path)
-                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                let canonical = canonical_extra_path(path);
-                extra_candidates.insert(canonical.clone(), canonical);
-            }
-        }
-        let extra_candidates = extra_candidates
-            .into_iter()
-            .filter_map(|(key, path)| {
-                (!source_file_keys.contains(&key)).then_some(ScanCandidate {
-                    path,
-                    kind: BlockLocationKind::Extra,
-                })
-            })
-            .collect::<Vec<_>>();
+        let extra_candidates = self.extra_scan_candidates(options)?;
         // Extra candidates are, by construction, paths no source file claims,
         // so no seeded verdict can name one. The empty plan states that rather
         // than relying on the lookup to miss.
@@ -3563,39 +3629,7 @@ impl RepairState {
             return Ok(diagnostics);
         }
 
-        let source_file_keys: HashSet<PathBuf> = self
-            .files
-            .iter()
-            .map(|file| canonical_extra_path(&file.safe_path))
-            .collect();
-        let mut extra_candidates = BTreeMap::new();
-        for path in discover_candidate_files(&options.base_dir)? {
-            extra_candidates
-                .entry(canonical_extra_path(&path))
-                .or_insert(path);
-        }
-        for path in &options.extra_paths {
-            if !has_par2_marker(path) {
-                let Ok(metadata) = fs::symlink_metadata(path) else {
-                    continue;
-                };
-                if !metadata.file_type().is_file() {
-                    continue;
-                }
-                let canonical = canonical_extra_path(path);
-                extra_candidates.insert(canonical.clone(), canonical);
-            }
-        }
-
-        let extra_candidates = extra_candidates
-            .into_iter()
-            .filter_map(|(key, path)| {
-                (!source_file_keys.contains(&key)).then_some(ScanCandidate {
-                    path,
-                    kind: BlockLocationKind::Extra,
-                })
-            })
-            .collect::<Vec<_>>();
+        let extra_candidates = self.extra_scan_candidates(options)?;
         self.scan_candidates(
             options,
             &extra_candidates,
@@ -11146,6 +11180,157 @@ mod tests {
                 .as_ref()
                 .and_then(|location| location.path()),
             Some(canonical_extra.as_path())
+        );
+    }
+
+    /// A directory can hold the volumes of a *different* recovery set, whose
+    /// bytes cannot contain this set's slices at any offset. Naming them keeps
+    /// the extra scan from reading them window by window. The first half of
+    /// this test is the cost being avoided: without the exclusion the same
+    /// file is read end to end.
+    #[test]
+    fn scan_excludes_named_paths_from_extra_candidates() {
+        let dir = tempdir().unwrap();
+        let data = b"complete-target-inside-a-foreign-volume".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let foreign = dir.path().join("other-set.rar");
+        fs::write(&foreign, &data).unwrap();
+
+        let mut discovered = RepairState::from_set(dir.path(), set.clone()).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let scan = discovered.scan(&options).unwrap();
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(scan.bytes_scanned, data.len() as u64);
+
+        let mut excluded = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.exclude_paths.push(foreign);
+        let scan = excluded.scan(&options).unwrap();
+
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(scan.bytes_scanned, 0);
+        assert!(excluded.blocks.iter().all(|block| block.location.is_none()));
+    }
+
+    /// The exclusion is a list of paths, not a switch: an extra the caller did
+    /// not name is still discovered and still scanned, which is what makes a
+    /// renamed source findable.
+    #[test]
+    fn scan_still_reads_extras_the_exclusion_does_not_name() {
+        let dir = tempdir().unwrap();
+        let data = b"complete-target-beside-a-foreign-volume".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let foreign = dir.path().join("other-set.rar");
+        fs::write(&foreign, b"bytes belonging to another recovery set").unwrap();
+        fs::write(dir.path().join("renamed.bin"), &data).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.exclude_paths.push(foreign);
+        let scan = state.scan(&options).unwrap();
+
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(scan.bytes_scanned, data.len() as u64);
+        assert_eq!(state.verification_result().total_missing_blocks, 0);
+    }
+
+    /// Exclusions are matched on the canonicalised path, the same key the
+    /// discovered candidates and the explicit extras are keyed by, so an
+    /// exclusion spelled differently from the walk's own spelling still lands.
+    #[test]
+    fn scan_canonicalizes_exclusions_before_matching_candidates() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(base.join("subdir")).unwrap();
+        let data = b"complete-target-reached-by-two-spellings".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        fs::write(base.join("other-set.rar"), &data).unwrap();
+
+        let mut state = RepairState::from_set(&base, set).unwrap();
+        let mut options = Par2RepairerOptions::new(base.clone(), Vec::new());
+        options
+            .exclude_paths
+            .push(base.join("subdir").join("..").join("other-set.rar"));
+        let scan = state.scan(&options).unwrap();
+
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(scan.bytes_scanned, 0);
+        assert!(state.blocks.iter().all(|block| block.location.is_none()));
+    }
+
+    /// With discovery off the directory walk contributes nothing, so a caller
+    /// that already knows what the tree holds pays for exactly the extras it
+    /// named and no others.
+    #[test]
+    fn scan_without_extra_discovery_reads_only_explicit_extras() {
+        let dir = tempdir().unwrap();
+        let data = b"complete-target-not-worth-discovering".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let undiscovered = dir.path().join("undiscovered.bin");
+        fs::write(&undiscovered, &data).unwrap();
+
+        let mut ignored = RepairState::from_set(dir.path(), set.clone()).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.discover_extras = false;
+        let scan = ignored.scan(&options).unwrap();
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(scan.bytes_scanned, 0);
+
+        let mut named = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.discover_extras = false;
+        options.extra_paths.push(undiscovered);
+        let scan = named.scan(&options).unwrap();
+
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(scan.bytes_scanned, data.len() as u64);
+        assert_eq!(named.verification_result().total_missing_blocks, 0);
+    }
+
+    /// A carry stays usable across passes that agree on the exclusion. The
+    /// excluded file contributes no snapshot entry — nothing observed it — so
+    /// the gate that re-stats what the scan saw has nothing to say about it,
+    /// and the carried analysis installs as it would without the exclusion.
+    #[test]
+    fn scan_carry_applies_across_a_shared_exclusion() {
+        let dir = tempdir().unwrap();
+        let slice_size = 8u64;
+        let file_data = b"alpha---beta----gamma---".to_vec();
+        let set = synthetic_set(&[("target.bin", &file_data)], slice_size);
+        let mut damaged = file_data.clone();
+        damaged[..slice_size as usize].fill(0);
+        fs::write(dir.path().join("target.bin"), &damaged).unwrap();
+        let foreign = dir.path().join("other-set.rar");
+        fs::write(&foreign, &file_data).unwrap();
+
+        let mut analyze = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        analyze.file_set = Some(set.clone());
+        analyze.repair = false;
+        analyze.exclude_paths = vec![foreign.clone()];
+        let (first, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert!(first.verification.total_missing_blocks > 0, "{first:#?}");
+        assert_eq!(
+            first.scan.bytes_scanned,
+            damaged.len() as u64,
+            "the excluded volume must not be read: {first:#?}"
+        );
+        let carry = carry.expect("an analyze pass carries its scan state");
+
+        let mut second = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        second.file_set = Some(set);
+        second.repair = false;
+        second.exclude_paths = vec![foreign];
+        second.scan_carry = Some(carry);
+        let outcome = Par2Repairer::new(second).verify_or_repair().unwrap();
+
+        assert!(outcome.carry.carry_attempted, "{outcome:#?}");
+        assert!(outcome.carry.carry_applied, "{outcome:#?}");
+        assert_eq!(
+            outcome.verification.total_missing_blocks, first.verification.total_missing_blocks,
+            "{outcome:#?}"
         );
     }
 

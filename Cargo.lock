@@ -1937,6 +1937,25 @@ dependencies = [
 [[package]]
 name = "par2-rs"
 version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b12ba7c7fe4afe720eeb9157b48cc14b0ae71eba0a2173524fafb54d21eb51bc"
+dependencies = [
+ "aws-lc-sys",
+ "bytes",
+ "cap-std",
+ "crc-fast",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "par2-rs"
+version = "0.10.0"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -1953,25 +1972,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unrar-rs 0.10.1",
-]
-
-[[package]]
-name = "par2-rs"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b12ba7c7fe4afe720eeb9157b48cc14b0ae71eba0a2173524fafb54d21eb51bc"
-dependencies = [
- "aws-lc-sys",
- "bytes",
- "cap-std",
- "crc-fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "reedsolomon-rs 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.20",
- "tracing",
 ]
 
 [[package]]
@@ -2193,7 +2193,7 @@ version = "0.4.1"
 dependencies = [
  "clap",
  "mimalloc",
- "par2-rs 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "par2-rs 0.9.1",
  "serde",
  "serde_json",
  "tempfile",
