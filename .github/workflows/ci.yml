@@ -31,17 +31,31 @@ jobs:
     name: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # One boolean per workspace member, decided by `.github/scripts/ci_changes.py`
+    # from the changed paths, the lockfile diff and the dependency graph: a
+    # member is affected when its own files changed, when a locked dependency
+    # in its closure changed, or when a workspace member it depends on is
+    # affected. `crates` is any library crate under `crates/`; `rust` is any
+    # member at all. Lanes that run one crate's suite key on that crate.
     outputs:
-      crates: ${{ steps.detect.outputs.crates }}
+      reedsolomon: ${{ steps.detect.outputs.reedsolomon }}
+      unrar: ${{ steps.detect.outputs.unrar }}
+      par2: ${{ steps.detect.outputs.par2 }}
+      par3: ${{ steps.detect.outputs.par3 }}
       rarpar: ${{ steps.detect.outputs.rarpar }}
+      xtask: ${{ steps.detect.outputs.xtask }}
+      crates: ${{ steps.detect.outputs.crates }}
       rust: ${{ steps.detect.outputs.rust }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - id: detect
-        name: Detect changed areas
+        name: Detect affected workspace members
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -51,12 +65,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Resolving the graph needs no build, only the index.
+          cargo metadata --locked --all-features --format-version 1 \
+            > "$RUNNER_TEMP/metadata.json"
+
+          classify() {
+            python3 .github/scripts/ci_changes.py "$@" \
+              --metadata "$RUNNER_TEMP/metadata.json" \
+              --github-output "$GITHUB_OUTPUT" \
+              --step-summary "$GITHUB_STEP_SUMMARY"
+          }
+
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            {
-              echo "crates=true"
-              echo "rarpar=true"
-              echo "rust=true"
-            } >> "$GITHUB_OUTPUT"
+            classify --all
             exit 0
           fi
 
@@ -79,64 +100,24 @@ jobs:
           esac
 
           if [ -z "${base:-}" ]; then
-            git ls-files > changed-files.txt
-          else
-            git diff --name-only "$base" "$head" > changed-files.txt
+            classify --all
+            exit 0
           fi
 
-          crates_direct=false
-          rarpar_direct=false
-          shared_rust=false
+          # Compare against the fork point, not the base branch's current tip:
+          # what main merged since the branch was cut has already been tested
+          # on main, and counting it here is what used to make every stale PR
+          # run every lane.
+          base="$(git merge-base "$base" "$head" 2>/dev/null || echo "$base")"
 
-          while IFS= read -r path; do
-            case "$path" in
-              crates/*|.github/workflows/publish-crates.yml|.gitattributes|.gitleaks.toml|.githooks/*|.github/scripts/*|test-corpus/*|.github/workflows/test-corpus-publish.yml)
-                crates_direct=true
-                ;;
-              tools/rarpar/*|xtask/*|bench/rarpar-bench/*|.github/workflows/release.yml|README.md|docs/*)
-                rarpar_direct=true
-                ;;
-              .github/workflows/ci.yml)
-                crates_direct=true
-                rarpar_direct=true
-                ;;
-              Cargo.toml|Cargo.lock|rust-toolchain.toml)
-                shared_rust=true
-                ;;
-            esac
-          done < changed-files.txt
+          git diff --name-only "$base" "$head" > "$RUNNER_TEMP/changed-files.txt"
+          git show "$base:Cargo.lock" > "$RUNNER_TEMP/old.lock" 2>/dev/null || : > "$RUNNER_TEMP/old.lock"
+          git show "$head:Cargo.lock" > "$RUNNER_TEMP/new.lock" 2>/dev/null || : > "$RUNNER_TEMP/new.lock"
 
-          crates="$crates_direct"
-          rarpar="$rarpar_direct"
-
-          if [ "$shared_rust" = true ] && [ "$rarpar_direct" = false ]; then
-            crates=true
-          fi
-          if [ "$shared_rust" = true ] && [ "$crates_direct" = false ]; then
-            rarpar=true
-          fi
-
-          rust=false
-          if [ "$crates" = true ] || [ "$rarpar" = true ]; then
-            rust=true
-          fi
-
-          {
-            echo "crates=$crates"
-            echo "rarpar=$rarpar"
-            echo "rust=$rust"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### Change classification"
-            echo
-            echo "- crates: \`$crates\`"
-            echo "- rarpar: \`$rarpar\`"
-            echo "- rust: \`$rust\`"
-            echo
-            echo "Changed files:"
-            sed 's/^/- `/' changed-files.txt | sed 's/$/`/'
-          } >> "$GITHUB_STEP_SUMMARY"
+          classify \
+            --changed-files "$RUNNER_TEMP/changed-files.txt" \
+            --old-lock "$RUNNER_TEMP/old.lock" \
+            --new-lock "$RUNNER_TEMP/new.lock"
 
   hygiene:
     name: hygiene
@@ -400,7 +381,9 @@ jobs:
   fixture-tests:
     name: fixture-tests
     needs: [changes, fmt, clippy, clippy-aarch64, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    # Everything this lane tests is outside unrar-rs and par2-rs: reedsolomon-rs,
+    # the rarpar CLI suite and xtask. Their own lanes cover the two heavy crates.
+    if: needs.changes.outputs.reedsolomon == 'true' || needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.xtask == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -482,7 +465,7 @@ jobs:
   par2-tests:
     name: par2-tests
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.par2 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -556,7 +539,7 @@ jobs:
   unrar-tests-shard:
     name: unrar-tests (${{ matrix.shard }}/3)
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.unrar == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -723,7 +706,7 @@ jobs:
   unrar-tests:
     name: unrar-tests
     needs: [changes, unrar-tests-shard]
-    if: ${{ always() && needs.changes.outputs.crates == 'true' }}
+    if: ${{ always() && needs.changes.outputs.unrar == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -1318,7 +1301,7 @@ jobs:
   cli-smoke:
     name: cli-smoke
     needs: [changes, unit-tests]
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rarpar == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -1394,7 +1377,7 @@ jobs:
   wasm-par2-harness:
     name: wasm-par2-harness
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.par2 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -1568,7 +1551,7 @@ jobs:
   wasm-unrar-harness:
     name: wasm-unrar-harness
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.unrar == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
