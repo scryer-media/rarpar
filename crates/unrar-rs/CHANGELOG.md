@@ -37,6 +37,49 @@ find out what it had already been given.
   store that persists these facts across an upgrade should key entries by
   crate version and re-parse anything older.
 
+## 0.9.2
+
+Hardening against pathological RAR4 input found by the nightly fuzzing lane.
+Every reproducer it saved since 2026-08-16 (18 inputs of 73 bytes to 1.6 KiB,
+each declaring 2.5 MB to 4.2 GB of output) now fails fast with
+`CorruptArchive` instead of hanging, panicking, or trying to decode gigabytes
+from a kilobyte. Legitimate archives pay nothing for it: the checks run at
+header time, or on paths the decoder only reaches once its input is already
+exhausted, and the RAR4 LZ and PPMd decode benches are unchanged within noise.
+
+### Fixed
+
+- A RAR4 file header declaring a `packed_size` above `i64::MAX` made the
+  volume scan seek *backwards* (the size was cast to `i64` for a relative
+  seek), re-read the same header indefinitely, and grow the member list
+  without bound; this was reachable from `RarArchive::open` alone. Every data
+  skip is now a checked forward seek, each scan must strictly advance per
+  header, and no volume yields more than `MAX_HEADERS_PER_VOLUME` headers.
+- A RAR4 member whose data offset plus declared `packed_size` lies past the
+  end of its volume is rejected when its header is read, unless the header
+  says the data continues in the next volume. That is where most of the
+  fuzzer's inputs now stop, before any decoder runs.
+- The RAR4 LZ decoder could spin forever once its input ran out: the
+  bit reader kept reporting bits remaining from a stale accumulator while
+  refilling from nothing on every call. `bits_remaining()` no longer refills
+  past end of input, and a decode round that neither consumes input nor
+  produces output ends the member as corrupt.
+- PPMd: the run-length counter overflowed `i32` after enough binary-context
+  symbols and, with overflow checks on, panicked (it also feeds an array index,
+  so a silent wrap was not benign); it saturates. A stream repeating the
+  VM-code escape with no output is bounded by the filter queue's own limit,
+  and a range decoder fed zeros past end of input fails after 64 of them
+  instead of decoding symbols forever.
+- The sliding window's invisible-byte accounting is a running total rather
+  than a scan of every recorded range per symbol.
+
+### Added
+
+- `limits::MAX_HEADERS_PER_VOLUME`.
+- The fuzz seed corpus under `fuzz/corpus/<target>/` carries the 18
+  reproducers, and `tests/fuzz_corpus_regressions.rs` replays them. Both are
+  excluded from the published crate together with the rest of `fuzz/**`.
+
 ## 0.9.1
 
 A recovery-volume fix for header-encrypted sets.
