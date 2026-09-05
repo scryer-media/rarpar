@@ -170,37 +170,6 @@ pub struct RarVolumeFacts {
     pub has_locator: bool,
     #[serde(default)]
     pub quick_open_offset: Option<u64>,
-    /// Whether these facts were read out of the volume's Quick Open cache
-    /// instead of off its physical header chain.
-    ///
-    /// `true` only when the parse answered wholly from the `QO` service block.
-    /// It is `false` for every physically walked volume — including one whose
-    /// `QO` block was present but rejected, and every RAR4/RAR1.4 volume,
-    /// which has no such cache.
-    ///
-    /// **Cache-derived facts are not authoritative.** Nothing in RAR5 binds a
-    /// `QO` record to the physical header it claims to describe, and the
-    /// format's own specification warns the cached copies may deliberately
-    /// differ. A caller deciding where bytes are written — member names, data
-    /// offsets, what is admitted downstream — should re-parse the volume with
-    /// `HeaderParseOptions { allow_quick_open: false }` when this is `true`,
-    /// and can skip that second walk when it is `false`.
-    ///
-    /// This, not `quick_open_offset`, is the provenance answer.
-    /// `quick_open_offset.is_some()` says a locator record exists in the main
-    /// header; it says nothing about where these facts came from, because a
-    /// located cache may still have been rejected.
-    ///
-    /// Cache compatibility, and the one sharp edge here: facts encoded by a
-    /// binary from before this field existed carry no value for it and decode
-    /// as `false`. Those binaries did consult the Quick Open cache by default,
-    /// so such a row can claim a physical walk it never performed. The field
-    /// is only load-bearing for rows this version or later wrote; a store that
-    /// persists these facts across an upgrade should key its entries by crate
-    /// version and re-parse anything older rather than read provenance out of
-    /// them.
-    #[serde(default)]
-    pub headers_from_quick_open: bool,
     #[serde(default)]
     pub recovery_record_offset: Option<u64>,
     #[serde(default)]
@@ -853,9 +822,6 @@ impl RarArchive {
                 has_authenticity_verification: parsed.archive_header.has_authenticity_verification,
                 has_locator: false,
                 quick_open_offset: None,
-                // RAR4 and RAR1.4 have no Quick Open cache; this walk is
-                // physical by construction.
-                headers_from_quick_open: false,
                 recovery_record_offset: None,
                 original_name: None,
                 original_name_raw: None,
@@ -877,10 +843,6 @@ impl RarArchive {
         let is_locked = main.is_some_and(|main| main.is_locked);
         let has_locator = main.is_some_and(|main| main.has_locator);
         let quick_open_offset = main.and_then(|main| main.quick_open_offset);
-        // Provenance, not the mere presence of a locator: a volume can carry
-        // `quick_open_offset` and still be answered by the physical walk when
-        // its `QO` block was rejected.
-        let headers_from_quick_open = parsed.headers_from_quick_open;
         let recovery_record_offset = main.and_then(|main| main.recovery_record_offset);
         let original_name = main.and_then(|main| main.original_name.clone());
         let original_name_raw = main.and_then(|main| main.original_name_raw.clone());
@@ -977,7 +939,6 @@ impl RarArchive {
             has_authenticity_verification: false,
             has_locator,
             quick_open_offset,
-            headers_from_quick_open,
             recovery_record_offset,
             original_name,
             original_name_raw,
