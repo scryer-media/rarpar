@@ -33,9 +33,12 @@ use crate::packet::{HEADER_SIZE, InputSetId, MAGIC, Packet, PacketBody, ParseCon
 /// Bounds on one scan.
 ///
 /// The scanner never allocates from a length it has not first checked against
-/// the input, so these are a guard against a large *valid* input rather than
-/// against a malicious small one. Exceeding any of them fails the scan with
-/// [`Par3Error::ScanLimitExceeded`]; the result is never silently truncated.
+/// the input, so most of these guard against a large *valid* input rather than
+/// against a malicious small one. The exception is
+/// [`max_failed_hash_passes`](ScanLimits::max_failed_hash_passes), which bounds
+/// the work a small hostile input can ask for. Exceeding any of them fails the
+/// scan with [`Par3Error::ScanLimitExceeded`]; the result is never silently
+/// truncated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScanLimits {
@@ -47,6 +50,20 @@ pub struct ScanLimits {
     pub max_packets: usize,
     /// Most body bytes one scan may retain.
     pub max_retained_bytes: u64,
+    /// How many times over the input the scanner may hash bytes belonging to
+    /// candidates that turn out not to be packets.
+    ///
+    /// A header that looks plausible can claim a range reaching to the end of
+    /// the input, and the only way to find out that the claim is a lie is to
+    /// hash that range. Rejecting a candidate only steps eight bytes, so an
+    /// input made of nothing but overlapping candidates would otherwise cost
+    /// work quadratic in its length. Genuine damage costs at most one pass over
+    /// the bytes it covers, so a small multiple leaves real files alone.
+    ///
+    /// The budget is checked once a candidate has been hashed rather than
+    /// before, so that a valid packet is never refused because of the damage
+    /// ahead of it; at most one candidate is hashed past the budget.
+    pub max_failed_hash_passes: u64,
 }
 
 impl ScanLimits {
@@ -58,6 +75,10 @@ impl ScanLimits {
     pub const DEFAULT_MAX_PACKETS: usize = 1_000_000;
     /// 4 GiB of retained bodies.
     pub const DEFAULT_MAX_RETAINED_BYTES: u64 = 4 << 30;
+    /// Eight passes. A `.par3` file damaged from end to end still only costs
+    /// one, so this is generous for real recovery data and still turns the
+    /// quadratic worst case into a linear one.
+    pub const DEFAULT_MAX_FAILED_HASH_PASSES: u64 = 8;
 }
 
 impl Default for ScanLimits {
@@ -66,6 +87,7 @@ impl Default for ScanLimits {
             max_packet_len: Self::DEFAULT_MAX_PACKET_LEN,
             max_packets: Self::DEFAULT_MAX_PACKETS,
             max_retained_bytes: Self::DEFAULT_MAX_RETAINED_BYTES,
+            max_failed_hash_passes: Self::DEFAULT_MAX_FAILED_HASH_PASSES,
         }
     }
 }
@@ -85,10 +107,25 @@ pub fn scan_packets_with_limits(data: &[u8], limits: &ScanLimits) -> Result<Vec<
     // turn up so that later File and Explicit Matrix packets can be typed on the
     // first pass. Anything that arrives before its Start packet is resolved below.
     let mut contexts: HashMap<InputSetId, ParseContext> = HashMap::new();
+    // Work spent hashing candidates that turned out to be damage or noise, and
+    // the budget it is charged against.
+    let failed_hash_budget = (data.len() as u64).saturating_mul(limits.max_failed_hash_passes);
+    let mut failed_hash_bytes: u64 = 0;
 
     let mut offset = 0usize;
     while let Some(position) = find_magic(data, offset) {
-        match read_packet(data, position, limits, &contexts) {
+        // The header alone rules most candidates out, and doing so reads a
+        // handful of fixed fields. Only a candidate that survives it is hashed,
+        // and only that hashing is charged.
+        let end = match candidate_end(data, position, limits) {
+            Ok(end) => end,
+            Err(error) => {
+                tracing::debug!(offset = position, %error, "skipping PAR3 packet");
+                offset = position + 8;
+                continue;
+            }
+        };
+        match parse_candidate(data, position, end, &contexts) {
             Ok(packet) => {
                 if found.len() >= limits.max_packets {
                     return Err(Par3Error::ScanLimitExceeded {
@@ -109,6 +146,15 @@ pub fn scan_packets_with_limits(data: &[u8], limits: &ScanLimits) -> Result<Vec<
             }
             Err(error) => {
                 tracing::debug!(offset = position, %error, "skipping PAR3 packet");
+                failed_hash_bytes = failed_hash_bytes.saturating_add((end - position) as u64);
+                if failed_hash_bytes > failed_hash_budget {
+                    return Err(Par3Error::ScanLimitExceeded {
+                        reason: format!(
+                            "candidate packets that did not check out were hashed more than {} times over the input",
+                            limits.max_failed_hash_passes
+                        ),
+                    });
+                }
                 // Same resynchronisation the reference implementation uses: step
                 // past this magic sequence and look for the next one.
                 offset = position + 8;
@@ -157,12 +203,13 @@ fn find_magic(data: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-fn read_packet(
-    data: &[u8],
-    position: usize,
-    limits: &ScanLimits,
-    contexts: &HashMap<InputSetId, ParseContext>,
-) -> Result<Packet> {
+/// Where the candidate packet at `position` ends, or why its header alone rules
+/// it out.
+///
+/// Every test here reads a fixed header field, so rejecting a candidate costs
+/// nothing while hashing one costs its whole declared length. Keeping the two
+/// apart is what lets the scan charge only the candidates it actually hashed.
+fn candidate_end(data: &[u8], position: usize, limits: &ScanLimits) -> Result<usize> {
     if data.len() - position < HEADER_SIZE {
         return Err(Par3Error::PacketTooShort {
             offset: position as u64,
@@ -175,6 +222,13 @@ fn read_packet(
             .try_into()
             .expect("8 bytes"),
     );
+    if length < HEADER_SIZE as u64 {
+        return Err(Par3Error::PacketTooShort {
+            offset: position as u64,
+            expected: HEADER_SIZE as u64,
+            actual: length,
+        });
+    }
     if length > limits.max_packet_len {
         return Err(Par3Error::ScanLimitExceeded {
             reason: format!(
@@ -183,16 +237,26 @@ fn read_packet(
             ),
         });
     }
-    // Bounds-checked against the real input before any body is copied.
-    let end = position
+    // Bounds-checked against the real input before any body is copied, and
+    // before anything is hashed: a packet running past the end of the input
+    // cannot be one.
+    position
         .checked_add(usize::try_from(length).unwrap_or(usize::MAX))
         .filter(|end| *end <= data.len())
         .ok_or(Par3Error::PacketTooShort {
             offset: position as u64,
             expected: length,
             actual: (data.len() - position) as u64,
-        })?;
+        })
+}
 
+/// Hash and parse the candidate spanning `position..end`.
+fn parse_candidate(
+    data: &[u8],
+    position: usize,
+    end: usize,
+    contexts: &HashMap<InputSetId, ParseContext>,
+) -> Result<Packet> {
     let set_id = InputSetId(
         data[position + 32..position + 40]
             .try_into()
@@ -363,6 +427,67 @@ mod tests {
         let bytes = concat(&[comment(id, "a")]);
         let limits = ScanLimits {
             max_retained_bytes: 8,
+            ..ScanLimits::default()
+        };
+        assert!(matches!(
+            scan_packets_with_limits(&bytes, &limits),
+            Err(Par3Error::ScanLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn overlapping_invalid_candidates_are_bounded() {
+        // Twenty thousand 48-byte headers, each claiming a packet that runs to
+        // the end of the input and each carrying a hash that cannot match.
+        // Every one of them has to be hashed to be refused, and refusing one
+        // only steps eight bytes, so without a budget this is quadratic: about
+        // ten gigabytes of hashing for a one-megabyte input. The default budget
+        // stops it after eight passes, which is why this test finishes.
+        let mut data = vec![0u8; HEADER_SIZE * 20_000];
+        for position in (0..data.len()).step_by(HEADER_SIZE) {
+            data[position..position + MAGIC.len()].copy_from_slice(MAGIC);
+            let length = (data.len() - position) as u64;
+            data[position + 24..position + 32].copy_from_slice(&length.to_le_bytes());
+        }
+        assert!(matches!(
+            scan_packets(&data),
+            Err(Par3Error::ScanLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn candidates_ruled_out_by_their_header_are_never_charged() {
+        // Declared lengths past the end of the input, and below the header, are
+        // both refused without hashing, so no budget is spent on them.
+        let mut data = Vec::new();
+        for step in 0..64u64 {
+            let mut header = vec![0u8; HEADER_SIZE];
+            header[..MAGIC.len()].copy_from_slice(MAGIC);
+            let length = if step.is_multiple_of(2) { u64::MAX } else { 1 };
+            header[24..32].copy_from_slice(&length.to_le_bytes());
+            data.extend_from_slice(&header);
+        }
+        let limits = ScanLimits {
+            max_failed_hash_passes: 0,
+            ..ScanLimits::default()
+        };
+        assert!(
+            scan_packets_with_limits(&data, &limits)
+                .expect("scans")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_failed_candidate_budget_is_configurable() {
+        let id = InputSetId([10; 8]);
+        let mut bytes = comment(id, "damaged").to_bytes();
+        bytes[HEADER_SIZE] ^= 0xff;
+        bytes.extend_from_slice(&comment(id, "survivor").to_bytes());
+        // One damaged packet is well inside the default budget.
+        assert_eq!(scan_packets(&bytes).expect("scans").len(), 1);
+        let limits = ScanLimits {
+            max_failed_hash_passes: 0,
             ..ScanLimits::default()
         };
         assert!(matches!(

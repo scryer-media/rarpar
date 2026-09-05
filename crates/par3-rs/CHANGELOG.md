@@ -18,7 +18,9 @@ does not repair anything — see the README for the full scope.
   written back is byte-identical to the packet read.
 - `scan`: `scan_packets` and friends, which find packets in any byte range,
   verify each header hash, skip damaged packets by resynchronising on the next
-  magic sequence, and bound their work with `ScanLimits`.
+  magic sequence, and bound their work with `ScanLimits` — including
+  `ScanLimits::max_failed_hash_passes`, which caps the hashing a hostile input
+  can provoke by packing overlapping candidate headers that never check out.
 - `set`: `Par3Set`, which groups packets by InputSetID, deduplicates them, and
   resolves the Root packet's tree into `Par3File` and `Par3Directory` entries
   with `/`-joined paths, under `SetLimits`.
