@@ -785,12 +785,20 @@ fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOption
         ));
     }
 
-    if requested_feature(options, "metal") {
-        assert_metal_only(metadata, &options.target)?;
-    } else {
-        assert_cpu_only(metadata)?;
+    // GPU backends are disabled for every shipped artifact on every platform.
+    // The rarpar tool no longer exposes `metal` or `wgpu` features, and the
+    // audit refuses a request for them rather than letting a stale matrix
+    // entry resolve a GPU dependency.
+    for feature in ["metal", "wgpu"] {
+        if requested_feature(options, feature) {
+            return fail(format!(
+                "GPU backends are disabled for shipped rarpar artifacts; \
+                 feature `{feature}` must not be requested for {}",
+                options.target
+            ));
+        }
     }
-    Ok(())
+    assert_cpu_only(metadata)
 }
 
 fn requested_feature(options: &FeatureAuditOptions, feature: &str) -> bool {
@@ -817,23 +825,6 @@ fn assert_cpu_only(metadata: &CargoMetadata) -> Result<()> {
     reject_gpu_features(metadata)?;
     reject_resolved_package(metadata, "wgpu")?;
     reject_resolved_package(metadata, "objc2-metal")
-}
-
-fn assert_metal_only(metadata: &CargoMetadata, target: &str) -> Result<()> {
-    if target != "aarch64-apple-darwin" {
-        return fail(format!(
-            "Metal is supported only for aarch64-apple-darwin, not {target}"
-        ));
-    }
-    for package in ["rarpar", "par2-rs", "reedsolomon-rs"] {
-        require_feature(metadata, package, "metal")?;
-        reject_feature(metadata, package, "wgpu")?;
-    }
-    reject_resolved_package(metadata, "wgpu")?;
-    if resolved_package_versions(metadata, "objc2-metal").is_empty() {
-        return fail("Metal build must resolve objc2-metal");
-    }
-    Ok(())
 }
 
 fn reject_gpu_features(metadata: &CargoMetadata) -> Result<()> {
@@ -1517,13 +1508,15 @@ mod tests {
     }
 
     #[test]
-    fn feature_audit_accepts_apple_silicon_metal_metadata() -> Result<()> {
+    fn feature_audit_rejects_metal_on_apple_silicon() {
         let options = FeatureAuditOptions {
             manifest: PathBuf::from("Cargo.toml"),
             target: "aarch64-apple-darwin".to_owned(),
             features: "runtime,metal".to_owned(),
         };
-        audit_feature_metadata(&metal_feature_metadata(), &options)
+        let error = audit_feature_metadata(&metal_feature_metadata(), &options)
+            .expect_err("GPU backends are disabled on every platform");
+        assert!(error.to_string().contains("GPU backends are disabled"));
     }
 
     #[test]
@@ -1535,7 +1528,19 @@ mod tests {
         };
         let error = audit_feature_metadata(&metal_feature_metadata(), &options)
             .expect_err("Intel macOS must not resolve Metal");
-        assert!(error.to_string().contains("aarch64-apple-darwin"));
+        assert!(error.to_string().contains("GPU backends are disabled"));
+    }
+
+    #[test]
+    fn feature_audit_rejects_resolved_gpu_packages_without_the_feature() {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "aarch64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        let error = audit_feature_metadata(&metal_feature_metadata(), &options)
+            .expect_err("a resolved Metal graph must fail the CPU-only audit");
+        assert!(error.to_string().contains("metal"));
     }
 
     #[test]

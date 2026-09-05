@@ -95,8 +95,8 @@ Verify repository metadata before the first publish.
   installs.
 - `.github/workflows/release.yml` builds eight release archives: GNU and musl
   Linux builds for both Linux architectures, Apple Silicon and Intel macOS,
-  and x86_64 and ARM64 Windows. Apple Silicon enables the native Metal backend;
-  Linux, Intel macOS, and Windows builds are CPU-only. The musl archives also
+  and x86_64 and ARM64 Windows. Every build is CPU-only: GPU backends are
+  disabled on all platforms. The musl archives also
   supply the GHCR image. The workflow validates this target-specific feature
   policy against the dependency graph and builds from `cargo package -p rarpar`
   output unpacked outside the
@@ -123,8 +123,8 @@ Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
 and `--remap-path-prefix`, are allowed. Every native artifact enables AWS-LC;
-the feature audit requires one resolved `aws-lc-sys`, permits Metal only for
-Apple Silicon, and blocks WGPU from every shipped `rarpar` artifact.
+the feature audit requires one resolved `aws-lc-sys` and blocks Metal and
+WGPU from every shipped `rarpar` artifact on every platform.
 
 Required repository configuration:
 

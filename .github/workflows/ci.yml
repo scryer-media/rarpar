@@ -872,7 +872,7 @@ jobs:
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
-            features: runtime,metal
+            features: runtime
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin

@@ -108,8 +108,8 @@ tracing-subscriber.workspace = true
 # the wasm example build — hence this same non-wasm target gate.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.8"
-wasmtime = "47"
-wasmtime-wasi = "47"
+wasmtime = "48"
+wasmtime-wasi = "48"
 aes = { workspace = true }
 cbc = { workspace = true }
 

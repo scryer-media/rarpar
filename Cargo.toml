@@ -18,7 +18,7 @@ repository = "https://github.com/scryer-media/rarpar"
 [workspace.dependencies]
 aes = { version = "0.9", features = ["zeroize"] }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips"] }
-aws-lc-sys = { version = "0.44", default-features = false, features = ["all-bindings"] }
+aws-lc-sys = { version = "0.45", default-features = false, features = ["all-bindings"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["zeroize"] }
