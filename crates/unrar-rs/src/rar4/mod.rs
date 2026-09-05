@@ -43,6 +43,58 @@ pub struct Rar4ParsedVolume {
     pub end: Option<Rar4EndHeader>,
 }
 
+/// Termination guard for this module's header-scan loops.
+///
+/// A RAR4 volume scan is driven entirely by untrusted sizes, and every header
+/// it accepts appends to a `Vec`, so an unterminated scan burns memory as well
+/// as time. Two properties have to hold: the stream position must strictly
+/// increase from one accepted header to the next, and the header count must
+/// stay finite.
+///
+/// Fuzz reproducer `timeout-a8693f23` broke the first one — a header declaring
+/// `packed_size = 2^64 - 80` skipped `-80` bytes as `i64`, so the scan landed
+/// back on the same header and re-parsed it ~28k times a second until memory
+/// ran out. [`header::skip_forward`] closes that at the source; this guard is
+/// the backstop for any other route to a stalled scan. It costs one
+/// `stream_position` per *header* and never runs on a decode path.
+struct ScanGuard {
+    position: u64,
+    headers: usize,
+}
+
+impl ScanGuard {
+    fn new<R: Seek>(reader: &mut R) -> RarResult<Self> {
+        Ok(Self {
+            position: reader.stream_position().map_err(RarError::Io)?,
+            headers: 0,
+        })
+    }
+
+    /// Account for one accepted header, rejecting a stalled or rewound scan.
+    fn advanced<R: Seek>(&mut self, reader: &mut R) -> RarResult<()> {
+        self.headers += 1;
+        if self.headers > crate::limits::MAX_HEADERS_PER_VOLUME {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "RAR4 volume declares more than {} headers",
+                    crate::limits::MAX_HEADERS_PER_VOLUME
+                ),
+            });
+        }
+        let position = reader.stream_position().map_err(RarError::Io)?;
+        if position <= self.position {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR4 header scan stalled at offset {position} (previous header ended at {})",
+                    self.position
+                ),
+            });
+        }
+        self.position = position;
+        Ok(())
+    }
+}
+
 /// Parse all headers from a RAR 1.4 archive volume.
 ///
 /// Reader must be positioned at the `RE~^` main-header marker.
@@ -70,6 +122,7 @@ pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Pars
     }
 
     let mut files = Vec::new();
+    let mut guard = ScanGuard::new(reader)?;
     loop {
         let offset = reader.stream_position().map_err(RarError::Io)?;
         let mut fixed = [0u8; 21];
@@ -104,9 +157,8 @@ pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Pars
         };
         let skip_size = fh.packed_size;
         files.push(fh);
-        reader
-            .seek(std::io::SeekFrom::Current(skip_size as i64))
-            .map_err(RarError::Io)?;
+        header::skip_forward(reader, skip_size)?;
+        guard.advanced(reader)?;
     }
 
     if archive_header.is_volume {
@@ -150,7 +202,13 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     let mut recovery_records = Vec::new();
     let mut end = None;
 
+    let mut guard = ScanGuard::new(reader)?;
     while let Some(raw) = header::read_raw_header(reader)? {
+        // Checked here rather than at the bottom of the body because several
+        // arms `continue`. At this point the header itself has been consumed,
+        // so the position is strictly ahead of the previous iteration's unless
+        // a data-area skip rewound the stream.
+        guard.advanced(reader)?;
         match raw.header_type {
             Rar4HeaderType::Mark => {
                 // Marker header — skip, it's just the signature confirmation.
@@ -189,9 +247,7 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                 // has the low 32 bits. Use the fully-resolved packed_size instead.
                 let skip_size = fh.packed_size;
                 files.push(fh);
-                reader
-                    .seek(std::io::SeekFrom::Current(skip_size as i64))
-                    .map_err(RarError::Io)?;
+                header::skip_forward(reader, skip_size)?;
                 continue;
             }
             Rar4HeaderType::EndArchive => {
@@ -217,9 +273,7 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                 attach_rar4_uowner_to_previous_file(&service, &mut files);
                 let skip_size = service.packed_size;
                 services.push(service);
-                reader
-                    .seek(std::io::SeekFrom::Current(skip_size as i64))
-                    .map_err(RarError::Io)?;
+                header::skip_forward(reader, skip_size)?;
                 continue;
             }
             Rar4HeaderType::Comment => {
@@ -341,6 +395,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
     end: &mut Option<Rar4EndHeader>,
     kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<()> {
+    let mut guard = ScanGuard::new(reader)?;
     loop {
         // Each encrypted header is preceded by its own 8-byte salt.
         let mut salt = [0u8; 8];
@@ -368,6 +423,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
             Err(e) => return Err(e),
         };
 
+        guard.advanced(reader)?;
         match raw.header_type {
             Rar4HeaderType::File => {
                 let mut fh = header::parse_file_header(&raw)?;
@@ -381,9 +437,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 );
                 let skip_size = fh.packed_size;
                 files.push(fh);
-                reader
-                    .seek(std::io::SeekFrom::Current(skip_size as i64))
-                    .map_err(RarError::Io)?;
+                header::skip_forward(reader, skip_size)?;
             }
             Rar4HeaderType::NewSub => {
                 let mut service = header::parse_file_header(&raw)?;
@@ -395,9 +449,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 attach_rar4_uowner_to_previous_file(&service, files);
                 let skip_size = service.packed_size;
                 services.push(service);
-                reader
-                    .seek(std::io::SeekFrom::Current(skip_size as i64))
-                    .map_err(RarError::Io)?;
+                header::skip_forward(reader, skip_size)?;
             }
             Rar4HeaderType::EndArchive => {
                 let e = header::parse_end_header(&raw);
@@ -413,19 +465,11 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 );
                 let skip_size = old_service.data_size;
                 old_services.push(old_service);
-                if skip_size > 0 {
-                    reader
-                        .seek(std::io::SeekFrom::Current(skip_size as i64))
-                        .map_err(RarError::Io)?;
-                }
+                header::skip_forward(reader, skip_size)?;
             }
             _ => {
                 debug!("RAR4 encrypted: skipping header type {:?}", raw.header_type);
-                if raw.data_area_size > 0 {
-                    reader
-                        .seek(std::io::SeekFrom::Current(raw.data_area_size as i64))
-                        .map_err(RarError::Io)?;
-                }
+                header::skip_forward(reader, raw.data_area_size)?;
             }
         }
     }
