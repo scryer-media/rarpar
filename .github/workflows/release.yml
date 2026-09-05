@@ -134,6 +134,15 @@ jobs:
               sys.exit(1)
           print(f"release package versions: {selected}")
           PY
+      # The one thing that has to hold before a tag becomes a release: the
+      # packaged manifest must reach its sibling crates through the registry,
+      # because a published crate carrying a path dependency cannot build for
+      # anyone but us. Everything this compares comes from the workspace
+      # manifest itself. An expected-version list written out here is a second
+      # copy of numbers that already exist in Cargo.toml, and the first bump
+      # that forgets it fails a release that was correct: this step spent
+      # rarpar 0.4.0 pinned to unrar-rs 0.7.0 and par2-rs 0.8.0, versions two
+      # minors behind what the workspace declared.
       - name: Validate packaged CLI registry dependencies
         run: |
           set -euo pipefail
@@ -143,53 +152,58 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rarpar-release-source"
           tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
           manifest="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}/Cargo.toml"
+          cargo metadata --locked --format-version 1 --no-deps \
+            > "$RUNNER_TEMP/rarpar-release-source/workspace.json"
           cargo metadata --locked --format-version 1 \
             --manifest-path "$manifest" \
-            > "$RUNNER_TEMP/rarpar-release-source/metadata.json"
-          python3 - "$RUNNER_TEMP/rarpar-release-source/metadata.json" <<'PY'
+            > "$RUNNER_TEMP/rarpar-release-source/packaged.json"
+          python3 - \
+            "$RUNNER_TEMP/rarpar-release-source/workspace.json" \
+            "$RUNNER_TEMP/rarpar-release-source/packaged.json" <<'PY'
           import json
           import sys
 
-          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          package = next(
-              package for package in metadata["packages"] if package["name"] == "rarpar"
-          )
-          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          expected_requirements = {
-              "par2-rs": "^0.8.0",
-              "unrar-rs": "^0.7.0",
+          workspace = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          packaged = json.load(open(sys.argv[2], "r", encoding="utf-8"))
+
+          members = {package["name"]: package for package in workspace["packages"]}
+          # Every normal dependency rarpar takes on another crate in this
+          # workspace, with the requirement the workspace declares for it.
+          declared = {
+              dependency["name"]: dependency["req"]
+              for dependency in members["rarpar"]["dependencies"]
+              if dependency["name"] in members and dependency.get("kind") is None
           }
-          for name, expected_requirement in expected_requirements.items():
-              dep = dependencies.get(name)
-              if dep is None:
-                  print(f"missing dependency: {name}", file=sys.stderr)
+          if not declared:
+              print("rarpar declares no in-workspace dependencies to check", file=sys.stderr)
+              sys.exit(1)
+
+          package = next(p for p in packaged["packages"] if p["name"] == "rarpar")
+          dependencies = {
+              dependency["name"]: dependency
+              for dependency in package["dependencies"]
+              if dependency.get("kind") is None
+          }
+
+          for name, requirement in sorted(declared.items()):
+              dependency = dependencies.get(name)
+              if dependency is None:
+                  print(f"packaged rarpar dropped {name}", file=sys.stderr)
                   sys.exit(1)
-              if dep.get("source") is None or dep.get("path"):
-                  print(f"{name} still has a path dependency in packaged manifest", file=sys.stderr)
+              if dependency.get("source") is None or dependency.get("path"):
+                  print(f"{name} is still a path dependency in the packaged manifest", file=sys.stderr)
                   sys.exit(1)
-              version = dep.get("req")
-              if not version:
-                  print(f"{name} is missing a registry version", file=sys.stderr)
+              if not dependency.get("req"):
+                  print(f"{name} has no registry version requirement", file=sys.stderr)
                   sys.exit(1)
-              if version != expected_requirement:
+              if dependency["req"] != requirement:
                   print(
-                      f"{name} must require {expected_requirement}, got {version}",
+                      f"packaged rarpar requires {name} {dependency['req']}, "
+                      f"but the workspace declares {requirement}",
                       file=sys.stderr,
                   )
                   sys.exit(1)
-              print(f"packaged dependency: {name} {version}")
-          resolved = {
-              package["name"]: package["version"]
-              for package in metadata["packages"]
-              if package["name"] in expected_requirements
-          }
-          expected_versions = {"par2-rs": "0.8.0", "unrar-rs": "0.7.0"}
-          if resolved != expected_versions:
-              print(
-                  f"packaged rarpar resolved {resolved}, expected {expected_versions}",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
+              print(f"packaged dependency: {name} {dependency['req']}")
           PY
       - name: Hydrate the test corpus (release-tests)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile release-tests
