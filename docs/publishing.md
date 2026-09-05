@@ -90,7 +90,11 @@ Verify repository metadata before the first publish.
 - `.github/workflows/ci.yml` runs formatting, clippy, workspace tests, and
   package-content checks on pull requests, pushes to `main`, and manual runs.
   It also validates generated manpages, shell completions, and the future Linux
-  package-root layout. Native build lanes use `sccache`, Linux `mold`,
+  package-root layout. Its `changes` job decides, per workspace member, whether
+  a change can reach that member (`.github/scripts/ci_changes.py`: changed
+  paths, the `Cargo.lock` diff, and the dependency graph), and each crate's
+  fixture lane runs only when its crate is affected. Manual runs exercise
+  every lane. Native build lanes use `sccache`, Linux `mold`,
   path-prefix remapping, and `--no-install-recommends` native dependency
   installs.
 - `.github/workflows/release.yml` builds eight release archives: GNU and musl
