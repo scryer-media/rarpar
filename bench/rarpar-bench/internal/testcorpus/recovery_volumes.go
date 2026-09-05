@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-// generateRecoveryVolumes writes the three standalone `.rev` recovery-volume
+// generateRecoveryVolumes writes the four standalone `.rev` recovery-volume
 // sets driven by tests/integration.rs, src/recovery.rs and the CLI's repair lane.
 //
 // All are `rar a … -rv2`, which writes the data volumes and two recovery
@@ -26,6 +26,14 @@ import (
 //
 //   - rar5_recovery_volumes comes from rarlab-7.20, so the .rev files carry the
 //     RAR5 `Rar!\x1aRev` signature and a proper header.
+//
+//   - rar5_hp_recovery_volumes is the same RAR5 shape written with `-hp`, the
+//     corpus header-encryption password. Every data volume's main header sits
+//     behind the encryption record, so a reader cannot learn a volume's number
+//     from its bytes; only the file name and the .rev table's per-volume size
+//     and CRC32 say which slot it fills. That is the shape whose restore
+//     unrar-rs 0.9.0 refused ("insufficient RAR5 recovery volumes"), and the
+//     one tests/integration.rs restores two missing parts of.
 //
 //   - rar3_recovery_volumes_large is the same RAR4-format shape at a size that
 //     matters: 1 MiB volumes, so one reconstruction pass decodes about a
@@ -52,7 +60,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	rar4Work := filepath.Join(work, "rar4")
 	rar4LargeWork := filepath.Join(work, "rar4-large")
 	rar5Work := filepath.Join(work, "rar5")
-	for _, dir := range []string{rar4Work, rar4LargeWork, rar5Work} {
+	rar5HpWork := filepath.Join(work, "rar5-hp")
+	for _, dir := range []string{rar4Work, rar4LargeWork, rar5Work, rar5HpWork} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -69,6 +78,13 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		payload5[index] = byte(17 + 51*(index/8) + 37*(index%8))
 	}
 	if err := writeFile(filepath.Join(rar5Work, "payload.bin"), payload5); err != nil {
+		return err
+	}
+
+	// RAR5 header-encrypted set: 16 KiB of (i * 13 + 5) mod 256 in 4 KiB
+	// volumes — five data volumes (the last one part full) and two recovery
+	// volumes.
+	if err := writeFile(filepath.Join(rar5HpWork, "payload.bin"), ramp(16384, 13, 5)); err != nil {
 		return err
 	}
 
@@ -90,6 +106,10 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		"-m0", "-v1k", "-rv2", "rar5_recovery_volumes.rar", "payload.bin"); err != nil {
 		return err
 	}
+	if err := e.rar(e.rar5.Image, work, "rar5-hp").add(ctx,
+		"-m0", "-v4k", "-hp"+hpPassword, "-rv2", "rar5_hp_recovery_volumes.rar", "payload.bin"); err != nil {
+		return err
+	}
 
 	for _, want := range []struct {
 		dir, stem, suffix string
@@ -101,6 +121,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		{rar4LargeWork, "rar3_recovery_volumes_large.part", ".rev", 2},
 		{rar5Work, "rar5_recovery_volumes.part", ".rar", 10},
 		{rar5Work, "rar5_recovery_volumes.part", ".rev", 2},
+		{rar5HpWork, "rar5_hp_recovery_volumes.part", ".rar", 5},
+		{rar5HpWork, "rar5_hp_recovery_volumes.part", ".rev", 2},
 	} {
 		got, err := countMatching(want.dir, want.stem, want.suffix)
 		if err != nil {
@@ -119,6 +141,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		filepath.Join(rar4Dir, "rar3_recovery_volumes_large.part*.rev"),
 		filepath.Join(rar5Dir, "rar5_recovery_volumes.part*.rar"),
 		filepath.Join(rar5Dir, "rar5_recovery_volumes.part*.rev"),
+		filepath.Join(rar5Dir, "rar5_hp_recovery_volumes.part*.rar"),
+		filepath.Join(rar5Dir, "rar5_hp_recovery_volumes.part*.rev"),
 	); err != nil {
 		return err
 	}
@@ -128,6 +152,9 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	if _, err := collect(rar4LargeWork, rar4Dir, "rar3_recovery_volumes_large."); err != nil {
 		return err
 	}
-	_, err = collect(rar5Work, rar5Dir, "rar5_recovery_volumes.")
+	if _, err := collect(rar5Work, rar5Dir, "rar5_recovery_volumes."); err != nil {
+		return err
+	}
+	_, err = collect(rar5HpWork, rar5Dir, "rar5_hp_recovery_volumes.")
 	return err
 }

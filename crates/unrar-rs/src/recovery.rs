@@ -1250,7 +1250,16 @@ fn probe_rar5_volume_number(path: &Path) -> RarResult<Option<usize>> {
         Err(e) => return Err(RarError::Io(e)),
     };
     match probe_volume(&mut file) {
-        Ok(probe) if probe.format == ArchiveFormat::Rar5 && probe.is_multi_volume => {
+        // A header-encrypted (`-hp`) volume states nothing the probe can read:
+        // its main header, and with it the volume flag and number, sit behind
+        // the encryption record. The layout name is the only statement left,
+        // and it is enough here because every slot this places is checked
+        // against the `.rev` table's size and CRC32 before it counts as
+        // present. A misnamed file fails that check; it is never trusted.
+        Ok(probe)
+            if probe.format == ArchiveFormat::Rar5
+                && (probe.is_multi_volume || probe.is_header_encrypted) =>
+        {
             Ok(parse_part_number(path).and_then(|number| number.checked_sub(1)))
         }
         Ok(_) | Err(RarError::InvalidSignature) => Ok(None),
@@ -1743,6 +1752,22 @@ mod tests {
         buf
     }
 
+    /// A RAR5 volume written with `-hp`: the signature, then the plaintext
+    /// encryption record (type 4), then bytes the probe cannot read without the
+    /// password. The main header — and the volume flag and number with it —
+    /// is behind the record, so nothing but the file name states which
+    /// volume this is.
+    fn build_probe_rar5_encrypted_headers_archive() -> Vec<u8> {
+        let mut buf = crate::signature::RAR5_SIGNATURE.to_vec();
+        let mut encryption_body = crate::vint::encode_vint(0); // version
+        encryption_body.extend_from_slice(&crate::vint::encode_vint(0)); // flags
+        encryption_body.push(15); // KDF lg2 count
+        encryption_body.extend_from_slice(&[0x5A; 16]); // salt
+        buf.extend_from_slice(&build_rar5_header(4, 0, &encryption_body));
+        buf.extend_from_slice(&[0xC3; 64]); // encrypted headers: opaque bytes
+        buf
+    }
+
     fn path_list_contains(paths: &[PathBuf], needle: &Path) -> bool {
         paths.iter().any(|path| path == needle)
     }
@@ -1875,6 +1900,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(probe_rar5_volume_number(&path).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_accepts_encrypted_headers_volume_by_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part03.rar");
+        std::fs::write(&path, build_probe_rar5_encrypted_headers_archive()).unwrap();
+
+        // The probe sees a RAR5 volume with encrypted headers and no readable
+        // volume flag. The layout number is still a statement, and the slot it
+        // places is CRC-checked against the .rev table before it counts.
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_rejects_encrypted_headers_volume_without_filename_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.rar");
+        std::fs::write(&path, build_probe_rar5_encrypted_headers_archive()).unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), None);
     }
 
     #[test]

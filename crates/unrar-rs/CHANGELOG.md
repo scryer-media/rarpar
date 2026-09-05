@@ -1,6 +1,23 @@
 # Changelog
 
 
+## 0.9.1
+
+A recovery-volume fix for header-encrypted sets.
+
+### Fixed
+
+- `restore_volumes_from_paths` now restores missing volumes of a RAR5 set
+  written with `-hp` (encrypted headers). The volume-number probe required a
+  readable main header to accept a data volume, and an encrypted one has none,
+  so every present volume was counted as missing and the restore refused with
+  "insufficient RAR5 recovery volumes". The layout name now places such a
+  volume, and the `.rev` table's per-volume size and CRC32 still decide
+  whether it is really present — a misnamed file is rejected, never trusted.
+  The corpus gains `rar5_hp_recovery_volumes.*` (five 4 KiB volumes and two
+  `.rev` files under the corpus HP password) from the `recovery_volumes`
+  recipe, and the integration suite restores two missing parts of it.
+
 ## 0.9.0
 
 Extraction is now reached the way the Rust archive ecosystem reaches it: take

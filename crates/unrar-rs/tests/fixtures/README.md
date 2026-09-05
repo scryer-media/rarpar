@@ -46,7 +46,7 @@ start are the pinned Docker images. `--only` names one of the units below.
 | `edge_cases` | most `rar4_*` / `rar5_*` edge-case sets, both `*_tiny_volumes` sets, and the `originals/` inputs | `rarlab-7.20`, `rarlab-6.24` |
 | `core_sets` | `*_store`, `*_lz`, `*_hp_store`, `*_hp_lz`, `*_mv_store`, `*_mv_video`, `rar4_lz_solid_mv` | `rarlab-7.20`, `rarlab-6.24` |
 | `encrypted` | the four `*_enc_*` sets per format | `rarlab-7.20`, `rarlab-6.24` |
-| `recovery_volumes` | `rar3_recovery_volumes.*` and `rar5_recovery_volumes.*`, `.rar` and `.rev` | `rarlab-6.24`, `rarlab-7.20` |
+| `recovery_volumes` | `rar3_recovery_volumes.*`, `rar3_recovery_volumes_large.*`, `rar5_recovery_volumes.*` and `rar5_hp_recovery_volumes.*`, `.rar` and `.rev` | `rarlab-6.24`, `rarlab-7.20` |
 | `large_sets` | the ~85 MB video-member sets: `*_solid`, `*_hp_large`, `rar5_solid_encrypted`, `rar5_unicode_cjk`, `rar5_nested_{2,3,5}deep` | `ffmpeg-7.1-ubuntu2404`, `rarlab-7.20`, `rarlab-6.24` |
 | `generated_matrix` | `generated_matrix_*` multi-volume matrix | `rarlab-7.20`, `rarlab-6.24`, `ffmpeg-7.1-ubuntu2404` |
 | `stored_layout` | the stored-layout sets listed below | `rarlab-7.20` |
