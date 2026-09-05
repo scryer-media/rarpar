@@ -328,6 +328,9 @@ the archive set; it waits for each later volume instead.
 - `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
+- `crates/par3-rs`: PAR3 packet parsing, input-set inspection, and
+  verification. A work in progress: it reads PAR3, and neither creates nor
+  repairs. Not used by the CLI. Licensed GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
   GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
   default dependency, so an ordinary build carries the unRAR restriction.
@@ -374,8 +377,8 @@ Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
 `unrar-rs` is used:
 
-- `reedsolomon-rs` and `par2-rs` are GPL-3.0-or-later. Neither depends on
-  `unrar-rs`, so neither carries the restriction.
+- `reedsolomon-rs`, `par2-rs` and `par3-rs` are GPL-3.0-or-later. None of them
+  depends on `unrar-rs`, so none carries the restriction.
 - `unrar-rs` is GPL-3.0-or-later; its RAR engine was developed using
   RARLAB's unRAR source code, and the unRAR license restriction continues to
   govern that derived code — see `crates/unrar-rs/LICENSE`.

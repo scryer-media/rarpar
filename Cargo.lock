@@ -1975,6 +1975,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "par3-rs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc-fast",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

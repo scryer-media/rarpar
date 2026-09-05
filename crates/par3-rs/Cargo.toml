@@ -1,0 +1,17 @@
+[package]
+name = "par3-rs"
+description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection and verification — work in progress"
+readme = "README.md"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["par3", "parchive", "parity", "erasure", "verification"]
+categories = ["parser-implementations", "filesystem"]
+
+[dependencies]
+blake3 = { workspace = true }
+crc-fast = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
