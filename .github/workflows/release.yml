@@ -241,7 +241,7 @@ jobs:
             runs_on: macos-26
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-            features: runtime,metal
+            features: runtime
             package_root: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel

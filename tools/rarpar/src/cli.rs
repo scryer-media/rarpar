@@ -281,8 +281,8 @@ pub struct ParCreateArgs {
     )]
     pub memory_mib: Option<usize>,
 
-    /// Recovery creation backend: cpu, auto, or metal. Auto keeps work below
-    /// 16 GiB on CPU and preflights native Metal when available at or above it.
+    /// Recovery creation backend: cpu or auto. GPU backends are disabled in
+    /// this build, so both resolve to the CPU/SIMD creation path.
     #[arg(long, value_enum, default_value_t = ParCreationBackend::Cpu)]
     pub backend: ParCreationBackend,
 }
@@ -291,11 +291,9 @@ pub struct ParCreateArgs {
 pub enum ParCreationBackend {
     /// Always use the CPU/SIMD creation path.
     Cpu,
-    /// Keep work below 16 GiB on CPU; at or above it, preflight native Metal
-    /// when available and use CPU if Metal cannot be admitted.
+    /// Let the library choose. With GPU backends disabled this is the CPU
+    /// path; the option is kept so existing invocations keep parsing.
     Auto,
-    /// Require Metal for recovery-data creation.
-    Metal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -377,8 +375,22 @@ mod tests {
 
     #[test]
     fn create_accepts_explicit_backend_selection() {
-        let args = create_args(&["set", "a.bin", "--backend", "metal"]);
-        assert_eq!(args.backend, ParCreationBackend::Metal);
+        let args = create_args(&["set", "a.bin", "--backend", "auto"]);
+        assert_eq!(args.backend, ParCreationBackend::Auto);
+    }
+
+    #[test]
+    fn create_rejects_gpu_backend_selection() {
+        let result = Cli::try_parse_from([
+            "rarpar",
+            "par",
+            "create",
+            "set",
+            "a.bin",
+            "--backend",
+            "metal",
+        ]);
+        assert!(result.is_err(), "metal is no longer a creation backend");
     }
 
     #[test]
