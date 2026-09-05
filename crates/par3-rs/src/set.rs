@@ -44,6 +44,16 @@ pub struct SetLimits {
     pub max_entries: usize,
     /// Deepest directory nesting the walk will follow.
     pub max_depth: usize,
+    /// Most bytes of resolved path text one set may materialise.
+    ///
+    /// Counting entries is not enough on its own, because an entry costs its
+    /// whole path rather than its own name: a graph two packets wide and `d`
+    /// levels deep expands into `2^d` paths that are each `d` names long, so a
+    /// set of a few kilobytes of packets with long names stays under
+    /// [`max_entries`](SetLimits::max_entries) while asking for many gigabytes
+    /// of strings. Every resolved file and directory path is charged against
+    /// this, and exceeding it fails the set rather than truncating the tree.
+    pub max_path_bytes: u64,
 }
 
 impl SetLimits {
@@ -51,6 +61,10 @@ impl SetLimits {
     pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
     /// 256 levels of nesting, comfortably beyond what any file system allows.
     pub const DEFAULT_MAX_DEPTH: usize = 256;
+    /// 64 MiB of path text. A million files whose paths average 64 bytes fit
+    /// inside it; the exponential expansion a directed acyclic tree can describe
+    /// does not.
+    pub const DEFAULT_MAX_PATH_BYTES: u64 = 64 << 20;
 }
 
 impl Default for SetLimits {
@@ -58,6 +72,7 @@ impl Default for SetLimits {
         Self {
             max_entries: Self::DEFAULT_MAX_ENTRIES,
             max_depth: Self::DEFAULT_MAX_DEPTH,
+            max_path_bytes: Self::DEFAULT_MAX_PATH_BYTES,
         }
     }
 }
@@ -351,6 +366,7 @@ impl Par3Set {
             directory_packets: &directory_packets,
             files: Vec::new(),
             directories: Vec::new(),
+            path_bytes: 0,
         };
         walk.run(&root.children)?;
         let TreeWalk {
@@ -602,6 +618,9 @@ struct TreeWalk<'a> {
     directory_packets: &'a HashMap<Fingerprint, DirectoryPacket>,
     files: Vec<Par3File>,
     directories: Vec<Par3Directory>,
+    /// Path bytes resolved so far, charged against
+    /// [`SetLimits::max_path_bytes`].
+    path_bytes: u64,
 }
 
 struct Frame {
@@ -648,8 +667,10 @@ impl TreeWalk<'_> {
                     packet: "File",
                     reason: format!("chunk lengths of {:?} overflow a u64", file.name),
                 })?;
+                let path = join_path(&parent_path, &file.name);
+                self.charge_path(&path)?;
                 self.files.push(Par3File {
-                    path: join_path(&parent_path, &file.name),
+                    path,
                     packet_hash: child,
                     size,
                     packet: file.clone(),
@@ -669,6 +690,7 @@ impl TreeWalk<'_> {
                 });
             }
             let path = join_path(&parent_path, &directory.name);
+            self.charge_path(&path)?;
             if stack.len() > self.limits.max_depth {
                 return Err(Par3Error::ScanLimitExceeded {
                     reason: format!(
@@ -688,6 +710,26 @@ impl TreeWalk<'_> {
                 path,
                 children: directory.children.clone(),
                 next: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charge one resolved path against [`SetLimits::max_path_bytes`].
+    ///
+    /// The entry count does not bound this: a path costs the whole chain of
+    /// names above it, and the same packet may hang under many parents, so the
+    /// text a graph expands into grows with both the number of paths and their
+    /// depth. Charging here, where a path is first materialised, keeps the check
+    /// off every other code path.
+    fn charge_path(&mut self, path: &str) -> Result<()> {
+        self.path_bytes = self.path_bytes.saturating_add(path.len() as u64);
+        if self.path_bytes > self.limits.max_path_bytes {
+            return Err(Par3Error::ScanLimitExceeded {
+                reason: format!(
+                    "input set {} resolves to more than {} bytes of paths",
+                    self.input_set_id, self.limits.max_path_bytes
+                ),
             });
         }
         Ok(())
@@ -1117,6 +1159,78 @@ mod tests {
             Par3Set::from_packets_with_limits(packets, &limits),
             Err(Par3Error::ScanLimitExceeded { .. })
         ));
+    }
+
+    /// A directed acyclic graph two packets wide and `levels` deep, with
+    /// `name_len`-byte names: every packet on a level is a child of both packets
+    /// on the level above, which is acyclic and repeats no name inside any one
+    /// directory, yet describes `2^levels` distinct paths.
+    fn wide_dag(levels: usize, name_len: usize) -> Vec<Packet> {
+        let name = |level: usize, side: char| format!("{side}{level:02}{}", "n".repeat(name_len));
+        let mut packets = Vec::new();
+        let mut children: Vec<Fingerprint> = ['a', 'b']
+            .into_iter()
+            .map(|side| {
+                let leaf = packet(PacketBody::File(file_packet(
+                    &name(levels, side),
+                    2000,
+                    Some(0),
+                )));
+                let hash = leaf.hash();
+                packets.push(leaf);
+                hash
+            })
+            .collect();
+        for level in (0..levels).rev() {
+            children = ['a', 'b']
+                .into_iter()
+                .map(|side| {
+                    let directory = packet(PacketBody::Directory(DirectoryPacket {
+                        name: name(level, side),
+                        option_hashes: Vec::new(),
+                        children: children.clone(),
+                    }));
+                    let hash = directory.hash();
+                    packets.push(directory);
+                    hash
+                })
+                .collect();
+        }
+        packets.push(packet(PacketBody::Start(start_packet())));
+        packets.push(packet(PacketBody::Root(RootPacket {
+            lowest_unused_block_index: 1,
+            attributes: 0,
+            option_hashes: Vec::new(),
+            children,
+        })));
+        packets
+    }
+
+    #[test]
+    fn the_path_byte_limit_bounds_a_directory_graph() {
+        // Eighteen levels of two 2 KiB names: under 80 KiB of packets, inside
+        // both the entry and the depth limits, and worth 786,430 entries whose
+        // paths come to more than seventeen gigabytes. Charging the bytes stops
+        // it after a megabyte of them.
+        let packets = wide_dag(18, 2048);
+        assert!(packets.len() < 64);
+        let limits = SetLimits {
+            max_path_bytes: 1 << 20,
+            ..SetLimits::default()
+        };
+        assert!(matches!(
+            Par3Set::from_packets_with_limits(packets, &limits),
+            Err(Par3Error::ScanLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn a_graph_that_fits_the_path_budget_still_resolves() {
+        // The same shape, small enough that every path fits: four directory
+        // levels of eight-byte names expand into 30 directories and 32 files.
+        let sets = Par3Set::from_packets(wide_dag(4, 5)).expect("builds");
+        assert_eq!(sets[0].directories().len(), 30);
+        assert_eq!(sets[0].files().len(), 32);
     }
 
     #[test]

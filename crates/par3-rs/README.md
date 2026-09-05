@@ -100,6 +100,23 @@ and File and Directory names that are empty, `.`, `..`, or that contain a path
 separator are refused at parse time, so a set cannot direct a read outside the
 directory it is verified against.
 
+The same limits bound *work*, not only memory, because a few kilobytes of
+packets can otherwise ask for a great deal of both:
+
+| Limit | Default | What it bounds |
+| --- | --- | --- |
+| `ScanLimits::max_packet_len` | 1 GiB | The largest packet a scan will read. |
+| `ScanLimits::max_packets` | 1,000,000 | Packets one scan returns. |
+| `ScanLimits::max_retained_bytes` | 4 GiB | Packet bodies one scan keeps. |
+| `ScanLimits::max_failed_hash_passes` | 8 | Hashing spent on overlapping candidates that never check out, as a multiple of the input length. |
+| `SetLimits::max_entries` | 1,000,000 | Files plus directories one set resolves to. |
+| `SetLimits::max_depth` | 256 | Directory nesting the walk follows. |
+| `SetLimits::max_path_bytes` | 64 MiB | Resolved path text, which a directory graph can expand exponentially. |
+
+Chunk block ranges are validated whole against the set's block count when the
+set is built, and verification narrows damage down only within the file it is
+reading, so neither is steered by a length a packet chose.
+
 ## Provenance
 
 This is an independent, clean-room Rust implementation. The format was learned

@@ -23,9 +23,11 @@ does not repair anything — see the README for the full scope.
   can provoke by packing overlapping candidate headers that never check out.
 - `set`: `Par3Set`, which groups packets by InputSetID, deduplicates them, and
   resolves the Root packet's tree into `Par3File` and `Par3Directory` entries
-  with `/`-joined paths, under `SetLimits`. Every chunk's whole block range —
-  not only its first index — is validated against the Root packet's block count,
-  so verification can walk a range without re-checking it.
+  with `/`-joined paths, under `SetLimits` — including
+  `SetLimits::max_path_bytes`, which meters the path text a directory graph
+  expands into rather than only counting entries. Every chunk's whole block
+  range — not only its first index — is validated against the Root packet's
+  block count, so verification can walk a range without re-checking it.
 - `verify`: `verify_file`, `verify_file_at_path` and `verify_set`, which check
   files against their File packet's fingerprint and narrow a mismatch down to
   input blocks using the set's External Data checksums. Localisation stops at
