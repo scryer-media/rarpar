@@ -6156,6 +6156,103 @@ fn test_rar5_recovery_volumes_restore_missing_part() {
     );
 }
 
+/// The `-hp` twin of the set above. With encrypted headers the probe cannot
+/// read a volume's number, so before 0.9.1 every present volume was treated
+/// as missing and the restore refused with "insufficient RAR5 recovery
+/// volumes: need 5, have 2". The layout name places each slot now, and the
+/// `.rev` table's size and CRC32 decide whether it is really present.
+#[test]
+fn test_rar5_encrypted_headers_recovery_volumes_restore_two_missing_parts() {
+    if !fixture("rar5", "rar5_hp_recovery_volumes.part1.rev").exists() {
+        eprintln!("skipping test: rar57 rar5_hp_recovery_volumes fixtures not present");
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar5_hp_recovery_volumes.part1.rar",
+        "rar5_hp_recovery_volumes.part3.rar",
+        "rar5_hp_recovery_volumes.part5.rar",
+        "rar5_hp_recovery_volumes.part1.rev",
+        "rar5_hp_recovery_volumes.part2.rev",
+    ];
+
+    let mut paths = Vec::new();
+    for name in present {
+        let dst = temp_dir.path().join(name);
+        std::fs::copy(fixture("rar5", name), &dst).unwrap();
+        paths.push(dst);
+    }
+
+    let options = unrar_rs::RecoveryOptions {
+        output_dir: Some(temp_dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_eq!(report.format, unrar_rs::ArchiveFormat::Rar5);
+    assert_eq!(report.missing_volume_numbers, vec![1, 3]);
+    assert_eq!(report.used_recovery_paths.len(), 2);
+    let expected_paths = [
+        temp_dir.path().join("rar5_hp_recovery_volumes.part2.rar"),
+        temp_dir.path().join("rar5_hp_recovery_volumes.part4.rar"),
+    ];
+    assert_eq!(report.restored_paths, expected_paths);
+    for (restored, name) in expected_paths.iter().zip([
+        "rar5_hp_recovery_volumes.part2.rar",
+        "rar5_hp_recovery_volumes.part4.rar",
+    ]) {
+        assert_eq!(
+            std::fs::read(restored).unwrap(),
+            std::fs::read(fixture("rar5", name)).unwrap(),
+            "{name} was not restored byte for byte"
+        );
+    }
+
+    // The rebuilt set opens under the corpus HP password and yields the
+    // recipe's ramp, so the restored bytes are volumes, not just matching CRCs.
+    let volume_paths: Vec<_> = (1..=5)
+        .map(|volume| {
+            temp_dir
+                .path()
+                .join(format!("rar5_hp_recovery_volumes.part{volume}.rar"))
+        })
+        .collect();
+    let mut archive = unrar_rs::RarArchive::open_with_password(
+        std::fs::File::open(&volume_paths[0]).unwrap(),
+        "secretpass",
+    )
+    .unwrap();
+    for (index, path) in volume_paths.iter().enumerate().skip(1) {
+        archive
+            .add_volume(index, Box::new(std::fs::File::open(path).unwrap()))
+            .unwrap();
+    }
+    assert_eq!(archive.member_names(), vec!["payload.bin"]);
+    let payload = archive
+        .extract_member(
+            0,
+            &unrar_rs::ExtractOptions {
+                verify: true,
+                password: Some("secretpass".to_string()),
+                restore_owners: false,
+            },
+            None,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_eq!(payload.len(), 16384);
+    assert!(
+        payload
+            .iter()
+            .enumerate()
+            .all(|(index, &byte)| byte == (index as u8).wrapping_mul(13).wrapping_add(5)),
+        "restored payload is not the recipe's ramp"
+    );
+}
+
 #[test]
 fn test_rar3_recovery_volumes_restore_missing_part() {
     let temp_dir = tempfile::tempdir().unwrap();
