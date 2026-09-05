@@ -455,9 +455,20 @@ jobs:
           # (a rename would silently turn this back into a second full pass over
           # that crate), whereas the crate lanes' `-p` hard-errors. Pin the
           # names first so a rename fails here too instead of just getting slow.
-          cargo pkgid unrar-rs >/dev/null
-          cargo pkgid par2-rs >/dev/null
-          cargo pkgid par3-rs >/dev/null
+          #
+          # Checked against the *workspace members* (`--no-deps`), not with
+          # `cargo pkgid`: between a crate's version bump and the release PR
+          # that moves `tools/rarpar`'s registry pin, the lock carries two
+          # packages by that name — the path crate and the registry one — and a
+          # bare `cargo pkgid unrar-rs` fails on the ambiguity. `--exclude` only
+          # ever matches workspace members, so that is the set to pin.
+          members="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name')"
+          for name in unrar-rs par2-rs par3-rs; do
+            if ! grep -qx "$name" <<<"$members"; then
+              echo "::error::workspace member '$name' is gone; update the --exclude list below"
+              exit 1
+            fi
+          done
           cargo test --locked --workspace --no-fail-fast \
             --exclude unrar-rs \
             --exclude par2-rs \
