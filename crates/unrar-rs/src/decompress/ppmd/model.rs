@@ -868,7 +868,14 @@ impl Model {
             self.bin_summ[idx0][idx1] = bs.wrapping_add(INTERVAL).wrapping_sub(mean);
 
             self.prev_success = 1;
-            self.run_length += 1;
+            // `RunLength` is only ever compared or shifted (see the `>> 26`
+            // index above), so unrar's C `int` overflow is benign there but
+            // trips Rust's overflow checks. Corrupt streams can hold a binary
+            // context for billions of symbols (fuzz reproducer
+            // `timeout-063caae0`, plus eight siblings, all panicked here), so
+            // saturate instead of wrapping: a wrap would flip the sign bit and
+            // silently change the `>> 26` bucket.
+            self.run_length = self.run_length.saturating_add(1);
         } else {
             // Escape.
             rc.decode(bs as u32, BIN_SCALE - bs as u32, BIN_SCALE);
@@ -941,7 +948,8 @@ impl Model {
         if count < p0_freq {
             // First symbol matched.
             self.prev_success = if 2 * p0_freq > sum_freq { 1 } else { 0 };
-            self.run_length += self.prev_success as i32;
+            // Same saturation rationale as `decode_bin_symbol`; see there.
+            self.run_length = self.run_length.saturating_add(self.prev_success as i32);
             self.found_state = stats;
             *found_span = Some(states_span.subspan(0, STATE_SIZE));
 
