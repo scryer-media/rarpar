@@ -3,6 +3,30 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.4.1
+
+The 0.4.0 tag never produced a release: its build refused to link two
+`aws-lc-sys` versions, because the copies of `par2-rs` and `unrar-rs` on
+crates.io asked for incompatible ranges. 0.4.1 carries everything listed
+under 0.4.0 below, with that conflict resolved and the RAR4 hardening added.
+
+### Libraries
+
+- `unrar-rs` moves from 0.9.0 to 0.9.2. RAR4 archives whose headers declare
+  data that cannot exist now fail fast with `CorruptArchive` instead of
+  hanging, panicking, or trying to decode gigabytes from a kilobyte; every
+  reproducer the nightly fuzzing lane has saved since 2026-08-16 is covered.
+  The checks run at header time or on paths the decoder reaches only once its
+  input is exhausted, so legitimate archives pay nothing and the decode
+  benches are unchanged within noise. `restore_volumes_from_paths` also
+  restores missing volumes of a RAR5 set written with encrypted headers
+  (`-hp`), which previously refused with "insufficient RAR5 recovery
+  volumes". See its [changelog](crates/unrar-rs/CHANGELOG.md).
+- `par2-rs` moves from 0.9.0 to 0.9.1: its optional `native-crypto` backend
+  requires `aws-lc-sys` 0.45 rather than 0.44, matching `unrar-rs`. No API or
+  behaviour change. See its [changelog](crates/par2-rs/CHANGELOG.md).
+- `reedsolomon-rs` stays at 0.4.3.
+
 ## rarpar 0.4.0
 
 ### CLI Changes
