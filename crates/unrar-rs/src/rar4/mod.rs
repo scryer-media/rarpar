@@ -60,14 +60,66 @@ pub struct Rar4ParsedVolume {
 struct ScanGuard {
     position: u64,
     headers: usize,
+    stream_len: u64,
 }
 
 impl ScanGuard {
     fn new<R: Seek>(reader: &mut R) -> RarResult<Self> {
+        let position = reader.stream_position().map_err(RarError::Io)?;
+        let stream_len = reader.seek(std::io::SeekFrom::End(0)).map_err(RarError::Io)?;
+        reader
+            .seek(std::io::SeekFrom::Start(position))
+            .map_err(RarError::Io)?;
         Ok(Self {
-            position: reader.stream_position().map_err(RarError::Io)?,
+            position,
             headers: 0,
+            stream_len,
         })
+    }
+
+    /// Reject a member whose packed data cannot fit in the volume that declares
+    /// it.
+    ///
+    /// RAR4 stores a *per-volume* packed size: a member split across volumes
+    /// declares only the bytes present in this one, and sets `SPLIT_AFTER` to
+    /// say the rest lives in the next volume. So for any member that does not
+    /// continue (`continues == false`), `data_offset + packed_size` must land
+    /// inside this file. Nothing else is checked here — a split member is left
+    /// alone, so legitimate multi-volume sets never reach this branch.
+    ///
+    /// This is the parse-time half of the fix for the `rar_extract` timeout
+    /// cluster (`timeout-2c9348e8`, `timeout-3b5f5167`, `timeout-7cbe702a`,
+    /// `timeout-8cd4372e`, `timeout-93aa06f4`, `timeout-f869e3ff`, …): those
+    /// inputs are 73 B to 1.6 KB of file declaring 541 MB to 1.35 GB packed and
+    /// up to 4.24 GB unpacked. `decode_limit()` hands the decoder the declared
+    /// unpacked size, so the decode loop is asked to produce gigabytes from a
+    /// stream that ran dry in the first kilobyte. Rejecting the declaration
+    /// here keeps that shape out of the decoder entirely, which is the only
+    /// place a fix costs a legitimate archive nothing: the decode loops stay
+    /// exactly as they were.
+    fn check_member_data_fits(
+        &self,
+        name: &str,
+        data_offset: u64,
+        packed_size: u64,
+        continues: bool,
+    ) -> RarResult<()> {
+        if continues {
+            return Ok(());
+        }
+        let end = data_offset
+            .checked_add(packed_size)
+            .filter(|end| *end <= self.stream_len);
+        if end.is_none() {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR4 member {name:?} at offset {data_offset} declares {packed_size} packed bytes, \
+                     past the {} bytes in this volume",
+                    self.stream_len
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Account for one accepted header, rejecting a stalled or rewound scan.
@@ -155,6 +207,7 @@ pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Pars
         let Some(fh) = header::parse_rar14_file_header(&data, offset)? else {
             break;
         };
+        guard.check_member_data_fits(&fh.name, fh.data_offset, fh.packed_size, fh.split_after)?;
         let skip_size = fh.packed_size;
         files.push(fh);
         header::skip_forward(reader, skip_size)?;
@@ -243,6 +296,12 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                     "RAR4 file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
+                guard.check_member_data_fits(
+                    &fh.name,
+                    fh.data_offset,
+                    fh.packed_size,
+                    fh.split_after,
+                )?;
                 // For files with LARGE flag, the raw header's data_area_size only
                 // has the low 32 bits. Use the fully-resolved packed_size instead.
                 let skip_size = fh.packed_size;
@@ -270,6 +329,12 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                     "RAR4 service: name={:?} packed={} unpacked={:?} method={:?}",
                     service.name, service.packed_size, service.unpacked_size, service.method
                 );
+                guard.check_member_data_fits(
+                    &service.name,
+                    service.data_offset,
+                    service.packed_size,
+                    service.split_after,
+                )?;
                 attach_rar4_uowner_to_previous_file(&service, &mut files);
                 let skip_size = service.packed_size;
                 services.push(service);
@@ -435,6 +500,12 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                     "RAR4 encrypted file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
+                guard.check_member_data_fits(
+                    &fh.name,
+                    fh.data_offset,
+                    fh.packed_size,
+                    fh.split_after,
+                )?;
                 let skip_size = fh.packed_size;
                 files.push(fh);
                 header::skip_forward(reader, skip_size)?;
@@ -446,6 +517,12 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                     "RAR4 encrypted service: name={:?} packed={} unpacked={:?} method={:?}",
                     service.name, service.packed_size, service.unpacked_size, service.method
                 );
+                guard.check_member_data_fits(
+                    &service.name,
+                    service.data_offset,
+                    service.packed_size,
+                    service.split_after,
+                )?;
                 attach_rar4_uowner_to_previous_file(&service, files);
                 let skip_size = service.packed_size;
                 services.push(service);
