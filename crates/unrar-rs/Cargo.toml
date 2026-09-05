@@ -6,7 +6,10 @@ version = "0.9.1"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
-exclude = ["tests/fixtures/**", "fuzz/**"]
+# `fuzz_corpus_regressions.rs` reads the seed corpus with `include_bytes!`, so
+# it goes wherever `fuzz/**` goes: shipping it without the corpus would leave a
+# published tarball whose `cargo test` cannot compile.
+exclude = ["tests/fixtures/**", "fuzz/**", "tests/fuzz_corpus_regressions.rs"]
 
 # Crypto backend selection.
 #

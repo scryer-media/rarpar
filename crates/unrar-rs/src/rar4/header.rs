@@ -1960,4 +1960,41 @@ mod tests {
         assert_eq!(raw.header_type, Rar4HeaderType::Archive);
         assert_eq!(raw.flags, 0);
     }
+
+    /// The sizes that used to seek a header scan backwards.
+    ///
+    /// `SeekFrom::Current` takes an `i64`, so any declared size above
+    /// `i64::MAX` cast to a negative offset. `timeout-a8693f23` used
+    /// `2^64 - 80`, i.e. `-80`, and re-read its own header forever.
+    #[test]
+    fn skip_forward_refuses_sizes_that_would_rewind_the_stream() {
+        for bytes in [
+            u64::MAX,
+            u64::MAX - 79,
+            i64::MAX as u64 + 1,
+            u64::MAX / 2 + 1,
+        ] {
+            let mut cursor = Cursor::new(vec![0u8; 64]);
+            cursor.set_position(16);
+            let err = skip_forward(&mut cursor, bytes).unwrap_err();
+            assert!(
+                matches!(err, RarError::CorruptArchive { .. }),
+                "size {bytes} should be rejected, got {err}"
+            );
+            assert_eq!(cursor.position(), 16, "a rejected skip must not move");
+        }
+    }
+
+    /// A skip past the end of the data is not itself an error: the scan simply
+    /// finds no next header there. Only the direction is enforced.
+    #[test]
+    fn skip_forward_moves_forward_and_never_back() {
+        let mut cursor = Cursor::new(vec![0u8; 64]);
+        cursor.set_position(8);
+
+        assert_eq!(skip_forward(&mut cursor, 0).unwrap(), 8);
+        assert_eq!(skip_forward(&mut cursor, 16).unwrap(), 24);
+        assert_eq!(skip_forward(&mut cursor, 1_000).unwrap(), 1_024);
+        assert!(read_raw_header(&mut cursor).unwrap().is_none());
+    }
 }

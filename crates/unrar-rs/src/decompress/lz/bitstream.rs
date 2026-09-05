@@ -1660,4 +1660,66 @@ mod tests {
         reader.align_byte();
         assert_eq!(reader.position(), 8);
     }
+
+    /// `bits_remaining` used to call `refill` unconditionally, so once the
+    /// input was exhausted every call paid a trip through the cold
+    /// `refill_slow` to learn nothing. Behaviour has to be identical either
+    /// way: the count is stable, and it is the same one a reader that still
+    /// refilled would report.
+    #[test]
+    fn streaming_bits_remaining_is_stable_and_refill_free_at_eof() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0xABu8, 0xCD]));
+        assert_eq!(reader.read_bits(16).unwrap(), 0xABCD);
+
+        // The first call is what discovers the end; every one after it must
+        // agree, without touching the source again.
+        let first = reader.bits_remaining();
+        assert_eq!(first, 0);
+        for _ in 0..4 {
+            assert_eq!(reader.bits_remaining(), first);
+        }
+        assert!(!reader.has_bits());
+    }
+
+    /// A partially consumed accumulator still reports what it holds after the
+    /// source runs dry — this is the state the RAR4 outer decode loops test
+    /// with `bits_remaining() < 1`.
+    #[test]
+    fn streaming_bits_remaining_reports_the_stale_accumulator_at_eof() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0xFFu8]));
+        assert_eq!(reader.read_bits(3).unwrap(), 0b111);
+        assert_eq!(reader.bits_remaining(), 5);
+        assert_eq!(reader.bits_remaining(), 5);
+    }
+
+    /// The counter behind the PPMd exhaustion guard: zeros invented past the
+    /// end of the input are counted, real bytes are not.
+    #[test]
+    fn streaming_read_byte_or_zero_counts_only_invented_bytes() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0x5Au8, 0xA5]));
+        assert_eq!(reader.read_byte_or_zero(), 0x5A);
+        assert_eq!(reader.read_byte_or_zero(), 0xA5);
+        assert_eq!(reader.zero_bytes_past_eof(), 0);
+
+        for expected in 1..=5u32 {
+            assert_eq!(reader.read_byte_or_zero(), 0);
+            assert_eq!(reader.zero_bytes_past_eof(), expected);
+        }
+    }
+
+    /// Same contract for the slice-backed reader, which is what the in-memory
+    /// RAR4 entry points hand to the range decoder.
+    #[test]
+    fn slice_read_byte_or_zero_counts_only_invented_bytes() {
+        let data = [0x5Au8, 0xA5];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0x5A);
+        assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0xA5);
+        assert_eq!(BitRead::zero_bytes_past_eof(&reader), 0);
+
+        for expected in 1..=5u32 {
+            assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0);
+            assert_eq!(BitRead::zero_bytes_past_eof(&reader), expected);
+        }
+    }
 }

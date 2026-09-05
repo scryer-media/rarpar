@@ -2248,6 +2248,36 @@ mod tests {
         assert_ne!(model.min_context, 0);
     }
 
+    /// `run_length` is only ever compared or shifted, so unrar's C `int`
+    /// overflow never bites there — but `decode_bin_symbol` shifts it into the
+    /// `bin_summ` row index as `((run_length >> 26) as usize) & 0x20`, and a
+    /// wrap from `i32::MAX` to `i32::MIN` flips that bucket. Nine `rar_extract`
+    /// timeout artifacts (`timeout-063caae0` and siblings) held one binary
+    /// context long enough to reach the boundary.
+    #[test]
+    fn run_length_saturates_instead_of_flipping_the_bin_summ_bucket() {
+        // The index term as `decode_bin_symbol` computes it.
+        let bucket = |run_length: i32| ((run_length >> 26) as usize) & 0x20;
+
+        let mut model = Model::new(6, 1024 * 1024);
+        model.run_length = i32::MAX;
+        let before = bucket(model.run_length);
+
+        for _ in 0..8 {
+            model.run_length = model.run_length.saturating_add(1);
+            model.run_length = model.run_length.saturating_add(model.prev_success as i32);
+        }
+
+        assert_eq!(model.run_length, i32::MAX);
+        assert_eq!(bucket(model.run_length), before);
+        assert!(before < 64, "the index term must stay inside bin_summ's row");
+
+        // What saturation is buying: the wrapped value lands in the other
+        // bucket, so a release build would silently decode against different
+        // probabilities rather than panicking as the debug build did.
+        assert_ne!(bucket(i32::MAX.wrapping_add(1)), before);
+    }
+
     #[test]
     fn cleanup_restarts_at_the_oracle_minimum_allocation_and_order() {
         let mut model = Model::new(16, 4 * 1024 * 1024);
