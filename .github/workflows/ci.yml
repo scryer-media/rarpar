@@ -36,7 +36,11 @@ jobs:
     # member is affected when its own files changed, when a locked dependency
     # in its closure changed, or when a workspace member it depends on is
     # affected. `crates` is any library crate under `crates/`; `rust` is any
-    # member at all. Lanes that run one crate's suite key on that crate.
+    # member at all. Lanes that run one crate's suite key on that crate. The
+    # three surface outputs cover lanes that test something other than a
+    # member's build: `packaging` (crates.io archive contents), `docs`
+    # (generated manpages, completions, package root) and `bench` (the Go
+    # fleet harness).
     outputs:
       reedsolomon: ${{ steps.detect.outputs.reedsolomon }}
       unrar: ${{ steps.detect.outputs.unrar }}
@@ -44,6 +48,9 @@ jobs:
       par3: ${{ steps.detect.outputs.par3 }}
       rarpar: ${{ steps.detect.outputs.rarpar }}
       xtask: ${{ steps.detect.outputs.xtask }}
+      packaging: ${{ steps.detect.outputs.packaging }}
+      docs: ${{ steps.detect.outputs.docs }}
+      bench: ${{ steps.detect.outputs.bench }}
       crates: ${{ steps.detect.outputs.crates }}
       rust: ${{ steps.detect.outputs.rust }}
     steps:
@@ -1012,7 +1019,7 @@ jobs:
   package:
     name: package
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.crates == 'true'
+    if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.packaging == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -1231,7 +1238,7 @@ jobs:
   docs-package:
     name: docs-package
     needs: [changes, fmt, clippy, unit-tests]
-    if: needs.changes.outputs.rarpar == 'true'
+    if: needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -1307,7 +1314,7 @@ jobs:
   benchmark-harness:
     name: benchmark-harness
     needs: [changes]
-    if: needs.changes.outputs.rarpar == 'true'
+    if: needs.changes.outputs.bench == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

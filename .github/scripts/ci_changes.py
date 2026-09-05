@@ -34,9 +34,12 @@ documented locations changes nothing that Rust compiles.
 The output is one boolean per member, named without the `-rs` suffix
 (`unrar`, `par2`, ...), plus two aggregates the workflow keys its shared lanes
 on: `crates` (any publishable library crate under `crates/`) and `rust` (any
-member at all). The set of names the workflow declares is fixed (`KNOWN`), so
-a crate that does not exist on this branch still yields `false` rather than
-an undefined output.
+member at all). A few lanes test something that is not a Rust build at all —
+the crates.io package contents, the generated docs, the Go bench harness —
+and those get their own "surface" outputs (`SURFACES`) so that, say, a README
+edit reaches the docs lane and nothing else. The set of names the workflow
+declares is fixed (`KNOWN`, `SURFACES`), so a crate that does not exist on
+this branch still yields `false` rather than an undefined output.
 """
 
 from __future__ import annotations
@@ -82,17 +85,27 @@ PATH_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # too, but reaches it through fan-out from these.
     ("test-corpus/*", ("unrar-rs", "par2-rs")),
     (".github/workflows/test-corpus-publish.yml", ("unrar-rs", "par2-rs")),
-    # Packaging inputs: the package-content lane keys on `crates`.
-    (".github/workflows/publish-crates.yml", (LIBRARY_CRATES,)),
-    (".gitattributes", (LIBRARY_CRATES,)),
-    (".gitleaks.toml", (LIBRARY_CRATES,)),
-    (".githooks/*", (LIBRARY_CRATES,)),
-    # The CLI's own release, docs and benchmark surfaces.
+    # The release workflow's feature policy is checked against the CLI build.
     (".github/workflows/release.yml", ("rarpar",)),
-    ("README.md", ("rarpar",)),
-    ("docs/*", ("rarpar",)),
-    ("bench/rarpar-bench/*", ("rarpar",)),
 )
+
+# Lanes that test a surface rather than a member's build. Each is also true
+# whenever a global input changed (the workflow itself, most often) and on
+# manual runs, like every member.
+SURFACES: dict[str, tuple[str, ...]] = {
+    # `package`: the crates.io archive contents and their size caps.
+    "packaging": (
+        ".github/workflows/publish-crates.yml",
+        ".gitattributes",
+        ".gitleaks.toml",
+        ".githooks/*",
+    ),
+    # `docs-package`: manpages, completions and the package-root layout are
+    # generated from these.
+    "docs": ("README.md", "docs/*"),
+    # `benchmark-harness`: the Go fleet harness, which never builds rarpar.
+    "bench": ("bench/rarpar-bench/*",),
+}
 
 LOCKFILE = "Cargo.lock"
 
@@ -119,6 +132,8 @@ class Classification:
     reasons: dict[str, set[str]]
     ignored: list[str]
     members: dict[str, Member]
+    # surface name -> reasons, same convention
+    surfaces: dict[str, set[str]] = field(default_factory=lambda: {name: set() for name in SURFACES})
 
     def affected(self, name: str) -> bool:
         return bool(self.reasons.get(name))
@@ -127,6 +142,8 @@ class Classification:
         out = {name: False for name in KNOWN}
         for member in self.members.values():
             out[member.output_name] = self.affected(member.name)
+        for surface in SURFACES:
+            out[surface] = bool(self.surfaces[surface])
         out["crates"] = any(
             self.affected(m.name) for m in self.members.values() if m.is_library_crate
         )
@@ -207,6 +224,7 @@ def classify(
     by_id = {m.id: m for m in members.values()}
     library = [m.name for m in members.values() if m.is_library_crate]
     reasons: dict[str, set[str]] = {name: set() for name in members}
+    surfaces: dict[str, set[str]] = {name: set() for name in SURFACES}
     ignored: list[str] = []
 
     def hit(names: Iterable[str], reason: str) -> None:
@@ -226,7 +244,13 @@ def classify(
         matched = False
         if any(_matches(path, g) for g in GLOBAL_PATHS):
             hit(members.keys(), f"global input `{path}`")
+            for why in surfaces.values():
+                why.add(f"global input `{path}`")
             matched = True
+        for surface, patterns in SURFACES.items():
+            if any(_matches(path, g) for g in patterns):
+                surfaces[surface].add(f"`{path}`")
+                matched = True
         for member in members.values():
             if path.startswith(member.directory + "/"):
                 hit([member.name], f"`{path}`")
@@ -269,7 +293,7 @@ def classify(
             if dep is not None and dep.name != member.name and dep.name in direct:
                 reasons[member.name].add(f"depends on `{dep.name}`")
 
-    return Classification(reasons, ignored, members)
+    return Classification(reasons, ignored, members, surfaces)
 
 
 def render_outputs(outputs: Mapping[str, bool]) -> str:
@@ -281,6 +305,9 @@ def render_summary(result: Classification, outputs: Mapping[str, bool], changed:
     for member in result.members.values():
         why = "; ".join(sorted(result.reasons[member.name])) or "—"
         lines.append(f"| `{member.output_name}` | `{str(result.affected(member.name)).lower()}` | {why} |")
+    for surface in SURFACES:
+        why = "; ".join(sorted(result.surfaces[surface])) or "—"
+        lines.append(f"| `{surface}` | `{str(outputs[surface]).lower()}` | {why} |")
     for key in ("crates", "rust"):
         lines.append(f"| `{key}` | `{str(outputs[key]).lower()}` | aggregate |")
     unknown = [m.output_name for m in result.members.values() if m.output_name not in KNOWN]
@@ -295,7 +322,12 @@ def render_summary(result: Classification, outputs: Mapping[str, bool], changed:
 
 def all_true(metadata: Mapping) -> Classification:
     members = load_members(metadata)
-    return Classification({name: {"manual run"} for name in members}, [], members)
+    return Classification(
+        {name: {"manual run"} for name in members},
+        [],
+        members,
+        {name: {"manual run"} for name in SURFACES},
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

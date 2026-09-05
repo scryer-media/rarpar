@@ -128,13 +128,36 @@ class PathClassification(unittest.TestCase):
             with self.subTest(path=path):
                 result = ci_changes.classify([path], metadata())
                 self.assertEqual(affected(result), sorted(MEMBERS))
+                self.assertTrue(all(result.outputs()[s] for s in ci_changes.SURFACES))
 
     def test_corpus_reaches_its_consumers(self):
         result = ci_changes.classify(["test-corpus/manifest.json"], metadata())
         self.assertEqual(affected(result), ["par2-rs", "unrar-rs"])
 
-    def test_docs_reach_the_cli(self):
+    def test_docs_reach_only_the_docs_lane(self):
         result = ci_changes.classify(["docs/usage.md", "README.md"], metadata())
+        self.assertEqual(affected(result), [])
+        outputs = result.outputs()
+        self.assertTrue(outputs["docs"])
+        self.assertFalse(outputs["rust"])
+        self.assertFalse(outputs["packaging"])
+
+    def test_packaging_inputs_reach_only_the_package_lane(self):
+        for path in (".github/workflows/publish-crates.yml", ".gitattributes", ".githooks/pre-commit"):
+            with self.subTest(path=path):
+                result = ci_changes.classify([path], metadata())
+                self.assertEqual(affected(result), [])
+                self.assertTrue(result.outputs()["packaging"])
+                self.assertFalse(result.outputs()["crates"])
+
+    def test_go_harness_reaches_only_the_bench_lane(self):
+        result = ci_changes.classify(["bench/rarpar-bench/internal/fleet/fleet.go"], metadata())
+        self.assertEqual(affected(result), [])
+        self.assertTrue(result.outputs()["bench"])
+        self.assertFalse(result.outputs()["docs"])
+
+    def test_release_workflow_reaches_the_cli(self):
+        result = ci_changes.classify([".github/workflows/release.yml"], metadata())
         self.assertEqual(affected(result), ["rarpar", "xtask"])
 
     def test_unrelated_files_are_ignored_and_reported(self):
@@ -198,7 +221,7 @@ class Outputs(unittest.TestCase):
     def test_declared_outputs_are_always_present(self):
         result = ci_changes.classify(["crates/unrar-rs/src/lib.rs"], metadata(members=[m for m in MEMBERS if m != "par3-rs"]))
         outputs = result.outputs()
-        self.assertEqual(set(ci_changes.KNOWN) | {"crates", "rust"}, set(outputs))
+        self.assertEqual(set(ci_changes.KNOWN) | set(ci_changes.SURFACES) | {"crates", "rust"}, set(outputs))
         self.assertFalse(outputs["par3"])
 
     def test_all_marks_everyone(self):
@@ -215,6 +238,7 @@ class Outputs(unittest.TestCase):
         summary = ci_changes.render_summary(result, result.outputs(), ["crates/par2-rs/src/lib.rs", "AGENTS.md"])
         self.assertIn("| `par2` | `true` | `crates/par2-rs/src/lib.rs` |", summary)
         self.assertIn("| `unrar` | `false` | — |", summary)
+        self.assertIn("| `docs` | `false` | — |", summary)
         self.assertIn("Changed files affecting no member:\n- `AGENTS.md`", summary)
 
 
@@ -247,6 +271,9 @@ class CommandLine(unittest.TestCase):
                     par3=true
                     rarpar=true
                     xtask=true
+                    packaging=false
+                    docs=false
+                    bench=false
                     crates=true
                     rust=true
                     """
