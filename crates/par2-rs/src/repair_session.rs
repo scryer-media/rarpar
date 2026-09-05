@@ -91,6 +91,26 @@ pub struct Par2RepairSessionOptions {
     /// Explicit recovery volumes to merge immediately after opening.
     pub recovery_paths: Vec<PathBuf>,
     pub extra_paths: Vec<PathBuf>,
+    /// Paths under [`base_dir`] the extra scan must never enrol as candidates.
+    ///
+    /// Forwarded verbatim to [`Par2RepairerOptions::exclude_paths`], which
+    /// documents what it is for: a directory can hold the volumes of *other*
+    /// recovery sets, whose bytes cannot contain this set's slices at any
+    /// offset, and rolling-scanning them is a whole-payload read that can only
+    /// ever find nothing. Every scanning pass of the session honours it, so an
+    /// exclusion set once at open applies to the analysis and to every
+    /// re-analysis after an invalidation.
+    ///
+    /// [`base_dir`]: Self::base_dir
+    /// [`Par2RepairerOptions::exclude_paths`]: crate::Par2RepairerOptions::exclude_paths
+    pub exclude_paths: Vec<PathBuf>,
+    /// Whether the extra scan walks [`base_dir`] for candidates at all.
+    /// `true` is the default and the pre-existing behaviour; `false` limits
+    /// extra candidates to [`extra_paths`].
+    ///
+    /// [`base_dir`]: Self::base_dir
+    /// [`extra_paths`]: Self::extra_paths
+    pub discover_extras: bool,
     pub memory_limit: Option<usize>,
     pub retained_state_limit: usize,
     pub rename_only: bool,
@@ -230,6 +250,8 @@ impl Default for Par2RepairSessionOptions {
             par2_paths: Vec::new(),
             recovery_paths: Vec::new(),
             extra_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            discover_extras: true,
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
             retained_state_limit: DEFAULT_RETAINED_STATE_LIMIT,
             rename_only: false,
@@ -893,6 +915,57 @@ impl Par2RepairSession {
         changed
     }
 
+    /// Replace the paths this session's extra scan must leave alone.
+    ///
+    /// A retained session outlives the facts that decide the exclusion set —
+    /// which files the host has bound to which recovery set — so the set has to
+    /// be replaceable without throwing the session away and paying for its
+    /// packet parse and its source scan again.
+    ///
+    /// A path that becomes excluded also loses whatever this session had
+    /// retained from it. An exclusion states that the file's bytes belong to
+    /// something else, so a location or a piece of evidence still pointing
+    /// into it is a claim this session is no longer willing to make — leaving
+    /// it standing would let a repair read from a file the caller has just
+    /// said not to read.
+    ///
+    /// A path that stops being excluded is a candidate this session has never
+    /// looked at, so the cached assessment is discarded and the next
+    /// [`Self::analyze`] scans what is unresolved with the file admitted.
+    ///
+    /// An unchanged list does nothing at all, so a caller may recompute and
+    /// re-set it on every pass without costing a scan.
+    pub fn set_exclude_paths(&mut self, exclude_paths: Vec<PathBuf>) {
+        let mut next: Vec<PathBuf> = exclude_paths;
+        next.sort();
+        next.dedup();
+        // Both sides are held in the same normal form, so "did it change" is
+        // answered by ordering rather than by how the caller spelled the list.
+        self.options.exclude_paths.sort();
+        self.options.exclude_paths.dedup();
+        if next == self.options.exclude_paths {
+            return;
+        }
+        let added: Vec<PathBuf> = next
+            .iter()
+            .filter(|path| self.options.exclude_paths.binary_search(path).is_err())
+            .cloned()
+            .collect();
+        let widened = self
+            .options
+            .exclude_paths
+            .iter()
+            .any(|path| next.binary_search(path).is_err());
+        self.options.exclude_paths = next;
+        for path in added {
+            self.invalidate_path(path);
+        }
+        if widened {
+            self.sources_scanned = false;
+            self.assessment = None;
+        }
+    }
+
     /// Forget every retained source location and evidence while retaining the
     /// parsed packet set and lazily selected recovery packets.
     ///
@@ -1215,6 +1288,8 @@ fn repairer_options(options: &Par2RepairSessionOptions, repair: bool) -> Par2Rep
     let mut out = Par2RepairerOptions::new(options.base_dir.clone(), options.par2_paths.clone());
     out.file_set = options.file_set.clone();
     out.extra_paths = options.extra_paths.clone();
+    out.exclude_paths = options.exclude_paths.clone();
+    out.discover_extras = options.discover_extras;
     out.repair = repair;
     out.memory_limit = options.memory_limit;
     out.rename_only = options.rename_only;
@@ -1516,6 +1591,101 @@ mod tests {
             )),
             Err(Par2SessionError::EvidenceDoesNotMatch { .. })
         ));
+    }
+
+    /// Excluding a path a live session had already resolved a block from
+    /// retires that resolution: the caller has just said those bytes belong to
+    /// something else, and a repair must not read them. Re-admitting the path
+    /// lets the next analysis find it again.
+    #[test]
+    fn excluding_a_path_retires_what_the_session_resolved_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x51; 16]);
+        let file_id = FileId::from_bytes([0x52; 16]);
+        // The described file is absent; only this foreign volume holds the
+        // bytes, so every located block comes from it.
+        let foreign = dir.path().join("other-set.rar");
+        fs::write(&foreign, payload).unwrap();
+
+        let options = Par2RepairSessionOptions::new(dir.path().to_path_buf(), Vec::new());
+        let mut session = session_from_set(
+            options,
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+        );
+        let found = session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 1);
+        assert_eq!(
+            session.diagnostics().scan.bytes_scanned,
+            payload.len() as u64
+        );
+        assert_eq!(found.verification.total_missing_blocks, 0);
+
+        session.set_exclude_paths(vec![foreign.clone()]);
+        let retired = session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 2);
+        assert_eq!(
+            session.diagnostics().scan.bytes_scanned,
+            0,
+            "the excluded volume must not be re-read"
+        );
+        assert!(retired.verification.total_missing_blocks > 0);
+
+        // Re-setting the same list is inert: no scan, same verdict.
+        session.set_exclude_paths(vec![foreign.clone()]);
+        session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 2);
+
+        // Re-admitting it makes the bytes findable again.
+        session.set_exclude_paths(Vec::new());
+        let readmitted = session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 3);
+        assert_eq!(readmitted.verification.total_missing_blocks, 0);
+    }
+
+    /// The exclusion reaches every scanning pass the session runs, not just
+    /// the first. That matters because a re-analysis after an invalidation —
+    /// the shape a post-repair verification takes — rebuilds the candidate
+    /// list from scratch, and would otherwise read the foreign volume a second
+    /// time for the same nothing.
+    #[test]
+    fn session_scan_honours_exclusions_on_every_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sixteen-byte-pay";
+        let set_id = RecoverySetId::from_bytes([0x41; 16]);
+        let file_id = FileId::from_bytes([0x42; 16]);
+        // A volume of some other recovery set that happens to hold these
+        // bytes: if it were scanned, the counters would say so.
+        let foreign = dir.path().join("other-set.rar");
+        fs::write(&foreign, payload).unwrap();
+
+        let mut discovering = Par2RepairSessionOptions::new(dir.path().to_path_buf(), Vec::new());
+        discovering.discover_extras = true;
+        let mut control = session_from_set(
+            discovering,
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+        );
+        control.analyze().unwrap();
+        assert_eq!(
+            control.diagnostics().scan.bytes_scanned,
+            payload.len() as u64
+        );
+
+        let mut options = Par2RepairSessionOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.exclude_paths = vec![foreign];
+        let mut session = session_from_set(
+            options,
+            single_file_set(set_id, file_id, "payload.bin", payload, 8),
+        );
+
+        session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 1);
+        assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
+
+        session.invalidate_all_sources();
+        session.analyze().unwrap();
+        assert_eq!(session.diagnostics().source_scan_passes, 2);
+        assert_eq!(session.diagnostics().scan.bytes_scanned, 0);
     }
 
     /// The FileId-keyed form still requires a handle to read those bytes with.

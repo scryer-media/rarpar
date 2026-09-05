@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.10.0
+
+A caller can now say which files in the working directory the extra scan must
+leave alone.
+
+**Semver: a compatibility break.** `Par2RepairerOptions` and
+`Par2RepairSessionOptions` each gain two public fields, so external struct
+literals stop compiling. Build them through `new()` / `Default::default()` and
+future additions arrive as minor versions.
+
+### Added
+
+- `Par2RepairerOptions::exclude_paths` and
+  `Par2RepairSessionOptions::exclude_paths`: paths under `base_dir` that must
+  never be enrolled as extra scan candidates. An extra candidate is a file the
+  set does not describe, rolling-scanned window by window on the chance that it
+  holds a copy of some slice — worth doing for a renamed or concatenated
+  source, pure waste for a file whose bytes provably belong elsewhere. The
+  motivating case is a directory holding two recovery sets: each set's extra
+  scan read the *other* set's volumes end to end, once per scanning pass,
+  and could never match a byte of them. Entries are canonicalised the same way
+  discovered candidates and `extra_paths` are, so a symlink and its target name
+  the same exclusion, and an entry naming a file the set itself describes is
+  inert. Only the extra scan is bounded: canonical sources, `.par2` packet
+  inputs and explicit `recovery_paths` are unaffected.
+- `Par2RepairSession::set_exclude_paths`: replace a live session's exclusion
+  set without discarding the session. A retained session outlives the facts
+  that decide the set, so it has to be adjustable in place. A path that becomes
+  excluded loses whatever the session had retained from it — a location still
+  pointing into a file the caller has just disowned would otherwise be readable
+  by a repair — and a path that stops being excluded discards the cached
+  assessment so the next `analyze` can find it. Re-setting an unchanged list
+  does nothing, so a host may recompute it every pass for free.
+- `Par2RepairerOptions::discover_extras` and
+  `Par2RepairSessionOptions::discover_extras` (default `true`, the previous
+  behaviour): setting it to `false` skips the `base_dir` walk entirely, so
+  extra candidates come only from the explicit `extra_paths`.
+
+Both fields default to the pre-existing behaviour, so a caller that does not
+set them scans exactly what it scanned before.
+
+### Changed
+
+- `Par2RepairerOptions::scan_carry` documents that a carry must come from a
+  pass with the same `exclude_paths` and `discover_extras` as well as the same
+  `base_dir`/`extra_paths`/`scan_skip_*`: those settings decide which files the
+  scan was allowed to look at, and carried block locations are only a complete
+  account of the tree for a pass allowed to look at the same ones.
+
 ## 0.9.1
 
 ### Changed
