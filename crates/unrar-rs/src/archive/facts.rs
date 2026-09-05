@@ -695,7 +695,9 @@ impl RarArchive {
             if format == ArchiveFormat::Rar14 {
                 return Ok(RarVolumeHeaderEncryption::None);
             }
-            return match crate::rar4::parse_rar4_headers(&mut reader, None) {
+            // The facts walk: nothing here is decoded from, so a reader with no
+            // known length — a volume still arriving — is accepted.
+            return match crate::rar4::parse_rar4_headers_for_facts(&mut reader, None) {
                 Ok(_) => Ok(RarVolumeHeaderEncryption::None),
                 Err(crate::error::RarError::EncryptedArchive) => {
                     Ok(RarVolumeHeaderEncryption::Rar4)
@@ -728,10 +730,14 @@ impl RarArchive {
         let format = signature::read_signature(&mut reader)?;
 
         if format.is_rar4_family() {
+            // The `_for_facts` walks accept a reader with no known length — a
+            // sparse image of a volume still arriving — because the result is
+            // reported and never decoded from; every extraction-bound parse
+            // still refuses one.
             let parsed = if format == ArchiveFormat::Rar14 {
-                crate::rar4::parse_rar14_headers(&mut reader)?
+                crate::rar4::parse_rar14_headers_for_facts(&mut reader)?
             } else {
-                crate::rar4::parse_rar4_headers(&mut reader, password)?
+                crate::rar4::parse_rar4_headers_for_facts(&mut reader, password)?
             };
             let volume_number = parsed
                 .end

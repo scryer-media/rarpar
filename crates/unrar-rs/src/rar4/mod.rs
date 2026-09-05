@@ -57,25 +57,50 @@ pub struct Rar4ParsedVolume {
 /// ran out. [`header::skip_forward`] closes that at the source; this guard is
 /// the backstop for any other route to a stalled scan. It costs one
 /// `stream_position` per *header* and never runs on a decode path.
+/// What a header scan does with a reader that cannot state its length — one
+/// that answers `SeekFrom::End(0)` with `ErrorKind::Unsupported`, the way a
+/// sparse image of a volume still arriving does.
+///
+/// The answer depends on what the parsed headers are *for*. A parse that feeds
+/// the decoder must know the volume's length: [`ScanGuard::check_member_data_fits`]
+/// is what keeps a 1 KiB file declaring gigabytes of packed data out of the
+/// decode loop, and a length it cannot learn is a check it cannot make. A parse
+/// that only reports what the headers *say* — the volume-facts walk — decodes
+/// nothing, so the same reader is not a hazard to it and a volume with no end
+/// yet is exactly the input it exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnknownLength {
+    /// Fail the parse with the reader's own `Unsupported` error. The default
+    /// for every parse whose result can reach the decoder.
+    Refuse,
+    /// Record the length as unknown and skip the one check that needs it. For
+    /// header walks whose result is never extracted from.
+    Tolerate,
+}
+
 struct ScanGuard {
     position: u64,
     headers: usize,
     /// The stream's length, when the reader can state one.
     ///
-    /// `None` for a reader that refuses end-relative seeks with
-    /// `ErrorKind::Unsupported` — a volume still arriving over the wire, or a
-    /// sparse image of one, has no end to seek from and says so. Such a reader
-    /// is not a corrupt archive: it forgoes [`Self::check_member_data_fits`],
-    /// the one check that needs a length, and keeps the other two properties.
+    /// `None` only under [`UnknownLength::Tolerate`], for a reader that refuses
+    /// end-relative seeks with `ErrorKind::Unsupported`. Such a reader is not a
+    /// corrupt archive: the scan forgoes [`Self::check_member_data_fits`], the
+    /// one check that needs a length, and keeps the other two properties.
     stream_len: Option<u64>,
 }
 
 impl ScanGuard {
-    fn new<R: Seek>(reader: &mut R) -> RarResult<Self> {
+    fn new<R: Seek>(reader: &mut R, unknown_length: UnknownLength) -> RarResult<Self> {
         let position = reader.stream_position().map_err(RarError::Io)?;
         let stream_len = match reader.seek(std::io::SeekFrom::End(0)) {
             Ok(len) => Some(len),
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Unsupported
+                    && unknown_length == UnknownLength::Tolerate =>
+            {
+                None
+            }
             Err(error) => return Err(RarError::Io(error)),
         };
         reader
@@ -110,8 +135,9 @@ impl ScanGuard {
     /// exactly as they were.
     ///
     /// A reader with no known length (see [`Self::stream_len`]) is not checked:
-    /// there is no volume end to fit inside yet, and the caller that hands one
-    /// over is walking headers, not feeding the decoder.
+    /// there is no volume end to fit inside yet. Only a facts walk ever holds
+    /// one — [`UnknownLength::Refuse`] keeps every decoder-bound parse from
+    /// reaching this arm — so nothing skipped here is ever extracted from.
     fn check_member_data_fits(
         &self,
         name: &str,
@@ -166,8 +192,25 @@ impl ScanGuard {
 
 /// Parse all headers from a RAR 1.4 archive volume.
 ///
-/// Reader must be positioned at the `RE~^` main-header marker.
+/// Reader must be positioned at the `RE~^` main-header marker. Refuses a reader
+/// that cannot state its length; [`parse_rar14_headers_for_facts`] is the walk
+/// for those.
 pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4ParsedVolume> {
+    parse_rar14_headers_with(reader, UnknownLength::Refuse)
+}
+
+/// [`parse_rar14_headers`] for a volume-facts walk: the result is reported,
+/// never decoded from, so a reader with no known length is accepted.
+pub(crate) fn parse_rar14_headers_for_facts<R: Read + Seek>(
+    reader: &mut R,
+) -> RarResult<Rar4ParsedVolume> {
+    parse_rar14_headers_with(reader, UnknownLength::Tolerate)
+}
+
+fn parse_rar14_headers_with<R: Read + Seek>(
+    reader: &mut R,
+    unknown_length: UnknownLength,
+) -> RarResult<Rar4ParsedVolume> {
     let main_offset = reader.stream_position().map_err(RarError::Io)?;
     let mut main = [0u8; 7];
     reader.read_exact(&mut main).map_err(|e| {
@@ -191,7 +234,7 @@ pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Pars
     }
 
     let mut files = Vec::new();
-    let mut guard = ScanGuard::new(reader)?;
+    let mut guard = ScanGuard::new(reader, unknown_length)?;
     loop {
         let offset = reader.stream_position().map_err(RarError::Io)?;
         let mut fixed = [0u8; 21];
@@ -251,6 +294,9 @@ pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Pars
 /// Reader should be positioned right after the 7-byte RAR4 signature.
 /// If the archive uses header-level encryption (`-hp`), the password is
 /// required to decrypt headers.
+///
+/// Refuses a reader that cannot state its length (see [`UnknownLength`]);
+/// [`parse_rar4_headers_for_facts`] is the walk for those.
 pub fn parse_rar4_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
@@ -259,10 +305,30 @@ pub fn parse_rar4_headers<R: Read + Seek>(
     parse_rar4_headers_with_kdf_cache(reader, password, &kdf_cache)
 }
 
+/// [`parse_rar4_headers`] for a volume-facts walk: the result is reported,
+/// never decoded from, so a reader with no known length is accepted and only
+/// the packed-data fit check is skipped for it.
+pub(crate) fn parse_rar4_headers_for_facts<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+) -> RarResult<Rar4ParsedVolume> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    parse_rar4_headers_with(reader, password, &kdf_cache, UnknownLength::Tolerate)
+}
+
 pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
+) -> RarResult<Rar4ParsedVolume> {
+    parse_rar4_headers_with(reader, password, kdf_cache, UnknownLength::Refuse)
+}
+
+fn parse_rar4_headers_with<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    unknown_length: UnknownLength,
 ) -> RarResult<Rar4ParsedVolume> {
     let mut archive_header = None;
     let mut files = Vec::new();
@@ -272,7 +338,7 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     let mut recovery_records = Vec::new();
     let mut end = None;
 
-    let mut guard = ScanGuard::new(reader)?;
+    let mut guard = ScanGuard::new(reader, unknown_length)?;
     while let Some(raw) = header::read_raw_header(reader)? {
         // Checked here rather than at the bottom of the body because several
         // arms `continue`. At this point the header itself has been consumed,
@@ -302,6 +368,7 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                         &mut old_services,
                         &mut end,
                         kdf_cache,
+                        unknown_length,
                     )?;
                     break;
                 }
@@ -468,6 +535,7 @@ pub(crate) fn parse_rar4_uowner_subdata(data: &[u8]) -> Option<UnixOwnerInfo> {
 /// In RAR4 header encryption (`-hp`), each header is individually encrypted:
 /// a fresh 8-byte salt precedes each header in the stream, and the decryptor
 /// is re-initialized per header.
+#[allow(clippy::too_many_arguments)]
 fn parse_rar4_encrypted_headers<R: Read + Seek>(
     reader: &mut R,
     password: &str,
@@ -476,8 +544,9 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
     old_services: &mut Vec<Rar4OldServiceHeader>,
     end: &mut Option<Rar4EndHeader>,
     kdf_cache: &crate::crypto::KdfCache,
+    unknown_length: UnknownLength,
 ) -> RarResult<()> {
-    let mut guard = ScanGuard::new(reader)?;
+    let mut guard = ScanGuard::new(reader, unknown_length)?;
     loop {
         // Each encrypted header is preceded by its own 8-byte salt.
         let mut salt = [0u8; 8];
@@ -888,10 +957,10 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_with_no_known_length_still_walks_the_headers() {
+    fn a_facts_walk_over_a_reader_with_no_known_length_still_reports_the_headers() {
         let data = build_minimal_rar4_archive("hello.txt", b"Hello world");
         let sized = parse_rar4_headers(&mut Cursor::new(data.clone()), None).unwrap();
-        let endless = parse_rar4_headers(&mut Endless(Cursor::new(data)), None)
+        let endless = parse_rar4_headers_for_facts(&mut Endless(Cursor::new(data)), None)
             .expect("a reader that cannot state its length is not a corrupt archive");
         assert_eq!(endless.files.len(), sized.files.len());
         assert_eq!(endless.files[0].name, sized.files[0].name);
@@ -901,25 +970,68 @@ mod tests {
     }
 
     #[test]
+    fn an_extraction_bound_parse_refuses_a_reader_with_no_known_length() {
+        // The decoder-facing parse keeps the packed-data fit check, and a
+        // length it cannot learn is a check it cannot make — so the reader's
+        // own refusal is the answer, exactly as it was before the facts walk
+        // learned to tolerate one.
+        let data = build_minimal_rar4_archive("hello.txt", b"Hello world");
+        let refused = parse_rar4_headers(&mut Endless(Cursor::new(data)), None);
+        let unsupported = matches!(
+            &refused,
+            Err(RarError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
+        );
+        assert!(
+            unsupported,
+            "a parse whose result can reach the decoder must refuse a reader with no length"
+        );
+    }
+
+    #[test]
     fn the_packed_size_fit_check_needs_a_length_and_only_that_check_is_skipped() {
         // Twelve bytes of a member that declares eleven more than the file
-        // holds: a sized reader refuses the declaration at the header, a reader
-        // with no end cannot and walks on, the way every scan did before the
-        // check existed.
+        // holds: a sized reader refuses the declaration at the header, a facts
+        // walk over a reader with no end cannot and walks on, the way every
+        // scan did before the check existed.
         let mut data = build_minimal_rar4_archive("hello.txt", b"Hello world");
         let end_header_len = 7;
         let content_len = b"Hello world".len();
         data.truncate(data.len() - end_header_len - content_len);
         let sized = parse_rar4_headers(&mut Cursor::new(data.clone()), None);
-        assert!(
-            matches!(&sized, Err(RarError::CorruptArchive { detail }) if detail.contains("past the")),
-            "a sized reader must refuse a member whose data cannot fit, got {sized:?}"
+        let sized_refused = matches!(
+            &sized,
+            Err(RarError::CorruptArchive { detail }) if detail.contains("past the")
         );
-        let endless = parse_rar4_headers(&mut Endless(Cursor::new(data)), None);
         assert!(
-            !matches!(&endless, Err(RarError::CorruptArchive { detail }) if detail.contains("past the")),
-            "a reader with no known length has no volume end to fit inside, got {endless:?}"
+            sized_refused,
+            "a sized reader must refuse a member whose data cannot fit"
         );
+        let endless = parse_rar4_headers_for_facts(&mut Endless(Cursor::new(data)), None);
+        let endless_refused = matches!(
+            &endless,
+            Err(RarError::CorruptArchive { detail }) if detail.contains("past the")
+        );
+        assert!(
+            !endless_refused,
+            "a facts walk over a reader with no known length has no volume end to fit inside"
+        );
+    }
+
+    #[test]
+    fn volume_facts_and_header_encryption_come_from_a_reader_with_no_known_length() {
+        // The two public entry points a consumer walks a still-arriving volume
+        // with. Both report; neither decodes. Unlike the module-level parsers
+        // they start at the signature, which the minimal builder omits.
+        let mut data = crate::signature::RAR4_SIGNATURE.to_vec();
+        data.extend_from_slice(&build_minimal_rar4_archive("hello.txt", b"Hello world"));
+        let facts = crate::RarArchive::parse_volume_facts(Endless(Cursor::new(data.clone())), None)
+            .expect("volume facts must come from a reader with no known length");
+        assert_eq!(facts.members.len(), 1);
+        assert_eq!(facts.members[0].name, "hello.txt");
+        let encryption =
+            crate::RarArchive::parse_volume_header_encryption(Endless(Cursor::new(data)))
+                .expect("header encryption must be answerable from a reader with no known length");
+        assert_eq!(encryption, crate::RarVolumeHeaderEncryption::None);
     }
 
     #[test]

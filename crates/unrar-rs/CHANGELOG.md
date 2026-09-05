@@ -5,16 +5,20 @@
 
 ### Fixed
 
-- The RAR4 header scan no longer fails on a reader that cannot report its
-  length. 0.9.2's scan guard learned the volume's size with an end-relative
-  seek so it could refuse a member whose declared packed data cannot fit in the
-  file; a reader that answers that seek with `ErrorKind::Unsupported` — a
-  sparse image of a volume still arriving, which has no end yet — made every
-  RAR4 header parse fail with that I/O error, and a consumer that had walked
-  such images since 0.9.1 lost RAR4 parsing entirely. The guard now records the
-  length as unknown for that one error kind, skips the fit check alone, and
-  keeps the stalled-scan and header-count guards, which need no length. A
-  reader that reports a length is checked exactly as before.
+- `RarArchive::parse_volume_facts` and `RarArchive::parse_volume_header_encryption`
+  no longer fail on a RAR4 reader that cannot report its length. 0.9.2's scan
+  guard learned the volume's size with an end-relative seek so it could refuse
+  a member whose declared packed data cannot fit in the file; a reader that
+  answers that seek with `ErrorKind::Unsupported` — a sparse image of a volume
+  still arriving, which has no end yet — made every RAR4 header parse fail with
+  that I/O error, and a consumer that had walked such images since 0.9.1 lost
+  RAR4 parsing entirely. The two facts walks now record the length as unknown
+  for that one error kind, skip the fit check alone, and keep the stalled-scan
+  and header-count guards, which need no length. Every parse whose result can
+  reach the decoder — `RarArchive::open` and its variants, `parse_rar4_headers`,
+  `parse_rar14_headers` — still refuses such a reader with that I/O error, so a
+  header declaring packed bytes the volume does not hold is never handed to
+  the decode loop. A reader that reports a length is checked exactly as before.
 
 ## 0.10.0
 
