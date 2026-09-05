@@ -14,7 +14,6 @@
 //! blocks needs the sliding rolling-hash search that this crate does not
 //! implement.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
@@ -347,16 +346,6 @@ fn slice(data: &[u8], start: u64, len: u64) -> Option<&[u8]> {
     data.get(start..end)
 }
 
-/// Every block checksum a set holds, keyed by index.
-///
-/// A convenience for callers that want to see the coverage before verifying:
-/// the map is normally sparse, because the reference implementation does not
-/// write checksums for blocks that hold chunk tails.
-#[must_use]
-pub fn block_checksum_coverage(set: &Par3Set) -> &BTreeMap<u64, crate::packet::BlockChecksum> {
-    set.block_checksums()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,9 +641,9 @@ mod tests {
     }
 
     #[test]
-    fn coverage_reports_the_blocks_the_set_can_check() {
+    fn the_set_carries_a_checksum_for_each_full_block() {
         let data = body(100);
         let set = build_set(&data, 16);
-        assert_eq!(block_checksum_coverage(&set).len(), 6);
+        assert_eq!(set.block_checksums().len(), 6);
     }
 }
