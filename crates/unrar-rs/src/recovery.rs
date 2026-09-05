@@ -925,8 +925,10 @@ fn rar3_data_volume_end_crc_valid(path: &Path) -> RarResult<bool> {
             crate::rar4::types::Rar4HeaderType::File
             | crate::rar4::types::Rar4HeaderType::NewSub => {
                 let fh = crate::rar4::header::parse_file_header(&raw)?;
-                file.seek(SeekFrom::Current(fh.packed_size as i64))
-                    .map_err(RarError::Io)?;
+                // Forward-only skip: a declared size above `i64::MAX` would
+                // otherwise rewind this scan and loop forever (fuzz reproducer
+                // `timeout-a8693f23`).
+                crate::rar4::header::skip_forward(&mut file, fh.packed_size)?;
             }
             crate::rar4::types::Rar4HeaderType::EndArchive => {
                 let end = crate::rar4::header::parse_end_header(&raw);
@@ -936,10 +938,7 @@ fn rar3_data_volume_end_crc_valid(path: &Path) -> RarResult<bool> {
                 return Ok(true);
             }
             _ => {
-                if raw.data_area_size > 0 {
-                    file.seek(SeekFrom::Current(raw.data_area_size as i64))
-                        .map_err(RarError::Io)?;
-                }
+                crate::rar4::header::skip_forward(&mut file, raw.data_area_size)?;
             }
         }
     }

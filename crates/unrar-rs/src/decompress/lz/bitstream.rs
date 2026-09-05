@@ -158,6 +158,24 @@ pub trait BitRead {
     fn read_byte_or_zero(&mut self) -> u8 {
         self.read_byte().unwrap_or(0)
     }
+
+    /// How many zero bytes [`Self::read_byte_or_zero`] has invented because the
+    /// input was exhausted.
+    ///
+    /// A range decoder fed endless zeros keeps producing symbols forever, so
+    /// "the stream ran dry" is invisible to it — the PPMd loop in
+    /// `decompress::rar4` sees a well-formed symbol every time. Fuzz
+    /// reproducers `timeout-2c9348e8`, `timeout-8cd4372e` and `timeout-f869e3ff`
+    /// are that shape: a few dozen bytes of packed data against a declared
+    /// unpacked size in the gigabytes.
+    ///
+    /// The count is maintained only on the branch that was already taken when
+    /// the reader is empty, so a real byte costs nothing. Readers that never
+    /// pad report zero.
+    #[doc(hidden)]
+    fn zero_bytes_past_eof(&self) -> u32 {
+        0
+    }
     #[inline(always)]
     fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
         debug_assert!(count <= 64);
@@ -193,6 +211,9 @@ pub struct BitReader<'a> {
     acc: u64,
     /// Number of valid bits currently in the accumulator (0..=64).
     acc_bits: u8,
+    /// Zero bytes invented past the end of `data`; see
+    /// [`BitRead::zero_bytes_past_eof`].
+    zero_bytes_past_eof: u32,
 }
 
 impl<'a> BitReader<'a> {
@@ -203,6 +224,7 @@ impl<'a> BitReader<'a> {
             byte_pos: 0,
             acc: 0,
             acc_bits: 0,
+            zero_bytes_past_eof: 0,
         };
         reader.refill();
         reader
@@ -573,6 +595,7 @@ impl<'a> BitReader<'a> {
         if self.acc_bits < 8 {
             self.refill();
             if self.acc_bits < 8 {
+                self.zero_bytes_past_eof = self.zero_bytes_past_eof.saturating_add(1);
                 return 0;
             }
         }
@@ -698,6 +721,11 @@ impl BitRead for BitReader<'_> {
         BitReader::read_byte_or_zero(self)
     }
 
+    #[inline(always)]
+    fn zero_bytes_past_eof(&self) -> u32 {
+        self.zero_bytes_past_eof
+    }
+
     /// The trait takes `&mut self`, so top the accumulator up first and keep
     /// the register fast path dominant for byte-oriented RAR4 readers.
     #[inline(always)]
@@ -735,6 +763,9 @@ pub struct StreamingBitReader<R: Read> {
     acc_bits: u8,
     eof: bool,
     bit_pos: usize,
+    /// Zero bytes invented past the end of the input; see
+    /// [`BitRead::zero_bytes_past_eof`].
+    zero_bytes_past_eof: u32,
 }
 
 impl<R: Read> StreamingBitReader<R> {
@@ -784,6 +815,7 @@ impl<R: Read> StreamingBitReader<R> {
             acc_bits: 0,
             eof: false,
             bit_pos: 0,
+            zero_bytes_past_eof: 0,
         }
     }
 
@@ -1010,6 +1042,16 @@ impl<R: Read> StreamingBitReader<R> {
 impl<R: Read> BitRead for StreamingBitReader<R> {
     #[inline]
     fn bits_remaining(&mut self) -> usize {
+        // Once `eof` is set nothing can enter the accumulator, so `refill`
+        // below is a guaranteed-empty round trip through the cold
+        // `refill_slow`. `sample` on fuzz reproducer `timeout-3b5f5167` put
+        // 68% of the process in `bits_remaining -> refill -> refill_slow`
+        // doing exactly that, once per LZ loop iteration. Returning early
+        // removes work on a path the decode loops already walk and changes no
+        // result: the count below is what `refill` would have left behind.
+        if self.eof {
+            return self.acc_bits as usize + (self.buf_len.saturating_sub(self.buf_pos)) * 8;
+        }
         let _ = self.refill();
         let buffered = self.acc_bits as usize + (self.buf_len.saturating_sub(self.buf_pos)) * 8;
         if self.eof {
@@ -1114,6 +1156,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
     #[inline(always)]
     fn read_byte_or_zero(&mut self) -> u8 {
         if self.acc_bits < 8 && (self.refill().is_err() || self.acc_bits < 8) {
+            self.zero_bytes_past_eof = self.zero_bytes_past_eof.saturating_add(1);
             return 0;
         }
 
@@ -1122,6 +1165,11 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         self.acc_bits -= 8;
         self.bit_pos += 8;
         byte
+    }
+
+    #[inline(always)]
+    fn zero_bytes_past_eof(&self) -> u32 {
+        self.zero_bytes_past_eof
     }
 
     #[inline(always)]
@@ -1611,5 +1659,67 @@ mod tests {
         assert_eq!(reader.position(), 8);
         reader.align_byte();
         assert_eq!(reader.position(), 8);
+    }
+
+    /// `bits_remaining` used to call `refill` unconditionally, so once the
+    /// input was exhausted every call paid a trip through the cold
+    /// `refill_slow` to learn nothing. Behaviour has to be identical either
+    /// way: the count is stable, and it is the same one a reader that still
+    /// refilled would report.
+    #[test]
+    fn streaming_bits_remaining_is_stable_and_refill_free_at_eof() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0xABu8, 0xCD]));
+        assert_eq!(reader.read_bits(16).unwrap(), 0xABCD);
+
+        // The first call is what discovers the end; every one after it must
+        // agree, without touching the source again.
+        let first = reader.bits_remaining();
+        assert_eq!(first, 0);
+        for _ in 0..4 {
+            assert_eq!(reader.bits_remaining(), first);
+        }
+        assert!(!reader.has_bits());
+    }
+
+    /// A partially consumed accumulator still reports what it holds after the
+    /// source runs dry — this is the state the RAR4 outer decode loops test
+    /// with `bits_remaining() < 1`.
+    #[test]
+    fn streaming_bits_remaining_reports_the_stale_accumulator_at_eof() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0xFFu8]));
+        assert_eq!(reader.read_bits(3).unwrap(), 0b111);
+        assert_eq!(reader.bits_remaining(), 5);
+        assert_eq!(reader.bits_remaining(), 5);
+    }
+
+    /// The counter behind the PPMd exhaustion guard: zeros invented past the
+    /// end of the input are counted, real bytes are not.
+    #[test]
+    fn streaming_read_byte_or_zero_counts_only_invented_bytes() {
+        let mut reader = StreamingBitReader::new(std::io::Cursor::new(vec![0x5Au8, 0xA5]));
+        assert_eq!(reader.read_byte_or_zero(), 0x5A);
+        assert_eq!(reader.read_byte_or_zero(), 0xA5);
+        assert_eq!(reader.zero_bytes_past_eof(), 0);
+
+        for expected in 1..=5u32 {
+            assert_eq!(reader.read_byte_or_zero(), 0);
+            assert_eq!(reader.zero_bytes_past_eof(), expected);
+        }
+    }
+
+    /// Same contract for the slice-backed reader, which is what the in-memory
+    /// RAR4 entry points hand to the range decoder.
+    #[test]
+    fn slice_read_byte_or_zero_counts_only_invented_bytes() {
+        let data = [0x5Au8, 0xA5];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0x5A);
+        assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0xA5);
+        assert_eq!(BitRead::zero_bytes_past_eof(&reader), 0);
+
+        for expected in 1..=5u32 {
+            assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0);
+            assert_eq!(BitRead::zero_bytes_past_eof(&reader), expected);
+        }
     }
 }

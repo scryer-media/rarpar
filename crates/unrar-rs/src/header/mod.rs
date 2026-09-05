@@ -506,11 +506,12 @@ fn parse_encrypted_headers<R: Read + Seek>(
             _ => {
                 dispatch_header(&raw, data_offset, result)?;
                 // Skip data area (not part of the encrypted header block).
-                if raw.data_area_size > 0 {
-                    reader
-                        .seek(SeekFrom::Current(raw.data_area_size as i64))
-                        .map_err(RarError::Io)?;
-                }
+                // Via `common::skip_data_area` so the `i64` range check applies
+                // here too: `data_area_size` is an unbounded vint, and a value
+                // above `i64::MAX` would otherwise seek the scan *backwards*
+                // (the RAR4 shape of this bug is fuzz reproducer
+                // `timeout-a8693f23`).
+                common::skip_data_area(reader, &raw)?;
             }
         }
     }

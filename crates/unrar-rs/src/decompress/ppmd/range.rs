@@ -200,6 +200,17 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
         }
     }
 
+    /// Zero bytes this coder has been handed past the end of the packed data.
+    ///
+    /// `read_byte` below is `read_byte_or_zero`, the range-coder convention of
+    /// padding a truncated stream with zeros. That keeps the decoder producing
+    /// well-formed symbols indefinitely, so the exhaustion has to be read off
+    /// the reader; the RAR4 PPMd loop consults this at its flush boundary. See
+    /// [`BitRead::zero_bytes_past_eof`].
+    pub fn zero_bytes_past_eof(&self) -> u32 {
+        self.reader.zero_bytes_past_eof()
+    }
+
     /// Save the coder registers for later resumption via [`Self::from_state`].
     pub fn state(&self) -> RangeCoderState {
         RangeCoderState {
@@ -368,5 +379,35 @@ mod tests {
         );
         assert_eq!(slice.get_threshold(256), streaming.get_threshold(256));
         assert_eq!(slice.position(), streaming.position());
+    }
+
+    /// Past the end of the input the coder is fed `read_byte_or_zero`'s
+    /// invented zeros and keeps producing perfectly plausible symbols. The
+    /// count is what makes that visible to the RAR4 PPMd loop, which is
+    /// otherwise willing to decode the whole declared unpacked size out of a
+    /// stream that ended in the first kilobyte.
+    #[test]
+    fn bitread_range_decoder_counts_the_zeros_it_is_fed_past_eof() {
+        use crate::decompress::lz::bitstream::BitReader;
+
+        // Exactly the four initialization bytes and nothing else.
+        let input = [0x00u8, 0x00, 0x00, 0x00];
+        let mut bit_reader = BitReader::new(&input);
+        let mut rc = BitReadRangeDecoder::new(&mut bit_reader).unwrap();
+        assert_eq!(rc.zero_bytes_past_eof(), 0);
+
+        // Put the coder where a decoded symbol leaves it — a range too narrow
+        // to work with — and let normalization pull the bytes it needs. With
+        // `low` at zero the loop runs until `range` reaches `TOP`, so it takes
+        // exactly three, and the input holds none of them.
+        rc.low = 0;
+        rc.range = 1;
+        RangeCode::normalize(&mut rc);
+
+        assert_eq!(
+            rc.zero_bytes_past_eof(),
+            3,
+            "an exhausted coder must report the padding it was handed"
+        );
     }
 }

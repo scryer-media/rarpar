@@ -868,7 +868,14 @@ impl Model {
             self.bin_summ[idx0][idx1] = bs.wrapping_add(INTERVAL).wrapping_sub(mean);
 
             self.prev_success = 1;
-            self.run_length += 1;
+            // `RunLength` is only ever compared or shifted (see the `>> 26`
+            // index above), so unrar's C `int` overflow is benign there but
+            // trips Rust's overflow checks. Corrupt streams can hold a binary
+            // context for billions of symbols (fuzz reproducer
+            // `timeout-063caae0`, plus eight siblings, all panicked here), so
+            // saturate instead of wrapping: a wrap would flip the sign bit and
+            // silently change the `>> 26` bucket.
+            self.run_length = self.run_length.saturating_add(1);
         } else {
             // Escape.
             rc.decode(bs as u32, BIN_SCALE - bs as u32, BIN_SCALE);
@@ -941,7 +948,8 @@ impl Model {
         if count < p0_freq {
             // First symbol matched.
             self.prev_success = if 2 * p0_freq > sum_freq { 1 } else { 0 };
-            self.run_length += self.prev_success as i32;
+            // Same saturation rationale as `decode_bin_symbol`; see there.
+            self.run_length = self.run_length.saturating_add(self.prev_success as i32);
             self.found_state = stats;
             *found_span = Some(states_span.subspan(0, STATE_SIZE));
 
@@ -2238,6 +2246,39 @@ mod tests {
         let mut model = Model::new(6, 1024 * 1024);
         model.restart();
         assert_ne!(model.min_context, 0);
+    }
+
+    /// `run_length` is only ever compared or shifted, so unrar's C `int`
+    /// overflow never bites there — but `decode_bin_symbol` shifts it into the
+    /// `bin_summ` row index as `((run_length >> 26) as usize) & 0x20`, and a
+    /// wrap from `i32::MAX` to `i32::MIN` flips that bucket. Nine `rar_extract`
+    /// timeout artifacts (`timeout-063caae0` and siblings) held one binary
+    /// context long enough to reach the boundary.
+    #[test]
+    fn run_length_saturates_instead_of_flipping_the_bin_summ_bucket() {
+        // The index term as `decode_bin_symbol` computes it.
+        let bucket = |run_length: i32| ((run_length >> 26) as usize) & 0x20;
+
+        let mut model = Model::new(6, 1024 * 1024);
+        model.run_length = i32::MAX;
+        let before = bucket(model.run_length);
+
+        for _ in 0..8 {
+            model.run_length = model.run_length.saturating_add(1);
+            model.run_length = model.run_length.saturating_add(model.prev_success as i32);
+        }
+
+        assert_eq!(model.run_length, i32::MAX);
+        assert_eq!(bucket(model.run_length), before);
+        assert!(
+            before < 64,
+            "the index term must stay inside bin_summ's row"
+        );
+
+        // What saturation is buying: the wrapped value lands in the other
+        // bucket, so a release build would silently decode against different
+        // probabilities rather than panicking as the debug build did.
+        assert_ne!(bucket(i32::MAX.wrapping_add(1)), before);
     }
 
     #[test]

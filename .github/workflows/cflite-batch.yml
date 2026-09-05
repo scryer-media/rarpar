@@ -47,8 +47,7 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-      # `output-sarif` publishes findings to the Security tab rather than
-      # leaving them in a run log nobody reads. Only this job produces them,
+      # For the SARIF upload at the end of the job. Only this job needs it,
       # and this workflow only ever runs on this repository (schedule and
       # manual dispatch), so the write is never handed to a fork's token.
       security-events: write
@@ -74,7 +73,19 @@ jobs:
           fuzz-seconds: ${{ inputs.fuzz-seconds || 7200 }}
           mode: batch
           sanitizer: address
-          output-sarif: true
+        # Deliberately not `output-sarif: true`. This job carried that flag
+        # for nineteen failing nights (2026-08-16 → 09-04) and nothing ever
+        # reached the Security tab, for two reasons. run_fuzzers is a bare
+        # Docker action: the flag makes it *write* cifuzz-sarif/results.sarif
+        # and nothing here uploaded it. Worse, the file it writes is not a
+        # report of the run — batch mode fuzzes every target without stopping
+        # at the first bug, then serialises only the target it walked last
+        # (run_fuzzers.py, "TODO: Handle multiple crashes"), so a rar_extract
+        # finding followed by a clean par2 target uploads an empty SARIF, and
+        # its rule table has no entry for timeouts or Rust panics. The
+        # reproducers CIFuzz saves under out/artifacts are complete and
+        # accurate, so the SARIF is rendered from those instead, below.
+        #
         # Timeouts are findings here, and without this they are discarded.
         #
         # The 2026-08-17 run watched rar_extract spend 34 s on a single unit
@@ -105,6 +116,35 @@ jobs:
         # a gate that blocks someone's merge.
         env:
           REPORT_TIMEOUTS: 'true'
+
+      # One SARIF result per saved reproducer, across every target, from the
+      # out/artifacts/<target>/<sanitizer>/ tree that run_fuzzers leaves
+      # behind (the same files the crashes-<target> artifacts hold). Both
+      # steps run `if: always()`: run_fuzzers exits non-zero precisely when it
+      # has something to report, and a clean night must still upload an empty
+      # run so code scanning can mark earlier alerts fixed. Stdlib Python
+      # only; nothing is installed on this runner after the container exits.
+      - name: Render findings as SARIF
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -B .github/scripts/cflite_sarif.py \
+            --artifacts out/artifacts \
+            --output cflite-findings.sarif \
+            --source-prefix /src/rarpar/ \
+            --run-url "$RUN_URL" \
+            --summary-path "$GITHUB_STEP_SUMMARY"
+
+      # Pinned to the same commit CodeQL and Scorecard use in codeql.yml, so
+      # there is one codeql-action version to bump. The category keeps these
+      # results in their own code-scanning stream, separate from CodeQL's.
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: cflite-findings.sarif
+          category: clusterfuzzlite-batch-address
 
   # What the corpus is actually reaching. Without this the fuzzing budget is
   # spent on faith: a target whose coverage has been flat for a month is either

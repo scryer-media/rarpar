@@ -270,6 +270,16 @@ pub struct Window {
     /// the visible output is derived as the complement — this keeps the
     /// per-literal hot path free of range bookkeeping.
     invisible_ranges: Vec<(u64, u64)>,
+    /// Invisible bytes inside `[total_flushed, total_written)`, kept as a
+    /// running total.
+    ///
+    /// `unflushed_bytes` is polled once per decoded symbol by both RAR4 decode
+    /// loops (the yield-threshold test) and it used to derive this by walking
+    /// `invisible_ranges` on every call — linear in a list that only shrinks at
+    /// a flush. Maintaining the total instead makes that a subtraction: it is
+    /// added to where a range is recorded, and recomputed only where
+    /// `total_flushed` moves, which is a flush boundary and already cold.
+    invisible_pending: u64,
 }
 
 impl Window {
@@ -307,6 +317,7 @@ impl Window {
             total_written: 0,
             total_flushed: 0,
             invisible_ranges: Vec::new(),
+            invisible_pending: 0,
         })
     }
 
@@ -370,6 +381,7 @@ impl Window {
         self.total_written = 0;
         self.total_flushed = 0;
         self.invisible_ranges.clear();
+        self.invisible_pending = 0;
         Ok(())
     }
 
@@ -386,6 +398,10 @@ impl Window {
         if len == 0 {
             return;
         }
+        // Recorded at the write frontier, so the new range is always at or
+        // after `total_flushed` and entirely inside the unflushed span.
+        debug_assert!(start_total >= self.total_flushed);
+        self.invisible_pending += len;
         if let Some((last_start, last_len)) = self.invisible_ranges.last_mut()
             && last_start.saturating_add(*last_len) == start_total
         {
@@ -409,6 +425,16 @@ impl Window {
                 overlap_end.saturating_sub(overlap_start)
             })
             .sum()
+    }
+
+    /// Re-derive [`Window::invisible_pending`] after the flushed border moved.
+    ///
+    /// The only place the running total cannot be updated incrementally: a
+    /// flush can stop part-way through an invisible range. Every caller is a
+    /// flush or mark-flushed boundary, so the walk happens once per flush
+    /// instead of once per decoded symbol.
+    fn resync_invisible_pending(&mut self) {
+        self.invisible_pending = self.invisible_overlap(self.total_flushed, self.total_written);
     }
 
     /// Drop invisible ranges that ended at or before the flushed border.
@@ -967,6 +993,7 @@ impl Window {
         if unflushed == 0 {
             self.total_flushed = self.total_written;
             self.gc_invisible();
+            self.resync_invisible_pending();
             return Ok(0);
         }
 
@@ -982,6 +1009,7 @@ impl Window {
         self.write_visible_span(self.total_flushed, self.total_written, writer)?;
         self.total_flushed = self.total_written;
         self.gc_invisible();
+        self.resync_invisible_pending();
         Ok(unflushed)
     }
 
@@ -1034,13 +1062,20 @@ impl Window {
         let written = self.write_visible_span(self.total_flushed, target, writer)?;
         self.total_flushed = target;
         self.gc_invisible();
+        self.resync_invisible_pending();
         Ok(written)
     }
 
     /// Number of unflushed bytes currently in the window.
+    #[inline(always)]
     pub fn unflushed_bytes(&self) -> u64 {
         let span = self.total_written.saturating_sub(self.total_flushed);
-        span - self.invisible_overlap(self.total_flushed, self.total_written)
+        debug_assert_eq!(
+            self.invisible_pending,
+            self.invisible_overlap(self.total_flushed, self.total_written),
+            "invisible running total drifted from the range list"
+        );
+        span.saturating_sub(self.invisible_pending)
     }
 
     /// Absolute position up to which data has been flushed.
@@ -1114,6 +1149,7 @@ impl Window {
     pub fn mark_flushed(&mut self, up_to: u64) {
         self.total_flushed = up_to.min(self.total_written);
         self.gc_invisible();
+        self.resync_invisible_pending();
     }
 
     /// Reset the window for a new file (non-solid mode), zeroing the buffer.
@@ -1130,6 +1166,7 @@ impl Window {
         self.total_written = 0;
         self.total_flushed = 0;
         self.invisible_ranges.clear();
+        self.invisible_pending = 0;
     }
 
     /// The logical dictionary contents, for tests that compare the whole ring

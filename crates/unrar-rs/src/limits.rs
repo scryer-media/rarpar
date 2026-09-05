@@ -23,6 +23,18 @@ pub const MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
 /// into 512 KiB volumes is still only ~1M parts.
 pub const RAR_MAX_VOLUME_NUMBER: u64 = 1 << 20;
 
+/// Maximum number of headers accepted from a single archive volume.
+///
+/// Every header a volume scan accepts appends to a `Vec` (`files`, `services`,
+/// `comments`, …), so an unterminated scan is unbounded memory as well as
+/// unbounded time. The seek hardening in [`crate::rar4::header::skip_forward`]
+/// already makes a scan structurally monotonic, and each RAR4 header consumes
+/// at least 7 bytes, so this is a backstop rather than the primary defence —
+/// it caps the damage from any *future* way of re-reading the same offset.
+/// One million headers needs at least a 7 MB volume; RAR's own 4 GB-ish
+/// practical volume ceiling with minimum-size headers stays far under it.
+pub const MAX_HEADERS_PER_VOLUME: usize = 1 << 20;
+
 /// Convert a header-declared volume number into a dense-vector index.
 ///
 /// Rejects anything above [`RAR_MAX_VOLUME_NUMBER`] rather than letting an untrusted
