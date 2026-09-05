@@ -76,6 +76,89 @@ const MAX3_INC_LZ_MATCH: usize = 0x104;
 /// Maximum number of bytes to accumulate before flushing decoded output.
 const UNPACK_MAX_WRITE: usize = 0x400000;
 
+/// Zero bytes the PPMd range decoder may be fed past the end of the input
+/// before the member is called corrupt.
+///
+/// `read_byte_or_zero` pads a truncated stream with zeros (the range-coder
+/// convention), which keeps the decoder producing plausible symbols forever;
+/// unrar tolerates a single such byte at the tail of a well-formed member.
+/// The allowance here is deliberately far above that — the range coder carries
+/// four bytes of lookahead and normalization can pull a few more while the
+/// last real symbols drain — because the point is only to make an endless
+/// stream of invented input terminate, not to police the tail byte-exactly.
+const PPM_MAX_ZERO_BYTES_PAST_EOF: u32 = 64;
+
+/// Consecutive `esc,3` (VM code) escapes that may pass without the PPMd loop
+/// emitting a single output byte.
+///
+/// Sized to the queued-filter ceiling: a legitimate stream cannot stack more
+/// than `MAX3_UNPACK_FILTERS` filters at one output position without
+/// `add_vm_code` rejecting it first, so this can only fire on a stream that is
+/// producing VM escapes and nothing else.
+const PPM_MAX_ZERO_OUTPUT_VM_ESCAPES: usize = MAX3_UNPACK_FILTERS;
+
+/// Stall detector for the three outer decode loops in this file.
+///
+/// Those loops are `while output_size < self.decode_limit()` around one full
+/// `decode_lz_symbols` / `decode_ppm_symbols` round, guarded only by
+/// `reader.bits_remaining() < 1`. At EOF `bits_remaining()` can stay non-zero
+/// on a stale accumulator while the inner round returns immediately without
+/// consuming a bit or emitting a byte — the round is deterministic, so the
+/// loop then repeats it forever. That is fuzz reproducers `timeout-3b5f5167`,
+/// `timeout-7cbe702a` and `timeout-93aa06f4`, whose profile is ~68% inside
+/// `bits_remaining -> refill -> refill_slow`.
+///
+/// The check is per *round*, not per symbol: an iteration of those loops
+/// already decodes up to a flush threshold's worth of output and calls
+/// `bits_remaining()` and `unflushed_bytes()`, so two `u64` compares alongside
+/// are not measurable. Nothing is added inside `decode_lz_symbols` or
+/// `decode_ppm_symbols`.
+struct Rar4RoundProgress {
+    output_size: u64,
+    input_bit: usize,
+    stalled: u32,
+}
+
+impl Rar4RoundProgress {
+    /// Rounds that may neither consume input nor emit output before the member
+    /// is called corrupt.
+    ///
+    /// A stalled round is deterministic, so one is already proof; the small
+    /// allowance is only so a future round that legitimately does its work
+    /// entirely in decoder state cannot be mistaken for a hang.
+    const MAX_STALLED_ROUNDS: u32 = 4;
+
+    fn new<R: BitRead>(reader: &R, output_size: u64) -> Self {
+        Self {
+            output_size,
+            input_bit: reader.position(),
+            stalled: 0,
+        }
+    }
+
+    /// Record the end of one decode round.
+    #[inline]
+    fn round<R: BitRead>(&mut self, reader: &R, output_size: u64) -> RarResult<()> {
+        let input_bit = reader.position();
+        if output_size != self.output_size || input_bit != self.input_bit {
+            self.output_size = output_size;
+            self.input_bit = input_bit;
+            self.stalled = 0;
+            return Ok(());
+        }
+        self.stalled += 1;
+        if self.stalled > Self::MAX_STALLED_ROUNDS {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR4 decode made no progress at output offset {output_size} \
+                     with the input exhausted"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Block type: LZ or PPMd.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockType {
@@ -2165,6 +2248,7 @@ impl Rar4LzDecoder {
         // lead but the window itself — and the window is on this thread.
         let threaded = rar4_mt_admitted(unpacked_size);
 
+        let mut progress = Rar4RoundProgress::new(reader, output_size);
         'member: loop {
             while output_size < self.decode_limit() {
                 if reader.bits_remaining() < 1 {
@@ -2210,6 +2294,7 @@ impl Rar4LzDecoder {
                         )?;
                     }
                 }
+                progress.round(reader, output_size)?;
 
                 if self.window.unflushed_bytes() as usize >= flush_threshold {
                     self.flush_ready_output_to_writer(writer, false)?;
@@ -2334,6 +2419,7 @@ impl Rar4LzDecoder {
         let mut chunk_bytes: u64 = 0;
         let mut pending_boundary_volume = None;
 
+        let mut progress = Rar4RoundProgress::new(reader, output_size);
         'member: loop {
             while output_size < self.decode_limit() {
                 if reader.bits_remaining() < 1 {
@@ -2362,6 +2448,7 @@ impl Rar4LzDecoder {
                         )?;
                     }
                 }
+                progress.round(reader, output_size)?;
 
                 let byte_pos = reader.byte_position() as u64;
                 if pending_boundary_volume.is_none()
@@ -2452,6 +2539,7 @@ impl Rar4LzDecoder {
         let mut chunk_bytes: u64 = 0;
         let mut pending_boundary_volume = None;
 
+        let mut progress = Rar4RoundProgress::new(reader, output_size);
         'member: loop {
             while output_size < self.decode_limit() {
                 if reader.bits_remaining() < 1 {
@@ -2480,6 +2568,7 @@ impl Rar4LzDecoder {
                         )?;
                     }
                 }
+                progress.round(reader, output_size)?;
 
                 let byte_pos = reader.byte_position() as u64;
                 let next_boundary = {
@@ -3612,6 +3701,12 @@ impl Rar4LzDecoder {
             };
             let mut literals = [0u8; 1024];
             let mut literal_len = 0usize;
+            // F4/F5 stall accounting. Both live on paths that are already cold:
+            // `zero_output_vm_escapes` is only touched inside the `esc,3` arm,
+            // and the zero-padding count is only consulted inside the existing
+            // flush branch. The literal fast path below is untouched.
+            let mut zero_output_vm_escapes = 0usize;
+            let mut last_vm_escape_output: Option<u64> = None;
             macro_rules! flush_literals {
                 () => {
                     if literal_len != 0 {
@@ -3625,6 +3720,22 @@ impl Rar4LzDecoder {
                 if let Some(threshold) = yield_threshold
                     && self.window.unflushed_bytes() as usize + literal_len >= threshold
                 {
+                    // Reached once per flush threshold (hundreds of KB), not
+                    // per symbol, so this is the cheapest place in the loop to
+                    // ask whether the symbols being decoded are still coming
+                    // from the archive. Past EOF the range decoder is fed
+                    // `read_byte_or_zero`'s invented zeros and will happily
+                    // emit the whole declared unpacked size — up to 4.24 GB for
+                    // the `rar_extract` timeout corpus. See
+                    // `BitRead::zero_bytes_past_eof`.
+                    if rc.zero_bytes_past_eof() > PPM_MAX_ZERO_BYTES_PAST_EOF {
+                        return Err(RarError::CorruptArchive {
+                            detail: format!(
+                                "RAR4 PPMd stream ran {} bytes past the end of the packed data                                  at output offset {output_size}",
+                                rc.zero_bytes_past_eof()
+                            ),
+                        });
+                    }
                     flush_literals!();
                     self.flush_ready_output_to_writer(writer, false)?;
                 }
@@ -3714,6 +3825,28 @@ impl Rar4LzDecoder {
                             break;
                         }
                         3 => {
+                            // `read_vm_code_ppm` queues a filter; it never
+                            // advances `output_size`. A stream of `esc,3` with
+                            // zero-length VM code therefore spins this loop
+                            // without ever reaching `output_size < decode_limit`
+                            // again. Counted here, in the escape arm, so the
+                            // literal and match paths pay nothing; the reset is
+                            // implicit in comparing against the output offset of
+                            // the previous escape rather than clearing a counter
+                            // from the fast path.
+                            if last_vm_escape_output == Some(output_size) {
+                                zero_output_vm_escapes += 1;
+                                if zero_output_vm_escapes > PPM_MAX_ZERO_OUTPUT_VM_ESCAPES {
+                                    return Err(RarError::CorruptArchive {
+                                        detail: format!(
+                                            "RAR4 PPMd queued {zero_output_vm_escapes} VM filters                                              at output offset {output_size} without emitting a byte"
+                                        ),
+                                    });
+                                }
+                            } else {
+                                zero_output_vm_escapes = 0;
+                                last_vm_escape_output = Some(output_size);
+                            }
                             if !self.read_vm_code_ppm(&mut ppm_model, &mut rc, output_size)? {
                                 trace!(
                                     "RAR4 PPMd VM-code corruption at output_size={output_size}: cleaning up"

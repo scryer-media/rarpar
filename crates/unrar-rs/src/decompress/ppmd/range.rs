@@ -200,6 +200,17 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
         }
     }
 
+    /// Zero bytes this coder has been handed past the end of the packed data.
+    ///
+    /// `read_byte` below is `read_byte_or_zero`, the range-coder convention of
+    /// padding a truncated stream with zeros. That keeps the decoder producing
+    /// well-formed symbols indefinitely, so the exhaustion has to be read off
+    /// the reader; the RAR4 PPMd loop consults this at its flush boundary. See
+    /// [`BitRead::zero_bytes_past_eof`].
+    pub fn zero_bytes_past_eof(&self) -> u32 {
+        self.reader.zero_bytes_past_eof()
+    }
+
     /// Save the coder registers for later resumption via [`Self::from_state`].
     pub fn state(&self) -> RangeCoderState {
         RangeCoderState {
