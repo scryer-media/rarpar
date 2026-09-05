@@ -3,6 +3,7 @@ members = [
     "crates/reedsolomon-rs",
     "crates/unrar-rs",
     "crates/par2-rs",
+    "crates/par3-rs",
     "tools/rarpar",
     "xtask",
 ]

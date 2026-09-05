@@ -1063,6 +1063,7 @@ jobs:
               reedsolomon-rs) echo "crates/reedsolomon-rs/Cargo.toml" ;;
               unrar-rs) echo "crates/unrar-rs/Cargo.toml" ;;
               par2-rs) echo "crates/par2-rs/Cargo.toml" ;;
+              par3-rs) echo "crates/par3-rs/Cargo.toml" ;;
               *) echo "unknown crate: $1" >&2; return 1 ;;
             esac
           }
@@ -1133,6 +1134,9 @@ jobs:
           )
 
           package_and_list reedsolomon-rs
+          # par3-rs depends on nothing in this workspace, so it never has to wait
+          # for a sibling to reach the registry.
+          package_and_list par3-rs
 
           if registry_has_version reedsolomon-rs "$reed_version"; then
             package_and_list unrar-rs
@@ -1161,6 +1165,7 @@ jobs:
               "reedsolomon-rs": 1_000_000,
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
+              "par3-rs": 300_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}

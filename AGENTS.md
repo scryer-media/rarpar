@@ -17,7 +17,7 @@ and PAR2 workflows.
 
 ## Licensing And Release
 
-- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
+- `reedsolomon-rs`, `par2-rs`, `par3-rs`, and `rarpar` source are
   GPL-3.0-or-later.
 - `unrar-rs` is GPL-3.0-or-later; its RAR engine is developed from RARLAB's
   unRAR source code, which remains governed by the unRAR license restriction
@@ -37,3 +37,19 @@ and PAR2 workflows.
   AWS-LC does not provide.
 - `rarpar` must not claim to be official RAR, UnRAR, or PAR2 tooling.
 - Do not ship binaries named `unrar`, `rar`, `par2`, or `par2repair`.
+
+## PAR3 Rules
+
+- `par3-rs` is read-only: parsing, set inspection, and verification. Do not add
+  creation, recovery, or repair APIs to it without an explicit decision to widen
+  its scope, and update its README and crate docs in the same change if that
+  happens.
+- Where the PAR3 specification draft and the `par3cmdline` reference
+  implementation disagree, follow the reference: it produced the files that
+  exist. Record any newly found difference in the deviation table in the crate's
+  README and `lib.rs`.
+- The crate is clean-room. Read the reference implementation for format facts;
+  do not copy its code or its comments.
+- PAR3 fixture bytes come only from official `par3cmdline` runs. Never
+  hand-assemble or bit-edit a PAR3 packet, in a test or anywhere else; produce
+  damage cases in memory by flipping bytes of regenerated inputs.

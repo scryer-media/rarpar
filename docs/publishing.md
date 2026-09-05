@@ -7,6 +7,11 @@ Publish order:
 1. `reedsolomon-rs`
 2. `unrar-rs`
 3. `par2-rs`
+4. `par3-rs`
+
+`par3-rs` depends on nothing else in this workspace, so its place in the order
+is arbitrary; it goes last so a coordinated publish reaches the crates that
+depend on each other first.
 
 `rarpar` is a CLI binary and is not published to crates.io. It has its own
 binary release cycle, independent of the library crate publish cycle.
@@ -23,9 +28,11 @@ rtk cargo test --locked --workspace --no-fail-fast
 rtk cargo package --locked -p reedsolomon-rs
 rtk cargo package --locked --no-verify -p unrar-rs
 rtk cargo package --locked --no-verify -p par2-rs
+rtk cargo package --locked -p par3-rs
 rtk cargo package --locked --list -p reedsolomon-rs
 rtk cargo package --locked --list -p unrar-rs
 rtk cargo package --locked --list -p par2-rs
+rtk cargo package --locked --list -p par3-rs
 ```
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
@@ -130,7 +137,10 @@ Required repository configuration:
 
 - crates.io Trusted Publishing: `reedsolomon-rs`, `unrar-rs` and `par2-rs`
   each list this repository, `publish-crates.yml` and the `crates-io`
-  environment as a Trusted Publisher. The publish job exchanges its OIDC
+  environment as a Trusted Publisher. `par3-rs` cannot be configured this way
+  until it exists on crates.io, so its first release has to be published by
+  hand; add the Trusted Publisher immediately afterwards, before the next
+  `package=all` run reaches it. The publish job exchanges its OIDC
   identity for a short-lived token (`rust-lang/crates-io-auth-action`); no
   long-lived registry token is stored in the repository.
 - `crates-io` environment: the identity Trusted Publishing is scoped to, and
