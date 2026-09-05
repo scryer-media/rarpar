@@ -360,7 +360,7 @@ impl Par3Set {
         } = walk;
 
         for file in &files {
-            check_block_indices(file, block_count)?;
+            check_block_indices(file, block_count, start.block_size)?;
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         directories.sort_by(|a, b| a.path.cmp(&b.path));
@@ -540,12 +540,17 @@ impl Par3Set {
 
 /// Reject chunk descriptions that point outside the set's blocks, the way the
 /// reference implementation does.
-fn check_block_indices(file: &Par3File, block_count: u64) -> Result<()> {
+///
+/// A chunk names a *range* of blocks, not just its first: `length / block_size`
+/// full blocks starting at `first_block_index`. Checking the whole range here is
+/// what lets verification walk it without a per-block guard, and is what stops a
+/// chunk whose length says `u64::MAX` from claiming blocks the set never had.
+fn check_block_indices(file: &Par3File, block_count: u64, block_size: u64) -> Result<()> {
     for chunk in file.chunks() {
         let ChunkDescription::Protected {
+            length,
             first_block_index,
             tail,
-            ..
         } = chunk
         else {
             continue;
@@ -557,6 +562,22 @@ fn check_block_indices(file: &Par3File, block_count: u64) -> Result<()> {
                 index: *index,
                 block_count,
             });
+        }
+        // The last full block the chunk claims. A zero block size describes no
+        // blocks at all, and is rejected on its own terms by verification.
+        if let Some(index) = first_block_index
+            && block_size != 0
+        {
+            let blocks = length / block_size;
+            if blocks != 0 {
+                let last = index.checked_add(blocks - 1);
+                if last.is_none_or(|last| last >= block_count) {
+                    return Err(Par3Error::BlockIndexOutOfRange {
+                        index: last.unwrap_or(u64::MAX),
+                        block_count,
+                    });
+                }
+            }
         }
         if let ChunkTail::Described { block_index, .. } = tail
             && *block_index >= block_count
@@ -984,6 +1005,56 @@ mod tests {
         assert!(matches!(
             Par3Set::from_packets(packets),
             Err(Par3Error::BlockIndexOutOfRange { index: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn a_chunk_whose_block_range_ends_beyond_the_block_count_is_refused() {
+        // The first index is inside the set, so only checking that one lets the
+        // chunk claim every block after it as well: four 2000-byte blocks
+        // starting at index 1, in a set that has three blocks in total.
+        let file = packet(PacketBody::File(file_packet("a.bin", 8000, Some(1))));
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            packet(PacketBody::Root(RootPacket {
+                lowest_unused_block_index: 3,
+                attributes: 0,
+                option_hashes: Vec::new(),
+                children: vec![file.hash()],
+            })),
+            file,
+        ];
+        assert!(matches!(
+            Par3Set::from_packets(packets),
+            Err(Par3Error::BlockIndexOutOfRange {
+                index: 4,
+                block_count: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn a_chunk_length_that_overflows_the_block_range_is_refused() {
+        // `length / block_size` blocks from the highest index there is: the end
+        // of the range does not fit in a `u64` at all.
+        let file = packet(PacketBody::File(file_packet(
+            "a.bin",
+            u64::MAX,
+            Some(u64::MAX - 1),
+        )));
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            packet(PacketBody::Root(RootPacket {
+                lowest_unused_block_index: u64::MAX,
+                attributes: 0,
+                option_hashes: Vec::new(),
+                children: vec![file.hash()],
+            })),
+            file,
+        ];
+        assert!(matches!(
+            Par3Set::from_packets(packets),
+            Err(Par3Error::BlockIndexOutOfRange { .. })
         ));
     }
 

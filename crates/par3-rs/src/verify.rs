@@ -10,9 +10,9 @@
 //!
 //! Nothing here repairs anything, and nothing here searches. A file whose bytes
 //! have been *shifted* — content inserted or removed rather than overwritten —
-//! will report every block after the shift as damaged, because finding the moved
-//! blocks needs the sliding rolling-hash search that this crate does not
-//! implement.
+//! will report every block after the shift that the file still reaches as
+//! damaged, because finding the moved blocks needs the sliding rolling-hash
+//! search that this crate does not implement.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,12 @@ pub enum FileVerdict {
         /// Length actually found.
         actual_size: u64,
         /// Input blocks whose bytes did not match the set's checksums.
+        ///
+        /// Only blocks the file actually reaches are listed. A block that
+        /// begins past `actual_size` is absent rather than wrong, and a File
+        /// packet may claim more of them than any file could hold, so the
+        /// missing tail is left to be read off `expected_size`, `actual_size`
+        /// and the chunk descriptions.
         damaged_blocks: Vec<u64>,
         /// Input blocks the set carries no checksum for.
         ///
@@ -281,7 +287,16 @@ fn localise(set: &Par3Set, file: &Par3File, data: &[u8]) -> Localised {
 
         let full_blocks = length / block_size;
         if let Some(first) = first_block_index {
-            for step in 0..full_blocks {
+            // A block whose first byte is past the end of the file is not there
+            // to be looked at, and the size mismatch this verdict already
+            // carries says so. Stopping at the bytes that exist keeps the work
+            // and the output proportional to the file rather than to a chunk
+            // length the packets chose: a chunk may honestly claim `u64::MAX`
+            // bytes of one-byte blocks.
+            let reachable = (data.len() as u64)
+                .saturating_sub(offset)
+                .div_ceil(block_size);
+            for step in 0..full_blocks.min(reachable) {
                 let block_index = first.wrapping_add(step);
                 let start = offset.saturating_add(step.saturating_mul(block_size));
                 match slice(data, start, block_size) {
@@ -542,9 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_file_reports_the_blocks_that_are_gone() {
+    fn a_truncated_file_reports_the_blocks_it_still_reaches() {
         let data = body(100);
         let set = build_set(&data, 16);
+        // Blocks 0 and 1 are intact, block 2 begins at 32 and runs off the end,
+        // and blocks 3 to 5 begin past the end entirely: absent rather than
+        // wrong, and left to be read off the two sizes.
         match verify_file(&set, &set.files()[0], &data[..40]) {
             FileVerdict::Damaged {
                 expected_size,
@@ -555,8 +573,57 @@ mod tests {
             } => {
                 assert_eq!(expected_size, 100);
                 assert_eq!(actual_size, 40);
-                assert_eq!(damaged_blocks, vec![2u64, 3, 4, 5]);
+                assert_eq!(damaged_blocks, vec![2u64]);
                 assert_eq!(damaged_chunks, vec![0usize]);
+            }
+            other => panic!("unexpected verdict: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chunk_cannot_make_verification_enumerate_more_blocks_than_the_file_holds() {
+        // The whole point of the block-range check in `set`: a chunk claiming
+        // `u64::MAX` bytes of one-byte blocks only builds into a set whose Root
+        // packet claims just as many blocks, and verifying a two-byte file
+        // against it must look at two blocks, not 2^64.
+        let file = FilePacket {
+            name: "a.bin".to_owned(),
+            quick_rolling_hash: 0,
+            fingerprint: [1u8; 16],
+            option_hashes: Vec::new(),
+            chunks: vec![ChunkDescription::Protected {
+                length: u64::MAX,
+                first_block_index: Some(0),
+                tail: ChunkTail::None,
+            }],
+        };
+        let file = Packet::new(ID, PacketBody::File(file));
+        let packets = vec![
+            start(1),
+            Packet::new(
+                ID,
+                PacketBody::Root(RootPacket {
+                    lowest_unused_block_index: u64::MAX,
+                    attributes: 0,
+                    option_hashes: Vec::new(),
+                    children: vec![file.hash()],
+                }),
+            ),
+            file,
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        match verify_file(&set, &set.files()[0], b"hi") {
+            FileVerdict::Damaged {
+                expected_size,
+                actual_size,
+                damaged_blocks,
+                unchecked_blocks,
+                ..
+            } => {
+                assert_eq!(expected_size, u64::MAX);
+                assert_eq!(actual_size, 2);
+                assert!(damaged_blocks.is_empty());
+                assert_eq!(unchecked_blocks, vec![0u64, 1]);
             }
             other => panic!("unexpected verdict: {other:?}"),
         }
