@@ -60,15 +60,24 @@ pub struct Rar4ParsedVolume {
 struct ScanGuard {
     position: u64,
     headers: usize,
-    stream_len: u64,
+    /// The stream's length, when the reader can state one.
+    ///
+    /// `None` for a reader that refuses end-relative seeks with
+    /// `ErrorKind::Unsupported` — a volume still arriving over the wire, or a
+    /// sparse image of one, has no end to seek from and says so. Such a reader
+    /// is not a corrupt archive: it forgoes [`Self::check_member_data_fits`],
+    /// the one check that needs a length, and keeps the other two properties.
+    stream_len: Option<u64>,
 }
 
 impl ScanGuard {
     fn new<R: Seek>(reader: &mut R) -> RarResult<Self> {
         let position = reader.stream_position().map_err(RarError::Io)?;
-        let stream_len = reader
-            .seek(std::io::SeekFrom::End(0))
-            .map_err(RarError::Io)?;
+        let stream_len = match reader.seek(std::io::SeekFrom::End(0)) {
+            Ok(len) => Some(len),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+            Err(error) => return Err(RarError::Io(error)),
+        };
         reader
             .seek(std::io::SeekFrom::Start(position))
             .map_err(RarError::Io)?;
@@ -99,6 +108,10 @@ impl ScanGuard {
     /// here keeps that shape out of the decoder entirely, which is the only
     /// place a fix costs a legitimate archive nothing: the decode loops stay
     /// exactly as they were.
+    ///
+    /// A reader with no known length (see [`Self::stream_len`]) is not checked:
+    /// there is no volume end to fit inside yet, and the caller that hands one
+    /// over is walking headers, not feeding the decoder.
     fn check_member_data_fits(
         &self,
         name: &str,
@@ -109,15 +122,17 @@ impl ScanGuard {
         if continues {
             return Ok(());
         }
+        let Some(stream_len) = self.stream_len else {
+            return Ok(());
+        };
         let end = data_offset
             .checked_add(packed_size)
-            .filter(|end| *end <= self.stream_len);
+            .filter(|end| *end <= stream_len);
         if end.is_none() {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "RAR4 member {name:?} at offset {data_offset} declares {packed_size} packed bytes, \
-                     past the {} bytes in this volume",
-                    self.stream_len
+                     past the {stream_len} bytes in this volume"
                 ),
             });
         }
@@ -848,6 +863,63 @@ mod tests {
         assert_eq!(vol.files[0].name, "hello.txt");
         assert_eq!(vol.files[0].unpacked_size, Some(11));
         assert!(vol.end.is_some());
+    }
+
+    /// A reader that has bytes but no end: it refuses end-relative seeks the
+    /// way a sparse image of a volume still arriving does.
+    struct Endless(Cursor<Vec<u8>>);
+
+    impl Read for Endless {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(out)
+        }
+    }
+
+    impl Seek for Endless {
+        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+            match from {
+                std::io::SeekFrom::End(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "this image has no end to seek from",
+                )),
+                other => self.0.seek(other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_reader_with_no_known_length_still_walks_the_headers() {
+        let data = build_minimal_rar4_archive("hello.txt", b"Hello world");
+        let sized = parse_rar4_headers(&mut Cursor::new(data.clone()), None).unwrap();
+        let endless = parse_rar4_headers(&mut Endless(Cursor::new(data)), None)
+            .expect("a reader that cannot state its length is not a corrupt archive");
+        assert_eq!(endless.files.len(), sized.files.len());
+        assert_eq!(endless.files[0].name, sized.files[0].name);
+        assert_eq!(endless.files[0].data_offset, sized.files[0].data_offset);
+        assert_eq!(endless.files[0].packed_size, sized.files[0].packed_size);
+        assert!(endless.end.is_some());
+    }
+
+    #[test]
+    fn the_packed_size_fit_check_needs_a_length_and_only_that_check_is_skipped() {
+        // Twelve bytes of a member that declares eleven more than the file
+        // holds: a sized reader refuses the declaration at the header, a reader
+        // with no end cannot and walks on, the way every scan did before the
+        // check existed.
+        let mut data = build_minimal_rar4_archive("hello.txt", b"Hello world");
+        let end_header_len = 7;
+        let content_len = b"Hello world".len();
+        data.truncate(data.len() - end_header_len - content_len);
+        let sized = parse_rar4_headers(&mut Cursor::new(data.clone()), None);
+        assert!(
+            matches!(&sized, Err(RarError::CorruptArchive { detail }) if detail.contains("past the")),
+            "a sized reader must refuse a member whose data cannot fit, got {sized:?}"
+        );
+        let endless = parse_rar4_headers(&mut Endless(Cursor::new(data)), None);
+        assert!(
+            !matches!(&endless, Err(RarError::CorruptArchive { detail }) if detail.contains("past the")),
+            "a reader with no known length has no volume end to fit inside, got {endless:?}"
+        );
     }
 
     #[test]
