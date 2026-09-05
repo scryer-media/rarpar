@@ -328,9 +328,13 @@ the archive set; it waits for each later volume instead.
 - `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
-- `crates/par3-rs`: PAR3 packet parsing, input-set inspection, and
-  verification. A work in progress: it reads PAR3, and neither creates nor
-  repairs. Not used by the CLI. Licensed GPL-3.0-or-later.
+- `crates/par3-rs`: PAR3 packet parsing, input-set inspection, verification,
+  an inventory of the recovery data a set carries — which recovery blocks
+  exist, which matrix each was computed with, and which packets contradict each
+  other — and the Cauchy Reed-Solomon codec over GF(2^8) and GF(2^16) that
+  computes recovery blocks and solves for lost input blocks. A work in
+  progress: nothing here writes a `.par3` file or repairs one. Not used by the
+  CLI. Licensed GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
   GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
   default dependency, so an ordinary build carries the unRAR restriction.

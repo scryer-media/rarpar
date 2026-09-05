@@ -9,8 +9,10 @@ use crate::packet::reader::BodyReader;
 /// hashes that say how it was computed.
 ///
 /// The data may be shorter than the block size, in which case it is zero-filled.
-/// This crate retains the bytes but computes nothing from them: PAR3 repair is
-/// out of scope for `0.1`.
+/// This crate retains the bytes; the set model takes inventory of them, see
+/// [`Par3Set::recovery_blocks`](crate::Par3Set::recovery_blocks). Feeding them
+/// to [`crate::cauchy::Decoder`] to rebuild lost input blocks is the caller's
+/// to do: nothing here decides what was lost or writes a repaired file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryDataPacket {
     /// Hash of the Root packet whose input blocks this recovery block covers.

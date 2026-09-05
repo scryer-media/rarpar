@@ -1,8 +1,9 @@
 //! Matrix packets: `PAR CAU\0`, `PAR SPA\0`, `PAR EXP\0` and `PAR FFT\0`.
 //!
-//! A matrix packet describes how recovery blocks were computed. This crate parses
-//! all four, but computes nothing from them: PAR3 recovery is out of scope for
-//! `0.1`.
+//! A matrix packet describes how recovery blocks were computed. This crate
+//! parses all four. The construction the Cauchy packet describes is implemented
+//! in [`crate::cauchy`], but nothing here reads a parsed packet and drives the
+//! codec from it; the other three are retained and never interpreted.
 
 use crate::error::Result;
 use crate::packet::reader::BodyReader;
@@ -30,13 +31,32 @@ impl BlockRange {
 
 /// The Cauchy Matrix packet: a Reed-Solomon code over the set's Galois field.
 ///
-/// # Element definition
+/// # How the reference implementation builds the matrix
 ///
-/// The published specification defines the non-zero element for input block `I`
-/// and recovery block `R` as `inv(x_(I+1) - y_(MAX-R))`. The reference
-/// implementation's appendix drops the `+1`, so the element is
-/// `inv(x_I - y_(MAX-R))`. Anything computing recovery data from this packet must
-/// follow the reference. Nothing in `0.1` does.
+/// Write `MAX` for the largest value of the set's Galois field — 255 for
+/// GF(2^8), 65535 for GF(2^16). For recovery block `R` and input block `I`, the
+/// matrix element is
+///
+/// ```text
+/// element(I, R) = inv(I ^ (MAX - R))
+/// ```
+///
+/// where `^` is bitwise exclusive-or (subtraction in a binary field) and `inv`
+/// is the multiplicative inverse. The recovery block is then the sum over every
+/// input block of `element(I, R)` times block `I`, with multiplication applied
+/// symbol by symbol — bytes for GF(2^8), little-endian 16-bit words for
+/// GF(2^16) — and addition being exclusive-or. Input blocks that a chunk tail
+/// only partly fills are zero-padded to the block size first.
+///
+/// The published specification numbers the rows from `x_(I+1)` instead of `I`;
+/// the reference implementation's appendix drops the `+1`, and its recovery
+/// bytes follow the form above. The `tests/oracle_recovery.rs` suite pins that
+/// against recovery volumes the reference wrote, including a check that the
+/// specification's numbering does *not* reproduce them.
+///
+/// [`crate::cauchy`] implements that construction. This packet type is only the
+/// wire form of it: nothing reads a parsed packet's block range or recovery
+/// hint and encodes or repairs from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CauchyMatrixPacket {
     /// Input blocks this matrix covers.

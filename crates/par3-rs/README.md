@@ -4,14 +4,16 @@
 [![docs.rs](https://docs.rs/par3-rs/badge.svg)](https://docs.rs/par3-rs)
 
 Reading PAR3 (Parity Volume Set 3.0) recovery files in pure Rust: packet
-parsing, set inspection, and verification of the files a set protects.
+parsing, set inspection, verification of the files a set protects, and the
+Cauchy Reed-Solomon arithmetic PAR3 recovery data is built from.
 
-**This is a work in progress.** It reads PAR3. It does not create PAR3, and it
-does not repair anything. See [Scope](#scope) before depending on it.
+**This is a work in progress.** It reads PAR3 and it can compute and solve the
+code. It does not yet write a `.par3` file or repair a damaged one. See
+[Scope](#scope) before depending on it.
 
 ```toml
 [dependencies]
-par3-rs = "0.1"
+par3-rs = "0.2"
 ```
 
 ## Usage
@@ -50,14 +52,25 @@ In:
   anything read writes back byte for byte.
 - Grouping packets into input sets and resolving each set's files and
   directories into paths.
+- An inventory of the recovery blocks a set carries: which indices exist, which
+  matrix each was computed with, and whether that matrix packet is present.
 - Whole-file verification, with a mismatch narrowed down to the input blocks
   that failed.
+- Arithmetic in both Galois fields PAR3 uses, GF(2^8) with `0x11D` and GF(2^16)
+  with `0x1100B`: scalar, table-driven, portable, no `unsafe`.
+- The Cauchy Reed-Solomon codec: a streaming encoder that computes a set's
+  recovery blocks from its input blocks, and a streaming decoder that solves for
+  lost input blocks from the recovery blocks that survived.
 
 Out, for this release:
 
-- Creating PAR3 files.
-- Recovery and repair, and the Galois-field arithmetic they need. Matrix and
-  Recovery Data packets are parsed and kept, but nothing is computed from them.
+- Creating PAR3 files. The codec computes recovery blocks, but nothing here
+  plans a set, builds packets or writes a volume.
+- Repairing damaged files. The codec solves for lost input blocks, but nothing
+  here decides what was lost, reads surviving blocks off a disk or writes a
+  repaired file back.
+- Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
+  matrix packets are parsed and kept, and nothing is computed from them.
 - The sliding rolling-hash search that finds blocks whose position has moved.
 - Verifying tail packing beyond each file's own whole-file hash.
 - Incremental backups: a Start packet's parent set is exposed, never followed.
@@ -112,6 +125,7 @@ packets can otherwise ask for a great deal of both:
 | `SetLimits::max_entries` | 1,000,000 | Files plus directories one set resolves to. |
 | `SetLimits::max_depth` | 256 | Directory nesting the walk follows. |
 | `SetLimits::max_path_bytes` | 64 MiB | Resolved path text, which a directory graph can expand exponentially. |
+| `CodecLimits::max_buffer_bytes` | 1 GiB | Recovery rows, syndromes and the matrix a codec holds. |
 
 Chunk block ranges are validated whole against the set's block count when the
 set is built, and verification narrows damage down only within the file it is
@@ -127,8 +141,14 @@ and by reading the reference implementation,
 that the draft does not. No code from that project was copied.
 
 The wire-format tests are pinned against `.par3` files that `par3cmdline` itself
-produced; the exact commit, build recipe and command lines are recorded in
-`tests/oracle_vectors.rs`.
+produced — index files and recovery volumes alike; the exact commit, build
+recipe and command lines are recorded in `tests/common/mod.rs`. The recovery
+bytes are checked against the reference's own Cauchy construction, recomputed
+from the input blocks in `tests/oracle_recovery.rs` with slow, longhand
+arithmetic that lives in the test and is deliberately not the library's own.
+`tests/oracle_codec.rs` then requires the library's encoder to reproduce those
+same recovery blocks and its decoder to put back every input block that could
+be lost.
 
 Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
 

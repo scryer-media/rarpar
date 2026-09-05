@@ -1,9 +1,10 @@
 //! Reading PAR3 (Parity Volume Set 3.0) recovery files.
 //!
 //! This crate parses `.par3` packets, groups them into input sets, resolves the
-//! directory tree a set describes, and checks input files against it. It is a
-//! **work in progress**: it reads and inspects PAR3, and does not create or
-//! repair anything.
+//! directory tree a set describes, checks input files against it, and computes
+//! the Cauchy Reed-Solomon code PAR3 recovery data is built from. It is a
+//! **work in progress**: it reads and inspects PAR3, and does not yet write a
+//! `.par3` file or repair a damaged one.
 //!
 //! ```no_run
 //! use par3_rs::{Par3Set, VerifyReport, scan_packets_from_path, verify_set};
@@ -34,19 +35,28 @@
 //! - Typed parsing *and* re-serialisation of the core packet types, with every
 //!   other type retained verbatim ([`packet`]).
 //! - Assembling packets into an input set and resolving its files and
-//!   directories to paths ([`set`]).
+//!   directories to paths, and taking inventory of the recovery blocks the set
+//!   carries ([`set`]).
 //! - Whole-file verification, with damage narrowed down to input blocks
 //!   ([`verify`]).
+//! - Arithmetic in the two Galois fields PAR3 uses, GF(2^8) and GF(2^16)
+//!   ([`gf`]).
+//! - The Cauchy Reed-Solomon codec: computing a set's recovery blocks from its
+//!   input blocks, and solving for lost input blocks from the recovery blocks
+//!   that survived ([`cauchy`]).
 //!
 //! # What is not
 //!
 //! None of the following is implemented, and none of it is planned for this
 //! release:
 //!
-//! - Creating PAR3 files.
-//! - Recovery or repair of damaged files, and the Galois-field arithmetic that
-//!   would need. Matrix and Recovery Data packets are parsed and retained, but
-//!   nothing is computed from them.
+//! - Creating PAR3 files. The codec computes recovery blocks, but nothing here
+//!   plans a set, builds packets or writes a volume.
+//! - Repairing damaged files. The codec solves for lost input blocks, but
+//!   nothing here decides what was lost, reads the surviving blocks off a disk
+//!   or writes a repaired file back.
+//! - Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
+//!   matrix packets are parsed and retained, and nothing is computed from them.
 //! - The sliding rolling-hash search that finds blocks whose position in a file
 //!   has moved. Verification compares bytes where the packets say they should
 //!   be.
@@ -90,8 +100,8 @@
 //! # Untrusted input
 //!
 //! Every entry point is written to be safe on hostile bytes. There is no
-//! `unsafe` code; allocations are bounded by [`ScanLimits`] and
-//! [`SetLimits`] rather than by lengths a packet claims; the
+//! `unsafe` code; allocations are bounded by [`ScanLimits`], [`SetLimits`] and
+//! [`CodecLimits`] rather than by lengths a packet claims; the
 //! directory walk is iterative and refuses cycles; and File and Directory names
 //! that are empty, `.`, `..`, or contain a path separator are refused at parse
 //! time, so a set cannot direct a read outside the directory it is verified
@@ -100,14 +110,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cauchy;
 pub mod error;
+pub mod gf;
 pub mod hash;
 pub mod packet;
 pub mod scan;
 pub mod set;
 pub mod verify;
 
+pub use cauchy::{CodecLimits, Decoder, Encoder, Geometry, RecoveredBlock, RecoveryRow};
 pub use error::{Par3Error, Result};
+pub use gf::{AnyField, Field, Gf8, Gf16};
 pub use hash::{
     FINGERPRINT_LEN, Fingerprint, FingerprintHasher, QUICK_HASH_LEN, RollingHasher, TAIL_HASH_LEN,
     fingerprint, quick_rolling_hash, rolling_hash,
@@ -122,7 +136,7 @@ pub use scan::{
     ScanLimits, scan_packets, scan_packets_from_path, scan_packets_from_path_with_limits,
     scan_packets_with_limits,
 };
-pub use set::{Par3Directory, Par3File, Par3Set, SetLimits};
+pub use set::{Par3Directory, Par3File, Par3Set, RecoveryBlock, SetLimits};
 pub use verify::{
     FileReport, FileVerdict, VerifyReport, verify_file, verify_file_at_path, verify_set,
 };

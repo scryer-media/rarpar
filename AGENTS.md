@@ -40,7 +40,8 @@ and PAR2 workflows.
 
 ## PAR3 Rules
 
-- `par3-rs` 0.1 is read-only: parsing, set inspection, and verification. The
+- `par3-rs` 0.x is read-only: parsing, set inspection, verification, and an
+  inventory of the recovery data a set carries (nothing is computed from it). The
   crate is intended to grow into a full PAR3 implementation (creation and
   repair), but each widening of scope is a deliberate, separately planned step:
   update the README and crate docs in the same change, and keep the "what does
