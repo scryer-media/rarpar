@@ -2270,7 +2270,10 @@ mod tests {
 
         assert_eq!(model.run_length, i32::MAX);
         assert_eq!(bucket(model.run_length), before);
-        assert!(before < 64, "the index term must stay inside bin_summ's row");
+        assert!(
+            before < 64,
+            "the index term must stay inside bin_summ's row"
+        );
 
         // What saturation is buying: the wrapped value lands in the other
         // bucket, so a release build would silently decode against different

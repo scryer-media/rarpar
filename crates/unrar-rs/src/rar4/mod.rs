@@ -66,7 +66,9 @@ struct ScanGuard {
 impl ScanGuard {
     fn new<R: Seek>(reader: &mut R) -> RarResult<Self> {
         let position = reader.stream_position().map_err(RarError::Io)?;
-        let stream_len = reader.seek(std::io::SeekFrom::End(0)).map_err(RarError::Io)?;
+        let stream_len = reader
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(RarError::Io)?;
         reader
             .seek(std::io::SeekFrom::Start(position))
             .map_err(RarError::Io)?;
