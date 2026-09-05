@@ -429,29 +429,32 @@ jobs:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify the corpus against its ledger, lock and signature
         run: cargo run --locked -p xtask -- test-corpus verify --all-present --require-signature
-      - name: Run the workspace fixture tests outside unrar-rs and par2-rs
+      - name: Run the workspace fixture tests outside the per-crate lanes
         run: |
           set -euo pipefail
 
-          # `unrar-rs` and `par2-rs` are deliberately NOT here: each of those
-          # crates runs its complete suite exactly once, in `unrar-tests` and
-          # `par2-tests` respectively (with `slow-tests` on, and with the UnRAR
-          # oracle installed for unrar-rs). Running them here as well used to
-          # cost a second full pass over the two heaviest suites in the
-          # workspace on every CI run. What remains is everything else that
-          # needs the hydrated corpora — chiefly the `rarpar` CLI suite, which
-          # extracts fixtures from both — plus reedsolomon-rs, xtask, and their
-          # doctests.
+          # `unrar-rs`, `par2-rs` and `par3-rs` are deliberately NOT here: each
+          # of those crates runs its complete suite exactly once, in
+          # `unrar-tests`, `par2-tests` and `par3-tests` respectively (with
+          # `slow-tests` on, and with the UnRAR oracle installed for unrar-rs),
+          # and only when the `changes` job says that crate is affected. Running
+          # them here as well used to cost a second full pass over the two
+          # heaviest suites in the workspace on every CI run. What remains is
+          # everything else that needs the hydrated corpora — chiefly the
+          # `rarpar` CLI suite, which extracts fixtures from both — plus
+          # reedsolomon-rs, xtask, and their doctests.
           #
           # cargo only *warns* about an `--exclude` name that no longer matches
           # (a rename would silently turn this back into a second full pass over
-          # that crate), whereas the crate lanes' `-p` hard-errors. Pin both
+          # that crate), whereas the crate lanes' `-p` hard-errors. Pin the
           # names first so a rename fails here too instead of just getting slow.
           cargo pkgid unrar-rs >/dev/null
           cargo pkgid par2-rs >/dev/null
+          cargo pkgid par3-rs >/dev/null
           cargo test --locked --workspace --no-fail-fast \
             --exclude unrar-rs \
-            --exclude par2-rs
+            --exclude par2-rs \
+            --exclude par3-rs
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -527,6 +530,31 @@ jobs:
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  # par3-rs has no corpus to hydrate and no C dependency beyond blake3's own
+  # build script, so its lane is the plain cargo run: lib, integration tests
+  # (reference-generated vectors embedded as hex) and doctests, once, only
+  # when the crate is affected.
+  par3-tests:
+    name: par3-tests
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.par3 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+      - name: Run the par3-rs suite
+        run: cargo test --locked -p par3-rs --no-fail-fast
+      - name: Check the wasm32-wasip1 build
+        run: cargo check --locked -p par3-rs --target wasm32-wasip1
 
   # The slow unrar suite, one runner per shard. Fixtures are never produced
   # here: generation happens exactly once, inside the signed
@@ -1693,6 +1721,7 @@ jobs:
       - unit-tests
       - fixture-tests
       - par2-tests
+      - par3-tests
       - unrar-tests
       - platform-tests
       - target-checks
