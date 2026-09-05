@@ -47,10 +47,13 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-      # `output-sarif` publishes findings to the Security tab rather than
-      # leaving them in a run log nobody reads. Only this job produces them,
-      # and this workflow only ever runs on this repository (schedule and
-      # manual dispatch), so the write is never handed to a fork's token.
+      # `output-sarif` only makes the ClusterFuzzLite action *write*
+      # `cifuzz-sarif/results.sarif`; nothing about it reaches GitHub on its
+      # own. The "Upload Sarif" step below is what puts findings in the
+      # Security tab, and that upload is what needs this permission. Only this
+      # job produces the file, and this workflow only ever runs on this
+      # repository (schedule and manual dispatch), so the write is never handed
+      # to a fork's token.
       security-events: write
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
@@ -105,6 +108,18 @@ jobs:
         # a gate that blocks someone's merge.
         env:
           REPORT_TIMEOUTS: 'true'
+
+      # `run_fuzzers` writes the SARIF and stops there. Without this step the
+      # file dies with the runner, `security-events: write` above is unused,
+      # and the Security tab stays empty however many findings the batch
+      # produced. `if: always()` because the interesting runs are the ones
+      # where the previous step reported something.
+      - name: Upload Sarif
+        if: always()
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: cifuzz-sarif/results.sarif
+          checkout_path: cifuzz-sarif
 
   # What the corpus is actually reaching. Without this the fuzzing budget is
   # spent on faith: a target whose coverage has been flat for a month is either
