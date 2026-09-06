@@ -1324,3 +1324,94 @@ pub fn assert_block_eq(actual: &[u8], expected: &[u8], what: &str) {
         actual.len()
     );
 }
+
+/// A scratch directory under the system temp directory, removed when the test
+/// that made it finishes.
+///
+/// Setting `PAR3_KEEP_OUTPUT` in the environment keeps it instead, and the path
+/// is printed so the files can be looked at; `cargo test -- --nocapture` shows
+/// it.
+pub struct TempTree {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl TempTree {
+    /// Make a fresh directory named after the test using it.
+    pub fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("par3-rs-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("a scratch directory");
+        let keep = std::env::var_os("PAR3_KEEP_OUTPUT").is_some();
+        if keep {
+            println!("PAR3_KEEP_OUTPUT: keeping {}", path.display());
+        }
+        Self { path, keep }
+    }
+
+    /// Where the directory is.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Put a file in it, making the directories above it first.
+    pub fn write(&self, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = self.path.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("a parent directory");
+        }
+        std::fs::write(&path, data).expect("a written file");
+        path
+    }
+
+    /// Make an empty directory in it.
+    pub fn mkdir(&self, name: &str) {
+        std::fs::create_dir_all(self.path.join(name)).expect("a directory");
+    }
+
+    /// Read one of its files back.
+    pub fn read(&self, name: &str) -> Vec<u8> {
+        std::fs::read(self.path.join(name)).expect("a readable file")
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Write the GF(2^8) oracle's three input files into a scratch directory.
+pub fn write_gf8_inputs(tree: &TempTree) {
+    tree.write("a.bin", &a_bin());
+    tree.write("b.txt", &b_txt());
+    tree.write("sub/c.bin", &c_bin());
+}
+
+/// Write the GF(2^16) oracle's one input file into a scratch directory.
+pub fn write_gf16_inputs(tree: &TempTree) {
+    tree.write("big.bin", &big_bin());
+}
+
+/// The eight-byte type signature of a packet, as text, for readable failures.
+pub fn type_name(packet: &Packet) -> String {
+    String::from_utf8_lossy(&packet.packet_type().signature())
+        .trim_end_matches('\0')
+        .to_owned()
+}
+
+/// The type signatures of a file's packets, in the order they were written.
+pub fn type_sequence(data: &[u8]) -> Vec<String> {
+    packets_of(data).iter().map(type_name).collect()
+}
+
+/// The body bytes of a packet: everything after the 48-byte header.
+pub fn body_of(packet: &Packet) -> Vec<u8> {
+    packet.to_bytes()[48..].to_vec()
+}

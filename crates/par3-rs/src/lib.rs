@@ -1,10 +1,17 @@
-//! Reading PAR3 (Parity Volume Set 3.0) recovery files.
+//! Reading, creating and repairing PAR3 (Parity Volume Set 3.0) recovery files.
 //!
 //! This crate parses `.par3` packets, groups them into input sets, resolves the
-//! directory tree a set describes, checks input files against it, and computes
-//! the Cauchy Reed-Solomon code PAR3 recovery data is built from. It is a
-//! **work in progress**: it reads and inspects PAR3, and does not yet write a
-//! `.par3` file or repair a damaged one.
+//! directory tree a set describes, checks input files against it, computes the
+//! Cauchy Reed-Solomon code PAR3 recovery data is built from, writes a complete
+//! set — an index file and its recovery volumes — from a list of input files,
+//! and puts damaged and missing files back from the recovery blocks a set
+//! carries.
+//!
+//! It is a **work in progress**. What it creates and repairs is a set with the
+//! reference implementation's default settings: a Cauchy matrix over GF(2^8) or
+//! GF(2^16), chunk tails packed into shared blocks, and power-of-two recovery
+//! volumes. Everything outside that is listed under
+//! [what is not in scope](#what-is-not).
 //!
 //! ```no_run
 //! use par3_rs::{Par3Set, VerifyReport, scan_packets_from_path, verify_set};
@@ -44,29 +51,42 @@
 //! - The Cauchy Reed-Solomon codec: computing a set's recovery blocks from its
 //!   input blocks, and solving for lost input blocks from the recovery blocks
 //!   that survived ([`cauchy`]).
+//! - Creating a set: planning the blocks, packing chunk tails, building the
+//!   packets and writing the index file and recovery volumes ([`mod@create`]).
+//! - Repairing a set: working out which input blocks were lost, solving for
+//!   them, and writing every damaged or missing file back over a backup of the
+//!   damaged one ([`repair`]).
 //!
 //! # What is not
 //!
 //! None of the following is implemented, and none of it is planned for this
 //! release:
 //!
-//! - Creating PAR3 files. The codec computes recovery blocks, but nothing here
-//!   plans a set, builds packets or writes a volume.
-//! - Repairing damaged files. The codec solves for lost input blocks, but
-//!   nothing here decides what was lost, reads the surviving blocks off a disk
-//!   or writes a repaired file back.
+//! - Repairing damaged recovery volumes. A recovery block that does not parse is
+//!   simply not available to a repair; nothing puts it back.
+//! - Finding a file that was renamed or moved. A repair rebuilds it from
+//!   recovery data instead, and does not look at whatever took its place.
 //! - Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
 //!   matrix packets are parsed and retained, and nothing is computed from them.
 //! - The sliding rolling-hash search that finds blocks whose position in a file
 //!   has moved. Verification compares bytes where the packets say they should
-//!   be.
-//! - Verifying tail packing beyond each file's own whole-file hash.
+//!   be, and a repair rebuilds a file whose content shifted rather than finding
+//!   the bytes it still has.
+//! - Checking a block of packed tails as a block. Each file's own tail is
+//!   checked against the hashes in its chunk description; the block those tails
+//!   share carries no checksum of its own — the reference implementation leaves
+//!   tail blocks out of its External Data packets — and is never checked as a
+//!   unit.
 //! - Incremental backups: a Start packet's parent set is exposed, but parent
 //!   packets are never followed.
 //! - Permissions and link packets, beyond keeping their bytes.
 //! - "Par inside", where PAR3 packets live within the file they protect. Files
 //!   with unprotected chunks are reported as unverifiable.
-//! - Any command-line interface.
+//! - Creating anything beyond a plain set: no deduplication, no Data packets,
+//!   no unprotected chunks, no splitting a file into several chunks, no
+//!   permission or link packets, no parent set, and no matrix but Cauchy.
+//! - Any command-line interface. `examples/par3rs.rs` drives this API from a
+//!   shell to demonstrate it; it is not a tool.
 //!
 //! # Format notes
 //!
@@ -100,8 +120,10 @@
 //! # Untrusted input
 //!
 //! Every entry point is written to be safe on hostile bytes. There is no
-//! `unsafe` code; allocations are bounded by [`ScanLimits`], [`SetLimits`] and
-//! [`CodecLimits`] rather than by lengths a packet claims; the
+//! `unsafe` code; allocations are bounded by [`ScanLimits`], [`SetLimits`],
+//! [`CodecLimits`], [`CreateLimits`] and [`RepairLimits`] rather than by lengths
+//! a packet or a caller claims; verifying and repairing read a bounded region at
+//! a time rather than a whole file; the
 //! directory walk is iterative and refuses cycles; and File and Directory names
 //! that are empty, `.`, `..`, or contain a path separator are refused at parse
 //! time, so a set cannot direct a read outside the directory it is verified
@@ -111,15 +133,21 @@
 #![warn(missing_docs)]
 
 pub mod cauchy;
+pub mod create;
 pub mod error;
 pub mod gf;
 pub mod hash;
 pub mod packet;
+pub mod repair;
 pub mod scan;
 pub mod set;
 pub mod verify;
 
 pub use cauchy::{CodecLimits, Decoder, Encoder, Geometry, RecoveredBlock, RecoveryRow};
+pub use create::{
+    CreateLimits, CreateOptions, CreateReport, InputSpec, RecoveryAmount, create,
+    suggest_block_size,
+};
 pub use error::{Par3Error, Result};
 pub use gf::{AnyField, Field, Gf8, Gf16};
 pub use hash::{
@@ -131,6 +159,9 @@ pub use packet::{
     DirectoryPacket, ExternalDataPacket, FilePacket, GaloisField, HEADER_SIZE, InputSetId, MAGIC,
     Packet, PacketBody, PacketHeader, PacketType, ParseContext, RecoveryDataPacket,
     RecoveryExternalDataPacket, RootPacket, StartPacket,
+};
+pub use repair::{
+    RepairLimits, RepairOptions, RepairPlan, RepairReport, RepairedFile, plan_repair, repair_set,
 };
 pub use scan::{
     ScanLimits, scan_packets, scan_packets_from_path, scan_packets_from_path_with_limits,

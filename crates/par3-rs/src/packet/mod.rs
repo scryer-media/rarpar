@@ -23,7 +23,7 @@ pub mod external_data;
 pub mod file;
 pub mod header;
 pub mod matrix;
-mod reader;
+pub(crate) mod reader;
 pub mod recovery;
 pub mod root;
 pub mod start;

@@ -14,12 +14,20 @@
 //! damaged, because finding the moved blocks needs the sliding rolling-hash
 //! search that this crate does not implement.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::hash::{TAIL_HASH_LEN, fingerprint, rolling_hash};
+use crate::hash::{FingerprintHasher, TAIL_HASH_LEN, fingerprint, rolling_hash};
 use crate::packet::{ChunkDescription, ChunkTail, InputSetId};
 use crate::set::{Par3File, Par3Set};
+
+/// Bytes read at a time when hashing a whole file.
+///
+/// The whole-file pass does not care where a block boundary falls, so this is a
+/// plain I/O buffer rather than anything the set chose.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// What checking one input file's bytes found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +38,7 @@ pub enum FileVerdict {
     /// The file was not found where it was looked for.
     Missing,
     /// The file is present, but its bytes do not match.
+    #[non_exhaustive]
     Damaged {
         /// Length the File packet describes.
         expected_size: u64,
@@ -53,6 +62,15 @@ pub enum FileVerdict {
         /// Chunks whose trailing partial block did not match, as indices into
         /// [`Par3File::chunks`].
         damaged_chunks: Vec<usize>,
+        /// Input blocks holding a chunk tail that did not match, ascending.
+        ///
+        /// This is the same damage [`damaged_chunks`](FileVerdict::Damaged) names,
+        /// expressed in the blocks a codec works in: the block index a described
+        /// tail's chunk description carries. A tail block may hold several tails,
+        /// possibly from other files, and one wrong tail spoils the whole block,
+        /// so a repair has to rebuild all of it. An inline tail lives in the File
+        /// packet and occupies no block, so it never appears here.
+        damaged_tail_blocks: Vec<u64>,
     },
     /// The file is present, but the set does not describe enough to check it.
     Unverifiable {
@@ -85,6 +103,18 @@ impl FileVerdict {
     pub fn damaged_blocks(&self) -> &[u64] {
         match self {
             Self::Damaged { damaged_blocks, .. } => damaged_blocks,
+            _ => &[],
+        }
+    }
+
+    /// The input blocks holding a chunk tail this verdict found damaged.
+    #[must_use]
+    pub fn damaged_tail_blocks(&self) -> &[u64] {
+        match self {
+            Self::Damaged {
+                damaged_tail_blocks,
+                ..
+            } => damaged_tail_blocks,
             _ => &[],
         }
     }
@@ -203,14 +233,9 @@ pub fn verify_file(set: &Par3Set, file: &Par3File, data: &[u8]) -> FileVerdict {
         return FileVerdict::Complete;
     }
 
-    let localised = localise(set, file, data);
-    FileVerdict::Damaged {
-        expected_size,
-        actual_size,
-        damaged_blocks: localised.damaged_blocks,
-        unchecked_blocks: localised.unchecked_blocks,
-        damaged_chunks: localised.damaged_chunks,
-    }
+    let mut source = Source::Memory(data);
+    let localised = localise(set, file, &mut source);
+    localised.into_verdict(expected_size, actual_size)
 }
 
 /// Check one input file by reading it from `path`.
@@ -218,17 +243,72 @@ pub fn verify_file(set: &Par3Set, file: &Par3File, data: &[u8]) -> FileVerdict {
 /// A path that does not exist yields [`FileVerdict::Missing`] rather than an
 /// error; any other I/O failure is an error.
 ///
-/// The file is read into memory in one piece, which bounds this to files that
-/// fit in it.
+/// # Memory
+///
+/// The file is never held in memory. It is read once, in fixed-size pieces, to
+/// hash it as a whole; only when that hash disagrees with the File packet is it
+/// read a second time, and that pass holds one region at a time — a single input
+/// block, or the shorter of a block and the file itself. So the working set is
+/// `min(block_size, file_size)` plus a fixed 64 KiB, whatever the file's length.
+///
+/// The verdicts are the ones [`verify_file`] gives for the same bytes.
 pub fn verify_file_at_path(set: &Par3Set, file: &Par3File, path: &Path) -> Result<FileVerdict> {
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
+    let mut handle = match File::open(path) {
+        Ok(handle) => handle,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FileVerdict::Missing);
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(verify_file(set, file, &data))
+
+    if file.packet().has_unprotected_data() {
+        return Ok(FileVerdict::Unverifiable {
+            reason: "the file has unprotected chunks, which this crate does not verify",
+        });
+    }
+    if file.packet().fingerprint_is_unset() {
+        return Ok(FileVerdict::Unverifiable {
+            reason: "the File packet carries no fingerprint",
+        });
+    }
+
+    // One pass for the whole-file hash, which is also what measures the file:
+    // the bytes that can be read are the bytes it has, whatever its metadata
+    // claims.
+    let expected_size = file.size();
+    let mut hasher = FingerprintHasher::new();
+    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut actual_size: u64 = 0;
+    loop {
+        let read = match handle.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        hasher.update(&buffer[..read]);
+        actual_size = actual_size.saturating_add(read as u64);
+    }
+    if actual_size == expected_size && hasher.finalize() == file.fingerprint() {
+        return Ok(FileVerdict::Complete);
+    }
+    drop(buffer);
+
+    // The bytes disagree, so the damage is narrowed down region by region.
+    // Regions run forwards through the file, so the seeks are short.
+    let mut source = Source::Stream(StreamSource {
+        handle: &mut handle,
+        len: actual_size,
+        buffer: Vec::new(),
+        error: None,
+    });
+    let localised = localise(set, file, &mut source);
+    if let Source::Stream(stream) = source
+        && let Some(error) = stream.error
+    {
+        return Err(error.into());
+    }
+    Ok(localised.into_verdict(expected_size, actual_size))
 }
 
 /// Check every file in a set against a base directory.
@@ -263,10 +343,102 @@ struct Localised {
     damaged_blocks: Vec<u64>,
     unchecked_blocks: Vec<u64>,
     damaged_chunks: Vec<usize>,
+    damaged_tail_blocks: Vec<u64>,
+}
+
+impl Localised {
+    fn into_verdict(self, expected_size: u64, actual_size: u64) -> FileVerdict {
+        FileVerdict::Damaged {
+            expected_size,
+            actual_size,
+            damaged_blocks: self.damaged_blocks,
+            unchecked_blocks: self.unchecked_blocks,
+            damaged_chunks: self.damaged_chunks,
+            damaged_tail_blocks: self.damaged_tail_blocks,
+        }
+    }
+}
+
+/// Where the bytes being checked come from.
+///
+/// Localisation reads a bounded region at a time and never looks at the file as
+/// a whole, so the same walk serves both a caller that already holds the bytes
+/// and one that only knows where they are.
+enum Source<'a> {
+    Memory(&'a [u8]),
+    Stream(StreamSource<'a>),
+}
+
+/// A file being read region by region.
+///
+/// `len` is how many bytes the file was measured at, not what its metadata
+/// claims, so a region past the end is refused without a read. An I/O failure is
+/// kept here rather than returned from the walk: the region reads as absent, and
+/// the caller turns the stored failure into an error instead of a verdict.
+struct StreamSource<'a> {
+    handle: &'a mut File,
+    len: u64,
+    buffer: Vec<u8>,
+    error: Option<std::io::Error>,
+}
+
+impl Source<'_> {
+    /// The bytes at `start..start + len`, or `None` when the file is too short
+    /// for them — or, for a stream, when they could not be read.
+    fn region(&mut self, start: u64, len: u64) -> Option<&[u8]> {
+        match self {
+            Self::Memory(data) => slice(data, start, len),
+            Self::Stream(stream) => stream.region(start, len),
+        }
+    }
+
+    /// How many bytes there are to look at.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(data) => data.len() as u64,
+            Self::Stream(stream) => stream.len,
+        }
+    }
+}
+
+impl StreamSource<'_> {
+    fn region(&mut self, start: u64, len: u64) -> Option<&[u8]> {
+        if self.error.is_some() {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        // The region lies inside the file, so its length is a length the file
+        // system already managed; a platform whose pointers are narrower than
+        // that cannot hold it, and it is reported rather than truncated.
+        let Ok(len) = usize::try_from(len) else {
+            self.error = Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an input block is larger than this platform can address",
+            ));
+            return None;
+        };
+        if self.buffer.len() < len {
+            self.buffer.resize(len, 0);
+        }
+        match self
+            .handle
+            .seek(SeekFrom::Start(start))
+            .and_then(|_| self.handle.read_exact(&mut self.buffer[..len]))
+        {
+            Ok(()) => Some(&self.buffer[..len]),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
 }
 
 /// Narrow a whole-file mismatch down to blocks and tails.
-fn localise(set: &Par3Set, file: &Par3File, data: &[u8]) -> Localised {
+fn localise(set: &Par3Set, file: &Par3File, source: &mut Source<'_>) -> Localised {
     let mut out = Localised::default();
     let block_size = set.block_size();
     if block_size == 0 {
@@ -293,13 +465,11 @@ fn localise(set: &Par3Set, file: &Par3File, data: &[u8]) -> Localised {
             // and the output proportional to the file rather than to a chunk
             // length the packets chose: a chunk may honestly claim `u64::MAX`
             // bytes of one-byte blocks.
-            let reachable = (data.len() as u64)
-                .saturating_sub(offset)
-                .div_ceil(block_size);
+            let reachable = source.len().saturating_sub(offset).div_ceil(block_size);
             for step in 0..full_blocks.min(reachable) {
                 let block_index = first.wrapping_add(step);
                 let start = offset.saturating_add(step.saturating_mul(block_size));
-                match slice(data, start, block_size) {
+                match source.region(start, block_size) {
                     Some(bytes) => match set.block_checksum(block_index) {
                         Some(checksum) => {
                             if rolling_hash(bytes) != checksum.rolling_hash
@@ -322,25 +492,29 @@ fn localise(set: &Par3Set, file: &Par3File, data: &[u8]) -> Localised {
         match tail {
             ChunkTail::None => {}
             ChunkTail::Inline(expected) => {
-                if slice(data, tail_start, expected.len() as u64) != Some(expected.as_slice()) {
+                if source.region(tail_start, expected.len() as u64) != Some(expected.as_slice()) {
                     out.damaged_chunks.push(index);
                 }
             }
             ChunkTail::Described {
                 rolling_hash: expected_rolling,
                 fingerprint: expected_fingerprint,
+                block_index,
                 ..
-            } => match slice(data, tail_start, tail_size) {
-                Some(bytes) => {
-                    let head = &bytes[..bytes.len().min(TAIL_HASH_LEN)];
-                    if rolling_hash(head) != *expected_rolling
-                        || fingerprint(bytes) != *expected_fingerprint
-                    {
-                        out.damaged_chunks.push(index);
+            } => {
+                let matched = match source.region(tail_start, tail_size) {
+                    Some(bytes) => {
+                        let head = &bytes[..bytes.len().min(TAIL_HASH_LEN)];
+                        rolling_hash(head) == *expected_rolling
+                            && fingerprint(bytes) == *expected_fingerprint
                     }
+                    None => false,
+                };
+                if !matched {
+                    out.damaged_chunks.push(index);
+                    out.damaged_tail_blocks.push(*block_index);
                 }
-                None => out.damaged_chunks.push(index),
-            },
+            }
         }
 
         offset = offset.saturating_add(*length);
@@ -350,6 +524,8 @@ fn localise(set: &Par3Set, file: &Par3File, data: &[u8]) -> Localised {
     out.damaged_blocks.dedup();
     out.unchecked_blocks.sort_unstable();
     out.unchecked_blocks.dedup();
+    out.damaged_tail_blocks.sort_unstable();
+    out.damaged_tail_blocks.dedup();
     out
 }
 
@@ -490,12 +666,15 @@ mod tests {
                 damaged_blocks,
                 unchecked_blocks,
                 damaged_chunks,
+                damaged_tail_blocks,
+                ..
             } => {
                 assert_eq!(expected_size, 100);
                 assert_eq!(actual_size, 100);
                 assert_eq!(damaged_blocks, vec![2u64]);
                 assert!(unchecked_blocks.is_empty());
                 assert!(damaged_chunks.is_empty());
+                assert!(damaged_tail_blocks.is_empty());
             }
             other => panic!("unexpected verdict: {other:?}"),
         }
@@ -704,6 +883,72 @@ mod tests {
         assert_eq!(report.missing_count(), 1);
         assert!(!report.is_complete());
         assert!(report.damaged_blocks().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_damaged_described_tail_names_the_block_that_holds_it() {
+        let data = body(178);
+        let set = build_set(&data, 64);
+        let mut damaged = data.clone();
+        damaged[170] ^= 0x01;
+        let verdict = verify_file(&set, &set.files()[0], &damaged);
+        assert_eq!(verdict.damaged_tail_blocks(), [2u64]);
+        // An inline tail lives in the packet, so nothing is lost with a block.
+        let short = body(74);
+        let set = build_set(&short, 64);
+        let mut damaged = short.clone();
+        damaged[70] ^= 0x80;
+        let verdict = verify_file(&set, &set.files()[0], &damaged);
+        assert!(verdict.damaged_tail_blocks().is_empty());
+        assert_eq!(verdict.damaged_blocks(), [] as [u64; 0]);
+    }
+
+    /// The two entry points must agree on every case, because a repair plans
+    /// from the streaming one and rebuilds against the in-memory one.
+    #[test]
+    fn reading_a_file_gives_the_same_verdict_as_holding_its_bytes() {
+        // Ten blocks and a described tail: many times the whole-file read
+        // buffer, so the streaming pass cannot be holding the file.
+        let data = body(64 * 1024 * 10 + 500);
+        let set = build_set(&data, 64 * 1024);
+        let file = &set.files()[0];
+
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![
+            ("intact", data.clone()),
+            ("empty", Vec::new()),
+            ("truncated to zero blocks", data[..100].to_vec()),
+            ("truncated mid-block", data[..64 * 1024 * 3 + 7].to_vec()),
+            ("truncated into the tail", data[..data.len() - 10].to_vec()),
+        ];
+        let mut flipped = data.clone();
+        flipped[64 * 1024 * 4 + 3] ^= 0xff;
+        cases.push(("a flipped byte in block 4", flipped));
+        let mut tail = data.clone();
+        let at = tail.len() - 1;
+        tail[at] ^= 0xff;
+        cases.push(("a flipped byte in the tail", tail));
+        let mut longer = data.clone();
+        longer.extend_from_slice(b"extra");
+        cases.push(("over-long", longer));
+
+        let dir = std::env::temp_dir().join(format!(
+            "par3-rs-stream-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("a.bin");
+        for (what, bytes) in &cases {
+            std::fs::write(&path, bytes).expect("write");
+            let streamed = verify_file_at_path(&set, file, &path).expect("reads");
+            assert_eq!(streamed, verify_file(&set, file, bytes), "{what}");
+        }
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(
+            verify_file_at_path(&set, file, &path).expect("reads"),
+            FileVerdict::Missing
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

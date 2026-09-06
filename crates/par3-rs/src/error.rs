@@ -198,6 +198,25 @@ pub enum Par3Error {
         reason: String,
     },
 
+    /// The set's own packets do not describe a layout a repair can work from.
+    ///
+    /// Two chunks claiming the same bytes of one input block, a block no file
+    /// writes, a file the set cannot check at all, or recovery data computed
+    /// with a matrix this crate does not implement: none of these is damage to
+    /// the protected files, so none of them is reported as such.
+    #[error("this PAR3 set cannot be repaired: {reason}")]
+    UnrepairableSet {
+        /// What about the set stands in the way.
+        reason: String,
+    },
+
+    /// A repair exceeded one of the [`RepairLimits`](crate::repair::RepairLimits).
+    #[error("PAR3 repair limit exceeded: {reason}")]
+    RepairLimitExceeded {
+        /// Which budget ran out.
+        reason: String,
+    },
+
     /// An input handed to [`create`](crate::create::create) cannot be used.
     ///
     /// The path is reported exactly as the caller named it, so a refusal points
