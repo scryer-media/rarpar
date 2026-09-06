@@ -296,13 +296,28 @@ pub(crate) fn paths(root: &Path, args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
+/// The BLAKE3 digest of no bytes at all. A ledger entry carrying it declares
+/// its fixture empty on purpose — the one digest a hand-written entry can be
+/// authoritative about, since an empty input has exactly one.
+pub(crate) const EMPTY_BLAKE3: &str =
+    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
 /// What a generation job proves before it hands its share of the corpus on:
 /// every path it owns is present as produced bytes, and it produced nothing the
 /// ledger does not list. The two failures this catches are a recipe that
 /// quietly stopped writing a fixture — the tree would still hold the pointer
-/// the checkout left — and one that writes a fixture nobody ledgered, which
-/// would travel no further than the runner it was written on.
+/// the checkout left, or nothing at all — and one that writes a fixture nobody
+/// ledgered, which would travel no further than the runner it was written on.
+/// A fixture produced empty counts as the first, unless its ledger entry
+/// carries [`EMPTY_BLAKE3`]: an empty file a set protects is a case worth
+/// pinning, and the entry says so in the one way that cannot be a placeholder.
 fn verify_produced(root: &Path, ledger: &Ledger, selected: &BTreeSet<String>) -> Result<()> {
+    let declared_empty: BTreeSet<&str> = ledger
+        .files
+        .iter()
+        .filter(|entry| entry.blake3 == EMPTY_BLAKE3)
+        .map(|entry| entry.path.as_str())
+        .collect();
     let mut problems: Vec<String> = Vec::new();
     for path in selected {
         let full = repo_path(root, path);
@@ -315,8 +330,10 @@ fn verify_produced(root: &Path, ledger: &Ledger, selected: &BTreeSet<String>) ->
             problems.push(format!(
                 "{path}: is still a Git LFS pointer, so nothing produced it in this job"
             ));
-        } else if digest.size == 0 {
-            problems.push(format!("{path}: was produced empty"));
+        } else if digest.size == 0 && !declared_empty.contains(path.as_str()) {
+            problems.push(format!(
+                "{path}: was produced empty, and the ledger does not declare it empty"
+            ));
         }
     }
     let listed = ledger.paths();
@@ -566,6 +583,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no recipe produced it"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A fixture produced with no bytes is a recipe that stopped writing —
+    /// unless the ledger declares it empty, with the digest of nothing, in
+    /// which case it is the fixture.
+    #[test]
+    fn paths_verify_accepts_an_empty_fixture_only_when_the_ledger_declares_it() {
+        let root = scaffold("verify-empty");
+        place(&root, ALPHA, b"");
+        place(&root, BETA, b"beta");
+        let err = paths(&root, arguments(&["--generator", "first", "--verify"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was produced empty"), "{err}");
+
+        let ledger_text = fs::read_to_string(root.join(LEDGER_FILE)).unwrap();
+        let declared = ledger_text.replace(
+            &format!(r#""size":5,"blake3":"{}""#, blake3_bytes(b"alpha")),
+            &format!(r#""size":0,"blake3":"{EMPTY_BLAKE3}""#),
+        );
+        assert_ne!(declared, ledger_text);
+        assert_eq!(EMPTY_BLAKE3, blake3_bytes(b""));
+        fs::write(root.join(LEDGER_FILE), declared).unwrap();
+        paths(&root, arguments(&["--generator", "first", "--verify"])).unwrap();
+
+        // The declaration is the entry's own: another fixture produced empty
+        // is still a failure.
+        place(&root, BETA, b"");
+        let err = paths(&root, arguments(&["--generator", "first", "--verify"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("beta.rar: was produced empty"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 
