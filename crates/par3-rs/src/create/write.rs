@@ -252,13 +252,18 @@ mod tests {
 
     #[test]
     fn names_are_padded_to_the_widest_number_either_field_reaches() {
+        // Compared as paths, not as text: the directory is joined with the
+        // platform's separator, which is a backslash on Windows.
         let (index, volumes) = plan_paths(Path::new("out/set.par3"), 3).expect("paths");
         assert_eq!(index, Path::new("out/set.par3"));
-        let names: Vec<String> = volumes
-            .iter()
-            .map(|volume| volume.path.display().to_string())
-            .collect();
-        assert_eq!(names, ["out/set.vol0+1.par3", "out/set.vol1+2.par3"]);
+        let paths: Vec<&Path> = volumes.iter().map(|volume| volume.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("out").join("set.vol0+1.par3"),
+                Path::new("out").join("set.vol1+2.par3"),
+            ]
+        );
 
         // 20 blocks split 1, 2, 4, 8, 5 with the last starting at 15.
         let (_, volumes) = plan_paths(Path::new("set"), 20).expect("paths");
