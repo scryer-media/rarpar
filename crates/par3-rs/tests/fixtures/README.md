@@ -7,10 +7,13 @@ corpus is published as a signed, content-addressed object set hydrated by
 `docs/test-corpus.md`. The repository carries no fixture bytes; `Cargo.toml`
 sets `exclude = ["tests/fixtures/**"]`, so none of this ships in the crate.
 
-Until the first corpus revision that carries these sets is published, the
-ledger entries are placeholders (size 0, zero digest) *pending first
-publication*, and there are no tests that read them yet: the publication comes
-first, the tests after it.
+`tests/corpus_sets.rs` is what reads them: it holds `par3-rs` to every set
+here, and skips when they are absent. Until the first corpus revision carrying
+these sets is published, the ledger entries are placeholders (size 0, zero
+digest) *pending first publication*, so no checkout can hydrate them yet and
+those tests skip everywhere. The publish workflow checks them regardless: its
+`workspace` validation lane runs the whole workspace suite against the tree it
+has just generated.
 
 ## Recipe
 

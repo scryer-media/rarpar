@@ -553,9 +553,19 @@ jobs:
   # is the plain cargo run: lib, integration tests (reference-generated
   # vectors embedded as hex) and doctests, once, only when the crate is
   # affected. Its corpus profile (`par3`, the reference-written sets under
-  # crates/par3-rs/tests/fixtures) is ledgered but pending first publication;
-  # the lane hydrates it once a revision carrying it is pinned and tests that
-  # read it exist.
+  # crates/par3-rs/tests/fixtures) is ledgered but still pending first
+  # publication, so there is nothing to hydrate from yet and the tests that
+  # read those sets — `tests/corpus_sets.rs` — skip here. The revision that
+  # pins a manifest carrying `par3` adds the step, the same one the par2 lane
+  # above runs:
+  #
+  #     - name: Hydrate the test corpus (par3)
+  #       run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
+  #
+  # Until then those tests still run where it counts. The publish workflow's
+  # `workspace` validation lane runs the whole workspace suite against the tree
+  # it has just generated, fixtures and all, so a set the library cannot read,
+  # reproduce or repair stops the corpus revision from being published.
   par3-tests:
     name: par3-tests
     needs: [changes, fmt, clippy, unit-tests]
