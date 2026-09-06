@@ -59,17 +59,27 @@ use crate::error::{Par3Error, Result};
 use crate::gf::Field;
 use crate::packet::GaloisField;
 
-/// Bounds on what a codec may allocate.
+/// Bounds on what a codec may allocate, and on the work a decoder may do.
 ///
 /// An encoder holds every recovery row it is building, and a decoder holds one
 /// syndrome per lost block plus the matrix it inverts and the blocks it
 /// rebuilds. All of that is sized from numbers a `.par3` file chose, so it is
-/// metered rather than trusted.
+/// metered rather than trusted. Memory is not the only cost a file can choose:
+/// the decoder's solve is a dense inversion, cubic in the number of lost
+/// blocks, and a set of tiny blocks can name thousands of them for a few
+/// hundred kilobytes of recovery data while staying well inside a memory
+/// budget. So the lost-block count is bounded on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodecLimits {
     /// Most bytes of block and matrix buffers one codec may hold.
     pub max_buffer_bytes: u64,
+    /// Most input blocks one decoder may rebuild in a single solve.
+    ///
+    /// Inverting the matrix costs on the order of the cube of this number in
+    /// field multiplications, and the solve itself the number times the block
+    /// size per lost block, so this is what bounds a decoder's time.
+    pub max_lost_blocks: u64,
 }
 
 impl CodecLimits {
@@ -77,14 +87,33 @@ impl CodecLimits {
     /// 65536-block set at 16 KiB blocks.
     pub const DEFAULT_MAX_BUFFER_BYTES: u64 = 1 << 30;
 
-    /// Limits allowing a codec `max_buffer_bytes` of block and matrix buffers.
+    /// 4096 lost blocks: an inversion of some 7 × 10¹⁰ field multiplications,
+    /// which is a minute or so of one core at the outside. That is enough for a
+    /// tenth of a 40,000-block set to be missing, while a set that would push
+    /// the count higher — thousands of two-byte blocks, say — is refused before
+    /// anything is allocated. A caller repairing very large sets with a lot of
+    /// damage can raise it, knowingly.
+    pub const DEFAULT_MAX_LOST_BLOCKS: u64 = 4096;
+
+    /// Limits allowing a codec `max_buffer_bytes` of block and matrix buffers,
+    /// with the default lost-block ceiling.
     ///
     /// This type is `#[non_exhaustive]`, so a caller outside the crate cannot
     /// write it out as a struct literal; this is how to build one that is not
     /// the default.
     #[must_use]
     pub fn new(max_buffer_bytes: u64) -> Self {
-        Self { max_buffer_bytes }
+        Self {
+            max_buffer_bytes,
+            max_lost_blocks: Self::DEFAULT_MAX_LOST_BLOCKS,
+        }
+    }
+
+    /// The most lost blocks a decoder built under these limits will solve for.
+    #[must_use]
+    pub fn with_max_lost_blocks(mut self, blocks: u64) -> Self {
+        self.max_lost_blocks = blocks;
+        self
     }
 }
 
@@ -92,6 +121,7 @@ impl Default for CodecLimits {
     fn default() -> Self {
         Self {
             max_buffer_bytes: Self::DEFAULT_MAX_BUFFER_BYTES,
+            max_lost_blocks: Self::DEFAULT_MAX_LOST_BLOCKS,
         }
     }
 }
@@ -535,6 +565,18 @@ impl<F: Field> Decoder<F> {
                 None
             }
         })?;
+        // The solve is cubic in this count, and the count is the file's to
+        // choose, so it is refused here — before the recovery list is even
+        // looked at, and long before a syndrome is allocated.
+        if lost.len() as u64 > limits.max_lost_blocks {
+            return Err(Par3Error::CodecLimitExceeded {
+                reason: format!(
+                    "rebuilding {} lost blocks needs a dense solve over the {}-block ceiling",
+                    lost.len(),
+                    limits.max_lost_blocks
+                ),
+            });
+        }
         let first = geometry.first_recovery;
         let end = first + geometry.recovery_blocks;
         let available = sorted_distinct(available_recovery, |index| {
@@ -951,6 +993,45 @@ mod tests {
             "eight one-kilobyte rows fit inside a kilobyte"
         );
         assert!(Encoder::with_limits(Gf8::default(), geometry(100, 4, 2), &limits).is_ok());
+    }
+
+    #[test]
+    fn a_solve_over_the_lost_block_ceiling_is_refused_before_anything_is_allocated() {
+        // Two-byte blocks: 5000 lost blocks and 5000 recovery blocks are a few
+        // kilobytes of buffers and a 5000³ inversion. The memory budget alone
+        // would wave it through.
+        let geometry = Geometry {
+            block_size: 2,
+            input_blocks: 5000,
+            recovery_blocks: 5000,
+            first_recovery: 0,
+        };
+        let lost: Vec<u64> = (0..5000).collect();
+        let available: Vec<u64> = (0..5000).collect();
+        let limits = CodecLimits::default();
+        assert_eq!(limits.max_lost_blocks, CodecLimits::DEFAULT_MAX_LOST_BLOCKS);
+        let error = Decoder::with_limits(Gf16::default(), geometry, &lost, &available, &limits)
+            .expect_err("5000 lost blocks are over the default ceiling");
+        assert!(
+            matches!(&error, Par3Error::CodecLimitExceeded { reason } if reason.contains("5000")),
+            "unexpected error: {error}"
+        );
+        // Under the ceiling, the same set decodes; over a lowered one, it is
+        // refused the same way.
+        assert!(
+            Decoder::with_limits(Gf16::default(), geometry, &lost[..8], &available, &limits)
+                .is_ok()
+        );
+        let lowered = CodecLimits::default().with_max_lost_blocks(7);
+        assert!(
+            Decoder::with_limits(Gf16::default(), geometry, &lost[..8], &available, &lowered)
+                .is_err()
+        );
+        // The ceiling is checked before the recovery list is: an impossible
+        // repair over the ceiling is reported as over the ceiling.
+        let error = Decoder::with_limits(Gf16::default(), geometry, &lost, &[0], &limits)
+            .expect_err("over the ceiling");
+        assert!(matches!(error, Par3Error::CodecLimitExceeded { .. }));
     }
 
     #[test]

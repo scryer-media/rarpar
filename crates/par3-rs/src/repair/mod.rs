@@ -336,6 +336,14 @@ pub fn plan_repair(set: &Par3Set, base: &Path, limits: &RepairLimits) -> Result<
 /// left under its temporary name and reported, and the file it was to replace is
 /// left alone.
 ///
+/// The temporary is created exclusively: a link planted under its name before
+/// the repair is refused rather than followed and truncated, while a plain file
+/// an interrupted repair left there is replaced. A directory of the set that has
+/// been replaced by a link is refused before the file under it is rebuilt. Both
+/// guard against what was put in place before the repair started; `base` itself
+/// is trusted as far as the caller trusts it, and a tree that changes under a
+/// running repair is not defended against.
+///
 /// A set whose files are all complete is not touched at all: no temporary file
 /// is created, nothing is renamed, and the report carries the verification that
 /// was already done.

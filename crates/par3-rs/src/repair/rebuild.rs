@@ -8,8 +8,8 @@
 //! not. Neither pass holds a file: they hold one input block.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::layout::{Layout, Region};
@@ -136,6 +136,9 @@ pub(super) fn write_files(
         let target = resolve(base, file.path());
         let temporary = base.join(format!("{prefix}{index}.tmp"));
 
+        // Settled before a byte is written: a directory of the set that is a
+        // link would carry the rename somewhere the set never named.
+        refuse_linked_directories(base, file.path())?;
         build(file, &target, &temporary, layout, recovered, &mut buffer)?;
 
         // Checking the rebuild before anything is moved is what makes a failed
@@ -436,11 +439,79 @@ fn open(path: &Path) -> Result<File> {
     })
 }
 
+/// Create the temporary exclusively: the name must not be taken, in any form.
+///
+/// `File::create` would follow a link planted under the temporary's name and
+/// truncate whatever it points at, and the rebuild would then be written,
+/// checked and moved into place through that link. Exclusive creation refuses
+/// an existing entry of any kind instead. A regular file an interrupted repair
+/// left under the name is removed first, once; anything else under the name is
+/// an error, and the file it was to replace is left alone.
 fn create(path: &Path) -> Result<File> {
-    File::create(path).map_err(|source| Par3Error::FileIo {
+    let exclusive = || OpenOptions::new().write(true).create_new(true).open(path);
+    match exclusive() {
+        Ok(file) => return Ok(file),
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(io_error(path, source)),
+    }
+    let existing = std::fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if !existing.file_type().is_file() {
+        return Err(io_error(
+            path,
+            std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "the temporary name is taken by something that is not a regular file",
+            ),
+        ));
+    }
+    std::fs::remove_file(path).map_err(|source| io_error(path, source))?;
+    exclusive().map_err(|source| io_error(path, source))
+}
+
+/// Refuse a directory of the set, between `base` and the file, that is a link.
+///
+/// A file's own name is resolved by the rename, which replaces a link rather
+/// than following one; the directories above it are followed, so a link among
+/// them would carry the rebuilt file wherever the link points. Only directories
+/// the set names are looked at — `base` is the caller's.
+fn refuse_linked_directories(base: &Path, path: &str) -> Result<()> {
+    let mut directory = PathBuf::from(base);
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        directory.push(component);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io_error(
+                    &directory,
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "a directory of the set is a link, which a repair will not follow",
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error(&directory, source)),
+        }
+    }
+    Ok(())
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> Par3Error {
+    Par3Error::FileIo {
         path: path.display().to_string(),
         source,
-    })
+    }
+}
+
+/// Whether anything at all — file, directory, or a link to anywhere, dangling
+/// or not — sits under `path`. `Path::exists` follows links and calls a
+/// dangling one absent.
+fn entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn read_at(handle: &mut File, path: &Path, at: u64, into: &mut [u8]) -> Result<()> {
@@ -484,14 +555,14 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
 ///
 /// Returns `None` when there was nothing there to keep.
 fn backup_existing(target: &Path) -> Result<Option<PathBuf>> {
-    if !target.exists() {
+    if !entry_exists(target) {
         return Ok(None);
     }
     for number in 1..10_000u32 {
         let mut name = target.as_os_str().to_owned();
         name.push(format!(".{number}"));
         let candidate = PathBuf::from(name);
-        if candidate.exists() {
+        if entry_exists(&candidate) {
             continue;
         }
         rename(target, &candidate)?;

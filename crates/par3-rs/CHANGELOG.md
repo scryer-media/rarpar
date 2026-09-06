@@ -57,7 +57,11 @@ that pins all of it against the reference implementation.
   between the two fields, and `element`, one matrix element on its own.
 - `cauchy`: `CodecLimits`, in the style of `ScanLimits` and `SetLimits`, bounding
   the recovery rows, syndromes and matrix a codec allocates from numbers a
-  `.par3` file chose. `Encoder::with_limits` and `Decoder::with_limits` take one.
+  `.par3` file chose, and — since the solve is cubic in the number of lost
+  blocks, and a set of two-byte blocks can name thousands of them inside any
+  memory budget — the lost blocks one decoder will solve for
+  (`max_lost_blocks`, 4096 by default). `Encoder::with_limits` and
+  `Decoder::with_limits` take one.
 - `error`: `Par3Error::UnsupportedField`, `CodecGeometry`, `CodecBlock`,
   `InsufficientRecovery`, `SingularSystem` and `CodecLimitExceeded`, for the
   ways a field or a codec geometry can be unusable. A hostile geometry is an
@@ -113,7 +117,10 @@ that pins all of it against the reference implementation.
   nothing is deleted either — the rebuilt file is renamed over the damaged one,
   which replaces it in one step. Each rebuild is written under a temporary name,
   checked against its File packet there, and only then moved into place, so a
-  rebuild that does not check out costs nothing that was still there.
+  rebuild that does not check out costs nothing that was still there. The
+  temporary is created exclusively — a link planted under its name is refused,
+  never followed — and a set directory replaced by a link is refused before its
+  file is rebuilt.
 - `repair`: `RepairReport` and `RepairedFile`, saying what was written, where the
   damaged file was kept, whether each rebuild checked out, and how the whole set
   verified afterwards.

@@ -111,6 +111,13 @@ into place, over a backup of the damaged one (`<name>.1`, `.2`, …) unless
 its temporary name and reported, and the file it was to replace is left alone.
 Nothing is read whole into memory, at any size of file.
 
+The temporary is created exclusively, so a link planted under its name before
+the repair is refused rather than followed and truncated (a plain file left
+there by an interrupted repair is replaced), and a set directory that has been
+replaced by a link is refused before its file is rebuilt. That protects against
+what was put in place before the repair started; the base directory itself, and
+what happens to the tree while the repair is running, are the caller's.
+
 ## Trying it from a shell
 
 `examples/par3rs.rs` drives all four of those from the command line, so the API
@@ -233,6 +240,7 @@ packets can otherwise ask for a great deal of both:
 | `SetLimits::max_depth` | 256 | Directory nesting the walk follows. |
 | `SetLimits::max_path_bytes` | 64 MiB | Resolved path text, which a directory graph can expand exponentially. |
 | `CodecLimits::max_buffer_bytes` | 1 GiB | Recovery rows, syndromes and the matrix a codec holds. |
+| `CodecLimits::max_lost_blocks` | 4096 | Input blocks one decoder solves for at once; the inversion is cubic in this, and a set of tiny blocks can name thousands of them inside any memory budget. |
 | `CreateLimits::max_block_size` | 1 GiB | The block size a create will use; one block is held while it is read, and every recovery row is one block wide. |
 | `CreateLimits::max_files` | 1,000,000 | Input files one set protects. |
 | `CreateLimits::max_path_bytes` | 64 MiB | Relative path text across all inputs. |

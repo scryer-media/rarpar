@@ -583,6 +583,120 @@ fn a_set_larger_than_the_limits_allow_is_refused_before_anything_is_read() {
     );
 }
 
+#[test]
+fn more_lost_blocks_than_the_codec_will_solve_for_is_refused_and_nothing_on_disk_changes() {
+    let (tree, set) = gf8_tree("repair-lost-ceiling");
+    flip(&tree, "a.bin", 10);
+    flip(&tree, "sub/c.bin", 10);
+    let before = snapshot(tree.path());
+
+    let plan = plan_repair(&set, tree.path(), &RepairLimits::default()).expect("a plan");
+    assert_eq!(plan.lost_blocks(), [0u64, 3]);
+    assert!(plan.is_possible(), "two losses, two recovery blocks");
+
+    let limits = RepairLimits::default().with_codec(CodecLimits::default().with_max_lost_blocks(1));
+    let error = repair_set(
+        &set,
+        tree.path(),
+        &RepairOptions::default().with_limits(limits),
+    )
+    .expect_err("two lost blocks are over a ceiling of one");
+    assert!(
+        matches!(&error, Par3Error::CodecLimitExceeded { reason } if reason.contains("2 lost")),
+        "unexpected error: {error}"
+    );
+    assert_eq!(snapshot(tree.path()), before, "the tree was written to");
+    assert!(no_temp_files_left(tree.path()));
+}
+
+// ---------------------------------------------------------------------------
+// 5a. Links in the tree: what was planted before the repair is never followed
+// ---------------------------------------------------------------------------
+
+/// The temporary name a repair gives one of the set's files.
+fn temporary_name(set: &Par3Set, name: &str) -> String {
+    let index = set
+        .files()
+        .iter()
+        .position(|file| file.path() == name)
+        .expect("a file of the set");
+    let hex: String = set
+        .input_set_id()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    format!("par3_{hex}_{index}.tmp")
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_planted_under_the_temporary_name_is_refused_and_its_target_is_untouched() {
+    let (tree, set) = gf8_tree("repair-planted-link");
+    flip(&tree, "a.bin", 10);
+    // Somewhere the set never named, reachable through a link under the name
+    // the repair is about to use.
+    let victim = tree.write("elsewhere/victim.bin", b"not part of the set");
+    std::os::unix::fs::symlink(&victim, tree.path().join(temporary_name(&set, "a.bin")))
+        .expect("a link");
+    let before = snapshot(tree.path());
+
+    let error = repair_set(&set, tree.path(), &RepairOptions::default())
+        .expect_err("the temporary name is taken by a link");
+    assert!(
+        matches!(&error, Par3Error::FileIo { path, .. } if path.ends_with(".tmp")),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("the victim is still there"),
+        b"not part of the set",
+        "the link was followed"
+    );
+    assert_eq!(snapshot(tree.path()), before, "the tree was written to");
+    assert!(
+        matches!(
+            verify_file(&set, &set.files()[0], &tree.read("a.bin")),
+            FileVerdict::Damaged { .. }
+        ),
+        "the damaged file was replaced"
+    );
+}
+
+#[test]
+fn a_plain_file_left_under_the_temporary_name_by_an_interrupted_repair_is_replaced() {
+    let (tree, set) = gf8_tree("repair-stale-temporary");
+    flip(&tree, "a.bin", 10);
+    tree.write(
+        &temporary_name(&set, "a.bin"),
+        b"half of an earlier rebuild",
+    );
+    repair_and_check(&tree, &set, &gf8_contents(), &RepairOptions::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_of_the_set_that_is_a_link_is_refused_before_its_file_is_rebuilt() {
+    let (tree, set) = gf8_tree("repair-linked-directory");
+    // `sub/` now points outside the tree the set describes; the file under it
+    // reads fine through the link and is damaged.
+    let outside = tree.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("a directory");
+    std::fs::rename(tree.path().join("sub/c.bin"), outside.join("c.bin")).expect("moved");
+    std::fs::remove_dir(tree.path().join("sub")).expect("emptied");
+    std::os::unix::fs::symlink(&outside, tree.path().join("sub")).expect("a link");
+    flip(&tree, "sub/c.bin", 10);
+    let before = snapshot(tree.path());
+
+    let error = repair_set(&set, tree.path(), &RepairOptions::default())
+        .expect_err("a linked directory is refused");
+    assert!(
+        matches!(&error, Par3Error::FileIo { path, .. } if path.ends_with("sub")),
+        "unexpected error: {error}"
+    );
+    assert_eq!(snapshot(tree.path()), before, "the tree was written to");
+    assert!(no_temp_files_left(tree.path()));
+}
+
 // ---------------------------------------------------------------------------
 // 6. The streaming verify and the in-memory one agree
 // ---------------------------------------------------------------------------
