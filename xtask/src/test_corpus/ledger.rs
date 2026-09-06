@@ -121,8 +121,9 @@ pub(crate) const SUPPORTED_ENCODINGS: [&str; 3] = ["raw", "uuencode", "git-lfs"]
 /// has to name the toolchain that wrote it unless its generator is a
 /// hand-assembler (no toolchains, byte-reproducible); raw inputs (`bin`,
 /// `txt`) may legitimately come from nothing but coreutils.
-pub(crate) const TOOL_FORMATS: [&str; 10] = [
-    "rar15", "rar20", "rar4", "rar5", "rar4-rev", "rar5-rev", "sfx-rar4", "sfx-rar5", "par2", "mkv",
+pub(crate) const TOOL_FORMATS: [&str; 11] = [
+    "rar15", "rar20", "rar4", "rar5", "rar4-rev", "rar5-rev", "sfx-rar4", "sfx-rar5", "par2",
+    "par3", "mkv",
 ];
 
 /// The RAR container formats, which carry a rule of their own.
@@ -503,7 +504,8 @@ pub(crate) mod tests {
                 {"id":"rarlab-7.20","image":"i7","platform":"linux/amd64","url":"https://www.rarlab.com/rar/rarlinux-x64-720.tar.gz","blake3":"9e04f9f9749e08422705f0b2e9246609ed03d056774f7453787dc5d3466565d1","binary":"rar"}
               ],
               "video_encoder": {"id":"ffmpeg-7.1-ubuntu2404","image":"jrottenberg/ffmpeg@sha256:292a972c60356abd651d9a4f9c808c13e7473f65ad400b7eb99215f4e571931d","platform":"linux/amd64"},
-              "par2_generator": {"id":"par2cmdline-turbo-1.4.0","image":"p","platform":"linux/amd64","url":"https://example.test/p.tar.gz","blake3":"c4042f01797d7e9095ea1b0537483e4057ac621d67c51124a12fd48b8320372a"}
+              "par2_generator": {"id":"par2cmdline-turbo-1.4.0","image":"p","platform":"linux/amd64","url":"https://example.test/p.tar.gz","blake3":"c4042f01797d7e9095ea1b0537483e4057ac621d67c51124a12fd48b8320372a"},
+              "par3_generator": {"id":"par3cmdline-2971702e","image":"q","platform":"linux/amd64","url":"https://example.test/q.tar.gz","blake3":"2989f64bcfff5ca14493ffa4e68dd058ab2b88236a9e64e884ac74387a225072"}
             }"#,
         )
         .unwrap()

@@ -27,9 +27,10 @@ use super::manifest::ToolchainLock;
 use super::{LEDGER_FILE, Result, TOOLCHAINS_FILE, fail, next_string, repo_path, write_atomic};
 
 /// The two directories that hold corpus content.
-pub(crate) const FIXTURE_ROOTS: [&str; 2] = [
+pub(crate) const FIXTURE_ROOTS: [&str; 3] = [
     "crates/unrar-rs/tests/fixtures",
     "crates/par2-rs/tests/fixtures",
+    "crates/par3-rs/tests/fixtures",
 ];
 
 /// Text that lives beside the fixtures but is not corpus content: the

@@ -88,6 +88,15 @@ func (lock ToolchainLock) Validate() error {
 	if par2.ID == "" || par2.Image == "" || par2.URL == "" || par2.Platform != "linux/amd64" || !digestPattern.MatchString(par2.BLAKE3) {
 		return fmt.Errorf("PAR2 generator is not source locked for linux/amd64")
 	}
+	par3 := lock.PAR3Generator
+	if par3.ID == "" || par3.Image == "" || par3.URL == "" || par3.Platform != "linux/amd64" || !digestPattern.MatchString(par3.BLAKE3) {
+		return fmt.Errorf("PAR3 generator is not source locked for linux/amd64")
+	}
+	// Two generators sharing an id, image tag, URL or digest would be one tool
+	// under two names, exactly as for the writers.
+	if par3.ID == par2.ID || par3.Image == par2.Image || par3.URL == par2.URL || par3.BLAKE3 == par2.BLAKE3 {
+		return fmt.Errorf("PAR3 generator %q duplicates the PAR2 generator's id, image or source", par3.ID)
+	}
 	if encoder := lock.VideoEncoder; encoder.ID != "" || encoder.Image != "" {
 		// The encoder is consumed as a published image, so the digest is the
 		// only thing that makes its output reproducible; a floating tag would
@@ -156,8 +165,8 @@ func (lock ToolchainLock) Writer(id string) (RARWriter, bool) {
 // and that archive, so no image build ever reaches upstream for its tool.
 //
 // `only`, when non-empty, restricts the build to those toolchain lock ids: one
-// runner per generator has no use for the six writers and the par2 compile
-// when its recipe drives one of them. An id the lock does not declare is an
+// runner per generator has no use for the six writers and the two parity-tool
+// compiles when its recipe drives one of them. An id the lock does not declare is an
 // error, so a typo cannot quietly build nothing.
 func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLock, mirror *SourceMirror, only []string) error {
 	if err := verifyDockerfiles(root, lock.DockerBase); err != nil {
@@ -187,20 +196,34 @@ func BuildToolchains(ctx context.Context, docker, root string, lock ToolchainLoc
 		}
 	}
 	par2 := lock.PAR2Generator
-	if wanted != nil && !wanted[par2.ID] {
-		return nil
+	if wanted == nil || wanted[par2.ID] {
+		source, err := PAR2ArchiveSource(par2)
+		if err != nil {
+			return err
+		}
+		resolved, err := mirror.Resolve(ctx, source, cacheDir)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", par2.ID, err)
+		}
+		args := []string{"--platform", par2.Platform, "--tag", par2.Image}
+		if err := buildFromArchive(ctx, docker, filepath.Join(root, "docker/par2/Dockerfile"), resolved.Path, "par2.tar.gz", args); err != nil {
+			return fmt.Errorf("build %s: %w", par2.ID, err)
+		}
 	}
-	source, err := PAR2ArchiveSource(par2)
-	if err != nil {
-		return err
-	}
-	resolved, err := mirror.Resolve(ctx, source, cacheDir)
-	if err != nil {
-		return fmt.Errorf("resolve %s: %w", par2.ID, err)
-	}
-	args := []string{"--platform", par2.Platform, "--tag", par2.Image}
-	if err := buildFromArchive(ctx, docker, filepath.Join(root, "docker/par2/Dockerfile"), resolved.Path, "par2.tar.gz", args); err != nil {
-		return fmt.Errorf("build %s: %w", par2.ID, err)
+	par3 := lock.PAR3Generator
+	if wanted == nil || wanted[par3.ID] {
+		source, err := PAR3ArchiveSource(par3)
+		if err != nil {
+			return err
+		}
+		resolved, err := mirror.Resolve(ctx, source, cacheDir)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", par3.ID, err)
+		}
+		args := []string{"--platform", par3.Platform, "--tag", par3.Image}
+		if err := buildFromArchive(ctx, docker, filepath.Join(root, "docker/par3/Dockerfile"), resolved.Path, "par3.tar.gz", args); err != nil {
+			return fmt.Errorf("build %s: %w", par3.ID, err)
+		}
 	}
 	return nil
 }
@@ -212,7 +235,7 @@ func selectedToolchains(lock ToolchainLock, only []string) (map[string]bool, err
 	if len(only) == 0 {
 		return nil, nil
 	}
-	known := map[string]bool{lock.PAR2Generator.ID: true}
+	known := map[string]bool{lock.PAR2Generator.ID: true, lock.PAR3Generator.ID: true}
 	if lock.VideoEncoder.ID != "" {
 		known[lock.VideoEncoder.ID] = true
 	}
@@ -257,9 +280,10 @@ func buildFromArchive(ctx context.Context, docker, dockerfile, archive, archiveN
 var dockerfileContract = []struct{ path, staged string }{
 	{"docker/rarlab/Dockerfile", "COPY rar.tar.gz"},
 	{"docker/par2/Dockerfile", "COPY par2.tar.gz"},
+	{"docker/par3/Dockerfile", "COPY par3.tar.gz"},
 }
 
-var dockerfileForbidden = []string{"curl ", "wget ", "RAR_URL", "PAR2_URL", "RAR_SHA256", "PAR2_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3"}
+var dockerfileForbidden = []string{"curl ", "wget ", "RAR_URL", "PAR2_URL", "PAR3_URL", "RAR_SHA256", "PAR2_SHA256", "PAR3_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3", "PAR3_BLAKE3"}
 
 func verifyDockerfiles(root, base string) error {
 	for _, contract := range dockerfileContract {

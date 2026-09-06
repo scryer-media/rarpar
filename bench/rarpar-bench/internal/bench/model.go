@@ -23,6 +23,7 @@ type ToolchainLock struct {
 	// image digest.
 	VideoEncoder  VideoEncoder  `json:"video_encoder"`
 	PAR2Generator PAR2Generator `json:"par2_generator"`
+	PAR3Generator PAR3Generator `json:"par3_generator"`
 }
 
 type VideoEncoder struct {
@@ -41,6 +42,17 @@ type RARWriter struct {
 }
 
 type PAR2Generator struct {
+	ID       string `json:"id"`
+	Image    string `json:"image"`
+	Platform string `json:"platform"`
+	URL      string `json:"url"`
+	BLAKE3   string `json:"blake3"`
+}
+
+// PAR3Generator is the reference par3cmdline, pinned to one upstream commit's
+// source archive and compiled into an image the way the PAR2 generator is. It
+// writes the PAR3 fixtures and nothing else reads it.
+type PAR3Generator struct {
 	ID       string `json:"id"`
 	Image    string `json:"image"`
 	Platform string `json:"platform"`

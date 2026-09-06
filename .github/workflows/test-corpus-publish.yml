@@ -267,9 +267,10 @@ jobs:
           retention-days: 1
 
   # One runner per stage-1 generator. Each builds only the images its own recipe
-  # drives — three of the seven, and the par2cmdline-turbo compile only for the
-  # three units that need it — and uploads only the fixtures the ledger says it
-  # owns, so every ledger path is carried by exactly one artifact.
+  # drives — three of the seven, and the par2cmdline-turbo and par3cmdline
+  # compiles only for the units that need them — and uploads only the fixtures
+  # the ledger says it owns, so every ledger path is carried by exactly one
+  # artifact.
   generate:
     name: generate (${{ matrix.group }})
     needs: [plan, generate-inputs]

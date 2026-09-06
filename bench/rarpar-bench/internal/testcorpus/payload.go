@@ -326,6 +326,22 @@ func (e *env) par2Run(ctx context.Context, host, sub string, args ...string) err
 	return runDocker(ctx, e, command...)
 }
 
+// par3 runs the pinned par3cmdline image, whose ENTRYPOINT is `par3`. The host
+// directory is mounted at /work like the other tools'; the reference's base
+// path (-B) and output name are paths under that mount, never host paths.
+func (e *env) par3Run(ctx context.Context, host, sub string, args ...string) error {
+	work := "/work"
+	if sub != "" {
+		work = "/work/" + sub
+	}
+	command := []string{
+		"run", "--rm", "--platform", "linux/amd64",
+		"-v", host + ":/work", "-w", work, e.par3Image,
+	}
+	command = append(command, args...)
+	return runDocker(ctx, e, command...)
+}
+
 func runDocker(ctx context.Context, e *env, args ...string) error {
 	command := exec.CommandContext(ctx, e.docker, args...)
 	command.Stdout = io.Discard

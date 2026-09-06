@@ -124,7 +124,7 @@ func runToolchains(ctx context.Context, args []string) error {
 	case "build":
 		// One image build per generator that needs it: a runner producing a
 		// single unit has no use for the writers its recipe never invokes, and
-		// the par2cmdline-turbo image is a compile.
+		// the par2cmdline-turbo and par3cmdline images are compiles.
 		var onlyIDs []string
 		if len(onlyImagesFor) > 0 {
 			onlyIDs, err = testcorpus.ToolchainIDsForUnits(lock, onlyImagesFor)

@@ -62,5 +62,12 @@
     "platform": "linux/amd64",
     "url": "https://github.com/animetosho/par2cmdline-turbo/archive/refs/tags/v1.4.0.tar.gz",
     "blake3": "c4042f01797d7e9095ea1b0537483e4057ac621d67c51124a12fd48b8320372a"
+  },
+  "par3_generator": {
+    "id": "par3cmdline-2971702e",
+    "image": "rarpar-bench-par3:2971702e",
+    "platform": "linux/amd64",
+    "url": "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz",
+    "blake3": "2989f64bcfff5ca14493ffa4e68dd058ab2b88236a9e64e884ac74387a225072"
   }
 }

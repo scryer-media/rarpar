@@ -28,6 +28,8 @@
 /crates/par2-rs/tests/fixtures/**/*.par2
 /crates/par2-rs/tests/fixtures/par2cmdline-turbo/**/*.tar.gz
 /crates/par2-rs/tests/fixtures/source/*.mkv
+/crates/par3-rs/tests/fixtures/**/*.par3
+/crates/par3-rs/tests/fixtures/**/*.bin
 # Hydration scratch: `xtask test-corpus` writes through sibling temp files and
 # renames them into place; a crash can leave one behind.
 /crates/*/tests/fixtures/**/.*.tmp

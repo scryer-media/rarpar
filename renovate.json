@@ -30,7 +30,7 @@
       "pinDigests": false
     },
     {
-      "description": "The generator toolchain is frozen: the RARLAB writers, the FFmpeg encoder image and the par2cmdline-turbo generator in config/toolchains.json, and the Docker bases the toolchain images build from, are pinned deliberately. Changing any of them is an intentional corpus revision (docs/test-corpus.md), never a dependency update.",
+      "description": "The generator toolchain is frozen: the RARLAB writers, the FFmpeg encoder image and the par2cmdline-turbo and par3cmdline generators in config/toolchains.json, and the Docker bases the toolchain images build from, are pinned deliberately. Changing any of them is an intentional corpus revision (docs/test-corpus.md), never a dependency update.",
       "matchFileNames": [
         "bench/rarpar-bench/config/toolchains.json",
         "bench/rarpar-bench/docker/**"

@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 keywords = ["par3", "parchive", "parity", "erasure", "verification"]
 categories = ["parser-implementations", "filesystem"]
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 blake3 = { workspace = true }

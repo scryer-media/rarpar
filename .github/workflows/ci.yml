@@ -549,10 +549,13 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  # par3-rs has no corpus to hydrate and no C dependency beyond blake3's own
-  # build script, so its lane is the plain cargo run: lib, integration tests
-  # (reference-generated vectors embedded as hex) and doctests, once, only
-  # when the crate is affected.
+  # par3-rs has no C dependency beyond blake3's own build script, so its lane
+  # is the plain cargo run: lib, integration tests (reference-generated
+  # vectors embedded as hex) and doctests, once, only when the crate is
+  # affected. Its corpus profile (`par3`, the reference-written sets under
+  # crates/par3-rs/tests/fixtures) is ledgered but pending first publication;
+  # the lane hydrates it once a revision carrying it is pinned and tests that
+  # read it exist.
   par3-tests:
     name: par3-tests
     needs: [changes, fmt, clippy, unit-tests]
