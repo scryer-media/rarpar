@@ -1,12 +1,12 @@
 //! `test-corpus build | verify | fetch | publish`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::http::{self, Download};
-use super::ledger::{Finding, Ledger};
+use super::ledger::{Finding, Ledger, Source};
 use super::lock::Lock;
 use super::manifest::{Manifest, Provenance, ToolchainLock};
 use super::profiles::ProfilesFile;
@@ -14,7 +14,7 @@ use super::sigstore;
 use super::sigv4::S3Credentials;
 use super::{
     LEDGER_FILE, LOCK_FILE, MANIFESTS_PREFIX, OBJECTS_PREFIX, PROFILES_FILE, Result,
-    TOOLCHAINS_FILE, blake3_bytes, digest_file, fail, next_path, next_string, repo_path,
+    TOOLCHAINS_FILE, blake3_bytes, digest_file, fail, glob, next_path, next_string, repo_path,
     write_atomic,
 };
 
@@ -74,9 +74,10 @@ Usage:
       Check ledger vs tree, recompute the manifest and compare it to the lock,
       verify the published manifest's Sigstore bundle (with cosign), and with
       --upstreams re-fetch every public upstream import at its pinned commit.
-      Ledger paths the pinned manifest does not carry are *pending first
-      publication* and are exempt until a revision containing them is
-      published. --candidate validates an unpublished revision (what the
+      What the tree declares and the pinned manifest does not carry — ledger
+      paths, and the generators, profiles and toolchain lock entries nothing
+      published depends on — is *pending first publication* and exempt until
+      a revision containing it is published. --candidate validates an unpublished revision (what the
       publish workflow assembles): the tree must be exactly the ledger, and
       the previous revision's lock is not compared against.
   cargo run -p xtask -- test-corpus fetch --profile NAME [--profile NAME]... [--check] [--parallel N]
@@ -208,6 +209,221 @@ struct Inputs {
     lock_blake3: String,
 }
 
+/// What the tree declares that the pinned manifest does not carry — and by
+/// definition cannot, since the manifest describes the published revision.
+/// A fixture-adding PR ledgers the fixture, the generator that writes it, the
+/// profile (or the include pattern) that selects it and the toolchain lock
+/// entry it needs; none of those exist published until the next revision
+/// is. Each is exempt from the comparison on one condition: nothing already
+/// published depends on it. A published path attributed to an unpublished
+/// generator or toolchain, or selected by an unpublished profile, is a real
+/// inconsistency rather than a fixture in flight, and stays a problem.
+#[derive(Default)]
+struct Pending {
+    paths: BTreeSet<String>,
+    generators: BTreeSet<String>,
+    profiles: BTreeSet<String>,
+    toolchains: BTreeSet<String>,
+    /// The lock digest the published manifest recorded. Substituted into the
+    /// comparison manifest only when the lock gained pending entries, since
+    /// any such gain moves the digest; the pinned sources the manifest
+    /// carries still catch an existing entry that changed underneath it.
+    published_lock_blake3: Option<String>,
+}
+
+impl Pending {
+    fn against(inputs: &Inputs, published: &Manifest, problems: &mut Vec<String>) -> Self {
+        let published_paths: BTreeSet<&str> = published
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        let mut pending = Pending::default();
+        for entry in &inputs.ledger.files {
+            if !published_paths.contains(entry.path.as_str()) {
+                pending.paths.insert(entry.path.clone());
+            }
+        }
+        for name in inputs.ledger.generators.keys() {
+            if !published.generators.contains_key(name) {
+                pending.generators.insert(name.clone());
+            }
+        }
+        for name in inputs.profiles.profiles.keys() {
+            if !published.profiles.contains_key(name) {
+                pending.profiles.insert(name.clone());
+            }
+        }
+        let published_toolchains = published.toolchains.ids();
+        for id in inputs.lock.ids() {
+            if !published_toolchains.contains(&id) {
+                pending.toolchains.insert(id);
+            }
+        }
+        if !pending.toolchains.is_empty() {
+            pending.published_lock_blake3 = Some(published.toolchains.lock_blake3.clone());
+        }
+
+        // Nothing published may depend on anything pending.
+        for entry in &inputs.ledger.files {
+            if pending.paths.contains(&entry.path) {
+                continue;
+            }
+            if let Source::Generated {
+                generator,
+                toolchains,
+                ..
+            } = &entry.source
+            {
+                if pending.generators.contains(generator) {
+                    problems.push(format!(
+                        "{}: published path names generator {generator:?}, which the pinned \
+                         manifest does not carry",
+                        entry.path
+                    ));
+                }
+                for id in toolchains {
+                    if pending.toolchains.contains(id) {
+                        problems.push(format!(
+                            "{}: published path names toolchain {id:?}, which the pinned \
+                             manifest does not carry",
+                            entry.path
+                        ));
+                    }
+                }
+            }
+        }
+        for (name, generator) in &inputs.ledger.generators {
+            if pending.generators.contains(name) {
+                continue;
+            }
+            for id in &generator.toolchains {
+                if pending.toolchains.contains(id) {
+                    problems.push(format!(
+                        "generator {name}: published generator names toolchain {id:?}, which \
+                         the pinned manifest does not carry"
+                    ));
+                }
+            }
+        }
+        for name in &pending.profiles {
+            let selected = pending.published_members(inputs, &inputs.profiles.profiles[name]);
+            if !selected.is_empty() {
+                problems.push(format!(
+                    "profile {name}: not in the pinned manifest, yet selects {} published path(s) \
+                     ({}, ...)",
+                    selected.len(),
+                    selected[0]
+                ));
+            }
+        }
+        pending
+    }
+
+    /// The published (non-pending) ledger paths a profile's include patterns
+    /// select, before its excludes.
+    fn published_members(
+        &self,
+        inputs: &Inputs,
+        profile: &super::profiles::Profile,
+    ) -> Vec<String> {
+        inputs
+            .ledger
+            .files
+            .iter()
+            .filter(|entry| !self.paths.contains(&entry.path))
+            .filter(|entry| {
+                profile
+                    .include
+                    .iter()
+                    .any(|pattern| glob::matches(pattern, &entry.path))
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+            && self.generators.is_empty()
+            && self.profiles.is_empty()
+            && self.toolchains.is_empty()
+    }
+
+    /// The manifest the tree recomputes with everything pending left out: the
+    /// published revision's ledger, generators, profiles and lock, as far as
+    /// this tree still agrees with them. A published profile keeps only the
+    /// include patterns that select a published path — a pattern added for a
+    /// pending fixture root matches nothing published and would otherwise
+    /// fail resolution against the reduced ledger.
+    fn comparison_manifest(&self, inputs: &Inputs) -> Result<Manifest> {
+        let mut ledger = inputs.ledger.clone();
+        ledger
+            .files
+            .retain(|entry| !self.paths.contains(&entry.path));
+        ledger
+            .generators
+            .retain(|name, _| !self.generators.contains(name));
+        let mut profiles = inputs.profiles.clone();
+        profiles
+            .profiles
+            .retain(|name, _| !self.profiles.contains(name));
+        if !self.paths.is_empty() {
+            for profile in profiles.profiles.values_mut() {
+                let published: Vec<String> = profile
+                    .include
+                    .iter()
+                    .filter(|pattern| {
+                        ledger
+                            .files
+                            .iter()
+                            .any(|entry| glob::matches(pattern, &entry.path))
+                    })
+                    .cloned()
+                    .collect();
+                if !published.is_empty() {
+                    profile.include = published;
+                }
+            }
+        }
+        let mut manifest = Manifest::build(&ledger, &profiles, &inputs.lock, &inputs.lock_blake3)?;
+        let toolchains = &mut manifest.toolchains;
+        toolchains
+            .rar_writers
+            .retain(|id, _| !self.toolchains.contains(id));
+        if toolchains
+            .par3_generator
+            .as_ref()
+            .is_some_and(|par3| self.toolchains.contains(&par3.id))
+        {
+            toolchains.par3_generator = None;
+        }
+        if let Some(lock_blake3) = &self.published_lock_blake3 {
+            toolchains.lock_blake3 = lock_blake3.clone();
+        }
+        Ok(manifest)
+    }
+
+    fn report(&self) {
+        if self.is_empty() {
+            return;
+        }
+        println!(
+            "test-corpus: pending first publication (absent from the pinned manifest; becomes \
+             authoritative when the next revision is published):"
+        );
+        for (what, names) in [
+            ("path", &self.paths),
+            ("generator", &self.generators),
+            ("profile", &self.profiles),
+            ("toolchain", &self.toolchains),
+        ] {
+            for name in names {
+                println!("  {what} {name}");
+            }
+        }
+    }
+}
+
 fn load_inputs(root: &Path) -> Result<Inputs> {
     let (lock, lock_blake3) = ToolchainLock::load(&repo_path(root, TOOLCHAINS_FILE))?;
     let ledger = Ledger::load(&repo_path(root, LEDGER_FILE))?;
@@ -328,34 +544,32 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
     let lock = Lock::load(&repo_path(root, LOCK_FILE))?;
     let mut problems: Vec<String> = Vec::new();
 
-    // Ledger paths the pinned manifest does not carry are *pending first
-    // publication*: a fixture is added by ledgering it and then publishing a
-    // revision that contains it, and between those two events the entry can
-    // be hydrated from nowhere and its recorded digest is not yet
-    // authoritative (the publish run refreshes it from the produced bytes).
-    // Such paths are exempt from presence and digest checks, and excluded
+    // What the tree declares and the pinned manifest does not carry is
+    // *pending first publication*: a fixture is added by ledgering it — with
+    // the generator that writes it, the profile that selects it and the
+    // toolchain lock entry it needs — and then publishing a revision that
+    // contains it. Between those two events the entry can be hydrated from
+    // nowhere and its recorded digest is not yet authoritative (the publish
+    // run refreshes it from the produced bytes). Pending paths are exempt
+    // from presence and digest checks, and everything pending is excluded
     // from the manifest recomputed for the lock comparison — the pinned
     // manifest describes the published revision, which by definition does
     // not have them. A candidate revision gets no such grace: its tree must
-    // be exactly its ledger. Offline the published path set is unknowable,
+    // be exactly its ledger. Offline the published manifest is unknowable,
     // so nothing is pending and the strict comparison stands.
-    let mut pending: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pending = Pending::default();
     let mut published_manifest: Option<Vec<u8>> = None;
     if !candidate && !offline && !lock.is_unpublished() {
         match http::get_to_vec(&lock.manifest.url) {
             Err(err) => problems.push(format!("published manifest unavailable: {err}")),
             Ok(bytes) => {
-                match published_manifest_paths(&bytes) {
+                match Manifest::parse(&bytes) {
                     Err(err) => problems.push(format!(
                         "published manifest at {} is unreadable: {err}",
                         lock.manifest.url
                     )),
-                    Ok(published_paths) => {
-                        for entry in &inputs.ledger.files {
-                            if !published_paths.contains(&entry.path) {
-                                pending.insert(entry.path.clone());
-                            }
-                        }
+                    Ok(published) => {
+                        pending = Pending::against(&inputs, &published, &mut problems);
                     }
                 }
                 published_manifest = Some(bytes);
@@ -367,7 +581,7 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
     problems.extend(
         findings
             .iter()
-            .filter(|finding| !pending.contains(&finding.path))
+            .filter(|finding| !pending.paths.contains(&finding.path))
             .map(ToString::to_string),
     );
     let blocked = inputs.ledger.blocked();
@@ -402,36 +616,14 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
         ));
     }
     // The recompute-vs-lock comparison holds the *published* subset to the
-    // pinned manifest: pending paths cannot be in it by definition, so they
-    // are left out of the recomputed manifest for this comparison only. With
+    // pinned manifest: what is pending cannot be in it by definition, so it
+    // is left out of the recomputed manifest for this comparison only. With
     // nothing pending the reduction is the identity.
-    let manifest_ledger = if pending.is_empty() {
-        inputs.ledger.clone()
-    } else {
-        let mut reduced = inputs.ledger.clone();
-        reduced.files.retain(|entry| !pending.contains(&entry.path));
-        reduced
-    };
-    let manifest = Manifest::build(
-        &manifest_ledger,
-        &inputs.profiles,
-        &inputs.lock,
-        &inputs.lock_blake3,
-    )?;
+    let manifest = pending.comparison_manifest(&inputs)?;
     let bytes = manifest.canonical_bytes()?;
     let digest = blake3_bytes(&bytes);
     println!("test-corpus: manifest recomputed from the tree: {digest}");
-    if !pending.is_empty() {
-        println!(
-            "test-corpus: {} ledger path(s) pending first publication (absent from the pinned \
-             manifest); their recorded digests become authoritative when the next revision is \
-             published:",
-            pending.len()
-        );
-        for path in &pending {
-            println!("  {path}");
-        }
-    }
+    pending.report();
 
     if candidate {
         // A candidate revision is what the publish workflow's assemble job
@@ -513,27 +705,6 @@ fn verify(root: &Path, args: Vec<OsString>) -> Result<()> {
         problems.len(),
         problems.join("\n  ")
     ))
-}
-
-/// The path set a published manifest describes. Parsed structurally rather
-/// than through `Manifest` so a schema field this xtask does not know yet
-/// cannot make an otherwise-usable manifest unreadable.
-fn published_manifest_paths(bytes: &[u8]) -> Result<std::collections::BTreeSet<String>> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|err| super::error(format!("{err}")))?;
-    let files = value
-        .get("files")
-        .and_then(|files| files.as_array())
-        .ok_or_else(|| super::error("manifest has no files array"))?;
-    let mut paths = std::collections::BTreeSet::new();
-    for file in files {
-        let path = file
-            .get("path")
-            .and_then(|path| path.as_str())
-            .ok_or_else(|| super::error("manifest file entry has no path"))?;
-        paths.insert(path.to_owned());
-    }
-    Ok(paths)
 }
 
 /// Verify the pinned manifest's Sigstore bundle with cosign: exact workflow
@@ -1372,6 +1543,124 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing from the tree"), "{err}");
+        unsafe { std::env::remove_var(ALLOW_PLAIN_HTTP_ENV) };
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The same window exists for what *writes* and *selects* a pending
+    /// fixture: the generator, the profile, the include pattern and the
+    /// toolchain lock entry a fixture-adding PR introduces cannot be in the
+    /// pinned manifest either. They are pending on the one condition that
+    /// nothing already published depends on them.
+    #[test]
+    fn a_generator_profile_and_toolchain_pending_first_publication_are_tolerated() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = scaffold("pending-tables");
+        for (path, bytes) in [
+            (
+                "crates/unrar-rs/tests/fixtures/rar5/a.rar",
+                &b"alpha-bytes"[..],
+            ),
+            (
+                "crates/unrar-rs/tests/fixtures/rar5/a-twin.rar",
+                &b"alpha-bytes"[..],
+            ),
+            ("crates/par2-rs/tests/fixtures/b.par2", &b"beta-bytes"[..]),
+        ] {
+            write_atomic(&repo_path(&root, path), bytes).unwrap();
+        }
+        // The published manifest is an older revision's: from before the lock
+        // carried a PAR3 generator, and with the lock digest of that time.
+        let (lock, _) = ToolchainLock::load(&repo_path(&root, TOOLCHAINS_FILE)).unwrap();
+        let par3 = lock.par3_generator.id.clone();
+        let (current_bytes, _) = manifest_for(&root);
+        let mut published = Manifest::parse(&current_bytes).unwrap();
+        assert!(published.toolchains.par3_generator.is_some());
+        published.toolchains.par3_generator = None;
+        published.toolchains.lock_blake3 = blake3_bytes(b"the lock as it was");
+        let manifest_bytes = published.canonical_bytes().unwrap();
+        let manifest_blake3 = blake3_bytes(&manifest_bytes);
+        let manifest_key = format!("/{MANIFESTS_PREFIX}{manifest_blake3}.json");
+        let routes: Vec<crate::test_corpus::http::tests::Route> = vec![(
+            ("GET", Box::leak(manifest_key.into_boxed_str())),
+            (200, manifest_bytes.clone()),
+        )];
+        let server = FakeServer::start(routes);
+        unsafe { std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1") };
+        let lock = Lock::published(
+            &server.base_url,
+            &manifest_blake3,
+            &blake3_bytes(b"provenance"),
+            "0123456789abcdef0123456789abcdef01234567",
+            "https://github.com/scryer-media/rarpar/actions/runs/1",
+        );
+        fs::write(root.join(LOCK_FILE), lock.render().unwrap()).unwrap();
+
+        // The ledger gains a generator on the PAR3 toolchain and a path it
+        // writes; the profiles gain one that selects it, and the published
+        // `par2` profile gains an include pattern reaching the same root.
+        let ledger_text = fs::read_to_string(root.join(LEDGER_FILE)).unwrap();
+        let with_pending = ledger_text
+            .replace(
+                r#""generators":{"gen.sh":"#,
+                &format!(
+                    r#""generators":{{"par3.sh":{{"path":"gen/gen.sh","toolchains":["{par3}"],"byte_reproducible":false}},"gen.sh":"#
+                ),
+            )
+            .replace(
+                r#"{"path":"crates/unrar-rs/tests/fixtures/rar5/a.rar""#,
+                &format!(
+                    r#"{{"path":"crates/par3-rs/tests/fixtures/PENDING.par3","size":0,"blake3":"{}","format":"par3","source":{{"kind":"generated","generator":"par3.sh","toolchains":["{par3}"]}}}},
+                 {{"path":"crates/unrar-rs/tests/fixtures/rar5/a.rar""#,
+                    "0".repeat(64)
+                ),
+            );
+        assert_ne!(with_pending, ledger_text);
+        fs::write(root.join(LEDGER_FILE), &with_pending).unwrap();
+        fs::write(
+            root.join(PROFILES_FILE),
+            r#"{"schema_version":1,"profiles":{
+                "unrar":{"include":["crates/unrar-rs/tests/fixtures/**"]},
+                "par2":{"include":["crates/par2-rs/tests/fixtures/**","crates/par3-rs/tests/fixtures/**"]},
+                "par3":{"include":["crates/par3-rs/tests/fixtures/**"]}}}"#,
+        )
+        .unwrap();
+        verify(&root, arguments(&["--all-present"])).unwrap();
+
+        // A published path re-attributed to the pending generator and
+        // toolchain is not a fixture in flight: it fails.
+        let reattributed = {
+            let marker = r#"{"path":"crates/par2-rs/tests/fixtures/b.par2""#;
+            let at = with_pending.find(marker).unwrap();
+            let tail = &with_pending[at..];
+            let fixed = tail.replacen(
+                r#""generator":"gen.sh","toolchains":["rarlab-7.20"]"#,
+                &format!(r#""generator":"par3.sh","toolchains":["{par3}"]"#),
+                1,
+            );
+            assert_ne!(fixed, tail);
+            format!("{}{fixed}", &with_pending[..at])
+        };
+        fs::write(root.join(LEDGER_FILE), reattributed).unwrap();
+        let err = verify(&root, arguments(&["--all-present"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pinned manifest does not carry"), "{err}");
+        fs::write(root.join(LEDGER_FILE), &with_pending).unwrap();
+
+        // Nor is a pending profile that selects a published path.
+        fs::write(
+            root.join(PROFILES_FILE),
+            r#"{"schema_version":1,"profiles":{
+                "unrar":{"include":["crates/unrar-rs/tests/fixtures/**"]},
+                "par2":{"include":["crates/par2-rs/tests/fixtures/**"]},
+                "par3":{"include":["crates/par3-rs/tests/fixtures/**","crates/par2-rs/tests/fixtures/**"]}}}"#,
+        )
+        .unwrap();
+        let err = verify(&root, arguments(&["--all-present"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("yet selects"), "{err}");
         unsafe { std::env::remove_var(ALLOW_PLAIN_HTTP_ENV) };
         let _ = fs::remove_dir_all(root);
     }

@@ -39,6 +39,12 @@
         "crates/par2-rs/tests/fixtures/**"
       ]
     },
+    "par3": {
+      "description": "Every par3-rs fixture: the reference-written PAR3 sets and their inputs (the par3-tests lane, once a revision carrying them is published).",
+      "include": [
+        "crates/par3-rs/tests/fixtures/**"
+      ]
+    },
     "wasm-unrar": {
       "description": "Exactly the fixture families the wasm UnRAR harness (examples/wasm_extract_check) opens \u2014 ~169 MiB instead of the whole unrar profile. If the harness gains a case, add its family here or the missing file fails the lane loudly.",
       "include": [
@@ -108,7 +114,8 @@
       "description": "The whole corpus (publish-crates, and anyone who wants everything).",
       "include": [
         "crates/unrar-rs/tests/fixtures/**",
-        "crates/par2-rs/tests/fixtures/**"
+        "crates/par2-rs/tests/fixtures/**",
+        "crates/par3-rs/tests/fixtures/**"
       ]
     }
   }

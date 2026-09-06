@@ -1021,8 +1021,8 @@ func TestResolveToolchainSourcesCoversTheWholeLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != len(lock.RARWriters)+1 {
-		t.Fatalf("resolved %d archives, want %d", len(lines), len(lock.RARWriters)+1)
+	if len(lines) != len(lock.RARWriters)+2 {
+		t.Fatalf("resolved %d archives, want %d", len(lines), len(lock.RARWriters)+2)
 	}
 	for _, line := range lines {
 		fields := strings.Fields(line)
@@ -1032,6 +1032,9 @@ func TestResolveToolchainSourcesCoversTheWholeLock(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), ArchiveKindPAR2) {
 		t.Fatalf("the PAR2 generator source is missing from %q", out.String())
+	}
+	if !strings.Contains(out.String(), ArchiveKindPAR3) {
+		t.Fatalf("the PAR3 generator source is missing from %q", out.String())
 	}
 	if got := fixture.officialHits(); got != 0 {
 		t.Fatalf("official upstreams were contacted %d times for a fully mirrored lock", got)
@@ -1062,6 +1065,13 @@ func mirroredToolchainLock(t *testing.T, fixture *mirrorFixture) ToolchainLock {
 		t.Fatal(err)
 	}
 	fixture.mirrorObjects(source, archive, nil)
+	par3Archive := []byte("archive for " + lock.PAR3Generator.ID)
+	lock.PAR3Generator.BLAKE3 = bytesBLAKE3(par3Archive)
+	par3Source, err := PAR3ArchiveSource(lock.PAR3Generator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mirrorObjects(par3Source, par3Archive, nil)
 	return lock
 }
 
@@ -1093,7 +1103,7 @@ cp -R "$context" "$directory/context"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(builds) != len(lock.RARWriters)+1 {
+	if len(builds) != len(lock.RARWriters)+2 {
 		t.Fatalf("%d builds recorded, want one per locked tool", len(builds))
 	}
 	for index, writer := range lock.RARWriters {
@@ -1109,6 +1119,13 @@ cp -R "$context" "$directory/context"
 	argv := readArgv(t, filepath.Join(par2Directory, "argv"))
 	assertNoUpstreamArguments(t, lock.PAR2Generator.ID, argv)
 	assertStagedContext(t, lock.PAR2Generator.ID, filepath.Join(par2Directory, "context"), "par2.tar.gz", lock.PAR2Generator.BLAKE3)
+	par3Directory := filepath.Join(record, fmt.Sprintf("build-%d", len(lock.RARWriters)+1))
+	argv = readArgv(t, filepath.Join(par3Directory, "argv"))
+	assertNoUpstreamArguments(t, lock.PAR3Generator.ID, argv)
+	if !argvHasPair(argv, "--tag", lock.PAR3Generator.Image) {
+		t.Errorf("%s: build is not tagged %s: %v", lock.PAR3Generator.ID, lock.PAR3Generator.Image, argv)
+	}
+	assertStagedContext(t, lock.PAR3Generator.ID, filepath.Join(par3Directory, "context"), "par3.tar.gz", lock.PAR3Generator.BLAKE3)
 }
 
 // One runner per generator builds one generator's images. The subset is the
@@ -1172,7 +1189,7 @@ func argvHasPair(argv []string, flag, value string) bool {
 func assertNoUpstreamArguments(t *testing.T, id string, argv []string) {
 	t.Helper()
 	for _, argument := range argv {
-		for _, forbidden := range []string{"RAR_URL", "RAR_SHA256", "PAR2_URL", "PAR2_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3"} {
+		for _, forbidden := range []string{"RAR_URL", "RAR_SHA256", "PAR2_URL", "PAR2_SHA256", "PAR3_URL", "PAR3_SHA256", "RAR_BLAKE3", "PAR2_BLAKE3", "PAR3_BLAKE3"} {
 			if strings.Contains(argument, forbidden) {
 				t.Errorf("%s: build still passes %s (%q)", id, forbidden, argument)
 			}

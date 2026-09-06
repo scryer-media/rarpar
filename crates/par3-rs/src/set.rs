@@ -24,12 +24,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::{Par3Error, Result};
-use crate::hash::Fingerprint;
+use crate::hash::{Fingerprint, FingerprintHasher, RollingHasher};
 use crate::packet::{
     BlockChecksum, ChunkDescription, ChunkTail, DataPacket, DirectoryPacket, FilePacket,
     GaloisField, InputSetId, Packet, PacketBody, PacketType, ParseContext, RecoveryDataPacket,
     RecoveryExternalDataPacket, RootPacket, StartPacket,
 };
+use crate::scan::ScanLimits;
 
 /// Bounds on resolving one set's directory tree.
 ///
@@ -170,6 +171,104 @@ impl Par3Directory {
     }
 }
 
+/// One recovery block a set holds, from a Recovery Data packet that names the
+/// set's own Root packet.
+///
+/// A Recovery Data packet is only meaningful together with the Root packet whose
+/// input blocks it covers and the Matrix packet whose row produced it, so the
+/// inventory records whether that Matrix packet is present. Nothing is computed
+/// from the block; this says what recovery data exists, not how to use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryBlock {
+    index: u64,
+    matrix_hash: Fingerprint,
+    matrix_present: bool,
+    packet: RecoveryDataPacket,
+}
+
+impl RecoveryBlock {
+    /// The recovery block's index, which selects the matrix row it came from.
+    #[must_use]
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Hash of the Matrix packet whose row produced this block.
+    #[must_use]
+    pub fn matrix_hash(&self) -> Fingerprint {
+        self.matrix_hash
+    }
+
+    /// Whether that Matrix packet is among the Matrix packets this crate
+    /// recognises in the set.
+    ///
+    /// A recovery block whose matrix is missing cannot be interpreted, even
+    /// though its bytes are intact. The check only sees the Matrix packets the
+    /// crate parses — Cauchy, Sparse Random, Explicit and FFT — so a matrix of
+    /// some type this crate does not know is reported absent even when its
+    /// packet is sitting in the same file.
+    #[must_use]
+    pub fn matrix_present(&self) -> bool {
+        self.matrix_present
+    }
+
+    /// The recovery block's stored bytes.
+    ///
+    /// Shorter than the set's block size when the writer trimmed trailing
+    /// zeros; the reference implementation always writes a full block.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.packet.data
+    }
+
+    /// How many bytes the packet stores for this block.
+    #[must_use]
+    pub fn data_len(&self) -> usize {
+        self.packet.data.len()
+    }
+
+    /// The Recovery Data packet this block came from.
+    #[must_use]
+    pub fn packet(&self) -> &RecoveryDataPacket {
+        &self.packet
+    }
+
+    /// Whether the block matches a checksum from a Recovery External Data
+    /// packet.
+    ///
+    /// Those checksums cover the block zero-padded to `block_size`, the same way
+    /// input block checksums do, so the padding is hashed here rather than
+    /// materialised. A block whose stored data is longer than `block_size`
+    /// belongs to some other set's geometry and never matches.
+    ///
+    /// The cost is proportional to `block_size`, not to the stored data, because
+    /// the padding still has to be hashed. `block_size` comes from a Start
+    /// packet and is only as trustworthy as the file it was read from, so a
+    /// `block_size` above [`ScanLimits::DEFAULT_MAX_PACKET_LEN`] returns `false`
+    /// without hashing anything: a block that large could never have come out of
+    /// a packet this crate reads with the default limits, and hashing towards
+    /// `u64::MAX` would not finish.
+    #[must_use]
+    pub fn matches_checksum(&self, checksum: &BlockChecksum, block_size: u64) -> bool {
+        if block_size > ScanLimits::DEFAULT_MAX_PACKET_LEN {
+            return false;
+        }
+        let Some(padding) = block_size.checked_sub(self.data_len() as u64) else {
+            return false;
+        };
+        let mut rolling = RollingHasher::new();
+        rolling.update(self.data());
+        rolling.update_zeros(padding);
+        if rolling.finalize() != checksum.rolling_hash {
+            return false;
+        }
+        let mut fingerprint = FingerprintHasher::new();
+        fingerprint.update(self.data());
+        fingerprint.update_zeros(padding);
+        fingerprint.finalize() == checksum.fingerprint
+    }
+}
+
 /// One PAR3 input set: everything that shares an InputSetID.
 ///
 /// # What a set does not tell you
@@ -189,8 +288,11 @@ pub struct Par3Set {
     directories: Vec<Par3Directory>,
     block_checksums: BTreeMap<u64, BlockChecksum>,
     matrix_packets: Vec<Packet>,
-    recovery_packets: Vec<RecoveryDataPacket>,
+    recovery_blocks: Vec<RecoveryBlock>,
+    foreign_recovery_packets: Vec<RecoveryDataPacket>,
+    conflicting_recovery_packets: usize,
     recovery_external_data: Vec<RecoveryExternalDataPacket>,
+    recovery_block_checksums: BTreeMap<(Fingerprint, u64), BlockChecksum>,
     data_packets: Vec<DataPacket>,
     creator_texts: Vec<String>,
     comments: Vec<String>,
@@ -359,6 +461,54 @@ impl Par3Set {
         let (root_hash, root) = root.ok_or(Par3Error::MissingRootPacket { input_set_id })?;
         let block_count = root.lowest_unused_block_index;
 
+        // Recovery data can only be placed once the Root packet is known, so the
+        // inventory is built here rather than in the loop above. It takes
+        // ownership of the packets instead of adding a second copy of each: a
+        // recovery block is as large as an input block, and a set can hold
+        // thousands of them.
+        let matrix_hashes: HashSet<Fingerprint> = matrix_packets.iter().map(Packet::hash).collect();
+        let mut recovery_blocks = Vec::new();
+        let mut foreign_recovery_packets = Vec::new();
+        for packet in recovery_packets {
+            if packet.root_hash != root_hash {
+                tracing::debug!(
+                    index = packet.recovery_block_index,
+                    "PAR3 recovery block names another set's Root packet"
+                );
+                foreign_recovery_packets.push(packet);
+                continue;
+            }
+            recovery_blocks.push(RecoveryBlock {
+                index: packet.recovery_block_index,
+                matrix_hash: packet.matrix_hash,
+                matrix_present: matrix_hashes.contains(&packet.matrix_hash),
+                packet,
+            });
+        }
+        // An index only means something against the matrix it selects a row of,
+        // so two matrices in one set may each have a block 0. Sorting by index
+        // first keeps the inventory in the order a caller expects to read it.
+        recovery_blocks.sort_by_key(|block| (block.index, block.matrix_hash));
+        let conflicting_recovery_packets =
+            drop_conflicting_recovery_blocks(&mut recovery_blocks, input_set_id);
+
+        let mut recovery_block_checksums: BTreeMap<(Fingerprint, u64), BlockChecksum> =
+            BTreeMap::new();
+        for external in &recovery_external_data {
+            if external.root_hash != root_hash {
+                continue;
+            }
+            let first = external.first_recovery_block_index;
+            for (step, checksum) in external.checksums.iter().enumerate() {
+                let Some(index) = first.checked_add(step as u64) else {
+                    break;
+                };
+                recovery_block_checksums
+                    .entry((external.matrix_hash, index))
+                    .or_insert(*checksum);
+            }
+        }
+
         let mut walk = TreeWalk {
             input_set_id,
             limits,
@@ -390,8 +540,11 @@ impl Par3Set {
             directories,
             block_checksums,
             matrix_packets,
-            recovery_packets,
+            recovery_blocks,
+            foreign_recovery_packets,
+            conflicting_recovery_packets,
             recovery_external_data,
+            recovery_block_checksums,
             data_packets,
             creator_texts,
             comments,
@@ -494,16 +647,93 @@ impl Par3Set {
         &self.matrix_packets
     }
 
-    /// The set's Recovery Data packets, with their block data retained.
+    /// The recovery blocks this set holds, sorted by index and then by matrix
+    /// hash, one per matrix and index.
+    ///
+    /// A recovery block index selects a row of the Matrix packet the block
+    /// names, so a set holding two matrices — a Cauchy matrix and an FFT matrix,
+    /// say — legitimately holds a block 0 for each. Only Recovery Data packets
+    /// naming this set's Root packet are here.
+    ///
+    /// Identical copies — the reference implementation repeats packets across
+    /// recovery volumes so that any one volume can stand alone — collapse into a
+    /// single entry. Two packets that claim one matrix and index without sharing
+    /// their contents cannot both be right, and nothing stored says which one is,
+    /// so **neither** is listed: they are left out of the inventory and counted
+    /// by
+    /// [`conflicting_recovery_packet_count`](Par3Set::conflicting_recovery_packet_count).
+    /// Damage to recovery data costs the caller that recovery data, not the set.
     #[must_use]
-    pub fn recovery_packets(&self) -> &[RecoveryDataPacket] {
-        &self.recovery_packets
+    pub fn recovery_blocks(&self) -> &[RecoveryBlock] {
+        &self.recovery_blocks
+    }
+
+    /// How many Recovery Data packets were excluded for contradicting each
+    /// other.
+    ///
+    /// Counts every packet in every group that claimed one matrix and index
+    /// without agreeing on the bytes, not the number of groups — so two packets
+    /// fighting over one index count as two.
+    #[must_use]
+    pub fn conflicting_recovery_packet_count(&self) -> usize {
+        self.conflicting_recovery_packets
+    }
+
+    /// Recovery Data packets that named a Root packet other than this set's.
+    ///
+    /// An incremental backup's child set shares its parent's InputSetID lineage
+    /// but has its own Root packet, so recovery data written for the parent can
+    /// legitimately turn up alongside the child's packets. Such a block covers a
+    /// different set of input blocks and must not be counted as this set's, but
+    /// it is not damage either — so it is kept here, out of
+    /// [`recovery_blocks`](Par3Set::recovery_blocks), rather than dropped or
+    /// treated as an error.
+    #[must_use]
+    pub fn foreign_recovery_packets(&self) -> &[RecoveryDataPacket] {
+        &self.foreign_recovery_packets
     }
 
     /// The set's Recovery External Data packets.
     #[must_use]
     pub fn recovery_external_data(&self) -> &[RecoveryExternalDataPacket] {
         &self.recovery_external_data
+    }
+
+    /// Checksums for recovery blocks held outside the set, keyed by the Matrix
+    /// packet hash and the recovery block index.
+    ///
+    /// Built from the Recovery External Data packets that name this set's Root
+    /// packet, the same way input block checksums are built from External Data
+    /// packets. The matrix is part of the key for the same reason it is in
+    /// [`recovery_blocks`](Par3Set::recovery_blocks): an index only picks out a
+    /// row of the matrix its packet names. The reference implementation does not
+    /// write these packets, so the map is usually empty.
+    #[must_use]
+    pub fn recovery_block_checksums(&self) -> &BTreeMap<(Fingerprint, u64), BlockChecksum> {
+        &self.recovery_block_checksums
+    }
+
+    /// The checksum for one recovery block, if the set carries it.
+    ///
+    /// Pair it with [`RecoveryBlock::matches_checksum`] to check a block the set
+    /// holds:
+    ///
+    /// ```no_run
+    /// # fn example(set: &par3_rs::Par3Set) {
+    /// for block in set.recovery_blocks() {
+    ///     if let Some(checksum) = set.recovery_block_checksum(block.matrix_hash(), block.index()) {
+    ///         assert!(block.matches_checksum(checksum, set.block_size()));
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn recovery_block_checksum(
+        &self,
+        matrix_hash: Fingerprint,
+        index: u64,
+    ) -> Option<&BlockChecksum> {
+        self.recovery_block_checksums.get(&(matrix_hash, index))
     }
 
     /// Input blocks carried inside the set as Data packets.
@@ -761,6 +991,60 @@ impl TreeWalk<'_> {
     }
 }
 
+/// Drop every recovery block that shares its matrix and index with another, and
+/// report how many packets that cost.
+///
+/// `blocks` must already be sorted by `(index, matrix_hash)`, so that blocks
+/// claiming the same row of the same matrix sit next to each other.
+fn drop_conflicting_recovery_blocks(
+    blocks: &mut Vec<RecoveryBlock>,
+    input_set_id: InputSetId,
+) -> usize {
+    let sorted = std::mem::take(blocks);
+    let mut conflicting = 0;
+    let mut run: Vec<RecoveryBlock> = Vec::new();
+    for block in sorted {
+        let key = (block.index, block.matrix_hash);
+        if run
+            .last()
+            .is_some_and(|last| (last.index, last.matrix_hash) != key)
+        {
+            conflicting += flush_recovery_run(&mut run, blocks, input_set_id);
+        }
+        run.push(block);
+    }
+    conflicting + flush_recovery_run(&mut run, blocks, input_set_id)
+}
+
+/// Move one run of recovery blocks claiming the same matrix row into the
+/// inventory, or, if the run holds more than one of them, drop the whole run and
+/// report how many packets that was.
+///
+/// Identical packets are already collapsed by the packet-hash deduplication, so
+/// a run longer than one means genuinely different bytes claiming one row.
+/// Nothing stored says which of them is right, so none of them is kept: a set
+/// with a junk recovery packet appended must still list and verify its files.
+fn flush_recovery_run(
+    run: &mut Vec<RecoveryBlock>,
+    inventory: &mut Vec<RecoveryBlock>,
+    input_set_id: InputSetId,
+) -> usize {
+    if run.len() < 2 {
+        inventory.append(run);
+        return 0;
+    }
+    tracing::debug!(
+        %input_set_id,
+        index = run[0].index,
+        matrix = hex(&run[0].matrix_hash),
+        packets = run.len(),
+        "PAR3 recovery blocks contradict each other; excluding all of them"
+    );
+    let conflicting = run.len();
+    run.clear();
+    conflicting
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_owned()
@@ -776,7 +1060,11 @@ fn hex(bytes: &Fingerprint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{CommentPacket, CreatorPacket, ExternalDataPacket, FilePacket, RootPacket};
+    use crate::hash::{fingerprint, rolling_hash};
+    use crate::packet::{
+        BlockRange, CauchyMatrixPacket, CommentPacket, CreatorPacket, ExternalDataPacket,
+        FftMatrixPacket, FilePacket, RootPacket,
+    };
 
     fn start_packet() -> StartPacket {
         StartPacket {
@@ -1261,5 +1549,305 @@ mod tests {
         assert_eq!(sets.len(), 2);
         assert_eq!(sets[0].input_set_id(), ID);
         assert_eq!(sets[1].input_set_id(), other);
+    }
+
+    // -----------------------------------------------------------------------
+    // The recovery inventory. These build packets in memory rather than from
+    // reference bytes, because the oracle archives carry no Recovery External
+    // Data packets and no foreign Root packets to read.
+    // -----------------------------------------------------------------------
+
+    fn root_packet() -> Packet {
+        packet(PacketBody::Root(RootPacket {
+            lowest_unused_block_index: 2,
+            attributes: 0,
+            option_hashes: Vec::new(),
+            children: Vec::new(),
+        }))
+    }
+
+    fn matrix_packet() -> Packet {
+        packet(PacketBody::CauchyMatrix(
+            CauchyMatrixPacket::parse(&[0u8; 24]).expect("parses"),
+        ))
+    }
+
+    /// A second matrix for the same set, of the kind the reference writes
+    /// alongside a Cauchy matrix.
+    fn fft_matrix_packet() -> Packet {
+        packet(PacketBody::FftMatrix(FftMatrixPacket {
+            range: BlockRange { first: 0, end: 2 },
+            max_recovery_blocks_log2: 3,
+            interleave: 0,
+            interleave_len: 0,
+        }))
+    }
+
+    fn recovery_packet(
+        root_hash: Fingerprint,
+        matrix_hash: Fingerprint,
+        index: u64,
+        data: &[u8],
+    ) -> Packet {
+        packet(PacketBody::RecoveryData(RecoveryDataPacket {
+            root_hash,
+            matrix_hash,
+            recovery_block_index: index,
+            data: data.to_vec(),
+        }))
+    }
+
+    #[test]
+    fn recovery_packets_become_an_inventory_sorted_by_index() {
+        let root = root_packet();
+        let matrix = matrix_packet();
+        let (root_hash, matrix_hash) = (root.hash(), matrix.hash());
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            matrix,
+            recovery_packet(root_hash, matrix_hash, 1, &[0xbb; 2000]),
+            recovery_packet(root_hash, matrix_hash, 0, &[0xaa; 2000]),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+
+        let indices: Vec<u64> = set
+            .recovery_blocks()
+            .iter()
+            .map(RecoveryBlock::index)
+            .collect();
+        assert_eq!(indices, [0, 1]);
+        assert_eq!(set.recovery_blocks()[0].data(), [0xaa; 2000]);
+        assert_eq!(set.recovery_blocks()[0].data_len(), 2000);
+        assert_eq!(set.recovery_blocks()[0].matrix_hash(), matrix_hash);
+        assert!(
+            set.recovery_blocks()
+                .iter()
+                .all(RecoveryBlock::matrix_present)
+        );
+        assert!(set.foreign_recovery_packets().is_empty());
+        assert_eq!(set.conflicting_recovery_packet_count(), 0);
+    }
+
+    #[test]
+    fn two_matrices_may_each_have_a_recovery_block_zero() {
+        let root = root_packet();
+        let cauchy = matrix_packet();
+        let fft = fft_matrix_packet();
+        let (root_hash, cauchy_hash, fft_hash) = (root.hash(), cauchy.hash(), fft.hash());
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            cauchy,
+            fft,
+            recovery_packet(root_hash, fft_hash, 0, &[0xbb; 64]),
+            recovery_packet(root_hash, cauchy_hash, 0, &[0xaa; 64]),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+
+        // Index 0 of the Cauchy matrix and index 0 of the FFT matrix are
+        // different rows of different matrices, not a contradiction.
+        assert_eq!(set.conflicting_recovery_packet_count(), 0);
+        let listed: Vec<(u64, Fingerprint)> = set
+            .recovery_blocks()
+            .iter()
+            .map(|block| (block.index(), block.matrix_hash()))
+            .collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&(0, cauchy_hash)));
+        assert!(listed.contains(&(0, fft_hash)));
+        assert!(
+            set.recovery_blocks()
+                .iter()
+                .all(RecoveryBlock::matrix_present)
+        );
+    }
+
+    #[test]
+    fn a_recovery_block_whose_matrix_packet_is_absent_says_so() {
+        let root = root_packet();
+        let root_hash = root.hash();
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            recovery_packet(root_hash, [0x5a; 16], 0, &[0u8; 16]),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(set.recovery_blocks().len(), 1);
+        assert!(!set.recovery_blocks()[0].matrix_present());
+    }
+
+    #[test]
+    fn a_recovery_packet_for_another_root_is_counted_not_inventoried() {
+        let root = root_packet();
+        let matrix = matrix_packet();
+        let (root_hash, matrix_hash) = (root.hash(), matrix.hash());
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            matrix,
+            recovery_packet(root_hash, matrix_hash, 0, &[0xaa; 64]),
+            // The same index, but written against some other set's Root packet:
+            // it covers different input blocks, so it is not this set's.
+            recovery_packet([0x77; 16], matrix_hash, 0, &[0xcc; 64]),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(set.recovery_blocks().len(), 1);
+        assert_eq!(set.recovery_blocks()[0].data(), [0xaa; 64]);
+        assert_eq!(set.foreign_recovery_packets().len(), 1);
+        // Kept, just not as this set's recovery data.
+        assert_eq!(set.foreign_recovery_packets()[0].data, [0xcc; 64]);
+    }
+
+    #[test]
+    fn recovery_packets_that_contradict_one_index_are_all_excluded() {
+        let root = root_packet();
+        let matrix = matrix_packet();
+        let (root_hash, matrix_hash) = (root.hash(), matrix.hash());
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            matrix,
+            recovery_packet(root_hash, matrix_hash, 3, &[0xaa; 64]),
+            recovery_packet(root_hash, matrix_hash, 3, &[0xab; 64]),
+            recovery_packet(root_hash, matrix_hash, 4, &[0xac; 64]),
+        ];
+        // The set still builds: contradicting recovery data costs the caller
+        // that recovery block, not the file listing.
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(
+            set.recovery_blocks()
+                .iter()
+                .map(RecoveryBlock::index)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        // Both packets are gone, not one of them picked as the winner.
+        assert_eq!(set.conflicting_recovery_packet_count(), 2);
+    }
+
+    #[test]
+    fn identical_recovery_packets_collapse_into_one_block() {
+        let root = root_packet();
+        let matrix = matrix_packet();
+        let (root_hash, matrix_hash) = (root.hash(), matrix.hash());
+        let block = recovery_packet(root_hash, matrix_hash, 0, &[0xaa; 64]);
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            matrix,
+            block.clone(),
+            block,
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(set.recovery_blocks().len(), 1);
+        assert_eq!(set.duplicate_packet_count(), 1);
+    }
+
+    #[test]
+    fn recovery_external_data_maps_checksums_for_this_root_only() {
+        let root = root_packet();
+        let matrix = matrix_packet();
+        let (root_hash, matrix_hash) = (root.hash(), matrix.hash());
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            matrix,
+            packet(PacketBody::RecoveryExternalData(
+                RecoveryExternalDataPacket {
+                    root_hash,
+                    matrix_hash,
+                    first_recovery_block_index: 4,
+                    checksums: vec![
+                        BlockChecksum {
+                            rolling_hash: 40,
+                            fingerprint: [4u8; 16],
+                        },
+                        BlockChecksum {
+                            rolling_hash: 50,
+                            fingerprint: [5u8; 16],
+                        },
+                    ],
+                },
+            )),
+            packet(PacketBody::RecoveryExternalData(
+                RecoveryExternalDataPacket {
+                    root_hash: [0x77; 16],
+                    matrix_hash,
+                    first_recovery_block_index: 9,
+                    checksums: vec![BlockChecksum {
+                        rolling_hash: 90,
+                        fingerprint: [9u8; 16],
+                    }],
+                },
+            )),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(set.recovery_block_checksums().len(), 2);
+        assert_eq!(
+            set.recovery_block_checksum(matrix_hash, 4)
+                .expect("present")
+                .rolling_hash,
+            40
+        );
+        assert_eq!(
+            set.recovery_block_checksum(matrix_hash, 5)
+                .expect("present")
+                .rolling_hash,
+            50
+        );
+        // The index alone is not the key: the same index under another matrix is
+        // another row.
+        assert!(set.recovery_block_checksum([0x5a; 16], 4).is_none());
+        // The foreign packet's checksums are not this set's.
+        assert!(set.recovery_block_checksum(matrix_hash, 9).is_none());
+        assert_eq!(set.recovery_external_data().len(), 2);
+    }
+
+    #[test]
+    fn a_recovery_block_is_checked_against_its_checksum_zero_padded() {
+        let root = root_packet();
+        let root_hash = root.hash();
+        // A short block, as a writer that trimmed trailing zeros would store it.
+        let stored = [0x11u8; 30];
+        let mut padded = stored.to_vec();
+        padded.resize(64, 0);
+        let checksum = BlockChecksum {
+            rolling_hash: rolling_hash(&padded),
+            fingerprint: fingerprint(&padded),
+        };
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            recovery_packet(root_hash, [0x5a; 16], 0, &stored),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        let block = &set.recovery_blocks()[0];
+        assert!(block.matches_checksum(&checksum, 64));
+        // A different block size hashes different bytes, and a block longer than
+        // the block size cannot be the block the checksum describes.
+        assert!(!block.matches_checksum(&checksum, 65));
+        assert!(!block.matches_checksum(&checksum, 20));
+    }
+
+    #[test]
+    fn an_implausible_block_size_is_refused_rather_than_hashed() {
+        let root = root_packet();
+        let root_hash = root.hash();
+        let packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            root,
+            recovery_packet(root_hash, [0x5a; 16], 0, &[0x11; 30]),
+        ];
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        let block = &set.recovery_blocks()[0];
+        let checksum = BlockChecksum {
+            rolling_hash: 0,
+            fingerprint: [0; 16],
+        };
+        // A block size out of a damaged or hostile Start packet must not send
+        // the hashers off to count to u64::MAX. This returns at once.
+        assert!(!block.matches_checksum(&checksum, u64::MAX));
+        assert!(!block.matches_checksum(&checksum, ScanLimits::DEFAULT_MAX_PACKET_LEN + 1));
     }
 }

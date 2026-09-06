@@ -49,7 +49,7 @@ fn the_ledger_is_consistent_with_the_toolchain_lock_and_has_no_blocked_paths() {
         "blocked paths would stop publication:\n{}",
         blocked.join("\n")
     );
-    assert_eq!(ledger.files.len(), 377, "the corpus has 377 fixture paths");
+    assert_eq!(ledger.files.len(), 440, "the corpus has 440 fixture paths");
     // The ledger's on-disk layout is the canonical one, so `--update-ledger`
     // never reformats a reviewed file.
     // Compared with line endings normalised: a Windows checkout with
@@ -167,7 +167,8 @@ fn the_rar_15_and_20_oracles_are_immutable_imports_without_a_rarlab_writer() {
                 assert!(
                     id.starts_with("rarlab-")
                         || id.starts_with("ffmpeg-")
-                        || id.starts_with("par2cmdline-turbo-"),
+                        || id.starts_with("par2cmdline-turbo-")
+                        || id.starts_with("par3cmdline-"),
                     "{}: unexpected toolchain {id}",
                     entry.path
                 );
@@ -251,7 +252,7 @@ fn era_profiles_partition_the_rar_fixtures_by_format() {
     assert_eq!(members("ppmd-perf").len(), 3);
     assert_eq!(members("all").len(), ledger.files.len());
     assert_eq!(
-        members("unrar").len() + members("par2").len(),
+        members("unrar").len() + members("par2").len() + members("par3").len(),
         ledger.files.len()
     );
     // No benchmark output: every profile member is a ledger path under the fixture roots.

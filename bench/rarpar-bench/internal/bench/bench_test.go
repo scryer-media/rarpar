@@ -945,6 +945,7 @@ func validToolchainLock() ToolchainLock {
 			{ID: "rarlab-7.23", Image: "rar7", Platform: "linux/amd64", URL: "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz", BLAKE3: writerDigest(5), Binary: "rar"},
 		},
 		PAR2Generator: PAR2Generator{ID: "par2", Image: "par2", Platform: "linux/amd64", URL: "https://example.test/par2", BLAKE3: digest},
+		PAR3Generator: PAR3Generator{ID: "par3", Image: "par3", Platform: "linux/amd64", URL: "https://example.test/par3", BLAKE3: strings.Repeat("3", 64)},
 	}
 }
 

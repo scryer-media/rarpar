@@ -40,11 +40,16 @@ and PAR2 workflows.
 
 ## PAR3 Rules
 
-- `par3-rs` 0.1 is read-only: parsing, set inspection, and verification. The
-  crate is intended to grow into a full PAR3 implementation (creation and
-  repair), but each widening of scope is a deliberate, separately planned step:
-  update the README and crate docs in the same change, and keep the "what does
-  not work yet" statements accurate.
+- `par3-rs` 0.x parses, inspects, verifies, creates and repairs PAR3 sets built
+  with the reference implementation's default settings: a Cauchy matrix over
+  GF(2^8) or GF(2^16), chunk tails packed into shared blocks, and power-of-two
+  recovery volumes. Everything beyond that — repairing the recovery volumes
+  themselves, the FFT, sparse and explicit matrices, deduplication and Data
+  packets, permission and link packets, incremental parent sets, the sliding
+  search for moved or renamed files, a command-line interface — is out of scope
+  until a deliberate, separately planned step widens it: update the README and
+  crate docs in the same change, and keep the "what does not work yet"
+  statements accurate.
 - Where the PAR3 specification draft and the `par3cmdline` reference
   implementation disagree, follow the reference: it produced the files that
   exist. Record any newly found difference in the deviation table in the crate's

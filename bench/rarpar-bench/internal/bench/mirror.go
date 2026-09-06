@@ -44,6 +44,7 @@ const (
 const (
 	ArchiveKindRARLAB = "rarlab"
 	ArchiveKindPAR2   = "par2cmdline-turbo"
+	ArchiveKindPAR3   = "par3cmdline"
 )
 
 // Where a resolved archive came from.
@@ -204,7 +205,7 @@ func (source ArchiveSource) keys() mirrorKeys {
 
 func (source ArchiveSource) validate(allowInsecure bool) error {
 	switch source.Kind {
-	case ArchiveKindRARLAB, ArchiveKindPAR2:
+	case ArchiveKindRARLAB, ArchiveKindPAR2, ArchiveKindPAR3:
 	default:
 		return fmt.Errorf("unknown archive kind %q", source.Kind)
 	}
@@ -241,10 +242,23 @@ func PAR2ArchiveSource(generator PAR2Generator) (ArchiveSource, error) {
 	return ArchiveSource{Kind: ArchiveKindPAR2, Name: name, URL: generator.URL, BLAKE3: generator.BLAKE3}, nil
 }
 
+// PAR3ArchiveSource is the PAR3 generator's source archive as the lock pins it.
+func PAR3ArchiveSource(generator PAR3Generator) (ArchiveSource, error) {
+	parsed, err := url.Parse(generator.URL)
+	if err != nil {
+		return ArchiveSource{}, fmt.Errorf("PAR3 generator URL %q is not a URL: %w", generator.URL, err)
+	}
+	name := path.Base(parsed.Path)
+	if name == "" || name == "." || name == "/" {
+		return ArchiveSource{}, fmt.Errorf("PAR3 generator URL %q does not name an archive", generator.URL)
+	}
+	return ArchiveSource{Kind: ArchiveKindPAR3, Name: name, URL: generator.URL, BLAKE3: generator.BLAKE3}, nil
+}
+
 // ToolchainSources is every original distribution archive the lock pins, in
-// build order: the writers, then the PAR2 generator.
+// build order: the writers, then the PAR2 generator, then the PAR3 generator.
 func ToolchainSources(lock ToolchainLock) ([]ArchiveSource, error) {
-	sources := make([]ArchiveSource, 0, len(lock.RARWriters)+1)
+	sources := make([]ArchiveSource, 0, len(lock.RARWriters)+2)
 	for _, writer := range lock.RARWriters {
 		source, err := WriterArchiveSource(writer)
 		if err != nil {
@@ -252,11 +266,15 @@ func ToolchainSources(lock ToolchainLock) ([]ArchiveSource, error) {
 		}
 		sources = append(sources, source)
 	}
-	source, err := PAR2ArchiveSource(lock.PAR2Generator)
+	par2, err := PAR2ArchiveSource(lock.PAR2Generator)
 	if err != nil {
 		return nil, err
 	}
-	return append(sources, source), nil
+	par3, err := PAR3ArchiveSource(lock.PAR3Generator)
+	if err != nil {
+		return nil, err
+	}
+	return append(sources, par2, par3), nil
 }
 
 // ResolveToolchainSources resolves — and, when the mirror publishes, mirrors —

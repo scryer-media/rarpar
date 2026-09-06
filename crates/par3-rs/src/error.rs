@@ -144,6 +144,112 @@ pub enum Par3Error {
         input_set_id: InputSetId,
     },
 
+    /// A Galois field this crate cannot compute in.
+    ///
+    /// Either the set declares a field size no codec here implements, or its
+    /// generator polynomial is not one the field can be built from.
+    #[error("unsupported Galois field: {reason}")]
+    UnsupportedField {
+        /// What was wrong with the field.
+        reason: String,
+    },
+
+    /// A codec geometry that has no valid Cauchy matrix, or none this crate can
+    /// work with.
+    #[error("unusable PAR3 codec geometry: {reason}")]
+    CodecGeometry {
+        /// Why the block counts, block size or field do not fit together.
+        reason: String,
+    },
+
+    /// A block a codec was handed does not belong where the caller put it.
+    #[error("PAR3 codec block {index}: {reason}")]
+    CodecBlock {
+        /// The block index the caller named.
+        index: u64,
+        /// What was wrong with it.
+        reason: String,
+    },
+
+    /// Fewer recovery blocks are available than there are input blocks to
+    /// rebuild, so the system is underdetermined.
+    #[error("cannot rebuild {lost} lost input blocks from {available} recovery blocks")]
+    InsufficientRecovery {
+        /// Input blocks that must be rebuilt.
+        lost: u64,
+        /// Recovery blocks on hand.
+        available: u64,
+    },
+
+    /// The chosen recovery rows do not form an invertible system.
+    ///
+    /// A Cauchy matrix built over distinct, disjoint row and column values is
+    /// always invertible, so this means the geometry or the chosen rows were
+    /// not what they were taken to be, rather than that the data is damaged.
+    #[error("the chosen recovery blocks do not form an invertible system")]
+    SingularSystem,
+
+    /// A codec asked for more memory than its [`CodecLimits`] allow.
+    ///
+    /// [`CodecLimits`]: crate::cauchy::CodecLimits
+    #[error("PAR3 codec limit exceeded: {reason}")]
+    CodecLimitExceeded {
+        /// Which budget ran out.
+        reason: String,
+    },
+
+    /// The set's own packets do not describe a layout a repair can work from.
+    ///
+    /// Two chunks claiming the same bytes of one input block, a block no file
+    /// writes, a file the set cannot check at all, or recovery data computed
+    /// with a matrix this crate does not implement: none of these is damage to
+    /// the protected files, so none of them is reported as such.
+    #[error("this PAR3 set cannot be repaired: {reason}")]
+    UnrepairableSet {
+        /// What about the set stands in the way.
+        reason: String,
+    },
+
+    /// A repair exceeded one of the [`RepairLimits`](crate::repair::RepairLimits).
+    #[error("PAR3 repair limit exceeded: {reason}")]
+    RepairLimitExceeded {
+        /// Which budget ran out.
+        reason: String,
+    },
+
+    /// An input handed to [`create`](crate::create::create) cannot be used.
+    ///
+    /// The path is reported exactly as the caller named it, so a refusal points
+    /// back at the argument that caused it rather than at a rewritten form.
+    #[error("cannot protect {path:?}: {reason}")]
+    CreateInput {
+        /// The offending path or output name.
+        path: String,
+        /// Why it was refused.
+        reason: String,
+    },
+
+    /// A create exceeded one of the [`CreateLimits`](crate::create::CreateLimits).
+    #[error("PAR3 create limit exceeded: {reason}")]
+    CreateLimitExceeded {
+        /// Which budget ran out.
+        reason: String,
+    },
+
+    /// An I/O operation on a named file failed.
+    ///
+    /// [`Io`](Par3Error::Io) carries what the standard library reported and
+    /// nothing else; this variant names the file it happened on, which is what
+    /// a create needs to say when one input among many cannot be read.
+    #[error("I/O error on {path:?}: {source}")]
+    FileIo {
+        /// The file the operation was on.
+        path: String,
+        /// What the operating system reported.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Reading a `.par3` file or an input file failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

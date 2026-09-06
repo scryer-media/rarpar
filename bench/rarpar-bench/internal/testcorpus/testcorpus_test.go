@@ -162,8 +162,8 @@ func TestUnitToolsResolveToTheLedgersToolchains(t *testing.T) {
 	}
 }
 
-// The images a unit needs built are its writers and, where it drives one, the
-// par2 generator. The encoder is never in the list: it is pulled by digest.
+// The images a unit needs built are its writers and, where it drives one, a
+// parity generator. The encoder is never in the list: it is pulled by digest.
 func TestImagesForLeavesTheEncoderToBePulled(t *testing.T) {
 	lock, err := bench.LoadToolchains(filepath.Join(repoRoot(t), filepath.FromSlash(toolchainLockFile)))
 	if err != nil {
@@ -186,6 +186,13 @@ func TestImagesForLeavesTheEncoderToBePulled(t *testing.T) {
 	if !slices.Equal(images, want) {
 		t.Fatalf("images %v, want %v", images, want)
 	}
+	images, err = ImagesFor(lock, []string{ToolPAR3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(images, []string{lock.PAR3Generator.Image}) {
+		t.Fatalf("the PAR3 tool resolves to %v, want %v", images, lock.PAR3Generator.Image)
+	}
 	if _, err := ImagesFor(lock, []string{"typo"}); err == nil {
 		t.Fatal("an unknown tool must be an error")
 	}
@@ -198,6 +205,13 @@ func TestImagesForLeavesTheEncoderToBePulled(t *testing.T) {
 	}
 	if !slices.Equal(ids, []string{lock.PAR2Generator.ID}) {
 		t.Fatalf("par2_captures resolves to %v", ids)
+	}
+	ids, err = ToolchainIDsForUnits(lock, []string{"par3_sets"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ids, []string{lock.PAR3Generator.ID}) {
+		t.Fatalf("par3_sets resolves to %v", ids)
 	}
 }
 
@@ -242,6 +256,13 @@ func TestDescribeCoversEveryUnitAgainstTheLock(t *testing.T) {
 	}
 	if len(captures.Upstreams) != 2 {
 		t.Fatalf("par2_captures upstream inputs %v", captures.Upstreams)
+	}
+	sets := byName["par3_sets"]
+	if !slices.Equal(sets.Images, []string{lock.PAR3Generator.Image}) {
+		t.Fatalf("par3_sets images %v", sets.Images)
+	}
+	if len(sets.Upstreams) != 0 {
+		t.Fatalf("par3_sets reads no upstream import, declares %v", sets.Upstreams)
 	}
 }
 

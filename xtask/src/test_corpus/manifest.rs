@@ -22,6 +22,7 @@ pub(crate) struct ToolchainLock {
     pub(crate) rar_writers: Vec<RarWriter>,
     pub(crate) video_encoder: VideoEncoder,
     pub(crate) par2_generator: Par2Generator,
+    pub(crate) par3_generator: Par3Generator,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,6 +44,17 @@ pub(crate) struct VideoEncoder {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Par2Generator {
+    pub(crate) id: String,
+    pub(crate) image: String,
+    pub(crate) platform: String,
+    pub(crate) url: String,
+    pub(crate) blake3: String,
+}
+
+/// The PAR3 reference implementation, pinned to a commit archive: the only
+/// thing that may write a `.par3` fixture.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct Par3Generator {
     pub(crate) id: String,
     pub(crate) image: String,
     pub(crate) platform: String,
@@ -73,6 +85,22 @@ impl ToolchainLock {
         if !lock.video_encoder.image.contains("@sha256:") {
             return fail("toolchain lock video encoder is not digest pinned");
         }
+        for (what, url, blake3) in [
+            (
+                "PAR2",
+                &lock.par2_generator.url,
+                &lock.par2_generator.blake3,
+            ),
+            (
+                "PAR3",
+                &lock.par3_generator.url,
+                &lock.par3_generator.blake3,
+            ),
+        ] {
+            if !is_blake3_hex(blake3) || !url.starts_with("https://") {
+                return fail(format!("toolchain lock {what} generator is not pinned"));
+            }
+        }
         Ok((lock, blake3_bytes(text.as_bytes())))
     }
 
@@ -84,6 +112,7 @@ impl ToolchainLock {
             .collect();
         ids.insert(self.video_encoder.id.clone());
         ids.insert(self.par2_generator.id.clone());
+        ids.insert(self.par3_generator.id.clone());
         ids
     }
 }
@@ -98,6 +127,22 @@ pub(crate) struct ManifestToolchains {
     pub(crate) rar_writers: BTreeMap<String, PinnedSource>,
     pub(crate) video_encoder: BTreeMap<String, String>,
     pub(crate) par2_generator: PinnedSource,
+    /// Absent from manifests published before the lock carried a PAR3
+    /// generator; such a manifest must stay readable, since verify compares
+    /// the tree against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) par3_generator: Option<PinnedSource>,
+}
+
+impl ManifestToolchains {
+    /// Every toolchain id the manifest names.
+    pub(crate) fn ids(&self) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = self.rar_writers.keys().cloned().collect();
+        ids.extend(self.video_encoder.get("id").cloned());
+        ids.insert(self.par2_generator.id.clone());
+        ids.extend(self.par3_generator.iter().map(|par3| par3.id.clone()));
+        ids
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -248,6 +293,11 @@ impl Manifest {
                     url: lock.par2_generator.url.clone(),
                     blake3: lock.par2_generator.blake3.clone(),
                 },
+                par3_generator: Some(PinnedSource {
+                    id: lock.par3_generator.id.clone(),
+                    url: lock.par3_generator.url.clone(),
+                    blake3: lock.par3_generator.blake3.clone(),
+                }),
             },
             generators: ledger
                 .generators

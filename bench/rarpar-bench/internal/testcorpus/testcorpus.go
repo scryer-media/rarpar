@@ -1,15 +1,15 @@
 // Package testcorpus produces the repository's test corpus.
 //
-// Every fixture under crates/unrar-rs/tests/fixtures and
-// crates/par2-rs/tests/fixtures is either written by a recipe in this package or
-// fetched from a public upstream at a pinned commit. Nothing is carried forward:
+// Every fixture under crates/unrar-rs/tests/fixtures, crates/par2-rs/tests/fixtures
+// and crates/par3-rs/tests/fixtures is either written by a recipe in this package
+// or fetched from a public upstream at a pinned commit. Nothing is carried forward:
 // `rarpar-bench testcorpus generate` rewrites the whole tree, which is what a
 // corpus revision is. See docs/test-corpus.md.
 //
 // The recipes are Go rather than shell so they run wherever the harness does,
 // Windows included. The only external processes are the pinned Docker images
-// from config/toolchains.json — the RARLAB writers and par2cmdline-turbo, which
-// have no library form — plus python3 for generate_ppmd_perf.py, the one
+// from config/toolchains.json — the RARLAB writers, par2cmdline-turbo and the
+// par3cmdline reference, which have no library form — plus python3 for generate_ppmd_perf.py, the one
 // remaining Python recipe (it drives the same pinned RARLAB writer). Everything
 // else (digests, HTTP, tar/gzip, file operations, deterministic payloads, the
 // FFmpeg-encoded video members) is stdlib and in-process. RAR fixtures are only
@@ -31,11 +31,12 @@ import (
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 )
 
-// FixtureRoots are the two directories that hold corpus content, relative to
+// FixtureRoots are the three directories that hold corpus content, relative to
 // the repository root.
 var FixtureRoots = []string{
 	"crates/unrar-rs/tests/fixtures",
 	"crates/par2-rs/tests/fixtures",
+	"crates/par3-rs/tests/fixtures",
 }
 
 // Options is one `testcorpus generate` invocation.
@@ -65,6 +66,7 @@ const (
 	ToolRAR4  = "rar4"
 	ToolRAR5  = "rar5"
 	ToolPAR2  = "par2"
+	ToolPAR3  = "par3"
 	ToolVideo = "video"
 )
 
@@ -143,6 +145,12 @@ func units() []Unit {
 				"crates/par2-rs/tests/fixtures/par2cmdline-turbo/flatdata.tar.gz",
 			},
 			Run: generatePar2Captures},
+		// The PAR3 sets par3-rs is held to: the reference par3cmdline run over
+		// deterministic inputs, each case a directory holding those inputs and
+		// the .par3 files the reference wrote for them. Nothing here is damaged;
+		// the tests damage copies in memory.
+		{Name: "par3_sets", Source: source("par3_sets.go"), Stage: 1,
+			Tools: []string{ToolPAR3}, Run: generatePar3Sets},
 	}
 }
 
@@ -165,6 +173,8 @@ func ToolchainIDs(lock bench.ToolchainLock, tools []string) ([]string, error) {
 			add(rar5WriterID)
 		case ToolPAR2:
 			add(lock.PAR2Generator.ID)
+		case ToolPAR3:
+			add(lock.PAR3Generator.ID)
 		case ToolVideo:
 			add(lock.VideoEncoder.ID)
 		default:
@@ -268,6 +278,8 @@ func ImagesFor(lock bench.ToolchainLock, tools []string) ([]string, error) {
 			add(writer.Image)
 		case ToolPAR2:
 			add(lock.PAR2Generator.Image)
+		case ToolPAR3:
+			add(lock.PAR3Generator.Image)
 		case ToolVideo:
 		default:
 			return nil, fmt.Errorf("unknown generator tool %q", tool)
@@ -290,12 +302,14 @@ type env struct {
 	repoRoot  string
 	unrar     string // absolute crates/unrar-rs/tests/fixtures
 	par2      string // absolute crates/par2-rs/tests/fixtures
+	par3      string // absolute crates/par3-rs/tests/fixtures
 	lock      bench.ToolchainLock
 	docker    string
 	log       io.Writer
 	rar4      bench.RARWriter
 	rar5      bench.RARWriter
 	par2Image string
+	par3Image string
 	logMu     *sync.Mutex
 }
 
@@ -305,6 +319,10 @@ func (e *env) unrarPath(parts ...string) string {
 
 func (e *env) par2Path(parts ...string) string {
 	return filepath.Join(append([]string{e.par2}, parts...)...)
+}
+
+func (e *env) par3Path(parts ...string) string {
+	return filepath.Join(append([]string{e.par3}, parts...)...)
 }
 
 func (e *env) logf(format string, args ...any) {
@@ -342,12 +360,14 @@ func Generate(ctx context.Context, options Options) error {
 		repoRoot:  options.RepoRoot,
 		unrar:     filepath.Join(options.RepoRoot, filepath.FromSlash(FixtureRoots[0])),
 		par2:      filepath.Join(options.RepoRoot, filepath.FromSlash(FixtureRoots[1])),
+		par3:      filepath.Join(options.RepoRoot, filepath.FromSlash(FixtureRoots[2])),
 		lock:      lock,
 		docker:    docker,
 		log:       logWriter,
 		rar4:      rar4,
 		rar5:      rar5,
 		par2Image: lock.PAR2Generator.Image,
+		par3Image: lock.PAR3Generator.Image,
 		logMu:     &sync.Mutex{},
 	}
 

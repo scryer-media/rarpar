@@ -1,9 +1,11 @@
 # The test corpus
 
-The binary fixtures under `crates/unrar-rs/tests/fixtures/` and
-`crates/par2-rs/tests/fixtures/` are the **test corpus**: 376 archives, parity
-sets, SFX modules, video inputs and originals that the unit, integration, slow,
-PAR2, UnRAR, wasm and CLI suites read. They are published as a signed,
+The binary fixtures under `crates/unrar-rs/tests/fixtures/`,
+`crates/par2-rs/tests/fixtures/` and `crates/par3-rs/tests/fixtures/` are the
+**test corpus**: the archives, parity sets, SFX modules, video inputs and
+originals that the unit, integration, slow, PAR2, PAR3, UnRAR, wasm and CLI
+suites read (376 published, plus the PAR3 sets pending their first
+publication). They are published as a signed,
 content-addressed object set on Cloudflare R2 and hydrated by `xtask`. The
 repository carries no fixture bytes: the published, signed revision the lock
 pins is the only source, and Git LFS — the bridge transport while nothing had
@@ -39,9 +41,13 @@ is checked against this: a generated entry whose format is `rar15`, `rar20`,
 `rar4`, `rar5`, `rar4-rev`, `rar5-rev` or `sfx-*` must name a `rarlab-*`
 toolchain, with no byte-reproducibility exemption.
 
-This is a RAR rule, not a corpus-wide one. PAR2, Matroska and the plain `.bin` /
-`.txt` inputs are open formats and keep the ordinary provenance rules below: the
-pinned par2cmdline-turbo image, the pinned encoder, and deterministic Go.
+This is a RAR rule, not a corpus-wide one. PAR2, PAR3, Matroska and the plain
+`.bin` / `.txt` inputs are open formats and keep the ordinary provenance rules
+below: the pinned par2cmdline-turbo and par3cmdline images, the pinned encoder,
+and deterministic Go. PAR3 adds a rule of its own kind: a `.par3` is written
+only by the pinned reference implementation, never hand-assembled or bit-edited,
+so that what `par3-rs` is held to is what the reference actually produces
+(`AGENTS.md`, PAR3 rules).
 
 The corpus is **independent of the benchmark corpus** in
 `bench/rarpar-bench`: the two share generator code and the pinned toolchain
@@ -68,7 +74,7 @@ appears.
 | `test-corpus/sources.json` | Provenance ledger. One entry per fixture path: size, BLAKE3 digest, and its **source**: `generated` (which generator script, which pinned writer/encoder/parity tool, which inputs), `upstream` (which pinned upstream commit and path, under which license), or `blocked` (provenance incomplete). |
 | `test-corpus/profiles.json` | Named subsets of the corpus, as path globs, one per hydration need (`unit`, `cli`, `unrar`, `par2`, …). |
 | `test-corpus/lock.json` | The one published manifest CI and developers hydrate from: its BLAKE3 digest, its public URL, the Sigstore identity that must have signed it, and the commit it was published from. |
-| `bench/rarpar-bench/config/toolchains.json` | The shared generator-toolchain lock: the six RARLAB writers (3.93, 4.20, 5.00, 6.24, 7.20, 7.23), the digest-pinned FFmpeg 7.1 encoder image, and the par2cmdline-turbo generator, each pinned by URL and BLAKE3 digest (`schema_version` 2; the encoder image keeps the OCI `@sha256:` form the registry specifies). Frozen from Renovate; a toolchain change is a deliberate corpus revision. |
+| `bench/rarpar-bench/config/toolchains.json` | The shared generator-toolchain lock: the six RARLAB writers (3.93, 4.20, 5.00, 6.24, 7.20, 7.23), the digest-pinned FFmpeg 7.1 encoder image, the par2cmdline-turbo generator and the par3cmdline generator (a pinned commit archive; the reference has no release), each pinned by URL and BLAKE3 digest (`schema_version` 2; the encoder image keeps the OCI `@sha256:` form the registry specifies). Frozen from Renovate; a toolchain change is a deliberate corpus revision. |
 | `.github/workflows/test-corpus-publish.yml` | The protected, manual, `main`-only workflow that generates, validates, packages, signs and uploads a corpus revision. Implementing it does not dispatch it. |
 
 ### `sources.json`
@@ -162,6 +168,7 @@ is how the UnRAR lanes are split:
 | `rar57` | RAR5-format archives — everything written by RAR 5.x/7.x writers (`rar5/`) |
 | `unrar` | `rar12` ∪ `rar34` ∪ `rar57` (all of `crates/unrar-rs/tests/fixtures/`) |
 | `par2` | all of `crates/par2-rs/tests/fixtures/` |
+| `par3` | all of `crates/par3-rs/tests/fixtures/`: the eight reference-written PAR3 sets and their inputs |
 | `unit` | the two fixtures the no-fixture unit lanes read |
 | `cli` | what the CLI smoke lane reads |
 | `wasm-unrar` | exactly the fixture families the wasm UnRAR harness opens |
@@ -182,6 +189,7 @@ self-sufficient.
     "rar57": {"include": ["crates/unrar-rs/tests/fixtures/rar5/**", "crates/unrar-rs/tests/fixtures/originals/**"]},
     "unrar": {"include": ["crates/unrar-rs/tests/fixtures/**"]},
     "par2":  {"include": ["crates/par2-rs/tests/fixtures/**"]},
+    "par3":  {"include": ["crates/par3-rs/tests/fixtures/**"]},
     "unit":  {"include": ["crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar", "crates/unrar-rs/tests/fixtures/rar4/rar4_hp_large.rar"]},
     "cli":   {"include": ["crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar", "crates/par2-rs/tests/fixtures/rar5_lz_plain/**"]}
   }
@@ -416,7 +424,8 @@ guard ─► plan ─┬─► generate (inputs) ──┬───────�
 5. **`generate (<unit>)`**, one job per stage-1 generator, each of which:
    restores the stage-0 artifact; builds only the images its own recipe drives
    (`bench toolchains build --only-images-for <unit>` — three of the seven, and
-   the par2cmdline-turbo *compile* only for the three units that need it);
+   the par2cmdline-turbo and par3cmdline *compiles* only for the units that
+   need them: three and one respectively);
    removes the fixtures it owns so nothing is carried forward from the checkout;
    runs `test-corpus generate --only <unit>`; and uploads exactly the ledger
    paths whose `generator` is that unit. Every ledger path is carried by exactly
@@ -504,10 +513,17 @@ window between the two is a first-class state rather than a broken one:
    path the pinned manifest does not carry is **pending first publication**:
    `verify` exempts it from presence and digest checks (it can be hydrated
    from nowhere), excludes it from the manifest recomputed for the lock
-   comparison, and prints it by name. Everything already published is still
+   comparison, and prints it by name. The same grace covers what the fixture
+   needs around it — a new generator, a new profile or a new include pattern
+   in a published one, a new toolchain lock entry (the PAR3 sets brought all
+   four at once) — on the one condition that nothing already published
+   depends on it: a published path re-attributed to an unpublished generator
+   or toolchain, or selected by an unpublished profile, is an inconsistency,
+   not a fixture in flight, and fails. Everything already published is still
    held to the pinned manifest, so the PR's CI stays green and still proves
    what it could always prove. Tests that read the new fixture must skip when
-   it is absent — the same skip they need on any not-yet-hydrated checkout.
+   it is absent — the same skip they need on any not-yet-hydrated checkout;
+   the cleanest form is to land them only after the publication.
 2. An operator dispatches the publish workflow. Generation produces the new
    fixture, `assemble` refreshes its ledger entry from the produced bytes, and
    the new revision's manifest carries it.
@@ -532,7 +548,8 @@ cargo run --locked -p xtask -- test-corpus generate --jobs 4
 ```
 
 While iterating on one recipe, build only the images that recipe drives — the
-par2cmdline-turbo image is a compile, and only three units need it:
+par2cmdline-turbo and par3cmdline images are compiles, and only three units
+and one unit respectively need them:
 
 ```sh
 cargo run --locked -p xtask -- bench toolchains build --only-images-for stored_layout
