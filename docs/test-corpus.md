@@ -509,7 +509,11 @@ window between the two is a first-class state rather than a broken one:
 1. One PR adds the recipe (or upstream entry) **and** its `sources.json`
    entry. For a generated fixture the entry's size and digest are
    placeholders — regeneration is not byte-reproducible, so no value written
-   by hand could be authoritative — and the entry's `notes` say so. A ledger
+   by hand could be authoritative — and the entry's `notes` say so. The one
+   exception is a fixture that is meant to be empty: its entry carries the
+   BLAKE3 of no bytes, which is authoritative by construction, and that is
+   what lets the generation job's check tell a deliberately empty fixture
+   from a recipe that stopped writing. A ledger
    path the pinned manifest does not carry is **pending first publication**:
    `verify` exempts it from presence and digest checks (it can be hydrated
    from nowhere), excludes it from the manifest recomputed for the lock
