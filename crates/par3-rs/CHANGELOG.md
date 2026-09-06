@@ -196,6 +196,20 @@ that pins all of it against the reference implementation.
   first recovery indices, and input counts at the edge of what each field can
   address — and checks that the order input blocks arrive in does not change the
   result.
+- `tests/corpus_sets.rs` holds the library to the eight PAR3 sets in the
+  repository's test corpus — `gf8_packed`, `gf16_blocks`, `gf16_by_recovery`,
+  `index_only`, `tree`, `tiny_inline`, `auto_block` and `large_stream` — every
+  one of them written by the reference implementation, and hydrated from the
+  published, signed corpus rather than committed. Each set is read and compared
+  with the shape the reference recorded, its inputs are verified whole, it is
+  created again from those inputs and matched byte for byte across every index
+  and volume file, and damage made in memory on copies of the inputs is
+  repaired back to them from the reference's own volumes. `tiny_inline` and
+  `auto_block` were written without `-s`, so re-creating them holds
+  `suggest_block_size` to the block size the reference chose; `index_only` pins
+  the refusal to repair a set that carries no recovery data, and that the
+  refusal writes nothing. The tests skip where the corpus has not been
+  hydrated.
 
 ## 0.1.0
 
