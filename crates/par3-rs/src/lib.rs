@@ -78,9 +78,10 @@
 //! - Permissions and link packets, beyond keeping their bytes.
 //! - "Par inside", where PAR3 packets live within the file they protect. Files
 //!   with unprotected chunks are reported as unverifiable.
-//! - Creating anything beyond a plain set: no deduplication, no Data packets,
-//!   no unprotected chunks, no splitting a file into several chunks, no
-//!   permission or link packets, no parent set, and no matrix but Cauchy.
+//! - Creating unprotected chunks, permission or link packets, and parent sets.
+//!   Advanced standalone creation in [`creation`] supports Cauchy or low-rate
+//!   FFT, interleaving, aligned/sliding deduplication, Data packets, and variable,
+//!   uniform, or size-limited volumes. [`mod@create`] keeps its original defaults.
 //! - Any command-line interface. `examples/par3rs.rs` drives this API from a
 //!   shell to demonstrate it; it is not a tool.
 //!
@@ -130,6 +131,7 @@
 
 pub mod cauchy;
 pub mod create;
+pub mod creation;
 pub mod error;
 pub mod evidence;
 pub mod fft;

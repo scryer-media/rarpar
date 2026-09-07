@@ -193,11 +193,23 @@ Still unsupported:
 - Interpreting link and permission packets, beyond keeping their bytes.
 - "Par inside", where PAR3 packets live within the file they protect. Files with
   unprotected chunks are reported as unverifiable.
-- Creating anything beyond a plain set: no deduplication, no Data packets, no
-  unprotected chunks, no splitting a file into several chunks, no link or
-  permission packets, no parent set, and no matrix but Cauchy.
+- Creating unprotected chunks, link or permission packets, and parent sets.
 - Any command-line interface. `examples/par3rs.rs` demonstrates the API from a
   shell; it is not a tool, and nothing here is a supported front-end.
+
+## Advanced standalone creation
+
+`creation::CreationPlan::build` accepts virtual sources and explicit options for
+Cauchy or low-rate FFT, capacity, starting recovery index, interleaving, aligned
+or sliding deduplication, Data packets, and variable/uniform/size-limited volumes.
+Inspect `requirements()` for block counts, codec geometry, exact output sizes,
+and scratch bytes before calling `execute`. Deduplication windows and metadata
+must fit the supplied allocation budget. Encoding uses a caller-selected scratch
+directory. Destinations must be absent; output installation is exclusive.
+
+The original `create` API and its byte-for-byte default output remain unchanged.
+The new planner currently makes multiple source passes and uses scalar FFT
+transforms; native performance parity has not been established.
 
 ## The specification and the reference disagree
 
