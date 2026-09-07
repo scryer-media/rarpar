@@ -14,8 +14,8 @@ mod volume;
 pub use cache::CachedArchiveHeaders;
 pub use entry::Entry;
 pub use facts::{
-    RarVolumeFacts, RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
-    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeFacts, RarVolumeFactsWalk, RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts,
+    RarVolumeHostOs, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
     RarVolumeUnixOwnerFacts,
 };
 

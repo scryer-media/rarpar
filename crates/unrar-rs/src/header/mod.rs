@@ -106,6 +106,16 @@ impl From<u64> for RedirectionType {
     }
 }
 
+/// Smallest plaintext RAR5 header: a 4-byte CRC32, a one-byte header-size
+/// vint and a one-byte body. Used as the *lower* bound on what a walk that ran
+/// off the end of a partially staged stream still needs, so a caller that
+/// waits for it can never wait past the byte that would have unblocked it.
+const MIN_RAR5_HEADER_BYTES: u64 = 6;
+
+/// Smallest encrypted RAR5 header: its own 16-byte IV plus one AES block, the
+/// pair the walk must have before it can read a header size at all.
+const MIN_RAR5_ENCRYPTED_HEADER_BYTES: u64 = 32;
+
 /// Result of parsing all headers in a single volume.
 #[derive(Debug)]
 pub struct ParsedHeaders {
@@ -228,9 +238,14 @@ pub fn parse_all_headers_with_options<R: Read + Seek>(
 
 /// Parse all headers reusing a caller-owned RAR5 KDF cache.
 ///
+/// Same result as [`parse_all_headers`], and the entry point for a caller that
+/// parses the same header-encrypted (`-hp`) stream more than once: the archive
+/// key is derived from (password, salt, KDF count), so a cache that outlives
+/// the parse turns every repeat parse's PBKDF2 run into a lookup.
+///
 /// Uses [`HeaderParseOptions::default()`]; see
 /// [`parse_all_headers_with_kdf_cache_and_options`] to choose otherwise.
-pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
+pub fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
@@ -245,13 +260,32 @@ pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
 
 /// Parse all headers reusing a caller-owned RAR5 KDF cache, under explicit
 /// `options`.
-pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
+pub fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
 ) -> RarResult<ParsedHeaders> {
-    match walk_all_headers(reader, password, kdf_cache, options)? {
+    parse_all_headers_tracking_short_read(reader, password, kdf_cache, options, &mut None)
+}
+
+/// [`parse_all_headers_with_kdf_cache_and_options`], additionally reporting
+/// where the walk ran out of staged bytes.
+///
+/// `short_at` is left untouched when the walk ended on an end-of-archive
+/// record; it is set to the first offset the walk could not read when the
+/// stream simply stopped underneath it. See [`RarVolumeFactsWalk::short_at`]
+/// for what a caller does with that number.
+///
+/// [`RarVolumeFactsWalk::short_at`]: crate::RarVolumeFactsWalk::short_at
+pub(crate) fn parse_all_headers_tracking_short_read<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+    short_at: &mut Option<u64>,
+) -> RarResult<ParsedHeaders> {
+    match walk_all_headers(reader, password, kdf_cache, options, short_at)? {
         HeaderWalk::Parsed(parsed) => Ok(parsed),
         HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
     }
@@ -285,6 +319,8 @@ pub(crate) fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
 pub fn parse_header_encryption<R: Read + Seek>(
     reader: &mut R,
 ) -> RarResult<Option<encryption::EncryptionHeader>> {
+    // A no-password walk stops at the type-4 record before anything is keyed,
+    // so this parse never derives and has no cache to share.
     let kdf_cache = crate::crypto::KdfCache::new();
     let walk = walk_all_headers(
         reader,
@@ -293,6 +329,7 @@ pub fn parse_header_encryption<R: Read + Seek>(
         HeaderParseOptions {
             allow_quick_open: false,
         },
+        &mut None,
     )?;
     Ok(match walk {
         HeaderWalk::HeaderEncrypted(encryption) => Some(encryption),
@@ -319,15 +356,21 @@ fn walk_all_headers<R: Read + Seek>(
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
+    short_at: &mut Option<u64>,
 ) -> RarResult<HeaderWalk> {
     let mut result = empty_parsed_headers();
 
     // Parse plaintext headers until we hit an encryption header or end.
     loop {
+        let header_start = reader.stream_position().map_err(RarError::Io)?;
         let raw = match common::read_raw_header(reader)? {
             Some(raw) => raw,
             None => {
                 debug!("reached EOF while reading headers");
+                // The stream ran out at a header boundary with no
+                // end-of-archive record: another header needs at least its
+                // CRC32, a header-size vint and a one-byte body.
+                *short_at = Some(header_start + MIN_RAR5_HEADER_BYTES);
                 return Ok(HeaderWalk::Parsed(result));
             }
         };
@@ -368,7 +411,7 @@ fn walk_all_headers<R: Read + Seek>(
                 let mut key = kdf_cache.derive_key_rar5(pwd, &enc.salt, enc.kdf_count)?;
 
                 // Parse remaining headers — each has its own IV + padded encryption.
-                let encrypted_result = parse_encrypted_headers(reader, &key, &mut result);
+                let encrypted_result = parse_encrypted_headers(reader, &key, &mut result, short_at);
                 key.zeroize();
                 encrypted_result?;
                 return Ok(HeaderWalk::Parsed(result));
@@ -416,6 +459,7 @@ fn parse_encrypted_headers<R: Read + Seek>(
     reader: &mut R,
     key: &[u8; 32],
     result: &mut ParsedHeaders,
+    short_at: &mut Option<u64>,
 ) -> RarResult<()> {
     loop {
         let header_start = reader.stream_position().map_err(RarError::Io)?;
@@ -426,6 +470,10 @@ fn parse_encrypted_headers<R: Read + Seek>(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!("reached EOF reading encrypted header IV");
+                // Nothing short of the IV plus one cipher block can carry the
+                // next header, so that is the first offset a re-read could
+                // learn anything new from.
+                *short_at = Some(header_start + MIN_RAR5_ENCRYPTED_HEADER_BYTES);
                 break;
             }
             Err(e) => return Err(RarError::Io(e)),
@@ -2014,7 +2062,7 @@ mod tests {
             headers_from_quick_open: false,
         };
 
-        let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed);
+        let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed, &mut None);
         assert!(
             matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
             "expected non-canonical header-size vint to be rejected, got: {result:?}"

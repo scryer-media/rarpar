@@ -31,6 +31,16 @@ use crate::types::{
 };
 use types::*;
 
+/// The fixed RAR4 common header block: CRC16, type, flags and size. Used as
+/// the *lower* bound on what a scan that ran off the end of a partially staged
+/// volume still needs, so a caller that waits for it never waits past the byte
+/// that would have unblocked it.
+const MIN_RAR4_HEADER_BYTES: u64 = 7;
+
+/// The smallest a `-hp` RAR4 header can be on the wire: its own 8-byte salt
+/// plus the one AES block that carries the common block.
+const MIN_RAR4_ENCRYPTED_HEADER_BYTES: u64 = 24;
+
 /// Parsed RAR4 volume contents.
 #[derive(Debug, Clone)]
 pub struct Rar4ParsedVolume {
@@ -313,15 +323,48 @@ pub(crate) fn parse_rar4_headers_for_facts<R: Read + Seek>(
     password: Option<&str>,
 ) -> RarResult<Rar4ParsedVolume> {
     let kdf_cache = crate::crypto::KdfCache::new();
-    parse_rar4_headers_with(reader, password, &kdf_cache, UnknownLength::Tolerate)
+    parse_rar4_headers_for_facts_with_kdf_cache(reader, password, &kdf_cache, &mut None)
 }
 
-pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
+/// [`parse_rar4_headers_for_facts`] reusing a caller-owned KDF cache, and
+/// reporting where the walk ran out of staged bytes.
+///
+/// A header-encrypted (`-hp`) RAR4 volume keys each header from that header's
+/// own salt, so one volume derives more than once; a cache that outlives the
+/// parse also carries those derivations across repeated parses of the same
+/// volume, which is what a caller walking a still-arriving image does.
+pub(crate) fn parse_rar4_headers_for_facts_with_kdf_cache<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    short_at: &mut Option<u64>,
+) -> RarResult<Rar4ParsedVolume> {
+    parse_rar4_headers_with(
+        reader,
+        password,
+        kdf_cache,
+        UnknownLength::Tolerate,
+        short_at,
+    )
+}
+
+/// Parse all headers from a RAR4 volume reusing a caller-owned KDF cache.
+///
+/// Same contract as [`parse_rar4_headers`]; the cache is what makes a repeated
+/// parse of the same `-hp` volume cost one derivation per distinct header salt
+/// in total rather than per parse.
+pub fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<Rar4ParsedVolume> {
-    parse_rar4_headers_with(reader, password, kdf_cache, UnknownLength::Refuse)
+    parse_rar4_headers_with(
+        reader,
+        password,
+        kdf_cache,
+        UnknownLength::Refuse,
+        &mut None,
+    )
 }
 
 fn parse_rar4_headers_with<R: Read + Seek>(
@@ -329,6 +372,7 @@ fn parse_rar4_headers_with<R: Read + Seek>(
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
     unknown_length: UnknownLength,
+    short_at: &mut Option<u64>,
 ) -> RarResult<Rar4ParsedVolume> {
     let mut archive_header = None;
     let mut files = Vec::new();
@@ -339,7 +383,15 @@ fn parse_rar4_headers_with<R: Read + Seek>(
     let mut end = None;
 
     let mut guard = ScanGuard::new(reader, unknown_length)?;
-    while let Some(raw) = header::read_raw_header(reader)? {
+    loop {
+        let header_start = reader.stream_position().map_err(RarError::Io)?;
+        let Some(raw) = header::read_raw_header(reader)? else {
+            // The stream ended at a header boundary with no end record, so it
+            // is short rather than finished: another header needs at least the
+            // fixed seven-byte common block.
+            *short_at = Some(header_start + MIN_RAR4_HEADER_BYTES);
+            break;
+        };
         // Checked here rather than at the bottom of the body because several
         // arms `continue`. At this point the header itself has been consumed,
         // so the position is strictly ahead of the previous iteration's unless
@@ -369,6 +421,7 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                         &mut end,
                         kdf_cache,
                         unknown_length,
+                        short_at,
                     )?;
                     break;
                 }
@@ -545,14 +598,21 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
     end: &mut Option<Rar4EndHeader>,
     kdf_cache: &crate::crypto::KdfCache,
     unknown_length: UnknownLength,
+    short_at: &mut Option<u64>,
 ) -> RarResult<()> {
     let mut guard = ScanGuard::new(reader, unknown_length)?;
     loop {
+        let header_start = reader.stream_position().map_err(RarError::Io)?;
         // Each encrypted header is preceded by its own 8-byte salt.
         let mut salt = [0u8; 8];
         match reader.read_exact(&mut salt) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Short, not finished: the next header needs its salt and one
+                // cipher block before anything can be read out of it.
+                *short_at = Some(header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES);
+                break;
+            }
             Err(e) => return Err(RarError::Io(e)),
         }
 
@@ -561,7 +621,10 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
 
         let raw = match header::read_raw_header_encrypted(reader, &mut decryptor) {
             Ok(Some(raw)) => raw,
-            Ok(None) => break,
+            Ok(None) => {
+                *short_at = Some(header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES);
+                break;
+            }
             // A wrong password decrypts the header length field to garbage,
             // which typically walks the reader off the end of the archive.
             // Surface that as archive-level corruption, not a bare IO error.

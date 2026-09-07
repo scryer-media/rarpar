@@ -295,7 +295,7 @@ pub mod test_support {
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, Entry, RarArchive, RarVolumeFacts,
+    CachedArchiveHeaders, DataSegment, Entry, RarArchive, RarVolumeFacts, RarVolumeFactsWalk,
     RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
     RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
     RarVolumeUnixOwnerFacts, ReadSeek,
