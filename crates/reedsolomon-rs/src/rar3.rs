@@ -27,9 +27,21 @@ pub struct Rar3RsCoder {
     // columns.
     syn_data: [usize; MAX_PAR + 1],
     ee_pol: [usize; MAX_PAR + 1],
+    // The erasure set the cached locator polynomial (`el_pol`, `error_locs`,
+    // `dnm`) was built for. A coder is reused across every column of a
+    // volume set, where the erasures never change, but nothing stops a caller
+    // handing it a different set, and a locator for the wrong positions
+    // "corrects" the wrong bytes without any signal.
+    locator_erasures: [usize; MAX_PAR + 1],
+    locator_len: usize,
 }
 
 impl Rar3RsCoder {
+    /// Longest block `decode` accepts: data plus parity symbols together, the
+    /// GF(2^8) field size less one. A RAR3 recovery set has one symbol per
+    /// volume, so this is also the largest set of data plus recovery volumes.
+    pub const MAX_BLOCK_LEN: usize = MAX_PAR;
+
     pub fn new(par_size: usize) -> Option<Self> {
         if par_size == 0 || par_size > MAX_PAR {
             return None;
@@ -47,6 +59,8 @@ impl Rar3RsCoder {
             el_pol: [0; MAX_POL],
             syn_data: [0; MAX_PAR + 1],
             ee_pol: [0; MAX_PAR + 1],
+            locator_erasures: [0; MAX_PAR + 1],
+            locator_len: 0,
         };
         coder.gf_init();
         coder.pn_init();
@@ -96,8 +110,12 @@ impl Rar3RsCoder {
             return true;
         }
 
-        if !self.first_block_done {
+        let locator_stale =
+            !self.first_block_done || self.locator_erasures[..self.locator_len] != *erasures;
+        if locator_stale {
             self.first_block_done = true;
+            self.locator_len = erasures.len();
+            self.locator_erasures[..erasures.len()].copy_from_slice(erasures);
             self.el_pol.fill(0);
             self.el_pol[0] = 1;
 
@@ -202,8 +220,8 @@ impl Rar3RsCoder {
     /// `&mut self.ee_pol` in one call without borrowing all of `*self`.
     fn pn_mult(
         par_size: usize,
-        gf_exp: &[usize],
-        gf_log: &[usize],
+        gf_exp: &[usize; MAX_POL],
+        gf_log: &[usize; MAX_PAR + 1],
         p1: &[usize],
         p2: &[usize],
         result: &mut [usize],
@@ -225,7 +243,12 @@ impl Rar3RsCoder {
 }
 
 #[inline]
-fn gf_mult_tables(gf_exp: &[usize], gf_log: &[usize], a: usize, b: usize) -> usize {
+fn gf_mult_tables(
+    gf_exp: &[usize; MAX_POL],
+    gf_log: &[usize; MAX_PAR + 1],
+    a: usize,
+    b: usize,
+) -> usize {
     if a == 0 || b == 0 {
         0
     } else {
@@ -349,5 +372,42 @@ mod tests {
     #[test]
     fn reused_coder_matches_fresh_coder_multi_parity() {
         reused_coder_matches_fresh_coder(3, 6, &[0, 4, 7]);
+    }
+
+    /// The locator polynomial is cached from the first decode. A coder that
+    /// is then asked about a different erasure set has to rebuild it rather
+    /// than correct the positions of the previous call.
+    #[test]
+    fn reused_coder_rebuilds_its_locator_when_the_erasures_change() {
+        let encoder = Rar3RsCoder::new(2).unwrap();
+        let source = [17u8, 250, 3, 99, 128, 64];
+        let mut parity = [0u8; 2];
+        encoder.encode(&source, &mut parity);
+        let mut block = source.to_vec();
+        block.extend_from_slice(&parity);
+
+        let mut reused = Rar3RsCoder::new(2).unwrap();
+        for erasures in [&[1usize, 4][..], &[0, 5], &[3, 7], &[1, 4]] {
+            let mut damaged = block.clone();
+            for &era in erasures {
+                damaged[era] = 0;
+            }
+            let mut via_fresh = damaged.clone();
+            assert!(
+                Rar3RsCoder::new(2)
+                    .unwrap()
+                    .decode(&mut via_fresh, erasures)
+            );
+            assert!(
+                reused.decode(&mut damaged, erasures),
+                "reused coder refused erasures {erasures:?}"
+            );
+            assert_eq!(damaged, via_fresh, "erasures {erasures:?}");
+            assert_eq!(
+                &damaged[..source.len()],
+                &source[..],
+                "erasures {erasures:?}"
+            );
+        }
     }
 }

@@ -21,9 +21,9 @@ const REV5_SIGN: &[u8; 8] = b"Rar!\x1aRev";
 const REV5_PREFIX_LEN: usize = 16;
 const MAX_RAR5_VOLUMES: usize = 65_535;
 const RAR3_TOTAL_BUFFER_SIZE: usize = 64 * 1024 * 1024;
-/// A RAR3 recovery set holds at most 255 data plus recovery volumes, so one
-/// column always fits an array this size.
-const MAX_RAR3_SET: usize = 255;
+/// A RAR3 recovery set holds at most 255 data plus recovery volumes, one
+/// GF(2^8) symbol each, so one column always fits an array this size.
+const MAX_RAR3_SET: usize = Rar3RsCoder::MAX_BLOCK_LEN;
 const RAR5_TOTAL_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -742,7 +742,7 @@ fn restore_rar3(
     let rec_count = first.rec_count;
     let new_style = first.new_style;
     let total_count = data_count + rec_count;
-    if total_count > 255 {
+    if total_count > MAX_RAR3_SET {
         return Err(RarError::CorruptArchive {
             detail: "RAR3 recovery set exceeds 255 total volumes".into(),
         });
@@ -964,10 +964,7 @@ fn reconstruct_rar3(
             detail: "RAR3 recovery set exceeds 255 total volumes".into(),
         });
     }
-    let mut chunk_size = (RAR3_TOTAL_BUFFER_SIZE / total_count.max(1)).max(1);
-    if chunk_size == 0 {
-        chunk_size = 1;
-    }
+    let chunk_size = (RAR3_TOTAL_BUFFER_SIZE / total_count.max(1)).max(1);
 
     let mut inputs = slots
         .iter()
@@ -1013,6 +1010,14 @@ fn reconstruct_rar3(
     let missing_count = missing_volume_numbers.len();
     let mut restored = vec![0u8; chunk_size * missing_count];
 
+    // Built once and cloned into each rayon split below. A clone is a flat
+    // copy of the tables; `new` would rebuild the GF tables and the generator
+    // polynomial per split, and its only failure is one we can report here
+    // instead of from inside the column loop.
+    let coder_template = Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
+        detail: "RAR3 recovery set has invalid recovery count".into(),
+    })?;
+
     loop {
         let mut max_read = 0usize;
         for idx in 0..total_count {
@@ -1028,28 +1033,25 @@ fn reconstruct_rar3(
 
         // One coder per rayon split, boxed and reused across that split's
         // columns: the erasure pattern is the same for every column, which is
-        // exactly the case the coder's cached locator polynomial exists for,
-        // and building the GF tables once per split instead of once per byte
-        // position is most of the work here.
+        // exactly the case the coder's cached locator polynomial exists for.
         restored[..max_read * missing_count]
             .par_chunks_mut(missing_count)
             .enumerate()
             .try_for_each_init(
-                || Rar3RsCoder::new(rec_count).map(Box::new),
+                || Box::new(coder_template.clone()),
                 |coder, (pos, out)| {
-                    let coder = coder
-                        .as_deref_mut()
-                        .ok_or_else(|| RarError::CorruptArchive {
-                            detail: "RAR3 recovery set has invalid recovery count".into(),
-                        })?;
                     decode_rar3_column(coder, &buffers, pos, &erasures, missing_volume_numbers, out)
                 },
             )?;
 
-        for (missing_idx, &volume_idx) in missing_volume_numbers.iter().enumerate() {
-            let buffer = &mut buffers[volume_idx];
-            for pos in 0..max_read {
-                buffer[pos] = restored[pos * missing_count + missing_idx];
+        if missing_count == 1 {
+            buffers[missing_volume_numbers[0]][..max_read].copy_from_slice(&restored[..max_read]);
+        } else {
+            for (missing_idx, &volume_idx) in missing_volume_numbers.iter().enumerate() {
+                let buffer = &mut buffers[volume_idx];
+                for pos in 0..max_read {
+                    buffer[pos] = restored[pos * missing_count + missing_idx];
+                }
             }
         }
 
