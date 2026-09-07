@@ -985,8 +985,12 @@ fn reconstruct_rar3(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(RarError::Io)?;
         }
+        // Readable as well as writable: when the restored volume is the last
+        // data volume, the padding trim in `finalize_rar3_restored_output`
+        // reads the archive headers back through this same handle.
         outputs.push(
             OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create(true)
                 .truncate(options.overwrite_existing)
