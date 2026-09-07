@@ -22,7 +22,16 @@ declared slice size alone.
   ordered scan runs only when its two-slice buffer fits `memory_limit`, and
   otherwise the candidate takes the mmap scanner, which reads windows out of
   the mapping and stages nothing slice-sized. The same blocks are found either
-  way; only seeded-evidence skips are not honoured on the routed path.
+  way.
+- The mmap scanner now honours the ordered scan's seeded-evidence skips, so a
+  candidate routed off the ordered scan seeks past its settled slices without
+  touching their pages, exactly as the serial cursor does, and reports them in
+  the same `slices_settled_by_evidence` / `bytes_skipped_by_evidence` counters.
+- The mmap scanner polls the caller's cancellation token at entry and once per
+  1 MiB of rolling progress. A byte-stepping scan over a very large candidate,
+  whether it arrived there from the generic entry or from the ordered route,
+  could previously not be abandoned once under way; it now returns
+  `Par2Error::Cancelled` within roughly a millisecond of the request.
 
 ## 0.10.0
 
