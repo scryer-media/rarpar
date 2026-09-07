@@ -26,6 +26,7 @@ use std::io::{Read, Seek};
 use tracing::{debug, warn};
 
 use crate::error::{RarError, RarResult};
+use crate::short_read::{HeaderScan, ShortRead, absorb_short_read, next_needed};
 use crate::types::{
     CompressionInfo, CompressionMethod, HostOs, MemberInfo, UnixOwnerInfo, VolumeSpan,
 };
@@ -67,33 +68,21 @@ pub struct Rar4ParsedVolume {
 /// ran out. [`header::skip_forward`] closes that at the source; this guard is
 /// the backstop for any other route to a stalled scan. It costs one
 /// `stream_position` per *header* and never runs on a decode path.
-/// What a header scan does with a reader that cannot state its length — one
-/// that answers `SeekFrom::End(0)` with `ErrorKind::Unsupported`, the way a
-/// sparse image of a volume still arriving does.
 ///
-/// The answer depends on what the parsed headers are *for*. A parse that feeds
-/// the decoder must know the volume's length: [`ScanGuard::check_member_data_fits`]
-/// is what keeps a 1 KiB file declaring gigabytes of packed data out of the
-/// decode loop, and a length it cannot learn is a check it cannot make. A parse
-/// that only reports what the headers *say* — the volume-facts walk — decodes
-/// nothing, so the same reader is not a hazard to it and a volume with no end
-/// yet is exactly the input it exists for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnknownLength {
-    /// Fail the parse with the reader's own `Unsupported` error. The default
-    /// for every parse whose result can reach the decoder.
-    Refuse,
-    /// Record the length as unknown and skip the one check that needs it. For
-    /// header walks whose result is never extracted from.
-    Tolerate,
-}
-
+/// The guard also knows what the scan is *for* ([`HeaderScan`]). A reader that
+/// cannot state its length — one that answers `SeekFrom::End(0)` with
+/// `ErrorKind::Unsupported`, the way a sparse image of a volume still arriving
+/// does — is refused by a decode-bound scan, which needs the length for
+/// [`Self::check_member_data_fits`], and accepted by a facts walk, which
+/// decodes nothing and for which a volume with no end yet is the expected
+/// input.
 struct ScanGuard {
+    scan: HeaderScan,
     position: u64,
     headers: usize,
     /// The stream's length, when the reader can state one.
     ///
-    /// `None` only under [`UnknownLength::Tolerate`], for a reader that refuses
+    /// `None` only under [`HeaderScan::ForFacts`], for a reader that refuses
     /// end-relative seeks with `ErrorKind::Unsupported`. Such a reader is not a
     /// corrupt archive: the scan forgoes [`Self::check_member_data_fits`], the
     /// one check that needs a length, and keeps the other two properties.
@@ -101,13 +90,13 @@ struct ScanGuard {
 }
 
 impl ScanGuard {
-    fn new<R: Seek>(reader: &mut R, unknown_length: UnknownLength) -> RarResult<Self> {
+    fn new<R: Seek>(reader: &mut R, scan: HeaderScan) -> RarResult<Self> {
         let position = reader.stream_position().map_err(RarError::Io)?;
         let stream_len = match reader.seek(std::io::SeekFrom::End(0)) {
             Ok(len) => Some(len),
             Err(error)
                 if error.kind() == std::io::ErrorKind::Unsupported
-                    && unknown_length == UnknownLength::Tolerate =>
+                    && scan == HeaderScan::ForFacts =>
             {
                 None
             }
@@ -117,6 +106,7 @@ impl ScanGuard {
             .seek(std::io::SeekFrom::Start(position))
             .map_err(RarError::Io)?;
         Ok(Self {
+            scan,
             position,
             headers: 0,
             stream_len,
@@ -146,7 +136,7 @@ impl ScanGuard {
     ///
     /// A reader with no known length (see [`Self::stream_len`]) is not checked:
     /// there is no volume end to fit inside yet. Only a facts walk ever holds
-    /// one — [`UnknownLength::Refuse`] keeps every decoder-bound parse from
+    /// one — [`HeaderScan::ForDecode`] keeps every decoder-bound parse from
     /// reaching this arm — so nothing skipped here is ever extracted from.
     fn check_member_data_fits(
         &self,
@@ -173,6 +163,35 @@ impl ScanGuard {
             });
         }
         Ok(())
+    }
+
+    /// [`Self::check_member_data_fits`] as a facts walk sees it.
+    ///
+    /// On a reader that *can* state its length — a file or an in-memory image
+    /// of a volume still arriving — a member declaring more packed bytes than
+    /// the image holds is, to a facts walk, the image ending inside that
+    /// member's data: a short read at the data end, not corruption. This
+    /// returns that [`ShortRead`], carrying the corruption error a decode-bound
+    /// scan raises for the same bytes, so the walk can stop and report where.
+    /// Under [`HeaderScan::ForDecode`] the error is returned as before.
+    fn member_data_short_read(
+        &self,
+        name: &str,
+        data_offset: u64,
+        packed_size: u64,
+        continues: bool,
+    ) -> RarResult<Option<ShortRead>> {
+        match self.check_member_data_fits(name, data_offset, packed_size, continues) {
+            Ok(()) => Ok(None),
+            Err(error) if self.scan == HeaderScan::ForFacts => {
+                // The next header can only start past this member's data.
+                let at = data_offset
+                    .saturating_add(packed_size)
+                    .saturating_add(MIN_RAR4_HEADER_BYTES);
+                Ok(Some(ShortRead::truncated(at, error)))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Account for one accepted header, rejecting a stalled or rewound scan.
@@ -206,20 +225,24 @@ impl ScanGuard {
 /// that cannot state its length; [`parse_rar14_headers_for_facts`] is the walk
 /// for those.
 pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4ParsedVolume> {
-    parse_rar14_headers_with(reader, UnknownLength::Refuse)
+    parse_rar14_headers_with(reader, HeaderScan::ForDecode, &mut None)
 }
 
 /// [`parse_rar14_headers`] for a volume-facts walk: the result is reported,
-/// never decoded from, so a reader with no known length is accepted.
+/// never decoded from, so a reader with no known length is accepted, and an
+/// image that ends under the walk stops it with a [`ShortRead`] rather than
+/// an error.
 pub(crate) fn parse_rar14_headers_for_facts<R: Read + Seek>(
     reader: &mut R,
+    short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
-    parse_rar14_headers_with(reader, UnknownLength::Tolerate)
+    parse_rar14_headers_with(reader, HeaderScan::ForFacts, short)
 }
 
 fn parse_rar14_headers_with<R: Read + Seek>(
     reader: &mut R,
-    unknown_length: UnknownLength,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
     let main_offset = reader.stream_position().map_err(RarError::Io)?;
     let mut main = [0u8; 7];
@@ -244,13 +267,18 @@ fn parse_rar14_headers_with<R: Read + Seek>(
     }
 
     let mut files = Vec::new();
-    let mut guard = ScanGuard::new(reader, unknown_length)?;
+    let mut guard = ScanGuard::new(reader, scan)?;
     loop {
         let offset = reader.stream_position().map_err(RarError::Io)?;
+        // The least the next header can occupy: its fixed 21-byte block.
+        let floor = offset + 21;
         let mut fixed = [0u8; 21];
         match reader.read_exact(&mut fixed) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                *short = Some(ShortRead::at_boundary(floor));
+                break;
+            }
             Err(e) => return Err(RarError::Io(e)),
         }
 
@@ -265,19 +293,32 @@ fn parse_rar14_headers_with<R: Read + Seek>(
         if extra > 0 {
             let start = data.len();
             data.resize(start + extra, 0);
-            reader.read_exact(&mut data[start..]).map_err(|e| {
+            let read = reader.read_exact(&mut data[start..]).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     RarError::TruncatedHeader { offset }
                 } else {
                     RarError::Io(e)
                 }
-            })?;
+            });
+            if absorb_short_read(read, scan, reader, floor, short)?.is_none() {
+                break;
+            }
         }
 
         let Some(fh) = header::parse_rar14_file_header(&data, offset)? else {
             break;
         };
-        guard.check_member_data_fits(&fh.name, fh.data_offset, fh.packed_size, fh.split_after)?;
+        if let Some(short_read) = guard.member_data_short_read(
+            &fh.name,
+            fh.data_offset,
+            fh.packed_size,
+            fh.split_after,
+        )? {
+            // The header is whole; only its data is not here yet.
+            files.push(fh);
+            *short = Some(short_read);
+            break;
+        }
         let skip_size = fh.packed_size;
         files.push(fh);
         header::skip_forward(reader, skip_size)?;
@@ -305,7 +346,7 @@ fn parse_rar14_headers_with<R: Read + Seek>(
 /// If the archive uses header-level encryption (`-hp`), the password is
 /// required to decrypt headers.
 ///
-/// Refuses a reader that cannot state its length (see [`UnknownLength`]);
+/// Refuses a reader that cannot state its length (see [`HeaderScan`]);
 /// [`parse_rar4_headers_for_facts`] is the walk for those.
 pub fn parse_rar4_headers<R: Read + Seek>(
     reader: &mut R,
@@ -337,15 +378,9 @@ pub(crate) fn parse_rar4_headers_for_facts_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
-    short_at: &mut Option<u64>,
+    short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
-    parse_rar4_headers_with(
-        reader,
-        password,
-        kdf_cache,
-        UnknownLength::Tolerate,
-        short_at,
-    )
+    parse_rar4_headers_with(reader, password, kdf_cache, HeaderScan::ForFacts, short)
 }
 
 /// Parse all headers from a RAR4 volume reusing a caller-owned KDF cache.
@@ -353,7 +388,7 @@ pub(crate) fn parse_rar4_headers_for_facts_with_kdf_cache<R: Read + Seek>(
 /// Same contract as [`parse_rar4_headers`]; the cache is what makes a repeated
 /// parse of the same `-hp` volume cost one derivation per distinct header salt
 /// in total rather than per parse.
-pub fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
+pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
@@ -362,7 +397,7 @@ pub fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
         reader,
         password,
         kdf_cache,
-        UnknownLength::Refuse,
+        HeaderScan::ForDecode,
         &mut None,
     )
 }
@@ -371,8 +406,8 @@ fn parse_rar4_headers_with<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
-    unknown_length: UnknownLength,
-    short_at: &mut Option<u64>,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
     let mut archive_header = None;
     let mut files = Vec::new();
@@ -382,16 +417,25 @@ fn parse_rar4_headers_with<R: Read + Seek>(
     let mut recovery_records = Vec::new();
     let mut end = None;
 
-    let mut guard = ScanGuard::new(reader, unknown_length)?;
+    let mut guard = ScanGuard::new(reader, scan)?;
     loop {
         let header_start = reader.stream_position().map_err(RarError::Io)?;
-        let Some(raw) = header::read_raw_header(reader)? else {
-            // The stream ended at a header boundary with no end record, so it
-            // is short rather than finished: another header needs at least the
-            // fixed seven-byte common block.
-            *short_at = Some(header_start + MIN_RAR4_HEADER_BYTES);
-            break;
-        };
+        // The least the next header can occupy: the fixed seven-byte common
+        // block.
+        let floor = header_start + MIN_RAR4_HEADER_BYTES;
+        let raw =
+            match absorb_short_read(header::read_raw_header(reader), scan, reader, floor, short)? {
+                Some(Some(raw)) => raw,
+                Some(None) => {
+                    // The stream ended at a header boundary with no end record, so
+                    // it is short rather than finished.
+                    *short = Some(ShortRead::at_boundary(floor));
+                    break;
+                }
+                // A facts walk over an image that ends inside this header: `short`
+                // now says where, and what a strict parse raises.
+                None => break,
+            };
         // Checked here rather than at the bottom of the body because several
         // arms `continue`. At this point the header itself has been consumed,
         // so the position is strictly ahead of the previous iteration's unless
@@ -420,8 +464,8 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                         &mut old_services,
                         &mut end,
                         kdf_cache,
-                        unknown_length,
-                        short_at,
+                        scan,
+                        short,
                     )?;
                     break;
                 }
@@ -433,12 +477,17 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                     "RAR4 file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
-                guard.check_member_data_fits(
+                if let Some(short_read) = guard.member_data_short_read(
                     &fh.name,
                     fh.data_offset,
                     fh.packed_size,
                     fh.split_after,
-                )?;
+                )? {
+                    // The header is whole; only its data is not here yet.
+                    files.push(fh);
+                    *short = Some(short_read);
+                    break;
+                }
                 // For files with LARGE flag, the raw header's data_area_size only
                 // has the low 32 bits. Use the fully-resolved packed_size instead.
                 let skip_size = fh.packed_size;
@@ -466,12 +515,18 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                     "RAR4 service: name={:?} packed={} unpacked={:?} method={:?}",
                     service.name, service.packed_size, service.unpacked_size, service.method
                 );
-                guard.check_member_data_fits(
+                if let Some(short_read) = guard.member_data_short_read(
                     &service.name,
                     service.data_offset,
                     service.packed_size,
                     service.split_after,
-                )?;
+                )? {
+                    // The header is whole; only its data is not here yet.
+                    attach_rar4_uowner_to_previous_file(&service, &mut files);
+                    services.push(service);
+                    *short = Some(short_read);
+                    break;
+                }
                 attach_rar4_uowner_to_previous_file(&service, &mut files);
                 let skip_size = service.packed_size;
                 services.push(service);
@@ -597,20 +652,21 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
     old_services: &mut Vec<Rar4OldServiceHeader>,
     end: &mut Option<Rar4EndHeader>,
     kdf_cache: &crate::crypto::KdfCache,
-    unknown_length: UnknownLength,
-    short_at: &mut Option<u64>,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
 ) -> RarResult<()> {
-    let mut guard = ScanGuard::new(reader, unknown_length)?;
+    let mut guard = ScanGuard::new(reader, scan)?;
     loop {
         let header_start = reader.stream_position().map_err(RarError::Io)?;
+        // The least the next header can occupy: its salt and one cipher block.
+        let floor = header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES;
         // Each encrypted header is preceded by its own 8-byte salt.
         let mut salt = [0u8; 8];
         match reader.read_exact(&mut salt) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Short, not finished: the next header needs its salt and one
-                // cipher block before anything can be read out of it.
-                *short_at = Some(header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES);
+                // Short, not finished.
+                *short = Some(ShortRead::at_boundary(floor));
                 break;
             }
             Err(e) => return Err(RarError::Io(e)),
@@ -622,17 +678,25 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
         let raw = match header::read_raw_header_encrypted(reader, &mut decryptor) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
-                *short_at = Some(header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES);
+                *short = Some(ShortRead::at_boundary(floor));
                 break;
             }
             // A wrong password decrypts the header length field to garbage,
             // which typically walks the reader off the end of the archive.
             // Surface that as archive-level corruption, not a bare IO error.
+            // A facts walk cannot tell that from an image that simply ends
+            // inside the header, so it records the short read and lets the
+            // caller find out once the whole volume is in.
             Err(RarError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(RarError::CorruptArchive {
+                let error = RarError::CorruptArchive {
                     detail: "RAR4 encrypted header truncated: damaged archive or wrong password"
                         .into(),
-                });
+                };
+                if scan == HeaderScan::ForFacts {
+                    *short = Some(ShortRead::truncated(next_needed(reader, floor), error));
+                    break;
+                }
+                return Err(error);
             }
             Err(e) => return Err(e),
         };
@@ -649,12 +713,17 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                     "RAR4 encrypted file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
-                guard.check_member_data_fits(
+                if let Some(short_read) = guard.member_data_short_read(
                     &fh.name,
                     fh.data_offset,
                     fh.packed_size,
                     fh.split_after,
-                )?;
+                )? {
+                    // The header is whole; only its data is not here yet.
+                    files.push(fh);
+                    *short = Some(short_read);
+                    break;
+                }
                 let skip_size = fh.packed_size;
                 files.push(fh);
                 header::skip_forward(reader, skip_size)?;
@@ -666,12 +735,18 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                     "RAR4 encrypted service: name={:?} packed={} unpacked={:?} method={:?}",
                     service.name, service.packed_size, service.unpacked_size, service.method
                 );
-                guard.check_member_data_fits(
+                if let Some(short_read) = guard.member_data_short_read(
                     &service.name,
                     service.data_offset,
                     service.packed_size,
                     service.split_after,
-                )?;
+                )? {
+                    // The header is whole; only its data is not here yet.
+                    attach_rar4_uowner_to_previous_file(&service, files);
+                    services.push(service);
+                    *short = Some(short_read);
+                    break;
+                }
                 attach_rar4_uowner_to_previous_file(&service, files);
                 let skip_size = service.packed_size;
                 services.push(service);

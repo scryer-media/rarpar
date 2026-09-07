@@ -496,6 +496,16 @@ pub(crate) use blake2sp_simd::{Blake2spLeafGroup, GROUP_LEAVES};
 
 const KDF_CACHE_SLOTS: usize = 4;
 
+/// RAR4 keys each `-hp` header from that header's own salt, so a volume walk
+/// derives once per header and a repeat walk of the same image — a volume
+/// still arriving, parsed as each piece lands — only stays cheap while every
+/// one of those salts is still cached. Four slots would evict the first salt
+/// before the second walk reached it and then miss on every header in turn,
+/// so the RAR4 side holds enough for any volume a facts walk plausibly sees.
+/// Lookups stay a linear scan: each entry is checked by its 8-byte salt first,
+/// and the whole table costs under 128 KiB.
+const KDF3_CACHE_SLOTS: usize = 1024;
+
 /// Cached RAR5 key derivation result.
 #[derive(Debug)]
 struct Kdf5Entry {
@@ -562,7 +572,7 @@ impl KdfCache {
     pub fn new() -> Self {
         Self {
             rar5: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
-            rar4: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
+            rar4: Mutex::new((Vec::new(), 0)),
             rar5_derivations: AtomicU64::new(0),
             rar4_derivations: AtomicU64::new(0),
         }
@@ -665,9 +675,10 @@ impl KdfCache {
         let mut guard = self.rar4.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
-        // Check cache.
+        // Check cache. The salt is compared first: it is the field that
+        // differs between entries of one `-hp` volume, and it is eight bytes.
         for entry in entries.iter() {
-            if entry.password == password && entry.salt.as_ref() == salt {
+            if entry.salt.as_ref() == salt && entry.password == password {
                 return (entry.key, entry.iv);
             }
         }
@@ -683,12 +694,12 @@ impl KdfCache {
             iv,
         };
 
-        if entries.len() < KDF_CACHE_SLOTS {
+        if entries.len() < KDF3_CACHE_SLOTS {
             entries.push(entry);
         } else {
             entries[*pos] = entry;
         }
-        *pos = (*pos + 1) % KDF_CACHE_SLOTS;
+        *pos = (*pos + 1) % KDF3_CACHE_SLOTS;
 
         (key, iv)
     }
@@ -3821,6 +3832,27 @@ mod tests {
             check
         }));
         assert_eq!(cache.rar5_derivation_count(), 4);
+    }
+
+    #[test]
+    fn rar4_kdf_cache_holds_every_salt_of_a_many_header_volume() {
+        // An `-hp` RAR4 volume salts every header separately; a walk that is
+        // repeated over a still-arriving image must find all of them again.
+        let cache = KdfCache::new();
+        let salts: Vec<[u8; 8]> = (0..64u64).map(|i| i.to_le_bytes()).collect();
+        for salt in &salts {
+            cache.derive_key_rar4("cache-pass", Some(salt));
+        }
+        assert_eq!(cache.rar4_derivation_count(), salts.len() as u64);
+        for salt in &salts {
+            cache.derive_key_rar4("cache-pass", Some(salt));
+        }
+        assert_eq!(
+            cache.rar4_derivation_count(),
+            salts.len() as u64,
+            "a second pass over the same salts derives nothing"
+        );
+        assert!(KDF3_CACHE_SLOTS > salts.len());
     }
 
     #[test]

@@ -256,6 +256,7 @@ pub mod progress;
 // RAR5 volume's headers without opening it; there is no such use for these.
 pub(crate) mod rar4;
 pub mod recovery;
+pub(crate) mod short_read;
 pub mod signature;
 pub mod stored_layout;
 pub mod types;
