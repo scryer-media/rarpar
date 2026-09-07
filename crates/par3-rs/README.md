@@ -181,8 +181,11 @@ The incremental `Par3RepairSession` also provides:
 
 Still unsupported:
 
-- Repairing the recovery volumes themselves. A recovery block that does not
-  parse is not available to a repair, and nothing puts it back.
+- Inferring the original layout of an unknown recovery carrier. `carrier::CarrierPlan`
+  captures a complete authenticated carrier manifest for exact reconstruction;
+  `replacement` explicitly plans a valid replacement when that manifest is absent.
+  Execution requires verified or reconstructed input blocks and stages a separate
+  output. Reports distinguish exact restoration from replacement.
 - Sparse and explicit matrix execution, high-rate FFT, and automatic directory
   discovery. The original convenience repair API remains Cauchy-only.
 - Checking a block of packed tails as a block. Each file's own tail is checked

@@ -62,8 +62,9 @@
 //!
 //! The following capabilities are not implemented:
 //!
-//! - Repairing damaged recovery volumes. A recovery block that does not parse is
-//!   simply not available to a repair; nothing puts it back.
+//! - Inferring an unknown recovery carrier's original layout. [`carrier`]
+//!   reconstructs captured layouts exactly, or writes an explicitly requested
+//!   replacement from verified input blocks and authenticated matrix metadata.
 //! - Sparse and explicit matrix execution, and high-rate FFT. Low-rate FFT
 //!   execution is available through [`fft`] and the retained session.
 //! - Automatic directory discovery. [`placement`] accepts explicit candidates
@@ -129,6 +130,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod carrier;
 pub mod cauchy;
 pub mod create;
 pub mod creation;
