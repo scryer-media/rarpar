@@ -8,27 +8,47 @@ binary.
 
 ```toml
 [dependencies]
-par2-rs = "0.4"
+par2-rs = "0.10"
 ```
 
 ## Usage
 
 ```rust
-use par2_rs::{DiskFileAccess, Par2FileSet, scan_packets_from_path, verify_all};
+use par2_rs::{DiskFileAccess, Par2FileSet, Repairability, scan_packets_from_path, verify_all};
+use std::path::Path;
 
-let packets = scan_packets_from_path("release.par2".as_ref())?
-    .into_iter()
-    .map(|(packet, _offset)| packet)
-    .collect();
-let set = Par2FileSet::from_packets(packets)?;
+fn main() -> par2_rs::Result<()> {
+    let packets = scan_packets_from_path(Path::new("release.par2"))?
+        .into_iter()
+        .map(|(packet, _offset)| packet)
+        .collect();
+    let set = Par2FileSet::from_packets(packets)?;
 
-let access = DiskFileAccess::new("/downloads/release".into(), &set);
-let result = verify_all(&set, &access);
-println!("{} blocks missing", result.total_missing_blocks);
+    let access = DiskFileAccess::new("/downloads/release".into(), &set);
+    let result = verify_all(&set, &access);
+
+    println!("{} recovery blocks available", result.recovery_blocks_available);
+    match result.repairable {
+        Repairability::NotNeeded => println!("everything verified clean"),
+        Repairability::Repairable { blocks_needed, .. } => {
+            println!("repairable: {blocks_needed} blocks to rebuild")
+        }
+        Repairability::Insufficient { blocks_needed, .. } => {
+            println!("not enough recovery data: {blocks_needed} blocks short")
+        }
+        other => println!("{other:?}"),
+    }
+    Ok(())
+}
 ```
 
 `Par2Repairer` drives the full sequence: scan, verify, solve, repair, verify
 again.
+
+`Par2RepairSession` retains verification evidence while a download is still
+arriving, so assessment is incremental and repair uses what is already known.
+Its source can be files under a base directory, a `FileAccess` implementation,
+or an already-parsed set; repair output is always real files.
 
 ## Capabilities
 
@@ -49,24 +69,32 @@ ordinary implementation, but supplying your own allows verification against
 bytes that are still arriving over a network, or that are assembled from a
 source with no file paths at all.
 
+## Feature flags
+
+- `native-crypto` *(default)*: AWS-LC-backed MD5.
+- `metal` / `wgpu`: GPU-accelerated repair through `reedsolomon-rs`, with CPU
+  fallback when no suitable device or driver is present. On native Apple
+  Silicon, `metal` also enables policy-driven creation through
+  `CreationBackend`.
+
 ## Performance
 
 `2.0×` means `rarpar` finished in half the time:
 
 | CPU | Arch | Instruction set | par2 (heavy) |
 |---|---|---|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.3× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 2.3× |
-| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.8× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× |
-| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.9× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.4× |
-| Apple M5 Max | arm64 | NEON | 7.2× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 1.8× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.7× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.9× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.5× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.3× |
+| Apple M5 Max | arm64 | NEON | 7.1× |
 | Arm Cortex-A72 | arm64 | NEON | 1.2× |
-| Arm Neoverse N1 | arm64 | NEON | 1.5× |
+| Arm Neoverse N1 | arm64 | NEON | 1.4× |
 | Arm Neoverse V2 | arm64 | NEON | 1.5× |
 
+The Apple row is the CPU lane, measured against upstream's published macOS
+arm64 reference binary.
 
 Per-case charts for every machine, the full methodology, and the versions
 these numbers were measured with:
