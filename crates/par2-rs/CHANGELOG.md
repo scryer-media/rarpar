@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.1
+
+The ordered canonical scan no longer sizes its rolling buffer from the set's
+declared slice size alone.
+
+### Fixed
+
+- A set's Main packet may declare any slice size that is nonzero and a
+  multiple of 4. The generic scanner has long routed slices past 8 MiB to the
+  mmap scanner, but the ordered canonical scan — the path a described file
+  takes once its complete-file check fails — staged a two-slice rolling buffer
+  straight from the declared size, on its serial cursor and on the parallel
+  scan's gap resync alike, and the repair memory limit never weighed it. A set
+  declaring a multi-gigabyte slice against a file at least that long (a sparse
+  file will do) made the scan allocate twice that: an allocator abort or an
+  out-of-memory kill of the host process, not a reported failure. The ordered
+  scan now decides before its first slice-sized allocation. A slice up to
+  8 MiB always streams through the ring, so a small configured limit does not
+  change how ordinary sets scan; past that the ring is used only when its two
+  slices fit `memory_limit`, and otherwise the same ordered walk runs over a
+  mapped window source that stages nothing slice-sized. The walk keeps every
+  ordered jump either way, so a candidate with a huge slice is still visited
+  once per matched slice and not once per byte, and it honours the same
+  seeded-evidence skips. On `wasm` targets, which have no mapping to read
+  through, an unaffordable slice is reported as
+  `Par2Error::ResourceLimitExceeded` instead of attempted.
+- Cancellation now reaches the serial ordered walk and the mmap scanner. Both
+  poll the caller's token at entry, once per 1 MiB of rolling progress, and
+  inside every whole-window hash — the window is the declared slice, so a
+  request landing during that hash no longer waits for the whole slice. A
+  byte-stepping scan over a very large candidate could previously not be
+  abandoned once under way; it now returns `Par2Error::Cancelled` within
+  roughly a millisecond of the request.
+
 ## 0.10.0
 
 A caller can now say which files in the working directory the extra scan must

@@ -47,6 +47,14 @@ const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
 const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
+/// Scan progress between cancellation polls: byte steps on a rolling walk,
+/// and bytes hashed inside one window's CRC.
+///
+/// Coarse on purpose: the poll is an atomic load, and one per byte step would
+/// sit inside the CRC slide. At 1 MiB a cancel is observed within roughly a
+/// millisecond of scanning work, while the check itself is one predictable
+/// compare per step.
+const SCANNER_CANCEL_CHECK_BYTES: usize = 1024 * 1024;
 const SCANNER_PARALLEL_SEGMENT_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const ORDERED_SCAN_SERIAL_ENV: &str = "WEAVER_PAR2_SERIAL_SCAN";
 const ORDERED_SCAN_PARALLEL_ENV: &str = "WEAVER_PAR2_PARALLEL_SCAN";
@@ -850,6 +858,9 @@ fn settled_byte_runs(settled: &[bool], slice_size: usize, len: usize) -> Vec<(us
 enum FileScanMode {
     Complete,
     OrderedCanonical,
+    /// The ordered walk over a mapped window source: the same jumps and the
+    /// same matches, taken when the two-slice ring is unaffordable.
+    OrderedCanonicalMapped,
     OrderedCanonicalParallel,
     RollingGeneric,
 }
@@ -859,6 +870,7 @@ impl FileScanMode {
         match self {
             Self::Complete => "complete",
             Self::OrderedCanonical => "ordered_canonical",
+            Self::OrderedCanonicalMapped => "ordered_canonical_mapped",
             Self::OrderedCanonicalParallel => "ordered_canonical_parallel",
             Self::RollingGeneric => "rolling_generic",
         }
@@ -4021,6 +4033,7 @@ impl RepairState {
                     skip_data: options.scan_skip_data,
                     skip_leeway: options.scan_skip_leeway,
                 },
+                options.cancel.as_ref(),
             )?
         };
 
@@ -5390,6 +5403,299 @@ impl Drop for OrderedWindowCursor<'_> {
     }
 }
 
+/// Which window source the serial ordered walk reads through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkCursorKind {
+    /// The two-slice ring, streamed off the file.
+    Ring,
+    /// Windows read out of a mapping; nothing slice-sized is staged.
+    Mapped,
+}
+
+/// The ordered walk's window source, in the shape [`OrderedWindowCursor`]
+/// gave it.
+///
+/// The walk itself does not care where its windows come from; it wants an
+/// offset, a window, a CRC, and a way to step, jump, and seek. The ring is the
+/// right source whenever its two slices fit the repair memory limit, because
+/// it streams the file exactly once and never faults a page it has not asked
+/// for. When the declared slice makes the ring unaffordable, the same walk
+/// runs over [`MappedWindowCursor`] instead: on native targets a mapping
+/// stages nothing, and the walk keeps every ordered jump, so a candidate with
+/// a huge slice is still visited once per matched slice rather than once per
+/// byte.
+///
+/// A two-variant match per call, not a trait object: the ring's `step` is the
+/// serial scan's hot path and stays monomorphic behind one predictable
+/// branch.
+enum OrderedWalkCursor<'a> {
+    Ring(OrderedWindowCursor<'a>),
+    Mapped(MappedWindowCursor<'a>),
+}
+
+impl<'a> OrderedWalkCursor<'a> {
+    fn open(
+        kind: WalkCursorKind,
+        path: &Path,
+        block_size: usize,
+        window_table: &'a [u32; 256],
+        start: usize,
+        cancel: Option<&'a CancellationToken>,
+    ) -> Result<Self> {
+        match kind {
+            WalkCursorKind::Ring => Ok(Self::Ring(OrderedWindowCursor::new_at(
+                path,
+                block_size,
+                window_table,
+                start,
+            )?)),
+            WalkCursorKind::Mapped => {
+                // wasip1 has no mmap: `MappedFile` there is the whole file
+                // read into a `Vec`, which is the allocation this cursor
+                // exists to avoid, only larger. Report the limit instead.
+                if cfg!(target_family = "wasm") {
+                    return Err(Par2Error::ResourceLimitExceeded {
+                        reason: format!(
+                            "PAR2 slice size {block_size} needs a {} byte scan buffer, \
+                             which this target cannot map",
+                            block_size.saturating_mul(2)
+                        ),
+                    });
+                }
+                Ok(Self::Mapped(MappedWindowCursor::new_at(
+                    path,
+                    block_size,
+                    window_table,
+                    start,
+                    cancel,
+                )?))
+            }
+        }
+    }
+
+    #[inline]
+    fn last_full_offset(&self) -> usize {
+        match self {
+            Self::Ring(cursor) => cursor.last_full_offset(),
+            Self::Mapped(cursor) => cursor.last_full_offset(),
+        }
+    }
+
+    #[inline]
+    fn offset(&self) -> usize {
+        match self {
+            Self::Ring(cursor) => cursor.offset(),
+            Self::Mapped(cursor) => cursor.offset(),
+        }
+    }
+
+    #[inline]
+    fn data(&self) -> &[u8] {
+        match self {
+            Self::Ring(cursor) => cursor.data(),
+            Self::Mapped(cursor) => cursor.data(),
+        }
+    }
+
+    #[inline]
+    fn crc(&self) -> u32 {
+        match self {
+            Self::Ring(cursor) => cursor.crc(),
+            Self::Mapped(cursor) => cursor.crc(),
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Ring(cursor) => cursor.bytes_read(),
+            Self::Mapped(cursor) => cursor.bytes_read(),
+        }
+    }
+
+    #[inline]
+    fn step(&mut self) -> Result<bool> {
+        match self {
+            Self::Ring(cursor) => Ok(cursor.step()?),
+            Self::Mapped(cursor) => Ok(cursor.step()),
+        }
+    }
+
+    fn jump(&mut self, distance: usize) -> Result<bool> {
+        match self {
+            Self::Ring(cursor) => Ok(cursor.jump(distance)?),
+            Self::Mapped(cursor) => cursor.jump(distance),
+        }
+    }
+
+    fn seek_to(&mut self, start: usize) -> Result<bool> {
+        match self {
+            Self::Ring(cursor) => Ok(cursor.seek_to(start)?),
+            Self::Mapped(cursor) => cursor.seek_to(start),
+        }
+    }
+}
+
+/// [`OrderedWindowCursor`]'s contract over a mapped file.
+///
+/// The ring reads every byte between its first offset and wherever the walk
+/// ends, in two-slice fills. This cursor reads nothing ahead of time: a window
+/// is a slice of the mapping, a step slides it one byte, and a jump or seek
+/// hashes the window it lands on. `bytes_read` is the high-water mark of bytes
+/// any window has covered since the last seek, summed across seeks, so the
+/// walk's "what the skips saved" arithmetic holds here too — measured, and
+/// never more than the ring would have streamed for the same walk.
+struct MappedWindowCursor<'a> {
+    file: File,
+    path: PathBuf,
+    map: MappedFile,
+    len: usize,
+    block_size: usize,
+    first_offset: usize,
+    current_offset: usize,
+    /// One past the highest byte a window has covered. Bytes a seek passes
+    /// over never move it.
+    touched_end: usize,
+    crc: u32,
+    bytes_read: u64,
+    window_table: &'a [u32; 256],
+    cancel: Option<&'a CancellationToken>,
+}
+
+impl<'a> MappedWindowCursor<'a> {
+    fn new_at(
+        path: &Path,
+        block_size: usize,
+        window_table: &'a [u32; 256],
+        start: usize,
+        cancel: Option<&'a CancellationToken>,
+    ) -> Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        crate::file_cache::advise_range_sequential(
+            &file,
+            path,
+            start as u64,
+            len.saturating_sub(start) as u64,
+        );
+        let map = MappedFile::map(&file)?;
+        let mut cursor = Self {
+            file,
+            path: path.to_path_buf(),
+            map,
+            len,
+            block_size,
+            first_offset: start,
+            current_offset: start,
+            touched_end: start,
+            crc: 0,
+            bytes_read: 0,
+            window_table,
+            cancel,
+        };
+        cursor.crc = cursor.window_crc()?;
+        Ok(cursor)
+    }
+
+    fn last_full_offset(&self) -> usize {
+        self.len - self.block_size
+    }
+
+    fn offset(&self) -> usize {
+        self.current_offset
+    }
+
+    #[inline]
+    fn data(&self) -> &[u8] {
+        &self.map[self.current_offset..self.current_offset + self.block_size]
+    }
+
+    fn crc(&self) -> u32 {
+        self.crc
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Account for the window at the current offset having been read.
+    fn touch_window(&mut self) {
+        let end = self.current_offset + self.block_size;
+        if end > self.touched_end {
+            self.bytes_read = self
+                .bytes_read
+                .saturating_add((end - self.touched_end) as u64);
+            self.touched_end = end;
+        }
+    }
+
+    /// Hash the window at the current offset, polling cancellation as it goes.
+    fn window_crc(&mut self) -> Result<u32> {
+        let crc = crc32_polled(self.data(), self.cancel)?;
+        self.touch_window();
+        Ok(crc)
+    }
+
+    #[inline]
+    fn step(&mut self) -> bool {
+        if self.current_offset >= self.last_full_offset() {
+            self.current_offset = self.last_full_offset().saturating_add(1);
+            return false;
+        }
+        let outgoing = self.map[self.current_offset];
+        let incoming = self.map[self.current_offset + self.block_size];
+        self.current_offset += 1;
+        self.crc = crc_slide_char(self.crc, incoming, outgoing, self.window_table);
+        self.touch_window();
+        true
+    }
+
+    fn jump(&mut self, mut distance: usize) -> Result<bool> {
+        if distance == 0 {
+            return Ok(self.current_offset <= self.last_full_offset());
+        }
+        if distance == 1 {
+            return Ok(self.step());
+        }
+        distance = distance.min(self.block_size);
+        let next_offset = self.current_offset.saturating_add(distance);
+        if next_offset > self.last_full_offset() {
+            self.current_offset = self.last_full_offset().saturating_add(1);
+            return Ok(false);
+        }
+        self.current_offset = next_offset;
+        self.crc = self.window_crc()?;
+        Ok(true)
+    }
+
+    /// Restart the window at `start`, touching nothing in between. The same
+    /// contract as the ring's seek: sound only where something else already
+    /// explains the bytes passed over.
+    fn seek_to(&mut self, start: usize) -> Result<bool> {
+        if start > self.last_full_offset() {
+            self.current_offset = self.last_full_offset().saturating_add(1);
+            return Ok(false);
+        }
+        if start == self.current_offset {
+            return Ok(true);
+        }
+        self.current_offset = start;
+        self.crc = self.window_crc()?;
+        Ok(true)
+    }
+}
+
+impl Drop for MappedWindowCursor<'_> {
+    fn drop(&mut self) {
+        crate::file_cache::drop_touched_file_cache(
+            &self.file,
+            &self.path,
+            self.len as u64,
+            self.first_offset as u64,
+            self.touched_end.saturating_sub(self.first_offset) as u64,
+        );
+    }
+}
+
 impl<'a> RollingBlockScanner<'a> {
     fn new(table: &'a VerificationHashTable, slice_size: u64) -> Self {
         Self {
@@ -5436,12 +5742,14 @@ impl<'a> RollingBlockScanner<'a> {
             file_index_by_id,
             &mut state,
             scan_options,
+            None,
         )?;
         self.relocate_open_short_blocks_in(path, kind, &mut state)?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_file_with_state_options(
         &self,
         path: &Path,
@@ -5450,15 +5758,17 @@ impl<'a> RollingBlockScanner<'a> {
         file_index_by_id: &HashMap<FileId, usize>,
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
+        cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         if scanner_uses_mmap_fallback(self.table.slice_size) {
-            return self.scan_file_mmap_with_state_options(
+            return self.scan_file_mmap_state(
                 path,
                 kind,
                 files,
                 file_index_by_id,
                 blocks,
                 scan_options,
+                cancel,
             );
         }
 
@@ -5543,6 +5853,17 @@ impl<'a> RollingBlockScanner<'a> {
         // false (or empty) is the default and every pre-policy caller.
         settled: &[bool],
     ) -> Result<FileScanStats> {
+        // Decide before the first slice-sized allocation. The serial cursor
+        // and the parallel scan's gap resync both stage a ring of two full
+        // slices that no admission check weighs, so a declared slice whose
+        // ring the limit cannot afford takes the serial walk over a mapped
+        // window source instead: the same ordered jumps and the same matches,
+        // with nothing slice-sized staged.
+        let cursor_kind = if ordered_scan_ring_fits(self.table.slice_size, memory_limit) {
+            WalkCursorKind::Ring
+        } else {
+            WalkCursorKind::Mapped
+        };
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
         // the serial scanner; single-thread pools do too. `inner_parallel`
         // is false when the caller is already fanning out across candidate
@@ -5567,6 +5888,7 @@ impl<'a> RollingBlockScanner<'a> {
         if !reedsolomon_rs::threading::parallel_enabled()
             || scan_options.skip_data
             || has_settled_skips
+            || cursor_kind == WalkCursorKind::Mapped
             || ordered_scan_force_serial()
             || !ordered_scan_parallel_enabled()
             || !inner_parallel
@@ -5580,6 +5902,8 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 scan_options,
                 settled,
+                cursor_kind,
+                cancel,
             );
         }
         let segment_windows = ordered_scan_segment_windows(self.table.slice_size as usize);
@@ -5606,6 +5930,8 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 scan_options,
                 settled,
+                cursor_kind,
+                cancel,
             ),
         }
     }
@@ -5620,9 +5946,16 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
         settled: &[bool],
+        cursor_kind: WalkCursorKind,
+        cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         let len = fs::metadata(path)?.len() as usize;
-        let mut stats = FileScanStats::new(FileScanMode::OrderedCanonical, len as u64);
+        let mode = match cursor_kind {
+            WalkCursorKind::Ring => FileScanMode::OrderedCanonical,
+            WalkCursorKind::Mapped => FileScanMode::OrderedCanonicalMapped,
+        };
+        let mut stats = FileScanStats::new(mode, len as u64);
+        check_cancel_token(cancel)?;
         let slice_size = self.table.slice_size as usize;
         if len == 0 || slice_size == 0 {
             return Ok(stats);
@@ -5674,13 +6007,20 @@ impl<'a> RollingBlockScanner<'a> {
             )?;
             return Ok(stats);
         }
-        let mut cursor =
-            OrderedWindowCursor::new_at(path, slice_size, &self.window_table, entry_offset)?;
+        let mut cursor = OrderedWalkCursor::open(
+            cursor_kind,
+            path,
+            slice_size,
+            &self.window_table,
+            entry_offset,
+            cancel,
+        )?;
         let entry_local = entry_offset / slice_size;
         let mut preferred_next = ordered_full_blocks
             .iter()
             .position(|block_index| *block_index >= target_file.first_block + entry_local);
         let mut current_step_run = 0u64;
+        let mut steps_since_poll = 0usize;
         let scan_distance = scan_options.scan_distance(slice_size);
         let scan_skip = if scan_distance > 0 {
             slice_size.saturating_sub(scan_distance)
@@ -5767,6 +6107,11 @@ impl<'a> RollingBlockScanner<'a> {
 
             stats.windows_stepped += 1;
             current_step_run += 1;
+            steps_since_poll += 1;
+            if steps_since_poll >= SCANNER_CANCEL_CHECK_BYTES {
+                steps_since_poll = 0;
+                check_cancel_token(cancel)?;
+            }
 
             if scan_skip > 0 {
                 scan_offset += 1;
@@ -5974,6 +6319,8 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 scan_options,
                 &[],
+                WalkCursorKind::Ring,
+                cancel,
             );
         }
         let last_full_offset = len - slice_size;
@@ -6002,6 +6349,8 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 scan_options,
                 &[],
+                WalkCursorKind::Ring,
+                cancel,
             );
         };
 
@@ -6054,6 +6403,8 @@ impl<'a> RollingBlockScanner<'a> {
                     blocks,
                     scan_options,
                     &[],
+                    WalkCursorKind::Ring,
+                    cancel,
                 );
             }
         }
@@ -6471,6 +6822,7 @@ impl<'a> RollingBlockScanner<'a> {
         Ok(stats)
     }
 
+    #[cfg(test)]
     fn scan_file_mmap_with_state_options(
         &self,
         path: &Path,
@@ -6480,6 +6832,34 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
+        self.scan_file_mmap_state(
+            path,
+            kind,
+            files,
+            file_index_by_id,
+            blocks,
+            scan_options,
+            None,
+        )
+    }
+
+    /// The whole-file mmap scanner behind the generic entry's large-slice
+    /// route.
+    ///
+    /// `cancel` is polled at entry, inside every whole-window hash, and once
+    /// per [`SCANNER_CANCEL_CHECK_BYTES`] of rolling progress, so a
+    /// byte-stepping scan over a very large candidate can be abandoned.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_file_mmap_state(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        blocks: &mut ScanBlockState<'_>,
+        scan_options: ScanSkipOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<FileScanStats> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         crate::file_cache::advise_sequential(&file, path, len as u64);
@@ -6487,12 +6867,14 @@ impl<'a> RollingBlockScanner<'a> {
         if len == 0 {
             return Ok(stats);
         }
+        check_cancel_token(cancel)?;
 
         let map = MappedFile::map(&file)?;
         let slice_size = self.table.slice_size as usize;
         if slice_size > 0 && len >= slice_size {
-            let mut crc = checksum::crc32(&map[..slice_size]);
             let last = len - slice_size;
+            let mut offset = 0usize;
+            let mut crc = crc32_polled(&map[..slice_size], cancel)?;
             let scan_distance = scan_options.scan_distance(slice_size);
             let scan_skip = if scan_distance > 0 {
                 slice_size.saturating_sub(scan_distance)
@@ -6502,7 +6884,7 @@ impl<'a> RollingBlockScanner<'a> {
             let mut scan_progress = RollingScanProgress::new(scan_options, slice_size);
             let scanner_batch_lanes = scanner_md5_batch_lanes(slice_size);
             let mut pending = Vec::with_capacity(scanner_batch_lanes);
-            let mut offset = 0usize;
+            let mut next_cancel_offset = SCANNER_CANCEL_CHECK_BYTES;
             while offset <= last {
                 let mut saw_crc_candidate = false;
                 if let Some(candidates) = self.table.by_crc.get(&crc) {
@@ -6549,6 +6931,10 @@ impl<'a> RollingBlockScanner<'a> {
                     );
                     offset += 1;
                     scan_progress.record_step(&mut stats);
+                    if offset >= next_cancel_offset {
+                        next_cancel_offset = offset.saturating_add(SCANNER_CANCEL_CHECK_BYTES);
+                        check_cancel_token(cancel)?;
+                    }
 
                     if scan_skip > 0 {
                         if saw_crc_candidate {
@@ -6559,7 +6945,7 @@ impl<'a> RollingBlockScanner<'a> {
                                 scan_progress.record_jump(&mut stats);
                                 scan_progress.scan_offset = 0;
                                 offset = offset.saturating_add(scan_skip).min(last);
-                                crc = checksum::crc32(&map[offset..offset + slice_size]);
+                                crc = crc32_polled(&map[offset..offset + slice_size], cancel)?;
                             }
                         }
                     }
@@ -7385,6 +7771,25 @@ fn scanner_uses_mmap_fallback(slice_size: u64) -> bool {
     slice_size > SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64
 }
 
+/// Whether the ordered canonical scanner may stage its two-window ring for
+/// `slice_size` under `memory_limit`.
+///
+/// The slice size is read from the set's Main packet, which the parser only
+/// requires to be nonzero and a multiple of 4, so it is not a size the scanner
+/// may allocate from unquestioned: the ring is two full slices, and nothing
+/// else in the scan bounds it. Slices up to `SCANNER_MMAP_FALLBACK_SLICE_BYTES`
+/// always fit — their ring is at most 16 MiB, the ceiling the generic scanner
+/// has always staged for them — so a small configured limit does not push
+/// ordinary sets onto the mapped cursor. Above that the repair memory limit
+/// decides: a set whose ring fits streams through it, one that does not walks
+/// the same ordered scan over a mapped window source, which stages nothing
+/// slice-sized.
+fn ordered_scan_ring_fits(slice_size: u64, memory_limit: usize) -> bool {
+    let floor = 2 * SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64;
+    let budget = (memory_limit as u64).max(floor);
+    slice_size.checked_mul(2).is_some_and(|ring| ring <= budget)
+}
+
 fn record_block_location(
     blocks: &mut ScanBlockState<'_>,
     block_index: usize,
@@ -7480,6 +7885,39 @@ fn flush_pending_md5_checks(
 fn short_block_matches(data: &[u8], slice_size: u64, block: &SourceBlock) -> bool {
     padded_crc(data, slice_size) == block.checksum.crc32
         && padded_md5(data, slice_size) == block.checksum.md5
+}
+
+fn check_cancel_token(cancel: Option<&CancellationToken>) -> Result<()> {
+    match cancel {
+        Some(cancel) if cancel.is_cancelled() => Err(Par2Error::Cancelled),
+        _ => Ok(()),
+    }
+}
+
+/// [`checksum::crc32`] that polls `cancel` once per
+/// [`SCANNER_CANCEL_CHECK_BYTES`] hashed.
+///
+/// A scanner hashes one whole window wherever it lands — at entry, after a
+/// jump, after a seek — and the window is the declared slice, which a set may
+/// make as large as it likes. Polling only between steps would leave a cancel
+/// that lands during that hash waiting for the whole slice.
+fn crc32_polled(data: &[u8], cancel: Option<&CancellationToken>) -> Result<u32> {
+    check_cancel_token(cancel)?;
+    let Some(cancel) = cancel.filter(|_| data.len() > SCANNER_CANCEL_CHECK_BYTES) else {
+        return Ok(checksum::crc32(data));
+    };
+    let mut hasher = Crc32Hasher::new();
+    let mut chunks = data.chunks(SCANNER_CANCEL_CHECK_BYTES);
+    if let Some(first) = chunks.next() {
+        hasher.update(first);
+    }
+    for chunk in chunks {
+        if cancel.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        hasher.update(chunk);
+    }
+    Ok(hasher.finalize())
 }
 
 fn check_cancel(options: &Par2RepairerOptions) -> Result<()> {
@@ -9968,6 +10406,8 @@ mod tests {
                 &mut scan_state,
                 ScanSkipOptions::disabled(),
                 &[],
+                WalkCursorKind::Ring,
+                None,
             )
             .unwrap();
         scan_state.apply_to_blocks(&mut blocks);
@@ -10901,6 +11341,327 @@ mod tests {
             .unwrap();
 
         assert!(blocks.iter().all(|block| block.location.is_some()));
+    }
+
+    #[test]
+    fn ordered_scan_ring_fits_floor_then_limit() {
+        let floor_slice = SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64;
+        // Up to the generic fallback threshold the ring always fits, whatever
+        // the configured limit says.
+        assert!(ordered_scan_ring_fits(floor_slice, 0));
+        assert!(ordered_scan_ring_fits(floor_slice, 1));
+        // Past it the limit decides, at the exact boundary of the two-slice
+        // ring.
+        let slice = floor_slice + 4;
+        assert!(ordered_scan_ring_fits(slice, (2 * slice) as usize));
+        assert!(!ordered_scan_ring_fits(slice, (2 * slice - 1) as usize));
+        assert!(!ordered_scan_ring_fits(
+            1 << 30,
+            DEFAULT_REPAIR_MEMORY_LIMIT
+        ));
+        assert!(ordered_scan_ring_fits(1 << 30, 1 << 31));
+        // A ring that overflows never fits, however large the limit.
+        assert!(!ordered_scan_ring_fits(u64::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn ordered_scan_keeps_its_jumps_when_the_ring_is_unaffordable() {
+        let dir = tempdir().unwrap();
+        let slice_size = SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64 + 4;
+        let mut data = seeded_block(5, slice_size as usize);
+        data.extend_from_slice(&seeded_block(9, slice_size as usize));
+        let set = synthetic_set(&[("large.bin", &data)], slice_size);
+        let candidate = dir.path().join("large.bin");
+        fs::write(&candidate, &data).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let target_file = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == candidate)
+            .expect("described file");
+        let ring = (2 * slice_size) as usize;
+
+        let scan = |memory_limit: usize| {
+            let mut blocks = ScanBlockState::new(&baseline);
+            let stats = scanner
+                .scan_file_ordered_canonical_state(
+                    &candidate,
+                    BlockLocationKind::Canonical,
+                    SourceFileScanLookup {
+                        files: &state.files,
+                        file_index_by_id: &state.file_index_by_id,
+                    },
+                    target_file,
+                    &mut blocks,
+                    ScanSkipOptions::disabled(),
+                    true,
+                    memory_limit,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                (0..baseline.len()).all(|index| blocks.location(index).is_some()),
+                "every block placed under a {memory_limit} byte limit"
+            );
+            stats
+        };
+
+        // One byte short of the ring: the walk runs over the mapping, and it
+        // is still the ordered walk — a pristine file is two jumps, no steps.
+        let mapped = scan(ring - 1);
+        assert_eq!(mapped.mode, FileScanMode::OrderedCanonicalMapped);
+        assert_eq!(mapped.jumps_taken, 2);
+        assert_eq!(mapped.windows_stepped, 0);
+        // The ring fits exactly: the ordered scan streams as before.
+        let ring_stats = scan(ring);
+        assert!(matches!(
+            ring_stats.mode,
+            FileScanMode::OrderedCanonical | FileScanMode::OrderedCanonicalParallel
+        ));
+    }
+
+    fn serial_walk_with_evidence(
+        state: &RepairState,
+        path: &Path,
+        settled_locals: &[usize],
+        cursor_kind: WalkCursorKind,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let mut blocks = state.blocks.clone();
+        let target = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == path)
+            .unwrap()
+            .clone();
+        let mut settled = vec![false; target.block_count];
+        for &local in settled_locals {
+            let block_index = target.first_block + local;
+            blocks[block_index].location = Some(BlockLocation {
+                source: SourceLocation::Path(path.to_path_buf()),
+                offset: local as u64 * state.set.slice_size,
+                len: blocks[block_index].expected_len,
+                kind: BlockLocationKind::Canonical,
+            });
+            settled[local] = true;
+        }
+        let baseline = blocks.clone();
+        let mut scan_blocks = ScanBlockState::new(&baseline);
+        let stats = scanner
+            .scan_file_ordered_canonical_serial(
+                path,
+                BlockLocationKind::Canonical,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
+                &target,
+                &mut scan_blocks,
+                ScanSkipOptions::disabled(),
+                &settled,
+                cursor_kind,
+                None,
+            )
+            .unwrap();
+        scan_blocks.apply_to_blocks(&mut blocks);
+        (block_location_summary(&blocks), stats)
+    }
+
+    #[test]
+    fn mapped_walk_matches_the_ring() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let mut target = Vec::new();
+        for block in 0..8u8 {
+            target.extend(
+                (0..slice_size as usize)
+                    .map(|index| block.wrapping_mul(37).wrapping_add(index as u8)),
+            );
+        }
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let mut damaged = target.clone();
+        damaged[3 * slice_size as usize..4 * slice_size as usize].fill(0xEE);
+        fs::write(&candidate, &damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        // No evidence: both cursors step through the damaged slice and jump
+        // over every other one.
+        let (ring_blocks, ring_stats) =
+            serial_walk_with_evidence(&state, &candidate, &[], WalkCursorKind::Ring);
+        let (mapped_blocks, mapped_stats) =
+            serial_walk_with_evidence(&state, &candidate, &[], WalkCursorKind::Mapped);
+        assert_eq!(
+            mapped_blocks, ring_blocks,
+            "the cursor must not move a block"
+        );
+        assert_eq!(ring_stats.mode, FileScanMode::OrderedCanonical);
+        assert_eq!(mapped_stats.mode, FileScanMode::OrderedCanonicalMapped);
+        assert_eq!(mapped_stats.windows_stepped, ring_stats.windows_stepped);
+        assert_eq!(mapped_stats.jumps_taken, ring_stats.jumps_taken);
+        assert_eq!(mapped_stats.windows_stepped, slice_size);
+        assert_eq!(mapped_stats.jumps_taken, 7);
+        assert_eq!(mapped_stats.bytes_skipped_by_evidence, 0);
+
+        // Seeded evidence: both enter past the leading run, step through the
+        // damaged slice, and seek over the trailing run.
+        let settled_locals = [0usize, 1, 2, 4, 5, 6, 7];
+        let (ring_blocks, ring_stats) =
+            serial_walk_with_evidence(&state, &candidate, &settled_locals, WalkCursorKind::Ring);
+        let (mapped_blocks, mapped_stats) =
+            serial_walk_with_evidence(&state, &candidate, &settled_locals, WalkCursorKind::Mapped);
+        assert_eq!(mapped_blocks, ring_blocks, "the skip must not move a block");
+        assert_eq!(mapped_stats.windows_stepped, ring_stats.windows_stepped);
+        assert_eq!(mapped_stats.jumps_taken, ring_stats.jumps_taken);
+        assert_eq!(mapped_stats.slices_settled_by_evidence, 7);
+        assert_eq!(ring_stats.slices_settled_by_evidence, 7);
+        assert_eq!(mapped_stats.jumps_taken, 1);
+        // Both counters are measured. The ring streams two slices ahead of
+        // the window, so the mapping, which touches only what a window
+        // covers, can never report less saved than the ring does.
+        assert!(mapped_stats.bytes_skipped_by_evidence >= ring_stats.bytes_skipped_by_evidence);
+        assert!(mapped_stats.bytes_skipped_by_evidence > 0);
+    }
+
+    #[test]
+    fn serial_walk_stops_when_cancellation_lands_mid_walk() {
+        for cursor_kind in [WalkCursorKind::Ring, WalkCursorKind::Mapped] {
+            let dir = tempdir().unwrap();
+            let slice_size = 64u64;
+            let declared = seeded_block(53, slice_size as usize);
+            let set = synthetic_set(&[("rolling.bin", &declared)], slice_size);
+            let candidate = dir.path().join("rolling.bin");
+            // Nothing in the candidate matches, so the walk byte-steps the
+            // whole file and cancellation has to be observed by the poll.
+            fs::write(&candidate, vec![0x5Au8; 8 * SCANNER_CANCEL_CHECK_BYTES]).unwrap();
+            let state = RepairState::from_set(dir.path(), set).unwrap();
+            let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+            let target_file = state
+                .files
+                .iter()
+                .find(|file| file.safe_path == candidate)
+                .expect("described file");
+            let baseline = state.blocks.clone();
+            let mut blocks = ScanBlockState::new(&baseline);
+            let cancel = CancellationToken::new();
+            let watchdog = cancel.clone();
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                watchdog.cancel();
+            });
+
+            let error = scanner
+                .scan_file_ordered_canonical_serial(
+                    &candidate,
+                    BlockLocationKind::Canonical,
+                    SourceFileScanLookup {
+                        files: &state.files,
+                        file_index_by_id: &state.file_index_by_id,
+                    },
+                    target_file,
+                    &mut blocks,
+                    ScanSkipOptions::disabled(),
+                    &[],
+                    cursor_kind,
+                    Some(&cancel),
+                )
+                .expect_err("cancellation stops a walk already under way");
+            handle.join().unwrap();
+
+            assert!(
+                matches!(error, Par2Error::Cancelled),
+                "{cursor_kind:?}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crc32_polled_hashes_like_crc32_and_stops_on_cancel() {
+        let small = seeded_block(3, 4096);
+        let large = seeded_block(7, 3 * SCANNER_CANCEL_CHECK_BYTES + 17);
+        let live = CancellationToken::new();
+        for data in [&small, &large] {
+            let expected = checksum::crc32(data);
+            assert_eq!(crc32_polled(data, None).unwrap(), expected);
+            assert_eq!(crc32_polled(data, Some(&live)).unwrap(), expected);
+        }
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        for data in [&small, &large] {
+            let error = crc32_polled(data, Some(&cancelled)).expect_err("cancelled");
+            assert!(matches!(error, Par2Error::Cancelled), "got {error:?}");
+        }
+    }
+
+    #[test]
+    fn mmap_scan_stops_on_a_cancelled_token() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let target: Vec<u8> = (0..4 * slice_size as usize).map(|i| i as u8).collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let mut blocks = ScanBlockState::new(&baseline);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = scanner
+            .scan_file_mmap_state(
+                &candidate,
+                BlockLocationKind::Canonical,
+                &state.files,
+                &state.file_index_by_id,
+                &mut blocks,
+                ScanSkipOptions::disabled(),
+                Some(&cancel),
+            )
+            .expect_err("a cancelled token stops the scan at entry");
+
+        assert!(matches!(error, Par2Error::Cancelled), "got {error:?}");
+    }
+
+    #[test]
+    fn mmap_scan_stops_when_cancellation_lands_mid_scan() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let declared = seeded_block(53, slice_size as usize);
+        let set = synthetic_set(&[("rolling.bin", &declared)], slice_size);
+        let candidate = dir.path().join("rolling.bin");
+        // Nothing in the candidate matches, so the scan byte-steps the whole
+        // file and cancellation has to be observed by the periodic poll.
+        fs::write(&candidate, vec![0x5Au8; 8 * SCANNER_CANCEL_CHECK_BYTES]).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let mut blocks = ScanBlockState::new(&baseline);
+        let cancel = CancellationToken::new();
+        let watchdog = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            watchdog.cancel();
+        });
+
+        let error = scanner
+            .scan_file_mmap_state(
+                &candidate,
+                BlockLocationKind::Canonical,
+                &state.files,
+                &state.file_index_by_id,
+                &mut blocks,
+                ScanSkipOptions::disabled(),
+                Some(&cancel),
+            )
+            .expect_err("cancellation stops a scan already under way");
+        handle.join().unwrap();
+
+        assert!(matches!(error, Par2Error::Cancelled), "got {error:?}");
     }
 
     #[test]
@@ -12019,6 +12780,7 @@ mod tests {
                 &state.file_index_by_id,
                 &mut generic,
                 ScanSkipOptions::disabled(),
+                None,
             )
             .unwrap();
         let mut ordered = ScanBlockState::new(&baseline);
