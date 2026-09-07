@@ -9,11 +9,11 @@ protects, the Cauchy Reed-Solomon arithmetic PAR3 recovery data is built from,
 creating a complete set from a list of input files, and putting damaged and
 missing files back from one.
 
-**This is a work in progress.** It reads, inspects, verifies, creates and
-repairs PAR3 sets built with the reference implementation's default settings —
-a Cauchy matrix over GF(2^8) or GF(2^16), chunk tails packed into shared blocks,
-and power-of-two recovery volumes. Everything outside that is listed under
-[Scope](#scope); read it before depending on this crate.
+**This is a work in progress.** The convenience APIs preserve default Cauchy
+creation and repair. The incremental engine adds virtual sources, streaming
+verification evidence, retained repair sessions, and low-rate FFT recovery.
+Performance acceptance and the remaining advanced capabilities are still being
+developed. See [Scope](#scope) before depending on this crate.
 
 ```toml
 [dependencies]
@@ -167,17 +167,24 @@ In:
   recovery blocks the set carries, and writing every damaged or missing file
   back — including files inside directories that are themselves gone.
 
-Out, for this release:
+The incremental `Par3RepairSession` also provides:
+
+- Chunked authenticated packet ingestion with lazy recovery and Data payloads.
+- Source identity and generation contracts for disk, memory, and virtual input.
+- Positioned streaming evidence, shared block aliases, packed tails, damage
+  ranges, and contiguous verified prefixes.
+- Retained assessments and recovery requirements per FFT cohort, with no
+  source reads for unchanged reassessment or recovery-only merges.
+- Explicit candidate placement using bounded CRC64 search and BLAKE3 checks.
+- Byte-striped Cauchy and low-rate FFT repair, staged damaged files, cancellation,
+  and shared allocation budgets (256 MiB total, up to 64 MiB retained by default).
+
+Still unsupported:
 
 - Repairing the recovery volumes themselves. A recovery block that does not
   parse is not available to a repair, and nothing puts it back.
-- Finding a file that was renamed or moved: it counts as missing and is rebuilt
-  from recovery data, and whatever took its place is not looked at.
-- Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
-  matrix packets are parsed and kept, and nothing is computed from them. A set
-  whose recovery data names one of them is refused rather than misread.
-- The sliding rolling-hash search that finds blocks whose position has moved. A
-  file whose bytes are all present but shifted is rebuilt like any other damage.
+- Sparse and explicit matrix execution, high-rate FFT, and automatic directory
+  discovery. The original convenience repair API remains Cauchy-only.
 - Checking a block of packed tails as a block. Each file's own tail is checked
   against the hashes in its chunk description; the block those tails share
   carries no checksum of its own — the reference implementation leaves tail
@@ -208,7 +215,7 @@ how bytes are read:
 | Chunk descriptions | Per-chunk fingerprint | No per-chunk fingerprint |
 | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
-| `PAR FFT\0` | Not specified | Written by the reference implementation, and parsed here |
+| `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
 
 ## Damage is not an error
 

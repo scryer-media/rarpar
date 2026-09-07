@@ -7,11 +7,12 @@
 //! and puts damaged and missing files back from the recovery blocks a set
 //! carries.
 //!
-//! It is a **work in progress**. What it creates and repairs is a set with the
-//! reference implementation's default settings: a Cauchy matrix over GF(2^8) or
-//! GF(2^16), chunk tails packed into shared blocks, and power-of-two recovery
-//! volumes. Everything outside that is listed under
-//! [what is not in scope](#what-is-not).
+//! It is a **work in progress**. The original convenience APIs retain their
+//! default Cauchy behavior. The incremental [`Par3RepairSession`] adds virtual
+//! sources, streaming evidence, shared block layouts, retained assessments,
+//! bounded striped repair, and low-rate FFT recovery with interleaved cohorts.
+//! Performance acceptance and the remaining advanced capabilities are still
+//! being developed; see [what is not in scope](#what-is-not).
 //!
 //! ```no_run
 //! use par3_rs::{Par3Set, VerifyReport, scan_packets_from_path, verify_set};
@@ -59,19 +60,14 @@
 //!
 //! # What is not
 //!
-//! None of the following is implemented, and none of it is planned for this
-//! release:
+//! The following capabilities are not implemented:
 //!
 //! - Repairing damaged recovery volumes. A recovery block that does not parse is
 //!   simply not available to a repair; nothing puts it back.
-//! - Finding a file that was renamed or moved. A repair rebuilds it from
-//!   recovery data instead, and does not look at whatever took its place.
-//! - Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
-//!   matrix packets are parsed and retained, and nothing is computed from them.
-//! - The sliding rolling-hash search that finds blocks whose position in a file
-//!   has moved. Verification compares bytes where the packets say they should
-//!   be, and a repair rebuilds a file whose content shifted rather than finding
-//!   the bytes it still has.
+//! - Sparse and explicit matrix execution, and high-rate FFT. Low-rate FFT
+//!   execution is available through [`fft`] and the retained session.
+//! - Automatic directory discovery. [`placement`] accepts explicit candidates
+//!   and locates moved extents using CRC64 followed by BLAKE3 confirmation.
 //! - Checking a block of packed tails as a block. Each file's own tail is
 //!   checked against the hashes in its chunk description; the block those tails
 //!   share carries no checksum of its own — the reference implementation leaves
@@ -104,7 +100,7 @@
 //! | Chunk descriptions | Per-chunk fingerprint | No per-chunk fingerprint |
 //! | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 //! | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
-//! | `PAR FFT\0` | Not specified | Written by the reference implementation; parsed here |
+//! | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
 //!
 //! Because the InputSetID cannot be recomputed, this crate never validates it —
 //! it is only ever compared for equality.
@@ -135,8 +131,19 @@
 pub mod cauchy;
 pub mod create;
 pub mod error;
+pub mod evidence;
+pub mod fft;
 pub mod gf;
 pub mod hash;
+pub mod ingest;
+pub mod layout;
+pub mod placement;
+pub mod runtime;
+pub mod session;
+pub mod session_repair;
+pub mod source;
+
+pub use session::Par3RepairSession;
 pub mod packet;
 pub mod repair;
 pub mod scan;

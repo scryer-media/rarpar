@@ -1980,6 +1980,8 @@ version = "0.2.0"
 dependencies = [
  "blake3",
  "crc-fast",
+ "rayon",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]

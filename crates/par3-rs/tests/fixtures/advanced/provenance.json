@@ -1,0 +1,54 @@
+{
+  "reference_commit": "2971702e501f1350b1c7b9d11369af9157d6ed56",
+  "source_archive_blake3": "2989f64bcfff5ca14493ffa4e68dd058ab2b88236a9e64e884ac74387a225072",
+  "command": [
+    "par3",
+    "c",
+    "-s1024",
+    "-e8",
+    "-c8",
+    "-cm16",
+    "fft.par3",
+    "input.bin"
+  ],
+  "input_recipe": "bytes((i * 73 + i // 29) % 256 for i in range(14000))",
+  "files": {
+    "fft.par3": "f2e7462ba8aa381a90887510c1d7904e2dc6000538179bd20abb9567102ece4f",
+    "fft.vol0+1.par3": "7ddb4045fa7b3ad6b48da965f7f99b12e9efde6f128f15387889b416b4bec2ba",
+    "fft.vol1+2.par3": "3f02db4ff98b39105e149e25161e87420f208f1b02239c7e5417dc75cfb939b1",
+    "fft.vol3+4.par3": "5f3235fdc6219419b77aaccad4d353865683516d1b3e95cfe9bec88a24d29ec0",
+    "fft.vol7+1.par3": "94424d4d32fe8d14a8e4bd3b6a931f8e5aa1013b89fbb6e695af45a9133c7f42",
+    "fft16.par3": "2af5543d1494dc9927df0e3a27dee1f3bc01c5725f4ccefa36ba5f747e12a418",
+    "fft16.vol00+1.par3": "7cdefb29a50f0e4b28a0ff26fd25e12a0b9733c7f900b0b3dc04cf84859572af",
+    "fft16.vol01+2.par3": "7c465a36eb50de313bf47e473180a00395f37b683024f6a16ecb6f49de9e9364",
+    "fft16.vol03+4.par3": "b9fef35ad7a7a39a733ccaa58e88a1c74d59c9a3bb658583951e2973b6b30308",
+    "fft16.vol07+8.par3": "37ae162486f2d73d46aa0f4086ab9fa3a32970b332586c5dff14f577e211b0f2",
+    "fft16.vol15+1.par3": "2f18b81f790f715f080938c3c26c8912d1668ed55ce0b111823e4d50886abf1e",
+    "interleaved.par3": "be8649171973b0d27ccf39f5721196f25667c8194c4966863f98b856b280df81",
+    "interleaved.vol0+1.par3": "54e77c9ffd4256159b1864b7f9ebb04ef4b06030ac5a321c31a5681cab6f7932",
+    "interleaved.vol1+2.par3": "f08d7d62e2e551628c9caae5f040ead9beb3165992ccf15cce037d40560ec1e7"
+  },
+  "additional_commands": [
+    [
+      "par3",
+      "c",
+      "-s64",
+      "-e8",
+      "-c16",
+      "-cm64",
+      "fft16.par3",
+      "input.bin"
+    ],
+    [
+      "par3",
+      "c",
+      "-s1024",
+      "-e8",
+      "-i2",
+      "-c9",
+      "-cm24",
+      "interleaved.par3",
+      "input.bin"
+    ]
+  ]
+}
