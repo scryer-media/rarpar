@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.1
+
+The ordered canonical scan no longer sizes its rolling buffer from the set's
+declared slice size alone.
+
+### Fixed
+
+- A set's Main packet may declare any slice size that is nonzero and a
+  multiple of 4. The generic scanner has long routed slices past 8 MiB to the
+  mmap scanner, but the ordered canonical scan — the path a described file
+  takes once its complete-file check fails — staged a two-slice rolling buffer
+  straight from the declared size, on its serial cursor and on the parallel
+  scan's gap resync alike, and the repair memory limit never weighed it. A set
+  declaring a multi-gigabyte slice against a file at least that long (a sparse
+  file will do) made the scan allocate twice that: an allocator abort or an
+  out-of-memory kill of the host process, not a reported failure. The ordered
+  entry now routes before its first slice-sized allocation. A slice up to
+  8 MiB always keeps the ordered scan, so a small configured limit does not
+  push ordinary sets onto the slower byte-stepping scanner; past that the
+  ordered scan runs only when its two-slice buffer fits `memory_limit`, and
+  otherwise the candidate takes the mmap scanner, which reads windows out of
+  the mapping and stages nothing slice-sized. The same blocks are found either
+  way; only seeded-evidence skips are not honoured on the routed path.
+
 ## 0.10.0
 
 A caller can now say which files in the working directory the extra scan must

@@ -5543,6 +5543,23 @@ impl<'a> RollingBlockScanner<'a> {
         // false (or empty) is the default and every pre-policy caller.
         settled: &[bool],
     ) -> Result<FileScanStats> {
+        // Route before the first slice-sized allocation. Every path below —
+        // the serial cursor and the parallel scan's gap resync — stages a ring
+        // of two full slices that no admission check weighs, so a declared
+        // slice whose ring the limit cannot afford takes the generic mmap
+        // scanner instead, the same one the generic entry already uses for
+        // large slices. Seeded-evidence skips are not honoured there: the scan
+        // reads more and finds the same blocks.
+        if !ordered_scan_ring_fits(self.table.slice_size, memory_limit) {
+            return self.scan_file_mmap_with_state_options(
+                path,
+                kind,
+                lookup.files,
+                lookup.file_index_by_id,
+                blocks,
+                scan_options,
+            );
+        }
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
         // the serial scanner; single-thread pools do too. `inner_parallel`
         // is false when the caller is already fanning out across candidate
@@ -7383,6 +7400,25 @@ fn read_exact_file_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec
 
 fn scanner_uses_mmap_fallback(slice_size: u64) -> bool {
     slice_size > SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64
+}
+
+/// Whether the ordered canonical scanner may stage its two-window ring for
+/// `slice_size` under `memory_limit`.
+///
+/// The slice size is read from the set's Main packet, which the parser only
+/// requires to be nonzero and a multiple of 4, so it is not a size the scanner
+/// may allocate from unquestioned: the ring is two full slices, and nothing
+/// else in the scan bounds it. Slices up to `SCANNER_MMAP_FALLBACK_SLICE_BYTES`
+/// always fit — their ring is at most 16 MiB, the ceiling the generic scanner
+/// has always staged for them — so a small configured limit does not push
+/// ordinary sets onto the byte-stepping mmap scanner. Above that the repair
+/// memory limit decides: a set whose ring fits keeps the ordered scan, one
+/// that does not takes the mmap scanner, which reads windows out of the
+/// mapping and stages nothing slice-sized.
+fn ordered_scan_ring_fits(slice_size: u64, memory_limit: usize) -> bool {
+    let floor = 2 * SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64;
+    let budget = (memory_limit as u64).max(floor);
+    slice_size.checked_mul(2).is_some_and(|ring| ring <= budget)
 }
 
 fn record_block_location(
@@ -10901,6 +10937,82 @@ mod tests {
             .unwrap();
 
         assert!(blocks.iter().all(|block| block.location.is_some()));
+    }
+
+    #[test]
+    fn ordered_scan_ring_fits_floor_then_limit() {
+        let floor_slice = SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64;
+        // Up to the generic fallback threshold the ring always fits, whatever
+        // the configured limit says.
+        assert!(ordered_scan_ring_fits(floor_slice, 0));
+        assert!(ordered_scan_ring_fits(floor_slice, 1));
+        // Past it the limit decides, at the exact boundary of the two-slice
+        // ring.
+        let slice = floor_slice + 4;
+        assert!(ordered_scan_ring_fits(slice, (2 * slice) as usize));
+        assert!(!ordered_scan_ring_fits(slice, (2 * slice - 1) as usize));
+        assert!(!ordered_scan_ring_fits(
+            1 << 30,
+            DEFAULT_REPAIR_MEMORY_LIMIT
+        ));
+        assert!(ordered_scan_ring_fits(1 << 30, 1 << 31));
+        // A ring that overflows never fits, however large the limit.
+        assert!(!ordered_scan_ring_fits(u64::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn ordered_scan_routes_an_unaffordable_slice_to_the_mmap_scanner() {
+        let dir = tempdir().unwrap();
+        let slice_size = SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64 + 4;
+        let data = (0..slice_size as usize)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(3))
+            .collect::<Vec<_>>();
+        let set = synthetic_set(&[("large.bin", &data)], slice_size);
+        let candidate = dir.path().join("large.bin");
+        fs::write(&candidate, &data).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let target_file = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == candidate)
+            .expect("described file");
+        let ring = (2 * slice_size) as usize;
+
+        let scan = |memory_limit: usize| {
+            let mut blocks = ScanBlockState::new(&baseline);
+            let stats = scanner
+                .scan_file_ordered_canonical_state(
+                    &candidate,
+                    BlockLocationKind::Canonical,
+                    SourceFileScanLookup {
+                        files: &state.files,
+                        file_index_by_id: &state.file_index_by_id,
+                    },
+                    target_file,
+                    &mut blocks,
+                    ScanSkipOptions::disabled(),
+                    true,
+                    memory_limit,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                (0..baseline.len()).all(|index| blocks.location(index).is_some()),
+                "every block placed under a {memory_limit} byte limit"
+            );
+            stats.mode
+        };
+
+        // One byte short of the ring: routed to the mmap scanner, same blocks.
+        assert!(matches!(scan(ring - 1), FileScanMode::RollingGeneric));
+        // The ring fits exactly: the ordered scan keeps the file.
+        assert!(matches!(
+            scan(ring),
+            FileScanMode::OrderedCanonical | FileScanMode::OrderedCanonicalParallel
+        ));
     }
 
     #[test]
