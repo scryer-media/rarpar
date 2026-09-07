@@ -194,8 +194,10 @@ Still unsupported:
   blocks out of its External Data packets — and is never checked as a unit.
 - Incremental backups: a Start packet's parent set is exposed, never followed.
 - Interpreting link and permission packets, beyond keeping their bytes.
-- "Par inside", where PAR3 packets live within the file they protect. Files with
-  unprotected chunks are reported as unverifiable.
+- PAR-inside insertion and self-repair. `inside::ContainerLayout::inspect`
+  currently provides bounded ZIP/ZIP64 and 7z framing checks for those workflows;
+  it preserves opaque compressed members and refuses ambiguous trailing data.
+  The convenience verifier still reports unprotected chunks as unverifiable.
 - Creating unprotected chunks, link or permission packets, and parent sets.
 - Any command-line interface. `examples/par3rs.rs` demonstrates the API from a
   shell; it is not a tool, and nothing here is a supported front-end.
@@ -231,6 +233,7 @@ how bytes are read:
 | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
+| ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference rejects count-only ZIP64 unless the ZIP size/offset fields also use `0xffffffff` sentinels; the corpus normalizes these original ZIP fields before insertion |
 
 ## Damage is not an error
 

@@ -1,3 +1,15 @@
+# Advanced reference fixtures
+
+PAR3 bytes come only from official par3cmdline runs at commit
+`2971702e501f1350b1c7b9d11369af9157d6ed56`. The checked-in recipe is
+`bench/rarpar-bench/internal/testcorpus/par3_advanced.go`.
+
+The following records describe the initial reference runs. Original inputs
+are damaged in memory by tests; PAR3 packet bytes are never edited.
+
+## FFT generation record
+
+```json
 {
   "reference_commit": "2971702e501f1350b1c7b9d11369af9157d6ed56",
   "source_archive_blake3": "2989f64bcfff5ca14493ffa4e68dd058ab2b88236a9e64e884ac74387a225072",
@@ -52,3 +64,31 @@
     ]
   ]
 }
+```
+
+## Initial container generation record
+
+```json
+{
+  "reference_commit": "2971702e501f1350b1c7b9d11369af9157d6ed56",
+  "commands": [
+    "par3 i inside.zip",
+    "par3 i inside.7z",
+    "par3 i inside64.zip"
+  ],
+  "archive_recipes": {
+    "inside.zip": "Python zipfile ZIP_DEFLATED input.bin: bytes((i*73+i//29)%256 for i in range(14000)); original retained before insertion",
+    "inside.7z": "7zz 26.01 a -t7z -mx=1 -mtc=off -mta=off -mtm=off inside.7z input.bin; same input recipe",
+    "inside64.zip": "Python zipfile ZIP_STORED, 65536 empty members named str(i). Before PAR3 insertion only, set ZIP EOCD central-directory size and offset to valid ZIP64 0xffffffff sentinels; the ZIP64 record retains real values."
+  },
+  "notes": "All inserted PAR3 bytes are unmodified official output. Original archives are retained as paired inputs. ZIP64 sentinel normalization addresses the pinned reference detector rejecting count-only ZIP64; no PAR3 packets existed at normalization time.",
+  "sha256": {
+    "inside-original.zip": "a7e6fe0bb60fc960171b207789971c1b88783728c6e9688ecb28801fd8658fd0",
+    "inside.zip": "2cb759eb76fd5944f85677956c7c45ea08c2a8590b2346491dbf6b1a5f9c8ef8",
+    "inside-original.7z": "790de9fe642157589a5f61f51772795e2343e2713a00773dd92dec348475bad7",
+    "inside.7z": "7a745a680d9920615a72d94d6b7b46edf8b52a85cdc9b133ce11fdfedb6e2f13",
+    "inside64-original.zip": "15a58f3a5f5a60de6042cd762aece3514d0db8871b649088e66a180df8091b11",
+    "inside64.zip": "73d7278f203e3399a16b4157da5ecbb9b429d6fbacec4607e8c0d4908f115b9d"
+  }
+}
+```

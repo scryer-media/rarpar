@@ -77,8 +77,9 @@
 //! - Incremental backups: a Start packet's parent set is exposed, but parent
 //!   packets are never followed.
 //! - Permissions and link packets, beyond keeping their bytes.
-//! - "Par inside", where PAR3 packets live within the file they protect. Files
-//!   with unprotected chunks are reported as unverifiable.
+//! - PAR-inside insertion and self-repair. [`inside`] currently validates
+//!   ZIP/ZIP64 and 7z framing for those workflows. The convenience verifier
+//!   still reports unprotected chunks as unverifiable.
 //! - Creating unprotected chunks, permission or link packets, and parent sets.
 //!   Advanced standalone creation in [`creation`] supports Cauchy or low-rate
 //!   FFT, interleaving, aligned/sliding deduplication, Data packets, and variable,
@@ -103,6 +104,7 @@
 //! | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 //! | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 //! | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
+//! | ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference requires size/offset sentinels too; the corpus normalizes these original ZIP fields before insertion |
 //!
 //! Because the InputSetID cannot be recomputed, this crate never validates it —
 //! it is only ever compared for equality.
@@ -140,6 +142,7 @@ pub mod fft;
 pub mod gf;
 pub mod hash;
 pub mod ingest;
+pub mod inside;
 pub mod layout;
 pub mod placement;
 pub mod runtime;
