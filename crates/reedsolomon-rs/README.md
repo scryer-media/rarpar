@@ -31,6 +31,11 @@ assert_eq!(gf::mul(0x89ab, gf::inv(0x89ab)), 1);
 ## Contents
 
 - `gf`: scalar GF(2¹⁶) arithmetic shared by PAR2 and RAR5.
+- `gf8`: GF(2⁸) arithmetic with reusable multiplication plans and runtime
+  NEON, AVX2, or SSSE3 dispatch, with a scalar fallback.
+- `fft`: clean-room additive transforms and erasure locator factors over
+  GF(2⁸) and GF(2¹⁶) in Cantor representation. These scalar primitives leave
+  codec geometry, interleaving, allocation budgets, and worker policy to callers.
 - `gf_simd`: multiply-accumulate kernels, including `mul_acc_region` for one
   source and destination, `mul_acc_multi_region` for one source and multiple
   destinations, and `mul_acc_input_batch` for multiple sources and one

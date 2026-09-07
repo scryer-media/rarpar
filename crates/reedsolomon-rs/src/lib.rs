@@ -47,7 +47,10 @@
 //! Session admission can fail because of workload size, configuration, device,
 //! shape, or allocation constraints. Callers decide whether to remain on CPU.
 //!
+/// Additive transforms in Cantor fields; codec geometry belongs to callers.
+pub mod fft;
 pub mod gf;
+pub mod gf8;
 pub mod gf_pmul;
 pub mod gf_simd;
 pub mod matrix;
