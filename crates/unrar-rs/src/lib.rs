@@ -256,6 +256,7 @@ pub mod progress;
 // RAR5 volume's headers without opening it; there is no such use for these.
 pub(crate) mod rar4;
 pub mod recovery;
+pub(crate) mod short_read;
 pub mod signature;
 pub mod stored_layout;
 pub mod types;
@@ -295,7 +296,7 @@ pub mod test_support {
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, Entry, RarArchive, RarVolumeFacts,
+    CachedArchiveHeaders, DataSegment, Entry, RarArchive, RarVolumeFacts, RarVolumeFactsWalk,
     RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
     RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
     RarVolumeUnixOwnerFacts, ReadSeek,

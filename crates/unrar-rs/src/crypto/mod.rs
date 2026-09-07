@@ -51,6 +51,7 @@ mod differential_tests;
 use std::borrow::Cow;
 use std::io::Read;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // The upstream BLAKE2sp is only used where the in-crate SIMD kernel is not
 // selected (see `Blake2spHasher` below); gate the import to that config so it
@@ -495,6 +496,16 @@ pub(crate) use blake2sp_simd::{Blake2spLeafGroup, GROUP_LEAVES};
 
 const KDF_CACHE_SLOTS: usize = 4;
 
+/// RAR4 keys each `-hp` header from that header's own salt, so a volume walk
+/// derives once per header and a repeat walk of the same image — a volume
+/// still arriving, parsed as each piece lands — only stays cheap while every
+/// one of those salts is still cached. Four slots would evict the first salt
+/// before the second walk reached it and then miss on every header in turn,
+/// so the RAR4 side holds enough for any volume a facts walk plausibly sees.
+/// Lookups stay a linear scan: each entry is checked by its 8-byte salt first,
+/// and the whole table costs under 128 KiB.
+const KDF3_CACHE_SLOTS: usize = 1024;
+
 /// Cached RAR5 key derivation result.
 #[derive(Debug)]
 struct Kdf5Entry {
@@ -548,14 +559,40 @@ impl Drop for Kdf3Entry {
 pub struct KdfCache {
     rar5: Mutex<(Vec<Kdf5Entry>, usize)>,
     rar4: Mutex<(Vec<Kdf3Entry>, usize)>,
+    /// How many RAR5 derivations actually ran. Incremented on a miss only, so
+    /// the delta between two readings is the real PBKDF2 work a stretch of
+    /// parsing cost — the only way to tell a cache that was merely *consulted*
+    /// from one that was *used*.
+    rar5_derivations: AtomicU64,
+    /// The RAR4 counterpart of `rar5_derivations`.
+    rar4_derivations: AtomicU64,
 }
 
 impl KdfCache {
     pub fn new() -> Self {
         Self {
             rar5: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
-            rar4: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
+            rar4: Mutex::new((Vec::new(), 0)),
+            rar5_derivations: AtomicU64::new(0),
+            rar4_derivations: AtomicU64::new(0),
         }
+    }
+
+    /// How many RAR5 key derivations this cache has actually performed.
+    ///
+    /// Each one is a full PBKDF2-HMAC-SHA256 run of up to 2^24 iterations, so
+    /// this is the cost that matters to a caller which parses the same archive
+    /// repeatedly: hand one cache to every parse and this must stop growing
+    /// after the first.
+    pub fn rar5_derivation_count(&self) -> u64 {
+        self.rar5_derivations.load(Ordering::Relaxed)
+    }
+
+    /// How many RAR4 key derivations this cache has actually performed. The
+    /// RAR4 KDF is a fixed 2^18-round SHA-1 loop; the reasoning of
+    /// [`Self::rar5_derivation_count`] applies unchanged.
+    pub fn rar4_derivation_count(&self) -> u64 {
+        self.rar4_derivations.load(Ordering::Relaxed)
     }
 
     pub fn derive_material_rar5(
@@ -578,6 +615,7 @@ impl KdfCache {
         }
 
         let material = derive_rar5_material(password, salt, kdf_count)?;
+        self.rar5_derivations.fetch_add(1, Ordering::Relaxed);
 
         let entry = Kdf5Entry {
             password: password.to_string(),
@@ -637,15 +675,17 @@ impl KdfCache {
         let mut guard = self.rar4.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
-        // Check cache.
+        // Check cache. The salt is compared first: it is the field that
+        // differs between entries of one `-hp` volume, and it is eight bytes.
         for entry in entries.iter() {
-            if entry.password == password && entry.salt.as_ref() == salt {
+            if entry.salt.as_ref() == salt && entry.password == password {
                 return (entry.key, entry.iv);
             }
         }
 
         // Cache miss — derive key.
         let (key, iv) = rar4_derive_key(password, salt);
+        self.rar4_derivations.fetch_add(1, Ordering::Relaxed);
 
         let entry = Kdf3Entry {
             password: password.to_string(),
@@ -654,12 +694,12 @@ impl KdfCache {
             iv,
         };
 
-        if entries.len() < KDF_CACHE_SLOTS {
+        if entries.len() < KDF3_CACHE_SLOTS {
             entries.push(entry);
         } else {
             entries[*pos] = entry;
         }
-        *pos = (*pos + 1) % KDF_CACHE_SLOTS;
+        *pos = (*pos + 1) % KDF3_CACHE_SLOTS;
 
         (key, iv)
     }
@@ -3752,6 +3792,85 @@ mod tests {
 
         cache.derive_material_rar5("cache-pass", &salt, 4).unwrap();
         assert_eq!(cache.rar5.lock().unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn rar5_kdf_cache_keys_on_password_salt_and_count_and_a_hit_derives_nothing() {
+        let cache = KdfCache::new();
+        let salt = [0xAB; 16];
+        assert_eq!(cache.rar5_derivation_count(), 0);
+
+        let first = cache.derive_material_rar5("cache-pass", &salt, 4).unwrap();
+        assert_eq!(cache.rar5_derivation_count(), 1);
+
+        // Same three inputs: served from the cache, byte for byte, with no
+        // hashing at all.
+        let again = cache.derive_material_rar5("cache-pass", &salt, 4).unwrap();
+        assert_eq!(cache.rar5_derivation_count(), 1);
+        assert_eq!(first.key, again.key);
+        assert_eq!(first.hash_key, again.hash_key);
+        assert_eq!(first.psw_check, again.psw_check);
+
+        // Each of the three inputs is part of the key: change any one and the
+        // cache misses.
+        cache.derive_material_rar5("other-pass", &salt, 4).unwrap();
+        assert_eq!(cache.rar5_derivation_count(), 2);
+        cache
+            .derive_material_rar5("cache-pass", &[0xCD; 16], 4)
+            .unwrap();
+        assert_eq!(cache.rar5_derivation_count(), 3);
+        cache.derive_material_rar5("cache-pass", &salt, 5).unwrap();
+        assert_eq!(cache.rar5_derivation_count(), 4);
+
+        // And the derived-key and password-check accessors ride the same
+        // entry rather than deriving again.
+        cache.derive_key_rar5("cache-pass", &salt, 4).unwrap();
+        assert!(cache.verify_password_rar5("cache-pass", &salt, 4, &{
+            let mut check = [0u8; 12];
+            check[..8].copy_from_slice(&first.psw_check);
+            check[8..].copy_from_slice(&sha256_digest(&first.psw_check)[..4]);
+            check
+        }));
+        assert_eq!(cache.rar5_derivation_count(), 4);
+    }
+
+    #[test]
+    fn rar4_kdf_cache_holds_every_salt_of_a_many_header_volume() {
+        // An `-hp` RAR4 volume salts every header separately; a walk that is
+        // repeated over a still-arriving image must find all of them again.
+        let cache = KdfCache::new();
+        let salts: Vec<[u8; 8]> = (0..64u64).map(|i| i.to_le_bytes()).collect();
+        for salt in &salts {
+            cache.derive_key_rar4("cache-pass", Some(salt));
+        }
+        assert_eq!(cache.rar4_derivation_count(), salts.len() as u64);
+        for salt in &salts {
+            cache.derive_key_rar4("cache-pass", Some(salt));
+        }
+        assert_eq!(
+            cache.rar4_derivation_count(),
+            salts.len() as u64,
+            "a second pass over the same salts derives nothing"
+        );
+        assert!(KDF3_CACHE_SLOTS > salts.len());
+    }
+
+    #[test]
+    fn rar4_kdf_cache_hit_derives_nothing() {
+        let cache = KdfCache::new();
+        let salt = [0xCC; 8];
+        assert_eq!(cache.rar4_derivation_count(), 0);
+
+        let (key, iv) = cache.derive_key_rar4("cache-pass", Some(&salt));
+        assert_eq!(cache.rar4_derivation_count(), 1);
+
+        let (again_key, again_iv) = cache.derive_key_rar4("cache-pass", Some(&salt));
+        assert_eq!(cache.rar4_derivation_count(), 1);
+        assert_eq!(key, again_key);
+        assert_eq!(iv, again_iv);
+
+        cache.derive_key_rar4("cache-pass", None);
+        assert_eq!(cache.rar4_derivation_count(), 2);
     }
 
     // RAR4 crypto tests

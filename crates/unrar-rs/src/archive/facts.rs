@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{RarArchive, ReadSeek};
 use crate::error::RarResult;
+use crate::short_read::ShortRead;
 use crate::signature;
 use crate::types::{ArchiveFormat, CompressionMethod};
 
@@ -212,6 +213,80 @@ pub struct RarVolumeFacts {
     pub members: Vec<RarVolumeMemberFacts>,
     #[serde(default)]
     pub services: Vec<RarVolumeServiceFacts>,
+}
+
+/// One volume-facts walk's result: the facts, plus where the walk ran out of
+/// bytes.
+///
+/// Deliberately not the same type as [`RarVolumeFacts`] and deliberately not
+/// serializable. The facts describe the *volume* and are worth persisting;
+/// `short_at` describes one walk over one image of it and is worth nothing
+/// once the image grows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RarVolumeFactsWalk {
+    /// What the headers this walk reached state. Identical to what
+    /// [`RarArchive::parse_volume_facts`] returns for the same bytes.
+    pub facts: RarVolumeFacts,
+    /// The first offset the walk could not read, when it stopped because the
+    /// image ended underneath it; `None` when it stopped for a reason more
+    /// bytes will not change — an end-of-archive record or a Quick Open
+    /// answer.
+    ///
+    /// Every way an image can end under the walk reports here: between two
+    /// headers, inside a header, and — on an image whose length is known —
+    /// inside a member's declared data. The last two are where
+    /// [`RarArchive::parse_volume_facts`] fails instead; this walk keeps the
+    /// headers it reached and says where the image has to grow to.
+    ///
+    /// This is what makes re-reading a still-arriving volume cheap. A caller
+    /// staging a volume image as its pieces arrive otherwise has no way to
+    /// tell "this parse failed and the next one will too" from "one more byte
+    /// would have finished it", so it re-walks on every arrival; a store
+    /// volume's end-of-archive record lives past all of its payload, so that
+    /// is a full walk per piece for the whole volume. With this, the caller
+    /// re-walks only once the image covers `short_at`.
+    ///
+    /// It is a **lower** bound: the walk reports the least it would need to
+    /// make any progress at all, never a guess at where the next header ends.
+    /// Waiting for it can therefore cost a parse that still comes up short,
+    /// and can never skip the parse that would have succeeded.
+    ///
+    /// `Some(_)` alongside complete-looking facts is normal and is not an
+    /// error: a volume whose headers all parsed can still be missing its end
+    /// record, which is exactly the case this field exists for.
+    pub short_at: Option<u64>,
+}
+
+/// What one facts walk produced, before a caller decides how to treat a walk
+/// that ran out of image. See [`RarArchive::facts_walk_boxed`].
+struct FactsWalkOutcome {
+    walk: RarVolumeFactsWalk,
+    /// The error a decode-bound parse raises for the same image, when the walk
+    /// stopped somewhere such a parse does not tolerate: inside a header, or
+    /// inside a member's declared data on an image whose length is known.
+    strict_error: Option<crate::error::RarError>,
+}
+
+impl FactsWalkOutcome {
+    fn new(short: Option<ShortRead>, facts: RarVolumeFacts) -> Self {
+        let (short_at, strict_error) = match short {
+            Some(short) => (Some(short.at), short.strict_error),
+            None => (None, None),
+        };
+        Self {
+            walk: RarVolumeFactsWalk { facts, short_at },
+            strict_error,
+        }
+    }
+
+    /// The facts as `parse_volume_facts` has always reported them: a walk
+    /// that stopped where a strict parse fails is that failure.
+    fn strict(self) -> RarResult<RarVolumeFacts> {
+        match self.strict_error {
+            Some(error) => Err(error),
+            None => Ok(self.walk.facts),
+        }
+    }
 }
 
 /// A single ordered file-header record from one physical RAR volume.
@@ -649,12 +724,72 @@ fn rar4_method_to_compression_method(method: crate::rar4::types::Rar4Method) -> 
 impl RarArchive {
     /// Parse immutable facts from a single physical RAR volume without
     /// building a live multi-volume archive graph.
+    ///
+    /// Every derivation this walk needs runs against a cache created for the
+    /// call and dropped with it. A caller that parses the *same* encrypted
+    /// volume more than once — a volume image that grows as it arrives, say —
+    /// should use [`Self::parse_volume_facts_with_shared_kdf_cache`] instead,
+    /// which is the same walk against a cache the caller keeps.
     pub fn parse_volume_facts(
         reader: impl std::io::Read + std::io::Seek + Send + 'static,
         password: Option<&str>,
     ) -> RarResult<RarVolumeFacts> {
         let reader: Box<dyn ReadSeek> = Box::new(reader);
         Self::parse_volume_facts_boxed(reader, password)
+    }
+
+    /// [`Self::parse_volume_facts`] against a caller-owned KDF cache.
+    ///
+    /// Identical facts, one difference in cost: the archive key of a
+    /// header-encrypted (`-hp`) volume comes from a PBKDF2 run of up to 2^24
+    /// iterations over (password, salt, KDF count), and all three are
+    /// properties of the *volume*, not of the parse. Passing a cache that
+    /// outlives the parse therefore makes the first walk of a volume pay that
+    /// derivation and every later walk of the same volume pay a lookup.
+    ///
+    /// The cache is keyed by password as well as salt, so sharing one across
+    /// unrelated archives is safe; it holds derived key material, so its
+    /// lifetime should be the caller's unit of work, not the process.
+    pub fn parse_volume_facts_with_shared_kdf_cache(
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<RarVolumeFacts> {
+        let reader: Box<dyn ReadSeek> = Box::new(reader);
+        Self::facts_walk_boxed(reader, password, kdf_cache)?.strict()
+    }
+
+    /// [`Self::parse_volume_facts`], additionally reporting where the header
+    /// walk ran out of bytes.
+    ///
+    /// Same headers, one difference in what a stopped walk is: where
+    /// [`Self::parse_volume_facts`] fails on an image that ends inside a
+    /// header, this returns the headers it reached and says where the image
+    /// has to grow to. See [`RarVolumeFactsWalk::short_at`].
+    pub fn parse_volume_facts_walk(
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+    ) -> RarResult<RarVolumeFactsWalk> {
+        let reader: Box<dyn ReadSeek> = Box::new(reader);
+        Self::parse_volume_facts_walk_boxed(
+            reader,
+            password,
+            std::sync::Arc::new(crate::crypto::KdfCache::new()),
+        )
+    }
+
+    /// [`Self::parse_volume_facts_walk`] against a caller-owned KDF cache.
+    ///
+    /// The entry point for reading a volume image that is still arriving: the
+    /// shared cache removes the repeated derivation, and
+    /// [`RarVolumeFactsWalk::short_at`] removes most of the repeated walks.
+    pub fn parse_volume_facts_walk_with_shared_kdf_cache(
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<RarVolumeFactsWalk> {
+        let reader: Box<dyn ReadSeek> = Box::new(reader);
+        Self::parse_volume_facts_walk_boxed(reader, password, kdf_cache)
     }
 
     /// Read one physical volume's **archive-level** encryption record with no
@@ -719,15 +854,48 @@ impl RarArchive {
     }
 
     pub(crate) fn parse_volume_facts_boxed(
-        mut reader: Box<dyn ReadSeek>,
+        reader: Box<dyn ReadSeek>,
         password: Option<&str>,
     ) -> RarResult<RarVolumeFacts> {
+        Self::facts_walk_boxed(
+            reader,
+            password,
+            std::sync::Arc::new(crate::crypto::KdfCache::new()),
+        )?
+        .strict()
+    }
+
+    pub(crate) fn parse_volume_facts_walk_boxed(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<RarVolumeFactsWalk> {
+        Ok(Self::facts_walk_boxed(reader, password, kdf_cache)?.walk)
+    }
+
+    /// The one walk behind every `parse_volume_facts*` entry point.
+    ///
+    /// The walk itself is the facts walk: it accepts a reader with no known
+    /// length and stops, rather than fails, where the image ends. The two
+    /// public shapes differ only in what they do with that stop:
+    /// [`FactsWalkOutcome::walk`] reports it as [`RarVolumeFactsWalk::short_at`];
+    /// [`FactsWalkOutcome::strict`] re-raises the error a decode-bound parse of
+    /// the same bytes raises, so `parse_volume_facts` fails on a truncated
+    /// volume exactly as it always has.
+    fn facts_walk_boxed(
+        mut reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<FactsWalkOutcome> {
         use std::io::{Seek, SeekFrom};
 
         reader
             .seek(SeekFrom::Start(0))
             .map_err(crate::error::RarError::Io)?;
         let format = signature::read_signature(&mut reader)?;
+        // Set by the walks below when the staged image ended underneath them;
+        // left `None` when the walk stopped on an end-of-archive record.
+        let mut short: Option<ShortRead> = None;
 
         if format.is_rar4_family() {
             // The `_for_facts` walks accept a reader with no known length — a
@@ -735,9 +903,14 @@ impl RarArchive {
             // reported and never decoded from; every extraction-bound parse
             // still refuses one.
             let parsed = if format == ArchiveFormat::Rar14 {
-                crate::rar4::parse_rar14_headers_for_facts(&mut reader)?
+                crate::rar4::parse_rar14_headers_for_facts(&mut reader, &mut short)?
             } else {
-                crate::rar4::parse_rar4_headers_for_facts(&mut reader, password)?
+                crate::rar4::parse_rar4_headers_for_facts_with_kdf_cache(
+                    &mut reader,
+                    password,
+                    &kdf_cache,
+                    &mut short,
+                )?
             };
             let volume_number = parsed
                 .end
@@ -758,7 +931,7 @@ impl RarArchive {
                 let archive = Self::open_rar4_parsed(
                     reader,
                     password,
-                    std::sync::Arc::new(crate::crypto::KdfCache::new()),
+                    std::sync::Arc::clone(&kdf_cache),
                     format,
                     parsed.clone(),
                 )?;
@@ -843,35 +1016,46 @@ impl RarArchive {
                         RarVolumeServiceFacts::from_rar4_old_service(base_order + order, service)
                     }),
             );
-            return Ok(RarVolumeFacts {
-                format: if format == ArchiveFormat::Rar14 {
-                    14
-                } else {
-                    4
+            return Ok(FactsWalkOutcome::new(
+                short,
+                RarVolumeFacts {
+                    format: if format == ArchiveFormat::Rar14 {
+                        14
+                    } else {
+                        4
+                    },
+                    volume_number,
+                    more_volumes,
+                    is_solid: parsed.archive_header.is_solid,
+                    is_encrypted: parsed.archive_header.is_encrypted,
+                    is_volume: parsed.archive_header.is_volume,
+                    has_recovery_record: parsed.archive_header.has_recovery_record,
+                    is_locked: parsed.archive_header.is_locked,
+                    has_authenticity_verification: parsed
+                        .archive_header
+                        .has_authenticity_verification,
+                    has_locator: false,
+                    quick_open_offset: None,
+                    // RAR4 and RAR1.4 have no Quick Open cache; this walk is
+                    // physical by construction.
+                    headers_from_quick_open: false,
+                    recovery_record_offset: None,
+                    original_name: None,
+                    original_name_raw: None,
+                    original_creation_time_ns: None,
+                    members,
+                    services,
                 },
-                volume_number,
-                more_volumes,
-                is_solid: parsed.archive_header.is_solid,
-                is_encrypted: parsed.archive_header.is_encrypted,
-                is_volume: parsed.archive_header.is_volume,
-                has_recovery_record: parsed.archive_header.has_recovery_record,
-                is_locked: parsed.archive_header.is_locked,
-                has_authenticity_verification: parsed.archive_header.has_authenticity_verification,
-                has_locator: false,
-                quick_open_offset: None,
-                // RAR4 and RAR1.4 have no Quick Open cache; this walk is
-                // physical by construction.
-                headers_from_quick_open: false,
-                recovery_record_offset: None,
-                original_name: None,
-                original_name_raw: None,
-                original_creation_time_ns: None,
-                members,
-                services,
-            });
+            ));
         }
 
-        let parsed = crate::header::parse_all_headers(&mut reader, password)?;
+        let parsed = crate::header::parse_all_headers_for_facts(
+            &mut reader,
+            password,
+            &kdf_cache,
+            crate::header::HeaderParseOptions::default(),
+            &mut short,
+        )?;
         let main = parsed.main.as_ref();
         let volume_number = main
             .and_then(|main| main.volume_number)
@@ -971,26 +1155,29 @@ impl RarArchive {
             })
             .collect();
 
-        Ok(RarVolumeFacts {
-            format: 5,
-            volume_number,
-            more_volumes,
-            is_solid,
-            is_encrypted: parsed.is_encrypted,
-            is_volume,
-            has_recovery_record,
-            is_locked,
-            has_authenticity_verification: false,
-            has_locator,
-            quick_open_offset,
-            headers_from_quick_open,
-            recovery_record_offset,
-            original_name,
-            original_name_raw,
-            original_creation_time_ns,
-            members,
-            services,
-        })
+        Ok(FactsWalkOutcome::new(
+            short,
+            RarVolumeFacts {
+                format: 5,
+                volume_number,
+                more_volumes,
+                is_solid,
+                is_encrypted: parsed.is_encrypted,
+                is_volume,
+                has_recovery_record,
+                is_locked,
+                has_authenticity_verification: false,
+                has_locator,
+                quick_open_offset,
+                headers_from_quick_open,
+                recovery_record_offset,
+                original_name,
+                original_name_raw,
+                original_creation_time_ns,
+                members,
+                services,
+            },
+        ))
     }
 }
 
@@ -998,6 +1185,25 @@ impl RarArchive {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Arc;
+
+    /// Read one checked-in corpus fixture, or `None` when the corpus has not
+    /// been hydrated into this checkout. The fixture bytes are not part of the
+    /// published crate, so a test that needs them says so and steps aside
+    /// rather than failing where they cannot exist.
+    fn corpus_fixture(parts: &[&str]) -> Option<Vec<u8>> {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for part in parts {
+            path.push(part);
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                eprintln!("skipping: corpus fixture {} is not present", path.display());
+                None
+            }
+        }
+    }
 
     #[derive(Serialize)]
     struct LegacyVolumeFacts {
@@ -1504,5 +1710,300 @@ mod tests {
             facts.members[0].encryption
         );
         assert_eq!(round_tripped.members[0].rar4_salt, None);
+    }
+
+    #[test]
+    fn repeated_rar5_hp_facts_parses_through_one_cache_derive_once() {
+        let Some(data) = corpus_fixture(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"]) else {
+            return;
+        };
+        let cache = Arc::new(crate::crypto::KdfCache::new());
+        assert_eq!(cache.rar5_derivation_count(), 0);
+
+        let first = RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            Cursor::new(data.clone()),
+            Some("secretpass"),
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        let after_first = cache.rar5_derivation_count();
+        assert_eq!(
+            after_first, 1,
+            "a `-hp` volume's archive key is one derivation"
+        );
+
+        let second = RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            Cursor::new(data),
+            Some("secretpass"),
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.rar5_derivation_count(),
+            after_first,
+            "the second walk of the same volume must derive nothing"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_fresh_cache_per_parse_pays_the_rar5_hp_derivation_every_time() {
+        // The other half of the claim above: without a shared cache the cost
+        // is per parse, which is what makes the shared entry point worth
+        // having.
+        let Some(data) = corpus_fixture(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"]) else {
+            return;
+        };
+        for _ in 0..2 {
+            let cache = Arc::new(crate::crypto::KdfCache::new());
+            RarArchive::parse_volume_facts_with_shared_kdf_cache(
+                Cursor::new(data.clone()),
+                Some("secretpass"),
+                Arc::clone(&cache),
+            )
+            .unwrap();
+            assert_eq!(cache.rar5_derivation_count(), 1);
+        }
+    }
+
+    #[test]
+    fn shared_cache_rar5_hp_facts_match_the_owned_cache_walk() {
+        let Some(data) = corpus_fixture(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"]) else {
+            return;
+        };
+        let owned = RarArchive::parse_volume_facts(Cursor::new(data.clone()), Some("secretpass"))
+            .expect("owned-cache walk");
+        assert!(owned.is_encrypted, "non-vacuity: the fixture is `-hp`");
+        assert!(!owned.members.is_empty(), "non-vacuity: it holds members");
+
+        let shared = RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            Cursor::new(data.clone()),
+            Some("secretpass"),
+            Arc::new(crate::crypto::KdfCache::new()),
+        )
+        .expect("shared-cache walk");
+        assert_eq!(owned, shared);
+
+        let walk = RarArchive::parse_volume_facts_walk(Cursor::new(data), Some("secretpass"))
+            .expect("reporting walk");
+        assert_eq!(owned, walk.facts);
+    }
+
+    #[test]
+    fn repeated_rar4_hp_facts_parses_through_one_cache_derive_once_per_salt() {
+        let Some(data) = corpus_fixture(&["tests", "fixtures", "rar4", "rar4_hp_large.rar"]) else {
+            return;
+        };
+        let cache = Arc::new(crate::crypto::KdfCache::new());
+        let first = RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            Cursor::new(data.clone()),
+            Some("e2e-test-password"),
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        // RAR4 salts each header separately, so one walk derives more than
+        // once; what matters is that the next walk derives nothing.
+        let after_first = cache.rar4_derivation_count();
+        assert!(after_first > 0, "non-vacuity: the fixture is `-hp`");
+
+        let second = RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            Cursor::new(data.clone()),
+            Some("e2e-test-password"),
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.rar4_derivation_count(), after_first);
+        assert_eq!(first, second);
+
+        let owned =
+            RarArchive::parse_volume_facts(Cursor::new(data), Some("e2e-test-password")).unwrap();
+        assert_eq!(owned, first);
+    }
+
+    #[test]
+    fn a_complete_volume_walk_reports_no_short_read() {
+        let payload = vec![0xA5u8; 512];
+        let bytes = rar5_split_after_archive_bytes(
+            "Silver.Horizon.S02E12.mkv",
+            &payload,
+            4096,
+            0x1234_5678,
+            [0x11; 32],
+        );
+        let walk = RarArchive::parse_volume_facts_walk(Cursor::new(bytes), None).unwrap();
+        assert_eq!(
+            walk.short_at, None,
+            "a walk that reached the end-of-archive record needs nothing more"
+        );
+        assert_eq!(walk.facts.members.len(), 1);
+    }
+
+    #[test]
+    fn a_short_volume_image_reports_the_offset_its_walk_ran_out_at() {
+        let payload = vec![0xA5u8; 512];
+        let bytes = rar5_split_after_archive_bytes(
+            "Silver.Horizon.S02E12.mkv",
+            &payload,
+            4096,
+            0x1234_5678,
+            [0x11; 32],
+        );
+        // Where the payload ends is where the next header begins, so that is
+        // the offset a short image has to reach before another walk can learn
+        // anything.
+        let end_block = build_rar5_block(5, 0, &[], &crate::vint::encode_vint(1));
+        let payload_end = bytes.len() - end_block.len();
+
+        for staged in [payload_end - 400, payload_end - 1, payload_end] {
+            let walk =
+                RarArchive::parse_volume_facts_walk(Cursor::new(bytes[..staged].to_vec()), None)
+                    .unwrap_or_else(|err| panic!("walk over {staged} staged bytes: {err}"));
+            assert_eq!(
+                walk.short_at,
+                Some(payload_end as u64 + 6),
+                "short image of {staged} bytes"
+            );
+            assert!(
+                walk.short_at.unwrap() > staged as u64,
+                "the reported offset must be past what is staged, or a caller \
+                 waiting for it would spin"
+            );
+            // The headers it did reach are still the volume's own.
+            assert_eq!(walk.facts.members.len(), 1);
+            assert_eq!(walk.facts.members[0].name, "Silver.Horizon.S02E12.mkv");
+            assert!(
+                !walk.facts.more_volumes,
+                "the end record that states this was never reached"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_cut_inside_a_header_is_short_to_the_walk_and_truncated_to_the_parse() {
+        let payload = vec![0xA5u8; 512];
+        let bytes = rar5_split_after_archive_bytes(
+            "Silver.Horizon.S02E12.mkv",
+            &payload,
+            4096,
+            0x1234_5678,
+            [0x11; 32],
+        );
+        let end_block = build_rar5_block(5, 0, &[], &crate::vint::encode_vint(1));
+        let header_start = bytes.len() - end_block.len();
+        // Five bytes into the end record: its CRC32 and header-size vint are
+        // staged, its body is not. This is the cut a piece boundary makes when
+        // it lands inside a header rather than between two.
+        let staged = header_start + 5;
+
+        let walk = RarArchive::parse_volume_facts_walk(Cursor::new(bytes[..staged].to_vec()), None)
+            .expect("the walk stops where the image ends rather than failing");
+        let short_at = walk.short_at.expect("and says where");
+        assert!(
+            short_at > staged as u64,
+            "reported offset {short_at} must be past the {staged} staged bytes"
+        );
+        assert!(
+            short_at <= bytes.len() as u64,
+            "a lower bound never points past the complete volume"
+        );
+        assert_eq!(
+            walk.facts.members.len(),
+            1,
+            "the headers before the cut are kept"
+        );
+        assert!(!walk.facts.more_volumes, "the cut record was not read");
+
+        let err = RarArchive::parse_volume_facts(Cursor::new(bytes[..staged].to_vec()), None)
+            .expect_err("the plain parse still fails on a header the image cuts");
+        assert!(
+            matches!(err, crate::error::RarError::TruncatedHeader { offset } if offset == header_start as u64),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_rar4_image_ending_inside_a_members_data_is_short_to_the_walk_and_corrupt_to_the_parse() {
+        let Some(data) = corpus_fixture(&[
+            "tests",
+            "fixtures",
+            "rar4",
+            "generated_matrix_rar4_store_plain.part7.rar",
+        ]) else {
+            return;
+        };
+        let whole = RarArchive::parse_volume_facts_walk(Cursor::new(data.clone()), None).unwrap();
+        assert_eq!(whole.short_at, None, "the fixture is complete");
+        let member = whole
+            .facts
+            .members
+            .iter()
+            .find(|member| !member.split_after)
+            .expect("the last volume of a set closes a member");
+        let data_end = member.data_offset + member.data_size;
+        let staged = (member.data_offset + member.data_size / 2) as usize;
+
+        // A `Cursor` states its length, so the decode-bound check sees a member
+        // whose declared data runs past the end of the image. To the facts
+        // walk that is the image ending inside the member: short, at its data
+        // end plus the next header's fixed block.
+        let walk = RarArchive::parse_volume_facts_walk(Cursor::new(data[..staged].to_vec()), None)
+            .expect("the walk stops where the image ends rather than failing");
+        assert_eq!(walk.short_at, Some(data_end + 7));
+        assert!(
+            walk.facts.members.iter().any(|m| m.name == member.name),
+            "the member whose data the image cuts is still reported"
+        );
+
+        let err = RarArchive::parse_volume_facts(Cursor::new(data[..staged].to_vec()), None)
+            .expect_err("the plain parse still rejects data the volume cannot hold");
+        assert!(
+            matches!(err, crate::error::RarError::CorruptArchive { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_rar5_hp_volume_image_reports_an_offset_past_what_is_staged() {
+        let Some(data) = corpus_fixture(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"]) else {
+            return;
+        };
+        let whole =
+            RarArchive::parse_volume_facts_walk(Cursor::new(data.clone()), Some("secretpass"))
+                .unwrap();
+        assert_eq!(whole.short_at, None, "the fixture is complete");
+
+        // Cut inside the member's payload, the state a volume image is in for
+        // every article but its last: the headers before the payload are all
+        // staged, the end-of-archive record after it is not.
+        let member = whole.facts.members.first().expect("fixture holds a member");
+        let payload_end = member.data_offset + member.data_size;
+        assert!(
+            member.data_size >= 2 && (payload_end as usize) < data.len(),
+            "fixture shape: a store member followed by an end record"
+        );
+
+        for staged in [
+            member.data_offset as usize + member.data_size as usize / 2,
+            payload_end as usize,
+        ] {
+            let walk = RarArchive::parse_volume_facts_walk(
+                Cursor::new(data[..staged].to_vec()),
+                Some("secretpass"),
+            )
+            .unwrap_or_else(|err| panic!("short `-hp` image of {staged} bytes: {err}"));
+            let short_at = walk
+                .short_at
+                .expect("a walk that ran out of bytes must say where");
+            assert_eq!(
+                short_at,
+                payload_end + 32,
+                "the next encrypted header needs its IV and one cipher block"
+            );
+            assert!(
+                short_at > staged as u64,
+                "reported offset {short_at} must be past the {staged} staged bytes"
+            );
+            assert_eq!(walk.facts.members.len(), whole.facts.members.len());
+        }
     }
 }

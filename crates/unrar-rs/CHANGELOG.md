@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.10.3
+
+Reading a volume image that is still arriving no longer re-derives its key on
+every attempt, and can now say when a further attempt is pointless. Both are
+for the same caller: one that parses a volume's facts each time more of it
+lands, until the headers complete. On a header-encrypted (`-hp`) volume every
+such attempt ran the full RAR5 PBKDF2 — up to 2^24 iterations — because the
+facts walk built its KDF cache per call and dropped it again; and a store
+volume's end-of-archive record sits past all of its payload, so that repeated
+for as many attempts as the volume had pieces.
+
+### Added
+
+- `RarArchive::parse_volume_facts_with_shared_kdf_cache` parses exactly what
+  `parse_volume_facts` does, against a caller-owned `Arc<crypto::KdfCache>`.
+  The archive key of an `-hp` volume derives from (password, salt, KDF count),
+  all properties of the volume rather than of the parse, so the first walk pays
+  the derivation and every later walk of the same volume pays a lookup. The
+  RAR4 branch of the walk, which derives per header salt, shares the same
+  cache.
+- `RarArchive::parse_volume_facts_walk` and
+  `parse_volume_facts_walk_with_shared_kdf_cache` return the new
+  `RarVolumeFactsWalk`: the same facts plus `short_at`, the first offset the
+  walk could not read when the image ended underneath it, and `None` when the
+  walk stopped on an end-of-archive record. It is a lower bound — the least the
+  walk needs to make any progress — so waiting for it can cost a parse that
+  still comes up short and can never skip the parse that would have succeeded.
+  For a store volume it points past the member's payload, which is where that
+  volume's end record actually is. Every way an image can end under the walk
+  is reported: between two headers, inside a header, and — on a reader that
+  states its length — inside a member's declared data. The last two are where
+  `parse_volume_facts` fails instead, and it still does: the walk carries the
+  error a decode-bound parse raises for the same bytes, and the plain entry
+  points re-raise it, so no existing caller sees a truncated volume parse
+  succeed. This mirrors RARLAB's reader, which treats a stream ending between
+  headers as the end of an archive and a stream ending inside one as an
+  unexpected end.
+- `crypto::KdfCache::rar5_derivation_count` and `rar4_derivation_count` report
+  how many derivations a cache has actually performed, which is what separates
+  a cache that was consulted from one that was used.
+- `header::parse_all_headers_with_kdf_cache` and
+  `header::parse_all_headers_with_kdf_cache_and_options` are now public; they
+  were already the in-crate shape of the above. The RAR4 walk's equivalent
+  stays crate-private with the rest of the `rar4` module.
+  `header::parse_header_encryption` needs no such variant: it walks with no
+  password and stops at the archive's plaintext type-4 record, deriving
+  nothing.
+
+### Changed
+
+- The RAR4 side of `crypto::KdfCache` holds 1024 derivations instead of 4.
+  RAR3/RAR4 `-hp` salts every header separately, so a volume walk derives once
+  per header and a repeat walk of the same image only stays cheap while every
+  salt from the first walk is still cached; four slots evicted the first before
+  the second walk reached it and then missed on every header in turn. The
+  RAR5 side is unchanged at 4: an `-hp` RAR5 set keys all of its headers, on
+  every volume, from one salt.
+
+Existing entry points are unchanged in behaviour and in signature;
+`parse_volume_facts` creates a cache and delegates.
+
 ## 0.10.2
 
 ### Fixed
