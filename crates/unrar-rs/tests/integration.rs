@@ -6321,6 +6321,50 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     );
 }
 
+/// The last data volume is the one case with a read after the write: RAR pads
+/// every recovery column to the longest volume, so the restored final volume
+/// carries zero padding past its end-of-archive header that has to be read
+/// back and trimmed. Restoring it used to fail with a bad file descriptor,
+/// because the output was opened write-only and the trim read through it.
+#[test]
+fn test_rar3_recovery_volumes_restore_missing_last_part() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar3_recovery_volumes.part1.rar",
+        "rar3_recovery_volumes.part2.rar",
+        "rar3_recovery_volumes.part3.rar",
+        "rar3_recovery_volumes.part4.rar",
+        "rar3_recovery_volumes.part1.rev",
+        "rar3_recovery_volumes.part2.rev",
+    ];
+    let mut paths = Vec::new();
+    for name in present {
+        let dst = temp_dir.path().join(name);
+        std::fs::copy(fixture("rar4", name), &dst).unwrap();
+        paths.push(dst);
+    }
+
+    let expected_path = temp_dir.path().join("rar3_recovery_volumes.part5.rar");
+    let options = unrar_rs::RecoveryOptions {
+        output_dir: Some(temp_dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+    assert_eq!(report.format, unrar_rs::ArchiveFormat::Rar4);
+    assert_eq!(report.missing_volume_numbers, vec![4]);
+    assert_eq!(report.restored_paths, vec![expected_path.clone()]);
+
+    let expected = std::fs::read(fixture("rar4", "rar3_recovery_volumes.part5.rar")).unwrap();
+    let restored = std::fs::read(&expected_path).unwrap();
+    assert_eq!(
+        restored.len(),
+        expected.len(),
+        "restored last volume kept its recovery padding"
+    );
+    assert_eq!(restored, expected);
+}
+
 /// The same restore at a size that matters: 1 MiB volumes, two of them missing,
 /// so one reconstruction pass decodes about a million byte columns through
 /// rayon's split recursion with the coder reused across each split's columns.

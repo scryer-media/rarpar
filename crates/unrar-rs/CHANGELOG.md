@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.2
+
+### Fixed
+
+- `restore_volumes_from_paths` no longer fails with `Bad file descriptor` when
+  the missing volume of a RAR3/RAR4 set is its last data volume. RAR pads every
+  recovery column to the longest volume, so the rebuilt last volume ends in
+  zero padding past its end-of-archive header; the trim that removes it reads
+  the headers back through the output handle, which was opened write-only.
+  The output is now opened readable as well, the equivalent of unrar closing
+  and reopening the last volume in update mode before the same trim.
+
+### Performance
+
+- RAR3/RAR4 recovery-volume restores use a fraction of the CPU they did. The
+  column decoder no longer allocates two heap buffers and clears kilobytes of
+  scratch per reconstructed byte (see `reedsolomon-rs` 0.4.4), the coder is
+  built once and cloned into each rayon split rather than rebuilt per split,
+  and a whole chunk of columns is decoded into one buffer allocated once per
+  volume. Restoring a missing 1 MiB volume of the recovery fixture drops from
+  about 3.0 s to 0.26 s of CPU on one core with byte-identical output. RAR5
+  restores, which already worked a buffer at a time, are unchanged.
+
+Requires `reedsolomon-rs` 0.4.4.
 
 ## 0.10.1
 
