@@ -907,14 +907,18 @@ impl FileScanStats {
 /// Accounting for the exhaustive short-block relocation search.
 ///
 /// That search is the one scan phase whose cost is not proportional to the
-/// candidate it was asked about: it re-reads a whole candidate once per
-/// distinct still-open short length. It used to update no counter at all, so
-/// a quadratic blow-up surfaced in the logs as a slow file scan reporting zero
-/// windows stepped. These fields exist so it can never hide again.
+/// candidate it was asked about: it re-reads a candidate's unexplained bytes
+/// once per distinct still-open short length. It used to update no counter at
+/// all, so a quadratic blow-up surfaced in the logs as a slow file scan
+/// reporting zero windows stepped. These fields exist so it can never hide
+/// again, and `bytes_unexplained` says how much of the candidate the sweep
+/// was entitled to read, so a re-read close to it is the expected shape and
+/// one far above it is a bug.
 #[derive(Debug, Default, Clone, Copy)]
 struct ShortRelocationStats {
     windows_stepped: u64,
     bytes_read: u64,
+    bytes_unexplained: u64,
     blocks_placed: u64,
 }
 
@@ -922,6 +926,9 @@ impl ShortRelocationStats {
     fn accumulate(&mut self, other: &Self) {
         self.windows_stepped = self.windows_stepped.saturating_add(other.windows_stepped);
         self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.bytes_unexplained = self
+            .bytes_unexplained
+            .saturating_add(other.bytes_unexplained);
         self.blocks_placed = self.blocks_placed.saturating_add(other.blocks_placed);
     }
 }
@@ -3747,12 +3754,18 @@ impl RepairState {
     /// open, and only inside candidates the merged state cannot already account
     /// for byte-for-byte.
     ///
-    /// The search itself is unchanged, and so is its reach into candidates
-    /// that still hold unexplained bytes: a short block shifted inside,
-    /// concatenated into, or otherwise relocated within one is still found.
-    /// Only a block duplicated inside a candidate the merged state already
-    /// explains in full goes unsalvaged, and that costs a recovery block, not
-    /// the data.
+    /// Inside a candidate the sweep reads only the bytes the merged state
+    /// cannot account for, plus one window of lead-in, and tests only the
+    /// windows that cover at least one such byte. A short block shifted
+    /// inside, concatenated into, or otherwise relocated within a candidate is
+    /// still found there, because wherever it landed is by definition
+    /// unexplained. What goes unsalvaged is a short block whose bytes are
+    /// *duplicated* inside bytes already placed as other blocks, and that
+    /// costs a recovery block, not the data — the same trade the
+    /// whole-candidate skip below already makes, applied byte-for-byte.
+    /// A damaged canonical volume is the case that pays: its intact slices
+    /// are all placed, so a sweep that used to re-read the whole file once per
+    /// open short length now reads only the damaged tail.
     fn relocate_open_short_blocks(
         &mut self,
         options: &Par2RepairerOptions,
@@ -3784,24 +3797,31 @@ impl RepairState {
                     break;
                 }
                 check_cancel(options)?;
-                if explained
+                let unexplained = match explained
                     .get_or_insert_with(|| self.explained_bytes_by_path())
                     .get_mut(&target.path)
-                    .is_some_and(|spans| merged_span_bytes(spans) >= target.len)
                 {
+                    Some(spans) => unexplained_byte_ranges(spans, target.len),
+                    None => vec![(0, target.len)],
+                };
+                if unexplained.is_empty() {
                     candidates_skipped = candidates_skipped.saturating_add(1);
                     continue;
                 }
 
                 candidates_scanned = candidates_scanned.saturating_add(1);
                 let candidate_started = Instant::now();
-                let mut stats = ShortRelocationStats::default();
+                let mut stats = ShortRelocationStats {
+                    bytes_unexplained: unexplained.iter().map(|(start, end)| end - start).sum(),
+                    ..ShortRelocationStats::default()
+                };
                 let attempted = {
                     let mut scan = ShortRelocationScan {
                         table,
                         path: &target.path,
                         kind: target.kind,
                         open: &open,
+                        unexplained: &unexplained,
                         blocks: &mut blocks,
                         stats: &mut stats,
                     };
@@ -7045,11 +7065,15 @@ impl<'a> RollingBlockScanner<'a> {
             return Ok(stats);
         }
         let open = open_short_blocks(self.table, blocks, self.table.slice_size);
+        // No merged state to consult here: the whole candidate is unexplained.
+        let unexplained = [(0u64, len as u64)];
+        stats.bytes_unexplained = len as u64;
         let mut scan = ShortRelocationScan {
             table: self.table,
             path,
             kind,
             open: &open,
+            unexplained: &unexplained,
             blocks,
             stats: &mut stats,
         };
@@ -7206,6 +7230,7 @@ fn log_short_relocation(
         short_lengths_attempted = short_lengths.len(),
         windows_stepped = stats.windows_stepped,
         bytes_reread = stats.bytes_read,
+        bytes_unexplained = stats.bytes_unexplained,
         blocks_placed = stats.blocks_placed,
         elapsed_ms = elapsed.as_millis(),
         "completed par2 short-block relocation scan"
@@ -7220,6 +7245,7 @@ fn log_short_relocation(
             short_lengths_attempted = short_lengths.len(),
             windows_stepped = stats.windows_stepped,
             bytes_reread = stats.bytes_read,
+            bytes_unexplained = stats.bytes_unexplained,
             blocks_placed = stats.blocks_placed,
             elapsed_ms = elapsed.as_millis(),
             "slow par2 short-block relocation scan"
@@ -7242,6 +7268,7 @@ fn log_short_relocation_pass(
         open_short_blocks,
         windows_stepped = stats.windows_stepped,
         bytes_reread = stats.bytes_read,
+        bytes_unexplained = stats.bytes_unexplained,
         blocks_placed = stats.blocks_placed,
         elapsed_ms = elapsed.as_millis(),
         "completed par2 short-block relocation pass"
@@ -7255,6 +7282,7 @@ fn log_short_relocation_pass(
             open_short_blocks,
             windows_stepped = stats.windows_stepped,
             bytes_reread = stats.bytes_read,
+            bytes_unexplained = stats.bytes_unexplained,
             blocks_placed = stats.blocks_placed,
             elapsed_ms = elapsed.as_millis(),
             "slow par2 short-block relocation pass"
@@ -7474,6 +7502,10 @@ struct ShortRelocationScan<'a, 'blocks> {
     kind: BlockLocationKind,
     /// Indexed by block index; `true` for a short block still worth hunting.
     open: &'a [bool],
+    /// Byte ranges `[start, end)` of the candidate the merged state cannot
+    /// account for: ascending, disjoint, clamped to the candidate. The sweep
+    /// tests exactly the windows that cover at least one of these bytes.
+    unexplained: &'a [(u64, u64)],
     blocks: &'a mut ScanBlockState<'blocks>,
     stats: &'a mut ShortRelocationStats,
 }
@@ -7482,9 +7514,65 @@ struct ShortRelocationScan<'a, 'blocks> {
 /// window loop.
 struct ShortWindowParams<'a> {
     short_len: usize,
-    zero_combine: &'a checksum::Crc32CombineOp,
-    zero_crc: u32,
+    targets: &'a ShortWindowTargets,
     window_table: &'a [u32; 256],
+}
+
+/// The still-open short blocks of one length, keyed by the CRC32 of their
+/// *unpadded* bytes.
+///
+/// A short block's IFSC checksum covers the block zero-padded to the slice
+/// size, while the sweep's rolling CRC covers exactly `short_len` bytes. The
+/// sweep used to bridge that per window — a 32-step matrix-vector product to
+/// pad the rolling CRC forward, then a hash probe of the whole-set table —
+/// which put ~70 ns on every byte of candidate. Undoing the padding once per
+/// block moves all of it out of the loop: the per-window cost is the CRC
+/// slide and a comparison against a handful of sorted targets.
+struct ShortWindowTargets {
+    /// `(unpadded_crc, block_index)`, sorted by CRC.
+    entries: Vec<(u32, usize)>,
+}
+
+impl ShortWindowTargets {
+    fn new(
+        table: &VerificationHashTable,
+        blocks: &ScanBlockState<'_>,
+        open: &[bool],
+        short_len: usize,
+    ) -> Self {
+        let pad_len = table.slice_size.saturating_sub(short_len as u64);
+        let zero_crc = crc32_zeros(pad_len);
+        let uncombine = checksum::Crc32UncombineOp::new(pad_len);
+        let mut entries: Vec<(u32, usize)> = table
+            .short_blocks
+            .iter()
+            .copied()
+            .filter(|block_index| {
+                open.get(*block_index).copied().unwrap_or(false)
+                    && blocks.block(*block_index).expected_len as usize == short_len
+            })
+            .map(|block_index| {
+                let padded = blocks.block(block_index).checksum.crc32;
+                (uncombine.uncombine(padded, zero_crc), block_index)
+            })
+            .collect();
+        entries.sort_unstable();
+        Self { entries }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Block indices whose unpadded CRC is `crc`, in index order.
+    #[inline]
+    fn candidates(&self, crc: u32) -> impl Iterator<Item = usize> + '_ {
+        let start = self.entries.partition_point(|(target, _)| *target < crc);
+        self.entries[start..]
+            .iter()
+            .take_while(move |(target, _)| *target == crc)
+            .map(|(_, block_index)| *block_index)
+    }
 }
 
 /// Sweep one candidate for every still-open short length that fits in it.
@@ -7538,20 +7626,57 @@ fn short_block_is_settled(
         && location.len == block.expected_len
 }
 
-/// Total bytes the merged spans cover, merging overlaps. Sorts in place.
-fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
+/// The byte ranges `[start, end)` of a `len`-byte candidate that the located
+/// `(offset, len)` spans leave uncovered: ascending, disjoint, clamped to the
+/// candidate. Empty when the spans explain every byte. Sorts `spans` in place.
+fn unexplained_byte_ranges(spans: &mut [(u64, u64)], len: u64) -> Vec<(u64, u64)> {
     spans.sort_unstable();
-    let mut covered = 0u64;
+    let mut ranges = Vec::new();
     let mut reach = 0u64;
-    for (offset, len) in spans.iter() {
-        let end = offset.saturating_add(*len);
-        let start = (*offset).max(reach);
-        if end > start {
-            covered = covered.saturating_add(end - start);
-            reach = end;
+    for (offset, span_len) in spans.iter() {
+        let start = (*offset).min(len);
+        if start > reach {
+            ranges.push((reach, start));
+        }
+        reach = reach.max(offset.saturating_add(*span_len).min(len));
+    }
+    if reach < len {
+        ranges.push((reach, len));
+    }
+    ranges
+}
+
+/// The regions of a `len`-byte candidate one `short_len` sweep reads so that
+/// every window covering at least one unexplained byte is tested, and no
+/// other: each unexplained range widened by `short_len - 1` on both sides,
+/// clamped to the candidate, merged where the widening makes neighbours meet,
+/// and dropped when too small to hold a window. A window whose start lies in
+/// a region and whose end fits inside it is exactly a window that overlaps
+/// the range the region came from.
+fn short_sweep_regions(
+    unexplained: &[(u64, u64)],
+    len: usize,
+    short_len: usize,
+) -> Vec<(usize, usize)> {
+    let reach = short_len.saturating_sub(1);
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in unexplained {
+        let start = usize::try_from(*start).unwrap_or(usize::MAX).min(len);
+        let end = usize::try_from(*end).unwrap_or(usize::MAX).min(len);
+        if start >= end {
+            continue;
+        }
+        let region = (
+            start.saturating_sub(reach),
+            end.saturating_add(reach).min(len),
+        );
+        match regions.last_mut() {
+            Some(last) if region.0 <= last.1 => last.1 = last.1.max(region.1),
+            _ => regions.push(region),
         }
     }
-    covered
+    regions.retain(|(start, end)| end - start >= short_len);
+    regions
 }
 
 /// The distinct short lengths still worth sweeping a `len`-byte candidate for.
@@ -7586,14 +7711,40 @@ fn scan_shifted_short_len_from_file(
     if short_len == 0 || short_len > len {
         return Ok(());
     }
-    let table = scan.table;
+    let targets = ShortWindowTargets::new(scan.table, scan.blocks, scan.open, short_len);
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let regions = short_sweep_regions(scan.unexplained, len, short_len);
+    if regions.is_empty() {
+        return Ok(());
+    }
+    let window_table = generate_window_table(short_len as u64);
+    let params = ShortWindowParams {
+        short_len,
+        targets: &targets,
+        window_table: &window_table,
+    };
     let path = scan.path;
 
     if short_len > SCANNER_IO_TARGET_BYTES {
         let file = File::open(path)?;
         let map = MappedFile::map(&file)?;
-        scan.stats.bytes_read = scan.stats.bytes_read.saturating_add(map.len() as u64);
-        scan_shifted_short_len_from_slice(scan, &map, short_len);
+        for (start, end) in regions {
+            let end = end.min(map.len());
+            if end.saturating_sub(start) < short_len {
+                continue;
+            }
+            scan.stats.bytes_read = scan.stats.bytes_read.saturating_add((end - start) as u64);
+            let mut next_unscanned_offset = start;
+            scan_shifted_short_windows(
+                scan,
+                &params,
+                &map[start..end],
+                start,
+                &mut next_unscanned_offset,
+            );
+        }
         drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         return Ok(());
@@ -7606,76 +7757,57 @@ fn scan_shifted_short_len_from_file(
         io::Error::new(io::ErrorKind::InvalidInput, "scanner buffer size overflow")
     })?;
     let mut buffer = vec![0u8; buffer_len];
-    let mut valid_len = 0usize;
-    let mut base_offset = 0usize;
-    let mut next_unscanned_offset = 0usize;
-    let mut total_read = 0usize;
-    let window_table = generate_window_table(short_len as u64);
-    let pad_len = table.slice_size.saturating_sub(short_len as u64);
-    let zero_crc = crc32_zeros(pad_len);
-    let zero_combine = checksum::Crc32CombineOp::new(pad_len);
 
-    loop {
-        if valid_len == buffer.len() {
-            let keep = overlap.min(valid_len);
-            buffer.copy_within(valid_len - keep..valid_len, 0);
-            base_offset += valid_len - keep;
-            valid_len = keep;
+    for (region_start, region_end) in regions {
+        file.seek(SeekFrom::Start(region_start as u64))?;
+        let mut valid_len = 0usize;
+        let mut base_offset = region_start;
+        let mut next_unscanned_offset = region_start;
+        let mut remaining = region_end - region_start;
+        let mut region_read = 0usize;
+
+        loop {
+            if valid_len == buffer.len() {
+                let keep = overlap.min(valid_len);
+                buffer.copy_within(valid_len - keep..valid_len, 0);
+                base_offset += valid_len - keep;
+                valid_len = keep;
+            }
+
+            let want = (buffer.len() - valid_len).min(remaining);
+            let read_len = if want == 0 {
+                0
+            } else {
+                file.read(&mut buffer[valid_len..valid_len + want])?
+            };
+            remaining -= read_len;
+            region_read += read_len;
+            valid_len += read_len;
+            scan.stats.bytes_read = scan.stats.bytes_read.saturating_add(read_len as u64);
+
+            scan_shifted_short_windows(
+                scan,
+                &params,
+                &buffer[..valid_len],
+                base_offset,
+                &mut next_unscanned_offset,
+            );
+
+            if read_len == 0 {
+                break;
+            }
         }
 
-        let read_len = file.read(&mut buffer[valid_len..])?;
-        total_read += read_len;
-        valid_len += read_len;
-        scan.stats.bytes_read = scan.stats.bytes_read.saturating_add(read_len as u64);
-
-        scan_shifted_short_windows(
-            scan,
-            &ShortWindowParams {
-                short_len,
-                zero_combine: &zero_combine,
-                zero_crc,
-                window_table: &window_table,
-            },
-            &buffer[..valid_len],
-            base_offset,
-            &mut next_unscanned_offset,
+        crate::file_cache::drop_touched_file_cache(
+            &file,
+            path,
+            len as u64,
+            region_start as u64,
+            region_read as u64,
         );
-
-        if read_len == 0 {
-            break;
-        }
     }
 
-    crate::file_cache::drop_touched_file_cache(&file, path, len as u64, 0, total_read as u64);
     Ok(())
-}
-
-fn scan_shifted_short_len_from_slice(
-    scan: &mut ShortRelocationScan<'_, '_>,
-    data: &[u8],
-    short_len: usize,
-) {
-    if short_len == 0 || data.len() < short_len {
-        return;
-    }
-
-    let pad_len = scan.table.slice_size.saturating_sub(short_len as u64);
-    let zero_crc = crc32_zeros(pad_len);
-    let zero_combine = checksum::Crc32CombineOp::new(pad_len);
-    let window_table = generate_window_table(short_len as u64);
-    let mut next_unscanned_offset = 0usize;
-    scan_shifted_short_windows(
-        scan,
-        &ShortWindowParams {
-            short_len,
-            zero_combine: &zero_combine,
-            zero_crc,
-            window_table: &window_table,
-        },
-        data,
-        0,
-        &mut next_unscanned_offset,
-    );
 }
 
 fn scan_shifted_short_windows(
@@ -7687,8 +7819,7 @@ fn scan_shifted_short_windows(
 ) {
     let ShortWindowParams {
         short_len,
-        zero_combine,
-        zero_crc,
+        targets,
         window_table,
     } = *params;
     let table = scan.table;
@@ -7707,35 +7838,29 @@ fn scan_shifted_short_windows(
     let mut crc = checksum::crc32(&buffer[local_offset..local_offset + short_len]);
     let mut windows_stepped = 0u64;
     loop {
-        let padded_crc = zero_combine.combine(crc, zero_crc);
-        if let Some(candidates) = table.by_crc.get(&padded_crc) {
+        for block_index in targets.candidates(crc) {
             let data = &buffer[local_offset..local_offset + short_len];
             let absolute_offset = (base_offset + local_offset) as u64;
-            for block_index in candidates {
-                let block = scan.blocks.block(*block_index);
-                // Gating on the recording guard, not only on `open`, keeps the
-                // sweep from taking a hold it is not allowed to displace — an
-                // access-backed one above all — and skips the MD5 confirmation
-                // for any block whose placement could not have stood anyway.
-                if !scan.open.get(*block_index).copied().unwrap_or(false)
-                    || block.expected_len as usize != short_len
-                    || !can_record_block_location(scan.blocks, *block_index, path, kind)
-                {
-                    continue;
-                }
-                if short_block_matches(data, table.slice_size, block) {
-                    scan.stats.blocks_placed = scan.stats.blocks_placed.saturating_add(1);
-                    record_block_location(
-                        scan.blocks,
-                        *block_index,
-                        BlockLocation {
-                            source: SourceLocation::Path(path.to_path_buf()),
-                            offset: absolute_offset,
-                            len: short_len as u64,
-                            kind,
-                        },
-                    );
-                }
+            // `targets` holds only open blocks of this length. Gating on the
+            // recording guard as well keeps the sweep from taking a hold it is
+            // not allowed to displace — an access-backed one above all — and
+            // skips the MD5 confirmation for any block whose placement could
+            // not have stood anyway.
+            if !can_record_block_location(scan.blocks, block_index, path, kind) {
+                continue;
+            }
+            if short_block_matches(data, table.slice_size, scan.blocks.block(block_index)) {
+                scan.stats.blocks_placed = scan.stats.blocks_placed.saturating_add(1);
+                record_block_location(
+                    scan.blocks,
+                    block_index,
+                    BlockLocation {
+                        source: SourceLocation::Path(path.to_path_buf()),
+                        offset: absolute_offset,
+                        len: short_len as u64,
+                        kind,
+                    },
+                );
             }
         }
 
@@ -12995,6 +13120,143 @@ mod tests {
         assert_eq!(diagnostics.short_relocation_candidates_scanned, 0);
         assert_eq!(diagnostics.short_relocation_candidates_skipped, 1);
         assert_eq!(diagnostics.short_relocation_windows_stepped, 0);
+    }
+
+    /// The shape that made a damaged volume pay for its whole length: a
+    /// canonical file whose tail is damaged. Its short block stays open — the
+    /// owner-offset and tail checks both fail on the damaged bytes — but every
+    /// intact slice is placed, so the sweep may read only the damaged tail plus
+    /// one window of lead-in. Before, it re-read and stepped the entire file
+    /// once per open short length, at ~70 ns a byte.
+    #[test]
+    fn the_relocation_sweep_reads_only_a_candidates_unexplained_bytes() {
+        let dir = tempdir().unwrap();
+        let slice_size = 4096u64;
+        let full_slices = 64usize;
+        let tail = 1000usize;
+        let data = relocation_filler(7, full_slices * slice_size as usize + tail);
+        let set = synthetic_set(&[("part.bin", &data)], slice_size);
+        let damaged_from = (full_slices - 2) * slice_size as usize;
+        let mut damaged = data.clone();
+        damaged[damaged_from..].fill(0xEE);
+        fs::write(dir.path().join("part.bin"), &damaged).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        assert!(short_block_of(&state, "part.bin").location.is_none());
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 1);
+        assert_eq!(diagnostics.short_relocation_blocks_placed, 0);
+        let unexplained = (data.len() - damaged_from) as u64;
+        let lead_in = (tail - 1) as u64;
+        assert!(
+            diagnostics.short_relocation_windows_stepped > 0,
+            "the damaged tail really was swept"
+        );
+        assert!(
+            diagnostics.short_relocation_bytes_read <= unexplained + lead_in,
+            "read {} of a {}-byte file for {unexplained} unexplained bytes",
+            diagnostics.short_relocation_bytes_read,
+            data.len()
+        );
+        assert!(
+            diagnostics.short_relocation_windows_stepped <= unexplained,
+            "stepped {} windows for {unexplained} unexplained bytes",
+            diagnostics.short_relocation_windows_stepped
+        );
+    }
+
+    /// The lead-in exists for this: a short block whose first bytes are
+    /// duplicated at the end of an already-placed slice, so the window that
+    /// matches it starts inside explained bytes and only its tail is
+    /// unexplained. A sweep of the unexplained range alone would start too
+    /// late; widening it by one window catches the block.
+    #[test]
+    fn a_short_block_straddling_the_explained_boundary_is_still_found() {
+        let dir = tempdir().unwrap();
+        let data = b"ABCDEF1212345".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 8);
+        fs::write(dir.path().join("target.bin"), b"ABCDEF12345JUNK").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+
+        assert_eq!(
+            state.blocks[0]
+                .location
+                .as_ref()
+                .map(|location| location.offset),
+            Some(0),
+            "the full slice is placed and explains bytes 0..8"
+        );
+        let location = short_block_of(&state, "target.bin")
+            .location
+            .as_ref()
+            .expect("straddling short block placed");
+        assert_eq!(location.offset, 6);
+        assert_eq!(diagnostics.short_relocation_candidates_scanned, 1);
+        assert_eq!(diagnostics.short_relocation_blocks_placed, 1);
+    }
+
+    #[test]
+    fn unexplained_byte_ranges_are_the_complement_of_the_located_spans() {
+        assert_eq!(unexplained_byte_ranges(&mut [], 10), vec![(0, 10)]);
+        assert_eq!(unexplained_byte_ranges(&mut [(0, 10)], 10), Vec::new());
+        assert_eq!(
+            unexplained_byte_ranges(&mut [(8, 4), (0, 4)], 20),
+            vec![(4, 8), (12, 20)]
+        );
+        // Overlapping and nested spans merge; spans past the end are clamped.
+        assert_eq!(
+            unexplained_byte_ranges(&mut [(0, 6), (2, 2), (4, 4), (15, 100)], 20),
+            vec![(8, 15)]
+        );
+    }
+
+    #[test]
+    fn short_sweep_regions_cover_exactly_the_windows_touching_unexplained_bytes() {
+        // Widened by short_len - 1 on both sides, clamped to the file.
+        assert_eq!(short_sweep_regions(&[(10, 20)], 100, 5), vec![(6, 24)]);
+        assert_eq!(
+            short_sweep_regions(&[(0, 3), (97, 100)], 100, 5),
+            vec![(0, 7), (93, 100)]
+        );
+        // Neighbours whose widening meets become one read.
+        assert_eq!(
+            short_sweep_regions(&[(10, 12), (14, 16)], 100, 5),
+            vec![(6, 20)]
+        );
+        // A region too small to hold a window is not read at all.
+        assert_eq!(short_sweep_regions(&[(2, 3)], 3, 5), Vec::new());
+        // Every window in a region overlaps the range it came from, and every
+        // window overlapping the range lies in the region.
+        let (start, end) = short_sweep_regions(&[(10, 20)], 100, 5)[0];
+        for window_start in 0..=95usize {
+            let overlaps = window_start < 20 && window_start + 5 > 10;
+            let in_region = window_start >= start && window_start + 5 <= end;
+            assert_eq!(overlaps, in_region, "window at {window_start}");
+        }
+    }
+
+    /// The identity the sweep's per-length target table rests on: undoing the
+    /// zero padding of a short block's IFSC CRC yields the CRC of its bytes,
+    /// so a rolling CRC over exactly `short_len` bytes can be compared
+    /// directly, with no per-window padding step.
+    #[test]
+    fn unpadded_short_block_crc_is_recovered_from_the_padded_checksum() {
+        for (slice_size, short_len) in [(8u64, 5usize), (64, 21), (4096, 1000), (1 << 20, 12268)] {
+            let data = relocation_filler(short_len as u64, short_len);
+            let pad_len = slice_size - short_len as u64;
+            let padded = padded_crc(&data, slice_size);
+            let uncombine = checksum::Crc32UncombineOp::new(pad_len);
+            assert_eq!(
+                uncombine.uncombine(padded, crc32_zeros(pad_len)),
+                checksum::crc32(&data),
+                "slice {slice_size} short {short_len}"
+            );
+        }
     }
 
     #[test]

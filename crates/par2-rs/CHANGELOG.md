@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.10.2
+
+The short-block relocation sweep now costs what a damaged candidate is worth,
+not what it weighs.
+
+### Fixed
+
+- When a file's terminal short block is still open after the ordinary scan —
+  the tail of a canonical volume is damaged, so neither its own slice offset
+  nor the file's tail carries the block — the deferred relocation search
+  re-read and byte-stepped the *whole* candidate once per distinct open short
+  length, even though every intact slice of it was already placed. Each step
+  paid a 32-round matrix-vector product to zero-pad the rolling CRC forward
+  and a hash probe of the whole-set table: about 70 ns a byte, so an 8 MiB
+  volume with a damaged tail spent over half a second finding nothing, and a
+  200 MiB one would have spent a quarter of a minute. Both halves are fixed.
+  The sweep now reads only the bytes the merged state cannot account for, plus
+  one window of lead-in on either side, and tests exactly the windows that
+  cover at least one such byte; a damaged tail costs its own length. And the
+  open blocks of each length are keyed by the CRC of their *unpadded* bytes,
+  recovered once per block by undoing the IFSC zero padding, so the per-window
+  work is the CRC slide and a comparison against a handful of sorted targets:
+  4.5 ns a step in release builds on the same 8 MiB sweep. A short block
+  shifted inside, concatenated into, or straddling the edge of a candidate's
+  unexplained bytes is still found; only a block whose bytes are duplicated
+  entirely inside already-placed slices is no longer salvaged from there, the
+  same trade the whole-candidate skip already made, and one par2cmdline never
+  offered in the first place (it matches a short block only at a file's end).
+  The relocation log records now carry `bytes_unexplained` beside
+  `bytes_reread`, so a sweep reading far more than it was entitled to is
+  visible.
+
 ## 0.10.1
 
 The ordered canonical scan no longer sizes its rolling buffer from the set's
