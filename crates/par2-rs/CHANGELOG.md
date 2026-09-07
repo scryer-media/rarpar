@@ -16,22 +16,23 @@ declared slice size alone.
   declaring a multi-gigabyte slice against a file at least that long (a sparse
   file will do) made the scan allocate twice that: an allocator abort or an
   out-of-memory kill of the host process, not a reported failure. The ordered
-  entry now routes before its first slice-sized allocation. A slice up to
-  8 MiB always keeps the ordered scan, so a small configured limit does not
-  push ordinary sets onto the slower byte-stepping scanner; past that the
-  ordered scan runs only when its two-slice buffer fits `memory_limit`, and
-  otherwise the candidate takes the mmap scanner, which reads windows out of
-  the mapping and stages nothing slice-sized. The same blocks are found either
-  way.
-- The mmap scanner now honours the ordered scan's seeded-evidence skips, so a
-  candidate routed off the ordered scan seeks past its settled slices without
-  touching their pages, exactly as the serial cursor does, and reports them in
-  the same `slices_settled_by_evidence` / `bytes_skipped_by_evidence` counters.
-- The mmap scanner polls the caller's cancellation token at entry and once per
-  1 MiB of rolling progress. A byte-stepping scan over a very large candidate,
-  whether it arrived there from the generic entry or from the ordered route,
-  could previously not be abandoned once under way; it now returns
-  `Par2Error::Cancelled` within roughly a millisecond of the request.
+  scan now decides before its first slice-sized allocation. A slice up to
+  8 MiB always streams through the ring, so a small configured limit does not
+  change how ordinary sets scan; past that the ring is used only when its two
+  slices fit `memory_limit`, and otherwise the same ordered walk runs over a
+  mapped window source that stages nothing slice-sized. The walk keeps every
+  ordered jump either way, so a candidate with a huge slice is still visited
+  once per matched slice and not once per byte, and it honours the same
+  seeded-evidence skips. On `wasm` targets, which have no mapping to read
+  through, an unaffordable slice is reported as
+  `Par2Error::ResourceLimitExceeded` instead of attempted.
+- Cancellation now reaches the serial ordered walk and the mmap scanner. Both
+  poll the caller's token at entry, once per 1 MiB of rolling progress, and
+  inside every whole-window hash — the window is the declared slice, so a
+  request landing during that hash no longer waits for the whole slice. A
+  byte-stepping scan over a very large candidate could previously not be
+  abandoned once under way; it now returns `Par2Error::Cancelled` within
+  roughly a millisecond of the request.
 
 ## 0.10.0
 
