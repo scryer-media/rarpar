@@ -23,7 +23,7 @@ par3-rs = "0.2"
 ## Usage
 
 ```rust
-use par3_rs::{Par3Set, Result, scan_packets_from_path, verify_set};
+use par3_rs::{Par3Set, Result, VerifyReport, scan_packets_from_path, verify_set};
 use std::path::Path;
 
 fn main() -> Result<()> {
@@ -33,12 +33,10 @@ fn main() -> Result<()> {
         .collect();
 
     for set in Par3Set::from_packets(packets)? {
-        for file in set.files() {
-            println!("{} ({} bytes)", file.path(), file.size());
-        }
-        let report = verify_set(&set, Path::new("."))?;
-        println!("{} of {} files complete",
-            report.complete_count(), report.files().len());
+        println!("set {} — {} files", set.input_set_id(), set.files().len());
+        let report: VerifyReport = verify_set(&set, Path::new("."))?;
+        println!("{} complete, {} damaged, {} missing",
+            report.complete_count(), report.damaged_count(), report.missing_count());
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ RAR archive reading and extraction in pure Rust. No C bindings, no external
 
 ```toml
 [dependencies]
-unrar-rs = "0.5"
+unrar-rs = "0.10"
 ```
 
 This crate reads existing archives. It exposes no writer, builder, or
@@ -107,6 +107,18 @@ the carried-over dictionary no longer lines up with any member boundary, so the
 archive is poisoned: later solid extractions are refused until
 `reset_solid_state` clears it and extraction restarts from the first member.
 
+## Encrypted archives
+
+Both file-data encryption (`rar -p`) and encrypted headers (`rar -hp`) are
+supported. Set the password with `set_password`, use `open_with_password` when
+the headers are encrypted, or override it for one member with `with_password`.
+
+For callers that route bytes rather than extract them, the `crypto` module can
+derive a member key from header facts, check a password before decryption, and
+decrypt or re-encrypt an arbitrary range. A password check can be `Verified`,
+`Wrong`, or `Unverifiable`; malformed stored check data must not be treated as
+verification.
+
 ## Capabilities
 
 - RAR5 and RAR4, including legacy RAR 1.5 / 2.0 / 2.9, and SFX archives.
@@ -119,6 +131,19 @@ archive is poisoned: later solid extractions are refused until
 - Metadata-only mode for inspection without extraction.
 - Path sanitisation against traversal, and header-declared limits that bound
   allocation.
+
+## Feature flags
+
+- `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
+- `crypto-rust`: pure-Rust AES, CBC, SHA-2, and HMAC backend for targets where
+  AWS-LC does not build.
+- `crypto-host`: on `wasm32`, delegates bulk AES-CBC decryption to an
+  embedder-installed hook; it implies `crypto-rust` for key derivation.
+- `crc-host`: on `wasm32`, delegates bulk member CRC-32 to an
+  embedder-installed hook.
+- `ppmd-debug`: compiles per-symbol PPMd tracing, enabled at run time with
+  `UNRAR_RS_RAR4_DEBUG_PPM`.
+- `slow-tests`: opts in to long-running tests.
 
 ## Volume numbering
 
@@ -140,22 +165,21 @@ than adding it.
 
 | CPU | Arch | Instruction set | unrar (binary) | unrar (text) |
 |---|---|---|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.7× | 1.7× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.1× | 1.4× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.7× | 1.3× |
-| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.5× | 1.2× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× |
 | AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× |
-| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.5× | 1.2× |
 | Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× |
-| Apple M5 Max | arm64 | NEON | 1.3× | 1.4× |
-| Arm Cortex-A72 | arm64 | NEON | 2.3× | 1.6× |
-| Arm Neoverse N1 | arm64 | NEON | 3.1× | 1.7× |
-| Arm Neoverse V2 | arm64 | NEON | 3.8× | 1.8× |
+| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× |
+| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× |
+| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× |
+| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× |
 
 
-`binary` is store-mode extraction (uncompressible media payloads, encrypted
-variants included); `text` is compressed extraction (LZ and PPMd). Encrypted
-extraction is the widest win: 1.2×–13.4× depending on silicon and shape.
+`binary` is store-mode extraction of uncompressible media payloads, including
+encrypted and BLAKE2sp variants; `text` is compressed extraction across the LZ
+and PPMd paths. The text class includes RAR4 PPMd, an older mode deliberately
+left unoptimised.
 
 Per-case charts for every machine, the full methodology, and the versions
 these numbers were measured with:
@@ -170,7 +194,7 @@ cross-volume layout assembly that the reference implementation does not provide.
 The RAR format is documented in RARLAB's
 [technical note](https://www.rarlab.com/technote.htm).
 
-Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/CHANGELOG.md).
+Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/unrar-rs/CHANGELOG.md).
 
 ## License
 
