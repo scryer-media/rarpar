@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.4
+
+A patch release from 0.4.3: one additive constant and a cheaper RAR3 decoder.
+No existing public item changed shape or meaning.
+
+### Public API
+
+- `Rar3RsCoder::MAX_BLOCK_LEN`: the longest block `decode` accepts, data plus
+  parity symbols together (255, the GF(2^8) field size less one). A RAR3
+  recovery set has one symbol per volume, so this is also the largest set of
+  data plus recovery volumes a caller can hand the coder.
+
+### Performance
+
+- `Rar3RsCoder::decode` no longer zeroes a 512-entry syndrome buffer and a
+  1024-entry error-evaluator buffer on every call, nor allocates either. The
+  scratch lives in the coder, only the `par_size` entries in use are cleared,
+  and the polynomial multiply clears only the prefix it writes. unrar's own
+  `RSCoder::Decode` has always worked this way; the per-call clearing was an
+  artifact of the port. RAR3 recovery calls `decode` once per byte column, so
+  on a `.rev` restore of a 33 MiB set the decode CPU time drops by roughly an
+  order of magnitude.
+
+### Fixed
+
+- A reused `Rar3RsCoder` handed a different erasure set than its first
+  `decode` saw now rebuilds its cached locator polynomial instead of
+  correcting the previous call's positions. The cache exists because RAR3
+  recovery decodes every column of a set with the same erasures; the check is
+  a slice comparison per call.
+
 ## 0.4.3
 
 ### Public API

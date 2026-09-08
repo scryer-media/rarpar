@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.10.2
+
+The short-block relocation sweep now costs what a damaged candidate is worth,
+not what it weighs.
+
+### Fixed
+
+- When a file's terminal short block is still open after the ordinary scan —
+  the tail of a canonical volume is damaged, so neither its own slice offset
+  nor the file's tail carries the block — the deferred relocation search
+  re-read and byte-stepped the *whole* candidate once per distinct open short
+  length, even though every intact slice of it was already placed. Each step
+  paid a 32-round matrix-vector product to zero-pad the rolling CRC forward
+  and a hash probe of the whole-set table: about 70 ns a byte, so an 8 MiB
+  volume with a damaged tail spent over half a second finding nothing, and a
+  200 MiB one would have spent a quarter of a minute. Both halves are fixed.
+  The sweep now reads only the bytes the merged state cannot account for, plus
+  one window of lead-in on either side, and tests exactly the windows that
+  cover at least one such byte; a damaged tail costs its own length. And the
+  open blocks of each length are keyed by the CRC of their *unpadded* bytes,
+  recovered once per block by undoing the IFSC zero padding, so the per-window
+  work is the CRC slide and a comparison against a handful of sorted targets:
+  4.5 ns a step in release builds on the same 8 MiB sweep. A short block
+  shifted inside, concatenated into, or straddling the edge of a candidate's
+  unexplained bytes is still found; only a block whose bytes are duplicated
+  entirely inside already-placed slices is no longer salvaged from there, the
+  same trade the whole-candidate skip already made, and one par2cmdline never
+  offered in the first place (it matches a short block only at a file's end).
+  The relocation log records now carry `bytes_unexplained` beside
+  `bytes_reread`, so a sweep reading far more than it was entitled to is
+  visible.
+
+## 0.10.1
+
+The ordered canonical scan no longer sizes its rolling buffer from the set's
+declared slice size alone.
+
+### Fixed
+
+- A set's Main packet may declare any slice size that is nonzero and a
+  multiple of 4. The generic scanner has long routed slices past 8 MiB to the
+  mmap scanner, but the ordered canonical scan — the path a described file
+  takes once its complete-file check fails — staged a two-slice rolling buffer
+  straight from the declared size, on its serial cursor and on the parallel
+  scan's gap resync alike, and the repair memory limit never weighed it. A set
+  declaring a multi-gigabyte slice against a file at least that long (a sparse
+  file will do) made the scan allocate twice that: an allocator abort or an
+  out-of-memory kill of the host process, not a reported failure. The ordered
+  scan now decides before its first slice-sized allocation. A slice up to
+  8 MiB always streams through the ring, so a small configured limit does not
+  change how ordinary sets scan; past that the ring is used only when its two
+  slices fit `memory_limit`, and otherwise the same ordered walk runs over a
+  mapped window source that stages nothing slice-sized. The walk keeps every
+  ordered jump either way, so a candidate with a huge slice is still visited
+  once per matched slice and not once per byte, and it honours the same
+  seeded-evidence skips. On `wasm` targets, which have no mapping to read
+  through, an unaffordable slice is reported as
+  `Par2Error::ResourceLimitExceeded` instead of attempted.
+- Cancellation now reaches the serial ordered walk and the mmap scanner. Both
+  poll the caller's token at entry, once per 1 MiB of rolling progress, and
+  inside every whole-window hash — the window is the declared slice, so a
+  request landing during that hash no longer waits for the whole slice. A
+  byte-stepping scan over a very large candidate could previously not be
+  abandoned once under way; it now returns `Par2Error::Cancelled` within
+  roughly a millisecond of the request.
+
 ## 0.10.0
 
 A caller can now say which files in the working directory the extra scan must

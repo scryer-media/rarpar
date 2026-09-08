@@ -18,9 +18,30 @@ pub struct Rar3RsCoder {
     err_count: usize,
     dnm: [usize; MAX_PAR + 1],
     el_pol: [usize; MAX_POL],
+    // Decode scratch lives in the coder, not on `decode`'s stack. RAR3
+    // recovery calls `decode` once per byte column — 33.5 million times for a
+    // 33 MiB volume set — and a `[0usize; MAX_POL]` local costs a full 4 KiB
+    // memset on every one of those calls whatever `par_size` actually is. Only
+    // the first `par_size` entries of either buffer are ever live, and `decode`
+    // writes each of them before reading it, so neither needs clearing between
+    // columns.
+    syn_data: [usize; MAX_PAR + 1],
+    ee_pol: [usize; MAX_PAR + 1],
+    // The erasure set the cached locator polynomial (`el_pol`, `error_locs`,
+    // `dnm`) was built for. A coder is reused across every column of a
+    // volume set, where the erasures never change, but nothing stops a caller
+    // handing it a different set, and a locator for the wrong positions
+    // "corrects" the wrong bytes without any signal.
+    locator_erasures: [usize; MAX_PAR + 1],
+    locator_len: usize,
 }
 
 impl Rar3RsCoder {
+    /// Longest block `decode` accepts: data plus parity symbols together, the
+    /// GF(2^8) field size less one. A RAR3 recovery set has one symbol per
+    /// volume, so this is also the largest set of data plus recovery volumes.
+    pub const MAX_BLOCK_LEN: usize = MAX_PAR;
+
     pub fn new(par_size: usize) -> Option<Self> {
         if par_size == 0 || par_size > MAX_PAR {
             return None;
@@ -36,6 +57,10 @@ impl Rar3RsCoder {
             err_count: 0,
             dnm: [0; MAX_PAR + 1],
             el_pol: [0; MAX_POL],
+            syn_data: [0; MAX_PAR + 1],
+            ee_pol: [0; MAX_PAR + 1],
+            locator_erasures: [0; MAX_PAR + 1],
+            locator_len: 0,
         };
         coder.gf_init();
         coder.pn_init();
@@ -68,14 +93,14 @@ impl Rar3RsCoder {
             return false;
         }
 
-        let mut syn_data = [0usize; MAX_POL];
         let mut all_zeroes = true;
-        for (i, slot) in syn_data.iter_mut().take(self.par_size).enumerate() {
+        for i in 0..self.par_size {
+            let root = self.gf_exp[i + 1];
             let mut sum = 0usize;
             for &byte in data.iter() {
-                sum = (byte as usize) ^ self.gf_mult(self.gf_exp[i + 1], sum);
+                sum = (byte as usize) ^ self.gf_mult(root, sum);
             }
-            *slot = sum;
+            self.syn_data[i] = sum;
             if sum != 0 {
                 all_zeroes = false;
             }
@@ -85,8 +110,12 @@ impl Rar3RsCoder {
             return true;
         }
 
-        if !self.first_block_done {
+        let locator_stale =
+            !self.first_block_done || self.locator_erasures[..self.locator_len] != *erasures;
+        if locator_stale {
             self.first_block_done = true;
+            self.locator_len = erasures.len();
+            self.locator_erasures[..erasures.len()].copy_from_slice(erasures);
             self.el_pol.fill(0);
             self.el_pol[0] = 1;
 
@@ -115,15 +144,21 @@ impl Rar3RsCoder {
             }
         }
 
-        let mut ee_pol = [0usize; MAX_POL * 2];
-        self.pn_mult(&self.el_pol, &syn_data, &mut ee_pol);
+        Self::pn_mult(
+            self.par_size,
+            &self.gf_exp,
+            &self.gf_log,
+            &self.el_pol,
+            &self.syn_data,
+            &mut self.ee_pol,
+        );
 
         if self.err_count <= self.par_size && self.err_count > 0 {
             for i in 0..self.err_count {
                 let loc = self.error_locs[i];
                 let dloc = MAX_PAR - loc;
                 let mut n = 0usize;
-                for (j, &ee) in ee_pol.iter().take(self.par_size).enumerate() {
+                for (j, &ee) in self.ee_pol.iter().take(self.par_size).enumerate() {
                     n ^= self.gf_mult(ee, self.gf_exp[dloc * j % MAX_PAR]);
                 }
 
@@ -155,11 +190,7 @@ impl Rar3RsCoder {
 
     #[inline]
     fn gf_mult(&self, a: usize, b: usize) -> usize {
-        if a == 0 || b == 0 {
-            0
-        } else {
-            self.gf_exp[self.gf_log[a] + self.gf_log[b]]
-        }
+        gf_mult_tables(&self.gf_exp, &self.gf_log, a, b)
     }
 
     fn pn_init(&mut self) {
@@ -172,22 +203,56 @@ impl Rar3RsCoder {
             p1[1] = 1;
 
             let mut result = [0usize; MAX_POL * 2];
-            self.pn_mult(&p1, &p2, &mut result);
+            Self::pn_mult(
+                self.par_size,
+                &self.gf_exp,
+                &self.gf_log,
+                &p1,
+                &p2,
+                &mut result,
+            );
             self.gx_pol[..self.par_size].copy_from_slice(&result[..self.par_size]);
             p2[..self.par_size].copy_from_slice(&self.gx_pol[..self.par_size]);
         }
     }
 
-    fn pn_mult(&self, p1: &[usize], p2: &[usize], result: &mut [usize]) {
-        result.fill(0);
-        for i in 0..self.par_size {
+    /// Free-standing so `decode` can pass `&self.syn_data` and
+    /// `&mut self.ee_pol` in one call without borrowing all of `*self`.
+    fn pn_mult(
+        par_size: usize,
+        gf_exp: &[usize; MAX_POL],
+        gf_log: &[usize; MAX_PAR + 1],
+        p1: &[usize],
+        p2: &[usize],
+        result: &mut [usize],
+    ) {
+        // The loop below only ever writes `result[i + j]` with `i + j` under
+        // `par_size`, and every caller reads back at most that prefix, so
+        // clearing the whole slice would zero kilobytes of scratch nobody
+        // looks at — once per byte column, in RAR3 recovery's hot loop.
+        result[..par_size].fill(0);
+        for i in 0..par_size {
             if p1[i] == 0 {
                 continue;
             }
-            for j in 0..self.par_size - i {
-                result[i + j] ^= self.gf_mult(p1[i], p2[j]);
+            for j in 0..par_size - i {
+                result[i + j] ^= gf_mult_tables(gf_exp, gf_log, p1[i], p2[j]);
             }
         }
+    }
+}
+
+#[inline]
+fn gf_mult_tables(
+    gf_exp: &[usize; MAX_POL],
+    gf_log: &[usize; MAX_PAR + 1],
+    a: usize,
+    b: usize,
+) -> usize {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        gf_exp[gf_log[a] + gf_log[b]]
     }
 }
 
@@ -233,5 +298,116 @@ mod tests {
         let mut decoder = Rar3RsCoder::new(1).unwrap();
         let mut data = [0u8, 1, 2];
         assert!(!decoder.decode(&mut data, &[0, 1]));
+    }
+
+    /// `decode`'s syndrome and error-evaluator scratch lives in the coder and
+    /// is no longer cleared between calls, because RAR3 recovery drives one
+    /// coder across millions of byte columns. Anything left behind by column
+    /// N must not change column N+1, so a reused coder has to agree with a
+    /// fresh one on every column — including all-zero columns, which return
+    /// early before the evaluator scratch is touched.
+    fn reused_coder_matches_fresh_coder(par_size: usize, data_len: usize, erasures: &[usize]) {
+        let encoder = Rar3RsCoder::new(par_size).unwrap();
+        let mut reused = Rar3RsCoder::new(par_size).unwrap();
+
+        for column in 0..512u32 {
+            // Deterministic pseudo-random source bytes, with every 7th column
+            // forced to all-zero to exercise the early-return path in between
+            // ordinary ones.
+            let source = (0..data_len)
+                .map(|i| {
+                    if column % 7 == 3 {
+                        0
+                    } else {
+                        (column
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(i as u32 * 97)
+                            >> 11) as u8
+                    }
+                })
+                .collect::<Vec<u8>>();
+
+            let mut parity = vec![0u8; par_size];
+            encoder.encode(&source, &mut parity);
+
+            let mut damaged = source.clone();
+            damaged.extend_from_slice(&parity);
+            for &era in erasures {
+                damaged[era] = 0;
+            }
+
+            let mut via_reused = damaged.clone();
+            assert!(
+                reused.decode(&mut via_reused, erasures),
+                "reused coder refused column {column}"
+            );
+
+            let mut via_fresh = damaged.clone();
+            assert!(
+                Rar3RsCoder::new(par_size)
+                    .unwrap()
+                    .decode(&mut via_fresh, erasures),
+                "fresh coder refused column {column}"
+            );
+
+            assert_eq!(
+                via_reused, via_fresh,
+                "reused coder diverged from a fresh one at column {column}"
+            );
+            assert_eq!(
+                &via_reused[..data_len],
+                &source[..],
+                "column {column} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_coder_matches_fresh_coder_single_parity() {
+        // The shape RAR3 `.rev` recovery actually hits: one recovery volume,
+        // five data volumes, the same single volume missing in every column.
+        reused_coder_matches_fresh_coder(1, 5, &[2]);
+    }
+
+    #[test]
+    fn reused_coder_matches_fresh_coder_multi_parity() {
+        reused_coder_matches_fresh_coder(3, 6, &[0, 4, 7]);
+    }
+
+    /// The locator polynomial is cached from the first decode. A coder that
+    /// is then asked about a different erasure set has to rebuild it rather
+    /// than correct the positions of the previous call.
+    #[test]
+    fn reused_coder_rebuilds_its_locator_when_the_erasures_change() {
+        let encoder = Rar3RsCoder::new(2).unwrap();
+        let source = [17u8, 250, 3, 99, 128, 64];
+        let mut parity = [0u8; 2];
+        encoder.encode(&source, &mut parity);
+        let mut block = source.to_vec();
+        block.extend_from_slice(&parity);
+
+        let mut reused = Rar3RsCoder::new(2).unwrap();
+        for erasures in [&[1usize, 4][..], &[0, 5], &[3, 7], &[1, 4]] {
+            let mut damaged = block.clone();
+            for &era in erasures {
+                damaged[era] = 0;
+            }
+            let mut via_fresh = damaged.clone();
+            assert!(
+                Rar3RsCoder::new(2)
+                    .unwrap()
+                    .decode(&mut via_fresh, erasures)
+            );
+            assert!(
+                reused.decode(&mut damaged, erasures),
+                "reused coder refused erasures {erasures:?}"
+            );
+            assert_eq!(damaged, via_fresh, "erasures {erasures:?}");
+            assert_eq!(
+                &damaged[..source.len()],
+                &source[..],
+                "erasures {erasures:?}"
+            );
+        }
     }
 }

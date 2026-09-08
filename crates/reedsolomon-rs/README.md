@@ -48,6 +48,8 @@ CPU comparison harness and the limits of the exploratory native results.
   destinations, and `mul_acc_input_batch` for multiple sources and one
   destination. `LinearMap16` also applies caller-defined binary maps using
   NEON/AVX2/SSSE3 shuffles and representation-independent scalar tails.
+- `xor_jit`: JIT-generated bit-plane XOR GF(2¹⁶) multiplication on x86-64
+  systems without GFNI.
 - RAR-specific coders in separate modules, kept apart so PAR2 matrix semantics
   stay unchanged.
 
@@ -62,11 +64,9 @@ crate does not choose a repair workflow. The Metal backend is available only on
 Apple Silicon macOS. The `wgpu` backend uses a suitable adapter exposed by
 `wgpu`.
 
-Automatic admission rejects workloads below 256 MiB of effective work and may
-also reject a session because of configuration, adapter, shape, or allocation
-constraints. Higher-level callers such as [`par2-rs`] can use that result to
-stay on CPU. The admission threshold is an implementation policy, not a
-performance guarantee.
+Session admission may reject work because of workload size, configuration,
+adapter, shape, or allocation constraints. Higher-level callers such as
+[`par2-rs`] can use that result to stay on CPU.
 
 Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/CHANGELOG.md).
 
