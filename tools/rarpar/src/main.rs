@@ -86,24 +86,44 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
         return Ok(EXIT_SUCCESS);
     }
 
-    if report.par3_sets.is_empty()
-        && report.files.iter().any(|file| {
-            file.kind == discovery::DiscoveredKind::Par3 && !file.diagnostics.is_empty()
-        })
-    {
+    if report.files.iter().any(|file| {
+        file.kind == discovery::DiscoveredKind::Par3
+            && !file.diagnostics.is_empty()
+            && (report.par3_sets.is_empty() || report.roots.contains(&file.path))
+    }) {
         return Err(RarparError::Data(
             "PAR3 carrier has no authenticated packets; inspect its diagnostics".into(),
         ));
     }
-    let had_par3_sets = !report.par3_sets.is_empty();
-    for set in report.par3_sets.clone() {
+    let selected_par3: Vec<_> = report
+        .par3_sets
+        .iter()
+        .filter(|set| discovery::selected_par3_set(set, &report.roots))
+        .cloned()
+        .collect();
+    let had_par3_sets = !selected_par3.is_empty();
+    let mut pending_par3 = Vec::new();
+    let mut inferred = std::collections::BTreeSet::new();
+    for set in selected_par3 {
         let outcome = par3::repair_set(cli, &set)?;
         report.record_action(outcome.action());
         if !outcome.success {
-            report::emit_discovery(cli, &report)?;
-            return Ok(crate::error::EXIT_DATA_FAILURE);
+            pending_par3.push(set);
         }
-        paths.extend(outcome.protected_paths);
+        for path in outcome.protected_paths {
+            if path.is_file() && !inferred.contains(&path.canonicalize()?) {
+                for member in discovery::expand_inferred_member(&path, &options)? {
+                    if inferred.insert(member.canonicalize()?) {
+                        if inferred.len() > options.max_files {
+                            return Err(RarparError::Resource(
+                                "inferred archive discovery exceeded --max-files".into(),
+                            ));
+                        }
+                        paths.push(member);
+                    }
+                }
+            }
+        }
     }
     if had_par3_sets {
         paths.sort();
@@ -123,6 +143,20 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
     }
     if had_par2_sets {
         rediscover_preserving_history(cli, &paths, &options, &mut report)?;
+    }
+
+    // A PAR3 deficit must not prevent an overlapping PAR2 set from repairing
+    // the inputs. Reassess only deferred sets, using the retained packets.
+    for set in pending_par3 {
+        let outcome = par3::repair_set(cli, &set)?;
+        report.record_action(outcome.action());
+        if !outcome.success {
+            report::emit_discovery(cli, &report)?;
+            return Ok(crate::error::EXIT_DATA_FAILURE);
+        }
+    }
+    for set in &mut report.par3_sets {
+        set.release_carriers();
     }
 
     let mut restored_paths = Vec::new();
@@ -160,7 +194,12 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
 
         if cli.delete_sources {
             let mut manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
-            cleanup::add_par3_carriers(&mut manifest, &rar_set, &report.par3_sets);
+            cleanup::add_par3_carriers(
+                &mut manifest,
+                &rar_set,
+                &report.par3_sets,
+                cli.working_dir.as_deref(),
+            );
             let cleanup = cleanup::delete_manifest(cli, &manifest)?;
             report.record_cleanup(cleanup);
         }
@@ -176,8 +215,43 @@ fn run_inspect(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparEr
     Ok(EXIT_SUCCESS)
 }
 
-fn run_cleanup(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
-    let mut report = discovery::discover(paths, &DiscoveryOptions::from_cli(cli))?;
+fn run_cleanup(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
+    let options = DiscoveryOptions::from_cli(cli);
+    let mut report = discovery::discover(paths.clone(), &options)?;
+    let mut known: std::collections::BTreeSet<_> = report
+        .files
+        .iter()
+        .map(|file| file.path.canonicalize())
+        .collect::<Result<_, _>>()?;
+    let mut members = std::collections::BTreeSet::new();
+    for set in report
+        .par3_sets
+        .iter()
+        .filter(|set| discovery::selected_par3_set(set, &report.roots))
+    {
+        for path in set.member_paths(cli.working_dir.as_deref())? {
+            if path.is_file() && !known.contains(&path.canonicalize()?) {
+                for member in discovery::expand_inferred_member(&path, &options)? {
+                    if known.insert(member.canonicalize()?) {
+                        if known.len() > options.max_files {
+                            return Err(RarparError::Resource(
+                                "inferred cleanup exceeded --max-files".into(),
+                            ));
+                        }
+                        members.insert(member);
+                    }
+                }
+            }
+        }
+    }
+    if !members.is_empty() {
+        paths.extend(members);
+        let cached = std::mem::take(&mut report.par3_sets);
+        report = discovery::discover_reusing_par3(paths, &options, Some(cached))?;
+    }
+    for set in &mut report.par3_sets {
+        set.release_carriers();
+    }
     emit_progress(cli, &report)?;
 
     if cli.dry_run {
@@ -192,7 +266,12 @@ fn run_cleanup(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparEr
         let output_dir = discovery::output_dir_for_rar_set(cli, &rar_set, report.rar_sets.len());
         cleanup::validate_extracted_outputs(&rar_set, &output_dir, &mut passwords)?;
         let mut manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
-        cleanup::add_par3_carriers(&mut manifest, &rar_set, &report.par3_sets);
+        cleanup::add_par3_carriers(
+            &mut manifest,
+            &rar_set,
+            &report.par3_sets,
+            cli.working_dir.as_deref(),
+        );
         let cleanup = cleanup::delete_manifest(cli, &manifest)?;
         report.record_cleanup(cleanup.clone());
         if !cleanup.success {
@@ -219,7 +298,8 @@ fn rediscover_preserving_history(
 ) -> Result<(), RarparError> {
     let executed_actions = std::mem::take(&mut report.executed_actions);
     let cleanup_results = std::mem::take(&mut report.cleanup_results);
-    *report = discovery::discover(paths.to_vec(), options)?;
+    let par3_sets = std::mem::take(&mut report.par3_sets);
+    *report = discovery::discover_reusing_par3(paths.to_vec(), options, Some(par3_sets))?;
     report.executed_actions = executed_actions;
     report.cleanup_results = cleanup_results;
     emit_progress(cli, report)

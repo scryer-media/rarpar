@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,5 +16,5 @@ blake3 = { workspace = true }
 crc-fast = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.4", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.5", default-features = false }
 rayon = { workspace = true, default-features = false }

@@ -17,6 +17,7 @@ const RAR14_SIGNATURE: &[u8] = &[0x52, 0x45, 0x7E, 0x5E];
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryOptions {
+    pub working_dir: Option<PathBuf>,
     pub recursive: bool,
     pub max_depth: usize,
     pub max_files: usize,
@@ -29,6 +30,7 @@ impl DiscoveryOptions {
     pub fn from_cli(cli: &Cli) -> Self {
         Self {
             recursive: !cli.no_recursive,
+            working_dir: cli.working_dir.clone(),
             max_depth: cli.max_depth,
             max_files: cli.max_files,
             par3_memory_mib: cli.par3_memory_mib,
@@ -162,11 +164,28 @@ pub struct ExecutedAction {
     pub message: String,
 }
 
+pub fn selected_par3_set(set: &crate::par3::Par3Set, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| root.is_dir() || set.paths.iter().any(|path| same_path(path, root)))
+}
+
 pub fn discover(
     paths: Vec<PathBuf>,
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryReport, RarparError> {
+    discover_reusing_par3(paths, options, None)
+}
+
+// Pipeline rediscovery refreshes archive volumes after repair. The authenticated
+// PAR3 collection belongs to the operation and is not scanned again here.
+pub(crate) fn discover_reusing_par3(
+    paths: Vec<PathBuf>,
+    options: &DiscoveryOptions,
+    cached: Option<Vec<crate::par3::Par3Set>>,
+) -> Result<DiscoveryReport, RarparError> {
     let roots = paths.clone();
+    let mut sibling_directories = BTreeSet::new();
     let mut files = Vec::new();
     let mut scan_count = 0usize;
     let mut visited = BTreeSet::new();
@@ -175,6 +194,31 @@ pub fn discover(
             return Err(RarparError::MissingInput(path));
         }
         collect_path(&path, options, 0, &mut scan_count, &mut files, &mut visited)?;
+        if path.is_file() && crate::par3::is_carrier_candidate(&path) {
+            let directory = path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            if !sibling_directories.insert(directory.canonicalize()?) {
+                continue;
+            }
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && !visited.contains(&entry.path().canonicalize()?)
+                    && crate::par3::is_carrier_candidate(&entry.path())
+                {
+                    collect_path(
+                        &entry.path(),
+                        options,
+                        0,
+                        &mut scan_count,
+                        &mut files,
+                        &mut visited,
+                    )?;
+                }
+            }
+        }
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -184,7 +228,9 @@ pub fn discover(
         .filter(|file| file.kind == DiscoveredKind::Par3)
         .map(|file| file.path.clone())
         .collect();
-    let par3_sets = if par3_paths.is_empty() {
+    let par3_sets = if let Some(cached) = cached {
+        cached
+    } else if par3_paths.is_empty() {
         Vec::new()
     } else {
         crate::par3::discover_sets(
@@ -208,11 +254,16 @@ pub fn discover(
     let par2_sets = build_par2_sets(&files);
     let rar_sets = build_rar_sets(&files);
     let sets = summarize_sets(&rar_sets, &par2_sets);
-    let mut planned_actions: Vec<_> = par3_sets.iter().map(|set| PlannedAction { set_id: set.id.clone(), action: "par3_verify_repair".into(), reason: "verify protected data and repair with authenticated PAR3 recovery before extraction".into() }).collect();
+    let mut planned_actions: Vec<_> = par3_sets.iter().filter(|set| selected_par3_set(set, &roots)).map(|set| PlannedAction { set_id: set.id.clone(), action: "par3_verify_repair".into(), reason: "verify protected data and repair with authenticated PAR3 recovery before extraction".into() }).collect();
     planned_actions.extend(plan_actions(&rar_sets, &par2_sets));
     let mut cleanup_candidates = cleanup_candidates(&rar_sets, &par2_sets);
     for (manifest, rar) in cleanup_candidates.iter_mut().zip(&rar_sets) {
-        crate::cleanup::add_par3_carriers(manifest, rar, &par3_sets);
+        crate::cleanup::add_par3_carriers(
+            manifest,
+            rar,
+            &par3_sets,
+            options.working_dir.as_deref(),
+        );
     }
 
     Ok(DiscoveryReport {
@@ -230,6 +281,19 @@ pub fn discover(
         executed_actions: Vec::new(),
         cleanup_results: Vec::new(),
     })
+}
+
+/// Resolve a protected archive member to the same complete volume family used
+/// by explicit archive extraction before building an inferred cleanup manifest.
+pub fn expand_inferred_member(
+    path: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Vec<PathBuf>, RarparError> {
+    if matches!(classify_path(path).kind, DiscoveredKind::RarVolume(_)) {
+        Ok(discover_rar_set_for_archive(path, options)?.source_paths())
+    } else {
+        Ok(vec![path.to_path_buf()])
+    }
 }
 
 pub fn discover_rar_set_for_archive(
@@ -985,6 +1049,7 @@ mod tests {
                 recursive: true,
                 max_depth: 8,
                 max_files: 1,
+                working_dir: None,
                 par3_memory_mib: 256,
                 par3_workers: None,
                 par3_max_lost_blocks: 4096,
@@ -1030,6 +1095,7 @@ mod tests {
                 recursive: true,
                 max_depth: 8,
                 max_files: 5,
+                working_dir: None,
                 par3_memory_mib: 256,
                 par3_workers: None,
                 par3_max_lost_blocks: 4096,

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.5 (unreleased)
+
+- Add reusable GF(2^8) region arithmetic and clean-room Cantor-field FFT
+  primitives for the PAR3 engine, with runtime SIMD dispatch and scalar
+  fallbacks. PAR3 packet layouts and recovery geometry remain in `par3-rs`.
+- Add FFT transform benchmarks and native parity coverage. Existing PAR2 and
+  RAR arithmetic APIs remain compatible; GPU features remain opt-in.
+
 ## 0.4.4
 
 A patch release from 0.4.3: one additive constant and a cheaper RAR3 decoder.

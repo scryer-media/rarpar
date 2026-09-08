@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+- Pin Windows packet carriers with budgeted read-only sharing locks to avoid
+  full-file generation hashes inside scan and payload loops. Charge fallback
+  generation hashing to the cumulative work budget.
+- Expose `Par3RepairSession::validate_repair` so dry runs and execution share
+  readiness, ordinary-repair layout support, and configured Cauchy loss/handle checks.
+- Add bounded incremental packet ingestion, virtual source access, positioned
+  BLAKE3 verification evidence, retained repair sessions, cancellation, and
+  shared memory, handle, and scan-work budgets.
+- Support low-rate FFT and interleaved recovery, shared and deduplicated blocks,
+  packed tails, Data packets, content placement, and selective reconstruction.
+- Add advanced creation, recovery-carrier reconstruction, and explicit staged
+  ZIP/ZIP64/7z insertion and self-repair. Existing convenience creation defaults
+  remain Cauchy-based.
+- Reuse the GF8 and FFT primitives in `reedsolomon-rs` 0.4.5. Verify Data payloads
+  against protected-extent fingerprints before admission, validate FFT field
+  geometry, and bound Cauchy loss counts before solver allocation.
+- Enable the published advanced reference corpus and document the synchronous
+  host contract, interoperability, and native verification/repair performance.
+
+This minor version introduces the advanced public engine contract. Consumers
+should review the README and ENGINE.md when moving from the 0.2 convenience APIs.
+
 ## 0.2.0
 
 An inventory of the recovery data a set carries, the Galois-field arithmetic and

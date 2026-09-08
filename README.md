@@ -263,9 +263,13 @@ and scratch requirements without writing. Existing carriers require `--overwrite
 creation stages and authenticates every output before installation and refuses
 to overwrite an input. Files are synchronized by default; `--buffered` opts out
 of storage barriers. Installation is per file, not atomic for the entire set.
+An overwrite that would leave obsolete authenticated carriers is rejected before
+writing. Move the old set aside or choose a new output directory when changing
+volume layouts.
 
 Verification and repair accept a carrier or directory, matching sibling `.par3`
-files by authenticated set identity. `--set-id` selects among multiple sets.
+files and magic-detected renamed carriers by authenticated set identity.
+`--set-id` selects among multiple sets.
 `-C DIR` chooses the protected-data working directory, defaulting to the selected
 carrier's directory; `--output` controls RAR extraction only. Repair retains
 numbered backups unless `--no-backup` is given
@@ -273,6 +277,19 @@ and does not rewrite clean files. Smart placement searches explicit
 `--search-dir` candidates by content when recovery is insufficient; canonical
 placement uses recorded paths only. JSON reports include file-coordinate damage,
 verified prefixes, cohort deficits, and installed paths and backups.
+Repair checks destination aliases using temporary name probes on the target
+filesystem before binding files; it rejects names that collapse to one path.
+Dry runs check existing paths without creating probes; missing-name collisions
+are checked again during execution. Damaged embedded layouts with unprotected
+ranges require the explicit self-repair API, including during dry-run validation.
+The CLI sizes its shared handle ceiling for the selected carrier collection plus
+32 execution handles, so retained Windows carriers do not consume repair headroom.
+Explicit carrier discovery counts admitted candidates against `--max-files`;
+smart placement separately counts the source files it inspects. Inferred RAR
+members expand to their volume family for automatic and standalone cleanup.
+Dry-run repair also enforces the configured Cauchy loss ceiling. Cleanup uses
+the same `-C` data root as repair. Auto mode retains discovery packets and tries
+available PAR2 recovery before returning a deferred PAR3 deficit.
 
 PAR3 commands use the bounded session engine, including FFT and Data-only
 recovery. Global `--par3-memory-mib` (default 256), `--par3-workers`, and

@@ -345,7 +345,8 @@ struct Candidate {
 /// assumes that holes contain zero bytes.
 /// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
 /// discards it; every poll still checks the source generation. The scanner
-/// reserves two stripes of at most 64 KiB each and retains no file handles.
+/// reserves two stripes of at most 64 KiB each. A provider may also pin a
+/// budgeted handle for the scanner and its authenticated packets' lifetime.
 pub struct PacketScanner {
     access: Arc<dyn SourceAccess>,
     source: SourceId,
@@ -363,7 +364,8 @@ pub struct PacketScanner {
 }
 
 impl PacketScanner {
-    /// Open a source without reading its payload. Allocation is budgeted first.
+    /// Open a source, using a provider's immutable view when available. Pinning
+    /// may read the source once; the provider must charge that work to options.
     pub fn new(
         access: Arc<dyn SourceAccess>,
         source: SourceId,
@@ -371,6 +373,7 @@ impl PacketScanner {
         limits: ScanLimits,
     ) -> EngineResult<Self> {
         options.validate()?;
+        let access = access.pin(source, &options)?.unwrap_or(access);
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
