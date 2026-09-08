@@ -153,6 +153,9 @@ The fixtures and recipes pin official `par3cmdline` commit
 reference Cauchy and FFT packets, interleaved deficits, Data-only reconstruction,
 retained evidence, missing ranges, and exact ZIP/ZIP64/7z self-repair. Newly
 inserted archives were verified and repaired byte-for-byte by the reference.
+The [interoperability record](INTEROPERABILITY.md) also documents reference
+repair of larger SIMD/worker-created GF8, GF16, and uneven interleaved sets,
+including the recovery equations actually consumed.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
 FFT scheduling-threshold tuning, complete diagnostics and progress callbacks, stronger

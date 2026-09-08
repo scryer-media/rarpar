@@ -50,12 +50,55 @@ fn export_reference_interoperability_cases() {
             false,
             false,
         ),
+        (
+            "wide-fft8",
+            1024,
+            CreationCodec::Fft {
+                capacity_log2: 7,
+                interleave: 0,
+            },
+            false,
+            false,
+        ),
+        (
+            "wide-fft16",
+            1024,
+            CreationCodec::Fft {
+                capacity_log2: 6,
+                interleave: 0,
+            },
+            false,
+            false,
+        ),
+        (
+            "wide-interleaved",
+            1024,
+            CreationCodec::Fft {
+                capacity_log2: 7,
+                interleave: 2,
+            },
+            false,
+            false,
+        ),
         ("dedup", 256, CreationCodec::Cauchy, true, false),
         ("data", 256, CreationCodec::Cauchy, true, true),
     ] {
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        let bytes = data();
+        let bytes = if name.starts_with("wide-") {
+            let blocks = match name {
+                "wide-fft8" => 120,
+                "wide-interleaved" => 301,
+                _ => 300,
+            };
+            let mut bytes = vec![0; blocks * 1024 + 37];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"PAR3 native worker interoperability inputs v1");
+            hasher.finalize_xof().fill(&mut bytes);
+            bytes
+        } else {
+            data()
+        };
         std::fs::write(path.join("input.bin"), &bytes).unwrap();
         let mut source = MemorySourceAccess::default();
         source.insert(SourceId(1), 1, bytes.clone().into());
@@ -84,7 +127,7 @@ fn export_reference_interoperability_cases() {
             volumes: VolumeLayout::Uniform(3),
             ..CreationOptions::default()
         };
-        options.execution.workers = 1;
+        options.execution.workers = if name.starts_with("wide-") { 2 } else { 1 };
         let plan = CreationPlan::build(Arc::new(source), &inputs, options).unwrap();
         plan.execute(&path.join("set"), &path).unwrap();
     }
