@@ -502,6 +502,22 @@ impl CreationPlan {
         &self.requirements
     }
 
+    /// Planned destination names in the same order as `requirements().output_sizes`.
+    /// Each yielded path is caller-owned; no files or directories are created.
+    pub fn output_paths<'a>(&'a self, stem: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+        std::iter::once(suffix(stem, ".par3"))
+            .chain(
+                self.volumes
+                    .iter()
+                    .map(move |(first, count)| suffix(stem, &format!(".vol{first}+{count}.par3"))),
+            )
+            .chain(
+                self.data_volumes
+                    .iter()
+                    .map(move |(first, count)| suffix(stem, &format!(".part{first}+{count}.par3"))),
+            )
+    }
+
     /// Opaque identifier shared by every packet the plan will emit.
     #[must_use]
     pub fn input_set_id(&self) -> InputSetId {
@@ -667,17 +683,7 @@ impl CreationPlan {
             .and_then(|n| n.checked_mul(output_count))
             .ok_or(EngineError::ResourceLimit("output paths"))?;
         let _paths = self.options.execution.memory.reserve(path_cost)?;
-        let mut destinations = vec![suffix(stem, ".par3")];
-        destinations.extend(
-            self.volumes
-                .iter()
-                .map(|(first, count)| suffix(stem, &format!(".vol{first}+{count}.par3"))),
-        );
-        destinations.extend(
-            self.data_volumes
-                .iter()
-                .map(|(first, count)| suffix(stem, &format!(".part{first}+{count}.par3"))),
-        );
+        let destinations: Vec<_> = self.output_paths(stem).collect();
         for destination in &destinations {
             match std::fs::symlink_metadata(destination) {
                 Ok(_) => {

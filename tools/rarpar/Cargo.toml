@@ -1,6 +1,6 @@
 [package]
 name = "rarpar"
-description = "Intelligent RAR/PAR2 repair and extraction CLI"
+description = "Intelligent RAR/PAR2/PAR3 repair and extraction CLI"
 version = "0.4.1"
 edition.workspace = true
 license-file = "LICENSE"
@@ -25,6 +25,7 @@ runtime = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:par2-rs",
+    "dep:par3-rs",
     "par2-rs/native-crypto",
     "dep:unrar-rs",
     "unrar-rs/native-crypto",
@@ -37,6 +38,7 @@ musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
 par2-rs = { version = "0.9.1", default-features = false, optional = true }
+par3-rs = { version = "0.2", default-features = false, optional = true }
 unrar-rs = { version = "0.9.2", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }

@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const ROOT_LONG_ABOUT: &str = "\
-rarpar is a smart RAR/PAR2 repair and extraction tool.
+rarpar is a smart RAR/PAR2/PAR3 repair and extraction tool.
 
 The normal workflow is `rarpar <path>`. Point it at a file or directory and it
-will discover archive/parity sets, verify or repair PAR2 data when available,
+will discover archive/parity sets, verify or repair PAR2/PAR3 data when available,
 restore RAR recovery volumes when possible, and extract with verification
 enabled.
 
@@ -30,7 +30,7 @@ modify RAR archives.";
 #[command(
     name = "rarpar",
     version,
-    about = "Smart RAR/PAR2 repair and extraction CLI",
+    about = "Smart RAR/PAR2/PAR3 repair and extraction CLI",
     long_about = ROOT_LONG_ABOUT,
     after_long_help = ROOT_AFTER_LONG_HELP
 )]
@@ -63,15 +63,15 @@ pub struct Cli {
     #[arg(short = 'o', long, global = true, value_name = "DIR")]
     pub output: Option<PathBuf>,
 
-    /// Repair/read-write working directory for PAR2 operations.
+    /// Repair/read-write working directory for PAR2 and PAR3 operations.
     #[arg(short = 'C', long, global = true, value_name = "DIR")]
     pub working_dir: Option<PathBuf>,
 
-    /// Additional directory to search for PAR2-protected data files.
+    /// Additional directory to search for parity-protected data files.
     #[arg(long, global = true, value_name = "DIR")]
     pub search_dir: Vec<PathBuf>,
 
-    /// PAR2 file placement policy: smart scans by content; canonical uses recorded paths only.
+    /// Parity file placement policy: smart scans by content; canonical uses recorded paths only.
     #[arg(long, global = true, value_enum, default_value_t = ParPlacement::Smart)]
     pub par_placement: ParPlacement,
 
@@ -87,7 +87,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FD")]
     pub password_fd: Option<i32>,
 
-    /// Allow extraction and PAR2 creation to overwrite existing output files.
+    /// Allow extraction and parity creation to overwrite existing output files.
     #[arg(long, global = true)]
     pub overwrite: bool,
 
@@ -98,6 +98,18 @@ pub struct Cli {
     /// Permanently delete cleanup candidates instead of using the OS trash/recycle bin.
     #[arg(long, global = true)]
     pub permanent_delete: bool,
+
+    /// Total PAR3 engine allocation budget in MiB, including retained state.
+    #[arg(long, global = true, default_value_t = 256)]
+    pub par3_memory_mib: usize,
+
+    /// Maximum PAR3 arithmetic workers (defaults to available CPUs).
+    #[arg(long, global = true)]
+    pub par3_workers: Option<usize>,
+
+    /// Maximum lost blocks accepted by a PAR3 Cauchy solve.
+    #[arg(long, global = true, default_value_t = 4096)]
+    pub par3_max_lost_blocks: u64,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -111,7 +123,7 @@ pub struct Cli {
 pub enum Command {
     /// Discover, repair, restore, and extract what is safe to process.
     #[command(long_about = "\
-Discover archive and parity sets, repair with PAR2 when possible, restore RAR
+Discover archive and parity sets, repair with PAR2/PAR3 when possible, restore RAR
 recovery volumes when available, and extract with verification enabled.")]
     Auto(PathArgs),
     /// Inspect input paths and print the planned work.
@@ -135,6 +147,96 @@ manifest before deletion.")]
         #[command(subcommand)]
         command: ParCommand,
     },
+    /// PAR3 creation, verification and repair, including FFT and Data packets.
+    Par3 {
+        #[command(subcommand)]
+        command: Par3Command,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Par3Command {
+    /// Create a standalone PAR3 set from explicit files.
+    Create(Par3CreateArgs),
+    /// Verify protected files and report per-cohort recovery requirements.
+    Verify(Par3Args),
+    /// Rebuild damaged files in the working directory, keeping numbered backups.
+    Repair(Par3Args),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3Args {
+    /// PAR3 carrier or directory; sibling carriers are matched by authenticated set identity.
+    pub input: PathBuf,
+    /// Additional protected-data search directories.
+    pub search_dirs: Vec<PathBuf>,
+    /// Select an input-set ID when a directory or carrier contains multiple sets.
+    #[arg(long)]
+    pub set_id: Option<String>,
+    /// Replace damaged files without keeping numbered backups.
+    #[arg(long)]
+    pub no_backup: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3CreateArgs {
+    /// Output PAR3 path or stem.
+    pub output: PathBuf,
+    /// Explicit source files, relative to --base-path (defaults to current directory).
+    #[arg(required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+    #[arg(long)]
+    pub base_path: Option<PathBuf>,
+    /// Logical block size in bytes.
+    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..))]
+    pub block_size: u64,
+    /// Exact number of global recovery packets (defaults to one).
+    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    pub recovery_count: Option<u64>,
+    /// Recovery percentage of logical blocks after deduplication; planning requires a second source pass.
+    #[arg(short = 'r', long, conflicts_with = "recovery_count")]
+    pub recovery_percent: Option<u32>,
+    #[arg(long, value_enum, default_value_t = Par3Codec::Cauchy)]
+    pub codec: Par3Codec,
+    /// Log2 recovery capacity per FFT cohort; required with --codec fft.
+    #[arg(long, value_parser = clap::value_parser!(i8).range(0..=15))]
+    pub capacity_log2: Option<i8>,
+    /// Extra FFT cohorts; zero means one cohort.
+    #[arg(long, default_value_t = 0)]
+    pub interleave: u64,
+    /// First global recovery index.
+    #[arg(short = 'f', long, default_value_t = 0)]
+    pub first_recovery: u64,
+    #[arg(long, value_enum, default_value_t = Par3Dedup::None)]
+    pub dedup: Par3Dedup,
+    /// Store original blocks in authenticated Data packets as well.
+    #[arg(long)]
+    pub data_packets: bool,
+    /// Maximum recovery packets per volume; otherwise volumes grow by powers of two.
+    #[arg(long, conflicts_with = "volume_bytes", value_parser = clap::value_parser!(u64).range(1..))]
+    pub volume_blocks: Option<u64>,
+    /// Maximum bytes per recovery volume, including metadata.
+    #[arg(long, conflicts_with = "volume_blocks", value_parser = clap::value_parser!(u64).range(1..))]
+    pub volume_bytes: Option<u64>,
+    /// Scratch directory for recovery encoding; defaults to the output directory.
+    #[arg(long)]
+    pub scratch_dir: Option<PathBuf>,
+    /// Flush buffers without requesting durable storage barriers.
+    #[arg(long)]
+    pub buffered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Par3Codec {
+    Cauchy,
+    Fft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Par3Dedup {
+    None,
+    Aligned,
+    Sliding,
 }
 
 #[derive(Debug, Clone, Args)]

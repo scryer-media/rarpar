@@ -46,6 +46,11 @@ unicode-normalization = { version = "0.1.25", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 
+# Temporary consumer patch until the advanced PAR3 engine is published.
+[patch.crates-io]
+par3-rs = { path = "crates/par3-rs" }
+reedsolomon-rs = { path = "crates/reedsolomon-rs" }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

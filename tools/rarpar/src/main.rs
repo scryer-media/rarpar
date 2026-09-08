@@ -3,6 +3,7 @@ mod compat_unrar;
 mod discovery;
 mod error;
 mod par2;
+mod par3;
 mod password;
 mod rar;
 mod report;
@@ -63,6 +64,7 @@ fn run(cli: Cli) -> Result<u8, RarparError> {
         Some(Command::Cleanup(args)) => run_cleanup(&cli, args.paths),
         Some(Command::Rar { command }) => run_rar_command(&cli, command),
         Some(Command::Par { command }) => par2::run_command(&cli, command),
+        Some(Command::Par3 { command }) => par3::run_command(&cli, command),
         None => {
             if cli.paths.is_empty() {
                 return Err(RarparError::NoInput);
@@ -72,7 +74,7 @@ fn run(cli: Cli) -> Result<u8, RarparError> {
     }
 }
 
-fn run_auto(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
+fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
     let options = DiscoveryOptions::from_cli(cli);
     let mut report = discovery::discover(paths.clone(), &options)?;
     emit_progress(cli, &report)?;
@@ -84,6 +86,30 @@ fn run_auto(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError
         return Ok(EXIT_SUCCESS);
     }
 
+    if report.par3_sets.is_empty()
+        && report.files.iter().any(|file| {
+            file.kind == discovery::DiscoveredKind::Par3 && !file.diagnostics.is_empty()
+        })
+    {
+        return Err(RarparError::Data(
+            "PAR3 carrier has no authenticated packets; inspect its diagnostics".into(),
+        ));
+    }
+    let had_par3_sets = !report.par3_sets.is_empty();
+    for set in report.par3_sets.clone() {
+        let outcome = par3::repair_set(cli, &set)?;
+        report.record_action(outcome.action());
+        if !outcome.success {
+            report::emit_discovery(cli, &report)?;
+            return Ok(crate::error::EXIT_DATA_FAILURE);
+        }
+        paths.extend(outcome.protected_paths);
+    }
+    if had_par3_sets {
+        paths.sort();
+        paths.dedup();
+        rediscover_preserving_history(cli, &paths, &options, &mut report)?;
+    }
     let mut passwords = PasswordResolver::from_cli(cli)?;
     let had_par2_sets = !report.par2_sets.is_empty();
 
@@ -133,7 +159,8 @@ fn run_auto(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError
         }
 
         if cli.delete_sources {
-            let manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
+            let mut manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
+            cleanup::add_par3_carriers(&mut manifest, &rar_set, &report.par3_sets);
             let cleanup = cleanup::delete_manifest(cli, &manifest)?;
             report.record_cleanup(cleanup);
         }
@@ -164,7 +191,8 @@ fn run_cleanup(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparEr
     for rar_set in report.rar_sets.clone() {
         let output_dir = discovery::output_dir_for_rar_set(cli, &rar_set, report.rar_sets.len());
         cleanup::validate_extracted_outputs(&rar_set, &output_dir, &mut passwords)?;
-        let manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
+        let mut manifest = cleanup::manifest_for_rar_set(&rar_set, &report.par2_sets);
+        cleanup::add_par3_carriers(&mut manifest, &rar_set, &report.par3_sets);
         let cleanup = cleanup::delete_manifest(cli, &manifest)?;
         report.record_cleanup(cleanup.clone());
         if !cleanup.success {

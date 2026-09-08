@@ -1948,7 +1948,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.3",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -1966,7 +1966,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -1981,7 +1981,7 @@ dependencies = [
  "blake3",
  "crc-fast",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -2196,6 +2196,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "par2-rs 0.9.1",
+ "par3-rs",
  "serde",
  "serde_json",
  "tempfile",
@@ -2261,16 +2262,6 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "reedsolomon-rs"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9884b16620acba60129b537d7853b864293fbcd17080749f81a8662f3e72061"
-dependencies = [
- "memmap2",
- "rayon",
 ]
 
 [[package]]
@@ -2931,7 +2922,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.3",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -2960,7 +2951,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",

@@ -200,6 +200,15 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
             set.label, set.rar_volumes, set.rar_recovery_volumes, set.par2_files
         );
     }
+    for set in &report.par3_sets {
+        println!(
+            "  PAR3 set {}: {} carrier(s), {} protected file(s), metadata complete={}",
+            set.id,
+            set.paths.len(),
+            set.protected_files.len(),
+            set.metadata_complete
+        );
+    }
     for action in &report.planned_actions {
         println!("  plan {}: {}", action.action, action.reason);
     }

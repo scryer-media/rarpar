@@ -20,6 +20,9 @@ pub struct DiscoveryOptions {
     pub recursive: bool,
     pub max_depth: usize,
     pub max_files: usize,
+    pub par3_memory_mib: usize,
+    pub par3_workers: Option<usize>,
+    pub par3_max_lost_blocks: u64,
 }
 
 impl DiscoveryOptions {
@@ -28,6 +31,9 @@ impl DiscoveryOptions {
             recursive: !cli.no_recursive,
             max_depth: cli.max_depth,
             max_files: cli.max_files,
+            par3_memory_mib: cli.par3_memory_mib,
+            par3_workers: cli.par3_workers,
+            par3_max_lost_blocks: cli.par3_max_lost_blocks,
         }
     }
 }
@@ -42,6 +48,7 @@ pub struct DiscoveryReport {
     pub sets: Vec<DiscoveredSet>,
     pub rar_sets: Vec<RarSet>,
     pub par2_sets: Vec<Par2Set>,
+    pub par3_sets: Vec<crate::par3::Par3Set>,
     pub planned_actions: Vec<PlannedAction>,
     pub cleanup_candidates: Vec<CleanupManifest>,
     pub executed_actions: Vec<ExecutedAction>,
@@ -72,6 +79,7 @@ pub enum DiscoveredKind {
     RarVolume(RarVolumeInfo),
     RarRecoveryVolume,
     Par2(Par2FileInfo),
+    Par3,
     Other,
 }
 
@@ -161,19 +169,51 @@ pub fn discover(
     let roots = paths.clone();
     let mut files = Vec::new();
     let mut scan_count = 0usize;
+    let mut visited = BTreeSet::new();
     for path in paths {
         if !path.exists() {
             return Err(RarparError::MissingInput(path));
         }
-        collect_path(&path, options, 0, &mut scan_count, &mut files)?;
+        collect_path(&path, options, 0, &mut scan_count, &mut files, &mut visited)?;
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+    let par3_paths: Vec<_> = files
+        .iter()
+        .filter(|file| file.kind == DiscoveredKind::Par3)
+        .map(|file| file.path.clone())
+        .collect();
+    let par3_sets = if par3_paths.is_empty() {
+        Vec::new()
+    } else {
+        crate::par3::discover_sets(
+            &par3_paths,
+            &crate::par3::execution_options(
+                options.par3_memory_mib,
+                options.par3_workers,
+                options.par3_max_lost_blocks,
+            )?,
+        )?
+    };
+    for file in files
+        .iter_mut()
+        .filter(|file| file.kind == DiscoveredKind::Par3)
+    {
+        if !par3_sets.iter().any(|set| set.paths.contains(&file.path)) {
+            file.diagnostics
+                .push("no authenticated PAR3 packets found".into());
+        }
+    }
     let par2_sets = build_par2_sets(&files);
     let rar_sets = build_rar_sets(&files);
     let sets = summarize_sets(&rar_sets, &par2_sets);
-    let planned_actions = plan_actions(&rar_sets, &par2_sets);
-    let cleanup_candidates = cleanup_candidates(&rar_sets, &par2_sets);
+    let mut planned_actions: Vec<_> = par3_sets.iter().map(|set| PlannedAction { set_id: set.id.clone(), action: "par3_verify_repair".into(), reason: "verify protected data and repair with authenticated PAR3 recovery before extraction".into() }).collect();
+    planned_actions.extend(plan_actions(&rar_sets, &par2_sets));
+    let mut cleanup_candidates = cleanup_candidates(&rar_sets, &par2_sets);
+    for (manifest, rar) in cleanup_candidates.iter_mut().zip(&rar_sets) {
+        crate::cleanup::add_par3_carriers(manifest, rar, &par3_sets);
+    }
 
     Ok(DiscoveryReport {
         roots,
@@ -184,6 +224,7 @@ pub fn discover(
         sets,
         rar_sets,
         par2_sets,
+        par3_sets,
         planned_actions,
         cleanup_candidates,
         executed_actions: Vec::new(),
@@ -295,7 +336,11 @@ fn collect_path(
     depth: usize,
     scan_count: &mut usize,
     files: &mut Vec<DiscoveredFile>,
+    visited: &mut BTreeSet<PathBuf>,
 ) -> Result<(), RarparError> {
+    if !visited.insert(path.canonicalize()?) {
+        return Ok(());
+    }
     if *scan_count >= options.max_files {
         return Err(RarparError::Resource(format!(
             "discovery exceeded max files ({})",
@@ -330,6 +375,9 @@ fn collect_path(
             continue;
         }
         if file_type.is_file() {
+            if !visited.insert(entry_path.canonicalize()?) {
+                continue;
+            }
             *scan_count += 1;
             if *scan_count > options.max_files {
                 return Err(RarparError::Resource(format!(
@@ -339,7 +387,7 @@ fn collect_path(
             }
             files.push(classify_path(&entry_path));
         } else if options.recursive && file_type.is_dir() {
-            collect_path(&entry_path, options, depth + 1, scan_count, files)?;
+            collect_path(&entry_path, options, depth + 1, scan_count, files, visited)?;
         }
     }
     Ok(())
@@ -348,6 +396,15 @@ fn collect_path(
 fn classify_path(path: &Path) -> DiscoveredFile {
     let mut diagnostics = Vec::new();
     let prefix = read_prefix(path, 16).unwrap_or_default();
+
+    if crate::par3::is_carrier(path) || prefix.starts_with(par3_rs::MAGIC) {
+        return DiscoveredFile {
+            path: path.to_path_buf(),
+            kind: DiscoveredKind::Par3,
+            set_hint: set_hint(path),
+            diagnostics,
+        };
+    }
 
     if looks_like_par2(path, &prefix) {
         match par2_rs::scan_packets_from_path_with_set_ids(path) {
@@ -928,6 +985,9 @@ mod tests {
                 recursive: true,
                 max_depth: 8,
                 max_files: 1,
+                par3_memory_mib: 256,
+                par3_workers: None,
+                par3_max_lost_blocks: 4096,
             },
         )
         .unwrap();
@@ -970,6 +1030,9 @@ mod tests {
                 recursive: true,
                 max_depth: 8,
                 max_files: 5,
+                par3_memory_mib: 256,
+                par3_workers: None,
+                par3_max_lost_blocks: 4096,
             },
         )
         .unwrap();
