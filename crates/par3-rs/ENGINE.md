@@ -92,10 +92,20 @@ missing recovery packets are regenerated from verified inputs.
 
 `inside::InsertionPlan` validates plain ZIP/ZIP64 or 7z framing, preserves member
 bytes and compression, and stages Cauchy protection to a separate output.
-`inside::SelfRepairPlan` requires a captured embedded manifest; it reconstructs
+`inside::SelfRepairPlan::capture` uses a captured embedded manifest; it reconstructs
 protected bytes, validates container framing, fills the protection gap, and
 checks the result before exclusive installation. Ordinary file repair refuses
 unprotected gaps so it cannot silently remove embedded protection.
+
+Without the original manifest, explicitly request `SelfRepairPlan::replacement`
+with authenticated matrix identity and desired recovery indices. It preserves
+available authenticated packets and reconstructs only the requested missing
+protection. The replacement must fit the authenticated unprotected gap; unused
+capacity is zero-filled without moving protected bytes or ZIP footers. Requests
+that exceed that capacity fail before execution. `restoration()` and the output
+report distinguish exact restoration from replacement: verified protected data
+and a complete requested replacement do not prove original packet completeness.
+Missing essential metadata remains an error; filenames cannot supply it.
 
 ## Resources and operational outcomes
 
@@ -177,8 +187,7 @@ repair of larger SIMD/worker-created GF8, GF16, and uneven interleaved sets,
 including the recovery equations actually consumed.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT scheduling-threshold tuning, complete diagnostics and progress callbacks,
-and embedded replacement
-layouts when an original manifest is absent. The current reference runs in a
+FFT scheduling-threshold tuning, and complete diagnostics and progress callbacks.
+The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
 throughput parity. Correctness results alone do not satisfy performance acceptance.

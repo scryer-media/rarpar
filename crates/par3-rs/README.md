@@ -212,7 +212,9 @@ Still unsupported:
   blocks out of its External Data packets — and is never checked as a unit.
 - Incremental backups: a Start packet's parent set is exposed, never followed.
 - Interpreting link and permission packets, beyond keeping their bytes.
-- PAR-inside repair without an authenticated original carrier manifest.
+- Byte-exact PAR-inside restoration without an authenticated original manifest.
+  `SelfRepairPlan::replacement` explicitly replaces unknown packet order within
+  the authenticated gap, preserving surviving packets and reporting replacement.
   `inside::SelfRepairPlan` captures the original packet order and boundaries,
   restores damaged protected bytes into separate staging, preserves valid
   embedded packets, and regenerates missing packets only from verified blocks.

@@ -95,7 +95,9 @@
 //! - Incremental backups: a Start packet's parent set is exposed, but parent
 //!   packets are never followed.
 //! - Permissions and link packets, beyond keeping their bytes.
-//! - PAR-inside repair without a captured authenticated carrier manifest.
+//! - Byte-exact PAR-inside restoration without an authenticated carrier manifest.
+//!   [`inside::SelfRepairPlan::replacement`] preserves surviving packets within
+//!   the authenticated gap and explicitly reports a replacement carrier.
 //!   [`inside::SelfRepairPlan`] stages protected-data reconstruction, preserves
 //!   valid packets and regenerates missing packets from verified input blocks.
 //!   Reference ZIP/ZIP64 and 7z fixtures restore byte for byte, including packet holes.

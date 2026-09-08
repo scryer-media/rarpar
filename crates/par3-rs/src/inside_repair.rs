@@ -28,7 +28,7 @@ pub struct SelfRepairPlan {
     limits: ContainerLimits,
 }
 
-/// A separately installed, verified archive with its original packet layout.
+/// A separately installed archive with verified protected bytes and protection.
 #[derive(Debug)]
 pub struct SelfRepairReport {
     /// Destination explicitly selected by the caller.
@@ -39,6 +39,8 @@ pub struct SelfRepairReport {
     pub reconstructed_blocks: u64,
     /// Distinct recovery packets regenerated from verified source blocks.
     pub recovery_packets: usize,
+    /// Whether the original carrier bytes were restored or explicitly replaced.
+    pub restoration: crate::carrier::CarrierRestoration,
 }
 
 impl SelfRepairPlan {
@@ -50,6 +52,39 @@ impl SelfRepairPlan {
         session: &mut Par3RepairSession,
         packets: &[IngestedPacket],
         limits: ContainerLimits,
+    ) -> EngineResult<Self> {
+        Self::build(session, limits, |session, gap| {
+            if packets.iter().any(|packet| {
+                packet.input_set_id() != session.set.as_ref().expect("resolved set").input_set_id()
+            }) {
+                return Err(EngineError::InvalidState(
+                    "embedded packets belong to another set",
+                ));
+            }
+            CarrierPlan::capture_range(packets, gap, &session.options)
+        })
+    }
+
+    /// Explicitly replace an unknown packet order within the authenticated gap.
+    /// Preserve all available authenticated packets and add the requested recovery
+    /// indices. Unused unprotected capacity is zero-filled. The gap and protected
+    /// layout never move; requests which do not fit are refused before execution.
+    /// This cannot recover missing essential metadata or claim byte-exact repair.
+    pub fn replacement(
+        session: &mut Par3RepairSession,
+        matrix: Fingerprint,
+        indices: &[u64],
+        limits: ContainerLimits,
+    ) -> EngineResult<Self> {
+        Self::build(session, limits, |session, _| {
+            CarrierPlan::replacement_preserving(session, matrix, indices)
+        })
+    }
+
+    fn build(
+        session: &mut Par3RepairSession,
+        limits: ContainerLimits,
+        carrier: impl FnOnce(&mut Par3RepairSession, Range<u64>) -> EngineResult<CarrierPlan>,
     ) -> EngineResult<Self> {
         let layout = session
             .layout()?
@@ -80,15 +115,12 @@ impl SelfRepairPlan {
         if gaps.next().is_some() || gap.start == 0 || gap.end > file.len {
             return Err(EngineError::Unsupported("ambiguous embedded packet gaps"));
         }
-        if packets
-            .iter()
-            .any(|packet| packet.input_set_id() != set.input_set_id())
-        {
-            return Err(EngineError::InvalidState(
-                "embedded packets belong to another set",
+        let carrier = carrier(session, gap.clone())?;
+        if carrier.output_bytes() > gap.end - gap.start {
+            return Err(EngineError::ResourceLimit(
+                "replacement exceeds authenticated packet gap",
             ));
         }
-        let carrier = CarrierPlan::capture_range(packets, gap.clone(), &session.options)?;
         Ok(Self {
             carrier,
             identity: layout.identity,
@@ -101,6 +133,11 @@ impl SelfRepairPlan {
     /// Full staged archive bytes required before installation.
     pub fn output_bytes(&self) -> u64 {
         self.length
+    }
+
+    /// Exact restoration or an explicitly requested replacement.
+    pub fn restoration(&self) -> crate::carrier::CarrierRestoration {
+        self.carrier.restoration()
     }
 
     /// Auxiliary carrier and equation scratch, excluding the staged archive.
@@ -199,11 +236,21 @@ impl SelfRepairPlan {
                 .write(true)
                 .open_budgeted(&temporary, &options)?;
             output.seek(SeekFrom::Start(self.gap.start))?;
-            let mut remaining = self.gap.end - self.gap.start;
+            let mut remaining = self.carrier.output_bytes();
             while remaining != 0 {
                 options.cancel.check()?;
                 let take = remaining.min(size as u64) as usize;
                 carrier.read_exact(&mut buffer[..take])?;
+                output.write_all(&buffer[..take])?;
+                remaining -= take as u64;
+            }
+            // This is explicit unprotected carrier slack, never missing source
+            // data or codec padding. Protected extents retain their coordinates.
+            buffer.fill(0);
+            let mut remaining = self.gap.end - self.gap.start - self.carrier.output_bytes();
+            while remaining != 0 {
+                options.cancel.check()?;
+                let take = remaining.min(size as u64) as usize;
                 output.write_all(&buffer[..take])?;
                 remaining -= take as u64;
             }
@@ -255,6 +302,7 @@ impl SelfRepairPlan {
                 kind: container.kind(),
                 reconstructed_blocks,
                 recovery_packets: report.recovery_packets,
+                restoration: report.restoration,
             })
         })();
         if carrier_installed {

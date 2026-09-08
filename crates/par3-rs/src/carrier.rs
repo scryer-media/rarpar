@@ -139,6 +139,23 @@ impl CarrierPlan {
         matrix: Fingerprint,
         indices: &[u64],
     ) -> EngineResult<Self> {
+        Self::replacement_inner(session, matrix, indices, false)
+    }
+
+    pub(crate) fn replacement_preserving(
+        session: &mut Par3RepairSession,
+        matrix: Fingerprint,
+        indices: &[u64],
+    ) -> EngineResult<Self> {
+        Self::replacement_inner(session, matrix, indices, true)
+    }
+
+    fn replacement_inner(
+        session: &mut Par3RepairSession,
+        matrix: Fingerprint,
+        indices: &[u64],
+        preserve: bool,
+    ) -> EngineResult<Self> {
         session.assess()?;
         let set = session
             .set
@@ -174,6 +191,15 @@ impl CarrierPlan {
                     .map(|packet| Entry::Metadata(packet.to_bytes()))
             })
             .collect();
+        if preserve {
+            for payload in session.input.payloads() {
+                entries.push(Entry::Payload {
+                    kind: payload.kind(),
+                    length: payload.len(),
+                    expected: Some(payload.packet_hash()),
+                });
+            }
+        }
         let mut seen = std::collections::BTreeSet::new();
         for &index in indices {
             if !seen.insert(index) {
@@ -181,12 +207,18 @@ impl CarrierPlan {
                     "duplicate replacement recovery index",
                 ));
             }
+            let kind = PayloadKind::Recovery {
+                root: set.root_hash(),
+                matrix,
+                index,
+            };
+            if entries.iter().any(
+                |entry| matches!(entry, Entry::Payload { kind: existing, .. } if *existing == kind),
+            ) {
+                continue;
+            }
             entries.push(Entry::Payload {
-                kind: PayloadKind::Recovery {
-                    root: set.root_hash(),
-                    matrix,
-                    index,
-                },
+                kind,
                 length: set.block_size(),
                 expected: None,
             });
@@ -196,7 +228,13 @@ impl CarrierPlan {
             .try_fold(0u64, |sum, entry| {
                 sum.checked_add(match entry {
                     Entry::Metadata(bytes) => bytes.len() as u64,
-                    Entry::Payload { length, .. } => length.checked_add(88)?,
+                    Entry::Payload { length, kind, .. } => {
+                        length.checked_add(if matches!(kind, PayloadKind::Data { .. }) {
+                            56
+                        } else {
+                            88
+                        })?
+                    }
                 })
             })
             .ok_or(EngineError::ResourceLimit("replacement length"))?;

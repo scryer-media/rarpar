@@ -177,6 +177,150 @@ fn captured_self_repair_restores_official_archives_with_missing_packets() {
     }
 }
 
+#[test]
+fn unknown_embedded_manifest_preserves_packets_and_repairs_protected_data() {
+    replacement_cases(None);
+}
+
+#[test]
+#[ignore = "exports replacement archives to an explicit pinned-reference directory"]
+fn export_replacement_archives_for_reference_validation() {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("PAR3_REPLACEMENT_ORACLE_OUTPUT").unwrap());
+    std::fs::create_dir(&root).unwrap();
+    replacement_cases(Some(&root));
+}
+
+fn replacement_cases(export: Option<&std::path::Path>) {
+    use par3_rs::carrier::CarrierRestoration;
+    use par3_rs::ingest::{PacketScanner, ScanEvent};
+    use par3_rs::inside::SelfRepairPlan;
+    use par3_rs::packet::PacketBody;
+    use std::sync::Arc;
+
+    for (kind, original, inserted) in cases() {
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        for damage_protected in [false, true] {
+            // Read only official boundaries to model one missing packet; do not
+            // capture or supply the original carrier manifest to the repair plan.
+            let (offset, packet) = common::scan(inserted)
+                .into_iter()
+                .rev()
+                .find(|(_, packet)| {
+                    if damage_protected {
+                        matches!(packet.body(), PacketBody::Creator(_))
+                    } else {
+                        matches!(packet.body(), PacketBody::RecoveryData(_))
+                    }
+                })
+                .unwrap();
+            let hole = offset..offset + packet.len();
+            let mut damaged = inserted.to_vec();
+            if damage_protected {
+                damaged[100] ^= 0x80;
+            }
+            let source = Arc::new(HoleyArchive {
+                bytes: damaged,
+                hole: hole.clone(),
+            });
+            let mut scanner = PacketScanner::new(
+                source.clone(),
+                SourceId(1),
+                options.clone(),
+                par3_rs::ScanLimits::default(),
+            )
+            .unwrap();
+            let mut available = Vec::new();
+            loop {
+                match scanner.poll().unwrap() {
+                    ScanEvent::Packet(packet) => available.push(packet),
+                    ScanEvent::NeedData { offset } if offset <= hole.end => {
+                        scanner.seek(hole.end).unwrap()
+                    }
+                    ScanEvent::End | ScanEvent::NeedData { .. } => break,
+                }
+            }
+            let mut session = par3_rs::Par3RepairSession::new(
+                available[0].input_set_id(),
+                source,
+                options.clone(),
+            )
+            .unwrap();
+            for packet in &available {
+                session.merge(packet.clone()).unwrap();
+            }
+            let layout = session.layout().unwrap().unwrap();
+            let name = layout.files()[0].path.clone();
+            session.bind_file(&name, SourceId(1)).unwrap();
+            let matrix = available
+                .iter()
+                .find(|packet| {
+                    packet
+                        .metadata()
+                        .is_some_and(|packet| matches!(packet.body(), PacketBody::CauchyMatrix(_)))
+                })
+                .unwrap()
+                .hash();
+            let indices = match packet.body() {
+                PacketBody::RecoveryData(row) => vec![row.recovery_block_index],
+                _ => Vec::new(),
+            };
+            let plan = SelfRepairPlan::replacement(
+                &mut session,
+                matrix,
+                &indices,
+                ContainerLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(plan.restoration(), CarrierRestoration::Replacement);
+            let excessive: Vec<_> = (0..1000).collect();
+            assert!(matches!(
+                SelfRepairPlan::replacement(
+                    &mut session,
+                    matrix,
+                    &excessive,
+                    ContainerLimits::default()
+                ),
+                Err(EngineError::ResourceLimit(
+                    "replacement exceeds authenticated packet gap"
+                ))
+            ));
+            let tree = common::TempTree::new(&format!("replacement-{kind:?}"));
+            let destination = tree.path().join("replaced.archive");
+            let report = plan
+                .execute(&mut session, &destination, tree.path())
+                .unwrap();
+            assert_eq!(report.restoration, CarrierRestoration::Replacement);
+            assert_eq!(report.kind, kind);
+            assert_eq!(report.recovery_packets, usize::from(!damage_protected));
+            assert_eq!(report.reconstructed_blocks > 0, damage_protected);
+            let restored = std::fs::read(&destination).unwrap();
+            assert_eq!(restored.len(), inserted.len());
+            assert_eq!(&restored[..original.len()], original);
+            let packets = common::packets_of(&restored);
+            for packet in available {
+                assert!(packets.iter().any(|out| out.hash() == packet.hash()));
+            }
+            let sets = par3_rs::Par3Set::from_packets(packets).unwrap();
+            let mut disk = MemorySourceAccess::default();
+            disk.insert(SourceId(1), 3, restored.clone().into());
+            let fresh = Arc::new(par3_rs::layout::BlockLayout::new(&sets[0], &options).unwrap());
+            assert!(
+                par3_rs::evidence::verify_source(fresh, 0, &disk, SourceId(1), &options)
+                    .unwrap()
+                    .protected_complete()
+            );
+            assert_eq!(options.handles.used(), 0);
+            if let Some(export) = export.filter(|_| !damage_protected) {
+                let directory = export.join(format!("{kind:?}"));
+                std::fs::create_dir(&directory).unwrap();
+                std::fs::write(directory.join(name), restored).unwrap();
+            }
+        }
+    }
+}
+
 struct HoleyArchive {
     bytes: Vec<u8>,
     hole: std::ops::Range<u64>,

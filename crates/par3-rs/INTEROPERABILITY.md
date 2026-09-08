@@ -41,6 +41,32 @@ No original copy was placed where reference file discovery could use it.
 These comparison digests supplement the reference's own PAR3 verification;
 they do not replace required PAR3 fingerprints in engine evidence.
 
+## Embedded replacement checks, 2026-09-07
+
+`tests/inside_engine.rs::export_replacement_archives_for_reference_validation`
+exports replacements made without an original carrier manifest. It omits the
+official archive's recovery packet through an unavailable range, preserves the
+remaining authenticated packets, and explicitly requests the missing equation.
+The authenticated gap and protected coordinates remain fixed. Ordinary tests
+also repair protected-data damage with a missing optional Creator packet.
+
+The pinned reference accepted all three replacements with `par3 vs`. XORing
+protected byte 100 with `0x80` and running `par3 rs -S0` then consumed one
+recovery equation in each archive and restored the complete replacement digest.
+
+| Format | Replacement bytes | SHA-256 before damage and after reference repair |
+| --- | ---: | --- |
+| ZIP | 2643 | `0e02305e5ab00997e8f1c0a44b54ab5d8bb31cb9f5a88e611a05617b97e74109` |
+| ZIP64 | 5656335 | `863ea588cfd53f0622ffc4c5f3c35489ef49fdb293d1d82cb5a77262bff320f3` |
+| 7z | 1969 | `ca37a65afe9e79bffb50dee888effa45c55f08a4a5eb0380bb2e1ea530348509` |
+
+Export with `PAR3_REPLACEMENT_ORACLE_OUTPUT` naming an absent directory and
+Nextest's ignored test filter `test(export_replacement_archives_for_reference_validation)`.
+The recorded output was `/tmp/par3-reference.mGh8NL/replacements-20260907`,
+with `Zip/inside.zip`, `Zip64/inside64.zip`, and `SevenZip/inside.7z`.
+These are explicit replacement carriers, not byte-exact restoration claims
+about an unknown original manifest, and are not official-reference fixtures.
+
 ## Reproduction
 
 Create a fresh empty output directory, then export through the public library:
