@@ -63,6 +63,45 @@ fn scan(access: Arc<Carriers>, options: &ExecutionOptions) -> Vec<IngestedPacket
 }
 
 #[test]
+fn official_xor_recovers_each_omitted_data_block_and_all_its_file_aliases() {
+    for missing in 0..4 {
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = 127;
+        let access = Arc::new(Carriers {
+            generation: AtomicU64::new(1),
+            reads: AtomicUsize::new(0),
+        });
+        let packets = scan(access, &options);
+        let mut session = Par3RepairSession::new(
+            packets[0].input_set_id(),
+            Arc::new(MemorySourceAccess::default()),
+            options,
+        )
+        .unwrap();
+        for packet in packets {
+            if packet.payload().is_some_and(
+                |payload| matches!(payload.kind(), PayloadKind::Data { index } if index == missing),
+            ) {
+                continue;
+            }
+            session.merge(packet).unwrap();
+        }
+        let assessment = session.assess().unwrap();
+        assert_eq!(assessment.status, RepairStatus::Ready);
+        assert_eq!(assessment.lost_blocks, vec![missing]);
+        let output = common::TempTree::new("official-data-xor");
+        let report = session.repair(output.path(), false).unwrap();
+        assert_eq!(report.reconstructed_blocks, 1);
+        assert_eq!(report.installed.len(), 2);
+        let expected: Vec<u8> = (0..3300).map(|i| ((i * 29 + i / 31) % 256) as u8).collect();
+        for name in ["copy.bin", "input.bin"] {
+            assert_eq!(std::fs::read(output.path().join(name)).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn official_data_only_recovery_retains_proofs_across_replays_and_recovery_arrivals() {
     let mut options = ExecutionOptions::default();
     options.workers = 1;

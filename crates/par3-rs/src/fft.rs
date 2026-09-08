@@ -63,6 +63,13 @@ impl FftGeometry {
     pub fn field_bytes(self) -> usize {
         (self.bits / 8) as usize
     }
+
+    /// A single input is copied; a single recovery row is the XOR of inputs.
+    /// These geometries need no field arithmetic and accept byte alignment.
+    #[must_use]
+    pub fn is_trivial(self) -> bool {
+        self.inputs == 1 || self.capacity == 1
+    }
 }
 
 /// A source row consumed by FFT decoding.
@@ -78,24 +85,32 @@ pub enum FftInput {
 /// one byte per GF8 symbol and little-endian pairs per GF16 symbol.
 pub struct FftCodec {
     geometry: FftGeometry,
-    field: TransformField,
+    field: Option<TransformField>,
     options: ExecutionOptions,
-    _tables: Reservation,
+    _tables: Option<Reservation>,
 }
 
 impl FftCodec {
     /// Allocate the field only after its memory requirement is admitted.
     pub fn new(geometry: FftGeometry, options: ExecutionOptions) -> EngineResult<Self> {
         options.validate()?;
+        if geometry.is_trivial() {
+            return Ok(Self {
+                geometry,
+                field: None,
+                options,
+                _tables: None,
+            });
+        }
         let reservation = options
             .memory
             .reserve(TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?)?;
         let field = TransformField::new(geometry.bits).map_err(transform_error)?;
         Ok(Self {
             geometry,
-            field,
+            field: Some(field),
             options,
-            _tables: reservation,
+            _tables: Some(reservation),
         })
     }
 
@@ -115,6 +130,10 @@ impl FftCodec {
                 "FFT recovery range exceeds capacity",
             ));
         }
+        if g.is_trivial() {
+            return self.encode_trivial(block_size, first, count, read, write);
+        }
+        let field = self.field.as_ref().expect("nontrivial FFT field");
         let rows = g
             .capacity
             .checked_mul(2)
@@ -132,14 +151,6 @@ impl FftCodec {
             for row in &mut sum {
                 row.fill(0);
             }
-            if g.inputs == 1 {
-                read(0, offset, &mut bytes[..take])?;
-                for index in first..first + count {
-                    write(index, offset, &bytes[..take])?;
-                }
-                offset += take as u64;
-                continue;
-            }
             for base in (0..g.inputs).step_by(g.capacity) {
                 for (at, row) in work.iter_mut().enumerate() {
                     self.options.cancel.check()?;
@@ -151,7 +162,7 @@ impl FftCodec {
                     read(base + at, offset, &mut bytes[..take])?;
                     unpack(g.field_bytes(), &bytes, row);
                 }
-                self.field
+                field
                     .transform(&mut work, g.capacity + base, true, &cancelled)
                     .map_err(transform_error)?;
                 for (to, from) in sum.iter_mut().zip(&work) {
@@ -160,7 +171,7 @@ impl FftCodec {
                     }
                 }
             }
-            self.field
+            field
                 .transform(&mut sum, 0, false, &cancelled)
                 .map_err(transform_error)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
@@ -189,6 +200,10 @@ impl FftCodec {
         if lost.len() > recovery.len() {
             return Err(EngineError::InvalidState("insufficient FFT recovery"));
         }
+        if g.is_trivial() {
+            return self.decode_trivial(block_size, lost, recovery, read, write);
+        }
+        let field = self.field.as_ref().expect("nontrivial FFT field");
         let _plan = self.options.memory.reserve(
             g.domain
                 .checked_mul(32)
@@ -211,8 +226,7 @@ impl FftCodec {
             erased[g.capacity + index] = true;
         }
         let cancelled = || self.options.cancel.check().is_err();
-        let factors = self
-            .field
+        let factors = field
             .erasure_factors(&erased, &cancelled)
             .map_err(transform_error)?;
         let (stripe, _buffers) = self.buffers(block_size, g.domain)?;
@@ -223,12 +237,6 @@ impl FftCodec {
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
-            if g.inputs == 1 {
-                read(FftInput::Recovery(recovery[0]), offset, &mut bytes[..take])?;
-                write(0, offset, &bytes[..take])?;
-                offset += take as u64;
-                continue;
-            }
             for (index, row) in rows.iter_mut().enumerate() {
                 self.options.cancel.check()?;
                 row.fill(0);
@@ -244,26 +252,25 @@ impl FftCodec {
                 read(source, offset, &mut bytes[..take])?;
                 unpack(g.field_bytes(), &bytes, row);
                 for value in row {
-                    *value = self.field.mul(*value, factors[index]);
+                    *value = field.mul(*value, factors[index]);
                 }
             }
-            self.field
+            field
                 .transform(&mut rows, 0, true, &cancelled)
                 .map_err(transform_error)?;
-            self.field
+            field
                 .derivative(&mut rows, &cancelled)
                 .map_err(transform_error)?;
-            self.field
+            field
                 .transform(&mut rows, 0, false, &cancelled)
                 .map_err(transform_error)?;
             for &index in lost {
-                let factor = self
-                    .field
+                let factor = field
                     .inverse(factors[g.capacity + index])
                     .ok_or(EngineError::InvalidState("singular FFT locator"))?;
                 let row = &mut rows[g.capacity + index];
                 for value in row.iter_mut() {
-                    *value = self.field.mul(*value, factor);
+                    *value = field.mul(*value, factor);
                 }
                 pack(g.field_bytes(), row, &mut bytes);
                 write(index, offset, &bytes[..take])?;
@@ -271,6 +278,108 @@ impl FftCodec {
             offset += take as u64;
         }
         Ok(())
+    }
+
+    fn encode_trivial(
+        &self,
+        block_size: u64,
+        first: usize,
+        count: usize,
+        mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let (stripe, _buffers) = self.byte_buffers(block_size)?;
+        let mut sum = vec![0; stripe];
+        let mut bytes = vec![0; stripe];
+        let mut offset = 0;
+        while offset < block_size {
+            self.options.cancel.check()?;
+            let take = (block_size - offset).min(stripe as u64) as usize;
+            sum[..take].fill(0);
+            for index in 0..self.geometry.inputs {
+                self.options.cancel.check()?;
+                read(index, offset, &mut bytes[..take])?;
+                for (to, from) in sum[..take].iter_mut().zip(&bytes[..take]) {
+                    *to ^= from;
+                }
+            }
+            for index in first..first + count {
+                self.options.cancel.check()?;
+                write(index, offset, &sum[..take])?;
+            }
+            offset += take as u64;
+        }
+        Ok(())
+    }
+
+    fn decode_trivial(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
+        mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        if lost.len() != 1 || lost[0] >= self.geometry.inputs {
+            return Err(EngineError::InvalidState("invalid or duplicate FFT loss"));
+        }
+        // Charge only supplied indices; a large copy geometry needs no locator.
+        let _indices = self.options.memory.reserve(
+            recovery
+                .len()
+                .checked_mul(size_of::<usize>())
+                .ok_or(EngineError::ResourceLimit("FFT recovery indices"))?,
+        )?;
+        let mut indices = recovery.to_vec();
+        indices.sort_unstable();
+        if indices
+            .last()
+            .is_none_or(|index| *index >= self.geometry.capacity)
+            || indices.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(EngineError::InvalidState(
+                "invalid or duplicate FFT recovery index",
+            ));
+        }
+        let (stripe, _buffers) = self.byte_buffers(block_size)?;
+        let mut sum = vec![0; stripe];
+        let mut bytes = vec![0; stripe];
+        let mut offset = 0;
+        while offset < block_size {
+            self.options.cancel.check()?;
+            let take = (block_size - offset).min(stripe as u64) as usize;
+            read(FftInput::Recovery(recovery[0]), offset, &mut sum[..take])?;
+            for index in 0..self.geometry.inputs {
+                self.options.cancel.check()?;
+                if index == lost[0] {
+                    continue;
+                }
+                read(FftInput::Original(index), offset, &mut bytes[..take])?;
+                for (to, from) in sum[..take].iter_mut().zip(&bytes[..take]) {
+                    *to ^= from;
+                }
+            }
+            self.options.cancel.check()?;
+            write(lost[0], offset, &sum[..take])?;
+            offset += take as u64;
+        }
+        Ok(())
+    }
+
+    fn byte_buffers(&self, block_size: u64) -> EngineResult<(usize, Reservation)> {
+        self.options.validate()?;
+        if block_size == 0 {
+            return Err(EngineError::InvalidState("FFT block alignment"));
+        }
+        let stripe = self
+            .options
+            .stripe_bytes
+            .min(self.options.memory.available().saturating_sub(64) / 2)
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        if stripe == 0 {
+            return Err(EngineError::ResourceLimit("minimum FFT stripe"));
+        }
+        Ok((stripe, self.options.memory.reserve(64 + stripe * 2)?))
     }
 
     fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {

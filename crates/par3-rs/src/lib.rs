@@ -21,6 +21,8 @@
 //! at holes, omitting unprotected gaps from the whole protected-data fingerprint.
 //! Performance acceptance and the remaining advanced capabilities are still
 //! being developed; see [what is not in scope](#what-is-not).
+//! The crate's `ENGINE.md` documents the Weaver integration contract, including
+//! source identity, evidence, lifecycle, resource limits, and remaining acceptance.
 //!
 //! ```no_run
 //! use par3_rs::{Par3Set, VerifyReport, scan_packets_from_path, verify_set};
@@ -117,6 +119,7 @@
 //! | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 //! | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 //! | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
+//! | Trivial FFT field | Not specified | Field size zero denotes copy recovery for one input, or XOR for recovery capacity one; byte stripes need no transform tables |
 //! | ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference requires size/offset sentinels too; the corpus normalizes these original ZIP fields before insertion |
 //! | Unprotected file hash | The draft does not define this File-packet hash | Concatenate protected chunks, omitting unprotected bytes; earlier crate docs incorrectly described zero substitution |
 //!

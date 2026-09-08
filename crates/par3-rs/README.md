@@ -13,7 +13,9 @@ missing files back from one.
 creation and repair. The incremental engine adds virtual sources, streaming
 verification evidence, retained repair sessions, and low-rate FFT recovery.
 Performance acceptance and the remaining advanced capabilities are still being
-developed. See [Scope](#scope) before depending on this crate.
+developed. See [Scope](#scope) before depending on this crate and the
+[Weaver engine contract](ENGINE.md) for source identity, evidence, lifecycle,
+resource limits, and remaining acceptance work.
 
 ```toml
 [dependencies]
@@ -251,6 +253,7 @@ how bytes are read:
 | Cauchy matrix | Interleaved `x` values | `x_I = I` |
 | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
+| Trivial FFT field | Not specified | Field size zero denotes copy recovery for one input, or XOR for recovery capacity one; these paths use byte stripes without transform tables |
 | ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference rejects count-only ZIP64 unless the ZIP size/offset fields also use `0xffffffff` sentinels; the corpus normalizes these original ZIP fields before insertion |
 | Unprotected file hash | The draft does not define this File-packet hash | Concatenate protected chunks in file order, omitting unprotected bytes; the earlier crate documentation incorrectly described zero substitution |
 
