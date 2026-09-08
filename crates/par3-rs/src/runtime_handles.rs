@@ -56,6 +56,7 @@ impl OpenBudgeted for OpenOptions {
         Ok(EngineFile {
             file,
             _lease: lease,
+            diagnostics: options.diagnostics.clone(),
         })
     }
 }
@@ -64,6 +65,7 @@ pub(crate) struct EngineFile {
     // Declaration order closes the OS file before releasing its lease.
     file: File,
     _lease: HandleLease,
+    diagnostics: super::ExecutionDiagnostics,
 }
 impl EngineFile {
     pub(crate) fn open(path: &Path, options: &ExecutionOptions) -> EngineResult<Self> {
@@ -81,12 +83,14 @@ impl EngineFile {
 }
 impl Read for EngineFile {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.file.read(out)
+        self.diagnostics
+            .files()
+            .read(out.len(), || self.file.read(out))
     }
 }
 impl Write for EngineFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.file.write(bytes)
+        self.diagnostics.files().write(|| self.file.write(bytes))
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()

@@ -157,6 +157,7 @@ impl SelfRepairPlan {
         destination: &Path,
         scratch_directory: &Path,
     ) -> EngineResult<SelfRepairReport> {
+        let _progress = session.options.stage(crate::runtime::Stage::Container)?;
         let layout = session
             .layout()?
             .ok_or(EngineError::InvalidState("incomplete embedded metadata"))?;
@@ -277,12 +278,14 @@ impl SelfRepairPlan {
                 let take =
                     (footer.end - footer.start - at).min(size.min(duplicate.len()) as u64) as usize;
                 crate::source::read_exact_at(
+                    &options.diagnostics,
                     disk.as_ref(),
                     SourceId(0),
                     footer.start + at,
                     &mut buffer[..take],
                 )?;
                 crate::source::read_exact_at(
+                    &options.diagnostics,
                     disk.as_ref(),
                     SourceId(0),
                     self.gap.end + at,

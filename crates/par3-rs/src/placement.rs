@@ -94,7 +94,7 @@ pub fn search_extent(
     limits: &PlacementOptions,
     options: &ExecutionOptions,
 ) -> EngineResult<PlacementReport> {
-    options.validate()?;
+    let mut progress = options.stage(crate::runtime::Stage::Placement)?;
     let description = layout
         .files
         .get(file)
@@ -177,7 +177,8 @@ pub fn search_extent(
                 continue;
             }
             charge(&mut report, window as u64, limits)?;
-            read_exact_at(access, source, range.start, &mut ring)?;
+            read_exact_at(&options.diagnostics, access, source, range.start, &mut ring)?;
+            progress.advance(window as u64);
             let mut raw = SlidingCrc::raw(&ring);
             let mut start = range.start;
             let mut cursor = 0;
@@ -196,7 +197,13 @@ pub fn search_extent(
                         options.cancel.check()?;
                         let take = (length - (position - start)).min(stripe as u64) as usize;
                         charge(&mut report, take as u64, limits)?;
-                        read_exact_at(access, source, position, &mut confirmation[..take])?;
+                        read_exact_at(
+                            &options.diagnostics,
+                            access,
+                            source,
+                            position,
+                            &mut confirmation[..take],
+                        )?;
                         hash.update(&confirmation[..take]);
                         position += take as u64;
                     }
@@ -222,7 +229,9 @@ pub fn search_extent(
                 }
                 let take = (range.end - at).min(stripe as u64) as usize;
                 charge(&mut report, take as u64, limits)?;
-                read_exact_at(access, source, at, &mut input[..take])?;
+                read_exact_at(&options.diagnostics, access, source, at, &mut input[..take])?;
+                progress.advance(take as u64);
+                options.cancel.check()?;
                 // Stop at the next CRC candidate, retaining the remaining input
                 // buffer while confirming it so each search byte is read once.
                 for &byte in &input[..take] {
@@ -242,7 +251,13 @@ pub fn search_extent(
                         options.cancel.check()?;
                         let count = (length - (position - start)).min(stripe as u64) as usize;
                         charge(&mut report, count as u64, limits)?;
-                        read_exact_at(access, source, position, &mut confirmation[..count])?;
+                        read_exact_at(
+                            &options.diagnostics,
+                            access,
+                            source,
+                            position,
+                            &mut confirmation[..count],
+                        )?;
                         hash.update(&confirmation[..count]);
                         position += count as u64;
                     }

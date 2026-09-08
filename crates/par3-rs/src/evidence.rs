@@ -231,7 +231,7 @@ impl StreamingVerifier {
     /// Supply bytes at their decoded file offset. The source generation must
     /// satisfy `SourceSnapshot`'s immutable-publication contract.
     pub fn feed(&mut self, offset: u64, bytes: &[u8]) -> EngineResult<()> {
-        self.options.cancel.check()?;
+        let mut progress = self.options.stage(crate::runtime::Stage::Verify)?;
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(EngineError::InvalidState("verification offset overflow"))?;
@@ -272,7 +272,8 @@ impl StreamingVerifier {
         if self.whole_ordered {
             self.whole_next = end;
         }
-        Ok(())
+        progress.advance(bytes.len() as u64);
+        self.options.cancel.check()
     }
 
     fn feed_extent(&mut self, index: usize, offset: u64, bytes: &[u8]) -> EngineResult<()> {
@@ -452,7 +453,10 @@ pub fn verify_arrivals(
             while at < end {
                 options.cancel.check()?;
                 let take = (end - at).min(size as u64) as usize;
-                let read = access.read_at(previous.source, at, &mut bytes[..take])?;
+                let read =
+                    options
+                        .diagnostics
+                        .read_at(access, previous.source, at, &mut bytes[..take])?;
                 if read > take {
                     return Err(EngineError::InvalidState("invalid source read length"));
                 }
@@ -494,7 +498,9 @@ pub fn verify_source(
         while offset < snapshot.len {
             options.cancel.check()?;
             let take = (snapshot.len - offset).min(buffer.len() as u64) as usize;
-            let read = reader.read(&mut buffer[..take])?;
+            let read = options
+                .diagnostics
+                .read(reader.as_mut(), &mut buffer[..take])?;
             if read == 0 {
                 break;
             }
@@ -513,7 +519,10 @@ pub fn verify_source(
             while offset < range.end {
                 options.cancel.check()?;
                 let take = (range.end - offset).min(buffer.len() as u64) as usize;
-                let read = access.read_at(source, offset, &mut buffer[..take])?;
+                let read =
+                    options
+                        .diagnostics
+                        .read_at(access, source, offset, &mut buffer[..take])?;
                 if read == 0 {
                     break;
                 }

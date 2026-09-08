@@ -121,7 +121,7 @@ impl InsertionPlan {
     /// Final PAR3 verification precedes exclusive output installation.
     pub fn execute(&self, destination: &Path, scratch_directory: &Path) -> EngineResult<PathBuf> {
         let options = &self.options.execution;
-        options.validate()?;
+        let _progress = options.stage(crate::runtime::Stage::Container)?;
         ensure_snapshot(
             self.access.as_ref(),
             self.layout.source(),
@@ -158,6 +158,7 @@ impl InsertionPlan {
                     options.cancel.check()?;
                     let take = (range.end - at).min(size as u64) as usize;
                     read_exact_at(
+                        &options.diagnostics,
                         self.access.as_ref(),
                         self.layout.source(),
                         at,
@@ -184,6 +185,7 @@ impl InsertionPlan {
                 options.cancel.check()?;
                 let take = (footer.end - at).min(size as u64) as usize;
                 read_exact_at(
+                    &options.diagnostics,
                     self.access.as_ref(),
                     self.layout.source(),
                     at,

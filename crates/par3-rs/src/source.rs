@@ -195,6 +195,7 @@ impl SourceAccess for MemorySourceAccess {
 }
 
 pub(crate) fn read_exact_at(
+    diagnostics: &crate::runtime::ExecutionDiagnostics,
     access: &dyn SourceAccess,
     source: SourceId,
     offset: u64,
@@ -205,7 +206,7 @@ pub(crate) fn read_exact_at(
         let at = offset
             .checked_add(done as u64)
             .ok_or(EngineError::InvalidState("source offset overflow"))?;
-        let read = access.read_at(source, at, &mut out[done..])?;
+        let read = diagnostics.read_at(access, source, at, &mut out[done..])?;
         if read == 0 {
             return Err(EngineError::Unavailable {
                 source_id: source,

@@ -68,12 +68,13 @@ impl ContainerLayout {
         options: &ExecutionOptions,
         limits: &ContainerLimits,
     ) -> EngineResult<Self> {
-        options.validate()?;
+        let progress = options.stage(crate::runtime::Stage::Container)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
         })?;
         let mut reader = Inspector {
+            progress,
             access,
             source,
             snapshot,
@@ -127,6 +128,7 @@ impl ContainerLayout {
 }
 
 struct Inspector<'a> {
+    progress: crate::runtime::StageGuard,
     access: &'a dyn SourceAccess,
     source: SourceId,
     snapshot: SourceSnapshot,
@@ -160,7 +162,15 @@ impl Inspector<'_> {
             .remaining
             .checked_sub(bytes.len() as u64)
             .ok_or(EngineError::ResourceLimit("container inspection bytes"))?;
-        read_exact_at(self.access, self.source, at, bytes)
+        read_exact_at(
+            &self.options.diagnostics,
+            self.access,
+            self.source,
+            at,
+            bytes,
+        )?;
+        self.progress.advance(bytes.len() as u64);
+        self.options.cancel.check()
     }
 
     fn seven_zip(&mut self) -> EngineResult<(ContainerKind, Range<u64>)> {

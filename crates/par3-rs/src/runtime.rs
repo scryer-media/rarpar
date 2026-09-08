@@ -10,6 +10,14 @@ mod handles;
 pub(crate) use handles::{EngineFile, OpenBudgeted};
 pub use handles::{HandleBudget, HandleLease};
 
+#[path = "runtime_diagnostics.rs"]
+mod diagnostics;
+pub(crate) use diagnostics::StageGuard;
+pub use diagnostics::{
+    ExecutionDiagnostics, IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, Stage,
+    StageSnapshot,
+};
+
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -43,6 +51,15 @@ pub enum EngineError {
     /// A session operation cannot run in its current state.
     #[error("invalid PAR3 engine state: {0}")]
     InvalidState(&'static str),
+    /// Creation stopped after installing some independently authenticated carriers.
+    #[error("PAR3 output installation stopped: {cause}")]
+    OutputInterrupted {
+        /// Explicit destinations already installed successfully.
+        installed: Vec<std::path::PathBuf>,
+        /// Original cancellation or I/O failure.
+        #[source]
+        cause: Box<EngineError>,
+    },
     /// Repair stopped after creating outputs. Installed files remain valid;
     /// temporary paths are reported so the caller can inspect or remove them.
     #[error("PAR3 repair stopped: {cause}")]
@@ -264,6 +281,10 @@ pub struct ExecutionOptions {
     pub stripe_bytes: usize,
     /// Cancellation shared with the host.
     pub cancel: CancellationToken,
+    /// Shared cumulative counters and stage timings; clones aggregate work.
+    pub diagnostics: ExecutionDiagnostics,
+    /// Optional synchronous observer. Callbacks must be short and must not panic.
+    pub progress: Option<ProgressCallback>,
 }
 
 impl Default for ExecutionOptions {
@@ -278,6 +299,8 @@ impl Default for ExecutionOptions {
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,
             cancel: CancellationToken::default(),
+            diagnostics: ExecutionDiagnostics::default(),
+            progress: None,
         }
     }
 }

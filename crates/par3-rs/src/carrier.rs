@@ -286,6 +286,7 @@ impl CarrierPlan {
         destination: &Path,
         scratch_directory: &Path,
     ) -> EngineResult<CarrierReport> {
+        let mut progress = session.options.stage(crate::runtime::Stage::Carrier)?;
         let assessment = session.assess()?;
         if !assessment.lost_blocks.is_empty() {
             return Err(EngineError::InvalidState(
@@ -599,6 +600,7 @@ impl CarrierPlan {
                         hash.update(&bytes[..take]);
                     } else {
                         out.write_all(&bytes[..take])?;
+                        progress.advance(take as u64);
                     }
                     offset += take as u64;
                 }
@@ -628,6 +630,7 @@ fn encode_cauchy<F: Field>(
     scratch: &mut File,
     field: F,
 ) -> EngineResult<()> {
+    let _progress = session.options.stage(crate::runtime::Stage::Encode)?;
     let set = session.set.as_ref().expect("prepared set");
     let stripe = session.options.stripe_bytes.min(64 << 10);
     let stripe = stripe / F::SYMBOL_BYTES * F::SYMBOL_BYTES;

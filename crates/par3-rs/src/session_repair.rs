@@ -295,6 +295,7 @@ fn copy_available(
     layout: &BlockLayout,
     outputs: &[StagedFile],
 ) -> EngineResult<()> {
+    let mut progress = session.options.stage(crate::runtime::Stage::Repair)?;
     // Data packets, aliases and inline-only files require no field or matrix.
     // In particular, the reference emits field size zero for degenerate codes.
     let size = session.options.stripe_bytes.min(64 << 10);
@@ -321,6 +322,7 @@ fn copy_available(
                 offset,
                 &bytes[..take],
             )?;
+            progress.advance(take as u64);
             offset += take as u64;
         }
     }
@@ -337,6 +339,7 @@ where
     F: Field + Sync,
     F::Symbol: Send + Sync,
 {
+    let mut progress = session.options.stage(crate::runtime::Stage::Decode)?;
     let assessment = session.assessment.as_ref().expect("assessment");
     let lost = &assessment.lost_blocks;
     let rows: Vec<u64> = assessment
@@ -463,6 +466,8 @@ where
                 offset,
                 &bytes[..take],
             )?;
+            progress.advance(take as u64);
+            session.options.cancel.check()?;
         }
         offset += take as u64;
     }
@@ -638,6 +643,7 @@ fn verify_staged(
     layout: &BlockLayout,
     target: &StagedFile,
 ) -> EngineResult<()> {
+    let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
     let expected = &layout.files[target.index];
     let size = session.options.stripe_bytes.min(64 << 10);
     let _buffer = session.options.memory.reserve(size)?;
@@ -655,6 +661,7 @@ fn verify_staged(
             let take = remaining.min(size as u64) as usize;
             file.read_exact(&mut buffer[..take])?;
             hash.update(&buffer[..take]);
+            progress.advance(take as u64);
             remaining -= take as u64;
         }
     }

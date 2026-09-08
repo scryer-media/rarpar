@@ -138,12 +138,31 @@ partial reads, and seeks. Its default is 1 TiB; dropping or recreating a scanner
 does not reset a shared budget. Exhaustion is explicit before further I/O.
 Cancellation is cooperative between work units and uses a shared token.
 
+`ExecutionOptions::diagnostics` shares cumulative source read counters, engine
+file read/write counters, and `stage(Stage)` timings. It retains no event log.
+Read requests include short reads and failures; byte counts measure successful
+transfers. Disk source reads appear at both the provider and file layers, so do
+not sum those layers. Lazy payload reads retain their scanner's diagnostics;
+clone the same controls across scanner and session to aggregate them.
+
+An optional `ProgressCallback` receives synchronous Begin, Advance, and End
+events with a scope ID. Callbacks must be short and must not panic; they may
+cancel the shared token. End means the scope exited, including errors; the API
+result establishes success. Streaming verification measures active feed calls,
+excluding idle arrival time. Nested/concurrent stage durations overlap and must
+not be summed as exclusive wall time. Advance counts consumed bytes for scanning
+and verification, produced bytes for codecs/carriers, searched bytes for
+placement, and installed carriers for creation; it is not a verified-byte proof.
+
 Handle `EngineError::Io` as the preserved backing-store failure, `Unavailable`
 as missing bytes, `SourceChanged` as invalidated input, `ResourceLimit` as a
 planning/scheduling constraint, and `Cancelled` as cancellation. Unsupported
 execution modes must remain distinct from insufficient recovery. Assessment
 statuses separately report incomplete metadata, recovery deficits, readiness,
 and completeness. Engine outcomes do not imply a downloader retry policy.
+`OutputInterrupted` reports carriers already installed by creation before a
+later failure. Creation removes its disposable spool and uninstalled staging
+on early exits; successfully installed carriers remain available for the host.
 
 Sessions are disposable. Export `checkpoint_file` (or `FileEvidence::checkpoint`)
 and retain its full `digest()` in trusted job metadata independently of the blob.
@@ -187,7 +206,7 @@ repair of larger SIMD/worker-created GF8, GF16, and uneven interleaved sets,
 including the recovery equations actually consumed.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT scheduling-threshold tuning, and complete diagnostics and progress callbacks.
-The current reference runs in a
+FFT scheduling-threshold tuning, the final resource-accounting audit, and the
+combined consumer acceptance harness. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
 throughput parity. Correctness results alone do not satisfy performance acceptance.

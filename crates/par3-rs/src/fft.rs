@@ -167,6 +167,12 @@ impl FftCodec {
         mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
+        let mut progress = self.options.stage(crate::runtime::Stage::Encode)?;
+        let mut write = |index, offset, bytes: &[u8]| {
+            write(index, offset, bytes)?;
+            progress.advance(bytes.len() as u64);
+            self.options.cancel.check()
+        };
         let g = self.geometry;
         if first.checked_add(count).is_none_or(|end| end > g.capacity) {
             return Err(EngineError::InvalidState(
@@ -230,6 +236,12 @@ impl FftCodec {
         mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
+        let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
+        let mut write = |index, offset, bytes: &[u8]| {
+            write(index, offset, bytes)?;
+            progress.advance(bytes.len() as u64);
+            self.options.cancel.check()
+        };
         let g = self.geometry;
         if lost.is_empty() {
             return Ok(());

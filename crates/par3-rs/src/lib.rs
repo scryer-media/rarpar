@@ -19,6 +19,8 @@
 //! threads before releasing stack reservations; small stripes run synchronously.
 //! [`runtime::HandleBudget`] bounds actual engine file lifetimes across sessions;
 //! cooperating disk providers share it through [`source::DiskSourceAccess::with_options`].
+//! [`runtime::ExecutionDiagnostics`] supplies shared I/O counters and stage
+//! timings; [`runtime::ProgressCallback`] observes work and can request cancellation.
 //! Data packets are checked against block and tail fingerprints once per layout
 //! and source generation; recovery-only merges retain these results. Reconstruction
 //! from available Data and aliases does not require a Galois field or matrix.

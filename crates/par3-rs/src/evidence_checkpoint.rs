@@ -43,7 +43,7 @@ impl FileEvidence {
     /// Export complete verdicts for durable replay. Incomplete hashing work is
     /// not serialized. The host owns persistence and authenticity of the digest.
     pub fn checkpoint(&self, options: &ExecutionOptions) -> EngineResult<EvidenceCheckpoint> {
-        options.validate()?;
+        let _progress = options.stage(crate::runtime::Stage::Checkpoint)?;
         let size = HEADER
             .checked_add(self.verdicts.len())
             .ok_or(EngineError::ResourceLimit("evidence checkpoint"))?;
@@ -95,7 +95,7 @@ impl FileEvidence {
         layout: &BlockLayout,
         options: &ExecutionOptions,
     ) -> EngineResult<Self> {
-        options.validate()?;
+        let _progress = options.stage(crate::runtime::Stage::Checkpoint)?;
         if bytes.len() > options.retained_bytes {
             return Err(EngineError::ResourceLimit("retained evidence checkpoint"));
         }

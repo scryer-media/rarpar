@@ -35,6 +35,7 @@ pub enum PayloadKind {
 /// Reads check the original generation, and `validate` rechecks packet contents.
 #[derive(Clone)]
 pub struct PayloadRef {
+    diagnostics: crate::runtime::ExecutionDiagnostics,
     access: Arc<dyn SourceAccess>,
     source: SourceId,
     snapshot: SourceSnapshot,
@@ -100,6 +101,7 @@ impl PayloadRef {
         let take = self.len().saturating_sub(offset).min(out.len() as u64) as usize;
         if take != 0 {
             read_exact_at(
+                &self.diagnostics,
                 self.access.as_ref(),
                 self.source,
                 self.data_offset + offset,
@@ -124,6 +126,7 @@ impl PayloadRef {
             options.cancel.check()?;
             let take = (self.header.length - offset).min(size as u64) as usize;
             read_exact_at(
+                &options.diagnostics,
                 self.access.as_ref(),
                 self.source,
                 self.packet_offset + offset,
@@ -367,6 +370,7 @@ impl PacketScanner {
 
     /// Return one packet, a missing-byte boundary, or the logical end.
     pub fn poll(&mut self) -> EngineResult<ScanEvent> {
+        let mut progress = self.options.stage(crate::runtime::Stage::Scan)?;
         loop {
             self.options.cancel.check()?;
             ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
@@ -388,11 +392,13 @@ impl PacketScanner {
                 let mut read = 0;
                 while read < 8 {
                     self.options.scan_work.charge(take - read)?;
-                    let count = self.access.read_at(
+                    let count = self.options.diagnostics.read_at(
+                        self.access.as_ref(),
                         self.source,
                         self.offset + read as u64,
                         &mut self.buffer[read..take],
                     )?;
+                    progress.advance(count as u64);
                     if count > take - read {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
@@ -422,11 +428,13 @@ impl PacketScanner {
                 while header_read < HEADER_SIZE {
                     self.options.cancel.check()?;
                     self.options.scan_work.charge(HEADER_SIZE - header_read)?;
-                    let count = self.access.read_at(
+                    let count = self.options.diagnostics.read_at(
+                        self.access.as_ref(),
                         self.source,
                         self.offset + header_read as u64,
                         &mut header_bytes[header_read..],
                     )?;
+                    progress.advance(count as u64);
                     if count > HEADER_SIZE - header_read {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
@@ -498,11 +506,13 @@ impl PacketScanner {
                 let take = (candidate.header.length - candidate.consumed)
                     .min(self.buffer.len() as u64) as usize;
                 self.options.scan_work.charge(take)?;
-                let read = self.access.read_at(
+                let read = self.options.diagnostics.read_at(
+                    self.access.as_ref(),
                     self.source,
                     candidate.offset + candidate.consumed,
                     &mut self.buffer[..take],
                 )?;
+                progress.advance(read as u64);
                 if read == 0 {
                     return Ok(ScanEvent::NeedData {
                         offset: candidate.offset + candidate.consumed,
@@ -568,6 +578,7 @@ impl PacketScanner {
                     }
                 };
                 IngestedContents::Payload(Arc::new(PayloadRef {
+                    diagnostics: self.options.diagnostics.clone(),
                     access: Arc::clone(&self.access),
                     source: self.source,
                     snapshot: self.snapshot,
@@ -702,7 +713,7 @@ impl IncrementalSet {
     /// Resolve metadata when Start, Root and all referenced children are present.
     /// `None` means more metadata is needed, rather than a malformed set.
     pub fn metadata(&self) -> EngineResult<Option<Par3Set>> {
-        self.options.cancel.check()?;
+        let _progress = self.options.stage(crate::runtime::Stage::Metadata)?;
         // Admission reserved four times each packet's wire size for the parsed
         // packet, its clone during resolution, and the resolved metadata tree.
         let packets = self

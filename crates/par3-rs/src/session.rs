@@ -343,7 +343,7 @@ impl Par3RepairSession {
     /// Assess losses and precise recovery requirements. Unchanged evidence costs
     /// only source snapshot checks; a recovery merge never triggers source reads.
     pub fn assess(&mut self) -> EngineResult<&RepairAssessment> {
-        self.options.validate()?;
+        let _progress = self.options.stage(crate::runtime::Stage::Assess)?;
         match self.input.discard_changed_payloads() {
             Ok(0) => {}
             Ok(_) => {
@@ -634,6 +634,7 @@ impl Par3RepairSession {
         output: &Path,
         backup: bool,
     ) -> EngineResult<crate::session_repair::SessionRepairReport> {
+        let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
         self.assess()?;
         crate::session_repair::repair(self, output, backup)
     }
@@ -754,6 +755,7 @@ impl Par3RepairSession {
                     self.options.cancel.check()?;
                     let take = (finish - position).min(scratch.len());
                     read_exact_at(
+                        &self.options.diagnostics,
                         self.access.as_ref(),
                         source,
                         source_offset + start - block_offset + (position - begin) as u64,
@@ -771,6 +773,7 @@ impl Par3RepairSession {
                 }
             } else {
                 read_exact_at(
+                    &self.options.diagnostics,
                     self.access.as_ref(),
                     source,
                     source_offset + start - block_offset,

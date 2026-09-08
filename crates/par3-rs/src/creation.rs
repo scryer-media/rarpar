@@ -168,7 +168,7 @@ impl CreationPlan {
         sources: &[CreationSource],
         options: CreationOptions,
     ) -> EngineResult<Self> {
-        options.execution.validate()?;
+        let _progress = options.execution.stage(crate::runtime::Stage::Create)?;
         if options.block_size == 0 {
             return Err(EngineError::InvalidState("zero creation block size"));
         }
@@ -310,7 +310,13 @@ impl CreationPlan {
                     append_full(&mut chunks, index, options.block_size);
                 } else if length < 40 {
                     let mut bytes = vec![0; length as usize];
-                    read_exact_at(access.as_ref(), source.source, at, &mut bytes)?;
+                    read_exact_at(
+                        &options.execution.diagnostics,
+                        access.as_ref(),
+                        source.source,
+                        at,
+                        &mut bytes,
+                    )?;
                     append_tail(
                         &mut chunks,
                         length,
@@ -574,7 +580,13 @@ impl CreationPlan {
             while at < snapshot.len {
                 self.options.execution.cancel.check()?;
                 let take = (snapshot.len - at).min(size as u64) as usize;
-                read_exact_at(self.access.as_ref(), source, at, &mut buffer[..take])?;
+                read_exact_at(
+                    &self.options.execution.diagnostics,
+                    self.access.as_ref(),
+                    source,
+                    at,
+                    &mut buffer[..take],
+                )?;
                 hash.update(&buffer[..take]);
                 at += take as u64;
             }
@@ -591,7 +603,13 @@ impl CreationPlan {
             while at < footer.snapshot.len {
                 self.options.execution.cancel.check()?;
                 let take = (footer.snapshot.len - at).min(size as u64) as usize;
-                read_exact_at(self.access.as_ref(), footer.source, at, &mut buffer[..take])?;
+                read_exact_at(
+                    &self.options.execution.diagnostics,
+                    self.access.as_ref(),
+                    footer.source,
+                    at,
+                    &mut buffer[..take],
+                )?;
                 hash.update(&buffer[..take]);
                 at += take as u64;
             }
@@ -626,7 +644,10 @@ impl CreationPlan {
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.
     pub fn execute(&self, stem: &Path, scratch_directory: &Path) -> EngineResult<Vec<PathBuf>> {
-        self.options.execution.validate()?;
+        let mut progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Create)?;
         if self.options.execution.open_handles < 3 {
             return Err(EngineError::ResourceLimit(
                 "creation requires three open handles",
@@ -635,6 +656,21 @@ impl CreationPlan {
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
+        let output_count = self
+            .volumes
+            .len()
+            .checked_add(self.data_volumes.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(EngineError::ResourceLimit("output paths"))?;
+        let path_cost = stem
+            .as_os_str()
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(scratch_directory.as_os_str().len().checked_mul(2)?))
+            .and_then(|n| n.checked_add(1024))
+            .and_then(|n| n.checked_mul(output_count))
+            .ok_or(EngineError::ResourceLimit("output paths"))?;
+        let _paths = self.options.execution.memory.reserve(path_cost)?;
         let mut destinations = vec![suffix(stem, ".par3")];
         destinations.extend(
             self.volumes
@@ -659,14 +695,14 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let scratch_path = crate::session_repair::stage_path(
+        let scratch_path = crate::session_repair::ScratchFile::new(
             &scratch_directory.join("recovery-spool"),
             &self.options.execution,
         )?;
         let mut scratch = OpenOptions::new()
             .read(true)
             .write(true)
-            .open_budgeted(&scratch_path, &self.options.execution)?;
+            .open_budgeted(scratch_path.path(), &self.options.execution)?;
         scratch.set_len(self.requirements.scratch_bytes)?;
         if self.options.recovery_count != 0 {
             match self.options.codec {
@@ -736,10 +772,10 @@ impl CreationPlan {
         for (number, destination) in destinations.iter().enumerate() {
             self.options.execution.cancel.check()?;
             let temporary =
-                crate::session_repair::stage_path(destination, &self.options.execution)?;
+                crate::session_repair::ScratchFile::new(destination, &self.options.execution)?;
             let mut out = OpenOptions::new()
                 .write(true)
-                .open_budgeted(&temporary, &self.options.execution)?;
+                .open_budgeted(temporary.path(), &self.options.execution)?;
             for packet in &self.metadata {
                 out.write_all(packet)?;
             }
@@ -777,12 +813,13 @@ impl CreationPlan {
             }
             out.sync_all()?;
             drop(out);
-            if std::fs::metadata(&temporary)?.len() != self.requirements.output_sizes[number] {
+            if std::fs::metadata(temporary.path())?.len() != self.requirements.output_sizes[number]
+            {
                 return Err(EngineError::InvalidState("creation size differs from plan"));
             }
             let mut source =
                 crate::source::DiskSourceAccess::with_options(self.options.execution.clone());
-            source.insert(SourceId(0), temporary.clone());
+            source.insert(SourceId(0), temporary.path().to_owned());
             let mut scanner = crate::ingest::PacketScanner::new(
                 Arc::new(source),
                 SourceId(0),
@@ -822,13 +859,25 @@ impl CreationPlan {
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
+        let mut installed = Vec::new();
         for (temporary, destination) in staged.iter().zip(&destinations) {
-            self.options.execution.cancel.check()?;
-            std::fs::hard_link(temporary, destination)?;
-            std::fs::remove_file(temporary)?;
+            let result = self.options.execution.cancel.check().and_then(|()| {
+                std::fs::hard_link(temporary.path(), destination).map_err(EngineError::from)
+            });
+            if let Err(cause) = result {
+                return if installed.is_empty() {
+                    Err(cause)
+                } else {
+                    Err(EngineError::OutputInterrupted {
+                        installed,
+                        cause: Box::new(cause),
+                    })
+                };
+            }
+            installed.push(destination.clone());
+            progress.advance(1);
         }
         drop(scratch);
-        std::fs::remove_file(scratch_path)?;
         Ok(destinations)
     }
 
@@ -842,6 +891,7 @@ impl CreationPlan {
             }
             ensure_snapshot(self.access.as_ref(), piece.source, piece.snapshot)?;
             read_exact_at(
+                &self.options.execution.diagnostics,
                 self.access.as_ref(),
                 piece.source,
                 piece.at + start - piece.offset,
@@ -853,6 +903,10 @@ impl CreationPlan {
     }
 
     fn encode_cauchy<F: Field>(&self, field: F, scratch: &mut File) -> EngineResult<()> {
+        let mut progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Encode)?;
         let count = usize::try_from(self.options.recovery_count)
             .map_err(|_| EngineError::ResourceLimit("Cauchy output count"))?;
         let unit = F::SYMBOL_BYTES;
@@ -909,6 +963,8 @@ impl CreationPlan {
                         (first + index) as u64 * self.options.block_size + offset,
                     ))?;
                     scratch.write_all(&row[..take])?;
+                    progress.advance(take as u64);
+                    self.options.execution.cancel.check()?;
                 }
                 offset += take as u64;
             }
@@ -1247,7 +1303,7 @@ fn find_shift(
     )?;
     let mut ring = vec![0; window];
     let mut input = vec![0; stripe];
-    read_exact_at(access, source, start, &mut ring)?;
+    read_exact_at(&options.diagnostics, access, source, start, &mut ring)?;
     let rolling = SlidingCrc::new(size);
     let mut state = SlidingCrc::raw(&ring);
     let maximum = (snapshot.len - start - size).min(size - 1);
@@ -1271,7 +1327,13 @@ fn find_shift(
         if consumed == buffered {
             options.cancel.check()?;
             buffered = (maximum - shift).min(stripe as u64) as usize;
-            read_exact_at(access, source, start + size + shift, &mut input[..buffered])?;
+            read_exact_at(
+                &options.diagnostics,
+                access,
+                source,
+                start + size + shift,
+                &mut input[..buffered],
+            )?;
             consumed = 0;
         }
         let byte = input[consumed];
@@ -1294,6 +1356,7 @@ fn hash_range(
     buffer: &mut [u8],
     options: &ExecutionOptions,
 ) -> EngineResult<(Fingerprint, u64)> {
+    let mut progress = options.stage(crate::runtime::Stage::Verify)?;
     ensure_snapshot(access, source, snapshot)?;
     let mut hash = FingerprintHasher::new();
     let mut crc = RollingHasher::new();
@@ -1301,9 +1364,16 @@ fn hash_range(
     while offset < length {
         options.cancel.check()?;
         let take = (length - offset).min(buffer.len() as u64) as usize;
-        read_exact_at(access, source, start + offset, &mut buffer[..take])?;
+        read_exact_at(
+            &options.diagnostics,
+            access,
+            source,
+            start + offset,
+            &mut buffer[..take],
+        )?;
         hash.update(&buffer[..take]);
         crc.update(&buffer[..take]);
+        progress.advance(take as u64);
         offset += take as u64;
     }
     ensure_snapshot(access, source, snapshot)?;
