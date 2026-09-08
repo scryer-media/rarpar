@@ -4,8 +4,7 @@ The binary fixtures under `crates/unrar-rs/tests/fixtures/`,
 `crates/par2-rs/tests/fixtures/` and `crates/par3-rs/tests/fixtures/` are the
 **test corpus**: the archives, parity sets, SFX modules, video inputs and
 originals that the unit, integration, slow, PAR2, PAR3, UnRAR, wasm and CLI
-suites read (376 published, plus the PAR3 sets pending their first
-publication). They are published as a signed,
+suites read, including the advanced PAR3 sets. They are published as a signed,
 content-addressed object set on Cloudflare R2 and hydrated by `xtask`. The
 repository carries no fixture bytes: the published, signed revision the lock
 pins is the only source, and Git LFS — the bridge transport while nothing had

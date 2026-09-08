@@ -7,9 +7,9 @@ tests gated during initial implementation are now required: one in
 Missing files fail with their expected path. The two explicit reference
 exporters in `inside_engine.rs` stay opt-in.
 
-The corpus pin must include the advanced PAR3 recipe before these tests run in
-CI. Publication remains an operator-owned action; enabling tests does not
-publish a corpus or change its signature requirements.
+The corpus pin includes the advanced PAR3 recipe from the signed publication
+in [run 34256502968](https://github.com/scryer-media/rarpar/actions/runs/34256502968).
+CI hydrates that revision before running the required tests.
 
 PAR3 bytes come only from official par3cmdline runs at commit
 `2971702e501f1350b1c7b9d11369af9157d6ed56`. The checked-in recipe is
