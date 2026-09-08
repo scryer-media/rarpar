@@ -1136,17 +1136,27 @@ jobs:
 
           exact_packaged_crates=""
           package_and_list() {
-            crate="$1"
-            cargo package --locked -p "$crate"
-            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
-            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
-              echo "::error::${crate} package includes fixture files"
-              exit 1
-            fi
-            if [ "$crate" = unrar-rs ]; then
-              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
-            fi
-            exact_packaged_crates="${exact_packaged_crates} ${crate}"
+            local crate
+            local -a package_args=()
+            for crate in "$@"; do
+              package_args+=(-p "$crate")
+            done
+            cargo package --locked "${package_args[@]}"
+            for crate in "$@"; do
+              cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+              if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+                echo "::error::${crate} package includes fixture files"
+                exit 1
+              fi
+              if [ "$crate" = par3-rs ] && grep -n '^benchmarks/' ".ci/package-lists/${crate}.txt"; then
+                echo "::error::par3-rs package includes benchmark evidence"
+                exit 1
+              fi
+              if [ "$crate" = unrar-rs ]; then
+                grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+              fi
+              exact_packaged_crates="${exact_packaged_crates} ${crate}"
+            done
           }
 
           read -r reed_version unrar_version _ < <(python3 - <<'PY'
@@ -1175,10 +1185,9 @@ jobs:
           PY
           )
 
-          package_and_list reedsolomon-rs
-          # par3-rs depends on nothing in this workspace, so it never has to wait
-          # for a sibling to reach the registry.
-          package_and_list par3-rs
+          # Cargo's temporary registry verifies PAR3 against the sibling archive
+          # containing its new arithmetic APIs before those APIs are published.
+          package_and_list reedsolomon-rs par3-rs
 
           if registry_has_version reedsolomon-rs "$reed_version"; then
             package_and_list unrar-rs
@@ -1207,7 +1216,8 @@ jobs:
               "reedsolomon-rs": 1_000_000,
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
-              "par3-rs": 300_000,
+              # The bounded engine and docs package at about 314 KB, without evidence archives.
+              "par3-rs": 350_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}
