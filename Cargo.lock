@@ -1981,7 +1981,7 @@ dependencies = [
  "blake3",
  "crc-fast",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.3",
  "thiserror 2.0.20",
  "tracing",
 ]
