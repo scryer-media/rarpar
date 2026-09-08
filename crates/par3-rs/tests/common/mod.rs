@@ -1128,6 +1128,18 @@ fn from_hex(hex: &str) -> Vec<u8> {
 }
 
 /// The bytes of `set.par3`.
+pub fn advanced_fixture(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/advanced")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "advanced corpus fixture {} is unavailable: {error}",
+            path.display()
+        )
+    })
+}
+
 pub fn set_par3() -> Vec<u8> {
     from_hex(SET_PAR3_HEX)
 }

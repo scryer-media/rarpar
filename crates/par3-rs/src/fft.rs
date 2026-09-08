@@ -300,9 +300,9 @@ impl FftCodec {
                 };
                 read(source, offset, &mut bytes[..take])?;
                 unpack(g.field_bytes(), &bytes, row);
-                for value in row {
-                    *value = field.mul(*value, factors[index]);
-                }
+                field
+                    .scale_with_backend(row, factors[index], self.options.fft_backend, &cancelled)
+                    .map_err(transform_error)?;
             }
             self.transform(&mut rows, 0, true)?;
             field
@@ -314,9 +314,9 @@ impl FftCodec {
                     .inverse(factors[g.capacity + index])
                     .ok_or(EngineError::InvalidState("singular FFT locator"))?;
                 let row = &mut rows[g.capacity + index];
-                for value in row.iter_mut() {
-                    *value = field.mul(*value, factor);
-                }
+                field
+                    .scale_with_backend(row, factor, self.options.fft_backend, &cancelled)
+                    .map_err(transform_error)?;
                 pack(g.field_bytes(), row, &mut bytes);
                 write(index, offset, &bytes[..take])?;
             }

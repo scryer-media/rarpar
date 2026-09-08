@@ -99,6 +99,69 @@ impl TransformField {
         }
     }
 
+    /// Multiply a stripe by one Cantor-representation factor in place.
+    /// Uses fixed-size stack scratch and the selected shuffle backend, with a
+    /// scalar fallback. Cancellation is checked at most 256 symbols apart;
+    /// cancelled calls may have modified a prefix. Invalid symbols or factors
+    /// return `Geometry` before modifying the stripe.
+    pub fn scale_with_backend(
+        &self,
+        values: &mut [u16],
+        factor: u16,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        if factor as usize >= self.order() {
+            return Err(TransformError::Geometry);
+        }
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        for stripe in values.chunks(256) {
+            if cancelled() {
+                return Err(TransformError::Cancelled);
+            }
+            if stripe.iter().any(|&v| v as usize >= self.order()) {
+                return Err(TransformError::Geometry);
+            }
+        }
+        if factor == 1 {
+            return Ok(());
+        }
+        let plan =
+            (backend != crate::gf_simd::LinearBackend::Scalar && values.len() >= 64 && factor > 1)
+                .then(|| {
+                    crate::gf_simd::LinearMap16::new(
+                        std::array::from_fn(|bit| {
+                            if bit < self.bits as usize {
+                                self.mul(1 << bit, factor)
+                            } else {
+                                0
+                            }
+                        }),
+                        backend,
+                    )
+                });
+        let mut source = [0u16; 256];
+        for stripe in values.chunks_mut(source.len()) {
+            if cancelled() {
+                return Err(TransformError::Cancelled);
+            }
+            if factor == 0 {
+                stripe.fill(0);
+            } else if let Some(plan) = &plan {
+                source[..stripe.len()].copy_from_slice(stripe);
+                stripe.fill(0);
+                plan.accumulate(&source[..stripe.len()], stripe);
+            } else {
+                for value in stripe {
+                    *value = self.mul(*value, factor);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Multiplicative inverse. Zero has no inverse.
     #[must_use]
     pub fn inverse(&self, value: u16) -> Option<u16> {
@@ -418,6 +481,63 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn dispatched_scaling_matches_field_products_and_cancellation_boundaries() {
+        use crate::gf_simd::LinearBackend;
+        for bits in [8, 16] {
+            let field = TransformField::new(bits).unwrap();
+            let original = (0..field.order()).map(|v| v as u16).collect::<Vec<_>>();
+            let factors = if bits == 8 {
+                (0..256).collect::<Vec<u16>>()
+            } else {
+                vec![0, 1, 2, 42, 32768, 65535]
+            };
+            for factor in factors {
+                let expected = original
+                    .iter()
+                    .map(|&v| field.mul(v, factor))
+                    .collect::<Vec<_>>();
+                let mut actual = original.clone();
+                field
+                    .scale_with_backend(&mut actual, factor, LinearBackend::Auto, &|| false)
+                    .unwrap();
+                assert_eq!(actual, expected);
+            }
+            for width in [0, 1, 15, 16, 31, 32, 63, 64, 65, 255, 256, 257, 4097] {
+                let mut scalar = (0..width)
+                    .map(|v| (v % field.order()) as u16)
+                    .collect::<Vec<_>>();
+                let mut dispatched = scalar.clone();
+                field
+                    .scale_with_backend(&mut scalar, 42, LinearBackend::Scalar, &|| false)
+                    .unwrap();
+                field
+                    .scale_with_backend(&mut dispatched, 42, LinearBackend::Auto, &|| false)
+                    .unwrap();
+                assert_eq!(scalar, dispatched);
+            }
+            let calls = std::cell::Cell::new(0);
+            let mut values = vec![1; 1024];
+            assert_eq!(
+                field.scale_with_backend(&mut values, 2, LinearBackend::Auto, &|| {
+                    calls.set(calls.get() + 1);
+                    // Initial check, four validation chunks, one scaled chunk.
+                    calls.get() == 7
+                }),
+                Err(TransformError::Cancelled)
+            );
+            assert!(values[..256].iter().all(|&v| v == 2));
+            assert!(values[256..].iter().all(|&v| v == 1));
+        }
+        let field = TransformField::new(8).unwrap();
+        let mut invalid = [1, 256];
+        assert_eq!(
+            field.scale_with_backend(&mut invalid, 2, LinearBackend::Auto, &|| false),
+            Err(TransformError::Geometry)
+        );
+        assert_eq!(invalid, [1, 256]);
+    }
+
     #[test]
     fn dispatched_transforms_match_scalar_at_simd_boundaries_and_cosets() {
         use crate::gf_simd::LinearBackend;

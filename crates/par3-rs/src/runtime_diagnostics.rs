@@ -180,6 +180,7 @@ struct State {
     source: IoCounters,
     files: IoCounters,
     stages: [StageCounters; STAGES],
+    sync: StageCounters,
     next: AtomicU64,
 }
 
@@ -195,6 +196,29 @@ impl ExecutionDiagnostics {
     /// Disk provider bytes also appear in source_io; do not sum the two layers.
     pub fn file_io(&self) -> IoSnapshot {
         self.0.files.snapshot()
+    }
+    /// File synchronization barriers, including time waiting for storage.
+    /// `calls` counts attempts and `completed` counts successes. Durations are
+    /// already included in enclosing operation stages; do not add them again.
+    pub fn file_sync(&self) -> StageSnapshot {
+        StageSnapshot {
+            calls: self.0.sync.calls.load(Ordering::Relaxed),
+            elapsed: Duration::from_nanos(self.0.sync.nanos.load(Ordering::Relaxed)),
+            completed: self.0.sync.completed.load(Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn sync(&self, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let started = Instant::now();
+        let result = sync();
+        add(&self.0.sync.calls, 1);
+        add(
+            &self.0.sync.nanos,
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        if result.is_ok() {
+            add(&self.0.sync.completed, 1);
+        }
+        result
     }
     /// Cumulative measurements for one stage.
     pub fn stage(&self, stage: Stage) -> StageSnapshot {

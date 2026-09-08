@@ -76,6 +76,13 @@ reference workloads, memory observations, and remaining acceptance limits.
 
 ## Native ARM64 rerun, 2026-09-08
 
+The later PAR3 tuning pass additionally uses
+`TransformField::scale_with_backend` for decoder locator factors. It uses the
+same dispatched linear-map kernels with fixed stack scratch, a scalar fallback,
+and cancellation checks at most 256 symbols apart. Its effect is measured in
+the [tuned engine report](../par3-rs/PERFORMANCE.md), separately from the
+transform-pair measurements below; no new primitive speedup is inferred here.
+
 Apple M5 Max, 128 GiB RAM, macOS 26.6.2, Rust 1.97.1 / LLVM 22.1.6;
 release build with `-C target-cpu=native`. One worker, automatic NEON dispatch,
 no affinity or frequency controls. Existing services remained running. Builds

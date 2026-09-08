@@ -1,5 +1,18 @@
 # Advanced reference fixtures
 
+The first implementation PR carries recipes and provenance, not fixture
+binaries. Thirteen tests that require these new files are explicitly ignored
+pending corpus publication; they load fixtures at runtime so an older published
+corpus still compiles. Tests that generate their own inputs remain enabled.
+
+After the operator publishes the corpus, the follow-up PR must update the
+published corpus pin as needed, hydrate and validate the advanced profile
+contents, and remove only the `requires the next published advanced PAR3 corpus`
+ignore attributes: one in `carrier_engine.rs`, two in `data_engine.rs`, four in
+`fft_engine.rs`, and six in `inside_engine.rs`. The two explicit reference
+exporters in `inside_engine.rs` stay opt-in. No publication is performed by this
+implementation PR.
+
 PAR3 bytes come only from official par3cmdline runs at commit
 `2971702e501f1350b1c7b9d11369af9157d6ed56`. The checked-in recipe is
 `bench/rarpar-bench/internal/testcorpus/par3_advanced.go`.

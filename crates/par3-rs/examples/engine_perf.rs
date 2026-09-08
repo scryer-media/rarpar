@@ -4,6 +4,8 @@
 //! OP is create, scan, verify, reassess, repair, or placement. Inputs are explicitly
 //! generated `.bin` files in DATA; carriers are `.par3` files in CARRIERS.
 //! Timing excludes directory discovery. Each invocation is one fresh process.
+//! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
+//! the default is sync-files. The selected policy is recorded in metrics.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -116,7 +118,15 @@ fn main() -> Result<()> {
         );
         let before = options.diagnostics.source_io();
         let start = Instant::now();
-        let paths = plan.execute(&carriers.join("set"), output)?;
+        let durability = match std::env::var("PAR3_BENCH_CREATE_DURABILITY").as_deref() {
+            Ok("buffered") => par3_rs::creation::CreationDurability::Buffered,
+            Err(std::env::VarError::NotPresent) | Ok("sync-files") => {
+                par3_rs::creation::CreationDurability::SyncFiles
+            }
+            _ => return Err("invalid PAR3_BENCH_CREATE_DURABILITY".into()),
+        };
+        println!("{{\"creation_durability\":\"{durability:?}\"}}");
+        let paths = plan.execute_with_durability(&carriers.join("set"), output, durability)?;
         metric("create", start, before, &options);
         println!("{{\"carriers\":{}}}", paths.len());
     } else {
@@ -256,6 +266,12 @@ fn main() -> Result<()> {
             snapshot.calls
         );
     }
+    let sync = options.diagnostics.file_sync();
+    println!(
+        "{{\"internal_stage\":\"Sync\",\"seconds\":{:.9},\"calls\":{}}}",
+        sync.elapsed.as_secs_f64(),
+        sync.calls
+    );
     let io = options.diagnostics.file_io();
     println!(
         "{{\"file_read_bytes\":{},\"file_write_bytes\":{},\"memory_limit\":{},\"workers\":{}}}",

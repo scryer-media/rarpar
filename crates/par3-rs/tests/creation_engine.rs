@@ -13,6 +13,46 @@ fn data() -> Vec<u8> {
 }
 
 #[test]
+fn planning_hashes_full_blocks_and_both_tail_forms_in_one_source_pass() {
+    for deduplication in [Deduplication::None, Deduplication::Aligned] {
+        let mut access = MemorySourceAccess::default();
+        let mut sources = Vec::new();
+        let lengths = [32768 + 47, 2048 + 13, 32768 + 47, 0];
+        for (index, length) in lengths.into_iter().enumerate() {
+            let source = SourceId(index as u64);
+            access.insert(
+                source,
+                1,
+                (0..length)
+                    .map(|i| (i % 251) as u8)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            sources.push(CreationSource {
+                name: format!("{index}.bin"),
+                source,
+            });
+        }
+        let options = CreationOptions {
+            block_size: 1024,
+            recovery_count: 2,
+            deduplication,
+            ..CreationOptions::default()
+        };
+        let diagnostics = options.execution.diagnostics.clone();
+        let plan = CreationPlan::build(Arc::new(access), &sources, options).unwrap();
+        assert_eq!(
+            plan.requirements().source_bytes,
+            lengths.iter().sum::<usize>() as u64
+        );
+        assert_eq!(
+            diagnostics.source_io().read_bytes,
+            plan.requirements().source_bytes
+        );
+    }
+}
+
+#[test]
 #[ignore = "exports generated sets for an explicitly configured pinned-reference run"]
 fn export_reference_interoperability_cases() {
     let directory = std::path::PathBuf::from(
@@ -411,6 +451,28 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
         let paths = plan
             .execute(&carriers.path().join("set"), carriers.path())
             .unwrap();
+        let synced = options.execution.diagnostics.file_sync();
+        assert_eq!(synced.calls, paths.len() as u64 + 1);
+        assert_eq!(synced.completed, synced.calls);
+        let buffered = common::TempTree::new(&format!("advanced-buffered-{number}"));
+        let buffered_paths = plan
+            .execute_with_durability(
+                &buffered.path().join("set"),
+                buffered.path(),
+                par3_rs::creation::CreationDurability::Buffered,
+            )
+            .unwrap();
+        assert_eq!(
+            options.execution.diagnostics.file_sync().calls,
+            synced.calls
+        );
+        assert_eq!(buffered_paths.len(), paths.len());
+        for (durable, buffered) in paths.iter().zip(&buffered_paths) {
+            assert_eq!(
+                std::fs::read(durable).unwrap(),
+                std::fs::read(buffered).unwrap()
+            );
+        }
         for (path, size) in paths.iter().zip(&plan.requirements().output_sizes) {
             assert_eq!(std::fs::metadata(path).unwrap().len(), *size);
         }

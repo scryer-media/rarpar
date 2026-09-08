@@ -152,6 +152,8 @@ Cancellation is cooperative between work units and uses a shared token.
 
 `ExecutionOptions::diagnostics` shares cumulative source read counters, engine
 file read/write counters, and `stage(Stage)` timings. It retains no event log.
+`file_sync()` measures file synchronization attempts, successes, and storage
+wait time; this time is already included in enclosing operation stages.
 Read requests include short reads and failures; byte counts measure successful
 transfers. Disk source reads appear at both the provider and file layers, so do
 not sum those layers. Lazy payload reads retain their scanner's diagnostics;
@@ -238,22 +240,30 @@ throughput probes, reference exporters/interop, and an external RAR fixture gate
 the doctest sweep left one host-hook example ignored. These are not represented
 as passing. PAR3 reference checks are recorded separately in `INTEROPERABILITY.md`.
 
-The 2026-09-08 native x86-64 matrix passed all 534 invocations across 54 trials,
-including reference verification and independent repaired-output hashes. Both
-codecs exceeded the reference's geometric-mean creation, verification, and
-repair throughput on that host. See `PERFORMANCE.md` for the measurements,
-resource observations, and individual shortfalls in small-file verification
-and uneven-cohort FFT repair.
+The subsequent tuning pass passed 2,546 workspace Nextest tests and 24 doctests,
+plus formatting and all-target/all-feature Clippy, with the same opt-in skips.
+Carrier read-ahead and SIMD FFT locator scaling closed the measured small-file
+verification and uneven-cohort repair gaps on both native hosts. Each final
+matrix passed all 534 invocations, including reference verification and repaired
+output hashes. Both codecs exceeded reference verification/repair geometric
+means with one and four workers. All cached reassessments still read zero source
+bytes, clean files remained unstaged, and memory/handle ceilings held.
 
-The native ARM64 matrix also passed all 534 invocations, using the explicitly
-documented macOS adaptation of the pinned reference. Cauchy exceeded that
-reference's three throughput aggregates; FFT verification and repair exceeded
-it, but FFT creation reached only 80–85% of reference throughput. Small-file
-workloads and one-worker uneven FFT repair also remain slower. The report
-preserves the reference portability patch and SIMD-hashing qualification.
+Historical timing increases above 5% were investigated with interleaved baseline
+and tuned binaries. No >5% median regression reproduced in those checks. See
+`PERFORMANCE.md` for the raw measurements, source/binary provenance, resource
+observations, and macOS reference adaptation qualification.
 
-Performance acceptance and further creation, carrier-I/O, and decoder tuning
-remain outstanding. These first native baselines do not establish historical
-regression percentages or broad platform readiness. Earlier emulated reference
-timings are interoperability evidence only; correctness alone does not satisfy
-performance acceptance.
+These results support Weaver's verification/repair consumption on the measured
+native workloads. They do not measure a Weaver application integration. Default
+ARM64 FFT creation remains below reference aggregate throughput (89–95%); the
+all-operation performance gate remains open separately from this consumer use
+case. Earlier emulated reference timings remain interoperability evidence only.
+
+The first implementation PR temporarily ignores 13 advanced-corpus tests until
+the operator publishes their fixtures. Their runtime loading permits builds
+without the new corpus; independent engine tests remain enabled. All 13 passed
+explicitly with the local reference-generated files before gating. The follow-up
+PR will enable them against the newly pinned corpus. See
+`tests/fixtures/advanced/README.md` for the exact targets; corpus publication is
+an operator-owned action outside this implementation.

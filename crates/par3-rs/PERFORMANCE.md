@@ -1,5 +1,124 @@
 # Native PAR3 performance
 
+## Tuned verification and repair, 2026-09-08
+
+The Weaver-facing tuning pass closes the measured small-file verification and
+uneven-cohort FFT repair shortfalls on both native hosts. Weaver consumes
+verification and repair; creation is reported separately below. This is engine
+evidence, not a measurement of a Weaver application integration.
+
+The changes reuse a budgeted carrier read-ahead stripe across packet boundaries
+and dispatch FFT locator scaling through the existing SIMD linear-map kernels.
+Source-generation checks, packet authentication, cancellation, and repair output
+synchronization remain enabled. Default stripe size remains 64 KiB. Creation
+also combines file/chunk hashing in one planning pass and buffers carrier writes.
+
+Both final matrices passed **534 invocations each**, with the same nine cases,
+one/four-worker limits, three repetitions, and reference builds described in
+the earlier baseline sections. Reference verification of created carriers and
+SHA-256 checks of both engines' repairs passed. All 108 batches of 100 unchanged
+reassessments read zero source bytes; small-file repairs staged only the 64
+damaged files. Memory reservations stayed within every configured limit and
+observed handle peaks remained two.
+
+Reference time divided by engine time, geometric means of workload medians:
+
+| Host / codec / workers | Verify | Repair |
+| --- | ---: | ---: |
+| x86-64 / Cauchy / 1 | 3.56× | 5.49× |
+| x86-64 / Cauchy / 4 | 3.46× | 6.00× |
+| x86-64 / FFT / 1 | 2.59× | 1.98× |
+| x86-64 / FFT / 4 | 2.57× | 2.20× |
+| ARM64 / Cauchy / 1 | 3.04× | 2.94× |
+| ARM64 / Cauchy / 4 | 2.84× | 2.83× |
+| ARM64 / FFT / 1 | 2.09× | 1.64× |
+| ARM64 / FFT / 4 | 2.09× | 1.87× |
+
+One-worker improvements versus each host's earlier baseline:
+
+- **Mac small files:** verification 43.1 → 13.4 ms; repair 62.5 → 30.4 ms;
+  scan-only 39.6 → 8.6 ms. Current adapted-reference verification/repair:
+  15.7 / 33.2 ms.
+- **x86 small files:** verification 14.8 → 8.7 ms; repair 16.0 → 11.7 ms.
+  Current reference: 11.0 / 23.2 ms.
+- **Mac uneven FFT repair:** 231.8 → 201.7 ms, versus 215.8 ms for the
+  adapted reference. Four-worker repair: 170.6 versus 212.6 ms.
+- **x86 uneven FFT repair:** 303.3 → 241.4 ms, versus 267.2 ms for the
+  reference. Four-worker repair: 221.4 versus 269.5 ms.
+
+Peak repair RSS was 67.88 MiB on ARM64 and 68.05 MiB on x86-64. The 8 MiB
+large-block case reserved at most 4.18 MiB, with repair RSS at most 2.66 and
+3.55 MiB respectively. RSS includes allocator/runtime overhead outside engine
+reservation accounting; it is not an allocation-budget assertion.
+
+### Regression investigation
+
+Comparisons with the historical runs flagged several Mac Cauchy timings above
+5%, and x86 four-worker Cauchy GF8 verification at +6.9% (about 1 ms). The
+reference also slowed on several Mac cases, but that alone does not explain
+the engine changes. The exact earlier implementation was rebuilt with each
+host's same native Rust toolchain for interleaved old/new comparisons.
+
+On Mac, seven paired repetitions covered scan, verification, placement, and
+repair for both worker limits on Cauchy GF8/GF16, heavy Cauchy, and large-block
+cases: **448 successful invocations**, with repaired-output hash checks. None
+of the 32 median comparisons regressed above 5%; the largest increase was 3.65%.
+The x86 verification check used fifteen paired repetitions; the difference was
+1.65%. A separate seven-pair Mac Cauchy GF16 creation check, with reference
+verification of each set, measured a 10.45% improvement. These checks do not
+reproduce a >5% implementation regression. All
+original final-matrix samples remain in the report; A/B samples do not replace
+them or enter reference-throughput aggregates. Mac load ranged 3.92–7.57 and
+x86 load 0.27–1.43 in the final matrices. No task-owned build overlapped either
+host's measurements, and existing services were not stopped.
+
+### Creation is a separate result
+
+With unchanged file-synchronization defaults, Cauchy creation reached 3.83/3.86×
+reference throughput on x86 and 1.89/1.87× on Mac (one/four workers). FFT
+creation reached 1.33/1.43× on x86 and **0.89/0.95× on Mac**. The all-operation
+performance gate therefore remains open for default ARM64 FFT creation; it
+does not block the measured verification/repair use case.
+
+File-sync diagnostics attributed 36–46 ms to storage barriers in the ordinary
+one-worker Mac FFT creation cases. A separate native sample spent 20 of 40
+samples in `fcntl`; this is corroborating attribution, not a statistical
+profile. Rust's Apple `sync_all` requests `F_FULLFSYNC`; the pinned reference
+has no explicit matching barrier. The approved `CreationDurability::Buffered`
+policy is opt-in through `execute_with_durability`: it flushes application
+buffers and authenticates output while omitting durable storage barriers.
+Default creation and all repair synchronization remain unchanged. See the
+[Rust filesystem implementation](https://raw.githubusercontent.com/rust-lang/rust/1.97.0/library/std/src/sys/fs/unix.rs)
+for the platform barrier semantics.
+
+A separate buffered-creation matrix passed all **240 invocations** across the
+four FFT cases, both worker limits, and three repetitions. Its FFT creation
+geometric means were **1.32× / 1.38×** the adapted reference. Every creation
+record reports `Buffered` and zero synchronization calls. This result is
+explicitly opt-in and is excluded from the durable-default aggregates above;
+it neither changes nor measures a different repair policy.
+
+### Validation and evidence
+
+Workspace formatting, all-target/all-feature Clippy, **2,546 Nextest tests**,
+and **24 doctests** passed after these code changes. Twelve existing opt-in
+tests and one host-hook doctest remain skipped. All four PAR2 real-world
+consumer regressions passed within the workspace sweep. Targeted tests check
+one-pass planning, scanner read counts and stale generations, scalar/SIMD
+scaling equivalence and cancellation, and byte-identical creation policies.
+
+The scanner slice is signed commit `276c7c1`; the complete measured runtime is
+reproduced by applying the archived `tuning.patch` to `10b1640`. Binary and
+source hashes are included. The earlier baseline sections below are retained
+as historical measurements, including their then-open tuning gaps.
+
+[`benchmarks/native-tuning-20260908.tar.gz`](benchmarks/native-tuning-20260908.tar.gz)
+contains both tuned matrices, baseline comparisons, A/B checks, the separate
+buffered-creation run, source patch, binary hashes, scripts, and validation logs.
+It excludes generated inputs, carriers, outputs, and downloaded dependencies.
+Archive SHA-256:
+`8aebf8c7a470cd1ae19ed627c8d218fa3005a35ec05ace19acbe1644e5d62f0c`.
+
 ## x86-64 results, 2026-09-08
 
 Host: Intel Core i5-1240P, native Linux x86-64, 62 GiB RAM, AVX2 and GFNI;

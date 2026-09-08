@@ -55,6 +55,19 @@ pub enum VolumeLayout {
     SizeLimited(u64),
 }
 
+/// File synchronization policy for standalone creation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CreationDurability {
+    /// Preserve the default: synchronize scratch and staged carrier files before
+    /// installation. This does not synchronize parent directories or promise
+    /// atomic installation of the complete set across a crash.
+    #[default]
+    SyncFiles,
+    /// Flush application buffers without requesting durable storage barriers.
+    /// Authentication still runs, but a crash can lose acknowledged output.
+    Buffered,
+}
+
 /// Advanced creation options. Recovery indices are global across cohorts.
 #[derive(Clone, Debug)]
 pub struct CreationOptions {
@@ -163,6 +176,9 @@ pub struct CreationPlan {
 impl CreationPlan {
     /// Read and hash explicit sources, then expose exact output and scratch
     /// requirements. Holes and changed generations are typed failures.
+    /// File, quick-prefix, block, and tail hashes share one source pass; sliding
+    /// deduplication additionally reads candidate windows. Forward readers are
+    /// used when available, with at most one retained input handle per file.
     pub fn build(
         access: Arc<dyn SourceAccess>,
         sources: &[CreationSource],
@@ -231,24 +247,22 @@ impl CreationPlan {
             if names.insert(source.name.clone(), ()).is_some() {
                 return Err(EngineError::InvalidState("duplicate creation path"));
             }
-            let (fingerprint, _) = hash_range(
-                access.as_ref(),
-                source.source,
+            let mut reader = PlanningReader {
+                access: access.as_ref(),
+                source: source.source,
                 snapshot,
-                0,
-                snapshot.len,
-                &mut buffer,
-                &options.execution,
-            )?;
-            let (_, quick_rolling_hash) = hash_range(
-                access.as_ref(),
-                source.source,
-                snapshot,
-                0,
-                snapshot.len.min(16384),
-                &mut buffer,
-                &options.execution,
-            )?;
+                options: &options.execution,
+                // Sliding searches may need a second handle; keep that mode
+                // usable with a one-handle shared budget.
+                forward: if options.deduplication != Deduplication::Sliding && snapshot.len != 0 {
+                    access.open_sequential(source.source)?
+                } else {
+                    None
+                },
+                position: 0,
+                file_hash: FingerprintHasher::new(),
+                quick_crc: RollingHasher::new(),
+            };
             let mut chunks = Vec::new();
             let mut at = 0;
             while at < snapshot.len {
@@ -278,15 +292,8 @@ impl CreationPlan {
                     offset: 0,
                 };
                 if length == options.block_size {
-                    let (hash, rolling_hash) = hash_range(
-                        access.as_ref(),
-                        source.source,
-                        snapshot,
-                        at,
-                        length,
-                        &mut buffer,
-                        &options.execution,
-                    )?;
+                    let (hash, rolling_hash) =
+                        reader.hash_chunk(at, length, length, &mut buffer)?;
                     let alias = (options.deduplication != Deduplication::None)
                         .then(|| full.get(&hash).copied())
                         .flatten();
@@ -310,13 +317,7 @@ impl CreationPlan {
                     append_full(&mut chunks, index, options.block_size);
                 } else if length < 40 {
                     let mut bytes = vec![0; length as usize];
-                    read_exact_at(
-                        &options.execution.diagnostics,
-                        access.as_ref(),
-                        source.source,
-                        at,
-                        &mut bytes,
-                    )?;
+                    reader.read(at, &mut bytes)?;
                     append_tail(
                         &mut chunks,
                         length,
@@ -324,24 +325,7 @@ impl CreationPlan {
                         options.block_size,
                     );
                 } else {
-                    let (hash, _) = hash_range(
-                        access.as_ref(),
-                        source.source,
-                        snapshot,
-                        at,
-                        length,
-                        &mut buffer,
-                        &options.execution,
-                    )?;
-                    let (_, rolling_hash) = hash_range(
-                        access.as_ref(),
-                        source.source,
-                        snapshot,
-                        at,
-                        40,
-                        &mut buffer,
-                        &options.execution,
-                    )?;
+                    let (hash, rolling_hash) = reader.hash_chunk(at, length, 40, &mut buffer)?;
                     let alias = (options.deduplication != Deduplication::None)
                         .then(|| tails.get(&(length, hash)).copied())
                         .flatten();
@@ -392,8 +376,8 @@ impl CreationPlan {
                         .next()
                         .expect("validated path")
                         .to_owned(),
-                    quick_rolling_hash,
-                    fingerprint,
+                    quick_rolling_hash: reader.quick_crc.finalize(),
+                    fingerprint: reader.file_hash.finalize(),
                     option_hashes: Vec::new(),
                     chunks,
                 },
@@ -644,6 +628,18 @@ impl CreationPlan {
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.
     pub fn execute(&self, stem: &Path, scratch_directory: &Path) -> EngineResult<Vec<PathBuf>> {
+        self.execute_with_durability(stem, scratch_directory, CreationDurability::SyncFiles)
+    }
+
+    /// Execute with an explicit file synchronization policy. Both policies flush
+    /// application buffers and authenticate staged carriers before installation.
+    /// This does not change verification or repair behavior.
+    pub fn execute_with_durability(
+        &self,
+        stem: &Path,
+        scratch_directory: &Path,
+        durability: CreationDurability,
+    ) -> EngineResult<Vec<PathBuf>> {
         let mut progress = self
             .options
             .execution
@@ -767,15 +763,20 @@ impl CreationPlan {
                 }
             }
         }
-        scratch.sync_all()?;
+        if durability == CreationDurability::SyncFiles {
+            scratch.sync_all()?;
+        }
         let mut staged = Vec::new();
         for (number, destination) in destinations.iter().enumerate() {
             self.options.execution.cancel.check()?;
             let temporary =
                 crate::session_repair::ScratchFile::new(destination, &self.options.execution)?;
-            let mut out = OpenOptions::new()
+            let buffer_size = self.options.execution.stripe_bytes.min(64 << 10);
+            let _output_buffer = self.options.execution.memory.reserve(buffer_size)?;
+            let file = OpenOptions::new()
                 .write(true)
                 .open_budgeted(temporary.path(), &self.options.execution)?;
+            let mut out = std::io::BufWriter::with_capacity(buffer_size, file);
             for packet in &self.metadata {
                 out.write_all(packet)?;
             }
@@ -811,8 +812,12 @@ impl CreationPlan {
                     )?;
                 }
             }
-            out.sync_all()?;
+            out.flush()?;
+            if durability == CreationDurability::SyncFiles {
+                out.get_ref().sync_all()?;
+            }
             drop(out);
+            drop(_output_buffer);
             if std::fs::metadata(temporary.path())?.len() != self.requirements.output_sizes[number]
             {
                 return Err(EngineError::InvalidState("creation size differs from plan"));
@@ -974,7 +979,7 @@ impl CreationPlan {
 
     fn write_payload(
         &self,
-        out: &mut File,
+        out: &mut impl Write,
         kind: PacketType,
         prefix: &[u8],
         mut read: impl FnMut(u64, &mut [u8]) -> EngineResult<()>,
@@ -1347,35 +1352,82 @@ fn find_shift(
     Ok(None)
 }
 
-fn hash_range(
-    access: &dyn SourceAccess,
+/// Hash file and chunk coordinates together without finalizing fragment hashes.
+struct PlanningReader<'a> {
+    access: &'a dyn SourceAccess,
     source: SourceId,
     snapshot: SourceSnapshot,
-    start: u64,
-    length: u64,
-    buffer: &mut [u8],
-    options: &ExecutionOptions,
-) -> EngineResult<(Fingerprint, u64)> {
-    let mut progress = options.stage(crate::runtime::Stage::Verify)?;
-    ensure_snapshot(access, source, snapshot)?;
-    let mut hash = FingerprintHasher::new();
-    let mut crc = RollingHasher::new();
-    let mut offset = 0;
-    while offset < length {
-        options.cancel.check()?;
-        let take = (length - offset).min(buffer.len() as u64) as usize;
-        read_exact_at(
-            &options.diagnostics,
-            access,
-            source,
-            start + offset,
-            &mut buffer[..take],
-        )?;
-        hash.update(&buffer[..take]);
-        crc.update(&buffer[..take]);
-        progress.advance(take as u64);
-        offset += take as u64;
+    options: &'a ExecutionOptions,
+    forward: Option<Box<dyn Read + Send>>,
+    position: u64,
+    file_hash: FingerprintHasher,
+    quick_crc: RollingHasher,
+}
+
+impl PlanningReader<'_> {
+    fn read(&mut self, start: u64, out: &mut [u8]) -> EngineResult<()> {
+        if start != self.position {
+            return Err(EngineError::InvalidState(
+                "creation hash frontier is discontinuous",
+            ));
+        }
+        let mut done = 0;
+        while done < out.len() {
+            self.options.cancel.check()?;
+            let Some(reader) = self.forward.as_mut() else {
+                break;
+            };
+            let read = self
+                .options
+                .diagnostics
+                .read(reader.as_mut(), &mut out[done..])?;
+            if read > out.len() - done {
+                return Err(EngineError::InvalidState("invalid source read length"));
+            }
+            if read == 0 {
+                self.forward = None;
+                break;
+            }
+            done += read;
+        }
+        if done < out.len() {
+            read_exact_at(
+                &self.options.diagnostics,
+                self.access,
+                self.source,
+                start + done as u64,
+                &mut out[done..],
+            )?;
+        }
+        self.file_hash.update(out);
+        let quick = (16384u64.saturating_sub(start)).min(out.len() as u64) as usize;
+        self.quick_crc.update(&out[..quick]);
+        self.position += out.len() as u64;
+        Ok(())
     }
-    ensure_snapshot(access, source, snapshot)?;
-    Ok((hash.finalize(), crc.finalize()))
+
+    fn hash_chunk(
+        &mut self,
+        start: u64,
+        length: u64,
+        crc_length: u64,
+        buffer: &mut [u8],
+    ) -> EngineResult<(Fingerprint, u64)> {
+        let mut progress = self.options.stage(crate::runtime::Stage::Verify)?;
+        ensure_snapshot(self.access, self.source, self.snapshot)?;
+        let mut hash = FingerprintHasher::new();
+        let mut crc = RollingHasher::new();
+        let mut offset = 0;
+        while offset < length {
+            let take = (length - offset).min(buffer.len() as u64) as usize;
+            self.read(start + offset, &mut buffer[..take])?;
+            hash.update(&buffer[..take]);
+            let crc_take = crc_length.saturating_sub(offset).min(take as u64) as usize;
+            crc.update(&buffer[..crc_take]);
+            progress.advance(take as u64);
+            offset += take as u64;
+        }
+        ensure_snapshot(self.access, self.source, self.snapshot)?;
+        Ok((hash.finalize(), crc.finalize()))
+    }
 }

@@ -78,7 +78,7 @@ impl EngineFile {
         self.file.set_len(len)
     }
     pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.file.sync_all()
+        self.diagnostics.sync(|| self.file.sync_all())
     }
 }
 impl Read for EngineFile {

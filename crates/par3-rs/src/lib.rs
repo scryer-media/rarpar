@@ -3,7 +3,11 @@
 //! The convenience APIs handle default Cauchy sets on disk. The incremental
 //! engine adds low-rate FFT, virtual sources, streaming integrity evidence,
 //! and retained analysis as protected data and recovery packets arrive.
-//! Matched native performance acceptance remains outstanding.
+//! Native verification/repair benchmarks exceed reference throughput aggregates
+//! on the measured x86-64 and ARM64 workloads. Default ARM64 FFT creation still
+//! falls short; see the
+//! [performance report](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
+//! for scope, resource measurements, and reference-build qualifications.
 //!
 //! # Choose an API
 //!

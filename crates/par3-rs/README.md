@@ -7,11 +7,12 @@ Read, verify, create, and repair PAR3 recovery sets in Rust. Supports Cauchy and
 low-rate FFT recovery, virtual sources, incremental verification, and repair
 sessions that retain evidence as more data arrives.
 
-**Status:** a 0.x library with reference interoperability tests. Matched native
-performance acceptance remains outstanding; initial
+**Status:** a 0.x library with reference interoperability tests. Verification and
+repair exceed the reference's throughput aggregates in the measured
 [native x86-64 and ARM64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
-are available. See [Scope](#scope) for supported formats and exclusions. This is
-independent, clean-room software, not official Parchive tooling.
+with matched worker limits. Default ARM64 FFT creation still falls short.
+See [Scope](#scope) for supported formats and exclusions. This is independent,
+clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
@@ -138,8 +139,16 @@ input file once, and preserves the reference-compatible default output.
 
 For advanced creation, inspect `CreationPlan::requirements()` before execution.
 It reports block counts, recovery geometry, output sizes, and scratch space.
-The advanced planner may make multiple source passes. Destinations must be
-absent; execution uses a caller-selected scratch directory.
+File and chunk hashes share one planning pass; sliding deduplication can read
+additional candidate windows. Encoding reads sources again. Destinations must
+be absent; execution uses a caller-selected scratch directory.
+
+`execute` preserves file synchronization before installation. Standalone
+creators can explicitly use `execute_with_durability` with
+`CreationDurability::Buffered` to omit storage barriers. Both modes flush
+application buffers and authenticate staged carriers; buffered output can be
+lost after a crash. Neither mode promises atomic set installation across a
+crash. Verification and repair retain their existing behavior.
 
 ## Streaming and resource limits
 
