@@ -5,6 +5,48 @@ use par3_rs::inside::{ContainerKind, ContainerLayout, ContainerLimits};
 use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget};
 use par3_rs::source::{MemorySourceAccess, SourceId};
 
+#[test]
+#[ignore = "requires an explicit new output directory for the official reference"]
+fn export_inserted_archives_for_reference_validation() {
+    use par3_rs::creation::CreationOptions;
+    use par3_rs::inside::InsertionPlan;
+    use std::sync::Arc;
+
+    let root = std::path::PathBuf::from(
+        std::env::var_os("PAR3_INSIDE_ORACLE_OUTPUT").expect("PAR3_INSIDE_ORACLE_OUTPUT"),
+    );
+    assert!(root.is_absolute());
+    std::fs::create_dir(&root).unwrap();
+    for (kind, original, _) in cases() {
+        let name = match kind {
+            ContainerKind::Zip => "inside.zip",
+            ContainerKind::Zip64 => "inside64.zip",
+            ContainerKind::SevenZip => "inside.7z",
+        };
+        let scratch = root.join(format!("scratch-{kind:?}"));
+        std::fs::create_dir(&scratch).unwrap();
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(7), 1, original.into());
+        let plan = InsertionPlan::build(
+            Arc::new(access),
+            SourceId(7),
+            name,
+            CreationOptions {
+                block_size: if kind == ContainerKind::Zip64 {
+                    32768
+                } else {
+                    128
+                },
+                recovery_count: 4,
+                ..CreationOptions::default()
+            },
+            &ContainerLimits::default(),
+        )
+        .unwrap();
+        plan.execute(&root.join(name), &scratch).unwrap();
+    }
+}
+
 fn cases() -> [(ContainerKind, &'static [u8], &'static [u8]); 3] {
     [
         (
@@ -57,6 +99,15 @@ fn reference_containers_preserve_original_bytes_and_duplicate_zip_footers() {
             assert_eq!(file.chunks().len(), 2);
         }
         access.insert(SourceId(2), 1, inserted.into());
+        let protected =
+            std::sync::Arc::new(par3_rs::layout::BlockLayout::new(&sets[0], &options).unwrap());
+        let proof =
+            par3_rs::evidence::verify_source(protected, 0, &access, SourceId(2), &options).unwrap();
+        assert!(
+            proof.protected_complete(),
+            "official protected-chunk file hash must verify"
+        );
+        drop(proof);
         assert!(matches!(
             ContainerLayout::inspect(&access, SourceId(2), &options, &ContainerLimits::default()),
             Err(EngineError::Unsupported(_))
@@ -96,5 +147,57 @@ fn inspection_refuses_trailing_data_damage_and_exhausted_budgets() {
             ContainerLayout::inspect(&access, SourceId(1), &options, &ContainerLimits::default()),
             Err(EngineError::Cancelled)
         ));
+    }
+}
+
+#[test]
+fn staged_insertion_preserves_members_and_authenticates_embedded_layout() {
+    use par3_rs::creation::CreationOptions;
+    use par3_rs::inside::InsertionPlan;
+    use std::sync::Arc;
+
+    for (kind, original, _) in cases() {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(7), 1, original.into());
+        let name = if kind == ContainerKind::SevenZip {
+            "archive.7z"
+        } else {
+            "archive.zip"
+        };
+        let options = CreationOptions {
+            block_size: if kind == ContainerKind::Zip64 {
+                32768
+            } else {
+                128
+            },
+            recovery_count: 4,
+            ..CreationOptions::default()
+        };
+        let plan = InsertionPlan::build(
+            Arc::new(access),
+            SourceId(7),
+            name,
+            options,
+            &ContainerLimits::default(),
+        )
+        .unwrap();
+        let tree = common::TempTree::new(&format!("insert-{kind:?}"));
+        let output = tree.path().join(name);
+        let scratch = tree.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        plan.execute(&output, &scratch).unwrap();
+        let inserted = std::fs::read(&output).unwrap();
+        assert_eq!(inserted.len() as u64, plan.requirements().output_bytes);
+        assert_eq!(&inserted[..original.len()], original);
+        let packets = common::packets_of(&inserted);
+        let sets = par3_rs::Par3Set::from_packets(packets).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].files()[0].size(), inserted.len() as u64);
+        assert_eq!(sets[0].recovery_blocks().len(), 4);
+        assert!(
+            matches!(plan.execute(&output, &scratch), Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), inserted);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
     }
 }

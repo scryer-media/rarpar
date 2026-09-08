@@ -57,8 +57,8 @@ pub enum ChunkDescription {
     },
     /// A chunk that no input block covers.
     ///
-    /// Its bytes are hashed as zeros when computing the file's fingerprint, and
-    /// it is not recoverable. These come from the "Par inside" feature.
+    /// Its bytes are omitted from the file fingerprint, following the reference,
+    /// and it is not recoverable. These come from the "Par inside" feature.
     Unprotected {
         /// Length of the chunk in bytes.
         length: u64,
@@ -121,7 +121,7 @@ pub struct FilePacket {
     /// and it is not unique.
     pub quick_rolling_hash: u64,
     /// 16-byte BLAKE3 of the file's protected data, with unprotected chunks
-    /// hashed as zeros. All zeros when the producer did not compute it.
+    /// omitted. All zeros when the producer did not compute it.
     pub fingerprint: Fingerprint,
     /// Hashes of this file's option packets — UNIX and FAT permissions.
     pub option_hashes: Vec<Fingerprint>,

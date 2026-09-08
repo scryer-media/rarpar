@@ -6,6 +6,10 @@
 
 use std::ops::Range;
 
+#[path = "inside_create.rs"]
+mod create;
+pub use create::{InsertionPlan, InsertionRequirements};
+
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions};

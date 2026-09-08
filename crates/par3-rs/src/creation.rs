@@ -517,6 +517,110 @@ impl CreationPlan {
         self.id
     }
 
+    // Assemble a single embedded file from the original body and optional ZIP
+    // footer views. The appended footer aliases its existing protected chunks.
+    pub(crate) fn embedded_layout(&mut self) -> EngineResult<u64> {
+        if self.options.codec != CreationCodec::Cauchy
+            || self.options.store_data
+            || self.options.recovery_count == 0
+            || self.files.is_empty()
+            || self.files.len() > 2
+        {
+            return Err(EngineError::Unsupported("embedded creation geometry"));
+        }
+        let footer = self
+            .files
+            .iter()
+            .position(|file| file.source == SourceId(1))
+            .map(|index| self.files.remove(index));
+        if self.files.len() != 1 || self.files[0].source != SourceId(0) {
+            return Err(EngineError::InvalidState("embedded source views"));
+        }
+        let duplicate = footer
+            .as_ref()
+            .map(|file| file.packet.chunks.clone())
+            .unwrap_or_default();
+        self.files[0]
+            .packet
+            .chunks
+            .extend(duplicate.iter().cloned());
+        let gap = self.files[0].packet.chunks.len();
+        self.files[0]
+            .packet
+            .chunks
+            .push(ChunkDescription::Unprotected { length: 1 });
+        self.files[0].packet.chunks.extend(duplicate);
+        self.files[0].packet.quick_rolling_hash = 0;
+        self.files[0].packet.fingerprint = [0; 16];
+        self.build_metadata()?;
+        let metadata_size = self.requirements.metadata_bytes;
+        let packet_bytes = self
+            .options
+            .block_size
+            .checked_add(88)
+            .and_then(|size| size.checked_mul(self.options.recovery_count))
+            .and_then(|size| size.checked_add(metadata_size))
+            .ok_or(EngineError::ResourceLimit("embedded packet bytes"))?;
+        self.files[0].packet.chunks[gap] = ChunkDescription::Unprotected {
+            length: packet_bytes,
+        };
+        let size = self.options.execution.stripe_bytes.min(64 << 10);
+        let _memory = self.options.execution.memory.reserve(size)?;
+        let mut buffer = vec![0; size];
+        let mut hash = FingerprintHasher::new();
+        let mut feed = |source: SourceId, snapshot: SourceSnapshot| -> EngineResult<()> {
+            let mut at = 0;
+            while at < snapshot.len {
+                self.options.execution.cancel.check()?;
+                let take = (snapshot.len - at).min(size as u64) as usize;
+                read_exact_at(self.access.as_ref(), source, at, &mut buffer[..take])?;
+                hash.update(&buffer[..take]);
+                at += take as u64;
+            }
+            ensure_snapshot(self.access.as_ref(), source, snapshot)
+        };
+        feed(self.files[0].source, self.files[0].snapshot)?;
+        if let Some(footer) = &footer {
+            feed(footer.source, footer.snapshot)?;
+        }
+        // The reference concatenates protected chunks for the file hash.
+        // Embedded packet bytes contribute neither bytes nor zero padding.
+        if let Some(footer) = &footer {
+            let mut at = 0;
+            while at < footer.snapshot.len {
+                self.options.execution.cancel.check()?;
+                let take = (footer.snapshot.len - at).min(size as u64) as usize;
+                read_exact_at(self.access.as_ref(), footer.source, at, &mut buffer[..take])?;
+                hash.update(&buffer[..take]);
+                at += take as u64;
+            }
+            ensure_snapshot(self.access.as_ref(), footer.source, footer.snapshot)?;
+        }
+        self.files[0].packet.fingerprint = hash.finalize();
+        self.build_metadata()?;
+        if self.requirements.metadata_bytes != metadata_size {
+            return Err(EngineError::InvalidState(
+                "embedded metadata length changed",
+            ));
+        }
+        self.options.volumes = VolumeLayout::Uniform(self.options.recovery_count);
+        self.volumes.clear();
+        self.data_volumes.clear();
+        self.requirements.output_sizes.clear();
+        self.plan_volumes()?;
+        self.requirements.source_bytes =
+            self.files[0]
+                .packet
+                .chunks
+                .iter()
+                .try_fold(0u64, |total, chunk| {
+                    total
+                        .checked_add(chunk.length())
+                        .ok_or(EngineError::ResourceLimit("embedded file length"))
+                })?;
+        Ok(packet_bytes)
+    }
+
     /// Execute into explicit local output and scratch directories. Existing
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.
@@ -678,9 +782,21 @@ impl CreationPlan {
                 self.options.execution.clone(),
                 crate::ScanLimits::default(),
             )?;
+            let mut authenticated_end = 0;
             loop {
                 match scanner.poll()? {
-                    crate::ingest::ScanEvent::Packet(_) => {}
+                    crate::ingest::ScanEvent::Packet(packet) => {
+                        let origin = packet.origin();
+                        if origin.offset != authenticated_end || packet.input_set_id() != self.id {
+                            return Err(EngineError::InvalidState(
+                                "staged carrier has unauthenticated bytes",
+                            ));
+                        }
+                        authenticated_end = origin
+                            .offset
+                            .checked_add(origin.length)
+                            .ok_or(EngineError::ResourceLimit("staged carrier length"))?;
+                    }
                     crate::ingest::ScanEvent::End => break,
                     crate::ingest::ScanEvent::NeedData { .. } => {
                         return Err(EngineError::InvalidState(
@@ -688,6 +804,11 @@ impl CreationPlan {
                         ));
                     }
                 }
+            }
+            if authenticated_end != self.requirements.output_sizes[number] {
+                return Err(EngineError::InvalidState(
+                    "staged carrier authentication is incomplete",
+                ));
             }
             staged.push(temporary);
         }

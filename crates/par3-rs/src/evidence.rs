@@ -242,12 +242,8 @@ impl StreamingVerifier {
             let start = extent.range.start.max(offset);
             let stop = extent.range.end.min(end);
             let data = &bytes[(start - offset) as usize..(stop - offset) as usize];
-            if self.whole_ordered {
-                if matches!(extent.kind, ExtentKind::Unprotected) {
-                    self.whole.update_zeros(data.len() as u64);
-                } else {
-                    self.whole.update(data);
-                }
+            if self.whole_ordered && !matches!(extent.kind, ExtentKind::Unprotected) {
+                self.whole.update(data);
             }
             if self.verdicts[index] == ExtentVerdict::Unknown {
                 let relative = start - extent.range.start;

@@ -194,11 +194,12 @@ Still unsupported:
   blocks out of its External Data packets — and is never checked as a unit.
 - Incremental backups: a Start packet's parent set is exposed, never followed.
 - Interpreting link and permission packets, beyond keeping their bytes.
-- PAR-inside insertion and self-repair. `inside::ContainerLayout::inspect`
-  currently provides bounded ZIP/ZIP64 and 7z framing checks for those workflows;
-  it preserves opaque compressed members and refuses ambiguous trailing data.
-  The convenience verifier still reports unprotected chunks as unverifiable.
-- Creating unprotected chunks, link or permission packets, and parent sets.
+- PAR-inside self-repair. `inside::InsertionPlan` now plans and stages Cauchy
+  insertion into ZIP/ZIP64 and 7z. The pinned reference verifies newly inserted
+  output and repairs damaged protected bytes back byte for byte. Original member bytes
+  are preserved, ZIP footers are duplicated, and ambiguous trailing data is
+  refused. The convenience verifier still reports unprotected chunks as unverifiable.
+- Arbitrary unprotected creation layouts, link or permission packets, and parent sets.
 - Any command-line interface. `examples/par3rs.rs` demonstrates the API from a
   shell; it is not a tool, and nothing here is a supported front-end.
 
@@ -234,6 +235,7 @@ how bytes are read:
 | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
 | ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference rejects count-only ZIP64 unless the ZIP size/offset fields also use `0xffffffff` sentinels; the corpus normalizes these original ZIP fields before insertion |
+| Unprotected file hash | The draft does not define this File-packet hash | Concatenate protected chunks in file order, omitting unprotected bytes; the earlier crate documentation incorrectly described zero substitution |
 
 ## Damage is not an error
 

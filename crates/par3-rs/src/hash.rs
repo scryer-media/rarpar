@@ -78,9 +78,8 @@ impl FingerprintHasher {
 
     /// Feed `count` zero bytes into the hash.
     ///
-    /// Unprotected chunks and the unused tail of a partially filled input block
-    /// are both hashed as zeros, so this is a common enough operation to be worth
-    /// doing without allocating a zero buffer per call.
+    /// Useful for explicit codec padding without allocating a zero buffer per
+    /// call. Unprotected file chunks are omitted from the reference's file hash.
     pub fn update_zeros(&mut self, count: u64) {
         const ZEROS: [u8; 4096] = [0u8; 4096];
         let mut remaining = count;

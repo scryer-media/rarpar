@@ -77,10 +77,11 @@
 //! - Incremental backups: a Start packet's parent set is exposed, but parent
 //!   packets are never followed.
 //! - Permissions and link packets, beyond keeping their bytes.
-//! - PAR-inside insertion and self-repair. [`inside`] currently validates
-//!   ZIP/ZIP64 and 7z framing for those workflows. The convenience verifier
-//!   still reports unprotected chunks as unverifiable.
-//! - Creating unprotected chunks, permission or link packets, and parent sets.
+//! - PAR-inside self-repair. [`inside::InsertionPlan`] supports staged Cauchy
+//!   insertion into ZIP/ZIP64 and 7z, validated by the reference's self-verifier
+//!   and self-repairer after protected-byte damage. The convenience
+//!   verifier still reports unprotected chunks as unverifiable.
+//! - Arbitrary unprotected creation layouts, permission or link packets, and parent sets.
 //!   Advanced standalone creation in [`creation`] supports Cauchy or low-rate
 //!   FFT, interleaving, aligned/sliding deduplication, Data packets, and variable,
 //!   uniform, or size-limited volumes. [`mod@create`] keeps its original defaults.
@@ -105,6 +106,7 @@
 //! | External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
 //! | `PAR FFT\0` | Not specified | Low-rate Cantor-field execution follows the pinned reference appendix; GF16 uses polynomial `0x1002D`, distinct from Cauchy |
 //! | ZIP64 insertion detection | ZIP64 can be required by member count alone | The pinned reference requires size/offset sentinels too; the corpus normalizes these original ZIP fields before insertion |
+//! | Unprotected file hash | The draft does not define this File-packet hash | Concatenate protected chunks, omitting unprotected bytes; earlier crate docs incorrectly described zero substitution |
 //!
 //! Because the InputSetID cannot be recomputed, this crate never validates it —
 //! it is only ever compared for equality.
