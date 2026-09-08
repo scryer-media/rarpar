@@ -88,6 +88,7 @@ pub struct FftCodec {
     field: Option<TransformField>,
     options: ExecutionOptions,
     _tables: Option<Reservation>,
+    workers: Option<crate::runtime::WorkerPool>,
 }
 
 impl FftCodec {
@@ -100,18 +101,60 @@ impl FftCodec {
                 field: None,
                 options,
                 _tables: None,
+                workers: None,
             });
         }
         let reservation = options
             .memory
             .reserve(TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?)?;
         let field = TransformField::new(geometry.bits).map_err(transform_error)?;
+        // Keep enough admission space for locator bookkeeping and a minimal
+        // stripe; a worker limit is a ceiling, not a request to exhaust memory.
+        let workers = crate::runtime::WorkerPool::for_work(
+            &options,
+            geometry.domain / 2,
+            geometry.domain * 96 + 64,
+        )?;
         Ok(Self {
             geometry,
             field: Some(field),
             options,
             _tables: Some(reservation),
+            workers,
         })
+    }
+
+    /// Admitted execution workers. One runs on the caller's thread; larger
+    /// counts use a private pool whose stacks remain charged until joined.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.workers
+            .as_ref()
+            .map_or(1, |workers| workers.pool().current_num_threads())
+    }
+
+    fn transform(&self, rows: &mut [Vec<u16>], origin: usize, inverse: bool) -> EngineResult<()> {
+        let field = self.field.as_ref().expect("nontrivial FFT field");
+        let cancelled = || self.options.cancel.check().is_err();
+        if let Some(workers) = &self.workers {
+            field.transform_in_pool(
+                rows,
+                origin,
+                inverse,
+                self.options.fft_backend,
+                workers.pool(),
+                &cancelled,
+            )
+        } else {
+            field.transform_with_backend(
+                rows,
+                origin,
+                inverse,
+                self.options.fft_backend,
+                &cancelled,
+            )
+        }
+        .map_err(transform_error)
     }
 
     /// Encode a compatible recovery range. Input and output callbacks receive
@@ -133,7 +176,6 @@ impl FftCodec {
         if g.is_trivial() {
             return self.encode_trivial(block_size, first, count, read, write);
         }
-        let field = self.field.as_ref().expect("nontrivial FFT field");
         let rows = g
             .capacity
             .checked_mul(2)
@@ -143,7 +185,6 @@ impl FftCodec {
         let mut work = vec![vec![0u16; symbols]; g.capacity];
         let mut sum = vec![vec![0u16; symbols]; g.capacity];
         let mut bytes = vec![0; stripe];
-        let cancelled = || self.options.cancel.check().is_err();
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
@@ -162,24 +203,14 @@ impl FftCodec {
                     read(base + at, offset, &mut bytes[..take])?;
                     unpack(g.field_bytes(), &bytes, row);
                 }
-                field
-                    .transform_with_backend(
-                        &mut work,
-                        g.capacity + base,
-                        true,
-                        self.options.fft_backend,
-                        &cancelled,
-                    )
-                    .map_err(transform_error)?;
+                self.transform(&mut work, g.capacity + base, true)?;
                 for (to, from) in sum.iter_mut().zip(&work) {
                     for (to, from) in to.iter_mut().zip(from) {
                         *to ^= from;
                     }
                 }
             }
-            field
-                .transform_with_backend(&mut sum, 0, false, self.options.fft_backend, &cancelled)
-                .map_err(transform_error)?;
+            self.transform(&mut sum, 0, false)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
                 pack(g.field_bytes(), row, &mut bytes);
                 write(index, offset, &bytes[..take])?;
@@ -261,15 +292,11 @@ impl FftCodec {
                     *value = field.mul(*value, factors[index]);
                 }
             }
-            field
-                .transform_with_backend(&mut rows, 0, true, self.options.fft_backend, &cancelled)
-                .map_err(transform_error)?;
+            self.transform(&mut rows, 0, true)?;
             field
                 .derivative(&mut rows, &cancelled)
                 .map_err(transform_error)?;
-            field
-                .transform_with_backend(&mut rows, 0, false, self.options.fft_backend, &cancelled)
-                .map_err(transform_error)?;
+            self.transform(&mut rows, 0, false)?;
             for &index in lost {
                 let factor = field
                     .inverse(factors[g.capacity + index])

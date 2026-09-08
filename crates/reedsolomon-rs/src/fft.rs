@@ -138,18 +138,8 @@ impl TransformField {
         backend: crate::gf_simd::LinearBackend,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
+        self.validate_transform(rows, origin, cancelled)?;
         let n = rows.len();
-        if !n.is_power_of_two()
-            || n > self.order()
-            || !origin.is_multiple_of(n)
-            || origin > self.order() - n
-            || rows.iter().any(|row| {
-                row.len() != rows[0].len()
-                    || row.iter().any(|value| *value as usize >= self.order())
-            })
-        {
-            return Err(TransformError::Geometry);
-        }
         let levels = n.trailing_zeros();
         for stage in 0..levels {
             let level = if inverse { stage } else { levels - 1 - stage };
@@ -160,58 +150,142 @@ impl TransformField {
                 }
                 let factor = ((origin ^ base) >> level) as u16;
                 let (left, right) = rows[base..base + half * 2].split_at_mut(half);
-                let plan = (backend != crate::gf_simd::LinearBackend::Scalar
-                    && left[0].len() >= 64
-                    && factor > 1)
-                    .then(|| {
-                        crate::gf_simd::LinearMap16::new(
-                            std::array::from_fn(|bit| {
-                                if bit < self.bits as usize {
-                                    self.mul(1 << bit, factor)
-                                } else {
-                                    0
-                                }
-                            }),
-                            backend,
-                        )
-                    });
+                let butterfly = self.butterfly(factor, inverse, backend, left[0].len());
                 for (left, right) in left.iter_mut().zip(right) {
                     if cancelled() {
                         return Err(TransformError::Cancelled);
                     }
-                    if factor == 0 && backend != crate::gf_simd::LinearBackend::Scalar {
-                        for (a, b) in left.iter().zip(right.iter_mut()) {
-                            *b ^= *a;
-                        }
-                        continue;
-                    }
-                    if let Some(plan) = &plan {
-                        if inverse {
-                            for (a, b) in left.iter().zip(right.iter_mut()) {
-                                *b ^= *a;
-                            }
-                            plan.accumulate(right, left);
-                        } else {
-                            plan.accumulate(right, left);
-                            for (a, b) in left.iter().zip(right.iter_mut()) {
-                                *b ^= *a;
-                            }
-                        }
-                        continue;
-                    }
-                    for (a, b) in left.iter_mut().zip(right) {
-                        if inverse {
-                            *b ^= *a;
-                            *a ^= self.mul(*b, factor);
-                        } else {
-                            *a ^= self.mul(*b, factor);
-                            *b ^= *a;
-                        }
-                    }
+                    butterfly(left, right);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Run transform stages inside a caller-owned, bounded worker pool. No
+    /// global pool is used. Small stripes execute synchronously to avoid task
+    /// overhead; cancellation is checked before each butterfly pair.
+    pub fn transform_in_pool(
+        &self,
+        rows: &mut [Vec<u16>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        use rayon::prelude::*;
+        let n = rows.len();
+        if pool.current_num_threads() == 1
+            || rows
+                .first()
+                .is_none_or(|row| row.len().saturating_mul(n) < 32768)
+        {
+            return self.transform_with_backend(rows, origin, inverse, backend, cancelled);
+        }
+        self.validate_transform(rows, origin, cancelled)?;
+        let levels = n.trailing_zeros();
+        pool.install(|| {
+            for stage in 0..levels {
+                let level = if inverse { stage } else { levels - 1 - stage };
+                let half = 1 << level;
+                rows.par_chunks_mut(half * 2)
+                    .enumerate()
+                    .try_for_each(|(group, rows)| {
+                        let factor = ((origin ^ (group * half * 2)) >> level) as u16;
+                        let (left, right) = rows.split_at_mut(half);
+                        let butterfly = self.butterfly(factor, inverse, backend, left[0].len());
+                        left.par_iter_mut().zip(right.par_iter_mut()).try_for_each(
+                            |(left, right)| {
+                                if cancelled() {
+                                    return Err(TransformError::Cancelled);
+                                }
+                                butterfly(left, right);
+                                Ok(())
+                            },
+                        )
+                    })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn validate_transform(
+        &self,
+        rows: &[Vec<u16>],
+        origin: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        let n = rows.len();
+        if !n.is_power_of_two()
+            || n > self.order()
+            || !origin.is_multiple_of(n)
+            || origin > self.order() - n
+        {
+            return Err(TransformError::Geometry);
+        }
+        for row in rows {
+            if cancelled() {
+                return Err(TransformError::Cancelled);
+            }
+            if row.len() != rows[0].len()
+                || (self.bits == 8 && row.iter().any(|value| *value > 255))
+            {
+                return Err(TransformError::Geometry);
+            }
+        }
+        Ok(())
+    }
+
+    fn butterfly(
+        &self,
+        factor: u16,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        width: usize,
+    ) -> impl Fn(&mut [u16], &mut [u16]) + Sync + '_ {
+        let plan = (backend != crate::gf_simd::LinearBackend::Scalar && width >= 64 && factor > 1)
+            .then(|| {
+                crate::gf_simd::LinearMap16::new(
+                    std::array::from_fn(|bit| {
+                        if bit < self.bits as usize {
+                            self.mul(1 << bit, factor)
+                        } else {
+                            0
+                        }
+                    }),
+                    backend,
+                )
+            });
+        move |left, right| {
+            if factor == 0 && backend != crate::gf_simd::LinearBackend::Scalar {
+                for (a, b) in left.iter().zip(right) {
+                    *b ^= *a;
+                }
+            } else if let Some(plan) = &plan {
+                if inverse {
+                    for (a, b) in left.iter().zip(right.iter_mut()) {
+                        *b ^= *a;
+                    }
+                    plan.accumulate(right, left);
+                } else {
+                    plan.accumulate(right, left);
+                    for (a, b) in left.iter().zip(right.iter_mut()) {
+                        *b ^= *a;
+                    }
+                }
+            } else {
+                for (a, b) in left.iter_mut().zip(right) {
+                    if inverse {
+                        *b ^= *a;
+                        *a ^= self.mul(*b, factor);
+                    } else {
+                        *a ^= self.mul(*b, factor);
+                        *b ^= *a;
+                    }
+                }
+            }
+        }
     }
 
     /// Differentiate a polynomial in place. In this Cantor basis each normalized

@@ -235,8 +235,11 @@ directory. Destinations must be absent; output installation is exclusive.
 The original `create` API and its byte-for-byte default output remain unchanged.
 The new planner currently makes multiple source passes. FFT butterflies use
 Cantor-derived NEON/AVX2/SSSE3 maps; `ExecutionOptions::fft_backend` can select the
-scalar oracle and report the detected kernel. FFT worker scheduling and native
-performance parity with the reference have not been established. The shared
+scalar oracle and report the detected kernel. FFT uses a private pool capped by
+`workers` and available memory; `FftCodec::worker_count` reports its admission.
+Small stripes execute on the caller, and codec drop joins workers before
+releasing stack reservations. Native performance parity with the reference has
+not been established. The shared
 crate's `fft_transform` benchmark compares arithmetic with equal buffers and one
 worker; it does not measure complete PAR3 workloads.
 

@@ -40,6 +40,8 @@ CPU comparison harness and the limits of the exploratory native results.
   GF(2⁸) and GF(2¹⁶) in Cantor representation. Butterfly multiplication uses
   Cantor-derived SIMD maps with an explicit scalar oracle. Codec geometry,
   interleaving, allocation budgets, and worker policy belong to callers.
+  `transform_in_pool` distributes butterfly pairs inside an explicitly supplied
+  Rayon pool, with cancellation and synchronous execution for small stripes.
 - `gf_simd`: multiply-accumulate kernels, including `mul_acc_region` for one
   source and destination, `mul_acc_multi_region` for one source and multiple
   destinations, and `mul_acc_input_batch` for multiple sources and one

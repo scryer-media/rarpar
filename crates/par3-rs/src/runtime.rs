@@ -249,6 +249,73 @@ impl Default for ExecutionOptions {
     }
 }
 
+/// Private pools join their workers before releasing stack reservations.
+pub(crate) struct WorkerPool {
+    pool: Option<rayon::ThreadPool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    _memory: Reservation,
+}
+
+impl WorkerPool {
+    const STACK_BYTES: usize = 256 << 10;
+    const WORKER_BYTES: usize = Self::STACK_BYTES + (64 << 10);
+
+    pub(crate) fn for_work(
+        options: &ExecutionOptions,
+        maximum: usize,
+        headroom: usize,
+    ) -> EngineResult<Option<Self>> {
+        options.validate()?;
+        let workers = options
+            .workers
+            .min(maximum)
+            .min(options.memory.available().saturating_sub(headroom) / Self::WORKER_BYTES);
+        if workers < 2 {
+            return Ok(None);
+        }
+        let memory = options.memory.reserve(workers * Self::WORKER_BYTES)?;
+        let mut threads = Vec::with_capacity(workers);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .stack_size(Self::STACK_BYTES)
+            .spawn_handler(|worker| {
+                threads.push(
+                    std::thread::Builder::new()
+                        .stack_size(Self::STACK_BYTES)
+                        .spawn(move || worker.run())?,
+                );
+                Ok(())
+            })
+            .build();
+        match pool {
+            Ok(pool) => Ok(Some(Self {
+                pool: Some(pool),
+                threads,
+                _memory: memory,
+            })),
+            Err(error) => {
+                for thread in threads {
+                    let _ = thread.join();
+                }
+                Err(EngineError::Io(std::io::Error::other(error)))
+            }
+        }
+    }
+
+    pub(crate) fn pool(&self) -> &rayon::ThreadPool {
+        self.pool.as_ref().expect("live worker pool")
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        drop(self.pool.take());
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl ExecutionOptions {
     pub(crate) fn validate(&self) -> EngineResult<()> {
         if self.workers == 0 || self.open_handles == 0 || self.stripe_bytes == 0 {

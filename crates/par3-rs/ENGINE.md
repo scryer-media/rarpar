@@ -106,6 +106,13 @@ process RSS; provider storage and allocator bookkeeping are outside that count.
 and measurement. Set explicit worker limits when Weaver schedules concurrent
 jobs. Clone the same memory and scan-work budgets to share ceilings across jobs.
 
+FFT admits a private worker pool after field tables, keeping headroom for a
+minimal decoder stripe. `FftCodec::worker_count()` reports the admitted ceiling;
+small transforms still run on the caller. Each worker reserves a 256 KiB stack
+plus 64 KiB of scheduler allowance. Dropping the codec joins every worker before
+returning those reservations, including after cancellation. This does not bound
+the caller's own worker pool or imply measured process RSS.
+
 `ScanWorkBudget` limits cumulative requested read bytes, including retries,
 partial reads, and seeks. Its default is 1 TiB; dropping or recreating a scanner
 does not reset a shared budget. Exhaustion is explicit before further I/O.
@@ -148,7 +155,7 @@ retained evidence, missing ranges, and exact ZIP/ZIP64/7z self-repair. Newly
 inserted archives were verified and repaired byte-for-byte by the reference.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT worker tuning, complete diagnostics and progress callbacks, stronger
+FFT scheduling-threshold tuning, complete diagnostics and progress callbacks, stronger
 process-wide handle accounting, durable evidence replay, and embedded replacement
 layouts when an original manifest is absent. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
