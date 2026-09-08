@@ -789,6 +789,8 @@ pub(crate) fn install(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // Rust replaces an existing regular file on Windows as well as Unix.
+    // Keep the destination in place until the verified stage is installed.
     std::fs::rename(temporary, destination)?;
     Ok(saved)
 }
@@ -804,3 +806,58 @@ const _: fn() = || {
     supported::<Gf8>();
     supported::<Gf16>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replacement_keeps_expected_bytes(backup: bool) {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "par3-install-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let destination = directory.0.join("damaged.bin");
+        let temporary = directory.0.join("verified.tmp");
+        let existing_backup = directory.0.join("damaged.bin.1");
+        std::fs::write(&destination, b"damaged bytes").unwrap();
+        std::fs::write(&temporary, b"verified repaired bytes").unwrap();
+        std::fs::write(&existing_backup, b"earlier backup").unwrap();
+
+        let saved = install(&temporary, &destination, backup).unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"verified repaired bytes"
+        );
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&existing_backup).unwrap(), b"earlier backup");
+        if backup {
+            let expected = directory.0.join("damaged.bin.2");
+            assert_eq!(saved.as_deref(), Some(expected.as_path()));
+            assert_eq!(std::fs::read(expected).unwrap(), b"damaged bytes");
+        } else {
+            assert!(saved.is_none());
+            assert!(!directory.0.join("damaged.bin.2").exists());
+        }
+    }
+
+    #[test]
+    fn install_replaces_an_existing_file_with_a_numbered_backup() {
+        replacement_keeps_expected_bytes(true);
+    }
+
+    #[test]
+    fn install_replaces_an_existing_file_without_a_backup() {
+        replacement_keeps_expected_bytes(false);
+    }
+}

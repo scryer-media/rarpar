@@ -554,10 +554,12 @@ impl Par3RepairSession {
                         2 => 65536,
                         _ => continue,
                     };
-                    if layout.block_count >= capacity {
+                    let capacity =
+                        cauchy_recovery_capacity(matrix.range, layout.block_count, capacity)?;
+                    if capacity == 0 {
                         continue;
                     }
-                    (matrix.range, 1, capacity - layout.block_count)
+                    (matrix.range, 1, capacity)
                 }
                 PacketBody::FftMatrix(matrix) => {
                     let Some(cohorts) = matrix.interleave.checked_add(1) else {
@@ -828,6 +830,13 @@ impl Par3RepairSession {
     }
 }
 
+fn cauchy_recovery_capacity(range: BlockRange, count: u64, field_size: u64) -> EngineResult<u64> {
+    let covered = block_range(range, count)?;
+    // Columns retain their absolute block indices. Recovery row r uses
+    // MAX - r, so the initial collision-free rows end at field_size - end.
+    Ok(field_size.saturating_sub(covered.end))
+}
+
 pub(crate) fn block_range(range: BlockRange, count: u64) -> EngineResult<Range<u64>> {
     if range.covers_all() {
         return Ok(0..count);
@@ -851,4 +860,67 @@ fn union(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cauchy::element;
+    use crate::gf::{Gf8, Gf16};
+
+    #[test]
+    fn cauchy_prefix_capacity_ignores_blocks_outside_the_matrix() {
+        let range = BlockRange { first: 0, end: 10 };
+        for count in [250, 70_000] {
+            let capacity = cauchy_recovery_capacity(range, count, 256).unwrap();
+            assert_eq!(capacity, 246);
+            assert!(100 < capacity);
+            for block in 0..10 {
+                assert!(element(&Gf8::default(), block, 100).is_ok());
+                assert!(element(&Gf8::default(), block, capacity - 1).is_ok());
+            }
+            assert!(element(&Gf8::default(), 9, capacity).is_err());
+        }
+    }
+
+    #[test]
+    fn cauchy_subrange_capacity_preserves_absolute_column_indices() {
+        let range = BlockRange {
+            first: 230,
+            end: 240,
+        };
+        let capacity = cauchy_recovery_capacity(range, 250, 256).unwrap();
+        assert_eq!(capacity, 16);
+        for block in 230..240 {
+            assert!(element(&Gf8::default(), block, capacity - 1).is_ok());
+        }
+        assert!(element(&Gf8::default(), 239, capacity).is_err());
+
+        let range = BlockRange {
+            first: 65_000,
+            end: 65_010,
+        };
+        let capacity = cauchy_recovery_capacity(range, 70_000, 65_536).unwrap();
+        assert_eq!(capacity, 526);
+        for block in 65_000..65_010 {
+            assert!(element(&Gf16::default(), block, capacity - 1).is_ok());
+        }
+        assert!(element(&Gf16::default(), 65_009, capacity).is_err());
+    }
+
+    #[test]
+    fn cauchy_capacity_keeps_full_set_limits_and_rejects_invalid_ranges() {
+        let all = BlockRange { first: 0, end: 0 };
+        assert_eq!(cauchy_recovery_capacity(all, 250, 256).unwrap(), 6);
+        assert_eq!(cauchy_recovery_capacity(all, 65_530, 65_536).unwrap(), 6);
+        assert_eq!(cauchy_recovery_capacity(all, 256, 256).unwrap(), 0);
+        assert_eq!(cauchy_recovery_capacity(all, 257, 256).unwrap(), 0);
+        for range in [
+            BlockRange { first: 10, end: 10 },
+            BlockRange { first: 10, end: 9 },
+            BlockRange { first: 0, end: 251 },
+        ] {
+            assert!(cauchy_recovery_capacity(range, 250, 256).is_err());
+        }
+    }
 }
