@@ -125,10 +125,19 @@ execution modes must remain distinct from insufficient recovery. Assessment
 statuses separately report incomplete metadata, recovery deficits, readiness,
 and completeness. Engine outcomes do not imply a downloader retry policy.
 
-Sessions are disposable. After restart, reopen and replay authenticated packets
-against current providers. There is currently no serialized engine-evidence
-format; do not turn persisted verdict bits into trusted evidence. Any future
-evidence replay interface must establish source identity, generation, and layout.
+Sessions are disposable. Export `checkpoint_file` (or `FileEvidence::checkpoint`)
+and retain its full `digest()` in trusted job metadata independently of the blob.
+After restart, replay authenticated packets, restore source bindings, and call
+`replay_evidence(bytes, trusted_digest)`. The engine checks the version, digest,
+authenticated layout, binding, logical length, and current source generation
+before admitting verdicts. Successful replay and unchanged assessment require no
+source-byte reads. Unknown extents remain unknown; partial hash state is omitted.
+
+The digest is an integrity anchor, not a signature or a PAR3 file fingerprint.
+Never derive the trusted digest from an untrusted replay blob. If trusted job
+metadata or stable source generations cannot be established, verify again.
+Checkpoint creation and decoding reserve memory and honor cancellation; the
+host owns the persisted bytes and their storage policy.
 
 ## Read-only Weaver reference
 
@@ -159,7 +168,7 @@ including the recovery equations actually consumed.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
 FFT scheduling-threshold tuning, complete diagnostics and progress callbacks, stronger
-process-wide handle accounting, durable evidence replay, and embedded replacement
+process-wide handle accounting and embedded replacement
 layouts when an original manifest is absent. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
 throughput parity. Correctness results alone do not satisfy performance acceptance.

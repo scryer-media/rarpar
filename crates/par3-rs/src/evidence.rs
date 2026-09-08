@@ -9,6 +9,10 @@ use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot};
 use crate::{Fingerprint, FingerprintHasher};
 
+#[path = "evidence_checkpoint.rs"]
+mod checkpoint;
+pub use checkpoint::EvidenceCheckpoint;
+
 /// Verification state of a file-coordinate extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtentVerdict {
@@ -22,7 +26,8 @@ pub enum ExtentVerdict {
     Unprotected,
 }
 
-/// Sealed evidence produced only by hashing bytes against an authenticated layout.
+/// Sealed evidence produced by hashing bytes against an authenticated layout,
+/// or replaying such verdicts using a checkpoint digest trusted by the host.
 #[derive(Clone, Debug)]
 pub struct FileEvidence {
     pub(crate) layout: Fingerprint,

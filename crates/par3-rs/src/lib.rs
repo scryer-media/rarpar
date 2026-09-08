@@ -11,6 +11,8 @@
 //! default Cauchy behavior. The incremental [`Par3RepairSession`] adds virtual
 //! sources, streaming evidence, shared block layouts, retained assessments,
 //! bounded striped repair, and low-rate FFT recovery with interleaved cohorts.
+//! Versioned evidence checkpoints can be replayed without source-byte reads;
+//! the host must preserve their trusted digests and stable source generations.
 //! FFT butterflies dispatch Cantor-derived shuffle maps on supported CPUs;
 //! [`ExecutionOptions::fft_backend`] retains an explicit scalar comparison path.
 //! FFT worker pools obey the worker and allocation ceilings and join their

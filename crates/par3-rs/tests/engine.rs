@@ -432,6 +432,112 @@ fn merge_carrier(
 }
 
 #[test]
+fn checkpoint_restart_preserves_partial_proofs_and_rejects_stale_or_altered_bytes() {
+    let options = ExecutionOptions::default();
+    let source = Arc::new(ArrivingSource {
+        bytes: common::a_bin(),
+        visible: AtomicUsize::new(2000),
+        generation: AtomicU64::new(1),
+        reads: AtomicUsize::new(0),
+    });
+    let reopen = || {
+        let mut session =
+            par3_rs::Par3RepairSession::new(common::SET_ID, source.clone(), options.clone())
+                .unwrap();
+        merge_carrier(&mut session, common::set_par3(), &options);
+        session.bind_file("a.bin", SourceId(1)).unwrap();
+        session
+    };
+    let mut original = reopen();
+    original.assess().unwrap();
+    let checkpoint = original.checkpoint_file("a.bin").unwrap().unwrap();
+    // The host persists this digest independently of the checkpoint blob.
+    let trusted_digest = checkpoint.digest();
+    drop(original);
+    source.reads.store(0, Ordering::Relaxed);
+    let mut restored = reopen();
+    restored
+        .replay_evidence(checkpoint.as_bytes(), trusted_digest)
+        .unwrap();
+    restored.assess().unwrap();
+    restored.assess().unwrap();
+    merge_carrier(&mut restored, common::set_vol0_par3(), &options);
+    restored.assess().unwrap();
+    assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+    source.visible.store(5000, Ordering::Relaxed);
+    restored.source_arrived(SourceId(1)).unwrap();
+    assert_eq!(source.reads.load(Ordering::Relaxed), 2);
+    let complete = restored.checkpoint_file("a.bin").unwrap().unwrap();
+    drop(restored);
+    source.reads.store(0, Ordering::Relaxed);
+    let mut restored = reopen();
+    restored
+        .replay_evidence(complete.as_bytes(), complete.digest())
+        .unwrap();
+    restored.source_arrived(SourceId(1)).unwrap();
+    restored.assess().unwrap();
+    assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+
+    let baseline = options.memory.used();
+    let mut altered = complete.as_bytes().to_vec();
+    *altered.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        restored.replay_evidence(&altered, complete.digest()),
+        Err(EngineError::InvalidState(
+            "evidence checkpoint digest mismatch"
+        ))
+    ));
+    assert!(restored.replay_evidence(&[], complete.digest()).is_err());
+    restored.bind_file("a.bin", SourceId(2)).unwrap();
+    assert!(
+        restored
+            .replay_evidence(complete.as_bytes(), complete.digest())
+            .is_err()
+    );
+    restored.bind_file("a.bin", SourceId(1)).unwrap();
+    source.generation.store(2, Ordering::Relaxed);
+    assert!(matches!(
+        restored.replay_evidence(complete.as_bytes(), complete.digest()),
+        Err(EngineError::SourceChanged(SourceId(1)))
+    ));
+    assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+    assert!(options.memory.used() <= baseline);
+    drop(restored);
+    drop(complete);
+    drop(checkpoint);
+    assert_eq!(options.memory.used(), 0);
+}
+
+#[test]
+fn checkpoint_allocation_and_cancellation_release_reservations() {
+    let options = ExecutionOptions::default();
+    let layout = Arc::new(BlockLayout::new(&common::gf8_set(), &options).unwrap());
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, common::a_bin().into());
+    let evidence = verify_source(layout, 0, &access, SourceId(1), &options).unwrap();
+    assert_eq!(evidence.whole_matches(), Some(true));
+    let mut constrained = options.clone();
+    constrained.memory = MemoryBudget::new(1);
+    assert!(matches!(
+        evidence.checkpoint(&constrained),
+        Err(EngineError::ResourceLimit(_))
+    ));
+    assert_eq!(constrained.memory.used(), 0);
+    let before = options.memory.used();
+    let checkpoint = evidence.checkpoint(&options).unwrap();
+    assert_eq!(options.memory.used(), before + checkpoint.retained_bytes());
+    drop(checkpoint);
+    options.cancel.cancel();
+    assert!(matches!(
+        evidence.checkpoint(&options),
+        Err(EngineError::Cancelled)
+    ));
+    assert_eq!(options.memory.used(), before);
+    drop(evidence);
+    assert_eq!(options.memory.used(), 0);
+}
+
+#[test]
 fn retained_virtual_repair_reuses_analysis_when_recovery_arrives() {
     use par3_rs::session::RepairStatus;
     let mut options = ExecutionOptions::default();
