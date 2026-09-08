@@ -52,6 +52,12 @@ pub trait SourceAccess: Send + Sync {
 
 /// Disk source registry. Positioned reads retain no handles; sequential readers
 /// hold one shared lease until dropped.
+///
+/// Unix generations include device, inode and change time. On other platforms,
+/// snapshots hash the file through bounded buffers because length and mtime do
+/// not identify replaced content. This costs a full read per snapshot; callers
+/// with immutable backing objects should implement [`SourceAccess`] with their
+/// own stable generations to retain read-free reassessment.
 #[derive(Debug, Default)]
 pub struct DiskSourceAccess {
     paths: BTreeMap<SourceId, PathBuf>,
@@ -112,6 +118,9 @@ impl SourceAccess for DiskSourceAccess {
             hash.update(&metadata.ctime().to_le_bytes());
             hash.update(&metadata.ctime_nsec().to_le_bytes());
         }
+        #[cfg(not(unix))]
+        hash_disk_contents(path, source, &metadata, &self.options, &mut hash)
+            .map_err(EngineError::into_io)?;
         let generation = u64::from_le_bytes(
             hash.finalize().as_bytes()[..8]
                 .try_into()
@@ -141,6 +150,41 @@ impl SourceAccess for DiskSourceAccess {
             File::open(self.path(source)?, &self.options).map_err(EngineError::into_io)?,
         )))
     }
+}
+
+// Stable Rust exposes no portable file identity/change counter outside Unix.
+// Hash bytes there rather than reuse evidence based only on length and mtime.
+#[cfg(any(not(unix), test))]
+fn hash_disk_contents(
+    path: &std::path::Path,
+    source: SourceId,
+    expected: &std::fs::Metadata,
+    options: &ExecutionOptions,
+    hash: &mut blake3::Hasher,
+) -> EngineResult<()> {
+    let mut file = File::open(path, options)?;
+    let size = options.stripe_bytes.min(64 << 10);
+    let _memory = options.memory.reserve(size)?;
+    let mut buffer = vec![0; size];
+    let mut remaining = expected.len();
+    while remaining != 0 {
+        options.cancel.check()?;
+        let take = remaining.min(size as u64) as usize;
+        let count = file.read(&mut buffer[..take])?;
+        if count == 0 {
+            return Err(EngineError::SourceChanged(source));
+        }
+        hash.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    let current = file.metadata()?;
+    if file.read(&mut [0])? != 0
+        || current.len() != expected.len()
+        || current.modified()? != expected.modified()?
+    {
+        return Err(EngineError::SourceChanged(source));
+    }
+    Ok(())
 }
 
 /// Immutable memory source registry, useful for callers which already own bytes.
@@ -232,4 +276,55 @@ pub(crate) fn ensure_snapshot(
         return Err(EngineError::SourceChanged(source));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_generations_detect_replacement_with_preserved_length_and_mtime() {
+        let directory = std::env::temp_dir().join(format!(
+            "par3-generation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("source");
+        let replacement = directory.join("replacement");
+        std::fs::write(&path, b"original").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let options = ExecutionOptions {
+            stripe_bytes: 3,
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), path.clone());
+        let before = access.snapshot(SourceId(1)).unwrap().unwrap();
+        let content_hash = || {
+            let mut hash = blake3::Hasher::new();
+            hash_disk_contents(&path, SourceId(1), &metadata, &options, &mut hash).unwrap();
+            hash.finalize()
+        };
+        let before_hash = content_hash();
+        std::fs::write(&replacement, b"replaced").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(before.len, after.len);
+        assert_ne!(before.generation, after.generation);
+        assert_ne!(before_hash, content_hash());
+        assert_eq!(after, access.snapshot(SourceId(1)).unwrap().unwrap());
+        assert_eq!(options.memory.used(), 0);
+        assert_eq!(options.handles.used(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -32,6 +32,43 @@ pub fn manifest_for_rar_set(rar: &RarSet, par2_sets: &[Par2Set]) -> CleanupManif
     CleanupManifest { candidates }
 }
 
+pub fn add_par3_carriers(
+    manifest: &mut CleanupManifest,
+    rar: &RarSet,
+    sets: &[crate::par3::Par3Set],
+) {
+    let volumes: Vec<_> = rar
+        .volumes
+        .iter()
+        .filter_map(|volume| volume.path.canonicalize().ok())
+        .collect();
+    let consumed = |set: &crate::par3::Par3Set| {
+        set.metadata_complete
+            && !set.protected_files.is_empty()
+            && set.protected_files.iter().all(|name| {
+                set.base_dir
+                    .join(name)
+                    .canonicalize()
+                    .is_ok_and(|path| volumes.contains(&path))
+            })
+    };
+    for set in sets.iter().filter(|set| consumed(set)) {
+        for path in &set.paths {
+            // One carrier can contain multiple sets. Preserve it if any of
+            // those sets protects data outside this extracted archive.
+            if sets
+                .iter()
+                .filter(|other| other.paths.contains(path))
+                .all(consumed)
+            {
+                manifest.candidates.push(path.clone());
+            }
+        }
+    }
+    manifest.candidates.sort();
+    manifest.candidates.dedup();
+}
+
 pub fn validate_extracted_outputs(
     rar: &RarSet,
     output_dir: &Path,

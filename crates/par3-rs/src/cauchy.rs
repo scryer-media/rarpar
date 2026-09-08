@@ -65,8 +65,8 @@ use crate::packet::GaloisField;
 /// syndrome per lost block plus the matrix it inverts and the blocks it
 /// rebuilds. All of that is sized from numbers a `.par3` file chose, so it is
 /// metered rather than trusted. Memory is not the only cost a file can choose:
-/// the decoder's solve is a dense inversion, cubic in the number of lost
-/// blocks, and a set of tiny blocks can name thousands of them for a few
+/// coefficient construction is quadratic in the number of lost blocks,
+/// and a set of tiny blocks can name thousands of them for a few
 /// hundred kilobytes of recovery data while staying well inside a memory
 /// budget. So the lost-block count is bounded on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,9 +76,9 @@ pub struct CodecLimits {
     pub max_buffer_bytes: u64,
     /// Most input blocks one decoder may rebuild in a single solve.
     ///
-    /// Inverting the matrix costs on the order of the cube of this number in
-    /// field multiplications, and the solve itself the number times the block
-    /// size per lost block, so this is what bounds a decoder's time.
+    /// Cauchy coefficient construction is quadratic in this number. Applying
+    /// the coefficients also scales with the block size, independently of
+    /// whether the buffers fit within the memory budget.
     pub max_lost_blocks: u64,
 }
 
@@ -87,12 +87,10 @@ impl CodecLimits {
     /// 65536-block set at 16 KiB blocks.
     pub const DEFAULT_MAX_BUFFER_BYTES: u64 = 1 << 30;
 
-    /// 4096 lost blocks: an inversion of some 7 × 10¹⁰ field multiplications,
-    /// which is a minute or so of one core at the outside. That is enough for a
-    /// tenth of a 40,000-block set to be missing, while a set that would push
-    /// the count higher — thousands of two-byte blocks, say — is refused before
-    /// anything is allocated. A caller repairing very large sets with a lot of
-    /// damage can raise it, knowingly.
+    /// 4096 lost blocks, bounding the coefficient matrix to 16,777,216 entries.
+    /// Larger solves are refused before coefficient allocation even when tiny
+    /// blocks would fit the memory budget. Callers can explicitly raise this
+    /// ceiling when they accept the additional work.
     pub const DEFAULT_MAX_LOST_BLOCKS: u64 = 4096;
 
     /// Limits allowing a codec `max_buffer_bytes` of block and matrix buffers,

@@ -1,17 +1,15 @@
 # Advanced reference fixtures
 
-The first implementation PR carries recipes and provenance, not fixture
-binaries. Thirteen tests that require these new files are explicitly ignored
-pending corpus publication; they load fixtures at runtime so an older published
-corpus still compiles. Tests that generate their own inputs remain enabled.
+Fixture binaries are hydrated from the corpus, not tracked in Git. The thirteen
+tests gated during initial implementation are now required: one in
+`carrier_engine.rs`, two in `data_engine.rs`, four in `fft_engine.rs`, and six in
+`inside_engine.rs`. The Data admission regression also needs these fixtures.
+Missing files fail with their expected path. The two explicit reference
+exporters in `inside_engine.rs` stay opt-in.
 
-After the operator publishes the corpus, the follow-up PR must update the
-published corpus pin as needed, hydrate and validate the advanced profile
-contents, and remove only the `requires the next published advanced PAR3 corpus`
-ignore attributes: one in `carrier_engine.rs`, two in `data_engine.rs`, four in
-`fft_engine.rs`, and six in `inside_engine.rs`. The two explicit reference
-exporters in `inside_engine.rs` stay opt-in. No publication is performed by this
-implementation PR.
+The corpus pin includes the advanced PAR3 recipe from the signed publication
+in [run 34256502968](https://github.com/scryer-media/rarpar/actions/runs/34256502968).
+CI hydrates that revision before running the required tests.
 
 PAR3 bytes come only from official par3cmdline runs at commit
 `2971702e501f1350b1c7b9d11369af9157d6ed56`. The checked-in recipe is

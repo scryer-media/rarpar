@@ -572,9 +572,7 @@ impl Par3RepairSession {
                     ) else {
                         continue;
                     };
-                    if geometry.field_bytes() != set.galois_field().size as usize
-                        && !(geometry.is_trivial() && set.galois_field().size == 0)
-                    {
+                    if geometry.validate_field(set.galois_field()).is_err() {
                         continue;
                     }
                     if (geometry.capacity() as u64).checked_mul(cohorts).is_none() {

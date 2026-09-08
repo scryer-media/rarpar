@@ -367,6 +367,9 @@ fn restore_recovery_volumes(set: &RarSet) -> Result<RarSet, CompatFailure> {
             recursive: false,
             max_depth: 1,
             max_files: 20_000,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
         },
     )
     .map_err(|error| CompatFailure::stdout(EXIT_OPEN, format!("Cannot open: {error}")))
@@ -619,6 +622,9 @@ fn resolve_sets(specs: &[PathBuf]) -> Result<Vec<RarSet>, CompatFailure> {
         recursive: false,
         max_depth: 1,
         max_files: 20_000,
+        par3_memory_mib: 256,
+        par3_workers: None,
+        par3_max_lost_blocks: 4096,
     };
     for path in paths {
         let archive = std::fs::canonicalize(&path).map_err(|error| {

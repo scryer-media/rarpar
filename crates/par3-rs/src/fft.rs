@@ -64,6 +64,19 @@ impl FftGeometry {
         (self.bits / 8) as usize
     }
 
+    pub(crate) fn validate_field(self, field: crate::packet::GaloisField) -> EngineResult<()> {
+        let compatible = if field.size == 0 {
+            self.is_trivial() && field.generator == 0
+        } else {
+            field.size as usize == self.field_bytes()
+                && matches!((field.size, field.generator), (1, 0x1d) | (2, 0x2d))
+        };
+        if !compatible {
+            return Err(EngineError::Unsupported("FFT field representation"));
+        }
+        Ok(())
+    }
+
     /// A single input is copied; a single recovery row is the XOR of inputs.
     /// These geometries need no field arithmetic and accept byte alignment.
     #[must_use]
@@ -484,5 +497,52 @@ fn transform_error(error: TransformError) -> EngineError {
         TransformError::Cancelled => EngineError::Cancelled,
         TransformError::Field => EngineError::Unsupported("FFT field"),
         TransformError::Geometry => EngineError::InvalidState("FFT transform geometry"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::GaloisField;
+
+    #[test]
+    fn declared_fft_fields_must_match_the_reference_representation() {
+        for (inputs, size, generator) in [(4, 1, 0x1d), (300, 2, 0x2d)] {
+            let geometry = FftGeometry::new(inputs, 2).unwrap();
+            assert!(
+                geometry
+                    .validate_field(GaloisField { size, generator })
+                    .is_ok()
+            );
+            for generator in [0, 0x1b, 0x100b, generator | (1 << (size * 8))] {
+                assert!(matches!(
+                    geometry.validate_field(GaloisField { size, generator }),
+                    Err(EngineError::Unsupported("FFT field representation"))
+                ));
+            }
+            assert!(
+                geometry
+                    .validate_field(GaloisField {
+                        size: 0,
+                        generator: 0
+                    })
+                    .is_err()
+            );
+        }
+        let xor = FftGeometry::new(4, 0).unwrap();
+        assert!(
+            xor.validate_field(GaloisField {
+                size: 0,
+                generator: 0
+            })
+            .is_ok()
+        );
+        assert!(
+            xor.validate_field(GaloisField {
+                size: 0,
+                generator: 1
+            })
+            .is_err()
+        );
     }
 }

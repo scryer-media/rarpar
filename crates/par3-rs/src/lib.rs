@@ -83,7 +83,10 @@
 //! - Inferring an unknown carrier's original byte order or missing metadata.
 //!   Exact restoration requires a captured manifest; explicit replacement APIs
 //!   report replacement separately from protected-data completeness.
-//! - A supported CLI. The repository's `par3rs` example demonstrates convenience APIs.
+//!
+//! The workspace's `rarpar` binary exposes `par3 create`, `par3 verify`,
+//! `par3 repair`, and PAR3 processing in `auto` mode through the session engine.
+//! This crate remains a library; `par3rs` is a convenience-API example.
 //!
 //! Ordinary repair does not silently strip embedded protection. Use [`inside`]
 //! for those carriers. The convenience verifier reports unprotected chunks as

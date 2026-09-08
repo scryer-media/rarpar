@@ -6,6 +6,57 @@ use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
 use std::sync::{Arc, Barrier};
 
 #[test]
+fn cauchy_loss_ceiling_is_enforced_before_staging_outputs() {
+    use par3_rs::ingest::{PacketScanner, ScanEvent};
+    use par3_rs::source::MemorySourceAccess;
+    for ceiling in [0, 1] {
+        let tree = common::TempTree::new("cauchy-loss-limit");
+        let mut options = ExecutionOptions::default();
+        options.max_cauchy_lost_blocks = ceiling;
+        let mut access = MemorySourceAccess::default();
+        let mut damaged = common::a_bin();
+        damaged[2300] ^= 1;
+        access.insert(SourceId(1), 1, damaged.into());
+        access.insert(SourceId(2), 1, common::b_txt().into());
+        access.insert(SourceId(3), 1, common::c_bin().into());
+        access.insert(SourceId(9), 1, common::set_vol0_par3().into());
+        let access = Arc::new(access);
+        let mut session =
+            par3_rs::Par3RepairSession::new(common::SET_ID, access.clone(), options.clone())
+                .unwrap();
+        for (name, id) in [("a.bin", 1), ("b.txt", 2), ("sub/c.bin", 3)] {
+            session.bind_file(name, SourceId(id)).unwrap();
+        }
+        let mut scanner = PacketScanner::new(
+            access,
+            SourceId(9),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            session.merge(packet).unwrap();
+        }
+        assert_eq!(session.assess().unwrap().lost_blocks, [1]);
+        let result = session.repair(tree.path(), false);
+        if ceiling == 0 {
+            assert!(matches!(
+                result,
+                Err(EngineError::ResourceLimit("Cauchy lost blocks"))
+            ));
+            assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+        } else {
+            assert_eq!(result.unwrap().reconstructed_blocks, 1);
+            assert_eq!(
+                std::fs::read(tree.path().join("a.bin")).unwrap(),
+                common::a_bin()
+            );
+        }
+        assert_eq!(options.handles.used(), 0);
+    }
+}
+
+#[test]
 fn sequential_readers_share_a_ceiling_and_release_on_drop() {
     let tree = common::TempTree::new("shared-handles");
     let path = tree.path().join("source");

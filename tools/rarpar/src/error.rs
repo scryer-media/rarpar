@@ -30,6 +30,8 @@ pub enum RarparError {
     Rar(#[from] unrar_rs::RarError),
     #[error("PAR2 error: {0}")]
     Par2(#[from] par2_rs::Par2Error),
+    #[error("PAR3 error: {0}")]
+    Par3(#[from] par3_rs::runtime::EngineError),
 }
 
 impl RarparError {
@@ -50,6 +52,18 @@ impl RarparError {
                 par2_rs::Par2Error::ResourceLimitExceeded { .. } => EXIT_RESOURCE,
                 _ => EXIT_DATA_FAILURE,
             },
+            Self::Par3(error) => par3_exit_code(error),
         }
+    }
+}
+
+fn par3_exit_code(error: &par3_rs::runtime::EngineError) -> u8 {
+    use par3_rs::runtime::EngineError;
+    match error {
+        EngineError::ResourceLimit(_) => EXIT_RESOURCE,
+        EngineError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => EXIT_UNSAFE,
+        EngineError::RepairInterrupted { cause, .. }
+        | EngineError::OutputInterrupted { cause, .. } => par3_exit_code(cause),
+        _ => EXIT_DATA_FAILURE,
     }
 }

@@ -3,8 +3,8 @@
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later%20AND%20UnRAR--restriction-blue)](#license)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/scryer-media/rarpar/badge)](https://scorecard.dev/viewer/?uri=github.com/scryer-media/rarpar)
 
-`rarpar` is a smart RAR/PAR2 command-line tool written in Rust. Point it at an
-archive, a PAR2 file, or a messy download directory and it will discover what is
+`rarpar` is a smart RAR/PAR2/PAR3 command-line tool written in Rust. Point it at an
+archive, a PAR2/PAR3 file, or a messy download directory and it will discover what is
 there, repair what can be repaired, restore recovery volumes when possible, and
 extract the archive with verification enabled.
 
@@ -12,15 +12,17 @@ It is built on reusable archive and parity crates that live in this workspace
 and are published on crates.io. The CLI is distributed as a binary release
 and source build, not as a crates.io package.
 
-`rarpar` is not an official RAR or PAR2 utility. It does not ship binaries named
+`rarpar` is not an official RAR, PAR2, or PAR3 utility. It does not ship binaries named
 `unrar`, `rar`, `par2`, or `par2repair`, and it does not provide RAR archive
 writing, compression, or modification APIs.
 
 ## What It Does
 
-- Discovers RAR, REV, and PAR2 sets from paths, headers, magic bytes, and
+- Discovers RAR, REV, PAR2, and PAR3 sets from paths, headers, magic bytes, and
   bounded directory scans.
-- Verifies and repairs PAR2 sets before extraction.
+- Verifies and repairs PAR2 and PAR3 sets before extraction.
+- Creates PAR3 sets with Cauchy or FFT recovery, interleaving, deduplication,
+  Data packets, and configurable recovery volumes (`par3 create`).
 - Creates PAR2 recovery sets with validated, atomically committed output
   (`par create`).
 - Restores missing RAR volumes from `.rev` recovery volumes when available.
@@ -236,6 +238,50 @@ rarpar r -B ./release ./release/release.par2 "*.rar"
 
 The explicit `rarpar par ...` commands remain the general-purpose interface.
 
+PAR3 operations:
+
+```bash
+rarpar par3 create release.par3 part01.rar part02.rar -s 1048576 -r 5
+rarpar par3 verify release.par3
+rarpar par3 repair release.par3
+rarpar auto release.par3
+rarpar par3 create fft.par3 part01.rar --codec fft --capacity-log2 8 \
+  --interleave 1 --recovery-count 32 --volume-blocks 8
+```
+
+PAR3 creation takes an output stem (or `.par3` path) and explicit files. Names
+are recorded relative to `--base-path`, which defaults to the current directory.
+The defaults are Cauchy, one recovery packet, 1 MiB blocks, no deduplication,
+and power-of-two recovery volumes. Opt into `--dedup aligned|sliding`,
+`--data-packets`, `--volume-blocks`, or `--volume-bytes` as needed. FFT requires
+`--capacity-log2`; `--interleave` counts extra cohorts and `--first-recovery`
+selects the first global recovery index. Percentage sizing uses the block count
+after deduplication and requires a second planning pass over sources.
+
+Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
+and scratch requirements without writing. Existing carriers require `--overwrite`;
+creation stages and authenticates every output before installation and refuses
+to overwrite an input. Files are synchronized by default; `--buffered` opts out
+of storage barriers. Installation is per file, not atomic for the entire set.
+
+Verification and repair accept a carrier or directory, matching sibling `.par3`
+files by authenticated set identity. `--set-id` selects among multiple sets.
+`-C DIR` chooses the protected-data working directory, defaulting to the selected
+carrier's directory; `--output` controls RAR extraction only. Repair retains
+numbered backups unless `--no-backup` is given
+and does not rewrite clean files. Smart placement searches explicit
+`--search-dir` candidates by content when recovery is insufficient; canonical
+placement uses recorded paths only. JSON reports include file-coordinate damage,
+verified prefixes, cohort deficits, and installed paths and backups.
+
+PAR3 commands use the bounded session engine, including FFT and Data-only
+recovery. Global `--par3-memory-mib` (default 256), `--par3-workers`, and
+`--par3-max-lost-blocks` (default 4096 for Cauchy) control resources. The memory
+budget covers engine allocations; CLI path/report storage is bounded separately
+by `--max-files` and metadata limits. `auto` repairs before rediscovering and
+extracting RAR inputs. Container insertion/self-repair and recovery-carrier
+reconstruction remain explicit library APIs rather than CLI commands.
+
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
 
@@ -288,6 +334,8 @@ positively identified as consumed source files for an extracted set:
 - Restored or repaired RAR volumes used for extraction
 - `.rev` recovery volumes for that set
 - PAR2 files used for that set
+- PAR3 carriers whose authenticated sets protect only volumes of that archive;
+  carriers shared with other protected data are retained
 
 It does not delete unrelated sidecar files such as `.nfo`, `.sfv`, samples,
 subtitles, or PAR2-protected data files. Standalone `cleanup` validates expected
@@ -329,18 +377,11 @@ the archive set; it waits for each later volume instead.
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
 - `crates/par3-rs`: PAR3 packet parsing, input-set inspection, verification,
-  creation and repair. It takes inventory of the recovery data a set carries —
-  which recovery blocks exist, which matrix each was computed with, and which
-  packets contradict each other — and carries the Cauchy Reed-Solomon codec
-  over GF(2^8) and GF(2^16) that computes recovery blocks and solves for lost
-  input blocks. It creates a set with the reference implementation's default
-  settings: an index file and power-of-two recovery volumes whose bytes match
-  what the reference writes for the same inputs. It repairs one by deciding
-  which input blocks were lost, solving for them, and writing every damaged or
-  missing file back over a backup of the damaged one. A work in progress: it
-  does not repair damaged recovery volumes, does not find files that were
-  renamed or moved, and computes nothing from any matrix but Cauchy. Not used by
-  the CLI. Licensed GPL-3.0-or-later.
+  creation and repair with bounded sessions, Cauchy/FFT, interleaving,
+  deduplication, Data packets, content placement, recovery-carrier rebuilding,
+  and ZIP/7z embedded protection. Powers the CLI's PAR3 operations. See the
+  [crate README](crates/par3-rs/README.md) for API boundaries and compatibility.
+  Licensed GPL-3.0-or-later.
 - `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
   GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
   default dependency, so an ordinary build carries the unRAR restriction.

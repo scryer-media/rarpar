@@ -287,6 +287,10 @@ pub struct ExecutionOptions {
     pub handles: HandleBudget,
     /// Target I/O and arithmetic stripe size; execution may use smaller stripes.
     pub stripe_bytes: usize,
+    /// Maximum losses in one Cauchy solve, independent of buffer size.
+    /// Defaults to [`crate::cauchy::CodecLimits::DEFAULT_MAX_LOST_BLOCKS`].
+    /// Raise only when the caller accepts the quadratic coefficient work.
+    pub max_cauchy_lost_blocks: u64,
     /// Cancellation shared with the host.
     pub cancel: CancellationToken,
     /// Shared cumulative counters and stage timings; clones aggregate work.
@@ -306,6 +310,7 @@ impl Default for ExecutionOptions {
             open_handles: 32,
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,
+            max_cauchy_lost_blocks: crate::cauchy::CodecLimits::DEFAULT_MAX_LOST_BLOCKS,
             cancel: CancellationToken::default(),
             diagnostics: ExecutionDiagnostics::default(),
             progress: None,

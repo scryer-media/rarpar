@@ -213,7 +213,11 @@ Still outside scope:
 - Automatic source-directory discovery and arbitrary unprotected creation
   layouts beyond supported container insertion.
 - Inferring an unknown carrier's original byte order or missing set metadata.
-- A supported CLI. The repository's `par3rs` example is a convenience-API demo.
+
+The workspace's `rarpar` CLI provides `par3 create`, `par3 verify`, `par3 repair`,
+and PAR3 discovery/repair in `auto` mode. Install it from the workspace or use
+its binary distribution; this crate remains a library. The `par3rs` example
+demonstrates the older convenience APIs.
 
 Ordinary repair does not silently remove embedded protection. Use the explicit
 PAR-inside APIs; exact carrier restoration requires an authenticated manifest.

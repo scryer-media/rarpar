@@ -457,6 +457,7 @@ impl CarrierPlan {
                         (range.end - range.start).div_ceil(cohorts),
                         description.max_recovery_blocks_log2,
                     )?;
+                    geometry.validate_field(set.galois_field())?;
                     let stripe = session.options.stripe_bytes.min(64 << 10);
                     let _buffer = session.options.memory.reserve(stripe)?;
                     let mut covered = vec![0; stripe];

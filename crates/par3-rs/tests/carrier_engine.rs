@@ -84,7 +84,6 @@ fn cauchy_carrier_is_reconstructed_byte_for_byte_and_unknown_layout_is_explicit(
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn interleaved_fft_carrier_is_reconstructed_without_original_recovery_payloads() {
     let mut options = ExecutionOptions::default();
     options.stripe_bytes = 111;

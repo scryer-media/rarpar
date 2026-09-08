@@ -101,6 +101,13 @@ fn repair_inner(
     if assessment.status != RepairStatus::Ready {
         return Err(EngineError::InvalidState("repair is not ready"));
     }
+    if matches!(
+        assessment.matrix.as_ref().map(|packet| packet.body()),
+        Some(PacketBody::CauchyMatrix(_))
+    ) && assessment.lost_blocks.len() as u64 > session.options.max_cauchy_lost_blocks
+    {
+        return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+    }
     if session.options.open_handles < 2 {
         return Err(EngineError::ResourceLimit(
             "repair requires two open handles",
@@ -382,6 +389,9 @@ where
         return Err(EngineError::InvalidState("block size is not field aligned"));
     }
     let n = lost.len();
+    if n as u64 > session.options.max_cauchy_lost_blocks {
+        return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+    }
     let coefficient_bytes = n
         .checked_mul(n)
         .and_then(|count| count.checked_mul(F::SYMBOL_BYTES))

@@ -71,7 +71,66 @@ fn scan(access: Arc<Carriers>, options: &ExecutionOptions) -> Vec<IngestedPacket
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
+fn data_admission_waits_for_external_checksums_before_carrier_reconstruction() {
+    use par3_rs::carrier::CarrierPlan;
+    use par3_rs::packet::PacketBody;
+    use par3_rs::runtime::EngineError;
+    let options = ExecutionOptions::default();
+    let packets = scan(
+        Arc::new(Carriers {
+            generation: 1.into(),
+            reads: 0.into(),
+        }),
+        &options,
+    );
+    let matrix = packets
+        .iter()
+        .find_map(|packet| {
+            packet.metadata().and_then(|metadata| {
+                matches!(metadata.body(), PacketBody::FftMatrix(_)).then_some(packet.hash())
+            })
+        })
+        .unwrap();
+    let mut session = Par3RepairSession::new(
+        packets[0].input_set_id(),
+        Arc::new(MemorySourceAccess::default()),
+        options,
+    )
+    .unwrap();
+    let mut checksums = Vec::new();
+    for packet in packets {
+        if packet
+            .metadata()
+            .is_some_and(|metadata| matches!(metadata.body(), PacketBody::ExternalData(_)))
+        {
+            checksums.push(packet);
+        } else {
+            session.merge(packet).unwrap();
+        }
+    }
+    assert!(!checksums.is_empty());
+    assert!(!session.assess().unwrap().lost_blocks.is_empty());
+    let plan = CarrierPlan::replacement(&mut session, matrix, &[0]).unwrap();
+    let output = common::TempTree::new("data-missing-checksums");
+    let destination = output.path().join("replacement.par3");
+    assert!(matches!(
+        plan.execute(&mut session, &destination, output.path()),
+        Err(EngineError::InvalidState(
+            "reconstruct source blocks before regenerating recovery"
+        ))
+    ));
+    assert!(!destination.exists());
+    for packet in checksums {
+        session.merge(packet).unwrap();
+    }
+    assert!(session.assess().unwrap().lost_blocks.is_empty());
+    let plan = CarrierPlan::replacement(&mut session, matrix, &[0]).unwrap();
+    plan.execute(&mut session, &destination, output.path())
+        .unwrap();
+    assert!(destination.exists());
+}
+
+#[test]
 fn official_xor_recovers_each_omitted_data_block_and_all_its_file_aliases() {
     for missing in 0..4 {
         let mut options = ExecutionOptions::default();
@@ -111,7 +170,6 @@ fn official_xor_recovers_each_omitted_data_block_and_all_its_file_aliases() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn official_data_only_recovery_retains_proofs_across_replays_and_recovery_arrivals() {
     let mut options = ExecutionOptions::default();
     options.workers = 1;

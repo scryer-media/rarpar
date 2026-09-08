@@ -428,8 +428,10 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Hydrate the test corpus (unrar, par2)
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unrar --profile par2
+      - name: Hydrate the whole test corpus
+        # Whole-tree verification below requires every published fixture,
+        # including PAR3 even though its tests run in a separate lane.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
@@ -549,23 +551,9 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  # par3-rs has no C dependency beyond blake3's own build script, so its lane
-  # is the plain cargo run: lib, integration tests (reference-generated
-  # vectors embedded as hex) and doctests, once, only when the crate is
-  # affected. Its corpus profile (`par3`, the reference-written sets under
-  # crates/par3-rs/tests/fixtures) is ledgered but still pending first
-  # publication, so there is nothing to hydrate from yet and the tests that
-  # read those sets — `tests/corpus_sets.rs` — skip here. The revision that
-  # pins a manifest carrying `par3` adds the step, the same one the par2 lane
-  # above runs:
-  #
-  #     - name: Hydrate the test corpus (par3)
-  #       run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
-  #
-  # Until then those tests still run where it counts. The publish workflow's
-  # `workspace` validation lane runs the whole workspace suite against the tree
-  # it has just generated, fixtures and all, so a set the library cannot read,
-  # reproduce or repair stops the corpus revision from being published.
+  # Run library, integration and documentation tests against the signed PAR3
+  # corpus, including the required FFT, Data, deduplication and PAR-inside cases.
+  # The publish workflow also validates freshly generated official fixtures.
   par3-tests:
     name: par3-tests
     needs: [changes, fmt, clippy, unit-tests]
@@ -582,6 +570,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
+      - name: Hydrate the test corpus (par3)
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
       - name: Run the par3-rs suite
         run: cargo test --locked -p par3-rs --no-fail-fast
       - name: Check the wasm32-wasip1 build
@@ -700,13 +690,10 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Hydrate the test corpus
-        # Both profiles, not just unrar: the whole-tree verify below is what
-        # proves the download, and it must hold on any checkout — with the
-        # legacy LFS pointers still present beside the hydrated files, or
-        # after their removal. Hydrating everything makes the guarantee
-        # independent of that ordering, and the extra profile costs seconds
-        # (the egress is free and the objects are digest-deduplicated).
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unrar --profile par2
+        # Whole-tree verification requires every published fixture, even
+        # when this shard only runs unrar-rs tests. Do not rely on fixture
+        # bytes already being present in the checkout or a runner cache.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile all
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
