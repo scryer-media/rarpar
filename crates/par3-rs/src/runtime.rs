@@ -5,6 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
+#[path = "runtime_handles.rs"]
+mod handles;
+pub(crate) use handles::{EngineFile, OpenBudgeted};
+pub use handles::{HandleBudget, HandleLease};
+
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -14,7 +19,7 @@ pub enum EngineError {
     Format(#[from] crate::Par3Error),
     /// A real backing-store error, with its original error chain preserved.
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     /// The requested work exceeds a configured resource budget.
     #[error("PAR3 resource limit: {0}")]
     ResourceLimit(&'static str),
@@ -54,6 +59,31 @@ pub enum EngineError {
 
 /// Result returned by incremental engine operations.
 pub type EngineResult<T> = std::result::Result<T, EngineError>;
+
+impl From<std::io::Error> for EngineError {
+    fn from(error: std::io::Error) -> Self {
+        // SourceAccess and Read transport typed engine failures through io::Error.
+        // Preserve all other backing-store errors exactly, including their chain.
+        if error.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            *error
+                .into_inner()
+                .expect("checked inner")
+                .downcast::<Self>()
+                .expect("checked type")
+        } else {
+            Self::Io(error)
+        }
+    }
+}
+
+impl EngineError {
+    pub(crate) fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Io(error) => error,
+            error => std::io::Error::other(error),
+        }
+    }
+}
 
 /// Cloneable cooperative cancellation, independent of an async runtime.
 #[derive(Clone, Debug, Default)]
@@ -228,6 +258,8 @@ pub struct ExecutionOptions {
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
+    /// Shared handle ceiling across cloned options and cooperating providers.
+    pub handles: HandleBudget,
     /// Target I/O and arithmetic stripe size; execution may use smaller stripes.
     pub stripe_bytes: usize,
     /// Cancellation shared with the host.
@@ -243,6 +275,7 @@ impl Default for ExecutionOptions {
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
             open_handles: 32,
+            handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,
             cancel: CancellationToken::default(),
         }

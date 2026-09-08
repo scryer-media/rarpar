@@ -1,6 +1,7 @@
 //! Staged PAR-inside insertion without recompressing archive members.
 
-use std::fs::{File, OpenOptions};
+use crate::runtime::{EngineFile as File, OpenBudgeted};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -146,9 +147,11 @@ impl InsertionPlan {
         if carriers.len() != 2 {
             return Err(EngineError::InvalidState("embedded carrier layout"));
         }
-        let temporary = crate::session_repair::stage_path(destination)?;
+        let temporary = crate::session_repair::stage_path(destination, options)?;
         let result = (|| -> EngineResult<()> {
-            let mut output = OpenOptions::new().write(true).open(&temporary)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .open_budgeted(&temporary, options)?;
             let mut copy_range = |range: Range<u64>| -> EngineResult<()> {
                 let mut at = range.start;
                 while at < range.end {
@@ -166,7 +169,7 @@ impl InsertionPlan {
                 Ok(())
             };
             copy_range(0..self.layout.snapshot().len)?;
-            let mut carrier = File::open(&carriers[1])?;
+            let mut carrier = File::open(&carriers[1], options)?;
             loop {
                 options.cancel.check()?;
                 let count = carrier.read(&mut buffer)?;
@@ -216,7 +219,7 @@ impl InsertionPlan {
 
     fn verify_staged(&self, output: &Path, index: &Path) -> EngineResult<()> {
         let options = &self.options.execution;
-        let mut disk = DiskSourceAccess::default();
+        let mut disk = DiskSourceAccess::with_options(options.clone());
         disk.insert(SourceId(0), index.to_owned());
         disk.insert(SourceId(1), output.to_owned());
         let disk = Arc::new(disk);

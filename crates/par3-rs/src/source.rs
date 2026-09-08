@@ -1,7 +1,7 @@
 //! Positioned access to immutable generations of disk, memory or virtual bytes.
 
+use crate::runtime::{EngineFile as File, ExecutionOptions};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -50,13 +50,23 @@ pub trait SourceAccess: Send + Sync {
     }
 }
 
-/// Disk source registry. No handles are retained between operations.
+/// Disk source registry. Positioned reads retain no handles; sequential readers
+/// hold one shared lease until dropped.
 #[derive(Debug, Default)]
 pub struct DiskSourceAccess {
     paths: BTreeMap<SourceId, PathBuf>,
+    options: ExecutionOptions,
 }
 
 impl DiskSourceAccess {
+    /// Share the engine's allocation, cancellation, and handle controls.
+    pub fn with_options(options: ExecutionOptions) -> Self {
+        Self {
+            paths: BTreeMap::new(),
+            options,
+        }
+    }
+
     /// Register a caller-selected path. File selection and containment belong to
     /// the caller; PAR3 paths are never interpreted by this registry.
     pub fn insert(&mut self, id: SourceId, path: PathBuf) {
@@ -114,7 +124,8 @@ impl SourceAccess for DiskSourceAccess {
     }
 
     fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> io::Result<usize> {
-        let mut file = File::open(self.path(source)?)?;
+        let mut file =
+            File::open(self.path(source)?, &self.options).map_err(EngineError::into_io)?;
         file.seek(SeekFrom::Start(offset))?;
         file.read(out)
     }
@@ -126,7 +137,9 @@ impl SourceAccess for DiskSourceAccess {
     }
 
     fn open_sequential(&self, source: SourceId) -> io::Result<Option<Box<dyn Read + Send>>> {
-        Ok(Some(Box::new(File::open(self.path(source)?)?)))
+        Ok(Some(Box::new(
+            File::open(self.path(source)?, &self.options).map_err(EngineError::into_io)?,
+        )))
     }
 }
 

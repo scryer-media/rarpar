@@ -1,7 +1,8 @@
 //! Explicit recovery-carrier reconstruction from authenticated packet layouts.
 
+use crate::runtime::{EngineFile as File, OpenBudgeted};
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -353,12 +354,14 @@ impl CarrierPlan {
                 .checked_mul(256)
                 .ok_or(EngineError::ResourceLimit("carrier equations"))?,
         )?;
-        let scratch_file =
-            crate::session_repair::ScratchFile::new(&scratch_directory.join("carrier-spool"))?;
+        let scratch_file = crate::session_repair::ScratchFile::new(
+            &scratch_directory.join("carrier-spool"),
+            &session.options,
+        )?;
         let mut scratch = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(scratch_file.path())?;
+            .open_budgeted(scratch_file.path(), &session.options)?;
         scratch.set_len(
             (slots.len() as u64)
                 .checked_mul(set.block_size())
@@ -462,9 +465,11 @@ impl CarrierPlan {
                 _ => return Err(EngineError::Unsupported("carrier matrix execution")),
             }
         }
-        let output_file = crate::session_repair::ScratchFile::new(destination)?;
+        let output_file = crate::session_repair::ScratchFile::new(destination, &session.options)?;
         let temporary = output_file.path();
-        let mut out = OpenOptions::new().write(true).open(temporary)?;
+        let mut out = OpenOptions::new()
+            .write(true)
+            .open_budgeted(temporary, &session.options)?;
         let stripe = session.options.stripe_bytes.min(64 << 10);
         let _buffers = session.options.memory.reserve(
             stripe

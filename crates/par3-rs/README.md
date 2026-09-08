@@ -14,6 +14,8 @@ creation and repair. The incremental engine adds virtual sources, streaming
 verification evidence, retained repair sessions, and low-rate FFT recovery.
 Versioned evidence checkpoints support restart without verification rereads when
 the host preserves trusted digests and stable source identities and generations.
+Shared handle leases bound engine file lifetimes across concurrent operations;
+Cauchy and FFT worker pools release stack reservations only after joining.
 Performance acceptance and the remaining advanced capabilities are still being
 developed. See [Scope](#scope) before depending on this crate and the
 [Weaver engine contract](ENGINE.md) for source identity, evidence, lifecycle,

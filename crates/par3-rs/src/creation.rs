@@ -1,7 +1,8 @@
 //! Explicit advanced creation plans over stable source identities.
 
+use crate::runtime::{EngineFile as File, OpenBudgeted};
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -658,12 +659,14 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let scratch_path =
-            crate::session_repair::stage_path(&scratch_directory.join("recovery-spool"))?;
+        let scratch_path = crate::session_repair::stage_path(
+            &scratch_directory.join("recovery-spool"),
+            &self.options.execution,
+        )?;
         let mut scratch = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&scratch_path)?;
+            .open_budgeted(&scratch_path, &self.options.execution)?;
         scratch.set_len(self.requirements.scratch_bytes)?;
         if self.options.recovery_count != 0 {
             match self.options.codec {
@@ -732,8 +735,11 @@ impl CreationPlan {
         let mut staged = Vec::new();
         for (number, destination) in destinations.iter().enumerate() {
             self.options.execution.cancel.check()?;
-            let temporary = crate::session_repair::stage_path(destination)?;
-            let mut out = OpenOptions::new().write(true).open(&temporary)?;
+            let temporary =
+                crate::session_repair::stage_path(destination, &self.options.execution)?;
+            let mut out = OpenOptions::new()
+                .write(true)
+                .open_budgeted(&temporary, &self.options.execution)?;
             for packet in &self.metadata {
                 out.write_all(packet)?;
             }
@@ -774,7 +780,8 @@ impl CreationPlan {
             if std::fs::metadata(&temporary)?.len() != self.requirements.output_sizes[number] {
                 return Err(EngineError::InvalidState("creation size differs from plan"));
             }
-            let mut source = crate::source::DiskSourceAccess::default();
+            let mut source =
+                crate::source::DiskSourceAccess::with_options(self.options.execution.clone());
             source.insert(SourceId(0), temporary.clone());
             let mut scanner = crate::ingest::PacketScanner::new(
                 Arc::new(source),

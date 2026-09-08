@@ -1,6 +1,7 @@
 //! Explicit self-repair from an authenticated embedded carrier manifest.
 
-use std::fs::{File, OpenOptions};
+use crate::runtime::{EngineFile as File, OpenBudgeted};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -141,17 +142,19 @@ impl SelfRepairPlan {
         let size = options.stripe_bytes.min(64 << 10);
         let _buffer = options.memory.reserve(size + 4096)?;
         let mut buffer = vec![0; size];
-        let staging = crate::session_repair::ScratchFile::new(destination)?;
+        let staging = crate::session_repair::ScratchFile::new(destination, &options)?;
         let temporary = staging.path().to_owned();
         // Reserve a unique scratch name; installation remains exclusive if
         // another caller independently creates the derived carrier path.
-        let scratch_marker =
-            crate::session_repair::ScratchFile::new(&scratch_directory.join("self-repair"))?;
+        let scratch_marker = crate::session_repair::ScratchFile::new(
+            &scratch_directory.join("self-repair"),
+            &options,
+        )?;
         let carrier_output = scratch_marker.path().with_extension("carrier");
         let mut carrier_installed = false;
         let result = (|| {
             let reconstructed_blocks = crate::session_repair::stage_embedded(session, &temporary)?;
-            let mut disk = DiskSourceAccess::default();
+            let mut disk = DiskSourceAccess::with_options(options.clone());
             disk.insert(SourceId(0), temporary.clone());
             let disk = Arc::new(disk);
             let mut verified = Par3RepairSession::new(
@@ -190,8 +193,11 @@ impl SelfRepairPlan {
                 .carrier
                 .execute(&mut verified, &carrier_output, scratch_directory)?;
             carrier_installed = true;
-            let mut carrier = File::open(&carrier_output)?;
-            let mut output = OpenOptions::new().read(true).write(true).open(&temporary)?;
+            let mut carrier = File::open(&carrier_output, &options)?;
+            let mut output = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open_budgeted(&temporary, &options)?;
             output.seek(SeekFrom::Start(self.gap.start))?;
             let mut remaining = self.gap.end - self.gap.start;
             while remaining != 0 {

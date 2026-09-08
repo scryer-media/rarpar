@@ -15,8 +15,10 @@
 //! the host must preserve their trusted digests and stable source generations.
 //! FFT butterflies dispatch Cantor-derived shuffle maps on supported CPUs;
 //! [`ExecutionOptions::fft_backend`] retains an explicit scalar comparison path.
-//! FFT worker pools obey the worker and allocation ceilings and join their
+//! Cauchy and FFT worker pools obey allocation ceilings and join their
 //! threads before releasing stack reservations; small stripes run synchronously.
+//! [`runtime::HandleBudget`] bounds actual engine file lifetimes across sessions;
+//! cooperating disk providers share it through [`source::DiskSourceAccess::with_options`].
 //! Data packets are checked against block and tail fingerprints once per layout
 //! and source generation; recovery-only merges retain these results. Reconstruction
 //! from available Data and aliases does not require a Galois field or matrix.

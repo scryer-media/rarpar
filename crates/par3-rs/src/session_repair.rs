@@ -1,6 +1,7 @@
 //! Striped repair and verified installation for retained sessions.
 
-use std::fs::{File, OpenOptions};
+use crate::runtime::{EngineFile as File, ExecutionOptions, OpenBudgeted};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +45,8 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct ScratchFile(PathBuf);
 
 impl ScratchFile {
-    pub(crate) fn new(destination: &Path) -> EngineResult<Self> {
-        stage_path(destination).map(Self)
+    pub(crate) fn new(destination: &Path, options: &ExecutionOptions) -> EngineResult<Self> {
+        stage_path(destination, options).map(Self)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -136,11 +137,11 @@ fn repair_inner(
         }
         session.options.cancel.check()?;
         let destination = contained_destination(output, &file.path)?;
-        let temporary = stage_path(&destination)?;
+        let temporary = stage_path(&destination, &session.options)?;
         temporary_outputs.push(temporary.clone());
         OpenOptions::new()
             .write(true)
-            .open(&temporary)?
+            .open_budgeted(&temporary, &session.options)?
             .set_len(layout.files[index].len)?;
         staged.push(StagedFile {
             index,
@@ -169,7 +170,9 @@ fn repair_inner(
     }
     // Inline tails need no source and no recovery equation.
     for target in &staged {
-        let mut file = OpenOptions::new().write(true).open(&target.temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open_budgeted(&target.temporary, &session.options)?;
         for extent in &layout.files[target.index].extents {
             if let ExtentKind::Inline(bytes) = &extent.kind {
                 file.seek(SeekFrom::Start(extent.range.start))?;
@@ -246,7 +249,7 @@ pub(crate) fn stage_embedded(
     }];
     OpenOptions::new()
         .write(true)
-        .open(temporary)?
+        .open_budgeted(temporary, &session.options)?
         .set_len(layout.files[0].len)?;
     if assessment.lost_blocks.is_empty() {
         copy_available(session, layout, &targets)?;
@@ -265,7 +268,9 @@ pub(crate) fn stage_embedded(
             crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &targets, field)?,
         }
     }
-    let mut output = OpenOptions::new().write(true).open(temporary)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .open_budgeted(temporary, &session.options)?;
     for extent in &layout.files[0].extents {
         if let ExtentKind::Inline(bytes) = &extent.kind {
             output.seek(SeekFrom::Start(extent.range.start))?;
@@ -308,7 +313,14 @@ fn copy_available(
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
-            scatter(layout, outputs, block, offset, &bytes[..take])?;
+            scatter(
+                &session.options,
+                layout,
+                outputs,
+                block,
+                offset,
+                &bytes[..take],
+            )?;
             offset += take as u64;
         }
     }
@@ -351,21 +363,17 @@ where
         .ok_or(EngineError::ResourceLimit("Cauchy coefficients"))?;
     let _coefficients = session.options.memory.reserve(coefficient_bytes)?;
     let inverse = crate::cauchy::inverse_coefficients(&field, lost, &rows)?;
-    let worker_bytes = session
-        .options
-        .workers
-        .checked_mul(256 << 10)
-        .ok_or(EngineError::ResourceLimit("worker stacks"))?;
-    let _workers = session.options.memory.reserve(worker_bytes)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(session.options.workers)
-        .stack_size(256 << 10)
-        .build()
-        .map_err(|_| EngineError::ResourceLimit("worker pool"))?;
     let buffer_count = n
         .checked_mul(2)
         .and_then(|count| count.checked_add(3))
         .ok_or(EngineError::ResourceLimit("repair stripes"))?;
+    let pool = crate::runtime::WorkerPool::for_work(
+        &session.options,
+        n,
+        buffer_count
+            .checked_mul(F::SYMBOL_BYTES)
+            .ok_or(EngineError::ResourceLimit("minimum repair stripe"))?,
+    )?;
     let stripe = session
         .options
         .stripe_bytes
@@ -393,17 +401,31 @@ where
                 continue;
             }
             session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
-            scatter(layout, outputs, block, offset, &input[..take])?;
+            scatter(
+                &session.options,
+                layout,
+                outputs,
+                block,
+                offset,
+                &input[..take],
+            )?;
             if coverage.contains(&block) {
-                pool.install(|| {
-                    syndromes.par_iter_mut().zip(rows.par_iter()).try_for_each(
-                        |(syndrome, row)| -> crate::Result<()> {
-                            let factor = crate::cauchy::element(&field, block, *row)?;
-                            field.mul_acc(&mut syndrome[..take], &input[..take], factor);
-                            Ok(())
-                        },
-                    )
-                })?;
+                let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
+                    session.options.cancel.check()?;
+                    let factor = crate::cauchy::element(&field, block, *row)?;
+                    field.mul_acc(&mut syndrome[..take], &input[..take], factor);
+                    Ok(())
+                };
+                if let Some(pool) = &pool {
+                    pool.pool().install(|| {
+                        syndromes
+                            .par_iter_mut()
+                            .zip(rows.par_iter())
+                            .try_for_each(apply)
+                    })?;
+                } else {
+                    syndromes.iter_mut().zip(rows.iter()).try_for_each(apply)?;
+                }
             }
         }
         for (row, payload) in assessment.recovery.iter().enumerate() {
@@ -413,23 +435,34 @@ where
                 *to ^= from;
             }
         }
-        pool.install(|| {
-            recovered
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(column, bytes)| {
-                    bytes[..take].fill(0);
-                    for (row, syndrome) in syndromes.iter().enumerate() {
-                        field.mul_acc(
-                            &mut bytes[..take],
-                            &syndrome[..take],
-                            inverse[column * n + row],
-                        );
-                    }
-                })
-        });
+        let recover = |(column, bytes): (usize, &mut Vec<u8>)| -> EngineResult<()> {
+            session.options.cancel.check()?;
+            bytes[..take].fill(0);
+            for (row, syndrome) in syndromes.iter().enumerate() {
+                session.options.cancel.check()?;
+                field.mul_acc(
+                    &mut bytes[..take],
+                    &syndrome[..take],
+                    inverse[column * n + row],
+                );
+            }
+            Ok(())
+        };
+        if let Some(pool) = &pool {
+            pool.pool()
+                .install(|| recovered.par_iter_mut().enumerate().try_for_each(recover))?;
+        } else {
+            recovered.iter_mut().enumerate().try_for_each(recover)?;
+        }
         for (index, bytes) in lost.iter().zip(&recovered) {
-            scatter(layout, outputs, *index, offset, &bytes[..take])?;
+            scatter(
+                &session.options,
+                layout,
+                outputs,
+                *index,
+                offset,
+                &bytes[..take],
+            )?;
         }
         offset += take as u64;
     }
@@ -492,7 +525,14 @@ fn reconstruct_fft(
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(stripe as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
-            scatter(layout, outputs, block, offset, &bytes[..take])?;
+            scatter(
+                &session.options,
+                layout,
+                outputs,
+                block,
+                offset,
+                &bytes[..take],
+            )?;
             offset += take as u64;
         }
     }
@@ -530,7 +570,7 @@ fn reconstruct_fft(
                             out.fill(0);
                         } else {
                             session.read_block(block, offset, out, &mut covered[..out.len()])?;
-                            scatter(layout, outputs, block, offset, out)?;
+                            scatter(&session.options, layout, outputs, block, offset, out)?;
                         }
                     }
                     FftInput::Recovery(index) => {
@@ -542,6 +582,7 @@ fn reconstruct_fft(
             },
             |local, offset, bytes| {
                 scatter(
+                    &session.options,
                     layout,
                     outputs,
                     first + local as u64 * cohorts,
@@ -555,6 +596,7 @@ fn reconstruct_fft(
 }
 
 fn scatter(
+    options: &ExecutionOptions,
     layout: &BlockLayout,
     outputs: &[StagedFile],
     block: u64,
@@ -582,7 +624,9 @@ fn scatter(
         if start >= end {
             continue;
         }
-        let mut file = OpenOptions::new().write(true).open(&target.temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open_budgeted(&target.temporary, options)?;
         file.seek(SeekFrom::Start(extent.range.start + start - block_offset))?;
         file.write_all(&bytes[(start - offset) as usize..(end - offset) as usize])?;
     }
@@ -598,7 +642,7 @@ fn verify_staged(
     let size = session.options.stripe_bytes.min(64 << 10);
     let _buffer = session.options.memory.reserve(size)?;
     let mut buffer = vec![0u8; size];
-    let mut file = File::open(&target.temporary)?;
+    let mut file = File::open(&target.temporary, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
     for extent in &expected.extents {
         if matches!(extent.kind, ExtentKind::Unprotected) {
@@ -656,7 +700,7 @@ pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult
     Ok(path)
 }
 
-pub(crate) fn stage_path(destination: &Path) -> EngineResult<PathBuf> {
+pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> EngineResult<PathBuf> {
     let parent = destination
         .parent()
         .ok_or(EngineError::InvalidState("output has no parent"))?;
@@ -669,11 +713,13 @@ pub(crate) fn stage_path(destination: &Path) -> EngineResult<PathBuf> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary)
+            .open_budgeted(&temporary, options)
         {
             Ok(_) => return Ok(temporary),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
+            Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => return Err(error),
         }
     }
     Err(EngineError::ResourceLimit("temporary output names"))

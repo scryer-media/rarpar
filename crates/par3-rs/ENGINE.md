@@ -104,14 +104,24 @@ ceiling of 64 MiB. Reservations are conservative engine accounting, not measured
 process RSS; provider storage and allocator bookkeeping are outside that count.
 `retained_bytes`, `reserved_bytes`, and the memory budget's peak support eviction
 and measurement. Set explicit worker limits when Weaver schedules concurrent
-jobs. Clone the same memory and scan-work budgets to share ceilings across jobs.
+jobs. Clone the same memory, handle, and scan-work budgets to share ceilings.
+
+`HandleBudget` reserves each actual engine file before opening it and releases
+the lease after close, including error paths and sequential readers. Exhaustion
+is a nonblocking `ResourceLimit`; it does not wait while holding other handles.
+The default shared ceiling and `open_handles` cap are both 32. Use
+`DiskSourceAccess::with_options` to include disk providers in the same ceiling;
+custom providers own their internal resources and may acquire leases from that
+budget. `used()` and `peak()` expose live and peak handle counts.
 
 FFT admits a private worker pool after field tables, keeping headroom for a
 minimal decoder stripe. `FftCodec::worker_count()` reports the admitted ceiling;
 small transforms still run on the caller. Each worker reserves a 256 KiB stack
 plus 64 KiB of scheduler allowance. Dropping the codec joins every worker before
 returning those reservations, including after cancellation. This does not bound
-the caller's own worker pool or imply measured process RSS.
+the caller's own worker pool or imply measured process RSS. Cauchy repair uses
+the same joined pool lifetime and falls back to the caller when a pool cannot
+fit or only one recovery equation needs processing.
 
 `ScanWorkBudget` limits cumulative requested read bytes, including retries,
 partial reads, and seeks. Its default is 1 TiB; dropping or recreating a scanner
@@ -167,8 +177,8 @@ repair of larger SIMD/worker-created GF8, GF16, and uneven interleaved sets,
 including the recovery equations actually consumed.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT scheduling-threshold tuning, complete diagnostics and progress callbacks, stronger
-process-wide handle accounting and embedded replacement
+FFT scheduling-threshold tuning, complete diagnostics and progress callbacks,
+and embedded replacement
 layouts when an original manifest is absent. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
 throughput parity. Correctness results alone do not satisfy performance acceptance.
