@@ -238,7 +238,15 @@ throughput probes, reference exporters/interop, and an external RAR fixture gate
 the doctest sweep left one host-hook example ignored. These are not represented
 as passing. PAR3 reference checks are recorded separately in `INTEROPERABILITY.md`.
 
-Remaining acceptance includes matched native ARM64 and x86-64 performance and
-FFT scheduling-threshold tuning. The current reference runs in a
-local x86-64 container under emulation; its timings cannot establish native
-throughput parity. Correctness results alone do not satisfy performance acceptance.
+The 2026-09-08 native x86-64 matrix passed all 534 invocations across 54 trials,
+including reference verification and independent repaired-output hashes. Both
+codecs exceeded the reference's geometric-mean creation, verification, and
+repair throughput on that host. See `PERFORMANCE.md` for the measurements,
+resource observations, and individual shortfalls in small-file verification
+and uneven-cohort FFT repair.
+
+Matched native ARM64 performance and further FFT scheduling/decoder tuning
+remain outstanding. This first x86-64 baseline does not establish historical
+regression percentages or broad platform readiness. Earlier emulated reference
+timings are interoperability evidence only; correctness alone does not satisfy
+performance acceptance.

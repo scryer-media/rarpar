@@ -46,7 +46,30 @@ regression or use these measurements to claim a stable speedup.
 Raw local run logs were `/tmp/par3-fft-simd-bench.log` and
 `/tmp/par3-fft-simd-bench-confirm.log`. Their temporary location is not durable
 evidence; the values and limitations above preserve the observation. Repeat on
-idle ARM64 and x86-64 hosts before accepting tuning decisions. AVX2/SSSE3 paths
-also require native execution evidence. End-to-end PAR3 acceptance separately
+idle ARM64 hosts before accepting ARM64 tuning decisions. The native x86-64
+run below supplies automatic-dispatch evidence on AVX2 hardware. End-to-end PAR3 acceptance separately
 requires matched official-reference workloads, worker limits, and memory
 measurements for each codec and stage.
+
+## Native x86-64 run, 2026-09-08
+
+Intel Core i5-1240P on native Linux, Rust 1.98.1, release build with
+`-C target-cpu=native`. One worker pinned to P-core logical CPU 0; existing
+services and the `powersave` governor were left running unchanged. The command
+above used 20 samples, one second of warmup, and three seconds of measurement
+per shape/backend. Every forward/inverse round trip restored the original rows.
+
+Criterion arithmetic-mean estimates (not its fitted slope):
+
+| Field and symbol shape | Scalar pair | Automatic pair | Speedup |
+| --- | ---: | ---: | ---: |
+| GF8, 128 × 64 | 102.217 µs | 16.091 µs | 6.35× |
+| GF8, 128 × 4096 | 6.0077 ms | 0.63769 ms | 9.42× |
+| GF16, 1024 × 64 | 1.13315 ms | 0.15355 ms | 7.38× |
+| GF16, 1024 × 4096 | 75.4635 ms | 7.42368 ms | 10.17× |
+
+Raw Criterion samples, estimates, console output, and host provenance are
+preserved in `crates/par3-rs/benchmarks/native-x86-20260908.tar.gz` at the
+repository root. These are primitive transform measurements; see the
+[PAR3 native report](../par3-rs/PERFORMANCE.md) for the separate matched
+reference workloads, memory observations, and remaining acceptance limits.

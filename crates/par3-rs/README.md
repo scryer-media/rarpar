@@ -8,9 +8,10 @@ low-rate FFT recovery, virtual sources, incremental verification, and repair
 sessions that retain evidence as more data arrives.
 
 **Status:** a 0.x library with reference interoperability tests. Matched native
-performance acceptance remains outstanding. See [Scope](#scope) for supported
-formats and exclusions. This is independent, clean-room software, not official
-Parchive tooling.
+performance acceptance remains outstanding; initial
+[native x86-64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
+are available. See [Scope](#scope) for supported formats and exclusions. This is
+independent, clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
