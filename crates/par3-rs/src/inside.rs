@@ -10,6 +10,10 @@ use std::ops::Range;
 mod create;
 pub use create::{InsertionPlan, InsertionRequirements};
 
+#[path = "inside_repair.rs"]
+mod repair;
+pub use repair::{SelfRepairPlan, SelfRepairReport};
+
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions};

@@ -77,7 +77,11 @@
 //! - Incremental backups: a Start packet's parent set is exposed, but parent
 //!   packets are never followed.
 //! - Permissions and link packets, beyond keeping their bytes.
-//! - PAR-inside self-repair. [`inside::InsertionPlan`] supports staged Cauchy
+//! - PAR-inside repair without a captured authenticated carrier manifest.
+//!   [`inside::SelfRepairPlan`] stages protected-data reconstruction, preserves
+//!   valid packets and regenerates missing packets from verified input blocks.
+//!   Reference ZIP/ZIP64 and 7z fixtures restore byte for byte, including packet holes.
+//!   [`inside::InsertionPlan`] supports staged Cauchy
 //!   insertion into ZIP/ZIP64 and 7z, validated by the reference's self-verifier
 //!   and self-repairer after protected-byte damage. The convenience
 //!   verifier still reports unprotected chunks as unverifiable.

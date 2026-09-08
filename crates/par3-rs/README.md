@@ -194,7 +194,12 @@ Still unsupported:
   blocks out of its External Data packets — and is never checked as a unit.
 - Incremental backups: a Start packet's parent set is exposed, never followed.
 - Interpreting link and permission packets, beyond keeping their bytes.
-- PAR-inside self-repair. `inside::InsertionPlan` now plans and stages Cauchy
+- PAR-inside repair without an authenticated original carrier manifest.
+  `inside::SelfRepairPlan` captures the original packet order and boundaries,
+  restores damaged protected bytes into separate staging, preserves valid
+  embedded packets, and regenerates missing packets only from verified blocks.
+  ZIP/ZIP64 and 7z reference fixtures restore byte for byte with packet holes.
+  `inside::InsertionPlan` plans and stages Cauchy
   insertion into ZIP/ZIP64 and 7z. The pinned reference verifies newly inserted
   output and repairs damaged protected bytes back byte for byte. Original member bytes
   are preserved, ZIP footers are duplicated, and ambiguous trailing data is

@@ -56,12 +56,29 @@ impl CarrierPlan {
     /// carrier. Gaps, trailing bytes, mixed sources and incomplete captures are
     /// refused; filenames never supply missing layout information.
     pub fn capture(packets: &[IngestedPacket], options: &ExecutionOptions) -> EngineResult<Self> {
+        let end = packets
+            .first()
+            .ok_or(EngineError::InvalidState("empty carrier capture"))?
+            .origin()
+            .snapshot
+            .len;
+        Self::capture_range(packets, 0..end, options)
+    }
+
+    pub(crate) fn capture_range(
+        packets: &[IngestedPacket],
+        range: std::ops::Range<u64>,
+        options: &ExecutionOptions,
+    ) -> EngineResult<Self> {
         options.validate()?;
         let first = packets
             .first()
             .ok_or(EngineError::InvalidState("empty carrier capture"))?;
         let origin = first.origin();
-        let mut next = 0;
+        if range.start >= range.end || range.end > origin.snapshot.len {
+            return Err(EngineError::InvalidState("invalid carrier capture range"));
+        }
+        let mut next = range.start;
         let mut cost = 0usize;
         for packet in packets {
             let at = packet.origin();
@@ -85,7 +102,7 @@ impl CarrierPlan {
                 }))
                 .ok_or(EngineError::ResourceLimit("carrier manifest"))?;
         }
-        if next != origin.snapshot.len {
+        if next != range.end {
             return Err(EngineError::InvalidState(
                 "carrier capture does not cover its full length",
             ));
@@ -110,7 +127,7 @@ impl CarrierPlan {
             id: first.input_set_id(),
             entries,
             restoration: CarrierRestoration::Exact,
-            bytes: next,
+            bytes: next - range.start,
             _reservation: reservation,
         })
     }
@@ -258,9 +275,51 @@ impl CarrierPlan {
             )
             .into());
         }
+        let _reuse_memory = session.options.memory.reserve(
+            self.entries
+                .len()
+                .checked_mul(256)
+                .ok_or(EngineError::ResourceLimit("carrier reuse map"))?,
+        )?;
+        let mut reusable = BTreeMap::new();
+        for entry in &self.entries {
+            let Entry::Payload {
+                expected: Some(hash),
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if reusable.contains_key(hash) {
+                continue;
+            }
+            if let Some(payload) = session
+                .input
+                .packets()
+                .find(|packet| packet.hash() == *hash)
+                .and_then(|packet| packet.payload())
+            {
+                match payload.validate(&session.options) {
+                    Ok(()) => {
+                        reusable.insert(*hash, payload);
+                    }
+                    Err(
+                        EngineError::Unavailable { .. }
+                        | EngineError::SourceChanged { .. }
+                        | EngineError::Format(crate::Par3Error::PacketHashMismatch { .. }),
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         let mut slots = BTreeMap::new();
         for entry in &self.entries {
-            if let Entry::Payload { kind, length, .. } = entry {
+            if let Entry::Payload {
+                kind,
+                length,
+                expected,
+            } = entry
+            {
                 if *length > set.block_size() {
                     return Err(EngineError::InvalidState(
                         "carrier payload exceeds block size",
@@ -275,8 +334,10 @@ impl CarrierPlan {
                         if root != set.root_hash() {
                             return Err(EngineError::InvalidState("carrier recovery root differs"));
                         }
-                        let next = slots.len();
-                        slots.entry((matrix, index)).or_insert(next);
+                        if !expected.is_some_and(|hash| reusable.contains_key(&hash)) {
+                            let next = slots.len();
+                            slots.entry((matrix, index)).or_insert(next);
+                        }
                     }
                     PayloadKind::Data { index } if index >= set.block_count() => {
                         return Err(EngineError::InvalidState(
@@ -293,13 +354,17 @@ impl CarrierPlan {
                 .checked_mul(256)
                 .ok_or(EngineError::ResourceLimit("carrier equations"))?,
         )?;
-        let scratch_path =
-            crate::session_repair::stage_path(&scratch_directory.join("carrier-spool"))?;
+        let scratch_file =
+            crate::session_repair::ScratchFile::new(&scratch_directory.join("carrier-spool"))?;
         let mut scratch = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&scratch_path)?;
-        scratch.set_len(self.scratch_bytes(set.block_size())?)?;
+            .open(scratch_file.path())?;
+        scratch.set_len(
+            (slots.len() as u64)
+                .checked_mul(set.block_size())
+                .ok_or(EngineError::ResourceLimit("carrier scratch size"))?,
+        )?;
         for matrix in slots
             .keys()
             .map(|key| key.0)
@@ -398,8 +463,9 @@ impl CarrierPlan {
                 _ => return Err(EngineError::Unsupported("carrier matrix execution")),
             }
         }
-        let temporary = crate::session_repair::stage_path(destination)?;
-        let mut out = OpenOptions::new().write(true).open(&temporary)?;
+        let output_file = crate::session_repair::ScratchFile::new(destination)?;
+        let temporary = output_file.path();
+        let mut out = OpenOptions::new().write(true).open(temporary)?;
         let stripe = session.options.stripe_bytes.min(64 << 10);
         let _buffers = session.options.memory.reserve(
             stripe
@@ -467,18 +533,24 @@ impl CarrierPlan {
                 while offset < *length {
                     session.options.cancel.check()?;
                     let take = (length - offset).min(stripe as u64) as usize;
-                    match *kind {
-                        PayloadKind::Data { index } => session.read_block(
-                            index,
-                            offset,
-                            &mut bytes[..take],
-                            &mut covered[..take],
-                        )?,
-                        PayloadKind::Recovery { matrix, index, .. } => {
-                            scratch.seek(SeekFrom::Start(
-                                slots[&(matrix, index)] as u64 * set.block_size() + offset,
-                            ))?;
-                            scratch.read_exact(&mut bytes[..take])?;
+                    if let Some(payload) = expected.and_then(|hash| reusable.get(&hash)) {
+                        if payload.read_at(offset, &mut bytes[..take])? != take {
+                            return Err(EngineError::InvalidState("reused carrier payload length"));
+                        }
+                    } else {
+                        match *kind {
+                            PayloadKind::Data { index } => session.read_block(
+                                index,
+                                offset,
+                                &mut bytes[..take],
+                                &mut covered[..take],
+                            )?,
+                            PayloadKind::Recovery { matrix, index, .. } => {
+                                scratch.seek(SeekFrom::Start(
+                                    slots[&(matrix, index)] as u64 * set.block_size() + offset,
+                                ))?;
+                                scratch.read_exact(&mut bytes[..take])?;
+                            }
                         }
                     }
                     if pass == 0 {
@@ -492,14 +564,12 @@ impl CarrierPlan {
         }
         out.sync_all()?;
         drop(out);
-        if std::fs::metadata(&temporary)?.len() != self.bytes {
+        if std::fs::metadata(temporary)?.len() != self.bytes {
             return Err(EngineError::InvalidState("rebuilt carrier length differs"));
         }
         session.options.cancel.check()?;
-        std::fs::hard_link(&temporary, destination)?;
-        std::fs::remove_file(temporary)?;
+        std::fs::hard_link(temporary, destination)?;
         drop(scratch);
-        std::fs::remove_file(scratch_path)?;
         Ok(CarrierReport {
             path: destination.to_owned(),
             restoration: self.restoration,

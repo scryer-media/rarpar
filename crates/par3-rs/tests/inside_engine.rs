@@ -47,6 +47,170 @@ fn export_inserted_archives_for_reference_validation() {
     }
 }
 
+#[test]
+fn captured_self_repair_restores_official_archives_with_missing_packets() {
+    use par3_rs::ingest::{PacketScanner, ScanEvent};
+    use par3_rs::inside::SelfRepairPlan;
+    use par3_rs::session::Par3RepairSession;
+    use std::sync::Arc;
+
+    for (kind, original, inserted) in cases() {
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        let mut clean = MemorySourceAccess::default();
+        clean.insert(SourceId(1), 1, inserted.into());
+        let mut scanner = PacketScanner::new(
+            Arc::new(clean),
+            SourceId(1),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        loop {
+            match scanner.poll().unwrap() {
+                ScanEvent::Packet(packet) => packets.push(packet),
+                ScanEvent::End => break,
+                ScanEvent::NeedData { .. } => panic!("complete reference archive"),
+            }
+        }
+        for damage_protected in [false, true] {
+            let mut damaged = inserted.to_vec();
+            // Only regenerated protected input is damaged; PAR3 packet bytes
+            // remain official. Packet loss is represented by an unavailable range.
+            if damage_protected {
+                damaged[100] ^= 0x80;
+            }
+            let omitted = if damage_protected {
+                packets
+                    .iter()
+                    .find(|packet| packet.metadata().is_some())
+                    .unwrap()
+            } else {
+                packets
+                    .iter()
+                    .rev()
+                    .find(|packet| packet.payload().is_some())
+                    .unwrap()
+            };
+            let origin = omitted.origin();
+            let hole = origin.offset..origin.offset + origin.length;
+            let access = Arc::new(HoleyArchive {
+                bytes: damaged,
+                hole,
+            });
+            let mut session =
+                Par3RepairSession::new(packets[0].input_set_id(), access.clone(), options.clone())
+                    .unwrap();
+            // Preserve an authenticated manifest before the packet becomes
+            // unavailable, but never admit its old payload into current analysis.
+            for packet in packets.iter().filter(|packet| packet.metadata().is_some()) {
+                session.merge(packet.clone()).unwrap();
+            }
+            let plan = SelfRepairPlan::capture(&mut session, &packets, ContainerLimits::default())
+                .unwrap();
+            let layout = session.layout().unwrap().unwrap();
+            session
+                .bind_file(&layout.files()[0].path, SourceId(1))
+                .unwrap();
+            assert!(original.len() > 100);
+            let mut current = PacketScanner::new(
+                access,
+                SourceId(1),
+                options.clone(),
+                par3_rs::ScanLimits::default(),
+            )
+            .unwrap();
+            loop {
+                match current.poll().unwrap() {
+                    ScanEvent::Packet(packet) => {
+                        session.merge(packet).unwrap();
+                    }
+                    ScanEvent::NeedData { offset } if offset < origin.offset + origin.length => {
+                        current.seek(origin.offset + origin.length).unwrap();
+                    }
+                    ScanEvent::End | ScanEvent::NeedData { .. } => break,
+                }
+            }
+            let tree = common::TempTree::new(&format!("self-repair-{kind:?}-{damage_protected}"));
+            let output = tree.path().join("repaired.archive");
+            let scratch = tree.path().join("scratch");
+            std::fs::create_dir(&scratch).unwrap();
+            let assessment = session.assess().unwrap();
+            assert!(
+                matches!(
+                    assessment.status,
+                    par3_rs::session::RepairStatus::Complete
+                        | par3_rs::session::RepairStatus::Ready
+                ),
+                "{kind:?} damage={damage_protected}: {assessment:?}"
+            );
+            let report = plan.execute(&mut session, &output, &scratch).unwrap();
+            assert_eq!(report.kind, kind);
+            assert_eq!(report.reconstructed_blocks != 0, damage_protected);
+            assert_eq!(report.recovery_packets, usize::from(!damage_protected));
+            assert_eq!(std::fs::read(&output).unwrap(), inserted);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert!(matches!(
+                plan.execute(&mut session, &output, &scratch),
+                Err(EngineError::Io(_))
+            ));
+            assert!(
+                SelfRepairPlan::capture(
+                    &mut session,
+                    &packets[..packets.len() - 1],
+                    ContainerLimits::default()
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+struct HoleyArchive {
+    bytes: Vec<u8>,
+    hole: std::ops::Range<u64>,
+}
+impl par3_rs::source::SourceAccess for HoleyArchive {
+    fn snapshot(&self, _: SourceId) -> std::io::Result<Option<par3_rs::source::SourceSnapshot>> {
+        Ok(Some(par3_rs::source::SourceSnapshot {
+            len: self.bytes.len() as u64,
+            generation: 2,
+        }))
+    }
+    fn read_at(&self, _: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        let end = if offset < self.hole.start {
+            self.hole.start
+        } else if offset < self.hole.end {
+            return Ok(0);
+        } else {
+            self.bytes.len() as u64
+        };
+        let count = end.saturating_sub(offset).min(out.len() as u64) as usize;
+        if count != 0 {
+            out[..count].copy_from_slice(&self.bytes[offset as usize..offset as usize + count]);
+        }
+        Ok(count)
+    }
+    fn next_available(
+        &self,
+        _: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        let start = if self.hole.contains(&offset) {
+            self.hole.end
+        } else {
+            offset
+        };
+        let end = if start < self.hole.start {
+            self.hole.start
+        } else {
+            self.bytes.len() as u64
+        };
+        Ok((start < end).then_some(start..end))
+    }
+}
+
 fn cases() -> [(ContainerKind, &'static [u8], &'static [u8]); 3] {
     [
         (

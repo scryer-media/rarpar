@@ -40,6 +40,25 @@ struct StagedFile {
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// An exclusively created disposable file, removed on every exit path.
+pub(crate) struct ScratchFile(PathBuf);
+
+impl ScratchFile {
+    pub(crate) fn new(destination: &Path) -> EngineResult<Self> {
+        stage_path(destination).map(Self)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub(crate) fn repair(
     session: &mut Par3RepairSession,
     output: &Path,
@@ -175,6 +194,89 @@ fn repair_inner(
             path: target.destination,
             backup: saved,
         });
+    }
+    Ok(assessment.lost_blocks.len() as u64)
+}
+
+/// Private scratch operation for self-repair. The unprotected gap remains
+/// unavailable to callers until the self-repair operation fills and validates it.
+pub(crate) fn stage_embedded(
+    session: &mut Par3RepairSession,
+    temporary: &Path,
+) -> EngineResult<u64> {
+    session.options.validate()?;
+    if !matches!(
+        session.assess()?.status,
+        RepairStatus::Ready | RepairStatus::Complete
+    ) {
+        return Err(EngineError::InvalidState("embedded repair is not ready"));
+    }
+    if session.options.open_handles < 3 {
+        return Err(EngineError::ResourceLimit(
+            "embedded repair requires three handles",
+        ));
+    }
+    let layout = session.layout.as_ref().expect("assessed layout");
+    if layout.files.len() != 1 {
+        return Err(EngineError::Unsupported(
+            "embedded repair requires one file",
+        ));
+    }
+    let assessment = session.assessment.as_ref().expect("assessment");
+    for evidence in session.evidence.values() {
+        crate::source::ensure_snapshot(
+            session.access.as_ref(),
+            evidence.source,
+            evidence.snapshot,
+        )?;
+    }
+    for payload in assessment
+        .recovery
+        .iter()
+        .chain(session.data_payloads().values())
+    {
+        payload.validate(&session.options)?;
+    }
+    let targets = [StagedFile {
+        index: 0,
+        destination: temporary.to_owned(),
+        temporary: temporary.to_owned(),
+    }];
+    OpenOptions::new()
+        .write(true)
+        .open(temporary)?
+        .set_len(layout.files[0].len)?;
+    if layout.block_count != 0 {
+        let set = session.set.as_ref().expect("assessed set");
+        let _field = session
+            .options
+            .memory
+            .reserve(if set.galois_field().size == 2 {
+                512 << 10
+            } else {
+                4096
+            })?;
+        match crate::gf::for_set(&set.galois_field())? {
+            crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &targets, field)?,
+            crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &targets, field)?,
+        }
+    }
+    let mut output = OpenOptions::new().write(true).open(temporary)?;
+    for extent in &layout.files[0].extents {
+        if let ExtentKind::Inline(bytes) = &extent.kind {
+            output.seek(SeekFrom::Start(extent.range.start))?;
+            output.write_all(bytes)?;
+        }
+    }
+    output.sync_all()?;
+    drop(output);
+    verify_staged(session, layout, &targets[0])?;
+    for evidence in session.evidence.values() {
+        crate::source::ensure_snapshot(
+            session.access.as_ref(),
+            evidence.source,
+            evidence.snapshot,
+        )?;
     }
     Ok(assessment.lost_blocks.len() as u64)
 }
@@ -464,17 +566,21 @@ fn verify_staged(
     let mut buffer = vec![0u8; size];
     let mut file = File::open(&target.temporary)?;
     let mut hash = crate::FingerprintHasher::new();
-    let mut count = 0u64;
-    loop {
-        session.options.cancel.check()?;
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    for extent in &expected.extents {
+        if matches!(extent.kind, ExtentKind::Unprotected) {
+            continue;
         }
-        hash.update(&buffer[..read]);
-        count += read as u64;
+        file.seek(SeekFrom::Start(extent.range.start))?;
+        let mut remaining = extent.range.end - extent.range.start;
+        while remaining != 0 {
+            session.options.cancel.check()?;
+            let take = remaining.min(size as u64) as usize;
+            file.read_exact(&mut buffer[..take])?;
+            hash.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
     }
-    if count != expected.len
+    if file.metadata()?.len() != expected.len
         || expected.fingerprint == [0; 16]
         || hash.finalize() != expected.fingerprint
     {
