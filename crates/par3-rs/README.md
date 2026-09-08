@@ -3,284 +3,267 @@
 [![crates.io](https://img.shields.io/crates/v/par3-rs.svg)](https://crates.io/crates/par3-rs)
 [![docs.rs](https://docs.rs/par3-rs/badge.svg)](https://docs.rs/par3-rs)
 
-Reading, creating and repairing PAR3 (Parity Volume Set 3.0) recovery files in
-pure Rust: packet parsing, set inspection, verification of the files a set
-protects, the Cauchy Reed-Solomon arithmetic PAR3 recovery data is built from,
-creating a complete set from a list of input files, and putting damaged and
-missing files back from one.
+Read, verify, create, and repair PAR3 recovery sets in Rust. Supports Cauchy and
+low-rate FFT recovery, virtual sources, incremental verification, and repair
+sessions that retain evidence as more data arrives.
 
-**This is a work in progress.** It reads, inspects, verifies, creates and
-repairs PAR3 sets built with the reference implementation's default settings —
-a Cauchy matrix over GF(2^8) or GF(2^16), chunk tails packed into shared blocks,
-and power-of-two recovery volumes. Everything outside that is listed under
-[Scope](#scope); read it before depending on this crate.
+**Status:** a 0.x library with reference interoperability tests. Verification and
+repair exceed the reference's throughput aggregates in the measured
+[native x86-64 and ARM64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
+with matched worker limits. Default ARM64 FFT creation still falls short.
+See [Scope](#scope) for supported formats and exclusions. This is independent,
+clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
 par3-rs = "0.2"
 ```
 
-## Usage
+## Choose an API
 
-```rust
-use par3_rs::{Par3Set, Result, VerifyReport, scan_packets_from_path, verify_set};
+- **Files on disk, default Cauchy sets:** use `scan_packets_from_path`,
+  `Par3Set`, `verify_set`, `create::create`, and `repair::repair_set`.
+- **Streaming or virtual input, FFT, or bounded memory:** use
+  `ingest::PacketScanner` and `Par3RepairSession`. Supply bytes through
+  `source::SourceAccess`; paths are optional.
+- **Advanced creation:** use `creation::CreationPlan` to select a codec,
+  interleaving, deduplication, Data packets, and recovery-volume layout.
+- **Recovery carriers or embedded protection:** use `carrier::CarrierPlan`
+  and `inside::{InsertionPlan, SelfRepairPlan}`.
+
+See the [API documentation](https://docs.rs/par3-rs/latest/par3_rs/) and
+[streaming engine contract](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/ENGINE.md).
+The engine APIs are synchronous and fit blocking workers; the host owns
+downloading, scheduling, persistence, and extraction policy.
+
+## Verify files
+
+An index normally contains enough metadata to verify protected files. To repair,
+also load the available recovery volumes, as shown in the next example.
+
+```rust,no_run
+use par3_rs::{
+    Par3Set, Result, scan_packets_from_path, verify_set,
+};
 use std::path::Path;
 
 fn main() -> Result<()> {
-    let packets = scan_packets_from_path(Path::new("archive.par3"))?
+    let packets = scan_packets_from_path(Path::new("set.par3"))?
         .into_iter()
-        .map(|(_offset, packet)| packet)
+        .map(|(_, packet)| packet)
         .collect();
 
     for set in Par3Set::from_packets(packets)? {
-        println!("set {} — {} files", set.input_set_id(), set.files().len());
-        let report: VerifyReport = verify_set(&set, Path::new("."))?;
-        println!("{} complete, {} damaged, {} missing",
-            report.complete_count(), report.damaged_count(), report.missing_count());
+        let report = verify_set(&set, Path::new("data"))?;
+        println!("{} files complete", report.complete_count());
     }
     Ok(())
 }
 ```
 
-## Creating a set
+## Repair a Cauchy set
 
-```rust
-use par3_rs::create::{CreateOptions, InputSpec, RecoveryAmount, create};
+Supply the carriers that actually arrived. Filenames do not establish set
+membership or recovery availability; authenticated packets do.
+
+```rust,no_run
+use par3_rs::{Par3Set, Result, scan_packets_from_path};
+use par3_rs::repair::{RepairOptions, repair_set};
+use std::path::Path;
+
+fn main() -> Result<()> {
+    let base = Path::new("data");
+    let carriers = ["set.par3", "set.vol0+1.par3"];
+    let mut packets = Vec::new();
+    for name in carriers {
+        let path = Path::new(name);
+        for (_, packet) in scan_packets_from_path(path)? {
+            packets.push(packet);
+        }
+    }
+
+    for set in Par3Set::from_packets(packets)? {
+        let report = repair_set(
+            &set, base, &RepairOptions::default(),
+        )?;
+        for file in report.repaired() {
+            println!("{}: verified={}",
+                file.path(), file.verified());
+        }
+        if !report.is_complete() {
+            eprintln!("repair is incomplete");
+        }
+    }
+    Ok(())
+}
+```
+
+Clean files are left alone. Rebuilt files are staged and verified before
+installation; backups are enabled by default. Inspect the report for incomplete
+repairs. `plan_repair` is available for a separate assessment, but
+`repair_set` performs its own analysis. Use a retained session to reuse evidence.
+
+The convenience scanner reads each carrier into memory, and the legacy codec
+retains whole recovery rows. Use the incremental engine for large carriers or
+strict allocation budgets.
+Its packet scanner reuses a bounded read-ahead stripe across packet boundaries;
+both scanner buffers are charged to the allocation budget, and source-generation
+checks still apply to cached bytes.
+
+## Create a Cauchy set
+
+```rust,no_run
+use par3_rs::create::{
+    CreateOptions, InputSpec, RecoveryAmount, create,
+};
 use par3_rs::Result;
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
-    let base = Path::new("/srv/releases/2026-09");
-    let files = [PathBuf::from("disc.iso"), PathBuf::from("notes/readme.txt")];
-
+    let base = Path::new("data");
+    let files = [PathBuf::from("disc.iso")];
+    let options = CreateOptions::default()
+        .with_recovery(RecoveryAmount::Percent(10));
     let report = create(
         &InputSpec::new(base, &files),
-        &base.join("disc.par3"),
-        &CreateOptions::default()
-            .with_recovery(RecoveryAmount::Percent(10))
-            .with_comment("2026-09 release"),
+        Path::new("set.par3"),
+        &options,
     )?;
-
-    println!("{} blocks of {} bytes, {} recovery blocks",
-        report.block_count, report.block_size, report.recovery_count);
-    for path in &report.files_written {
-        println!("wrote {}", path.display());
-    }
+    println!("{} recovery blocks", report.recovery_count);
     Ok(())
 }
 ```
 
-With no explicit block size, `suggest_block_size` picks one the way the
-reference implementation would. Each input file is read exactly once.
+This convenience API chooses the block size when none is supplied, reads each
+input file once, and preserves the reference-compatible default output.
 
-## Repairing a set
+For advanced creation, inspect `CreationPlan::requirements()` before execution.
+It reports block counts, recovery geometry, output sizes, and scratch space.
+File and chunk hashes share one planning pass; sliding deduplication can read
+additional candidate windows. Encoding reads sources again. Destinations must
+be absent; execution uses a caller-selected scratch directory.
 
-```rust
-use par3_rs::repair::{RepairLimits, RepairOptions, plan_repair, repair_set};
-use par3_rs::{Par3Set, Result, scan_packets_from_path};
-use std::path::Path;
+`execute` preserves file synchronization before installation. Standalone
+creators can explicitly use `execute_with_durability` with
+`CreationDurability::Buffered` to omit storage barriers. Both modes flush
+application buffers and authenticate staged carriers; buffered output can be
+lost after a crash. Neither mode promises atomic set installation across a
+crash. Verification and repair retain their existing behavior.
 
-fn main() -> Result<()> {
-    let base = Path::new("/srv/releases/2026-09");
-    let packets = scan_packets_from_path(&base.join("disc.par3"))?
-        .into_iter()
-        .map(|(_offset, packet)| packet)
-        .collect();
-    let set = &Par3Set::from_packets(packets)?[0];
+## Streaming and resource limits
 
-    // The dry run: what is wrong, and whether there is enough to fix it.
-    let plan = plan_repair(set, base, &RepairLimits::default())?;
-    if !plan.is_possible() {
-        println!("{} more recovery blocks needed", plan.missing_recovery_blocks());
-        return Ok(());
-    }
+`PacketScanner` authenticates packets incrementally and keeps lazy references
+to recovery and Data payloads. `Par3RepairSession` retains layout, evidence,
+and assessment. Duplicate packets do not increase recovery availability.
 
-    for file in repair_set(set, base, &RepairOptions::default())?.repaired() {
-        println!("rebuilt {}", file.path());
-    }
-    Ok(())
-}
-```
+Feed positioned decoded bytes to `evidence::StreamingVerifier`, then admit its
+evidence to the session. Verified prefixes and unresolved file ranges support
+extraction readiness. Unchanged assessments and recovery-only merges do not
+reread protected sources. Recovery requirements identify the matrix, cohort,
+admissible indices, and deficit.
 
-Files that verify complete are never touched. Each rebuilt file is written under
-a temporary name, checked against its File packet there, and only then moved
-into place, over a backup of the damaged one (`<name>.1`, `.2`, …) unless
-`RepairOptions::backup` is off. A rebuild that does not check out is left under
-its temporary name and reported, and the file it was to replace is left alone.
-Nothing is read whole into memory, at any size of file.
+Source identities, generations, and published bytes must follow the
+`SourceAccess` contract. Holes are unavailable bytes, never implicit zeroes.
+Checkpoint replay also requires a digest preserved separately in trusted host
+metadata. A digest computed from the replay blob does not establish trust.
 
-The temporary is created exclusively, so a link planted under its name before
-the repair is refused rather than followed and truncated (a plain file left
-there by an interrupted repair is replaced), and a set directory that has been
-replaced by a link is refused before its file is rebuilt. That protects against
-what was put in place before the repair started; the base directory itself, and
-what happens to the tree while the repair is running, are the caller's.
+Default engine budgets:
 
-## Trying it from a shell
+- **256 MiB** shared allocation accounting, including retained state.
+- **64 MiB** retained state per session.
+- **32** open engine handles, with shared leases across cloned options.
+- **1 TiB** cumulative requested carrier-scanning bytes.
 
-`examples/par3rs.rs` drives all four of those from the command line, so the API
-can be tried without writing a program first. It is an example rather than a
-tool — crude argument parsing, plain-text output, no configuration — and it is
-not official PAR3 tooling.
+Set worker limits explicitly when running concurrent jobs. Clone the same
+budgets to share ceilings, and use `DiskSourceAccess::with_options` to include
+disk-provider handles. Provider storage and allocator overhead are outside
+engine accounting; it is not a process-RSS limit. Out-of-order verification
+drops incomplete hash work when its budget is exhausted, leaving those extents
+unknown for later reading.
 
-```sh
-cargo run --example par3rs -- create ./data ./data/disc.par3 -r 10 disc.iso notes/readme.txt
-cargo run --example par3rs -- list ./data/disc.par3 ./data/disc.vol0+1.par3
-cargo run --example par3rs -- verify ./data ./data/disc.par3
-cargo run --example par3rs -- repair ./data ./data/*.par3
-```
-
-It exits 0 when the set is complete, 1 when files are missing, damaged, or
-beyond what the recovery blocks on hand can fix, and 2 when the command could
-not be carried out at all.
+Cancellation, progress callbacks, stage timings, I/O counters, and typed
+resource/I/O outcomes are available through `runtime`. Convenience APIs instead
+use their own `ScanLimits`, `SetLimits`, `CodecLimits`, `CreateLimits`, and
+`RepairLimits`; their defaults are documented on those types.
 
 ## Scope
 
-In:
+The incremental engine supports:
 
-- The two PAR3 hash functions: CRC-64/GO-ISO and 16-byte BLAKE3.
-- Packet framing, and scanning a byte range for packets while skipping damage.
-- Typed parsing and re-serialisation of Creator, Comment, Start, Data, External
-  Data, all four Matrix kinds, Recovery Data, Recovery External Data, File,
-  Directory and Root packets. Every other packet type is retained verbatim, so
-  anything read writes back byte for byte.
-- Grouping packets into input sets and resolving each set's files and
-  directories into paths.
-- An inventory of the recovery blocks a set carries: which indices exist, which
-  matrix each was computed with, and whether that matrix packet is present.
-- Whole-file verification, with a mismatch narrowed down to the input blocks
-  that failed.
-- Arithmetic in both Galois fields PAR3 uses, GF(2^8) with `0x11D` and GF(2^16)
-  with `0x1100B`: scalar, table-driven, portable, no `unsafe`.
-- The Cauchy Reed-Solomon codec: a streaming encoder that computes a set's
-  recovery blocks from its input blocks, and a streaming decoder that solves for
-  lost input blocks from the recovery blocks that survived.
-- Creating a set: choosing the block size, laying out the input blocks, packing
-  chunk tails into shared blocks, computing the Cauchy code in either field,
-  and writing the index file and power-of-two recovery volumes
-  (`<stem>.par3`, `<stem>.vol0+1.par3`, `<stem>.vol1+2.par3`, …). For the same
-  inputs and settings, the bytes match what the reference implementation writes.
-- Repairing a set: deciding which input blocks were lost, reading the survivors
-  and the tails packed beside them off the disk, solving for the rest with the
-  recovery blocks the set carries, and writing every damaged or missing file
-  back — including files inside directories that are themselves gone.
+- Cauchy over GF(2⁸) and GF(2¹⁶), and low-rate FFT with interleaved cohorts.
+  Interleaving permits more than 65,536 total blocks within per-cohort limits.
+- Shared blocks, packed and inline tails, repeated chunks, Data packets, and
+  protected/unprotected file extents.
+- Aligned or sliding deduplication during advanced creation, plus explicit
+  candidate placement using CRC64 and BLAKE3 confirmation.
+- Variable, uniform, or size-limited recovery volumes.
+- Recovery-carrier reconstruction from a captured manifest, or an explicitly
+  requested replacement when original packet order is unknown.
+- Cauchy PAR-inside insertion and self-repair for supported ZIP, ZIP64, and 7z
+  layouts, preserving existing archive member bytes and compression.
 
-Out, for this release:
+Packed tail blocks have no invented block checksum: each described tail is
+verified against its own fingerprint. CRC64 localizes candidates; BLAKE3
+establishes the required PAR3 integrity evidence.
 
-- Repairing the recovery volumes themselves. A recovery block that does not
-  parse is not available to a repair, and nothing puts it back.
-- Finding a file that was renamed or moved: it counts as missing and is rebuilt
-  from recovery data, and whatever took its place is not looked at.
-- Recovery from anything but a Cauchy matrix: the FFT, sparse and explicit
-  matrix packets are parsed and kept, and nothing is computed from them. A set
-  whose recovery data names one of them is refused rather than misread.
-- The sliding rolling-hash search that finds blocks whose position has moved. A
-  file whose bytes are all present but shifted is rebuilt like any other damage.
-- Checking a block of packed tails as a block. Each file's own tail is checked
-  against the hashes in its chunk description; the block those tails share
-  carries no checksum of its own — the reference implementation leaves tail
-  blocks out of its External Data packets — and is never checked as a unit.
-- Incremental backups: a Start packet's parent set is exposed, never followed.
-- Interpreting link and permission packets, beyond keeping their bytes.
-- "Par inside", where PAR3 packets live within the file they protect. Files with
-  unprotected chunks are reported as unverifiable.
-- Creating anything beyond a plain set: no deduplication, no Data packets, no
-  unprotected chunks, no splitting a file into several chunks, no link or
-  permission packets, no parent set, and no matrix but Cauchy.
-- Any command-line interface. `examples/par3rs.rs` demonstrates the API from a
-  shell; it is not a tool, and nothing here is a supported front-end.
+Still outside scope:
 
-## The specification and the reference disagree
+- Sparse/explicit matrix execution and high-rate FFT.
+- Parent-set backups, permission/link restoration, and recursive PAR-inside.
+- Automatic source-directory discovery and arbitrary unprotected creation
+  layouts beyond supported container insertion.
+- Inferring an unknown carrier's original byte order or missing set metadata.
+- A supported CLI. The repository's `par3rs` example is a convenience-API demo.
 
-PAR3 has a published specification draft and a reference implementation that do
-not match. Where they differ, this crate follows the reference implementation,
-because that is what produced the files that exist. The differences that change
-how bytes are read:
+Ordinary repair does not silently remove embedded protection. Use the explicit
+PAR-inside APIs; exact carrier restoration requires an authenticated manifest.
+The convenience verifier reports unprotected chunks as unverifiable.
 
-| Area | Specification draft | What this crate reads |
-| --- | --- | --- |
-| Galois field size | 2-byte field | 1 byte |
-| Start packet | Begins with 8 random bytes | No random bytes; the older layout is detected by body length and preserved |
-| InputSetID | First 8 bytes of the BLAKE3 of the Start body | Not derivable from anything stored; an opaque grouping key |
-| File packet | No whole-file hash | 16-byte BLAKE3 of the file's protected data |
-| Chunk descriptions | Per-chunk fingerprint | No per-chunk fingerprint |
-| Cauchy matrix | Interleaved `x` values | `x_I = I` |
-| External Data | Every input block | Full-size blocks only; blocks holding chunk tails are omitted |
-| `PAR FFT\0` | Not specified | Written by the reference implementation, and parsed here |
+## Format compatibility
 
-## Damage is not an error
+Where the draft specification and reference disagree, this crate follows the
+reference. The deviations affecting interpretation are:
 
-A `.par3` file exists to survive damage, so a packet whose header hash does not
-match is treated as noise: it is skipped, and the scan resynchronises on the next
-magic sequence. The error type describes input that cannot be interpreted at
-all, or sets whose packets contradict each other — not bytes that are merely
-corrupt.
+- **Field size:** one byte, rather than the draft's two-byte field.
+- **Start packet:** no leading random bytes. The older layout is detected by
+  body length and preserved.
+- **InputSetID:** an opaque grouping key; it cannot be recomputed from stored
+  bytes as the draft describes.
+- **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
+  chunks concatenated in file order. Unprotected bytes are omitted.
+- **Chunks:** no per-chunk fingerprint from the draft layout.
+- **Cauchy matrix:** `x_I = I`, rather than interleaved `x` values.
+- **External Data:** full-size blocks only; packed tail blocks are omitted.
+- **FFT:** low-rate Cantor-field semantics follow the pinned appendix.
+  GF16 uses `0x1002D`, distinct from Cauchy's `0x1100B`.
+- **Trivial FFT:** field size zero represents one-input copy recovery or
+  capacity-one XOR, without transform tables.
+- **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
+  fields too; member count alone is insufficient. Corpus recipes normalize
+  those original ZIP fields before official insertion.
 
-## Untrusted input
+The [interoperability record](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/INTEROPERABILITY.md)
+documents reference verification and repair, including both fields, uneven
+cohorts, more than 65,536 blocks, and embedded archive replacement.
 
-There is no `unsafe` code. Allocation is bounded by explicit limits rather than
-by lengths a packet claims, the directory walk is iterative and refuses cycles,
-and File and Directory names that are empty, `.`, `..`, or that contain a path
-separator are refused at parse time, so a set cannot direct a read outside the
-directory it is verified against. Creation refuses the same names on the way in,
-component by component, so nothing this crate writes can fail to be read back.
+## Input handling and provenance
 
-The same limits bound *work*, not only memory, because a few kilobytes of
-packets can otherwise ask for a great deal of both:
+Scanning skips corrupt packet candidates and resynchronizes. Malformed sets,
+contradictory metadata, resource exhaustion, and I/O failure remain errors.
+Parsed path components reject traversal names and separators, and set
+construction bounds directory expansion and rejects cycles. These checks do
+not replace control of the destination tree: callers must handle filesystem
+links and concurrent changes according to the selected API's contract.
 
-| Limit | Default | What it bounds |
-| --- | --- | --- |
-| `ScanLimits::max_packet_len` | 1 GiB | The largest packet a scan will read. |
-| `ScanLimits::max_packets` | 1,000,000 | Packets one scan returns. |
-| `ScanLimits::max_retained_bytes` | 4 GiB | Packet bodies one scan keeps. |
-| `ScanLimits::max_failed_hash_passes` | 8 | Hashing spent on overlapping candidates that never check out, as a multiple of the input length. |
-| `SetLimits::max_entries` | 1,000,000 | Files plus directories one set resolves to. |
-| `SetLimits::max_depth` | 256 | Directory nesting the walk follows. |
-| `SetLimits::max_path_bytes` | 64 MiB | Resolved path text, which a directory graph can expand exponentially. |
-| `CodecLimits::max_buffer_bytes` | 1 GiB | Recovery rows, syndromes and the matrix a codec holds. |
-| `CodecLimits::max_lost_blocks` | 4096 | Input blocks one decoder solves for at once; the inversion is cubic in this, and a set of tiny blocks can name thousands of them inside any memory budget. |
-| `CreateLimits::max_block_size` | 1 GiB | The block size a create will use; one block is held while it is read, and every recovery row is one block wide. |
-| `CreateLimits::max_files` | 1,000,000 | Input files one set protects. |
-| `CreateLimits::max_path_bytes` | 64 MiB | Relative path text across all inputs. |
-| `CreateLimits::max_tail_buffer_bytes` | 256 MiB | Blocks held while their chunk tails are still being filled. |
-| `CreateLimits::codec` | `CodecLimits::default()` | The encoder the create runs. |
-| `RepairLimits::max_input_blocks` | 65,536 | Input blocks a set may have for a repair to be attempted; the block ownership table has an entry per block. |
-| `RepairLimits::max_tail_buffer_bytes` | 256 MiB | Blocks of packed chunk tails held while the files that write them are still being read. |
-| `RepairLimits::codec` | `CodecLimits::default()` | The decoder the repair runs, which also caps the block size a repair will buffer. |
+The crate forbids unsafe Rust; shared arithmetic dependencies use CPU-specific
+kernels. It is a clean-room implementation of the
+[PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
+and format facts established by
+[par3cmdline](https://github.com/Parchive/par3cmdline). No reference code was
+copied into the implementation. Official fixture provenance and creation
+recipes are preserved in the repository; damage tests modify protected inputs
+or model unavailable carrier ranges.
 
-Chunk block ranges are validated whole against the set's block count when the
-set is built, and verification narrows damage down only within the file it is
-reading, so neither is steered by a length a packet chose. A repair builds its
-block ownership table from the chunk descriptions before it opens a file, and
-refuses a set whose descriptions contradict each other — two chunks claiming the
-same bytes of one block, a tail that does not fit, an index past the end of the
-set, or a block no file writes — rather than discovering it halfway through
-writing over someone's data.
-
-## Provenance
-
-This is an independent, clean-room Rust implementation. The format was learned
-from the
-[Parity Volume Set Specification 3.0 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
-and by reading the reference implementation,
-[par3cmdline](https://github.com/Parchive/par3cmdline), for the facts it settles
-that the draft does not. No code from that project was copied.
-
-The wire-format tests are pinned against `.par3` files that `par3cmdline` itself
-produced — index files and recovery volumes alike; the exact commit, build
-recipe and command lines are recorded in `tests/common/mod.rs`. The recovery
-bytes are checked against the reference's own Cauchy construction, recomputed
-from the input blocks in `tests/oracle_recovery.rs` with slow, longhand
-arithmetic that lives in the test and is deliberately not the library's own.
-`tests/oracle_codec.rs` then requires the library's encoder to reproduce those
-same recovery blocks and its decoder to put back every input block that could
-be lost. `tests/oracle_create.rs` rebuilds both reference archives from the same
-input files and settings and requires every byte to match. `tests/repair.rs`
-damages regenerated copies of those same input files — never the `.par3` bytes —
-and requires each one to come back byte for byte.
-
-Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/LICENSE).
+[API and migration notes](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
+Licensed **GPL-3.0-or-later**; see
+[LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/LICENSE).

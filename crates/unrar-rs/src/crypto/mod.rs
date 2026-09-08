@@ -1741,13 +1741,15 @@ mod sha1_hw {
 ///
 /// * SHA extensions present — this module stands aside;
 ///   the `sha1_hw` module is strictly better.
-/// * SSSE3 — [`Tier::Ssse3`]. Preferred over AVX2 by measurement on every
+/// * SSSE3 — [`Tier::Ssse3`](sha1_x86_vec::Tier::Ssse3).
+///   Preferred over AVX2 by measurement on every
 ///   no-SHA-NI x86 part tested to date (Alder Lake P+E, Haswell).
-/// * AVX2 + BMI1 + BMI2 — [`Tier::Avx2`], reachable through the override
+/// * AVX2 + BMI1 + BMI2 — [`Tier::Avx2`](sha1_x86_vec::Tier::Avx2),
+///   reachable through the override
 ///   below (and as the default only on an AVX2-without-SSSE3 part, which
 ///   does not exist in practice).
-/// * Otherwise — [`Tier::None`], and the unrolled scalar runs. That is the
-///   x86-64 parts predating SSSE3: Intel before Core 2, AMD before K10.
+/// * Otherwise — [`Tier::None`](sha1_x86_vec::Tier::None), and the unrolled
+///   scalar runs on x86-64 parts lacking SSSE3.
 ///
 /// `UNRAR_RS_SHA1_HW=0` keeps its existing whole-ladder meaning and pins
 /// plain scalar. `UNRAR_RS_SHA1_X86` selects within this module: `0`

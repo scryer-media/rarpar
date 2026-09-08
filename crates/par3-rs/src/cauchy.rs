@@ -757,13 +757,7 @@ impl<F: Field> Decoder<F> {
 
         // M[row][column] = element(lost[column], rows[row]), so that the
         // syndromes are M times the lost blocks.
-        let mut matrix = Vec::with_capacity(count * count);
-        for row in &self.rows {
-            for column in &self.lost {
-                matrix.push(element(&self.field, *column, *row)?);
-            }
-        }
-        let inverse = invert(&self.field, matrix, count)?;
+        let inverse = inverse_coefficients(&self.field, &self.lost, &self.rows)?;
 
         let mut recovered = Vec::with_capacity(count);
         for (column, index) in self.lost.iter().enumerate() {
@@ -804,11 +798,74 @@ fn sorted_distinct(indices: &[u64], check: impl Fn(u64) -> Option<String>) -> Re
     Ok(sorted)
 }
 
+/// Invert a validated Cauchy submatrix with quadratic product construction.
+///
+/// For `C[r,c] = 1/(x[c]+y[r])`, let `u[c]` be the product of `x[c]+y[*]`
+/// divided by the product of `x[c]+x[k]` for `k != c`. Define `v[r]` symmetrically.
+/// The inverse entry is `u[c]*v[r]/(x[c]+y[r])`. In characteristic two there
+/// are no alternating signs. Callers validate distinct, disjoint coordinates
+/// and reserve the matrix before invoking this internal routine.
+pub(crate) fn inverse_coefficients<F: Field>(
+    field: &F,
+    lost: &[u64],
+    rows: &[u64],
+) -> Result<Vec<F::Symbol>> {
+    let n = lost.len();
+    if rows.len() != n {
+        return Err(Par3Error::SingularSystem);
+    }
+    let x: Vec<_> = lost
+        .iter()
+        .map(|index| F::symbol(*index).ok_or(Par3Error::SingularSystem))
+        .collect::<Result<_>>()?;
+    let y: Vec<_> = rows
+        .iter()
+        .map(|index| {
+            F::MAX
+                .checked_sub(*index)
+                .and_then(F::symbol)
+                .ok_or(Par3Error::SingularSystem)
+        })
+        .collect::<Result<_>>()?;
+    let weights = |a: &[F::Symbol], b: &[F::Symbol]| -> Result<Vec<F::Symbol>> {
+        a.iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let numerator = b.iter().fold(field.one(), |product, other| {
+                    field.mul(product, field.add(*value, *other))
+                });
+                let denominator = a
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .fold(field.one(), |product, (_, other)| {
+                        field.mul(product, field.add(*value, *other))
+                    });
+                let reciprocal = field.inv(denominator).ok_or(Par3Error::SingularSystem)?;
+                Ok(field.mul(numerator, reciprocal))
+            })
+            .collect()
+    };
+    let u = weights(&x, &y)?;
+    let v = weights(&y, &x)?;
+    let mut inverse = Vec::with_capacity(n * n);
+    for column in 0..n {
+        for row in 0..n {
+            let divisor = field
+                .inv(field.add(x[column], y[row]))
+                .ok_or(Par3Error::SingularSystem)?;
+            inverse.push(field.mul(field.mul(u[column], v[row]), divisor));
+        }
+    }
+    Ok(inverse)
+}
+
 /// Invert an `n × n` matrix, stored row by row, by Gauss-Jordan elimination.
 ///
 /// A Cauchy matrix over distinct, disjoint row and column values is always
 /// invertible, so a zero pivot means the caller's geometry was not what it
 /// claimed; it is reported rather than assumed away.
+#[cfg(test)]
 fn invert<F: Field>(field: &F, mut matrix: Vec<F::Symbol>, n: usize) -> Result<Vec<F::Symbol>> {
     let zero = F::Symbol::default();
     let one = field.one();

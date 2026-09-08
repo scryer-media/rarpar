@@ -1,10 +1,16 @@
 //! High-performance Reed-Solomon finite-field kernels for parity and archive repair.
 //!
-//! This is the GF(2¹⁶) arithmetic that PAR2 repair and RAR5 recovery records are
-//! built on. It is a **kernel crate, not a codec**: it provides the field
-//! operations and multiply-accumulate primitives and leaves matrix semantics to
-//! its callers. To verify or repair a PAR2 set, reach for
-//! [`par2-rs`](https://crates.io/crates/par2-rs), which is built on this.
+//! Field arithmetic and multiply-accumulate kernels used by PAR2, PAR3, and RAR
+//! recovery. [`gf`] supplies the PAR2/RAR5 GF(2¹⁶) representation; [`gf8`]
+//! supplies GF(2⁸), and [`fft`] supplies additive Cantor transforms and erasure
+//! locator factors. These field representations are not interchangeable.
+//!
+//! This crate does not scan or repair PAR archive sets. Use
+//! [`par2-rs`](https://crates.io/crates/par2-rs) or
+//! [`par3-rs`](https://crates.io/crates/par3-rs) for those workflows. Their packet
+//! layouts, matrix selection, resource budgets, and job policy live above the
+//! kernels. RAR-specific recovery coders are provided separately in [`rar3`]
+//! and [`rar5`].
 //!
 //! # The field
 //!
@@ -47,7 +53,11 @@
 //! Session admission can fail because of workload size, configuration, device,
 //! shape, or allocation constraints. Callers decide whether to remain on CPU.
 //!
+/// Additive Cantor transforms with SIMD butterflies and a scalar oracle;
+/// codec geometry belongs to callers.
+pub mod fft;
 pub mod gf;
+pub mod gf8;
 pub mod gf_pmul;
 pub mod gf_simd;
 pub mod matrix;

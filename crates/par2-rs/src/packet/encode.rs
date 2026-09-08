@@ -55,7 +55,8 @@ pub(crate) fn packet_hash(
 }
 
 /// Start a streamed recovery-packet hash.  The caller feeds the exponent and
-/// every data stripe in packet order, then uses [`finish_streamed_header`].
+/// every data stripe in packet order, then passes the finalized digest to
+/// [`encode_header`].
 pub(crate) fn start_streamed_hash(
     recovery_set_id: RecoverySetId,
     packet_type: &[u8; 16],

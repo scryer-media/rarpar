@@ -58,7 +58,7 @@ const OUT: usize = 32;
 /// - `wasm32 + simd128` → wasm `simd128`.
 ///
 /// This module is only compiled/used on those targets (guarded by the caller in
-/// `crypto::mod`), so no portable branch is needed here; the [`Scalar`] backend
+/// `crypto::mod`), so no portable branch is needed here; the scalar backend
 /// is reserved for the differential tests.
 #[cfg(target_arch = "aarch64")]
 type Backend = simd::Neon;

@@ -185,7 +185,7 @@ func generatePar3Sets(ctx context.Context, e *env) error {
 		}
 		e.logf("testcorpus: par3_sets %s: %d file(s)", set.name, written)
 	}
-	return nil
+	return generatePar3Advanced(ctx, e, work)
 }
 
 // copyTree copies every regular file under source to the same relative path

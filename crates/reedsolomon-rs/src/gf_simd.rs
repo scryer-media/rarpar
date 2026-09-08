@@ -31,6 +31,131 @@
 
 use crate::gf;
 
+/// CPU selection for representation-independent binary linear maps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearBackend {
+    /// Detect an available shuffle kernel, with a portable fallback.
+    #[default]
+    Auto,
+    /// Disable explicit SIMD for arithmetic comparisons.
+    Scalar,
+}
+
+/// Kernel selected for a binary linear map. No field polynomial is implied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearKernel {
+    /// Portable nibble lookups.
+    Scalar,
+    /// ARM NEON byte-table lookups.
+    Neon,
+    /// x86 SSSE3 byte shuffles.
+    Ssse3,
+    /// x86 AVX2 byte shuffles.
+    Avx2,
+}
+
+impl LinearBackend {
+    /// Resolve this selection on the executing CPU.
+    pub fn kernel(self) -> LinearKernel {
+        if self == Self::Auto {
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return LinearKernel::Neon;
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
+                    return LinearKernel::Avx2;
+                }
+                if is_x86_feature_detected!("ssse3") {
+                    return LinearKernel::Ssse3;
+                }
+            }
+        }
+        LinearKernel::Scalar
+    }
+}
+
+/// A 16-bit binary linear map, constructed from the images of its sixteen
+/// input bits. This reuses byte-shuffle kernels without their Cauchy field or
+/// polynomial scalar tails. Cantor arithmetic supplies its own basis images.
+pub struct LinearMap16 {
+    tables: MulTables,
+    kernel: LinearKernel,
+}
+
+impl LinearMap16 {
+    /// Prepare fixed-size tables without heap allocation.
+    pub fn new(basis: [u16; 16], backend: LinearBackend) -> Self {
+        let mut tables = [[0; 16]; 8];
+        for (nibble, pair) in tables.chunks_exact_mut(2).enumerate() {
+            let (low, high) = pair.split_at_mut(1);
+            for (value, (low, high)) in low[0].iter_mut().zip(&mut high[0]).enumerate() {
+                let product = (0..4)
+                    .filter(|bit| value & (1 << bit) != 0)
+                    .fold(0, |sum, bit| sum ^ basis[nibble * 4 + bit]);
+                *low = product as u8;
+                *high = (product >> 8) as u8;
+            }
+        }
+        Self {
+            tables: MulTables { tables, factor: 0 },
+            kernel: backend.kernel(),
+        }
+    }
+
+    /// XOR mapped symbols into an equally sized destination. The mapping is
+    /// independent of host endianness; SIMD operates only on little-endian hosts.
+    pub fn accumulate(&self, source: &[u16], destination: &mut [u16]) {
+        assert_eq!(source.len(), destination.len());
+        let done = self.vector_prefix(source, destination);
+        for (to, from) in destination[done..].iter_mut().zip(&source[done..]) {
+            let mut product = 0;
+            for nibble in 0..4 {
+                let index = ((*from >> (4 * nibble)) & 15) as usize;
+                product ^= u16::from_le_bytes([
+                    self.tables.tables[nibble * 2][index],
+                    self.tables.tables[nibble * 2 + 1][index],
+                ]);
+            }
+            *to ^= product;
+        }
+    }
+
+    fn vector_prefix(&self, source: &[u16], destination: &mut [u16]) -> usize {
+        // Full 32-byte blocks keep all calls out of polynomial-field tails.
+        // AVX2 may hand its final 32-byte block to SSSE3, also without a tail.
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))]
+        if self.kernel != LinearKernel::Scalar {
+            let symbols = source.len() / 16 * 16;
+            let bytes = symbols * 2;
+            // SAFETY: u16 slices are initialized and non-overlapping; u8 has
+            // alignment one and accepts every bit pattern. Prefix byte lengths
+            // are within both slices. Only detected ISAs are invoked below.
+            unsafe {
+                let source = std::slice::from_raw_parts(source.as_ptr().cast::<u8>(), bytes);
+                let destination =
+                    std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), bytes);
+                match self.kernel {
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Avx2 => mul_acc_region_avx2(&self.tables, source, destination),
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Ssse3 => mul_acc_region_ssse3(&self.tables, source, destination),
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon => mul_acc_region_neon(&self.tables, source, destination),
+                    _ => return 0,
+                }
+            }
+            return symbols;
+        }
+        let _ = (source, destination, self.kernel);
+        0
+    }
+}
+
 /// Concurrent source read streams per destination pass in the grouped-input
 /// kernels. Bounded by the line-fill buffers of the smallest supported cores;
 /// larger groups stall on L1 misses instead of computing.
@@ -38,8 +163,8 @@ use crate::gf;
 /// This is a memory-stream bound over flat, separate source slices. Modern
 /// large-core hardware prefetchers cover that access pattern, so the kernels
 /// do not issue per-cacheline software prefetches by default.
-/// On aarch64 an explicit source-stream prefetch experiment exists behind
-/// [`NEON_SRC_PREFETCH`], currently off pending measurement.
+/// The aarch64 kernels have a separate source-stream prefetch experiment,
+/// disabled by default pending measurement.
 #[cfg(target_arch = "x86_64")]
 const SRC_STREAM_GROUP: usize = 8;
 
@@ -103,13 +228,9 @@ pub struct MulTables {
 
 /// Precompute the 8 shuffle tables for a given GF(2^16) multiplication factor.
 ///
-/// The tables are assembled from the shared nibble scratch
-/// ([`NibbleScratch`]) rather than rebuilt with field arithmetic: the entries
-/// are XOR-linear in `factor`, so four scratch reads and three XOR folds give
-/// the identical bytes that [`mul_tables_from_field`] computes. This is the
-/// per-(input, output) cost on every table-shuffle kernel, so the difference
-/// between 64 `gf::mul` log/antilog lookups and 128 bytes of L1-resident XOR
-/// lands on every coefficient pair an encode touches.
+/// The entries are XOR-linear in `factor`. A shared nibble cache supplies the
+/// tables without repeating scalar field multiplication for each coefficient.
+/// Retain the returned tables when applying the same factor to several regions.
 #[inline]
 pub fn precompute_mul_tables(factor: u16) -> MulTables {
     let scratch = nibble_scratch();
@@ -242,11 +363,8 @@ pub struct AffineMulMatrices {
 /// record which output bits are set. The result is packed into the GFNI
 /// row-major format.
 ///
-/// Assembled from the shared nibble scratch ([`NibbleScratch`]) with four reads
-/// and three XOR folds per matrix, mirroring the reference encoder's
-/// `gf16_affine_load_matrix`. The from-field construction below stays as
-/// [`affine_matrices_from_field`], which builds the scratch and anchors the
-/// byte-identity tests.
+/// A shared nibble cache supplies the matrices using four reads and three XOR
+/// folds per matrix. This produces the same map as the scalar field construction.
 #[inline]
 pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
     let scratch = nibble_scratch();
@@ -682,11 +800,8 @@ pub fn altmap_uses_avx2() -> bool {
     false
 }
 
-/// Whether the folded split-layout path should use the GFNI affine kernel
-/// (`gfni`+`avx2`) rather than the non-GFNI shuffle2x kernel. Only meaningful
-/// when [`altmap_supported`] is true.
 /// Whether the folded path's non-GFNI arm runs the 512-bit shuffle2x kernel
-/// (see [`shuffle2x_avx512_enabled`], including its env pin). Kernel ladders
+/// under the current runtime configuration. Kernel ladders
 /// use this to place the folded family the way the oracle places
 /// `SHUFFLE_AVX512`: ahead of the AVX2-line XOR-JIT on wide silicon.
 pub fn folded_wide_shuffle_available() -> bool {
@@ -2100,7 +2215,7 @@ pub const INPUT_BATCH_BLOCK_BYTES: usize = 32;
 /// Source lanes a caller should block-interleave into one contiguous stream for
 /// [`mul_acc_input_batch_prepared_interleaved`].
 ///
-/// On aarch64 this is [`CLMUL_SRC_GROUP_WIDE`] — the sources the wide kernel
+/// On aarch64 this is the wide kernel's source-group width — the sources its
 /// pass folds into the destination — so a full group runs one pass that reads
 /// exactly one sequential stream plus its destination: two streams, which even
 /// a 2-way L1D holds, with the pass's fixed per-block cost divided by sixteen.

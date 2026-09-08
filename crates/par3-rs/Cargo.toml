@@ -9,10 +9,12 @@ license.workspace = true
 repository.workspace = true
 keywords = ["par3", "parchive", "parity", "erasure", "verification"]
 categories = ["parser-implementations", "filesystem"]
-exclude = ["tests/fixtures/**"]
+exclude = ["tests/fixtures/**", "benchmarks/**"]
 
 [dependencies]
 blake3 = { workspace = true }
 crc-fast = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.4", default-features = false }
+rayon = { workspace = true, default-features = false }

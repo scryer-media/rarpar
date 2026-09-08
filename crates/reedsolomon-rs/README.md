@@ -3,17 +3,18 @@
 [![crates.io](https://img.shields.io/crates/v/reedsolomon-rs.svg)](https://crates.io/crates/reedsolomon-rs)
 [![docs.rs](https://docs.rs/reedsolomon-rs/badge.svg)](https://docs.rs/reedsolomon-rs)
 
-GF(2¹⁶) Reed-Solomon kernels for parity and archive repair: the finite-field
-arithmetic underneath PAR2 repair and RAR5 recovery records.
+GF(2⁸), GF(2¹⁶), and additive Cantor-transform kernels for PAR2, PAR3, and RAR
+recovery. Field representations and codec geometry must match the caller's format.
 
 ```toml
 [dependencies]
 reedsolomon-rs = "0.4"
 ```
 
-This is a kernel crate, not a codec. It provides field operations and
-multiply-accumulate primitives and leaves matrix semantics to its callers. To
-verify or repair a PAR2 set, use [`par2-rs`], which is built on this.
+This crate provides arithmetic kernels and RAR-specific recovery coders; it
+does not scan or repair PAR archive sets. Use [`par2-rs`] or
+[`par3-rs`](https://crates.io/crates/par3-rs) for those workflows. Packet layout,
+matrix selection, resource budgets, and job policy belong to callers.
 
 ## Usage
 
@@ -30,11 +31,23 @@ assert_eq!(gf::mul(0x89ab, gf::inv(0x89ab)), 1);
 
 ## Contents
 
+See [Cantor transform measurements](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/FFT_BENCHMARKS.md) for the reproducible
+CPU comparison harness and the limits of the exploratory native results.
+
 - `gf`: scalar GF(2¹⁶) arithmetic shared by PAR2 and RAR5.
+- `gf8`: GF(2⁸) arithmetic with reusable multiplication plans and runtime
+  NEON, AVX2, or SSSE3 dispatch, with a scalar fallback.
+- `fft`: clean-room additive transforms and erasure locator factors over
+  GF(2⁸) and GF(2¹⁶) in Cantor representation. Butterfly multiplication uses
+  Cantor-derived SIMD maps with an explicit scalar oracle. Codec geometry,
+  interleaving, allocation budgets, and worker policy belong to callers.
+  `transform_in_pool` distributes butterfly pairs inside an explicitly supplied
+  Rayon pool, with cancellation and synchronous execution for small stripes.
 - `gf_simd`: multiply-accumulate kernels, including `mul_acc_region` for one
   source and destination, `mul_acc_multi_region` for one source and multiple
   destinations, and `mul_acc_input_batch` for multiple sources and one
-  destination.
+  destination. `LinearMap16` also applies caller-defined binary maps using
+  NEON/AVX2/SSSE3 shuffles and representation-independent scalar tails.
 - `xor_jit`: JIT-generated bit-plane XOR GF(2¹⁶) multiplication on x86-64
   systems without GFNI.
 - RAR-specific coders in separate modules, kept apart so PAR2 matrix semantics

@@ -222,8 +222,8 @@ impl ScanGuard {
 /// Parse all headers from a RAR 1.4 archive volume.
 ///
 /// Reader must be positioned at the `RE~^` main-header marker. Refuses a reader
-/// that cannot state its length; [`parse_rar14_headers_for_facts`] is the walk
-/// for those.
+/// that cannot state its length, because packed-data ranges must be checked
+/// against the volume boundary before extraction.
 pub fn parse_rar14_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4ParsedVolume> {
     parse_rar14_headers_with(reader, HeaderScan::ForDecode, &mut None)
 }
@@ -346,8 +346,8 @@ fn parse_rar14_headers_with<R: Read + Seek>(
 /// If the archive uses header-level encryption (`-hp`), the password is
 /// required to decrypt headers.
 ///
-/// Refuses a reader that cannot state its length (see [`HeaderScan`]);
-/// [`parse_rar4_headers_for_facts`] is the walk for those.
+/// Refuses a reader that cannot state its length, because packed-data ranges
+/// must be checked against the volume boundary before extraction.
 pub fn parse_rar4_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,

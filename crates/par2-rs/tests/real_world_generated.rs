@@ -79,12 +79,13 @@ fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Optio
     if let Some(password) = password {
         archive.set_password(password);
     }
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: password.map(str::to_owned),
-        restore_owners: false,
-    };
-    let extracted = archive.extract_member(0, &opts, None).unwrap();
+    archive.set_verify(true);
+    let mut extracted = Vec::new();
+    archive
+        .by_index(0)
+        .unwrap()
+        .copy_to(&mut extracted)
+        .unwrap();
     assert_eq!(extracted, expected);
 }
 
@@ -298,12 +299,12 @@ fn repairs_heavy_damage_28_regions_rar5() {
             .collect(),
     )
     .unwrap();
-    let opts = unrar_rs::ExtractOptions {
-        verify: true,
-        password: None,
-        restore_owners: false,
-    };
-    let _extracted = archive.extract_member(0, &opts, None).unwrap();
-    // If extract_member didn't panic/error, the CRC matched.
+    archive.set_verify(true);
+    archive
+        .by_index(0)
+        .unwrap()
+        .copy_to(&mut std::io::sink())
+        .unwrap();
+    // Completing the verified extraction confirms the member CRC.
     eprintln!("heavy damage: extract verified OK");
 }

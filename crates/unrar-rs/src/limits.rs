@@ -27,12 +27,12 @@ pub const RAR_MAX_VOLUME_NUMBER: u64 = 1 << 20;
 ///
 /// Every header a volume scan accepts appends to a `Vec` (`files`, `services`,
 /// `comments`, …), so an unterminated scan is unbounded memory as well as
-/// unbounded time. The seek hardening in [`crate::rar4::header::skip_forward`]
+/// unbounded time. The RAR4 parser's forward-only header traversal
 /// already makes a scan structurally monotonic, and each RAR4 header consumes
 /// at least 7 bytes, so this is a backstop rather than the primary defence —
 /// it caps the damage from any *future* way of re-reading the same offset.
-/// One million headers needs at least a 7 MB volume; RAR's own 4 GB-ish
-/// practical volume ceiling with minimum-size headers stays far under it.
+/// Even minimum-size RAR4 headers require roughly 7 MiB to reach this ceiling;
+/// the volume's byte length alone is not a useful bound on retained header state.
 pub const MAX_HEADERS_PER_VOLUME: usize = 1 << 20;
 
 /// Convert a header-declared volume number into a dense-vector index.

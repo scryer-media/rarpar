@@ -158,10 +158,10 @@ impl JitCode {
     /// and `ret`s. `vzeroupper` clears the AVX upper state on return.
     ///
     /// # Safety
-    /// `self` must hold a normal body from
-    /// [`super::avx2_emitter::append_muladd_body`], AVX2 must be available,
-    /// `src`/`dst` valid for `len` bytes, and `len` must be a non-zero multiple
-    /// of 512.
+    /// `self` must hold a normal AVX2 body, as returned by
+    /// [`crate::xor_jit::build_muladd`], and AVX2 must be available. `src` must
+    /// be readable and `dst` readable and writable for `len` bytes. The ranges
+    /// must not overlap, and `len` must be a non-zero multiple of 512.
     pub unsafe fn run_muladd(&self, src: *const u8, dst: *mut u8, len: usize) {
         Self::run_muladd_entry(self.entry, src, dst, len);
     }
@@ -195,12 +195,11 @@ impl JitCode {
     /// body advances that stream and emits four T1 hints per block.
     ///
     /// # Safety
-    /// This handle must contain a prefetch-capable body from
-    /// [`super::avx2_emitter::append_muladd_body`], and AVX2 must be available.
-    /// `src` must be
-    /// readable and `dst` writable for `len` non-overlapping bytes, with `len`
-    /// a multiple of 512. `prefetch` must support every address hinted while
-    /// processing those bytes.
+    /// This handle must contain a prefetch-capable AVX2 body, as returned by
+    /// [`crate::xor_jit::JitWidth::build_muladd_prefetch`], and AVX2 must be
+    /// available. `src` must be readable and `dst` readable and writable for
+    /// `len` non-overlapping bytes, with `len` a non-zero multiple of 512.
+    /// `prefetch` must support every address hinted while processing those bytes.
     pub unsafe fn run_muladd_prefetch(
         &self,
         src: *const u8,
@@ -242,13 +241,16 @@ impl JitCode {
     /// followed by `rsi`, `rdi`, `r8`, `r9`, and `r10`. The code itself is
     /// immutable RX.
     ///
+    /// This is a legacy execution entrypoint. The current builders emit AVX2
+    /// bodies, which are incompatible with this calling convention.
+    ///
     /// # Safety
-    /// This handle must contain the AVX512 prefix body generated for exactly
-    /// `sources.len()` entries by [`super::codegen512::generate_muladd_multi`],
-    /// and the selected AVX512F/BW/VL tier must be available. There must be
+    /// This handle must contain an AVX512 prefix body using the register
+    /// convention above for exactly `sources.len()` entries, and AVX512F/BW/VL
+    /// must be available. There must be
     /// one to six sources; each must be readable for `len` bytes, `dst` must
-    /// be writable for `len` bytes, all ranges must be non-overlapping, and
-    /// `len` must be a multiple of 1024.
+    /// be readable and writable for `len` bytes, all ranges must be
+    /// non-overlapping, and `len` must be a non-zero multiple of 1024.
     #[target_feature(enable = "avx512f")]
     pub unsafe fn run_muladd_multi_512(&self, sources: &[*const u8], dst: *mut u8, len: usize) {
         assert!(!sources.is_empty() && sources.len() <= 6);

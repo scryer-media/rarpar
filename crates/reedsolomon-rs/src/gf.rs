@@ -20,11 +20,11 @@ const ORDER: u32 = 65535;
 
 /// Log and antilog lookup tables for GF(2^16).
 struct GfTables {
-    /// log_table[a] = discrete log base g of a, for a in 1..65535.
-    /// log_table[0] is unused (log of 0 is undefined).
+    /// `log_table[a]` is the discrete log base `g` of `a`, for `a` in `1..=65535`.
+    /// `log_table[0]` is unused (log of 0 is undefined).
     log_table: Box<[u16; 65536]>,
-    /// antilog_table[i] = g^i for i in 0..65534.
-    /// antilog_table[65535] is a duplicate of antilog_table[0] for convenience.
+    /// `antilog_table[i] = g^i` for `i` in `0..=65534`.
+    /// `antilog_table[65535]` duplicates `antilog_table[0]` for convenience.
     antilog_table: Box<[u16; 65536]>,
 }
 

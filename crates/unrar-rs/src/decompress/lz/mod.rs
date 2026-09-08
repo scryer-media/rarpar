@@ -534,12 +534,15 @@ impl LzDecoder {
     /// Read a RAR5 block header.
     ///
     /// The block header is byte-aligned:
-    /// - flags (1 byte): bit_size[0:2], byte_count[3:4], is_last[6], table_present[7]
+    /// - flags (1 byte): `bit_size[0:2]`, `byte_count[3:4]`, `is_last[6]`,
+    ///   `table_present[7]`
     /// - checksum (1 byte): must equal 0x5A ^ flags ^ size_byte_0 ^ ...
     /// - size bytes (1-3 bytes, LE): block byte count
     ///
-    /// Block size in bits = byte_count * 8 + ((flags & 7) + 1).
-    /// byte_count is full data bytes; the low 3 flag bits + 1 give additional valid bits.
+    /// For a nonempty block, the bit count is
+    /// `(block_bytes - 1) * 8 + ((flags & 7) + 1)`. The byte count includes
+    /// the final partial byte; the low three flag bits plus one give its valid
+    /// bits. A zero-byte block has zero bits.
     fn read_block_header<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
         // Block header is byte-aligned.
         reader.align_byte()?;

@@ -1341,7 +1341,7 @@ fn gf16_mul2_x4(v: u64) -> u64 {
 /// sizeof(uint8x16x2_t), gf16_prepare_block_neon, …, sizeof(uint8x16_t))`,
 /// `parpar/gf16/gf16_clmul_neon.c:27`). [`CpuKernelKind::NeonPacked`] is
 /// exactly that contract, so this arm now runs at `PLANES == 1` — which is
-/// [`checksum_block`] reduced to `gf16_checksum_block_neon` verbatim.
+/// the checksum recurrence reduced to `gf16_checksum_block_neon` verbatim.
 ///
 /// (measured 5.05-6.61x over the portable arm at widths 16/32/64)
 #[cfg(target_arch = "aarch64")]
@@ -1957,7 +1957,7 @@ fn finalize_output_bytes(
 /// The preparation worker's loop *body* and the state it carries across
 /// messages, factored out of [`run_preparation_worker`] so the identical body
 /// can also run inline on the controller thread where no worker thread can be
-/// spawned (see [`InlineControllerWorkers`]).
+/// spawned, as on WebAssembly without thread support.
 struct PreparationWorker<'a> {
     complete_tx: std::sync::mpsc::SyncSender<TransferBuffer>,
     prepared_tx: std::sync::mpsc::SyncSender<PreparedControllerBatch>,
@@ -3577,7 +3577,7 @@ fn complete_active_controller_batch<'a>(
 
 /// One compute worker's loop *body*, factored out of [`run_compute_worker`] so
 /// the identical body can also run inline on the controller thread where no
-/// worker thread can be spawned (see [`InlineControllerWorkers`]).
+/// worker thread can be spawned, as on WebAssembly without thread support.
 struct ComputeWorker {
     worker: usize,
     scratch: CpuWorkerScratch,

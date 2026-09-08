@@ -299,6 +299,10 @@ impl Field for Gf8 {
 
     fn mul_acc(&self, dst: &mut [u8], src: &[u8], factor: u8) {
         check_regions(dst, src, 1);
+        if self.generator == Self::DEFAULT_GENERATOR && dst.len() >= 128 {
+            reedsolomon_rs::gf8::mul_acc_region(factor, src, dst);
+            return;
+        }
         match factor {
             0 => {}
             1 => {
@@ -457,6 +461,10 @@ impl Field for Gf16 {
 
     fn mul_acc(&self, dst: &mut [u8], src: &[u8], factor: u16) {
         check_regions(dst, src, 2);
+        if self.generator == Self::DEFAULT_GENERATOR {
+            reedsolomon_rs::gf_simd::mul_acc_region(factor, src, dst);
+            return;
+        }
         match factor {
             0 => {}
             1 => {

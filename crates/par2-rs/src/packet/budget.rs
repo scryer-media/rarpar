@@ -63,7 +63,7 @@ pub const RECOVERY_EXPONENT_DOMAIN: usize = MAX_RECOVERY_EXPONENT as usize + 1;
 /// |----------------------|--------:|-----|
 /// | Main                 |       1 | one recovery set per inventory |
 /// | Creator              |       1 | one creator string is kept |
-/// | File Description     |  32,768 | [`MAX_FILES_PER_SET`], the Main packet's file-ID cap |
+/// | File Description     |  32,768 | the Main packet's file-ID cap |
 /// | Input File Slice Checksum | 32,768 | at most one IFSC packet per described file |
 /// | Recovery Slice       |  65,536 | [`RECOVERY_EXPONENT_DOMAIN`] |
 ///

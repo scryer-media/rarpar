@@ -24,7 +24,7 @@
 //!
 //! ## No padded copies
 //!
-//! The kernel never materializes a padded copy of a message. [`LanePlan`]
+//! The kernel never materializes a padded copy of a message. Its lane plan
 //! resolves each 64-byte block to one of four sources:
 //!
 //! 1. a pointer straight into the caller's buffer (the overwhelming majority),

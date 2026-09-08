@@ -56,7 +56,7 @@ const MAX_QUICK_ENTRIES: usize = 1 << MAX_QUICK_BITS;
 pub struct HuffmanTable {
     /// Left-aligned upper limit codes for each bit length.
     /// `decode_len[i]` is the left-aligned (16-bit) upper limit code for
-    /// bit length `i`. Codes < decode_len[i] have bit length <= i.
+    /// bit length `i`. Codes below `decode_len[i]` have bit length at most `i`.
     decode_len: [u32; 16],
 
     /// Start position in decode_num for each bit length.
