@@ -11,6 +11,9 @@
 //! default Cauchy behavior. The incremental [`Par3RepairSession`] adds virtual
 //! sources, streaming evidence, shared block layouts, retained assessments,
 //! bounded striped repair, and low-rate FFT recovery with interleaved cohorts.
+//! Data packets are checked against block and tail fingerprints once per layout
+//! and source generation; recovery-only merges retain these results. Reconstruction
+//! from available Data and aliases does not require a Galois field or matrix.
 //! [`runtime::ScanWorkBudget`] bounds cumulative carrier read requests across
 //! scanners, retries and seeks independently of the shared allocation budget.
 //! Carrier generation changes invalidate recovery availability without rereading

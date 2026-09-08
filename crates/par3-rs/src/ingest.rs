@@ -56,6 +56,13 @@ impl std::fmt::Debug for PayloadRef {
 }
 
 impl PayloadRef {
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.access, &other.access)
+            && self.source == other.source
+            && self.snapshot == other.snapshot
+            && self.packet_offset == other.packet_offset
+            && self.header.hash == other.header.hash
+    }
     /// Semantic identity of the payload.
     #[must_use]
     pub fn kind(&self) -> PayloadKind {
@@ -656,6 +663,10 @@ impl IncrementalSet {
 
     pub(crate) fn contains(&self, hash: &Fingerprint) -> bool {
         self.packets.contains_key(hash)
+    }
+
+    pub(crate) fn packet(&self, hash: &Fingerprint) -> Option<&IngestedPacket> {
+        self.packets.get(hash)
     }
 
     /// Forget lazy payloads whose published source generation disappeared or

@@ -148,7 +148,9 @@ fn repair_inner(
             temporary,
         });
     }
-    if let Some(PacketBody::FftMatrix(matrix)) =
+    if assessment.lost_blocks.is_empty() {
+        copy_available(session, layout, &staged)?;
+    } else if let Some(PacketBody::FftMatrix(matrix)) =
         assessment.matrix.as_ref().map(|packet| packet.body())
     {
         reconstruct_fft(session, layout, &staged, matrix)?;
@@ -246,7 +248,9 @@ pub(crate) fn stage_embedded(
         .write(true)
         .open(temporary)?
         .set_len(layout.files[0].len)?;
-    if layout.block_count != 0 {
+    if assessment.lost_blocks.is_empty() {
+        copy_available(session, layout, &targets)?;
+    } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
         let _field = session
             .options
@@ -279,6 +283,36 @@ pub(crate) fn stage_embedded(
         )?;
     }
     Ok(assessment.lost_blocks.len() as u64)
+}
+
+fn copy_available(
+    session: &Par3RepairSession,
+    layout: &BlockLayout,
+    outputs: &[StagedFile],
+) -> EngineResult<()> {
+    // Data packets, aliases and inline-only files require no field or matrix.
+    // In particular, the reference emits field size zero for degenerate codes.
+    let size = session.options.stripe_bytes.min(64 << 10);
+    let _memory = session.options.memory.reserve(size * 2)?;
+    let mut bytes = vec![0; size];
+    let mut covered = vec![0; size];
+    for (&block, locations) in &layout.blocks {
+        if !locations
+            .iter()
+            .any(|location| outputs.iter().any(|target| target.index == location.file))
+        {
+            continue;
+        }
+        let mut offset = 0;
+        while offset < layout.block_size {
+            session.options.cancel.check()?;
+            let take = (layout.block_size - offset).min(size as u64) as usize;
+            session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
+            scatter(layout, outputs, block, offset, &bytes[..take])?;
+            offset += take as u64;
+        }
+    }
+    Ok(())
 }
 
 fn reconstruct<F>(

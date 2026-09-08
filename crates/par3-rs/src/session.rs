@@ -13,6 +13,9 @@ use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
 use crate::source::{SourceAccess, SourceId, ensure_snapshot, read_exact_at};
 use crate::{Fingerprint, InputSetId, Packet, Par3Set};
 
+#[path = "session_data.rs"]
+mod data;
+
 /// Readiness of one retained assessment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairStatus {
@@ -87,6 +90,8 @@ pub struct SessionDiagnostics {
     pub source_verifications: u64,
     /// Metadata layouts actually rebuilt.
     pub layout_rebuilds: u64,
+    /// Data payloads checked against the current layout, excluding cached reuse.
+    pub data_validations: u64,
 }
 
 /// Retained engine state. No source file handles are retained by the session.
@@ -102,6 +107,9 @@ pub struct Par3RepairSession {
     pub(crate) placements: BTreeMap<(usize, usize), crate::placement::PlacedExtent>,
     pub(crate) assessment: Option<RepairAssessment>,
     metadata_dirty: bool,
+    data_dirty: bool,
+    data_checked: BTreeMap<Fingerprint, data::DataAdmission>,
+    data_blocks: BTreeMap<u64, PayloadRef>,
     diagnostics: SessionDiagnostics,
 }
 
@@ -126,19 +134,28 @@ impl Par3RepairSession {
             placements: BTreeMap::new(),
             assessment: None,
             metadata_dirty: true,
+            data_dirty: true,
+            data_checked: BTreeMap::new(),
+            data_blocks: BTreeMap::new(),
             diagnostics: SessionDiagnostics::default(),
         })
     }
 
     /// Admit an authenticated packet. Replays preserve the assessment unchanged.
     pub fn merge(&mut self, packet: IngestedPacket) -> EngineResult<MergeEffect> {
+        let is_data = packet
+            .payload()
+            .is_some_and(|payload| matches!(payload.kind(), PayloadKind::Data { .. }));
         if !self.input.contains(&packet.hash()) {
             self.admit_retained(packet.retained_bytes())?;
         }
         let effect = self.input.merge(packet)?;
         match effect {
             MergeEffect::Replay => {}
-            MergeEffect::Payload => self.assessment = None,
+            MergeEffect::Payload => {
+                self.assessment = None;
+                self.data_dirty |= is_data;
+            }
             MergeEffect::Metadata => {
                 self.metadata_dirty = true;
                 self.assessment = None;
@@ -255,6 +272,9 @@ impl Par3RepairSession {
         {
             self.evidence.clear();
             self.placements.clear();
+            self.data_checked.clear();
+            self.data_blocks.clear();
+            self.data_dirty = true;
         }
         self.layout = Some(layout);
         self.set = Some(set);
@@ -296,13 +316,18 @@ impl Par3RepairSession {
         self.options.validate()?;
         match self.input.discard_changed_payloads() {
             Ok(0) => {}
-            Ok(_) => self.assessment = None,
+            Ok(_) => {
+                self.assessment = None;
+                self.data_dirty = true;
+            }
             Err(error) => {
                 self.assessment = None;
+                self.data_dirty = true;
                 return Err(error);
             }
         }
         self.refresh_layout()?;
+        self.refresh_data()?;
         let stale: Vec<_> = self
             .evidence
             .iter()
@@ -460,21 +485,8 @@ impl Par3RepairSession {
         })
     }
 
-    pub(crate) fn data_payloads(&self) -> BTreeMap<u64, PayloadRef> {
-        let mut data: BTreeMap<u64, Option<PayloadRef>> = BTreeMap::new();
-        let size = self.layout.as_ref().map_or(0, |layout| layout.block_size);
-        for payload in self.input.payloads() {
-            if let PayloadKind::Data { index } = payload.kind()
-                && payload.len() <= size
-            {
-                data.entry(index)
-                    .and_modify(|entry| *entry = None)
-                    .or_insert_with(|| Some(payload.clone()));
-            }
-        }
-        data.into_iter()
-            .filter_map(|(index, payload)| payload.map(|payload| (index, payload)))
-            .collect()
+    pub(crate) fn data_payloads(&self) -> &BTreeMap<u64, PayloadRef> {
+        &self.data_blocks
     }
 
     fn select_matrix(
@@ -612,6 +624,11 @@ impl Par3RepairSession {
     pub fn retained_bytes(&self) -> usize {
         self.input
             .retained_bytes()
+            .saturating_add(
+                self.data_checked
+                    .len()
+                    .saturating_mul(data::ADMISSION_BYTES),
+            )
             .saturating_add(
                 self.layout
                     .as_ref()

@@ -39,6 +39,24 @@ func generatePar3Advanced(ctx context.Context, e *env, work string) error {
 			return err
 		}
 	}
+	dataDir := filepath.Join(work, "data-input")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	dataInput := make([]byte, 3300)
+	for i := range dataInput {
+		dataInput[i] = byte(i*29 + i/31)
+	}
+	for _, name := range []string{"input.bin", "copy.bin"} {
+		if err := writeFile(filepath.Join(dataDir, name), dataInput); err != nil {
+			return err
+		}
+	}
+	// The pinned reference returns an error with -c0 after writing Data volumes.
+	// Generate one recovery block and omit it in Data-only consumer tests.
+	if err := e.par3Run(ctx, work, "", "c", "-B/work/data-input", "-s1024", "-e8", "-c1", "-D", "-d1", "/work/advanced/data-dedup.par3", "input.bin", "copy.bin"); err != nil {
+		return err
+	}
 	archives, err := par3InsideInputs(payload)
 	if err != nil {
 		return err

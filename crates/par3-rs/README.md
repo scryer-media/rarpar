@@ -170,6 +170,10 @@ In:
 The incremental `Par3RepairSession` also provides:
 
 - Chunked authenticated packet ingestion with lazy recovery and Data payloads.
+  Data availability is checked against authenticated block and tail fingerprints
+  and retained across recovery-only merges. Compatible Data aliases compare as
+  logical bytes; contradictory descriptions or bytes are rejected. Copying
+  already available blocks needs no field, including reference field-size-zero sets.
   `ExecutionOptions::scan_work` bounds cumulative requested read bytes across
   scanners, retries, and seeks (1 TiB by default). Allocation and work ceilings
   are independent. Known packet boundaries avoid repeated volume prefetching.

@@ -7,6 +7,23 @@ PAR3 bytes come only from official par3cmdline runs at commit
 The following records describe the initial reference runs. Original inputs
 are damaged in memory by tests; PAR3 packet bytes are never edited.
 
+## Data and aligned deduplication generation record
+
+The five `data-dedup*` carriers were generated with the same pinned executable:
+
+```text
+par3 c -s1024 -e8 -c1 -D -d1 complete.par3 input.bin copy.bin
+par3 v complete.par3
+```
+
+Both inputs contain `bytes((i*29+i//31)%256 for i in range(3300))`.
+Creation and verification returned zero; the reference reported four logical
+blocks and both files complete. Only the output stem was renamed to
+`data-dedup`; packet bytes are unchanged. BLAKE3 digests are in `sources.json`.
+The Rust consumer omits the Recovery packet to exercise Data-only repair.
+An earlier `-c0` run wrote Data files but returned status 7; those files are not
+fixtures. The recipe therefore generates one recovery block and tests omit it.
+
 ## FFT generation record
 
 ```json
