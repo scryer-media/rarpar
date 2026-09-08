@@ -40,6 +40,10 @@ pub struct RecoveryRequirement {
     pub cohort: u64,
     /// Number of cohorts. Global recovery indices satisfy `index % cohorts == cohort`.
     pub cohorts: u64,
+    /// Admissible global recovery-index span. Only indices congruent to `cohort`
+    /// modulo `cohorts` belong to this requirement; skip those already available.
+    /// This describes codec capacity, not a claim that a carrier exists remotely.
+    pub recovery_indices: Range<u64>,
     /// Lost input blocks in this cohort.
     pub lost: u64,
     /// Available, distinct compatible recovery indices.
@@ -628,6 +632,7 @@ impl Par3RepairSession {
                     matrix: packet.hash(),
                     cohort,
                     cohorts,
+                    recovery_indices: cohort..capacity * cohorts,
                     lost: count,
                     available,
                     additional,

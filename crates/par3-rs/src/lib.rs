@@ -31,8 +31,10 @@
 //! Carrier generation changes invalidate recovery availability without rereading
 //! protected sources. Verification resumes after honest sequential readers stop
 //! at holes, omitting unprotected gaps from the whole protected-data fingerprint.
-//! Performance acceptance and the remaining advanced capabilities are still
-//! being developed; see [what is not in scope](#what-is-not).
+//! Recovery requirements expose admissible index spans and cohort deficits.
+//! A combined consumer harness validates restart, selective recovery, cancellation,
+//! and selective materialization. Matched native performance acceptance remains
+//! outstanding; see [what is not in scope](#what-is-not).
 //! The crate's `ENGINE.md` documents the Weaver integration contract, including
 //! source identity, evidence, lifecycle, resource limits, and remaining acceptance.
 //!

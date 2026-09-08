@@ -80,12 +80,28 @@ fn export_reference_interoperability_cases() {
             false,
             false,
         ),
+        (
+            "many-blocks",
+            64,
+            CreationCodec::Fft {
+                capacity_log2: 0,
+                interleave: 2,
+            },
+            false,
+            false,
+        ),
         ("dedup", 256, CreationCodec::Cauchy, true, false),
         ("data", 256, CreationCodec::Cauchy, true, true),
     ] {
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        let bytes = if name.starts_with("wide-") {
+        let bytes = if name == "many-blocks" {
+            let mut bytes = vec![0; 65_539 * 64];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"PAR3 interleaved logical block boundary v1");
+            hasher.finalize_xof().fill(&mut bytes);
+            bytes
+        } else if name.starts_with("wide-") {
             let blocks = match name {
                 "wide-fft8" => 120,
                 "wide-interleaved" => 301,
@@ -117,7 +133,13 @@ fn export_reference_interoperability_cases() {
         let mut options = CreationOptions {
             block_size,
             codec,
-            recovery_count: if data_only { 0 } else { 6 },
+            recovery_count: if data_only {
+                0
+            } else if name == "many-blocks" {
+                3
+            } else {
+                6
+            },
             store_data: data_only,
             deduplication: if duplicate {
                 Deduplication::Aligned
@@ -128,9 +150,109 @@ fn export_reference_interoperability_cases() {
             ..CreationOptions::default()
         };
         options.execution.workers = if name.starts_with("wide-") { 2 } else { 1 };
+        if name == "many-blocks" {
+            options.execution.retained_bytes = 224 << 20;
+        }
         let plan = CreationPlan::build(Arc::new(source), &inputs, options).unwrap();
         plan.execute(&path.join("set"), &path).unwrap();
     }
+}
+
+#[test]
+fn interleaved_xor_repairs_more_than_65536_logical_blocks() {
+    use par3_rs::runtime::MemoryBudget;
+    use par3_rs::session::RepairStatus;
+
+    let blocks = 65_539;
+    let mut bytes = vec![0; blocks * 64];
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"PAR3 interleaved logical block boundary v1");
+    hash.finalize_xof().fill(&mut bytes);
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.clone().into());
+    let mut options = CreationOptions {
+        block_size: 64,
+        recovery_count: 3,
+        codec: CreationCodec::Fft {
+            capacity_log2: 0,
+            interleave: 2,
+        },
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    // The logical geometry is allowed; callers still have to budget its many
+    // fingerprint and extent descriptions independently of tiny codec stripes.
+    options.execution.memory = MemoryBudget::new(256 << 20);
+    options.execution.retained_bytes = 224 << 20;
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options.clone(),
+    )
+    .unwrap();
+    assert_eq!(plan.requirements().blocks, blocks as u64);
+    let id = plan.input_set_id();
+    let carriers = common::TempTree::new("interleaved-block-boundary");
+    let paths = plan
+        .execute(&carriers.path().join("set"), carriers.path())
+        .unwrap();
+    drop(plan);
+    let mut damaged = bytes.clone();
+    for block in [0, 32_767, 65_537] {
+        damaged[block * 64 + 13] ^= 0x80;
+    }
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 2, damaged.into());
+    let mut session =
+        par3_rs::Par3RepairSession::new(id, Arc::new(access), options.execution.clone()).unwrap();
+    session.bind_file("input.bin", SourceId(1)).unwrap();
+    for path in paths {
+        let mut disk = DiskSourceAccess::with_options(options.execution.clone());
+        disk.insert(SourceId(99), path);
+        let mut scanner = PacketScanner::new(
+            Arc::new(disk),
+            SourceId(99),
+            options.execution.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        loop {
+            match scanner.poll().unwrap() {
+                ScanEvent::Packet(packet) => {
+                    session.merge(packet).unwrap();
+                }
+                ScanEvent::End => break,
+                ScanEvent::NeedData { .. } => panic!("complete created carrier"),
+            }
+        }
+    }
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::Ready);
+    assert_eq!(assessment.requirements.len(), 3);
+    assert!(
+        assessment
+            .requirements
+            .iter()
+            .all(|need| need.lost == 1 && need.additional == 0)
+    );
+    let output = common::TempTree::new("interleaved-block-boundary-repaired");
+    assert_eq!(
+        session
+            .repair(output.path(), false)
+            .unwrap()
+            .reconstructed_blocks,
+        3
+    );
+    assert_eq!(
+        std::fs::read(output.path().join("input.bin")).unwrap(),
+        bytes
+    );
+    assert!(options.execution.memory.peak() <= options.execution.memory.limit());
+    drop(session);
+    assert_eq!(options.execution.memory.used(), 0);
 }
 
 #[test]

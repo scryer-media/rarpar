@@ -67,6 +67,22 @@ with `Zip/inside.zip`, `Zip64/inside64.zip`, and `SevenZip/inside.7z`.
 These are explicit replacement carriers, not byte-exact restoration claims
 about an unknown original manifest, and are not official-reference fixtures.
 
+## Large logical block count, 2026-09-08
+
+The exporter now includes `many-blocks`: 65,539 full 64-byte blocks, three
+interleaved cohorts, and one XOR recovery equation per cohort. Its input is the
+BLAKE3 XOF of `PAR3 interleaved logical block boundary v1`. The ordinary creation
+test damages byte 13 of blocks 0, 32,767, and 65,537 with `0x80` and restores
+the full input through the public session API. This exceeds the per-codec field
+geometry globally while keeping each cohort within its own supported geometry.
+
+Local creation and repair passed. Reference exports are prepared under
+`/tmp/par3-reference.mGh8NL/created-boundary-20260908/many-blocks`; their reference
+verification and repair are pending explicit authorization to use the existing
+local reference container. The pinned source's Linux platform headers and x86
+build flags prevented an unchanged ARM64 macOS build. This case is not yet
+additional reference interoperability evidence.
+
 ## Reproduction
 
 Create a fresh empty output directory, then export through the public library:
@@ -94,6 +110,7 @@ official-reference fixture corpus.
 
 Automated tests separately cover reference-created FFT repair, pure arithmetic
 scalar/SIMD equivalence, supplied-pool isolation, cancellation, and allocation
-ceilings. Required native ARM64/x86-64 end-to-end performance comparisons,
-complete stage diagnostics, and the remaining integration acceptance still
-apply; these results do not claim Weaver production readiness.
+ceilings. The combined host lifecycle and diagnostics are covered by
+`tests/weaver_consumer.rs` and `tests/diagnostics.rs`. Required native
+ARM64/x86-64 end-to-end performance comparisons remain outstanding; these
+results do not claim Weaver production readiness.

@@ -35,7 +35,9 @@ providers cannot establish an exact carrier manifest.
 3. Call `merge` and `assess`. `IncompleteMetadata` means referenced descriptions
    have not all arrived. Recovery and Data packets can arrive before metadata.
 4. Retain the session while downloading. `RecoveryRequirement` reports the
-   selected matrix, cohort, available global indices, and additional count.
+   selected matrix, cohort, admissible `recovery_indices` span, available global
+   indices, and additional count. The span describes codec capacity; it does not
+   assert that the downloader can find those packets in a remote carrier.
    A global index belongs to `index % cohorts`; another cohort's surplus cannot
    cover a deficit. Weaver selects the carriers or byte ranges to request.
 5. Fill source holes and call `source_arrived` to verify only unknown extents.
@@ -215,8 +217,28 @@ The [interoperability record](INTEROPERABILITY.md) also documents reference
 repair of larger SIMD/worker-created GF8, GF16, and uneven interleaved sets,
 including the recovery equations actually consumed.
 
-Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT scheduling-threshold tuning, the final resource-accounting audit, and the
-combined consumer acceptance harness. The current reference runs in a
+The combined `tests/weaver_consumer.rs` harness exercises a blocking host through
+late metadata, out-of-order decoded bytes, interior holes, trusted checkpoint
+restart, recovery selection, replay, cancellation, stale generations, and
+selective materialization. It asserts zero protected-source reads for strong
+proof admission, restart, unchanged assessment, and recovery-only merges; only
+the changed source is reverified, and clean outputs are not rewritten. Shared
+memory and handle ceilings and final reservation cleanup are checked alongside
+the dedicated `resource_limits`, `diagnostics`, and interleaved FFT tests.
+The creation suite also creates and repairs 65,539 logical 64-byte blocks across
+three uneven XOR cohorts, using an explicit larger retained-metadata budget.
+The codec's per-cohort geometry does not impose a 65,536-block global limit.
+
+The 2026-09-08 validation ran workspace formatting and all-target/all-feature
+Clippy, 2,542 workspace Nextest tests, 24 doctests, all four PAR2 real-world
+consumer regressions, and the Go corpus recipe tests successfully. After adding
+the large-block-count case, the affected PAR3 suite passed all 339 tests and
+Clippy again. The workspace sweep left 12 opt-in tests skipped: native Metal,
+throughput probes, reference exporters/interop, and an external RAR fixture gate;
+the doctest sweep left one host-hook example ignored. These are not represented
+as passing. PAR3 reference checks are recorded separately in `INTEROPERABILITY.md`.
+
+Remaining acceptance includes matched native ARM64 and x86-64 performance and
+FFT scheduling-threshold tuning. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
 throughput parity. Correctness results alone do not satisfy performance acceptance.

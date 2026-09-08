@@ -167,6 +167,18 @@ fn retained_interleaved_repair_requires_recovery_in_the_damaged_cohort() {
     assert_eq!(assessment.requirements.len(), 1);
     assert_eq!(assessment.requirements[0].cohort, 0);
     assert_eq!(assessment.requirements[0].additional, 2);
+    let capacity = common::scan(&index)
+        .into_iter()
+        .find_map(|(_, packet)| {
+            if let PacketBody::FftMatrix(matrix) = packet.body() {
+                Some((1u64 << matrix.max_recovery_blocks_log2) * (matrix.interleave + 1))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(assessment.requirements[0].recovery_indices, 0..capacity);
+    assert_eq!(assessment.requirements[0].cohorts, 3);
     for packet in pending {
         session.merge(packet).unwrap();
     }
