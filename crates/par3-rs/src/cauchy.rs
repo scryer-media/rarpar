@@ -800,9 +800,9 @@ fn sorted_distinct(indices: &[u64], check: impl Fn(u64) -> Option<String>) -> Re
 
 /// Invert a validated Cauchy submatrix with quadratic product construction.
 ///
-/// For C[r,c] = 1/(x[c]+y[r]), let u[c] be the product of x[c]+y[*]
-/// divided by the product of x[c]+x[k] for k != c. Define v[r] symmetrically.
-/// The inverse entry is u[c]*v[r]/(x[c]+y[r]). In characteristic two there
+/// For `C[r,c] = 1/(x[c]+y[r])`, let `u[c]` be the product of `x[c]+y[*]`
+/// divided by the product of `x[c]+x[k]` for `k != c`. Define `v[r]` symmetrically.
+/// The inverse entry is `u[c]*v[r]/(x[c]+y[r])`. In characteristic two there
 /// are no alternating signs. Callers validate distinct, disjoint coordinates
 /// and reserve the matrix before invoking this internal routine.
 pub(crate) fn inverse_coefficients<F: Field>(

@@ -168,13 +168,17 @@ pub fn scan_packets_with_limits(data: &[u8], limits: &ScanLimits) -> Result<Vec<
 
 /// Read a `.par3` file and scan it, using the default [`ScanLimits`].
 ///
-/// The whole file is read into memory. For `0.1` that is the only mode; a
-/// recovery volume is as large as the recovery data it carries.
+/// This convenience API reads the whole carrier into memory. For chunked
+/// scanning and lazy recovery payloads, use [`crate::ingest::PacketScanner`].
 pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(u64, Packet)>> {
     scan_packets_from_path_with_limits(path, &ScanLimits::default())
 }
 
 /// Read a `.par3` file and scan it under explicit limits.
+///
+/// Limits apply to packet scanning after the complete file has been read;
+/// they do not cap that initial file allocation. Use
+/// [`crate::ingest::PacketScanner`] for a shared allocation budget.
 pub fn scan_packets_from_path_with_limits(
     path: &Path,
     limits: &ScanLimits,
