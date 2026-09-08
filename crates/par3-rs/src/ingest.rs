@@ -287,6 +287,45 @@ pub enum ScanEvent {
     End,
 }
 
+struct ScanReadAhead {
+    bytes: Vec<u8>,
+    offset: u64,
+    len: usize,
+}
+
+impl ScanReadAhead {
+    fn read_at(
+        &mut self,
+        access: &dyn SourceAccess,
+        source: SourceId,
+        source_len: u64,
+        offset: u64,
+        out: &mut [u8],
+        options: &ExecutionOptions,
+    ) -> EngineResult<usize> {
+        if offset < self.offset || offset - self.offset >= self.len as u64 {
+            self.len = 0;
+            let take = source_len
+                .saturating_sub(offset)
+                .min(self.bytes.len() as u64) as usize;
+            options.scan_work.charge(take)?;
+            let read =
+                options
+                    .diagnostics
+                    .read_at(access, source, offset, &mut self.bytes[..take])?;
+            if read > take {
+                return Err(EngineError::InvalidState("invalid source read length"));
+            }
+            self.offset = offset;
+            self.len = read;
+        }
+        let start = (offset - self.offset) as usize;
+        let take = out.len().min(self.len - start);
+        out[..take].copy_from_slice(&self.bytes[start..start + take]);
+        Ok(take)
+    }
+}
+
 struct Candidate {
     header: PacketHeader,
     offset: u64,
@@ -304,6 +343,9 @@ struct Candidate {
 /// arrivals. A hole returns `NeedData`; use `seek` to scan a later available
 /// range and a separate scanner to revisit the hole later. Neither operation
 /// assumes that holes contain zero bytes.
+/// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
+/// discards it; every poll still checks the source generation. The scanner
+/// reserves two stripes of at most 64 KiB each and retains no file handles.
 pub struct PacketScanner {
     access: Arc<dyn SourceAccess>,
     source: SourceId,
@@ -316,6 +358,7 @@ pub struct PacketScanner {
     failed_hash_bytes: u64,
     packets: usize,
     buffer: Vec<u8>,
+    read_ahead: ScanReadAhead,
     _buffer_reservation: Reservation,
 }
 
@@ -333,7 +376,7 @@ impl PacketScanner {
             offset: 0,
         })?;
         let size = options.stripe_bytes.clamp(HEADER_SIZE, 64 << 10);
-        let reservation = options.memory.reserve(size)?;
+        let reservation = options.memory.reserve(size * 2)?;
         Ok(Self {
             access,
             source,
@@ -346,6 +389,11 @@ impl PacketScanner {
             failed_hash_bytes: 0,
             packets: 0,
             buffer: vec![0; size],
+            read_ahead: ScanReadAhead {
+                bytes: vec![0; size],
+                offset: 0,
+                len: 0,
+            },
             _buffer_reservation: reservation,
         })
     }
@@ -359,6 +407,7 @@ impl PacketScanner {
         self.offset = offset;
         self.candidate = None;
         self.at_packet_boundary = false;
+        self.read_ahead.len = 0;
         Ok(())
     }
 
@@ -391,12 +440,13 @@ impl PacketScanner {
                 }
                 let mut read = 0;
                 while read < 8 {
-                    self.options.scan_work.charge(take - read)?;
-                    let count = self.options.diagnostics.read_at(
+                    let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
+                        self.snapshot.len,
                         self.offset + read as u64,
                         &mut self.buffer[read..take],
+                        &self.options,
                     )?;
                     progress.advance(count as u64);
                     if count > take - read {
@@ -427,12 +477,13 @@ impl PacketScanner {
                     .copy_from_slice(&self.buffer[found..found + header_read]);
                 while header_read < HEADER_SIZE {
                     self.options.cancel.check()?;
-                    self.options.scan_work.charge(HEADER_SIZE - header_read)?;
-                    let count = self.options.diagnostics.read_at(
+                    let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
+                        self.snapshot.len,
                         self.offset + header_read as u64,
                         &mut header_bytes[header_read..],
+                        &self.options,
                     )?;
                     progress.advance(count as u64);
                     if count > HEADER_SIZE - header_read {
@@ -505,12 +556,13 @@ impl PacketScanner {
                 self.options.cancel.check()?;
                 let take = (candidate.header.length - candidate.consumed)
                     .min(self.buffer.len() as u64) as usize;
-                self.options.scan_work.charge(take)?;
-                let read = self.options.diagnostics.read_at(
+                let read = self.read_ahead.read_at(
                     self.access.as_ref(),
                     self.source,
+                    self.snapshot.len,
                     candidate.offset + candidate.consumed,
                     &mut self.buffer[..take],
+                    &self.options,
                 )?;
                 progress.advance(read as u64);
                 if read == 0 {

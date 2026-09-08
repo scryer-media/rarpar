@@ -105,6 +105,9 @@ repairs. `plan_repair` is available for a separate assessment, but
 The convenience scanner reads each carrier into memory, and the legacy codec
 retains whole recovery rows. Use the incremental engine for large carriers or
 strict allocation budgets.
+Its packet scanner reuses a bounded read-ahead stripe across packet boundaries;
+both scanner buffers are charged to the allocation budget, and source-generation
+checks still apply to cached bytes.
 
 ## Create a Cauchy set
 

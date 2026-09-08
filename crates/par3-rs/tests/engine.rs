@@ -95,6 +95,49 @@ fn split_arrivals_authenticate_without_retaining_recovery_bytes() {
 }
 
 #[test]
+fn carrier_read_ahead_reads_each_byte_once_and_rejects_changed_generations() {
+    let bytes = common::set_vol0_par3();
+    let expected = common::scan(&bytes);
+    let source = Arc::new(ArrivingSource {
+        visible: AtomicUsize::new(bytes.len()),
+        generation: AtomicU64::new(1),
+        reads: AtomicUsize::new(0),
+        bytes,
+    });
+    let options = ExecutionOptions::default();
+    let mut scanner = PacketScanner::new(
+        source.clone(),
+        SourceId(1),
+        options.clone(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    let mut hashes = Vec::new();
+    while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+        hashes.push(packet.hash());
+    }
+    assert_eq!(
+        hashes,
+        expected
+            .iter()
+            .map(|(_, packet)| packet.hash())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(options.scan_work.used(), source.bytes.len() as u64);
+    assert_eq!(
+        source.reads.load(Ordering::Relaxed),
+        source.bytes.len().div_ceil(64 << 10)
+    );
+    scanner.seek(0).unwrap();
+    assert!(matches!(scanner.poll().unwrap(), ScanEvent::Packet(_)));
+    source.generation.store(2, Ordering::Relaxed);
+    assert!(matches!(
+        scanner.poll(),
+        Err(EngineError::SourceChanged(SourceId(1)))
+    ));
+}
+
+#[test]
 fn scan_work_is_cumulative_across_replays_seeks_and_scanners() {
     use par3_rs::runtime::ScanWorkBudget;
     let bytes = common::set_vol0_par3();
