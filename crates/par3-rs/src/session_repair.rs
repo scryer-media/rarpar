@@ -99,15 +99,6 @@ fn repair_inner(
         return Ok(0);
     }
     let layout = session.layout.as_ref().expect("ready layout");
-    if layout.files.iter().any(|file| {
-        file.extents
-            .iter()
-            .any(|extent| matches!(extent.kind, ExtentKind::Unprotected))
-    }) {
-        return Err(EngineError::Unsupported(
-            "unprotected ranges require explicit self-repair",
-        ));
-    }
     for evidence in session.evidence.values() {
         crate::source::ensure_snapshot(
             session.access.as_ref(),

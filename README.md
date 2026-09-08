@@ -279,6 +279,14 @@ placement uses recorded paths only. JSON reports include file-coordinate damage,
 verified prefixes, cohort deficits, and installed paths and backups.
 Repair checks destination aliases using temporary name probes on the target
 filesystem before binding files; it rejects names that collapse to one path.
+Dry runs check existing paths without creating probes; missing-name collisions
+are checked again during execution. Damaged embedded layouts with unprotected
+ranges require the explicit self-repair API, including during dry-run validation.
+The CLI sizes its shared handle ceiling for the selected carrier collection plus
+32 execution handles, so retained Windows carriers do not consume repair headroom.
+Explicit carrier discovery counts admitted candidates against `--max-files`;
+smart placement separately counts the source files it inspects. Inferred RAR
+members expand to their volume family for automatic and standalone cleanup.
 Dry-run repair also enforces the configured Cauchy loss ceiling. Cleanup uses
 the same `-C` data root as repair. Auto mode retains discovery packets and tries
 available PAR2 recovery before returning a deferred PAR3 deficit.

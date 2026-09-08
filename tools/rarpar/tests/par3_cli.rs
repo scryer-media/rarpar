@@ -34,6 +34,126 @@ fn input(root: &Path, name: &str) -> Vec<u8> {
 }
 
 #[test]
+fn many_carriers_keep_handle_headroom_for_verify_and_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let bytes = input(root, "data.bin");
+    let created = run(
+        root,
+        &[
+            "par3",
+            "create",
+            "set",
+            "data.bin",
+            "-s",
+            "256",
+            "-c",
+            "40",
+            "--volume-blocks",
+            "1",
+        ],
+        0,
+    );
+    assert!(created["outputs"].as_array().unwrap().len() > 32);
+    run(root, &["par3", "verify", "set.par3"], 0);
+    for auto in [false, true] {
+        std::fs::remove_file(root.join("data.bin")).unwrap();
+        if auto {
+            run(root, &["auto", "."], 0);
+        } else {
+            run(root, &["par3", "repair", "set.par3"], 0);
+        }
+        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn explicit_carrier_limit_counts_candidates_not_unrelated_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    input(root, "data.bin");
+    run(
+        root,
+        &["par3", "create", "set", "data.bin", "-s", "256", "-c", "0"],
+        0,
+    );
+    for index in 0..8 {
+        std::fs::create_dir(root.join(format!("directory{index}"))).unwrap();
+        std::fs::write(root.join(format!("unrelated{index}.txt")), b"unrelated").unwrap();
+    }
+    run(root, &["inspect", "set.par3", "--max-files", "1"], 0);
+    run(
+        root,
+        &[
+            "par3",
+            "verify",
+            "set.par3",
+            "--max-files",
+            "1",
+            "--par-placement",
+            "canonical",
+        ],
+        0,
+    );
+    std::fs::copy(root.join("set.par3"), root.join("renamed-recovery")).unwrap();
+    let inspected = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .args(["inspect", "set.par3", "--max-files", "1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(inspected.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&inspected.stderr).contains("max files"));
+    run(
+        root,
+        &[
+            "par3",
+            "verify",
+            "set.par3",
+            "--max-files",
+            "1",
+            "--par-placement",
+            "canonical",
+        ],
+        4,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_dry_run_does_not_require_writable_destination() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    input(root, "data.bin");
+    run(
+        root,
+        &["par3", "create", "set", "data.bin", "-s", "256", "-c", "4"],
+        0,
+    );
+    std::fs::remove_file(root.join("data.bin")).unwrap();
+    let permissions = std::fs::metadata(root).unwrap().permissions();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Restore permissions even if a regression makes the CLI fail.
+    let result = std::panic::catch_unwind(|| {
+        run(
+            root,
+            &[
+                "par3",
+                "repair",
+                "set.par3",
+                "--dry-run",
+                "--par-placement",
+                "canonical",
+            ],
+            0,
+        )
+    });
+    std::fs::set_permissions(root, permissions).unwrap();
+    result.unwrap();
+    assert!(!root.join("data.bin").exists());
+}
+
+#[test]
 fn overwrite_rejects_obsolete_carriers_before_changing_any_output() {
     for data_packets in [false, true] {
         let temp = tempfile::tempdir().unwrap();
@@ -486,7 +606,7 @@ fn symlink_member_is_rejected_without_touching_its_target() {
 
 #[test]
 fn cleanup_resolves_separate_carriers_against_the_working_directory() {
-    for standalone in [false, true] {
+    for (standalone, protect_all) in [(false, true), (true, true), (false, false), (true, false)] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::create_dir(root.join("data")).unwrap();
@@ -516,7 +636,13 @@ fn cleanup_resolves_separate_carriers_against_the_working_directory() {
             "0",
             "--data-packets",
         ];
-        create.extend(names.iter().map(String::as_str));
+        assert!(names.len() > 1, "regression requires a multivolume archive");
+        create.extend(
+            names
+                .iter()
+                .take(if protect_all { names.len() } else { 1 })
+                .map(String::as_str),
+        );
         let created = run(root, &create, 0);
         std::fs::remove_file(root.join("data").join(&names[0])).unwrap();
         let mut auto = vec!["auto", "protection", "-C", "data", "--output", "extracted"];

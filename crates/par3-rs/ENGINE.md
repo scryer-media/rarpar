@@ -147,7 +147,8 @@ leaving headroom for verification and staging. All generation hashing is
 charged to the cumulative scan-work budget before reading.
 
 `Par3RepairSession::validate_repair` checks readiness and the configured Cauchy
-loss and handle ceilings without staging output. Dry-run consumers should call
+loss and handle ceilings without staging output. It also rejects damaged layouts
+with unprotected ranges that require explicit self-repair. Dry-run consumers should call
 it instead of treating `Ready` as an unconditional execution guarantee. Sources
 can still change and later allocations or output I/O can fail.
 

@@ -202,12 +202,7 @@ pub(crate) fn discover_reusing_par3(
             if !sibling_directories.insert(directory.canonicalize()?) {
                 continue;
             }
-            for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
-                if index >= options.max_files {
-                    return Err(RarparError::Resource(
-                        "PAR3 sibling discovery exceeded --max-files".into(),
-                    ));
-                }
+            for entry in std::fs::read_dir(directory)? {
                 let entry = entry?;
                 if entry.file_type()?.is_file()
                     && !visited.contains(&entry.path().canonicalize()?)
@@ -286,6 +281,19 @@ pub(crate) fn discover_reusing_par3(
         executed_actions: Vec::new(),
         cleanup_results: Vec::new(),
     })
+}
+
+/// Resolve a protected archive member to the same complete volume family used
+/// by explicit archive extraction before building an inferred cleanup manifest.
+pub fn expand_inferred_member(
+    path: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Vec<PathBuf>, RarparError> {
+    if matches!(classify_path(path).kind, DiscoveredKind::RarVolume(_)) {
+        Ok(discover_rar_set_for_archive(path, options)?.source_paths())
+    } else {
+        Ok(vec![path.to_path_buf()])
+    }
 }
 
 pub fn discover_rar_set_for_archive(

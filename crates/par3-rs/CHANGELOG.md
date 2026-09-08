@@ -6,7 +6,7 @@
   full-file generation hashes inside scan and payload loops. Charge fallback
   generation hashing to the cumulative work budget.
 - Expose `Par3RepairSession::validate_repair` so dry runs and execution share
-  readiness and configured Cauchy loss/handle checks.
+  readiness, ordinary-repair layout support, and configured Cauchy loss/handle checks.
 - Add bounded incremental packet ingestion, virtual source access, positioned
   BLAKE3 verification evidence, retained repair sessions, cancellation, and
   shared memory, handle, and scan-work budgets.

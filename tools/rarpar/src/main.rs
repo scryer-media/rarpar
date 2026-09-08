@@ -103,18 +103,27 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
         .collect();
     let had_par3_sets = !selected_par3.is_empty();
     let mut pending_par3 = Vec::new();
+    let mut inferred = std::collections::BTreeSet::new();
     for set in selected_par3 {
         let outcome = par3::repair_set(cli, &set)?;
         report.record_action(outcome.action());
         if !outcome.success {
             pending_par3.push(set);
         }
-        paths.extend(
-            outcome
-                .protected_paths
-                .into_iter()
-                .filter(|path| path.exists()),
-        );
+        for path in outcome.protected_paths {
+            if path.is_file() && !inferred.contains(&path.canonicalize()?) {
+                for member in discovery::expand_inferred_member(&path, &options)? {
+                    if inferred.insert(member.canonicalize()?) {
+                        if inferred.len() > options.max_files {
+                            return Err(RarparError::Resource(
+                                "inferred archive discovery exceeded --max-files".into(),
+                            ));
+                        }
+                        paths.push(member);
+                    }
+                }
+            }
+        }
     }
     if had_par3_sets {
         paths.sort();
@@ -209,7 +218,7 @@ fn run_inspect(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparEr
 fn run_cleanup(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
     let options = DiscoveryOptions::from_cli(cli);
     let mut report = discovery::discover(paths.clone(), &options)?;
-    let known: std::collections::BTreeSet<_> = report
+    let mut known: std::collections::BTreeSet<_> = report
         .files
         .iter()
         .map(|file| file.path.canonicalize())
@@ -222,7 +231,16 @@ fn run_cleanup(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, Rarp
     {
         for path in set.member_paths(cli.working_dir.as_deref())? {
             if path.is_file() && !known.contains(&path.canonicalize()?) {
-                members.insert(path);
+                for member in discovery::expand_inferred_member(&path, &options)? {
+                    if known.insert(member.canonicalize()?) {
+                        if known.len() > options.max_files {
+                            return Err(RarparError::Resource(
+                                "inferred cleanup exceeded --max-files".into(),
+                            ));
+                        }
+                        members.insert(member);
+                    }
+                }
             }
         }
     }

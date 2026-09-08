@@ -647,7 +647,8 @@ impl Par3RepairSession {
             .unwrap_or_default())
     }
 
-    /// Check readiness and configured codec/handle ceilings without staging files.
+    /// Check readiness, ordinary-repair layout support, and configured
+    /// codec/handle ceilings without staging files.
     /// This reuses retained analysis. A successful check does not reserve future
     /// allocations or guarantee that sources remain unchanged until execution.
     pub fn validate_repair(&mut self) -> EngineResult<()> {
@@ -659,6 +660,22 @@ impl Par3RepairSession {
         }
         if assessment.status != RepairStatus::Ready {
             return Err(EngineError::InvalidState("repair is not ready"));
+        }
+        if self
+            .layout
+            .as_ref()
+            .expect("ready layout")
+            .files
+            .iter()
+            .any(|file| {
+                file.extents
+                    .iter()
+                    .any(|extent| matches!(extent.kind, ExtentKind::Unprotected))
+            })
+        {
+            return Err(EngineError::Unsupported(
+                "unprotected ranges require explicit self-repair",
+            ));
         }
         if matches!(
             assessment.matrix.as_ref().map(|packet| packet.body()),

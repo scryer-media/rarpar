@@ -5,6 +5,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.0 (unreleased)
 
+- Keep repair dry runs read-only and reject layouts requiring explicit
+  self-repair. Size CLI handle budgets for retained carrier collections, count
+  only admitted carrier siblings, and expand inferred RAR cleanup members to
+  their complete volume family.
 - Retain authenticated PAR3 discovery packets across automatic repair and
   rediscovery, including renamed carriers. Defer PAR3 deficits until available
   PAR2 recovery has run, then reassess the affected sets.

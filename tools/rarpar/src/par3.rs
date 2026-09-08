@@ -110,6 +110,21 @@ pub fn is_carrier_candidate(path: &Path) -> bool {
         && &prefix == par3_rs::MAGIC
 }
 
+fn carrier_options(
+    options: &ExecutionOptions,
+    carriers: usize,
+) -> Result<ExecutionOptions, RarparError> {
+    let mut options = options.clone();
+    // Windows keeps immutable carrier handles with lazy packet payloads. Size
+    // one shared collection budget before scanning, preserving execution headroom.
+    options.open_handles = options
+        .open_handles
+        .checked_add(carriers)
+        .ok_or_else(|| RarparError::Resource("PAR3 handle budget overflow".into()))?;
+    options.handles = par3_rs::runtime::HandleBudget::new(options.open_handles);
+    Ok(options)
+}
+
 fn scan(paths: &[PathBuf], options: &ExecutionOptions) -> Result<Vec<LoadedSet>, RarparError> {
     let mut disk = DiskSourceAccess::with_options(options.clone());
     for (index, path) in paths.iter().enumerate() {
@@ -165,6 +180,7 @@ pub fn discover_sets(
     paths: &[PathBuf],
     options: &ExecutionOptions,
 ) -> Result<Vec<Par3Set>, RarparError> {
+    let options = carrier_options(options, paths.len())?;
     let mut result = Vec::new();
     let mut directories: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in paths {
@@ -175,11 +191,11 @@ pub fn discover_sets(
     }
     // Identical sets in separate downloads still need independent repair.
     for paths in directories.into_values() {
-        for set in scan(&paths, options)? {
+        for set in scan(&paths, &options)? {
             let metadata = set.packets.metadata()?;
             let layout = metadata
                 .as_ref()
-                .map(|metadata| BlockLayout::new(metadata, options))
+                .map(|metadata| BlockLayout::new(metadata, &options))
                 .transpose()?;
             result.push(Par3Set {
                 id: set.id.to_string(),
@@ -246,7 +262,7 @@ fn protected_path(root: &Path, name: &str) -> Result<PathBuf, RarparError> {
     Ok(joined)
 }
 
-fn validate_destinations(paths: &[PathBuf]) -> Result<(), RarparError> {
+fn validate_destinations(paths: &[PathBuf], probe_missing: bool) -> Result<(), RarparError> {
     let mut existing = BTreeSet::new();
     let mut probes: BTreeMap<PathBuf, tempfile::TempDir> = BTreeMap::new();
     for path in paths {
@@ -273,6 +289,9 @@ fn validate_destinations(paths: &[PathBuf]) -> Result<(), RarparError> {
                 "PAR3 member is nested under a file: {}",
                 path.display()
             )));
+        }
+        if !probe_missing {
+            continue;
         }
         let relative = path.strip_prefix(&ancestor).expect("ancestor prefix");
         let key = ancestor.canonicalize()?;
@@ -344,15 +363,24 @@ fn load_selected(
     } else {
         files.insert(input.clone());
         // Siblings are candidates only; authenticated identities select the set.
-        let mut siblings_cli = cli.clone();
-        siblings_cli.no_recursive = true;
-        collect_files(&parent(&input), &siblings_cli, 0, &mut files)?;
+        for entry in std::fs::read_dir(parent(&input))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && is_carrier_candidate(&entry.path()) {
+                files.insert(entry.path());
+                if files.len() > cli.max_files {
+                    return Err(RarparError::Resource(
+                        "PAR3 discovery exceeded --max-files".into(),
+                    ));
+                }
+            }
+        }
     }
     let paths: Vec<_> = files
         .into_iter()
         .filter(|path| *path == input || is_carrier_candidate(path))
         .collect();
-    let mut sets = scan(&paths, options)?;
+    let options = carrier_options(options, paths.len())?;
+    let mut sets = scan(&paths, &options)?;
     sets.retain(|set| {
         args.set_id.as_ref().map_or_else(
             || input.is_dir() || set.paths.contains(&input),
@@ -549,7 +577,7 @@ fn verify_repair_loaded(
             .map(|file| protected_path(&root, &file.path))
             .collect::<Result<_, _>>()?;
         if repair {
-            validate_destinations(&destinations)?;
+            validate_destinations(&destinations, !cli.dry_run)?;
         }
         for (file, path) in layout.files().iter().zip(destinations) {
             let id = SourceId(bindings.len() as u64);
@@ -713,7 +741,8 @@ fn reject_obsolete_carriers(
             }
         })
         .collect::<Result<_, _>>()?;
-    for set in scan(&candidates, options)? {
+    let options = carrier_options(options, candidates.len())?;
+    for set in scan(&candidates, &options)? {
         // Names select overwrite candidates only. Membership comes exclusively
         // from authenticated packets, including renamed copies of the old set.
         let selected = set.paths.iter().any(|path| {

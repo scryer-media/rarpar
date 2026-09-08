@@ -48,6 +48,55 @@ fn export_inserted_archives_for_reference_validation() {
 }
 
 #[test]
+fn ordinary_repair_validation_rejects_unprotected_container_ranges() {
+    use par3_rs::ingest::{PacketScanner, ScanEvent};
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+    use std::sync::Arc;
+    for (_, original, inserted) in cases() {
+        let options = ExecutionOptions::default();
+        let mut damaged = inserted.to_vec();
+        assert!(original.len() > 100);
+        damaged[100] ^= 0x80; // Protected archive data; carrier packets stay official.
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, damaged.into());
+        let access = Arc::new(access);
+        let mut scanner = PacketScanner::new(
+            access.clone(),
+            SourceId(1),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            packets.push(packet);
+        }
+        let mut session =
+            Par3RepairSession::new(packets[0].input_set_id(), access, options).unwrap();
+        for packet in packets {
+            session.merge(packet).unwrap();
+        }
+        let name = session.layout().unwrap().unwrap().files()[0].path.clone();
+        session.bind_file(&name, SourceId(1)).unwrap();
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        assert!(matches!(
+            session.validate_repair(),
+            Err(EngineError::Unsupported(
+                "unprotected ranges require explicit self-repair"
+            ))
+        ));
+        let tree = common::TempTree::new("ordinary-inside-refused");
+        assert!(matches!(
+            session.repair(tree.path(), false),
+            Err(EngineError::Unsupported(
+                "unprotected ranges require explicit self-repair"
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn captured_self_repair_restores_official_archives_with_missing_packets() {
     use par3_rs::ingest::{PacketScanner, ScanEvent};
     use par3_rs::inside::SelfRepairPlan;

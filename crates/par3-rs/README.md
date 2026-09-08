@@ -185,8 +185,9 @@ unknown for later reading.
 Windows scanning pins a read-only carrier handle, preventing repeated full-file
 generation hashes after one acquisition hash. Retained packets keep that handle
 alive; drop them before replacing or deleting carriers. All generation hashes
-consume scan-work budget. Use `Par3RepairSession::validate_repair()` for dry-run readiness and
-configured codec limits before staging output.
+consume scan-work budget. Use `Par3RepairSession::validate_repair()` to check
+dry-run readiness, configured codec limits, and layouts requiring explicit
+self-repair before staging output.
 
 Cancellation, progress callbacks, stage timings, I/O counters, and typed
 resource/I/O outcomes are available through `runtime`. Convenience APIs instead
