@@ -9,7 +9,7 @@ sessions that retain evidence as more data arrives.
 
 **Status:** a 0.x library with reference interoperability tests. Matched native
 performance acceptance remains outstanding; initial
-[native x86-64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
+[native x86-64 and ARM64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
 are available. See [Scope](#scope) for supported formats and exclusions. This is
 independent, clean-room software, not official Parchive tooling.
 

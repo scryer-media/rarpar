@@ -24,9 +24,9 @@ codec's geometric mean, calculated from three-run median process times.
 | FFT / 4 | 1.37× | 2.49× | 1.88× |
 
 These measured x86-64 aggregates exceed the reference for both codecs. They
-do **not** complete performance acceptance: matched ARM64 measurements remain
-outstanding, this is the first native x86-64 baseline, and there are individual
-shortfalls worth tuning. No historical x86-64 regression percentage is inferred
+do **not** complete performance acceptance: the ARM64 run below exposes an FFT
+creation shortfall, this is the first native x86-64 baseline, and there are
+individual shortfalls worth tuning. No historical x86-64 regression percentage is inferred
 from the earlier emulated reference or contended ARM64 runs.
 
 One-worker median times, in milliseconds (engine / reference):
@@ -102,7 +102,146 @@ record the arithmetic-only comparison. Automatic x86 dispatch was 6.35–10.17×
 faster than scalar in those four shapes. That speedup is not an end-to-end
 throughput ratio.
 
-## Method
+## ARM64 results, 2026-09-08
+
+Host: Apple M5 Max, 18 logical CPUs, 128 GiB RAM, macOS 26.6.2;
+Rust 1.97.1 / LLVM 22.1.6, Homebrew Clang 22.1.8 and libomp 22.1.7.
+Library code is unchanged from the x86-64 run; the Mac runner is `10b1640`.
+Rust uses `-C target-cpu=native`; the reference uses `-mcpu=native -fopenmp`.
+There is no emulation, CPU affinity, or frequency control. Existing services
+remained running; measured one-minute host load ranged from 3.92 to 8.71.
+No build or other task-owned benchmark ran concurrently with the final matrix.
+
+All **534 final invocations passed** across the same nine workloads, two worker
+ceilings, and three repetitions. Every Rust-created set verified with the
+reference; both engines' repaired files matched saved SHA-256 input digests.
+All 54 batches of 100 unchanged reassessments had zero source bytes and read
+calls. Each small-file trial staged exactly the 64 damaged files.
+
+### Reference-build qualification
+
+The pinned reference does not provide a macOS build. Its benchmark-only scratch
+adaptation enables the existing POSIX platform layer, adjusts headers and
+timestamp access, and replaces x86-only compiler flags. Leopard's existing ARM
+path uses the added, pinned SSE2NEON header. Because the archive also lacks the
+BLAKE3 NEON source, its existing SSE2 hashing source is compiled through that
+same header and exposed to the ARM dispatcher with a symbol alias. Single-block
+compression retains the reference's portable ARM path. No algorithm bodies or
+Rust dependencies changed.
+
+These results compare against that **adapted reference**, not an official
+macOS binary or an upstream dedicated-NEON BLAKE3 build. The exact patch, header
+revision and hash, compiler flags, binary hashes, and build recipe are archived.
+A prior complete portable-hashing reference run and all pilots are excluded
+from the reported ratios. Both-way verification and repair checks were repeated
+after enabling SIMD hashing.
+
+### Throughput
+
+Reference wall time divided by engine wall time, using the same geometric-mean
+method as the x86-64 report:
+
+| Codec / worker ceiling | Create | Verify | Repair |
+| --- | ---: | ---: | ---: |
+| Cauchy / 1 | 1.64× | 2.25× | 2.67× |
+| Cauchy / 4 | 1.64× | 2.25× | 2.76× |
+| FFT / 1 | **0.80×** | 1.98× | 1.44× |
+| FFT / 4 | **0.85×** | 1.97× | 1.61× |
+
+**Performance acceptance remains open:** aggregate FFT creation throughput is
+15–20% below this adapted reference. Cauchy exceeds it in all three aggregates;
+FFT verification and repair also exceed it. This is the first matched native
+ARM64 baseline, not evidence of a historical implementation regression.
+
+One-worker median milliseconds (engine / adapted reference):
+
+| Workload | Create | Verify | Repair |
+| --- | ---: | ---: | ---: |
+| Cauchy GF8 | 108.3 / 216.4 | 22.4 / 72.9 | 92.9 / 272.5 |
+| Cauchy GF16 | 140.4 / 264.5 | 35.8 / 57.9 | 114.5 / 269.7 |
+| FFT GF8 | 138.8 / 90.3 | 25.9 / 80.1 | 244.5 / 284.4 |
+| FFT GF16 | 122.8 / 93.1 | 40.2 / 61.3 | 176.3 / 239.5 |
+| Uneven FFT | 136.5 / 86.8 | 38.9 / 57.7 | 231.8 / 210.4 |
+| Heavy Cauchy | 2005.0 / 7024.1 | 117.3 / 258.0 | 1595.4 / 7657.7 |
+| Heavy FFT | 432.1 / 565.3 | 115.7 / 252.4 | 932.6 / 2770.9 |
+| Large blocks | 102.3 / 157.6 | 30.8 / 416.4 | 87.9 / 653.1 |
+| Small files | 69.3 / 39.9 | 43.1 / 15.9 | 62.5 / 34.4 |
+
+Four-worker heavy Cauchy repair took 755.7 ms; heavy FFT took 820.2 ms.
+All four-worker medians and raw repetitions are in `summary.json` and JSONL.
+
+### Shortfalls and stage attribution
+
+- **FFT creation:** on the ordinary GF8, GF16, and uneven workloads, planning
+  consumed about 39–40 ms before execution. Nested encoding took 30.9, 16.2,
+  and 33.3 ms respectively, compared with complete process times of 138.8,
+  122.8, and 136.5 ms. Source reads, verification, scratch/output handling,
+  and other work therefore account for much of the elapsed time. These stage
+  timings identify where to profile; they do not isolate filesystem overhead
+  as the exclusive cause. Nested times must not be added to enclosing times.
+- **Small files:** ingestion consumed 32.8 ms of the 43.1 ms verification
+  process; assessment took 4.4 ms. Creation and repair also lagged the
+  reference. This agrees with the x86 syscall probe's carrier-open concern,
+  but no macOS syscall attribution was collected in this run.
+- **Uneven FFT repair:** one-worker time was 231.8 ms versus 210.4 ms.
+  Decoder work consumed 160.2 ms of the 193.2 ms repair stage. Four-worker
+  process times were close, at 204.2 versus 207.3 ms.
+
+Separate scan-only medians were about 8–15 ms for ordinary single-file cases,
+39–40 ms for small files, and 53–54 ms for heavy cases. CRC64 placement traversed
+32 MiB in about 213–238 ms and 128 MiB in 921–955 ms. Primitive FFT NEON dispatch
+was 5.59–10.81× scalar in the separately recorded
+[transform benchmark](../reedsolomon-rs/FFT_BENCHMARKS.md); that is not the engine
+throughput ratio.
+
+### Memory and storage
+
+All reservation peaks stayed within their configured ceilings; observed engine
+handle peaks never exceeded two. Native `/usr/bin/time -l -p` reports peak RSS
+in bytes, which the runner converts to KiB. RSS includes runtime and allocator
+overhead and is distinct from the engine's reservation limit.
+
+- **8 MiB budget, 4 MiB blocks:** peak reservation 4.18 MiB; maximum repair RSS
+  2.67 MiB for the engine and 20.78 MiB for the reference.
+- **64 MiB heavy cases:** maximum Cauchy repair RSS 28.08 MiB versus 83.67 MiB;
+  FFT 67.81 MiB versus 99.20 MiB.
+- Maximum repair RSS across the matrix: 67.81 MiB for the engine, 111.89 MiB
+  for the reference, from different workloads. The engine did not use less
+  RSS in every case: ordinary Cauchy GF16 was 5.53 versus 3.56 MiB.
+
+Mac inputs, scratch, and outputs use APFS under `/tmp`, with normal caching and
+no cache flush. The x86 run used tmpfs, different hardware and a different Rust
+version. Do not interpret absolute cross-host timing differences as CPU-only
+or code regressions. Each host's paired ratio is the comparison reported here.
+
+### Evidence and reproduction
+
+[`benchmarks/native-arm64-20260908.tar.gz`](benchmarks/native-arm64-20260908.tar.gz)
+contains the final JSONL records, process logs and RSS, input digests, summary
+and analysis script, host/build provenance, the reference adaptation recipe and
+patch, and fresh Criterion samples. Protected inputs, PAR3 carriers, downloaded
+dependency source, pilots, and portable-only reference timings are excluded.
+Archive SHA-256:
+`5084cf94eddc8b7219ee7625c9b900517a9b85735b0f9df5df622196a36df822`.
+
+Build the native Rust example as in the Linux recipe below. Extract the evidence
+archive and follow `REFERENCE-BUILD.md` in a separate pinned-reference checkout;
+then run:
+
+```sh
+python3 crates/par3-rs/benches/run_native.py \
+  --engine /path/to/native-build/release/examples/engine_perf \
+  --reference /path/to/adapted-reference/build/par3cmd/par3 \
+  --output /path/to/new-mac-results --workers 1,4 --repetitions 3
+```
+
+Omit `--cpus` on macOS. Omitting `--reference` gives Rust-only measurements,
+which do not supply independent interoperability or reference-throughput
+evidence. The native runner supports both forms and refuses existing output
+directories. The engine source and crate dependencies are unchanged by these
+measurements.
+
+## Method for the x86-64 run
 
 The native Linux measurements use the retained engine through
 `examples/engine_perf.rs`, orchestrated by `benches/run_native.py`. The driver

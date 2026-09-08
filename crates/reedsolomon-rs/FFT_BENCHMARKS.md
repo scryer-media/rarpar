@@ -73,3 +73,30 @@ preserved in `crates/par3-rs/benchmarks/native-x86-20260908.tar.gz` at the
 repository root. These are primitive transform measurements; see the
 [PAR3 native report](../par3-rs/PERFORMANCE.md) for the separate matched
 reference workloads, memory observations, and remaining acceptance limits.
+
+## Native ARM64 rerun, 2026-09-08
+
+Apple M5 Max, 128 GiB RAM, macOS 26.6.2, Rust 1.97.1 / LLVM 22.1.6;
+release build with `-C target-cpu=native`. One worker, automatic NEON dispatch,
+no affinity or frequency controls. Existing services remained running. Builds
+finished before measurement, and no other benchmark was run concurrently.
+This run used Criterion's defaults: 100 samples, three seconds of warmup and
+five seconds of target measurement time. The slowest scalar case extended its
+collection interval to collect the requested samples.
+
+Arithmetic-mean estimates from fresh Criterion output:
+
+| Field and symbol shape | Scalar pair | Automatic pair | Speedup |
+| --- | ---: | ---: | ---: |
+| GF8, 128 × 64 | 70.198 µs | 12.565 µs | 5.59× |
+| GF8, 128 × 4096 | 4.39770 ms | 0.59243 ms | 7.42× |
+| GF16, 1024 × 64 | 790.232 µs | 111.935 µs | 7.06× |
+| GF16, 1024 × 4096 | 46.8388 ms | 4.33420 ms | 10.81× |
+
+Every round trip restored its original symbols. These measurements supersede
+the contended exploratory ARM64 observations for tuning comparisons, but the
+different load, compiler flags, and sample settings prevent attributing their
+difference to a code change. Raw samples and the console log are preserved in
+`crates/par3-rs/benchmarks/native-arm64-20260908.tar.gz`. End-to-end engine
+measurements and reference-build qualifications are in the
+[PAR3 native report](../par3-rs/PERFORMANCE.md).

@@ -245,8 +245,15 @@ repair throughput on that host. See `PERFORMANCE.md` for the measurements,
 resource observations, and individual shortfalls in small-file verification
 and uneven-cohort FFT repair.
 
-Matched native ARM64 performance and further FFT scheduling/decoder tuning
-remain outstanding. This first x86-64 baseline does not establish historical
+The native ARM64 matrix also passed all 534 invocations, using the explicitly
+documented macOS adaptation of the pinned reference. Cauchy exceeded that
+reference's three throughput aggregates; FFT verification and repair exceeded
+it, but FFT creation reached only 80–85% of reference throughput. Small-file
+workloads and one-worker uneven FFT repair also remain slower. The report
+preserves the reference portability patch and SIMD-hashing qualification.
+
+Performance acceptance and further creation, carrier-I/O, and decoder tuning
+remain outstanding. These first native baselines do not establish historical
 regression percentages or broad platform readiness. Earlier emulated reference
 timings are interoperability evidence only; correctness alone does not satisfy
 performance acceptance.
