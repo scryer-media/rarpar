@@ -76,12 +76,21 @@ test damages byte 13 of blocks 0, 32,767, and 65,537 with `0x80` and restores
 the full input through the public session API. This exceeds the per-codec field
 geometry globally while keeping each cohort within its own supported geometry.
 
-Local creation and repair passed. Reference exports are prepared under
-`/tmp/par3-reference.mGh8NL/created-boundary-20260908/many-blocks`; their reference
-verification and repair are pending explicit authorization to use the existing
-local reference container. The pinned source's Linux platform headers and x86
-build flags prevented an unchanged ARM64 macOS build. This case is not yet
-additional reference interoperability evidence.
+Local creation and repair passed. The pinned reference also verified the
+generated set, repaired the same three damaged blocks with `par3 r -S0 set.par3`,
+and reported all files correct on a subsequent `par3 v set.par3`. It explicitly
+reported 65,536 surviving input blocks out of 65,539 and consumed three recovery
+equations. Only the protected input bytes were damaged; all carriers remained
+unchanged, and no clean input copy was available to reference file discovery.
+
+The original and repaired 4,194,496-byte input both have SHA-256
+`0e35f01462cc94e846d8b862b3c1cac400d484113e4bdd508a9a21de57a3e83b`.
+The authorized local run used `rarpar-par3-engine-oracle` with the generated set
+under `/tmp/par3-reference.mGh8NL/created-boundary-20260908/many-blocks`. Raw logs
+were `/tmp/par3-boundary-reference-before.log`,
+`/tmp/par3-boundary-reference-repair.log`, and
+`/tmp/par3-boundary-reference-after.log`. These are correctness results under
+emulation, not native throughput evidence or official-reference fixture bytes.
 
 ## Reproduction
 
