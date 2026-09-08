@@ -43,6 +43,72 @@ impl SourceAccess for ArrivingSource {
 }
 
 #[test]
+fn replay_rehomes_payloads_when_the_previous_provider_fails() {
+    struct FallibleSource {
+        inner: MemorySourceAccess,
+        failed: std::sync::atomic::AtomicBool,
+    }
+    impl SourceAccess for FallibleSource {
+        fn snapshot(&self, source: SourceId) -> io::Result<Option<SourceSnapshot>> {
+            if self.failed.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "withdrawn carrier",
+                ));
+            }
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+            self.snapshot(source)?;
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(&self, source: SourceId, offset: u64) -> io::Result<Option<Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+    let options = ExecutionOptions::default();
+    let source = || {
+        let mut inner = MemorySourceAccess::default();
+        inner.insert(SourceId(9), 1, common::set_vol0_par3().into());
+        Arc::new(FallibleSource {
+            inner,
+            failed: false.into(),
+        })
+    };
+    let old = source();
+    let new = source();
+    let scan = |access: Arc<FallibleSource>| {
+        let mut scanner =
+            PacketScanner::new(access, SourceId(9), options.clone(), ScanLimits::default())
+                .unwrap();
+        let mut packets = Vec::new();
+        while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            packets.push(packet);
+        }
+        packets
+    };
+    let mut input = IncrementalSet::new(common::SET_ID, options.clone()).unwrap();
+    for packet in scan(old.clone()) {
+        input.merge(packet).unwrap();
+    }
+    let retained = input.retained_bytes();
+    old.failed.store(true, Ordering::Relaxed);
+    for packet in scan(new) {
+        let expected = if packet.payload().is_some() {
+            MergeEffect::Payload
+        } else {
+            MergeEffect::Replay
+        };
+        assert_eq!(input.merge(packet.clone()).unwrap(), expected);
+        assert_eq!(input.merge(packet).unwrap(), MergeEffect::Replay);
+    }
+    assert_eq!(input.retained_bytes(), retained);
+    for payload in input.payloads() {
+        payload.validate(&options).unwrap();
+    }
+}
+
+#[test]
 fn split_arrivals_authenticate_without_retaining_recovery_bytes() {
     let bytes = common::set_vol0_par3();
     let expected = common::scan(&bytes);

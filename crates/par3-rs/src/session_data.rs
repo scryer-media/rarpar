@@ -53,7 +53,10 @@ impl Par3RepairSession {
             }
             self.admit_retained(ADMISSION_BYTES)?;
             let reservation = self.options.memory.reserve(ADMISSION_BYTES)?;
-            validate_extents(layout, index, payload, &self.options)?;
+            if !validate_extents(layout, index, payload, &self.options)? {
+                // Keep the payload pending until checksum metadata arrives.
+                continue;
+            }
             if let Some(existing) = self.data_blocks.get(&index) {
                 compare_aliases(existing, payload, layout.block_size, &self.options)?;
             }
@@ -79,7 +82,7 @@ fn validate_extents(
     index: u64,
     payload: &PayloadRef,
     options: &ExecutionOptions,
-) -> EngineResult<()> {
+) -> EngineResult<bool> {
     payload.validate(options)?;
     let Some(locations) = layout.blocks.get(&index) else {
         return Err(EngineError::InvalidState(
@@ -89,7 +92,7 @@ fn validate_extents(
     let size = options.stripe_bytes.min(64 << 10);
     let bookkeeping = locations
         .len()
-        .checked_mul(128)
+        .checked_mul(256)
         .and_then(|n| n.checked_add(size))
         .ok_or(EngineError::ResourceLimit("Data extent validation"))?;
     let _memory = options.memory.reserve(bookkeeping)?;
@@ -113,6 +116,24 @@ fn validate_extents(
             }
         }
     }
+    let authenticated = super::union(
+        expected
+            .keys()
+            .map(|&(offset, length)| offset..offset + length)
+            .collect(),
+    );
+    for location in locations {
+        let extent = &layout.files[location.file].extents[location.extent];
+        if let ExtentKind::Block { offset, .. } = extent.kind {
+            let end = offset + extent.range.end - extent.range.start;
+            if !authenticated
+                .iter()
+                .any(|range| range.start <= offset && range.end >= end)
+            {
+                return Ok(false);
+            }
+        }
+    }
     let mut buffer = vec![0; size];
     for ((offset, length), expected) in expected {
         let mut hash = FingerprintHasher::new();
@@ -131,7 +152,7 @@ fn validate_extents(
             ));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 // Compare logical bytes directly. Packed tail blocks acquire no invented

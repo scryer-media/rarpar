@@ -698,7 +698,10 @@ impl IncrementalSet {
         }
         if let Some(previous) = self.packets.get(&packet.hash()) {
             if let Some(payload) = previous.payload()
-                && payload.access.snapshot(payload.source)? != Some(payload.snapshot)
+                && !payload
+                    .access
+                    .snapshot(payload.source)
+                    .is_ok_and(|current| current == Some(payload.snapshot))
             {
                 packet.rehome(&self.options)?;
                 self.packets.insert(packet.hash(), packet);

@@ -118,6 +118,25 @@ process RSS; provider storage and allocator bookkeeping are outside that count.
 and measurement. Set explicit worker limits when Weaver schedules concurrent
 jobs. Clone the same memory, handle, and scan-work budgets to share ceilings.
 
+`max_cauchy_lost_blocks` separately caps each Cauchy solve at 4,096 losses by
+default. The limit is checked before staging or building the quadratic
+coefficient matrix; callers may explicitly raise it. FFT selection and carrier
+regeneration require the reference field generator as well as the field width.
+
+Data packet hashes authenticate their carrier bytes, not their connection to a
+protected file. Admission waits until extent fingerprints cover every protected
+part of the logical block. Missing checksum packets leave the Data payload
+pending; late metadata triggers validation before it can supply repair or
+carrier reconstruction. Identical packet replay can replace an unavailable or
+failing old provider without discarding unchanged source evidence.
+
+Unix disk snapshots include device, inode and change time. Other platforms use
+a bounded full-file hash for each snapshot because stable Rust does not expose
+portable file identity/change counters. This preserves correctness for
+same-length replacements with preserved timestamps, at the cost of snapshot
+reads. Weaver's virtual sources should supply their own immutable generations
+through `SourceAccess` to retain read-free reassessment.
+
 Packet admission charges parsed structures as well as wire bytes. Resolving
 shared directory/file descriptions has a separate reservation and expansion
 limits derived from remaining memory and retained-state headroom. Sessions keep
@@ -260,10 +279,9 @@ ARM64 FFT creation remains below reference aggregate throughput (89–95%); the
 all-operation performance gate remains open separately from this consumer use
 case. Earlier emulated reference timings remain interoperability evidence only.
 
-The first implementation PR temporarily ignores 13 advanced-corpus tests until
-the operator publishes their fixtures. Their runtime loading permits builds
-without the new corpus; independent engine tests remain enabled. All 13 passed
-explicitly with the local reference-generated files before gating. The follow-up
-PR will enable them against the newly pinned corpus. See
-`tests/fixtures/advanced/README.md` for the exact targets; corpus publication is
-an operator-owned action outside this implementation.
+The 13 advanced-corpus tests gated during initial implementation are enabled.
+They require the official advanced fixtures, as does the regression that omits
+External Data checksums and supplies them later. Missing files fail explicitly;
+they are never silently skipped. See `tests/fixtures/advanced/README.md` for the
+required corpus. Corpus publication is an operator-owned action outside this
+implementation.

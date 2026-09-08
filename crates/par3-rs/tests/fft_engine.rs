@@ -23,7 +23,6 @@ fn inputs() -> Vec<Vec<u8>> {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn gf16_fft_encoding_and_decoding_match_the_reference() {
     let names = [
         "fft16.par3",
@@ -106,7 +105,6 @@ fn gf16_fft_encoding_and_decoding_match_the_reference() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn retained_interleaved_repair_requires_recovery_in_the_damaged_cohort() {
     use par3_rs::ingest::{PacketScanner, PayloadKind, ScanEvent};
     use par3_rs::session::RepairStatus;
@@ -217,7 +215,6 @@ fn recovery() -> BTreeMap<usize, Vec<u8>> {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn bounded_fft_encoding_matches_official_recovery_bytes() {
     let input = inputs();
     let expected = recovery();
@@ -247,7 +244,6 @@ fn bounded_fft_encoding_matches_official_recovery_bytes() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn bounded_fft_decoding_restores_official_input_with_uneven_losses() {
     let input = inputs();
     let recovery = recovery();

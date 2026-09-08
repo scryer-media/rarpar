@@ -48,7 +48,6 @@ fn export_inserted_archives_for_reference_validation() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn captured_self_repair_restores_official_archives_with_missing_packets() {
     use par3_rs::ingest::{PacketScanner, ScanEvent};
     use par3_rs::inside::SelfRepairPlan;
@@ -179,7 +178,6 @@ fn captured_self_repair_restores_official_archives_with_missing_packets() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn unknown_embedded_manifest_preserves_packets_and_repairs_protected_data() {
     replacement_cases(None);
 }
@@ -403,7 +401,6 @@ fn cases() -> [(ContainerKind, &'static [u8], &'static [u8]); 3] {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn reference_containers_preserve_original_bytes_and_duplicate_zip_footers() {
     for (kind, original, inserted) in cases() {
         let mut access = MemorySourceAccess::default();
@@ -453,7 +450,6 @@ fn reference_containers_preserve_original_bytes_and_duplicate_zip_footers() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn inspection_refuses_trailing_data_damage_and_exhausted_budgets() {
     for (_, original, _) in cases() {
         let mut access = MemorySourceAccess::default();
@@ -488,7 +484,6 @@ fn inspection_refuses_trailing_data_damage_and_exhausted_budgets() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn insertion_cleans_carriers_when_output_staging_fails() {
     use par3_rs::creation::CreationOptions;
     use par3_rs::inside::InsertionPlan;
@@ -523,7 +518,6 @@ fn insertion_cleans_carriers_when_output_staging_fails() {
 }
 
 #[test]
-#[ignore = "requires the next published advanced PAR3 corpus; enable in the corpus follow-up PR"]
 fn staged_insertion_preserves_members_and_authenticates_embedded_layout() {
     use par3_rs::creation::CreationOptions;
     use par3_rs::inside::InsertionPlan;
