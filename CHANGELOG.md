@@ -3,6 +3,24 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.5.0 (unreleased)
+
+- Add `par3 create`, `par3 verify`, and `par3 repair`, using the bounded engine
+  in `par3-rs` 0.3.0. Support FFT/interleaving, deduplication, Data packets,
+  content placement, configurable volumes, dry-run creation plans, and explicit
+  memory, worker, and repair-loss limits.
+- Discover and repair PAR3 sets in `auto` before archive extraction. Handle
+  independent copies and multiple sets, and preserve shared protection carriers
+  during cleanup. Existing `par` commands continue to handle PAR2.
+- Report file-coordinate damage, verified prefixes, cohort deficits, installed
+  outputs, backups, and partial repair failures in human and JSON output.
+- Keep creation durable by default, with an explicit buffered-write option.
+  Embedded-container self-repair remains a library API.
+
+The binary requires the new PAR3 and `reedsolomon-rs` 0.4.5 packages. Workspace
+patches support validation before publication; packaged consumers require those
+versions in the registry.
+
 ## rarpar 0.4.1
 
 The 0.4.0 tag never produced a release: its build refused to link two

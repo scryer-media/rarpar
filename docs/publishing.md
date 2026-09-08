@@ -9,12 +9,26 @@ Publish order:
 3. `par2-rs`
 4. `par3-rs`
 
-`par3-rs` depends on nothing else in this workspace, so its place in the order
-is arbitrary; it goes last so a coordinated publish reaches the crates that
-depend on each other first.
+`par3-rs` depends on `reedsolomon-rs`; its required arithmetic version must be
+available before publishing PAR3. The other libraries also consume the shared
+arithmetic, but their existing compatible requirements need not change when
+they do not use newly added APIs.
 
 `rarpar` is a CLI binary and is not published to crates.io. It has its own
 binary release cycle, independent of the library crate publish cycle.
+
+PRs include prospective versions and changelog entries for changed libraries
+and CLI behavior, plus dependency requirements and the lockfile. Reuse an
+appropriate unreleased version instead of incrementing it for every follow-up.
+Version preparation does not publish packages or authorize tags or deployment.
+
+For the advanced PAR3 engine, the prospective versions are `reedsolomon-rs`
+0.4.5, `par3-rs` 0.3.0, and binary `rarpar` 0.5.0. PAR3 requires arithmetic
+0.4.5 and the CLI requires PAR3 0.3. Workspace patches keep these unpublished
+versions buildable together. Cargo can verify sibling library archives with
+`cargo package --locked -p reedsolomon-rs -p par3-rs`; that validates the
+packages together, not their availability in the public registry. Packaged
+CLI builds outside the workspace require the new library versions published.
 
 Patch releases may publish a single library crate when only that crate changed.
 Use the dependency order above for coordinated multi-crate releases.

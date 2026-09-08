@@ -282,26 +282,35 @@ jobs:
 
           exact_packaged_crates=""
           package_and_list() {
-            crate="$1"
-            cargo package --locked -p "$crate"
-            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
-            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
-              echo "::error::${crate} package includes fixture files"
-              exit 1
-            fi
-            if [ "$crate" = unrar-rs ]; then
-              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
-            fi
-            exact_packaged_crates="${exact_packaged_crates} ${crate}"
+            local crate
+            local -a package_args=()
+            for crate in "$@"; do
+              package_args+=(-p "$crate")
+            done
+            cargo package --locked "${package_args[@]}"
+            for crate in "$@"; do
+              cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+              if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+                echo "::error::${crate} package includes fixture files"
+                exit 1
+              fi
+              if [ "$crate" = par3-rs ] && grep -n '^benchmarks/' ".ci/package-lists/${crate}.txt"; then
+                echo "::error::par3-rs package includes benchmark evidence"
+                exit 1
+              fi
+              if [ "$crate" = unrar-rs ]; then
+                grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+              fi
+              exact_packaged_crates="${exact_packaged_crates} ${crate}"
+            done
           }
 
           if [ "$PUBLISH_PACKAGE" = all ]; then
             reed_solomon_version="$(crate_version reedsolomon-rs)"
             unrar_version="$(crate_version unrar-rs)"
-            package_and_list reedsolomon-rs
-            # par3-rs depends on nothing in this workspace, so it never has to
-            # wait for a sibling to reach the registry.
-            package_and_list par3-rs
+            # Verify PAR3 against the sibling archive before the new arithmetic
+            # version is available in the registry, matching PR CI.
+            package_and_list reedsolomon-rs par3-rs
 
             if registry_has_version reedsolomon-rs "$reed_solomon_version"; then
               package_and_list unrar-rs
@@ -333,7 +342,7 @@ jobs:
               "reedsolomon-rs": 1_000_000,
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
-              "par3-rs": 300_000,
+              "par3-rs": 350_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}
@@ -458,6 +467,10 @@ jobs:
               echo "::error::${crate} package includes fixture files"
               exit 1
             fi
+            if [ "$crate" = par3-rs ] && grep -n '^benchmarks/' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::par3-rs package includes benchmark evidence"
+              exit 1
+            fi
             if [ "$crate" = unrar-rs ]; then
               grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
             fi
@@ -473,7 +486,7 @@ jobs:
               "reedsolomon-rs": 1_000_000,
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
-              "par3-rs": 300_000,
+              "par3-rs": 350_000,
           }
           metadata = json.loads(
               subprocess.check_output([

@@ -16,7 +16,7 @@ clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
-par3-rs = "0.2"
+par3-rs = "0.3"
 ```
 
 ## Choose an API

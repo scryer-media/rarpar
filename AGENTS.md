@@ -17,6 +17,13 @@ and PAR2 workflows.
 
 ## Licensing And Release
 
+- PRs must carry prospective version bumps for changed publishable crates and
+  CLI behavior, with matching internal dependency requirements, lockfile, and
+  changelog entries. Use an existing appropriate unreleased version when one
+  already covers the change; never leave new behavior at an already-published
+  version. Record the version impact explicitly for documentation/CI-only PRs.
+  Preparing these PR changes is authorized; publication, tags, and deployment
+  still require a separate explicit operator instruction.
 - `reedsolomon-rs`, `par2-rs`, `par3-rs`, and `rarpar` source are
   GPL-3.0-or-later.
 - `unrar-rs` is GPL-3.0-or-later; its RAR engine is developed from RARLAB's
