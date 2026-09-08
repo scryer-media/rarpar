@@ -223,6 +223,9 @@ pub struct ExecutionOptions {
     pub retained_bytes: usize,
     /// Maximum native workers. One is useful for hosts scheduling many jobs.
     pub workers: usize,
+    /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
+    /// This does not change the independent Cauchy dispatch.
+    pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
     /// Target I/O and arithmetic stripe size; execution may use smaller stripes.
@@ -238,6 +241,7 @@ impl Default for ExecutionOptions {
             scan_work: ScanWorkBudget::new(1 << 40),
             retained_bytes: 64 << 20,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
+            fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
             open_handles: 32,
             stripe_bytes: 64 << 10,
             cancel: CancellationToken::default(),

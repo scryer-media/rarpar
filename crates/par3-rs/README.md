@@ -233,8 +233,12 @@ must fit the supplied allocation budget. Encoding uses a caller-selected scratch
 directory. Destinations must be absent; output installation is exclusive.
 
 The original `create` API and its byte-for-byte default output remain unchanged.
-The new planner currently makes multiple source passes and uses scalar FFT
-transforms; native performance parity has not been established.
+The new planner currently makes multiple source passes. FFT butterflies use
+Cantor-derived NEON/AVX2/SSSE3 maps; `ExecutionOptions::fft_backend` can select the
+scalar oracle and report the detected kernel. FFT worker scheduling and native
+performance parity with the reference have not been established. The shared
+crate's `fft_transform` benchmark compares arithmetic with equal buffers and one
+worker; it does not measure complete PAR3 workloads.
 
 ## The specification and the reference disagree
 

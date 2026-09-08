@@ -2,6 +2,80 @@
 use par3_rs::fft::{FftCodec, FftGeometry, FftInput};
 use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget};
 
+#[test]
+fn nontrivial_codecs_match_across_backends_and_recover_selected_rows() {
+    use reedsolomon_rs::gf_simd::LinearBackend;
+    for inputs in [7, 260] {
+        let mut reference = None;
+        for backend in [LinearBackend::Scalar, LinearBackend::Auto] {
+            let mut options = ExecutionOptions::default();
+            options.memory = MemoryBudget::new(2 << 20);
+            options.workers = 1;
+            options.stripe_bytes = 256;
+            options.fft_backend = backend;
+            let codec = FftCodec::new(FftGeometry::new(inputs, 3).unwrap(), options).unwrap();
+            let mut encoded = vec![vec![0; 514]; 8];
+            codec
+                .encode(
+                    514,
+                    0,
+                    8,
+                    |index, offset, out| {
+                        for (at, byte) in out.iter_mut().enumerate() {
+                            *byte = value(index, offset as usize + at);
+                        }
+                        Ok(())
+                    },
+                    |index, offset, bytes| {
+                        encoded[index][offset as usize..offset as usize + bytes.len()]
+                            .copy_from_slice(bytes);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            if let Some(reference) = &reference {
+                assert_eq!(&encoded, reference);
+            }
+            let lost = [2, inputs as usize - 1];
+            let mut repaired = vec![vec![0; 514]; 2];
+            codec
+                .decode(
+                    514,
+                    &lost,
+                    &[1, 6],
+                    |source, offset, out| {
+                        match source {
+                            FftInput::Original(index) => {
+                                assert!(!lost.contains(&index));
+                                for (at, byte) in out.iter_mut().enumerate() {
+                                    *byte = value(index, offset as usize + at);
+                                }
+                            }
+                            FftInput::Recovery(index) => out.copy_from_slice(
+                                &encoded[index][offset as usize..offset as usize + out.len()],
+                            ),
+                        }
+                        Ok(())
+                    },
+                    |index, offset, bytes| {
+                        let target = lost.iter().position(|lost| *lost == index).unwrap();
+                        repaired[target][offset as usize..offset as usize + bytes.len()]
+                            .copy_from_slice(bytes);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            for (index, bytes) in lost.iter().zip(repaired) {
+                assert_eq!(
+                    bytes,
+                    (0..514).map(|at| value(*index, at)).collect::<Vec<_>>()
+                );
+            }
+            reference = Some(encoded);
+        }
+    }
+}
+
 fn options() -> ExecutionOptions {
     let mut options = ExecutionOptions::default();
     options.memory = MemoryBudget::new(256);

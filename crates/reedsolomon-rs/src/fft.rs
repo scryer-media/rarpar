@@ -119,6 +119,25 @@ impl TransformField {
         inverse: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
+        self.transform_with_backend(
+            rows,
+            origin,
+            inverse,
+            crate::gf_simd::LinearBackend::Auto,
+            cancelled,
+        )
+    }
+
+    /// Evaluate or interpolate with explicit CPU selection. The scalar path is
+    /// the log-table oracle; automatic execution uses Cantor-derived SIMD maps.
+    pub fn transform_with_backend(
+        &self,
+        rows: &mut [Vec<u16>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
         let n = rows.len();
         if !n.is_power_of_two()
             || n > self.order()
@@ -141,7 +160,45 @@ impl TransformField {
                 }
                 let factor = ((origin ^ base) >> level) as u16;
                 let (left, right) = rows[base..base + half * 2].split_at_mut(half);
+                let plan = (backend != crate::gf_simd::LinearBackend::Scalar
+                    && left[0].len() >= 64
+                    && factor > 1)
+                    .then(|| {
+                        crate::gf_simd::LinearMap16::new(
+                            std::array::from_fn(|bit| {
+                                if bit < self.bits as usize {
+                                    self.mul(1 << bit, factor)
+                                } else {
+                                    0
+                                }
+                            }),
+                            backend,
+                        )
+                    });
                 for (left, right) in left.iter_mut().zip(right) {
+                    if cancelled() {
+                        return Err(TransformError::Cancelled);
+                    }
+                    if factor == 0 && backend != crate::gf_simd::LinearBackend::Scalar {
+                        for (a, b) in left.iter().zip(right.iter_mut()) {
+                            *b ^= *a;
+                        }
+                        continue;
+                    }
+                    if let Some(plan) = &plan {
+                        if inverse {
+                            for (a, b) in left.iter().zip(right.iter_mut()) {
+                                *b ^= *a;
+                            }
+                            plan.accumulate(right, left);
+                        } else {
+                            plan.accumulate(right, left);
+                            for (a, b) in left.iter().zip(right.iter_mut()) {
+                                *b ^= *a;
+                            }
+                        }
+                        continue;
+                    }
                     for (a, b) in left.iter_mut().zip(right) {
                         if inverse {
                             *b ^= *a;
@@ -287,6 +344,47 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn dispatched_transforms_match_scalar_at_simd_boundaries_and_cosets() {
+        use crate::gf_simd::LinearBackend;
+        for bits in [8, 16] {
+            let field = TransformField::new(bits).unwrap();
+            for width in [0, 1, 15, 16, 31, 32, 63, 64, 65, 127, 129] {
+                let original: Vec<Vec<u16>> = (0..32)
+                    .map(|row| {
+                        (0..width)
+                            .map(|at| ((row * 7919 + at * 103) % field.order()) as u16)
+                            .collect()
+                    })
+                    .collect();
+                for origin in [0, 32, field.order() - 32] {
+                    let mut expected = original.clone();
+                    field
+                        .transform_with_backend(
+                            &mut expected,
+                            origin,
+                            false,
+                            LinearBackend::Scalar,
+                            &|| false,
+                        )
+                        .unwrap();
+                    let mut actual = original.clone();
+                    field
+                        .transform(&mut actual, origin, false, &|| false)
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "bits {bits}, width {width}, origin {origin}"
+                    );
+                    field
+                        .transform(&mut actual, origin, true, &|| false)
+                        .unwrap();
+                    assert_eq!(actual, original);
+                }
+            }
+        }
+    }
+
     #[test]
     fn locator_factors_match_direct_products() {
         for bits in [8, 16] {

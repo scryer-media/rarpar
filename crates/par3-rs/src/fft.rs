@@ -163,7 +163,13 @@ impl FftCodec {
                     unpack(g.field_bytes(), &bytes, row);
                 }
                 field
-                    .transform(&mut work, g.capacity + base, true, &cancelled)
+                    .transform_with_backend(
+                        &mut work,
+                        g.capacity + base,
+                        true,
+                        self.options.fft_backend,
+                        &cancelled,
+                    )
                     .map_err(transform_error)?;
                 for (to, from) in sum.iter_mut().zip(&work) {
                     for (to, from) in to.iter_mut().zip(from) {
@@ -172,7 +178,7 @@ impl FftCodec {
                 }
             }
             field
-                .transform(&mut sum, 0, false, &cancelled)
+                .transform_with_backend(&mut sum, 0, false, self.options.fft_backend, &cancelled)
                 .map_err(transform_error)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
                 pack(g.field_bytes(), row, &mut bytes);
@@ -256,13 +262,13 @@ impl FftCodec {
                 }
             }
             field
-                .transform(&mut rows, 0, true, &cancelled)
+                .transform_with_backend(&mut rows, 0, true, self.options.fft_backend, &cancelled)
                 .map_err(transform_error)?;
             field
                 .derivative(&mut rows, &cancelled)
                 .map_err(transform_error)?;
             field
-                .transform(&mut rows, 0, false, &cancelled)
+                .transform_with_backend(&mut rows, 0, false, self.options.fft_backend, &cancelled)
                 .map_err(transform_error)?;
             for &index in lost {
                 let factor = field

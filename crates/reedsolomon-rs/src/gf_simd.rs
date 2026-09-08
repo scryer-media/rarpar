@@ -31,6 +31,131 @@
 
 use crate::gf;
 
+/// CPU selection for representation-independent binary linear maps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearBackend {
+    /// Detect an available shuffle kernel, with a portable fallback.
+    #[default]
+    Auto,
+    /// Disable explicit SIMD for arithmetic comparisons.
+    Scalar,
+}
+
+/// Kernel selected for a binary linear map. No field polynomial is implied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearKernel {
+    /// Portable nibble lookups.
+    Scalar,
+    /// ARM NEON byte-table lookups.
+    Neon,
+    /// x86 SSSE3 byte shuffles.
+    Ssse3,
+    /// x86 AVX2 byte shuffles.
+    Avx2,
+}
+
+impl LinearBackend {
+    /// Resolve this selection on the executing CPU.
+    pub fn kernel(self) -> LinearKernel {
+        if self == Self::Auto {
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return LinearKernel::Neon;
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
+                    return LinearKernel::Avx2;
+                }
+                if is_x86_feature_detected!("ssse3") {
+                    return LinearKernel::Ssse3;
+                }
+            }
+        }
+        LinearKernel::Scalar
+    }
+}
+
+/// A 16-bit binary linear map, constructed from the images of its sixteen
+/// input bits. This reuses byte-shuffle kernels without their Cauchy field or
+/// polynomial scalar tails. Cantor arithmetic supplies its own basis images.
+pub struct LinearMap16 {
+    tables: MulTables,
+    kernel: LinearKernel,
+}
+
+impl LinearMap16 {
+    /// Prepare fixed-size tables without heap allocation.
+    pub fn new(basis: [u16; 16], backend: LinearBackend) -> Self {
+        let mut tables = [[0; 16]; 8];
+        for (nibble, pair) in tables.chunks_exact_mut(2).enumerate() {
+            let (low, high) = pair.split_at_mut(1);
+            for (value, (low, high)) in low[0].iter_mut().zip(&mut high[0]).enumerate() {
+                let product = (0..4)
+                    .filter(|bit| value & (1 << bit) != 0)
+                    .fold(0, |sum, bit| sum ^ basis[nibble * 4 + bit]);
+                *low = product as u8;
+                *high = (product >> 8) as u8;
+            }
+        }
+        Self {
+            tables: MulTables { tables, factor: 0 },
+            kernel: backend.kernel(),
+        }
+    }
+
+    /// XOR mapped symbols into an equally sized destination. The mapping is
+    /// independent of host endianness; SIMD operates only on little-endian hosts.
+    pub fn accumulate(&self, source: &[u16], destination: &mut [u16]) {
+        assert_eq!(source.len(), destination.len());
+        let done = self.vector_prefix(source, destination);
+        for (to, from) in destination[done..].iter_mut().zip(&source[done..]) {
+            let mut product = 0;
+            for nibble in 0..4 {
+                let index = ((*from >> (4 * nibble)) & 15) as usize;
+                product ^= u16::from_le_bytes([
+                    self.tables.tables[nibble * 2][index],
+                    self.tables.tables[nibble * 2 + 1][index],
+                ]);
+            }
+            *to ^= product;
+        }
+    }
+
+    fn vector_prefix(&self, source: &[u16], destination: &mut [u16]) -> usize {
+        // Full 32-byte blocks keep all calls out of polynomial-field tails.
+        // AVX2 may hand its final 32-byte block to SSSE3, also without a tail.
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))]
+        if self.kernel != LinearKernel::Scalar {
+            let symbols = source.len() / 16 * 16;
+            let bytes = symbols * 2;
+            // SAFETY: u16 slices are initialized and non-overlapping; u8 has
+            // alignment one and accepts every bit pattern. Prefix byte lengths
+            // are within both slices. Only detected ISAs are invoked below.
+            unsafe {
+                let source = std::slice::from_raw_parts(source.as_ptr().cast::<u8>(), bytes);
+                let destination =
+                    std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), bytes);
+                match self.kernel {
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Avx2 => mul_acc_region_avx2(&self.tables, source, destination),
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Ssse3 => mul_acc_region_ssse3(&self.tables, source, destination),
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon => mul_acc_region_neon(&self.tables, source, destination),
+                    _ => return 0,
+                }
+            }
+            return symbols;
+        }
+        let _ = (source, destination, self.kernel);
+        0
+    }
+}
+
 /// Concurrent source read streams per destination pass in the grouped-input
 /// kernels. Bounded by the line-fill buffers of the smallest supported cores;
 /// larger groups stall on L1 misses instead of computing.

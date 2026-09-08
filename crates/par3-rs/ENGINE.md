@@ -148,7 +148,7 @@ retained evidence, missing ranges, and exact ZIP/ZIP64/7z self-repair. Newly
 inserted archives were verified and repaired byte-for-byte by the reference.
 
 Remaining acceptance includes matched native ARM64 and x86-64 performance,
-FFT SIMD/worker tuning, complete diagnostics and progress callbacks, stronger
+FFT worker tuning, complete diagnostics and progress callbacks, stronger
 process-wide handle accounting, durable evidence replay, and embedded replacement
 layouts when an original manifest is absent. The current reference runs in a
 local x86-64 container under emulation; its timings cannot establish native
