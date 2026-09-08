@@ -294,6 +294,14 @@ impl Par3RepairSession {
     /// only source snapshot checks; a recovery merge never triggers source reads.
     pub fn assess(&mut self) -> EngineResult<&RepairAssessment> {
         self.options.validate()?;
+        match self.input.discard_changed_payloads() {
+            Ok(0) => {}
+            Ok(_) => self.assessment = None,
+            Err(error) => {
+                self.assessment = None;
+                return Err(error);
+            }
+        }
         self.refresh_layout()?;
         let stale: Vec<_> = self
             .evidence

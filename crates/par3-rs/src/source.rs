@@ -41,8 +41,10 @@ pub trait SourceAccess: Send + Sync {
     /// First available contiguous range at or after `offset`.
     fn next_available(&self, source: SourceId, offset: u64) -> io::Result<Option<Range<u64>>>;
 
-    /// Optional efficient forward reader. Return `None` when holes would make a
-    /// whole-file sweep misleading. The caller must still check generations.
+    /// Optional efficient forward reader beginning at offset zero. It must stop
+    /// at the first hole, without skipping bytes or synthesizing padding. The
+    /// verifier resumes through `next_available` after this prefix and checks
+    /// generations. Return `None` if an honest forward prefix is unavailable.
     fn open_sequential(&self, _source: SourceId) -> io::Result<Option<Box<dyn Read + Send>>> {
         Ok(None)
     }

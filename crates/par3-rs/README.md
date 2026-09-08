@@ -171,8 +171,13 @@ The incremental `Par3RepairSession` also provides:
 
 - Chunked authenticated packet ingestion with lazy recovery and Data payloads.
 - Source identity and generation contracts for disk, memory, and virtual input.
+  Changed carrier generations are removed from cached availability without
+  rereading protected sources. Replayed packets can replace stale payload links;
+  carrier manifests also bind the provider, not just its numeric source identity.
 - Positioned streaming evidence, shared block aliases, packed tails, damage
   ranges, and contiguous verified prefixes.
+  Honest sequential readers may stop at a hole; verification resumes through
+  later available ranges. Unprotected gaps are omitted from whole-file hashing.
 - Retained assessments and recovery requirements per FFT cohort, with no
   source reads for unchanged reassessment or recovery-only merges.
 - Explicit candidate placement using bounded CRC64 search and BLAKE3 checks.

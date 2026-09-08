@@ -82,8 +82,7 @@ impl CarrierPlan {
         let mut cost = 0usize;
         for packet in packets {
             let at = packet.origin();
-            if at.source != origin.source
-                || at.snapshot != origin.snapshot
+            if !at.same_carrier(&origin)
                 || at.offset != next
                 || packet.input_set_id() != first.input_set_id()
             {

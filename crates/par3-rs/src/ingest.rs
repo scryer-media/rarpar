@@ -144,7 +144,7 @@ pub struct IngestedPacket {
 }
 
 /// Original carrier coordinates retained alongside an authenticated packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketOrigin {
     /// Caller-supplied source identity.
     pub source: SourceId,
@@ -154,19 +154,45 @@ pub struct PacketOrigin {
     pub offset: u64,
     /// Complete authenticated packet length.
     pub length: u64,
+    provider: ProviderIdentity,
+}
+
+impl PacketOrigin {
+    /// Whether coordinates refer to the same provider, source and generation.
+    /// Equal caller-supplied numeric identities in different providers do not
+    /// establish that two packets came from the same carrier.
+    pub fn same_carrier(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.source == other.source
+            && self.snapshot == other.snapshot
+    }
+}
+
+#[derive(Clone)]
+struct ProviderIdentity(Arc<dyn SourceAccess>);
+impl PartialEq for ProviderIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ProviderIdentity {}
+impl std::fmt::Debug for ProviderIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SourceProvider")
+    }
 }
 
 #[derive(Clone, Debug)]
 enum IngestedContents {
     Metadata(Arc<Packet>, Arc<Reservation>),
-    Payload(PayloadRef),
+    Payload(Arc<PayloadRef>),
 }
 
 impl IngestedPacket {
     /// Authenticated packet's original carrier coordinates.
     #[must_use]
     pub fn origin(&self) -> PacketOrigin {
-        self.origin
+        self.origin.clone()
     }
 
     /// Borrow metadata, if this packet is not a payload.
@@ -206,9 +232,14 @@ impl IngestedPacket {
     }
 
     pub(crate) fn rehome(&mut self, options: &ExecutionOptions) -> EngineResult<()> {
+        if let IngestedContents::Payload(payload) = &self.contents
+            && payload.reservation.belongs_to(&options.memory)
+        {
+            return Ok(());
+        }
         let reservation = match &mut self.contents {
             IngestedContents::Metadata(_, reservation) => reservation,
-            IngestedContents::Payload(payload) => &mut payload.reservation,
+            IngestedContents::Payload(payload) => &mut Arc::make_mut(payload).reservation,
         };
         if !reservation.belongs_to(&options.memory) {
             *reservation = Arc::new(options.memory.reserve(reservation.bytes())?);
@@ -508,7 +539,7 @@ impl PacketScanner {
                         ),
                     }
                 };
-                IngestedContents::Payload(PayloadRef {
+                IngestedContents::Payload(Arc::new(PayloadRef {
                     access: Arc::clone(&self.access),
                     source: self.source,
                     snapshot: self.snapshot,
@@ -519,11 +550,12 @@ impl PacketScanner {
                     header: candidate.header,
                     kind,
                     reservation: Arc::new(candidate.reservation),
-                })
+                }))
             };
             return Ok(ScanEvent::Packet(IngestedPacket {
                 contents,
                 origin: PacketOrigin {
+                    provider: ProviderIdentity(self.access.clone()),
                     source: self.source,
                     snapshot: self.snapshot,
                     offset: candidate.offset,
@@ -573,7 +605,14 @@ impl IncrementalSet {
                 "packet belongs to another input set",
             ));
         }
-        if self.packets.contains_key(&packet.hash()) {
+        if let Some(previous) = self.packets.get(&packet.hash()) {
+            if let Some(payload) = previous.payload()
+                && payload.access.snapshot(payload.source)? != Some(payload.snapshot)
+            {
+                packet.rehome(&self.options)?;
+                self.packets.insert(packet.hash(), packet);
+                return Ok(MergeEffect::Payload);
+            }
             return Ok(MergeEffect::Replay);
         }
         let retained = self
@@ -596,6 +635,36 @@ impl IncrementalSet {
 
     pub(crate) fn contains(&self, hash: &Fingerprint) -> bool {
         self.packets.contains_key(hash)
+    }
+
+    /// Forget lazy payloads whose published source generation disappeared or
+    /// changed. Authenticated metadata is self-contained and remains usable.
+    /// This checks source snapshots without reading carrier or protected bytes.
+    pub fn discard_changed_payloads(&mut self) -> EngineResult<usize> {
+        self.options.cancel.check()?;
+        let mut removed = 0;
+        let mut failure = None;
+        self.packets.retain(|_, packet| {
+            let Some(payload) = packet.payload() else {
+                return true;
+            };
+            match payload.access.snapshot(payload.source) {
+                Ok(snapshot) if snapshot != Some(payload.snapshot) => {
+                    self.retained -= packet.retained_bytes();
+                    removed += 1;
+                    false
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+                _ => true,
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error.into());
+        }
+        Ok(removed)
     }
 
     /// Resolve metadata when Start, Root and all referenced children are present.

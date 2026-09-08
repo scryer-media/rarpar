@@ -110,9 +110,19 @@ fn captured_self_repair_restores_official_archives_with_missing_packets() {
             let plan = SelfRepairPlan::capture(&mut session, &packets, ContainerLimits::default())
                 .unwrap();
             let layout = session.layout().unwrap().unwrap();
+            let proof = par3_rs::evidence::verify_source(
+                layout.clone(),
+                0,
+                access.as_ref(),
+                SourceId(1),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(proof.whole_matches(), Some(!damage_protected));
             session
                 .bind_file(&layout.files()[0].path, SourceId(1))
                 .unwrap();
+            session.add_evidence(proof).unwrap();
             assert!(original.len() > 100);
             let mut current = PacketScanner::new(
                 access,
@@ -172,6 +182,14 @@ struct HoleyArchive {
     hole: std::ops::Range<u64>,
 }
 impl par3_rs::source::SourceAccess for HoleyArchive {
+    fn open_sequential(
+        &self,
+        _: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        Ok(Some(Box::new(std::io::Cursor::new(
+            self.bytes[..self.hole.start as usize].to_vec(),
+        ))))
+    }
     fn snapshot(&self, _: SourceId) -> std::io::Result<Option<par3_rs::source::SourceSnapshot>> {
         Ok(Some(par3_rs::source::SourceSnapshot {
             len: self.bytes.len() as u64,

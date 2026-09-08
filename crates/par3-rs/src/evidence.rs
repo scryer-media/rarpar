@@ -67,6 +67,13 @@ impl FileEvidence {
         &self.verdicts
     }
 
+    /// Whole protected-data fingerprint result, or `None` when ordered bytes
+    /// were incomplete or the File packet does not supply this fingerprint.
+    /// Unprotected ranges are omitted, including unavailable carrier gaps.
+    pub fn whole_matches(&self) -> Option<bool> {
+        self.whole_matches
+    }
+
     /// Whether all protected extents are proven, with the expected file length.
     /// Unprotected ranges are not certified by this answer.
     #[must_use]
@@ -227,7 +234,7 @@ impl StreamingVerifier {
             return Err(EngineError::InvalidState("bytes exceed source length"));
         }
         let file = &self.layout.files[self.file];
-        if offset != self.whole_next && !bytes.is_empty() {
+        if !bytes.is_empty() && !unprotected_between(file, self.whole_next, offset) {
             self.whole_ordered = false;
         }
         let mut index = file
@@ -365,12 +372,13 @@ impl StreamingVerifier {
     /// Return sealed evidence; incomplete extents remain explicitly unknown.
     pub fn finish(mut self) -> FileEvidence {
         let file = &self.layout.files[self.file];
-        let whole_matches =
-            (self.whole_ordered && self.whole_next == file.len && file.fingerprint != [0; 16])
-                .then(|| self.whole.finalize() == file.fingerprint);
+        let whole_matches = (self.whole_ordered
+            && unprotected_between(file, self.whole_next, file.len)
+            && file.fingerprint != [0; 16])
+            .then(|| self.whole.finalize() == file.fingerprint);
         if whole_matches == Some(true) {
             for state in &mut self.verdicts {
-                if *state != ExtentVerdict::Unprotected {
+                if *state == ExtentVerdict::Unknown {
                     *state = ExtentVerdict::Intact;
                 }
             }
@@ -386,6 +394,20 @@ impl StreamingVerifier {
             _reservation: Arc::new(self.reservation),
         }
     }
+}
+
+fn unprotected_between(file: &crate::layout::FileLayout, start: u64, end: u64) -> bool {
+    start <= end
+        && end <= file.len
+        && file
+            .extents
+            .iter()
+            .skip(
+                file.extents
+                    .partition_point(|extent| extent.range.end <= start),
+            )
+            .take_while(|extent| extent.range.start < end)
+            .all(|extent| matches!(extent.kind, ExtentKind::Unprotected))
 }
 
 /// Recheck only unknown extents after new bytes arrive within an immutable source
@@ -462,8 +484,8 @@ pub fn verify_source(
     let size = options.stripe_bytes.min(64 << 10);
     let _reservation = options.memory.reserve(size)?;
     let mut buffer = vec![0; size];
+    let mut offset = 0;
     if let Some(mut reader) = access.open_sequential(source)? {
-        let mut offset = 0;
         while offset < snapshot.len {
             options.cancel.check()?;
             let take = (snapshot.len - offset).min(buffer.len() as u64) as usize;
@@ -474,8 +496,8 @@ pub fn verify_source(
             verifier.feed(offset, &buffer[..read])?;
             offset += read as u64;
         }
-    } else {
-        let mut offset = 0;
+    }
+    if offset < snapshot.len {
         while let Some(range) = access.next_available(source, offset)? {
             if range.start < offset || range.end <= range.start || range.end > snapshot.len {
                 return Err(EngineError::InvalidState(

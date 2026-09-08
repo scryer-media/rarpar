@@ -127,6 +127,99 @@ fn payload_rejects_changed_generation_and_cancellation() {
 }
 
 #[test]
+fn changed_recovery_is_removed_without_rereading_sources_and_replay_rebinds_it() {
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+    let options = ExecutionOptions::default();
+    let mut protected = MemorySourceAccess::default();
+    let mut damaged = common::a_bin();
+    damaged[2300] ^= 1;
+    protected.insert(SourceId(1), 1, damaged.into());
+    protected.insert(SourceId(2), 1, common::b_txt().into());
+    protected.insert(SourceId(3), 1, common::c_bin().into());
+    let mut session =
+        Par3RepairSession::new(common::SET_ID, Arc::new(protected), options.clone()).unwrap();
+    for (name, id) in [("a.bin", 1), ("b.txt", 2), ("sub/c.bin", 3)] {
+        session.bind_file(name, SourceId(id)).unwrap();
+    }
+    let bytes = common::set_vol0_par3();
+    let carrier = Arc::new(ArrivingSource {
+        visible: AtomicUsize::new(bytes.len()),
+        generation: AtomicU64::new(1),
+        reads: AtomicUsize::new(0),
+        bytes,
+    });
+    let scan = || {
+        let mut scanner = PacketScanner::new(
+            carrier.clone(),
+            SourceId(9),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            packets.push(packet);
+        }
+        packets
+    };
+    for packet in scan() {
+        session.merge(packet).unwrap();
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    let verifications = session.diagnostics().source_verifications;
+    carrier.generation.store(2, Ordering::Relaxed);
+    carrier.reads.store(0, Ordering::Relaxed);
+    assert_eq!(session.assess().unwrap().status, RepairStatus::NeedRecovery);
+    assert_eq!(carrier.reads.load(Ordering::Relaxed), 0);
+    assert_eq!(session.diagnostics().source_verifications, verifications);
+    for packet in scan() {
+        session.merge(packet).unwrap();
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    // Rebind an identical packet before assessment has discarded its old link.
+    carrier.generation.store(3, Ordering::Relaxed);
+    for packet in scan() {
+        let expected = if packet.payload().is_some() {
+            MergeEffect::Payload
+        } else {
+            MergeEffect::Replay
+        };
+        assert_eq!(session.merge(packet).unwrap(), expected);
+    }
+    carrier.reads.store(0, Ordering::Relaxed);
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    assert_eq!(carrier.reads.load(Ordering::Relaxed), 0);
+    assert_eq!(session.diagnostics().source_verifications, verifications);
+}
+
+#[test]
+fn matching_numeric_source_ids_do_not_prove_a_common_carrier() {
+    let options = ExecutionOptions::default();
+    let scan = || {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, common::set_vol0_par3().into());
+        let mut scanner = PacketScanner::new(
+            Arc::new(access),
+            SourceId(1),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            packets.push(packet);
+        }
+        packets
+    };
+    let mut packets = scan();
+    assert!(par3_rs::carrier::CarrierPlan::capture(&packets, &options).is_ok());
+    let independent = scan();
+    assert!(!packets[0].origin().same_carrier(&independent[0].origin()));
+    packets[1] = independent[1].clone();
+    assert!(par3_rs::carrier::CarrierPlan::capture(&packets, &options).is_err());
+}
+
+#[test]
 fn bounded_out_of_order_evidence_distinguishes_damage_and_verified_prefix() {
     let set = common::gf8_set();
     let options = ExecutionOptions::default();
