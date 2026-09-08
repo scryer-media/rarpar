@@ -11,6 +11,8 @@
 //! default Cauchy behavior. The incremental [`Par3RepairSession`] adds virtual
 //! sources, streaming evidence, shared block layouts, retained assessments,
 //! bounded striped repair, and low-rate FFT recovery with interleaved cohorts.
+//! [`runtime::ScanWorkBudget`] bounds cumulative carrier read requests across
+//! scanners, retries and seeks independently of the shared allocation budget.
 //! Carrier generation changes invalidate recovery availability without rereading
 //! protected sources. Verification resumes after honest sequential readers stop
 //! at holes, omitting unprotected gaps from the whole protected-data fingerprint.

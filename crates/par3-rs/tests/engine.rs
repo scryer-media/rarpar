@@ -93,6 +93,67 @@ fn split_arrivals_authenticate_without_retaining_recovery_bytes() {
 }
 
 #[test]
+fn scan_work_is_cumulative_across_replays_seeks_and_scanners() {
+    use par3_rs::runtime::ScanWorkBudget;
+    let bytes = common::set_vol0_par3();
+    let source = Arc::new(ArrivingSource {
+        visible: AtomicUsize::new(bytes.len()),
+        generation: AtomicU64::new(1),
+        reads: AtomicUsize::new(0),
+        bytes,
+    });
+    let mut options = ExecutionOptions::default();
+    let scan = |options: &ExecutionOptions| {
+        PacketScanner::new(
+            source.clone(),
+            SourceId(1),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .unwrap()
+    };
+    let mut first = scan(&options);
+    while let ScanEvent::Packet(_) = first.poll().unwrap() {}
+    let work = options.scan_work.used();
+    assert!(
+        work <= 2 * source.bytes.len() as u64,
+        "known boundaries must not repeatedly prefetch whole volumes"
+    );
+    options.scan_work = ScanWorkBudget::new(work);
+    let mut exact = scan(&options);
+    while let ScanEvent::Packet(_) = exact.poll().unwrap() {}
+    assert_eq!(options.scan_work.used(), work);
+    let reads = source.reads.load(Ordering::Relaxed);
+    exact.seek(0).unwrap();
+    assert!(matches!(
+        exact.poll(),
+        Err(EngineError::ResourceLimit("cumulative scanning work"))
+    ));
+    assert!(matches!(
+        scan(&options).poll(),
+        Err(EngineError::ResourceLimit("cumulative scanning work"))
+    ));
+    assert_eq!(source.reads.load(Ordering::Relaxed), reads);
+    // Empty polls are work too: callers cannot retry missing bytes indefinitely.
+    source.visible.store(0, Ordering::Relaxed);
+    options.stripe_bytes = 48;
+    options.scan_work = ScanWorkBudget::new(96);
+    let mut waiting = scan(&options);
+    assert!(matches!(
+        waiting.poll().unwrap(),
+        ScanEvent::NeedData { .. }
+    ));
+    assert!(matches!(
+        waiting.poll().unwrap(),
+        ScanEvent::NeedData { .. }
+    ));
+    assert!(matches!(
+        waiting.poll(),
+        Err(EngineError::ResourceLimit("cumulative scanning work"))
+    ));
+}
+
+#[test]
 fn payload_rejects_changed_generation_and_cancellation() {
     let bytes = common::set_vol0_par3();
     let source = Arc::new(ArrivingSource {

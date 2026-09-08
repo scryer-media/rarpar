@@ -170,6 +170,9 @@ In:
 The incremental `Par3RepairSession` also provides:
 
 - Chunked authenticated packet ingestion with lazy recovery and Data payloads.
+  `ExecutionOptions::scan_work` bounds cumulative requested read bytes across
+  scanners, retries, and seeks (1 TiB by default). Allocation and work ceilings
+  are independent. Known packet boundaries avoid repeated volume prefetching.
 - Source identity and generation contracts for disk, memory, and virtual input.
   Changed carrier generations are removed from cached availability without
   rereading protected sources. Replayed packets can replace stale payload links;

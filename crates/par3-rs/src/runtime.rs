@@ -1,7 +1,7 @@
 //! Shared resource limits, cancellation and typed errors for incremental work.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -171,12 +171,54 @@ impl Drop for Reservation {
     }
 }
 
+/// Cumulative scanning work shared across scanners and retained sessions.
+/// Each requested read is charged before I/O, including short reads, holes,
+/// replay and explicit seeks. Charges are not released when a scanner is dropped.
+#[derive(Clone, Debug)]
+pub struct ScanWorkBudget(Arc<ScanWorkState>);
+
+#[derive(Debug)]
+struct ScanWorkState {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl ScanWorkBudget {
+    /// Bound cumulative requested carrier bytes, independently of allocation.
+    pub fn new(limit: u64) -> Self {
+        Self(Arc::new(ScanWorkState {
+            limit,
+            used: AtomicU64::new(0),
+        }))
+    }
+    /// Cumulative byte-read requests admitted so far.
+    pub fn used(&self) -> u64 {
+        self.0.used.load(Ordering::Acquire)
+    }
+    /// Configured work ceiling.
+    pub fn limit(&self) -> u64 {
+        self.0.limit
+    }
+    pub(crate) fn charge(&self, bytes: usize) -> EngineResult<()> {
+        self.0
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes as u64)
+                    .filter(|next| *next <= self.0.limit)
+            })
+            .map(|_| ())
+            .map_err(|_| EngineError::ResourceLimit("cumulative scanning work"))
+    }
+}
+
 /// Synchronous execution controls for a session.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ExecutionOptions {
     /// Total allocation budget, including retained state.
     pub memory: MemoryBudget,
+    /// Cumulative carrier scanning requests; clones share the same ceiling.
+    pub scan_work: ScanWorkBudget,
     /// Per-session retained-state ceiling, also charged to `memory`.
     pub retained_bytes: usize,
     /// Maximum native workers. One is useful for hosts scheduling many jobs.
@@ -193,6 +235,7 @@ impl Default for ExecutionOptions {
     fn default() -> Self {
         Self {
             memory: MemoryBudget::new(256 << 20),
+            scan_work: ScanWorkBudget::new(1 << 40),
             retained_bytes: 64 << 20,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             open_handles: 32,

@@ -300,6 +300,7 @@ pub struct PacketScanner {
     snapshot: SourceSnapshot,
     offset: u64,
     candidate: Option<Candidate>,
+    at_packet_boundary: bool,
     options: ExecutionOptions,
     limits: ScanLimits,
     failed_hash_bytes: u64,
@@ -329,6 +330,7 @@ impl PacketScanner {
             snapshot,
             offset: 0,
             candidate: None,
+            at_packet_boundary: false,
             options,
             limits,
             failed_hash_bytes: 0,
@@ -346,6 +348,7 @@ impl PacketScanner {
         }
         self.offset = offset;
         self.candidate = None;
+        self.at_packet_boundary = false;
         Ok(())
     }
 
@@ -364,13 +367,20 @@ impl PacketScanner {
                 if self.offset >= self.snapshot.len {
                     return Ok(ScanEvent::End);
                 }
-                let take = (self.snapshot.len - self.offset).min(self.buffer.len() as u64) as usize;
+                let search_size = if self.at_packet_boundary {
+                    HEADER_SIZE
+                } else {
+                    self.buffer.len()
+                };
+                self.at_packet_boundary = false;
+                let take = (self.snapshot.len - self.offset).min(search_size as u64) as usize;
                 if take < 8 {
                     self.offset = self.snapshot.len;
                     return Ok(ScanEvent::End);
                 }
                 let mut read = 0;
                 while read < 8 {
+                    self.options.scan_work.charge(take - read)?;
                     let count = self.access.read_at(
                         self.source,
                         self.offset + read as u64,
@@ -399,17 +409,26 @@ impl PacketScanner {
                     return Ok(ScanEvent::End);
                 }
                 let mut header_bytes = [0; HEADER_SIZE];
-                match read_exact_at(
-                    self.access.as_ref(),
-                    self.source,
-                    self.offset,
-                    &mut header_bytes,
-                ) {
-                    Err(EngineError::Unavailable { offset, .. }) => {
-                        return Ok(ScanEvent::NeedData { offset });
+                let mut header_read = (read - found).min(HEADER_SIZE);
+                header_bytes[..header_read]
+                    .copy_from_slice(&self.buffer[found..found + header_read]);
+                while header_read < HEADER_SIZE {
+                    self.options.cancel.check()?;
+                    self.options.scan_work.charge(HEADER_SIZE - header_read)?;
+                    let count = self.access.read_at(
+                        self.source,
+                        self.offset + header_read as u64,
+                        &mut header_bytes[header_read..],
+                    )?;
+                    if count > HEADER_SIZE - header_read {
+                        return Err(EngineError::InvalidState("invalid source read length"));
                     }
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
+                    if count == 0 {
+                        return Ok(ScanEvent::NeedData {
+                            offset: self.offset + header_read as u64,
+                        });
+                    }
+                    header_read += count;
                 }
                 let header = match PacketHeader::parse(&header_bytes, self.offset) {
                     Ok(header)
@@ -471,6 +490,7 @@ impl PacketScanner {
                 self.options.cancel.check()?;
                 let take = (candidate.header.length - candidate.consumed)
                     .min(self.buffer.len() as u64) as usize;
+                self.options.scan_work.charge(take)?;
                 let read = self.access.read_at(
                     self.source,
                     candidate.offset + candidate.consumed,
@@ -519,6 +539,7 @@ impl PacketScanner {
             }
             self.packets += 1;
             self.offset = candidate.offset + candidate.header.length;
+            self.at_packet_boundary = true;
             let contents = if candidate.prefix_len == 0 {
                 let packet =
                     Packet::parse(&candidate.retained, candidate.offset, &ParseContext::new())?;
