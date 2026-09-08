@@ -38,6 +38,7 @@ pub struct CarrierPlan {
     entries: Vec<Entry>,
     restoration: CarrierRestoration,
     bytes: u64,
+    scratch_rows: usize,
     _reservation: Reservation,
 }
 
@@ -111,7 +112,7 @@ impl CarrierPlan {
             return Err(EngineError::ResourceLimit("retained carrier manifest"));
         }
         let reservation = options.memory.reserve(cost)?;
-        let entries = packets
+        let entries: Vec<Entry> = packets
             .iter()
             .map(|packet| match (packet.metadata(), packet.payload()) {
                 (Some(metadata), _) => Entry::Metadata(metadata.to_bytes()),
@@ -125,6 +126,7 @@ impl CarrierPlan {
             .collect();
         Ok(Self {
             id: first.input_set_id(),
+            scratch_rows: Self::count_recovery(&entries),
             entries,
             restoration: CarrierRestoration::Exact,
             bytes: next - range.start,
@@ -240,6 +242,7 @@ impl CarrierPlan {
             .ok_or(EngineError::ResourceLimit("replacement length"))?;
         Ok(Self {
             id: set.input_set_id(),
+            scratch_rows: Self::count_recovery(&entries),
             entries,
             restoration: CarrierRestoration::Replacement,
             bytes,
@@ -261,8 +264,15 @@ impl CarrierPlan {
     /// Required scratch bytes for recovery equations. Data packets are read
     /// directly from verified logical blocks and need no recovery scratch.
     pub fn scratch_bytes(&self, block_size: u64) -> EngineResult<u64> {
-        let unique: std::collections::BTreeSet<_> = self
-            .entries
+        block_size
+            .checked_mul(self.scratch_rows as u64)
+            .ok_or(EngineError::ResourceLimit("carrier scratch size"))
+    }
+
+    fn count_recovery(entries: &[Entry]) -> usize {
+        // Construction already reserves the manifest and indexing workspace.
+        // Requirement queries must allocate nothing, including concurrent calls.
+        let unique: std::collections::BTreeSet<_> = entries
             .iter()
             .filter_map(|entry| match entry {
                 Entry::Payload {
@@ -272,9 +282,7 @@ impl CarrierPlan {
                 _ => None,
             })
             .collect();
-        block_size
-            .checked_mul(unique.len() as u64)
-            .ok_or(EngineError::ResourceLimit("carrier scratch size"))
+        unique.len()
     }
 
     /// Rebuild into a separate destination. All required logical source blocks

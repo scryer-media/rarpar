@@ -169,7 +169,7 @@ pub struct StreamingVerifier {
     snapshot: SourceSnapshot,
     options: ExecutionOptions,
     verdicts: Vec<ExtentVerdict>,
-    partial: BTreeMap<usize, PartialExtent>,
+    partial: BTreeMap<usize, Box<PartialExtent>>,
     whole: FingerprintHasher,
     whole_next: u64,
     whole_ordered: bool,
@@ -281,12 +281,12 @@ impl StreamingVerifier {
             let reservation = self.options.memory.reserve(4096)?;
             self.partial.insert(
                 index,
-                PartialExtent {
+                Box::new(PartialExtent {
                     next: 0,
                     hasher: FingerprintHasher::new(),
                     pending: BTreeMap::new(),
                     _reservation: reservation,
-                },
+                }),
             );
         }
         let partial = self

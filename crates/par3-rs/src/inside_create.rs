@@ -141,17 +141,29 @@ impl InsertionPlan {
         let size = options.stripe_bytes.min(64 << 10);
         let _memory = options.memory.reserve(size)?;
         let mut buffer = vec![0; size];
-        let carriers = self
+        let carriers = match self
             .plan
-            .execute(&scratch_directory.join("inside-parity"), scratch_directory)?;
-        if carriers.len() != 2 {
-            return Err(EngineError::InvalidState("embedded carrier layout"));
-        }
-        let temporary = crate::session_repair::stage_path(destination, options)?;
+            .execute(&scratch_directory.join("inside-parity"), scratch_directory)
+        {
+            Ok(carriers) => carriers,
+            Err(EngineError::OutputInterrupted { installed, cause }) => {
+                for path in installed {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(*cause);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut staging = None;
         let result = (|| -> EngineResult<()> {
+            if carriers.len() != 2 {
+                return Err(EngineError::InvalidState("embedded carrier layout"));
+            }
+            let temporary =
+                staging.insert(crate::session_repair::stage_path(destination, options)?);
             let mut output = OpenOptions::new()
                 .write(true)
-                .open_budgeted(&temporary, options)?;
+                .open_budgeted(temporary, options)?;
             let mut copy_range = |range: Range<u64>| -> EngineResult<()> {
                 let mut at = range.start;
                 while at < range.end {
@@ -205,7 +217,7 @@ impl InsertionPlan {
                 self.layout.source(),
                 self.layout.snapshot(),
             )?;
-            self.verify_staged(&temporary, &carriers[0])?;
+            self.verify_staged(temporary, &carriers[0])?;
             std::fs::hard_link(&temporary, destination)?;
             Ok(())
         })();
@@ -214,7 +226,9 @@ impl InsertionPlan {
         for carrier in carriers {
             let _ = std::fs::remove_file(carrier);
         }
-        let _ = std::fs::remove_file(&temporary);
+        if let Some(temporary) = staging {
+            let _ = std::fs::remove_file(temporary);
+        }
         result?;
         Ok(destination.to_owned())
     }
@@ -243,11 +257,24 @@ impl InsertionPlan {
                 }
             }
         }
-        let set = input
-            .metadata()?
+        let (set, set_memory) = input
+            .metadata_accounted(
+                options
+                    .retained_bytes
+                    .saturating_sub(input.retained_bytes()),
+            )?
             .ok_or(EngineError::InvalidState("incomplete embedded metadata"))?;
-        let layout = Arc::new(crate::layout::BlockLayout::new(&set, options)?);
-        let proof = crate::evidence::verify_source(layout, 0, disk.as_ref(), SourceId(1), options)?;
+        let mut verification = options.clone();
+        verification.retained_bytes = verification
+            .retained_bytes
+            .saturating_sub(input.retained_bytes())
+            .saturating_sub(set_memory.bytes());
+        let layout = Arc::new(crate::layout::BlockLayout::new(&set, &verification)?);
+        verification.retained_bytes = verification
+            .retained_bytes
+            .saturating_sub(layout.retained_bytes());
+        let proof =
+            crate::evidence::verify_source(layout, 0, disk.as_ref(), SourceId(1), &verification)?;
         if !proof.protected_complete() {
             return Err(EngineError::InvalidState(
                 "embedded output failed verification",

@@ -204,6 +204,14 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes, "reservation can only shrink");
+        self.budget
+            .0
+            .used
+            .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        self.bytes = bytes;
+    }
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }

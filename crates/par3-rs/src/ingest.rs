@@ -262,7 +262,7 @@ impl IngestedPacket {
             IngestedContents::Metadata(packet, reservation) => {
                 let _ = reservation;
                 (packet.len() as usize)
-                    .saturating_mul(4)
+                    .saturating_mul(16)
                     .saturating_add(512)
             }
             IngestedContents::Payload(payload) => {
@@ -473,7 +473,7 @@ impl PacketScanner {
                     0
                 };
                 let cost = retained_len
-                    .checked_mul(4)
+                    .checked_mul(16)
                     .and_then(|size| size.checked_add(512))
                     .ok_or(EngineError::ResourceLimit("metadata packet size"))?;
                 if cost > self.options.retained_bytes
@@ -712,29 +712,99 @@ impl IncrementalSet {
 
     /// Resolve metadata when Start, Root and all referenced children are present.
     /// `None` means more metadata is needed, rather than a malformed set.
+    /// Construction is budgeted; the returned convenience value is caller-owned.
+    /// Retained sessions keep the separate resolved-tree reservation internally.
     pub fn metadata(&self) -> EngineResult<Option<Par3Set>> {
+        self.metadata_accounted(self.options.retained_bytes.saturating_sub(self.retained))
+            .map(|value| value.map(|(set, _reservation)| set))
+    }
+
+    pub(crate) fn metadata_accounted(
+        &self,
+        retained_limit: usize,
+    ) -> EngineResult<Option<(Par3Set, Reservation)>> {
         let _progress = self.options.stage(crate::runtime::Stage::Metadata)?;
-        // Admission reserved four times each packet's wire size for the parsed
-        // packet, its clone during resolution, and the resolved metadata tree.
+        use crate::packet::PacketBody;
+        let mut has_start = false;
+        let mut has_root = false;
+        let mut fixed = 8192usize;
+        let mut entry_cost = 1024usize;
+        for packet in self.packets.values().filter_map(IngestedPacket::metadata) {
+            self.options.cancel.check()?;
+            has_start |= matches!(packet.body(), PacketBody::Start(_));
+            has_root |= matches!(packet.body(), PacketBody::Root(_));
+            let cost = usize::try_from(packet.len())
+                .ok()
+                .and_then(|n| n.checked_mul(16))
+                .and_then(|n| n.checked_add(1024))
+                .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
+            fixed = fixed
+                .checked_add(cost)
+                .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
+            if matches!(
+                packet.body(),
+                PacketBody::File(_) | PacketBody::Directory(_)
+            ) {
+                entry_cost = entry_cost.max(cost);
+            }
+        }
+        if !has_start || !has_root {
+            return Ok(None);
+        }
+        // Reserve before cloning or expanding a shared metadata graph. Split
+        // expansion headroom between owned entry descriptions and path copies.
+        let ceiling = retained_limit.min(self.options.memory.available());
+        let extra = ceiling
+            .checked_sub(fixed)
+            .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
+        let mut reservation = self.options.memory.reserve(ceiling)?;
+        let limits = SetLimits {
+            max_entries: (extra / 2 / entry_cost).min(SetLimits::DEFAULT_MAX_ENTRIES),
+            max_path_bytes: (extra / 8) as u64,
+            ..SetLimits::default()
+        };
         let packets = self
             .packets
             .values()
             .filter_map(IngestedPacket::metadata)
             .cloned()
             .collect();
-        let limits = SetLimits {
-            max_entries: (self.options.retained_bytes / 1024).min(SetLimits::DEFAULT_MAX_ENTRIES),
-            max_path_bytes: (self.options.retained_bytes / 8) as u64,
-            ..SetLimits::default()
-        };
         match Par3Set::from_packets_for_with_limits(packets, self.id, &limits) {
-            Ok(set) => Ok(Some(set)),
+            Ok(set) => {
+                let entries = set
+                    .files()
+                    .len()
+                    .checked_add(set.directories().len())
+                    .ok_or(EngineError::ResourceLimit("resolved entries"))?;
+                let paths = set
+                    .files()
+                    .iter()
+                    .map(|file| file.path().len())
+                    .chain(
+                        set.directories()
+                            .iter()
+                            .map(|directory| directory.path().len()),
+                    )
+                    .try_fold(0usize, |sum, len| sum.checked_add(len))
+                    .ok_or(EngineError::ResourceLimit("resolved paths"))?;
+                let actual = entries
+                    .checked_mul(entry_cost)
+                    .and_then(|n| n.checked_add(paths.checked_mul(4)?))
+                    .and_then(|n| n.checked_add(fixed))
+                    .filter(|n| *n <= ceiling)
+                    .ok_or(EngineError::ResourceLimit("resolved metadata accounting"))?;
+                reservation.shrink_to(actual);
+                Ok(Some((set, reservation)))
+            }
             Err(
                 Par3Error::MissingStartPacket { .. }
                 | Par3Error::MissingRootPacket { .. }
                 | Par3Error::MissingChildPacket { .. }
                 | Par3Error::UnknownInputSet { .. },
             ) => Ok(None),
+            Err(Par3Error::ScanLimitExceeded { .. }) => {
+                Err(EngineError::ResourceLimit("metadata expansion"))
+            }
             Err(error) => Err(error.into()),
         }
     }

@@ -130,6 +130,21 @@ fn repair_inner(
     {
         payload.validate(&session.options)?;
     }
+    let path_cost = assessment
+        .files
+        .iter()
+        .filter(|file| !file.complete)
+        .try_fold(0usize, |sum, file| {
+            output
+                .as_os_str()
+                .len()
+                .checked_mul(6)
+                .and_then(|n| n.checked_add(file.path.len().checked_mul(4)?))
+                .and_then(|n| n.checked_add(2048))
+                .and_then(|n| n.checked_add(sum))
+        })
+        .ok_or(EngineError::ResourceLimit("repair output paths"))?;
+    let _paths = session.options.memory.reserve(path_cost)?;
     let mut staged = Vec::new();
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
@@ -342,6 +357,14 @@ where
     let mut progress = session.options.stage(crate::runtime::Stage::Decode)?;
     let assessment = session.assessment.as_ref().expect("assessment");
     let lost = &assessment.lost_blocks;
+    let _rows = session.options.memory.reserve(
+        assessment
+            .recovery
+            .len()
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(256))
+            .ok_or(EngineError::ResourceLimit("recovery row indices"))?,
+    )?;
     let rows: Vec<u64> = assessment
         .recovery
         .iter()

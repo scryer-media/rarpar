@@ -100,6 +100,7 @@ pub struct Par3RepairSession {
     pub(crate) access: Arc<dyn SourceAccess>,
     pub(crate) input: IncrementalSet,
     pub(crate) set: Option<Par3Set>,
+    set_memory: Option<Reservation>,
     pub(crate) layout: Option<Arc<BlockLayout>>,
     pub(crate) bindings: BTreeMap<String, SourceId>,
     binding_memory: BTreeMap<String, Reservation>,
@@ -127,6 +128,7 @@ impl Par3RepairSession {
             access,
             input,
             set: None,
+            set_memory: None,
             layout: None,
             bindings: BTreeMap::new(),
             binding_memory: BTreeMap::new(),
@@ -174,8 +176,8 @@ impl Par3RepairSession {
         if !self.binding_memory.contains_key(path) {
             let bytes = path
                 .len()
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(256))
+                .checked_mul(3)
+                .and_then(|n| n.checked_add(512))
                 .ok_or(EngineError::ResourceLimit("source bindings"))?;
             self.admit_retained(bytes)?;
             let reservation = self.options.memory.reserve(bytes)?;
@@ -259,11 +261,15 @@ impl Par3RepairSession {
         if !self.metadata_dirty {
             return Ok(());
         }
-        let Some(set) = self.input.metadata()? else {
+        let remaining = self
+            .options
+            .retained_bytes
+            .saturating_sub(self.retained_bytes());
+        let Some((set, set_memory)) = self.input.metadata_accounted(remaining)? else {
             return Ok(());
         };
         let mut options = self.options.clone();
-        options.retained_bytes = options.retained_bytes.saturating_sub(self.retained_bytes());
+        options.retained_bytes = remaining.saturating_sub(set_memory.bytes());
         let layout = Arc::new(BlockLayout::new(&set, &options)?);
         if self
             .layout
@@ -278,6 +284,7 @@ impl Par3RepairSession {
         }
         self.layout = Some(layout);
         self.set = Some(set);
+        self.set_memory = Some(set_memory);
         self.metadata_dirty = false;
         self.diagnostics.layout_rebuilds += 1;
         Ok(())
@@ -358,30 +365,29 @@ impl Par3RepairSession {
         }
         self.refresh_layout()?;
         self.refresh_data()?;
-        let stale: Vec<_> = self
-            .evidence
-            .iter()
-            .filter_map(
-                |(path, evidence)| match self.access.snapshot(evidence.source) {
-                    Ok(snapshot) if snapshot == Some(evidence.snapshot) => None,
-                    other => Some((path.clone(), other)),
-                },
-            )
-            .collect();
-        for (path, snapshot) in stale {
-            snapshot?;
-            self.evidence.remove(&path);
-            self.assessment = None;
-        }
-        let mut stale_placements = Vec::new();
-        for (key, placement) in &self.placements {
-            if self.access.snapshot(placement.source)? != Some(placement.snapshot) {
-                stale_placements.push(*key);
+        let mut changed = false;
+        let mut failure = None;
+        let mut current = |source, expected| match self.access.snapshot(source) {
+            Ok(snapshot) => {
+                let valid = snapshot == Some(expected);
+                changed |= !valid;
+                valid
             }
-        }
-        for key in stale_placements {
-            self.placements.remove(&key);
+            Err(error) => {
+                changed = true;
+                failure.get_or_insert(error);
+                false
+            }
+        };
+        self.evidence
+            .retain(|_, evidence| current(evidence.source, evidence.snapshot));
+        self.placements
+            .retain(|_, placement| current(placement.source, placement.snapshot));
+        if changed {
             self.assessment = None;
+        }
+        if let Some(error) = failure {
+            return Err(error.into());
         }
         if self.assessment.is_some() {
             self.diagnostics.assessment_reuses += 1;
@@ -405,8 +411,18 @@ impl Par3RepairSession {
         };
         let cost = usize::try_from(layout.block_count)
             .ok()
-            .and_then(|count| count.checked_mul(64))
-            .and_then(|count| count.checked_add(layout.files.len().checked_mul(1024)?))
+            // Include simultaneous best/current matrix candidates, cohort maps,
+            // recovery references, and temporary block-coverage unions.
+            .and_then(|count| count.checked_mul(512))
+            .and_then(|count| count.checked_add(self.input.payloads().count().checked_mul(2048)?))
+            .and_then(|count| {
+                layout.files.iter().try_fold(count, |total, file| {
+                    total
+                        .checked_add(1024)?
+                        .checked_add(file.path.len().checked_mul(2)?)?
+                        .checked_add(file.extents.len().checked_mul(128)?)
+                })
+            })
             .ok_or(EngineError::ResourceLimit("assessment blocks"))?;
         self.admit_retained(cost)?;
         let reservation = self.options.memory.reserve(cost)?;
@@ -652,11 +668,12 @@ impl Par3RepairSession {
     }
 
     /// Conservative retained state across packets, layouts, evidence, bindings,
-    /// placements and assessment. The resolved set is included in packet costs.
+    /// placements, the independently reserved resolved set, and assessment.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.input
             .retained_bytes()
+            .saturating_add(self.set_memory.as_ref().map_or(0, Reservation::bytes))
             .saturating_add(
                 self.data_checked
                     .len()

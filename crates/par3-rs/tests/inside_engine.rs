@@ -477,6 +477,40 @@ fn inspection_refuses_trailing_data_damage_and_exhausted_budgets() {
 }
 
 #[test]
+fn insertion_cleans_carriers_when_output_staging_fails() {
+    use par3_rs::creation::CreationOptions;
+    use par3_rs::inside::InsertionPlan;
+    use std::sync::Arc;
+
+    let (_, original, _) = cases()[0];
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(7), 1, original.into());
+    let options = CreationOptions {
+        block_size: 128,
+        recovery_count: 4,
+        ..CreationOptions::default()
+    };
+    let handles = options.execution.handles.clone();
+    let plan = InsertionPlan::build(
+        Arc::new(access),
+        SourceId(7),
+        "archive.zip",
+        options,
+        &ContainerLimits::default(),
+    )
+    .unwrap();
+    let tree = common::TempTree::new("inside-staging-failure");
+    let destination = tree.path().join("absent-parent/archive.zip");
+    assert!(matches!(
+        plan.execute(&destination, tree.path()),
+        Err(EngineError::Io(_))
+    ));
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    assert_eq!(handles.used(), 0);
+}
+
+#[test]
 fn staged_insertion_preserves_members_and_authenticates_embedded_layout() {
     use par3_rs::creation::CreationOptions;
     use par3_rs::inside::InsertionPlan;

@@ -116,6 +116,16 @@ process RSS; provider storage and allocator bookkeeping are outside that count.
 and measurement. Set explicit worker limits when Weaver schedules concurrent
 jobs. Clone the same memory, handle, and scan-work budgets to share ceilings.
 
+Packet admission charges parsed structures as well as wire bytes. Resolving
+shared directory/file descriptions has a separate reservation and expansion
+limits derived from remaining memory and retained-state headroom. Sessions keep
+that reservation for the resolved set's lifetime. The `IncrementalSet::metadata`
+convenience method budgets construction but transfers the returned legacy set
+to the caller; use a session for retained accounting. Assessment charges include
+cohort candidates, recovery references, file paths, damage ranges, and temporary
+coverage unions. Incomplete streaming hashes are boxed so one pending extent
+does not multiply large hasher storage across unused tree-node slots.
+
 `HandleBudget` reserves each actual engine file before opening it and releases
 the lease after close, including error paths and sequential readers. Exhaustion
 is a nonblocking `ResourceLimit`; it does not wait while holding other handles.

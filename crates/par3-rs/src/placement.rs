@@ -134,6 +134,7 @@ pub fn search_extent(
                 .ok_or(EngineError::ResourceLimit("placement buffers"))?,
         )
         .and_then(|size| size.checked_add(8192))
+        .and_then(|size| size.checked_add(candidates.len().checked_mul(32)?))
         .ok_or(EngineError::ResourceLimit("placement buffers"))?;
     let _buffers = options.memory.reserve(size)?;
     let mut ring = vec![0; window];

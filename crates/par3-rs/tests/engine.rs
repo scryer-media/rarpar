@@ -86,7 +86,9 @@ fn split_arrivals_authenticate_without_retaining_recovery_bytes() {
     assert_eq!(payload.read_at(120, &mut range).unwrap(), 21);
     let recovery = common::gf8_set();
     assert_eq!(range, recovery.recovery_blocks()[0].data()[120..141]);
-    assert!(budget.used() < 20_000);
+    // Parsed enum/vector storage is charged conservatively rather than using
+    // wire length as a proxy. No recovery block allocation is retained.
+    assert!(budget.used() < 64 << 10);
     drop(scanner);
     drop(set);
     assert_eq!(budget.used(), 0);

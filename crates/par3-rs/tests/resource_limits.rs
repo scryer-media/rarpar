@@ -61,3 +61,63 @@ fn failed_disk_open_preserves_io_error_and_releases_its_lease() {
     }
     assert_eq!(options.handles.used(), 0);
 }
+
+#[test]
+fn resolved_metadata_has_an_independent_budget_and_failed_admission_releases_it() {
+    use par3_rs::ingest::{IncrementalSet, PacketScanner, ScanEvent};
+    use par3_rs::runtime::MemoryBudget;
+    use par3_rs::source::MemorySourceAccess;
+
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(99), 1, common::set_par3().into());
+    let access = Arc::new(access);
+    let mut scanner = PacketScanner::new(
+        access.clone(),
+        SourceId(99),
+        ExecutionOptions::default(),
+        par3_rs::ScanLimits::default(),
+    )
+    .unwrap();
+    let mut packets = Vec::new();
+    let mut input = IncrementalSet::new(common::SET_ID, ExecutionOptions::default()).unwrap();
+    while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+        input.merge(packet.clone()).unwrap();
+        packets.push(packet);
+    }
+    let packet_bytes = input.retained_bytes();
+    drop(input);
+    drop(scanner);
+
+    for retained in [packet_bytes + 1, 1 << 20] {
+        let mut options = ExecutionOptions::default();
+        options.retained_bytes = retained;
+        options.memory = MemoryBudget::new(4 << 20);
+        let mut session =
+            par3_rs::Par3RepairSession::new(common::SET_ID, access.clone(), options.clone())
+                .unwrap();
+        for packet in &packets {
+            session.merge(packet.clone()).unwrap();
+        }
+        let before = options.memory.used();
+        if retained == packet_bytes + 1 {
+            for _ in 0..3 {
+                assert!(matches!(
+                    session.assess(),
+                    Err(EngineError::ResourceLimit(_))
+                ));
+                assert_eq!(options.memory.used(), before);
+                assert_eq!(session.retained_bytes(), packet_bytes);
+            }
+        } else {
+            session.assess().unwrap();
+            assert!(session.retained_bytes() > packet_bytes);
+            assert!(session.retained_bytes() <= retained);
+            let steady = options.memory.used();
+            session.assess().unwrap();
+            assert_eq!(options.memory.used(), steady);
+        }
+        assert!(options.memory.peak() <= options.memory.limit());
+        drop(session);
+        assert_eq!(options.memory.used(), 0);
+    }
+}

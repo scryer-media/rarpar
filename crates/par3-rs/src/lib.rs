@@ -26,6 +26,8 @@
 //! from available Data and aliases does not require a Galois field or matrix.
 //! [`runtime::ScanWorkBudget`] bounds cumulative carrier read requests across
 //! scanners, retries and seeks independently of the shared allocation budget.
+//! Resolved metadata has an independent lifetime reservation and expansion limits;
+//! assessment candidates and pending verification work share the allocation ceiling.
 //! Carrier generation changes invalidate recovery availability without rereading
 //! protected sources. Verification resumes after honest sequential readers stop
 //! at holes, omitting unprotected gaps from the whole protected-data fingerprint.
