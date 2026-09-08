@@ -5,6 +5,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.0 (unreleased)
 
+- Retain authenticated PAR3 discovery packets across automatic repair and
+  rediscovery, including renamed carriers. Defer PAR3 deficits until available
+  PAR2 recovery has run, then reassess the affected sets.
+- Reject overwrite plans leaving authenticated obsolete carriers and repair
+  destinations that alias on the target filesystem. Apply Cauchy loss limits
+  to repair dry runs and resolve cleanup membership against `-C`.
 - Add `par3 create`, `par3 verify`, and `par3 repair`, using the bounded engine
   in `par3-rs` 0.3.0. Support FFT/interleaving, deduplication, Data packets,
   content placement, configurable volumes, dry-run creation plans, and explicit

@@ -26,12 +26,37 @@ pub struct Par3Set {
     pub paths: Vec<PathBuf>,
     pub protected_files: Vec<String>,
     pub metadata_complete: bool,
+    #[serde(skip)]
+    loaded: Option<Arc<LoadedSet>>,
+}
+
+impl Par3Set {
+    pub fn member_paths(&self, working_dir: Option<&Path>) -> Result<Vec<PathBuf>, RarparError> {
+        self.protected_files
+            .iter()
+            .map(|name| protected_path(working_dir.unwrap_or(&self.base_dir), name))
+            .collect()
+    }
+
+    pub fn release_carriers(&mut self) {
+        self.loaded = None;
+    }
 }
 
 struct LoadedSet {
     id: InputSetId,
     packets: IncrementalSet,
     paths: Vec<PathBuf>,
+    options: ExecutionOptions,
+}
+
+impl std::fmt::Debug for LoadedSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSet")
+            .field("id", &self.id)
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn execution_options(
@@ -73,6 +98,18 @@ pub fn is_carrier(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("par3"))
 }
 
+pub fn is_carrier_candidate(path: &Path) -> bool {
+    use std::io::Read;
+    if is_carrier(path) {
+        return true;
+    }
+    let mut prefix = [0; 8];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok()
+        && &prefix == par3_rs::MAGIC
+}
+
 fn scan(paths: &[PathBuf], options: &ExecutionOptions) -> Result<Vec<LoadedSet>, RarparError> {
     let mut disk = DiskSourceAccess::with_options(options.clone());
     for (index, path) in paths.iter().enumerate() {
@@ -101,6 +138,7 @@ fn scan(paths: &[PathBuf], options: &ExecutionOptions) -> Result<Vec<LoadedSet>,
                             id,
                             packets: IncrementalSet::new(id, options.clone())?,
                             paths: Vec::new(),
+                            options: options.clone(),
                         });
                     }
                     let set = sets.get_mut(&key).expect("inserted set");
@@ -146,7 +184,7 @@ pub fn discover_sets(
             result.push(Par3Set {
                 id: set.id.to_string(),
                 base_dir: parent(&set.paths[0]),
-                paths: set.paths,
+                paths: set.paths.clone(),
                 protected_files: layout
                     .as_ref()
                     .map(|layout| {
@@ -158,6 +196,7 @@ pub fn discover_sets(
                     })
                     .unwrap_or_default(),
                 metadata_complete: layout.is_some(),
+                loaded: Some(Arc::new(set)),
             });
         }
     }
@@ -205,6 +244,59 @@ fn protected_path(root: &Path, name: &str) -> Result<PathBuf, RarparError> {
         reject_symlinks(&joined)?;
     }
     Ok(joined)
+}
+
+fn validate_destinations(paths: &[PathBuf]) -> Result<(), RarparError> {
+    let mut existing = BTreeSet::new();
+    let mut probes: BTreeMap<PathBuf, tempfile::TempDir> = BTreeMap::new();
+    for path in paths {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        if path.exists() {
+            if !existing.insert(path.canonicalize()?) {
+                return Err(RarparError::Unsafe(format!(
+                    "PAR3 member paths alias on the target filesystem: {}",
+                    path.display()
+                )));
+            }
+            continue;
+        }
+        let mut ancestor = parent(&path);
+        while !ancestor.exists() {
+            ancestor = parent(&ancestor);
+        }
+        if !ancestor.is_dir() {
+            return Err(RarparError::Unsafe(format!(
+                "PAR3 member is nested under a file: {}",
+                path.display()
+            )));
+        }
+        let relative = path.strip_prefix(&ancestor).expect("ancestor prefix");
+        let key = ancestor.canonicalize()?;
+        if !probes.contains_key(&key) {
+            probes.insert(key.clone(), tempfile::tempdir_in(&ancestor)?);
+        }
+        // Mirror missing names on the destination filesystem, letting its own
+        // case folding, Unicode normalization and name rules detect aliases.
+        let probe = probes[&key].path().join(relative);
+        let result = std::fs::create_dir_all(parent(&probe)).and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+                .map(drop)
+        });
+        if let Err(error) = result {
+            return Err(RarparError::Unsafe(format!(
+                "PAR3 member paths alias or cannot be represented on the target filesystem: {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn collect_files(
@@ -258,7 +350,7 @@ fn load_selected(
     }
     let paths: Vec<_> = files
         .into_iter()
-        .filter(|path| is_carrier(path) || *path == input)
+        .filter(|path| *path == input || is_carrier_candidate(path))
         .collect();
     let mut sets = scan(&paths, options)?;
     sets.retain(|set| {
@@ -400,7 +492,11 @@ pub fn repair_set(cli: &Cli, set: &Par3Set) -> Result<RepairOutcome, RarparError
         set_id: Some(set.id.clone()),
         no_backup: false,
     };
-    verify_repair(cli, &args, true)
+    let loaded = set
+        .loaded
+        .as_ref()
+        .ok_or(EngineError::InvalidState("PAR3 carriers already released"))?;
+    verify_repair_loaded(cli, &args, true, loaded)
 }
 
 impl RepairOutcome {
@@ -417,6 +513,17 @@ impl RepairOutcome {
 fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutcome, RarparError> {
     let options = options(cli)?;
     let loaded = load_selected(cli, args, &options)?;
+    verify_repair_loaded(cli, args, repair, &loaded)
+}
+
+fn verify_repair_loaded(
+    cli: &Cli,
+    args: &Par3Args,
+    repair: bool,
+    loaded: &LoadedSet,
+) -> Result<RepairOutcome, RarparError> {
+    // Discovery, every set, and any reassessment share cumulative budgets.
+    let options = loaded.options.clone();
     let root = cli
         .working_dir
         .clone()
@@ -431,8 +538,20 @@ fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutco
         .map(|set| BlockLayout::new(set, &options))
         .transpose()?;
     if let Some(layout) = &layout {
-        for file in layout.files() {
-            let path = protected_path(&root, &file.path)?;
+        if layout.files().len() > cli.max_files {
+            return Err(RarparError::Resource(
+                "PAR3 layout exceeded --max-files".into(),
+            ));
+        }
+        let destinations: Vec<_> = layout
+            .files()
+            .iter()
+            .map(|file| protected_path(&root, &file.path))
+            .collect::<Result<_, _>>()?;
+        if repair {
+            validate_destinations(&destinations)?;
+        }
+        for (file, path) in layout.files().iter().zip(destinations) {
             let id = SourceId(bindings.len() as u64);
             disk.insert(id, path.clone());
             protected_paths.push(path);
@@ -461,7 +580,6 @@ fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutco
     for packet in loaded.packets.packets() {
         session.merge(packet.clone())?;
     }
-    drop(loaded.packets);
     for (name, id) in bindings {
         session.bind_file(&name, id)?;
     }
@@ -553,6 +671,7 @@ fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutco
     }
     // A repair dry run succeeds when it can execute, while verify still reports damage.
     if repair && cli.dry_run && ready {
+        session.validate_repair()?;
         success = true;
         report["success"] = json!(true);
     }
@@ -561,6 +680,62 @@ fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutco
         report,
         protected_paths,
     })
+}
+
+fn reject_obsolete_carriers(
+    cli: &Cli,
+    stem: &Path,
+    outputs: &[PathBuf],
+    options: &ExecutionOptions,
+) -> Result<(), RarparError> {
+    let directory = parent(stem);
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut files = BTreeSet::new();
+    let mut local = cli.clone();
+    local.no_recursive = true;
+    collect_files(&directory, &local, 0, &mut files)?;
+    let candidates: Vec<_> = files
+        .into_iter()
+        .filter(|path| is_carrier_candidate(path))
+        .collect();
+    let stem_name = stem.file_name().unwrap_or_default().to_string_lossy();
+    let intended: BTreeSet<_> = outputs
+        .iter()
+        .map(|path| {
+            if path.exists() {
+                path.canonicalize()
+            } else {
+                directory
+                    .canonicalize()
+                    .map(|root| root.join(path.file_name().unwrap_or_default()))
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    for set in scan(&candidates, options)? {
+        // Names select overwrite candidates only. Membership comes exclusively
+        // from authenticated packets, including renamed copies of the old set.
+        let selected = set.paths.iter().any(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            path.canonicalize()
+                .is_ok_and(|path| intended.contains(&path))
+                || name == format!("{stem_name}.par3")
+                || (name.starts_with(&format!("{stem_name}.vol")) && is_carrier(path))
+                || (name.starts_with(&format!("{stem_name}.part")) && is_carrier(path))
+        });
+        if selected {
+            for path in &set.paths {
+                if !intended.contains(&path.canonicalize()?) {
+                    return Err(RarparError::Unsafe(format!(
+                        "overwrite would leave an obsolete authenticated PAR3 carrier: {}; move the previous set aside or choose a new output directory",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError> {
@@ -607,7 +782,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         sources.push(CreationSource { name, source: id });
     }
     let mut config = CreationOptions {
-        execution,
+        execution: execution.clone(),
         block_size: args.block_size,
         codec: match args.codec {
             Par3Codec::Cauchy => {
@@ -665,6 +840,9 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
     };
     reject_symlinks(&stem)?;
     let outputs: Vec<_> = plan.output_paths(&stem).collect();
+    if cli.overwrite {
+        reject_obsolete_carriers(cli, &stem, &outputs, &execution)?;
+    }
     for output in &outputs {
         reject_symlinks(output)?;
         match std::fs::symlink_metadata(output) {
@@ -719,4 +897,85 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         }
     }
     Ok((true, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use par3_rs::runtime::ScanWorkBudget;
+    use par3_rs::source::MemorySourceAccess;
+
+    #[test]
+    fn shared_carrier_sets_repair_and_rediscover_without_rescanning() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut carrier = Vec::new();
+        for index in 0..16 {
+            let mut access = MemorySourceAccess::default();
+            access.insert(SourceId(0), 0, Arc::from(&b""[..]));
+            let sources = [CreationSource {
+                name: format!("empty{index}"),
+                source: SourceId(0),
+            }];
+            let plan = CreationPlan::build(
+                Arc::new(access),
+                &sources,
+                CreationOptions {
+                    block_size: 256,
+                    recovery_count: 0,
+                    ..CreationOptions::default()
+                },
+            )
+            .unwrap();
+            for path in plan
+                .execute(&root.join(format!("set{index}")), root)
+                .unwrap()
+            {
+                // Concatenate complete carrier output, without modifying packets.
+                carrier.extend(std::fs::read(&path).unwrap());
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let path = root.join("collection.par3");
+        std::fs::write(&path, &carrier).unwrap();
+        let mut options = ExecutionOptions::default();
+        options.scan_work = ScanWorkBudget::new(4 * carrier.len() as u64);
+        let sets = discover_sets(std::slice::from_ref(&path), &options).unwrap();
+        assert_eq!(sets.len(), 16);
+        let scanned = options.scan_work.used();
+        let read_bytes = options.diagnostics.file_io().read_bytes;
+        let expected_reads = carrier.len() as u64 * if cfg!(windows) { 2 } else { 1 };
+        assert_eq!(read_bytes, expected_reads);
+        assert_eq!(scanned, expected_reads + u64::from(cfg!(windows)));
+        let cli = Cli::try_parse_from(["rarpar", "auto", path.to_str().unwrap()]).unwrap();
+        for set in &sets {
+            assert_eq!(
+                set.loaded.as_ref().unwrap().options.scan_work.used(),
+                options.scan_work.used()
+            );
+            assert!(repair_set(&cli, set).unwrap().success);
+        }
+        assert_eq!(
+            options.diagnostics.file_io().read_bytes,
+            read_bytes,
+            "repair must reuse discovery packets and budgets"
+        );
+        let report = crate::discovery::discover_reusing_par3(
+            vec![path],
+            &crate::discovery::DiscoveryOptions::from_cli(&cli),
+            Some(sets),
+        )
+        .unwrap();
+        assert_eq!(report.par3_sets.len(), 16);
+        assert_eq!(options.diagnostics.file_io().read_bytes, read_bytes);
+        #[cfg(unix)]
+        assert_eq!(options.scan_work.used(), scanned);
+        for index in 0..16 {
+            assert!(root.join(format!("empty{index}")).is_file());
+        }
+        drop(report);
+        assert_eq!(options.handles.used(), 0);
+        assert_eq!(options.memory.used(), 0);
+    }
 }

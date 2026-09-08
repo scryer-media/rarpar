@@ -36,6 +36,7 @@ pub fn add_par3_carriers(
     manifest: &mut CleanupManifest,
     rar: &RarSet,
     sets: &[crate::par3::Par3Set],
+    working_dir: Option<&Path>,
 ) {
     let volumes: Vec<_> = rar
         .volumes
@@ -46,7 +47,8 @@ pub fn add_par3_carriers(
         set.metadata_complete
             && !set.protected_files.is_empty()
             && set.protected_files.iter().all(|name| {
-                set.base_dir
+                working_dir
+                    .unwrap_or(&set.base_dir)
                     .join(name)
                     .canonicalize()
                     .is_ok_and(|path| volumes.contains(&path))

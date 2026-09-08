@@ -139,6 +139,12 @@
 //! when the host runs several jobs. [`runtime::ExecutionOptions::fft_backend`]
 //! selects automatic or scalar FFT butterflies.
 //!
+//! Windows scanners pin a budgeted read-only carrier handle through
+//! [`source::SourceAccess::pin`]. Drop the scanner and its authenticated packets
+//! before replacing that carrier. Pinning hashes once; all generation hashes consume scan-work
+//! budget. [`session::Par3RepairSession::validate_repair`] checks readiness and
+//! configured codec/handle ceilings without staging output.
+//!
 //! Convenience APIs instead use [`ScanLimits`], [`SetLimits`], [`CodecLimits`],
 //! [`CreateLimits`], and [`RepairLimits`]. In particular,
 //! [`scan_packets_from_path`] reads an entire carrier before applying packet

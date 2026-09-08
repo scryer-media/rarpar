@@ -158,9 +158,10 @@ and assessment. Duplicate packets do not increase recovery availability.
 
 Feed positioned decoded bytes to `evidence::StreamingVerifier`, then admit its
 evidence to the session. Verified prefixes and unresolved file ranges support
-extraction readiness. Unchanged assessments and recovery-only merges do not
-reread protected sources. Recovery requirements identify the matrix, cohort,
-admissible indices, and deficit.
+extraction readiness. Unchanged assessments and recovery-only merges reuse
+verification evidence. With read-free provider snapshots they perform no source
+reads; unpinned non-Unix disk snapshots still hash content. Recovery requirements
+identify the matrix, cohort, admissible indices, and deficit.
 
 Source identities, generations, and published bytes must follow the
 `SourceAccess` contract. Holes are unavailable bytes, never implicit zeroes.
@@ -180,6 +181,12 @@ disk-provider handles. Provider storage and allocator overhead are outside
 engine accounting; it is not a process-RSS limit. Out-of-order verification
 drops incomplete hash work when its budget is exhausted, leaving those extents
 unknown for later reading.
+
+Windows scanning pins a read-only carrier handle, preventing repeated full-file
+generation hashes after one acquisition hash. Retained packets keep that handle
+alive; drop them before replacing or deleting carriers. All generation hashes
+consume scan-work budget. Use `Par3RepairSession::validate_repair()` for dry-run readiness and
+configured codec limits before staging output.
 
 Cancellation, progress callbacks, stage timings, I/O counters, and typed
 resource/I/O outcomes are available through `runtime`. Convenience APIs instead

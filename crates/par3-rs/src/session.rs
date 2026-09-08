@@ -647,6 +647,34 @@ impl Par3RepairSession {
             .unwrap_or_default())
     }
 
+    /// Check readiness and configured codec/handle ceilings without staging files.
+    /// This reuses retained analysis. A successful check does not reserve future
+    /// allocations or guarantee that sources remain unchanged until execution.
+    pub fn validate_repair(&mut self) -> EngineResult<()> {
+        self.options.validate()?;
+        self.assess()?;
+        let assessment = self.assessment.as_ref().expect("assessed session");
+        if assessment.status == RepairStatus::Complete {
+            return Ok(());
+        }
+        if assessment.status != RepairStatus::Ready {
+            return Err(EngineError::InvalidState("repair is not ready"));
+        }
+        if matches!(
+            assessment.matrix.as_ref().map(|packet| packet.body()),
+            Some(PacketBody::CauchyMatrix(_))
+        ) && assessment.lost_blocks.len() as u64 > self.options.max_cauchy_lost_blocks
+        {
+            return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+        }
+        if self.options.open_handles < 2 {
+            return Err(EngineError::ResourceLimit(
+                "repair requires two open handles",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reconstruct damaged files into an explicitly selected output directory.
     /// Sources remain read-only; verified temporary outputs are installed only
     /// after their complete protected-data hashes match.

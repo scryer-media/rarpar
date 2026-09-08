@@ -364,6 +364,7 @@ fn restore_recovery_volumes(set: &RarSet) -> Result<RarSet, CompatFailure> {
     discovery::discover_rar_set_for_archive(
         anchor,
         &DiscoveryOptions {
+            working_dir: None,
             recursive: false,
             max_depth: 1,
             max_files: 20_000,
@@ -619,6 +620,7 @@ fn resolve_sets(specs: &[PathBuf]) -> Result<Vec<RarSet>, CompatFailure> {
     let mut sets = BTreeMap::new();
     let paths = expand_archive_specs(specs)?;
     let options = DiscoveryOptions {
+        working_dir: None,
         recursive: false,
         max_depth: 1,
         max_files: 20_000,

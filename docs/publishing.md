@@ -39,10 +39,9 @@ Before publishing:
 rtk cargo fmt --check --all
 rtk cargo clippy --locked --workspace --all-targets -- -D warnings
 rtk cargo test --locked --workspace --no-fail-fast
-rtk cargo package --locked -p reedsolomon-rs
+rtk cargo package --locked -p reedsolomon-rs -p par3-rs
 rtk cargo package --locked --no-verify -p unrar-rs
 rtk cargo package --locked --no-verify -p par2-rs
-rtk cargo package --locked -p par3-rs
 rtk cargo package --locked --list -p reedsolomon-rs
 rtk cargo package --locked --list -p unrar-rs
 rtk cargo package --locked --list -p par2-rs

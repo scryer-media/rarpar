@@ -2,6 +2,11 @@
 
 ## 0.3.0 (unreleased)
 
+- Pin Windows packet carriers with budgeted read-only sharing locks to avoid
+  full-file generation hashes inside scan and payload loops. Charge fallback
+  generation hashing to the cumulative work budget.
+- Expose `Par3RepairSession::validate_repair` so dry runs and execution share
+  readiness and configured Cauchy loss/handle checks.
 - Add bounded incremental packet ingestion, virtual source access, positioned
   BLAKE3 verification evidence, retained repair sessions, cancellation, and
   shared memory, handle, and scan-work budgets.

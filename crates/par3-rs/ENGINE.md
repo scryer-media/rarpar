@@ -137,6 +137,20 @@ same-length replacements with preserved timestamps, at the cost of snapshot
 reads. Weaver's virtual sources should supply their own immutable generations
 through `SourceAccess` to retain read-free reassessment.
 
+Windows scanners instead use `SourceAccess::pin`: a read-only sharing lock
+prevents writes and deletion. Acquisition hashes content once; subsequent
+generation checks need no content reads. Each
+retained carrier uses one handle lease until its scanner and all authenticated
+packets are dropped. Lock acquisition can fail if a writer is already open;
+handle exhaustion is explicit. Raise both handle limits for large collections,
+leaving headroom for verification and staging. All generation hashing is
+charged to the cumulative scan-work budget before reading.
+
+`Par3RepairSession::validate_repair` checks readiness and the configured Cauchy
+loss and handle ceilings without staging output. Dry-run consumers should call
+it instead of treating `Ready` as an unconditional execution guarantee. Sources
+can still change and later allocations or output I/O can fail.
+
 Packet admission charges parsed structures as well as wire bytes. Resolving
 shared directory/file descriptions has a separate reservation and expansion
 limits derived from remaining memory and retained-state headroom. Sessions keep

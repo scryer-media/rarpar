@@ -90,28 +90,13 @@ fn repair_inner(
     installed: &mut Vec<InstalledFile>,
     temporary_outputs: &mut Vec<PathBuf>,
 ) -> EngineResult<u64> {
-    session.options.validate()?;
+    session.validate_repair()?;
     let assessment = session
         .assessment
         .as_ref()
         .ok_or(EngineError::InvalidState("repair has no assessment"))?;
     if assessment.status == RepairStatus::Complete {
         return Ok(0);
-    }
-    if assessment.status != RepairStatus::Ready {
-        return Err(EngineError::InvalidState("repair is not ready"));
-    }
-    if matches!(
-        assessment.matrix.as_ref().map(|packet| packet.body()),
-        Some(PacketBody::CauchyMatrix(_))
-    ) && assessment.lost_blocks.len() as u64 > session.options.max_cauchy_lost_blocks
-    {
-        return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
-    }
-    if session.options.open_handles < 2 {
-        return Err(EngineError::ResourceLimit(
-            "repair requires two open handles",
-        ));
     }
     let layout = session.layout.as_ref().expect("ready layout");
     if layout.files.iter().any(|file| {
