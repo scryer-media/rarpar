@@ -1,10 +1,9 @@
 //! GF(2^16) multiply-accumulate on portable GPUs (wgpu: Vulkan/DX12/Metal).
 //!
-//! The wgpu twin of [`crate::metal_gf16`], for the platforms the native Metal
-//! backend does not cover (Windows/Linux discrete GPUs). Same product and the
-//! same 4×16-entry nibble-table formulation: each output's coefficient tables
-//! are staged into workgroup memory, and the inner loop uses on-chip table
-//! lookups.
+//! The wgpu counterpart of the native Metal backend, covering discrete GPUs on
+//! Windows and Linux. It computes the same product using 4×16-entry nibble
+//! tables: each output's coefficient tables are staged into workgroup memory,
+//! and the inner loop uses on-chip table lookups.
 //!
 //! WGSL has no 16-bit integer type, so words travel in packed pairs: every
 //! `u32` holds two LE u16 words, tables store two entries per `u32`
@@ -19,10 +18,10 @@
 //! unified-memory shortcut is assumed.
 //!
 //! Gating mirrors the Metal arm: `WEAVER_GF16_WGPU=0` disables, `=1` forces
-//! (skips every gate), otherwise a session engages when the repair is large
-//! enough to amortize dispatch + PCIe transfer. The automatic path also
-//! refuses `DeviceType::Cpu` adapters — see [`auto_engageable`] — because a
-//! Vulkan ICD list on a headless Linux box is often nothing but llvmpipe,
+//! (skips size and adapter-type policy), otherwise a session engages when the
+//! repair is large enough to amortize dispatch + PCIe transfer. The automatic
+//! path also refuses `DeviceType::Cpu` adapters because a Vulkan ICD list on a
+//! headless Linux box is often nothing but llvmpipe,
 //! and `request_adapter` returns it without complaint.
 
 use std::sync::OnceLock;
@@ -310,8 +309,8 @@ fn auto_engageable(device_type: wgpu::DeviceType) -> bool {
 /// True when a wgpu adapter is present and the tier is not disabled.
 ///
 /// Says nothing about whether the automatic gate would engage it — a CPU
-/// rasterizer is "available" and still refused. Use [`auto_engageable`] for
-/// that question.
+/// rasterizer can be available and still refused. After probing, use
+/// [`auto_refused_cpu_adapter`] to inspect that policy refusal.
 pub fn wgpu_gf16_available() -> bool {
     shared_context().is_some()
 }
@@ -355,7 +354,7 @@ fn discrete_auto_candidate_resolved(
 /// True when the AUTOMATIC gate should claim accumulation from an x86 CPU fast
 /// tier because a DISCRETE GPU is present and the repair clears the size gate.
 ///
-/// This is a stricter question than [`auto_engageable`], and deliberately so:
+/// This is stricter than the session's general automatic adapter policy:
 /// that gate serves hosts with no fast tier, where anything better than a CPU
 /// rasterizer wins by default. Here the GPU must beat a running start —
 /// AVX2 folded or XOR-JIT accumulation across every core — so the burden of
@@ -370,7 +369,7 @@ fn discrete_auto_candidate_resolved(
 /// class: an Iris Xe measured 6.4× BEHIND a 16-thread GFNI CPU kernel-isolated,
 /// and no end-to-end win has been shown on an AVX2 host.
 /// `Other`/`VirtualGpu` are refused as unmeasured against a fast tier (the
-/// under-reporting-driver argument in [`auto_engageable`] does not outweigh a
+/// possibility of an under-reporting driver does not outweigh a
 /// measured-fast CPU). `WEAVER_GF16_WGPU=1` remains the override for all of
 /// them, and `=0` still kills the arm entirely.
 ///
@@ -420,8 +419,8 @@ impl WgpuGf16Session {
     /// Engage a session when a suitable adapter exists and the whole repair is
     /// big enough to amortize dispatch + transfer (`effective_bytes` = outputs
     /// × sources × region bytes). The automatic path additionally refuses CPU
-    /// rasterizers (see [`auto_engageable`]); `WEAVER_GF16_WGPU=1` skips both
-    /// gates, `=0` refuses everything.
+    /// rasterizers; `WEAVER_GF16_WGPU=1` skips these two policy gates, while
+    /// `=0` refuses everything. Device, shape, and allocation checks still apply.
     pub fn try_new(outputs: usize, max_region_bytes: usize, effective_bytes: u64) -> Option<Self> {
         Self::try_new_gated(wgpu_gate(), outputs, max_region_bytes, effective_bytes)
     }
@@ -432,7 +431,7 @@ impl WgpuGf16Session {
     ///
     /// For benches and conformance tests that must exercise the shader on the
     /// adapter `VK_DRIVER_FILES` selected. `WEAVER_GF16_WGPU=0` still wins: the
-    /// kill switch lives in [`shared_context`], which this cannot bypass.
+    /// shared device initialization enforces that kill switch for forced calls too.
     pub fn try_new_forced(outputs: usize, max_region_bytes: usize) -> Option<Self> {
         Self::try_new_gated(WgpuGate::Force, outputs, max_region_bytes, 0)
     }

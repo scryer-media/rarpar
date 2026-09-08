@@ -5,11 +5,14 @@
 //! vector-ALU ports instead of the two shuffle ports that bound the shuffle2x
 //! tier.
 //!
-//! Build order (each phase validated before the next):
-//! 1. [`emit`] — the x86-64 machine-code emitter (byte-exact unit tests).
-//! 2. `memory` — W^X executable buffers.
-//! 3. `transpose` — the 16-plane bit-transpose prepare/finish.
-//! 4. `deps` + `codegen` — factor -> vpxor schedule.
+//! Start with [`JitWidth`](crate::xor_jit::JitWidth) for runtime selection and
+//! body construction. The lower-level building blocks are:
+//!
+//! - [`emit`](crate::xor_jit::emit): x86-64 machine-code emission.
+//! - [`memory`](crate::xor_jit::memory): W^X executable buffers.
+//! - [`transpose`](crate::xor_jit::transpose): prepare/finish bit transposition.
+//! - [`deps`](crate::xor_jit::deps) and [`codegen`](crate::xor_jit::codegen):
+//!   coefficient-to-XOR scheduling.
 
 mod avx2_emitter;
 pub mod codegen;

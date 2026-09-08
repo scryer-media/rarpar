@@ -73,7 +73,7 @@ pub enum DecodedItem {
     /// Distance is 1-based. Length includes distance-based adjustment.
     /// Distance must be u64: RAR7 (`extra_dist`) match distances exceed 4 GiB.
     Match { length: u32, distance: u64 },
-    /// Repeat previous match (sym 257). Uses current last_length + dist_cache[0].
+    /// Repeat previous match (sym 257), using `last_length` and `dist_cache[0]`.
     RepeatPrev,
     /// Cache reference (sym 258–261). Distance resolved from cache during apply.
     CacheRef { cache_idx: u8, length: u32 },

@@ -475,14 +475,12 @@ const RAR4_MT_ADMITTED_BY_DEFAULT: bool = false;
 /// length, and an eight-byte payload that is *either* the packed literal run or
 /// the match distance. Same 16 bytes as the oracle's record.
 ///
-/// Unlike the RAR5 controller's [`DecodedItem`], there is no `RepeatPrev` or
+/// Unlike the RAR5 controller's decoded items, there is no `RepeatPrev` or
 /// `CacheRef` variant: RAR5 fans decode out over several workers that cannot
 /// see the running distance cache, so it defers cache resolution to the apply
 /// phase. RAR4 has exactly one decode thread, which owns `Rar4FastState` and
 /// therefore resolves every distance before the record is emitted. Two kinds is
 /// all that reaches the window.
-///
-/// [`DecodedItem`]: super::lz::parallel::DecodedItem
 #[derive(Clone, Copy)]
 struct Rar4Item {
     /// Literals held in `payload` (1..=8), or 0 when this is a match.

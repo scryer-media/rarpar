@@ -795,7 +795,7 @@ impl SharedHashStream {
     }
 
     /// Submit an owned in-order chunk previously obtained from
-    /// [`Self::take_buffer`]. Do not mix with [`Self::update`].
+    /// [`Self::take_buffer_len`]. Do not mix with [`Self::update`].
     pub(crate) fn submit(&self, chunk: Vec<u8>) -> io::Result<()> {
         let mut state = self.lock();
         match &mut *state {

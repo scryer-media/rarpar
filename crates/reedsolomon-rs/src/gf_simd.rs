@@ -163,8 +163,8 @@ impl LinearMap16 {
 /// This is a memory-stream bound over flat, separate source slices. Modern
 /// large-core hardware prefetchers cover that access pattern, so the kernels
 /// do not issue per-cacheline software prefetches by default.
-/// On aarch64 an explicit source-stream prefetch experiment exists behind
-/// [`NEON_SRC_PREFETCH`], currently off pending measurement.
+/// The aarch64 kernels have a separate source-stream prefetch experiment,
+/// disabled by default pending measurement.
 #[cfg(target_arch = "x86_64")]
 const SRC_STREAM_GROUP: usize = 8;
 
@@ -228,13 +228,9 @@ pub struct MulTables {
 
 /// Precompute the 8 shuffle tables for a given GF(2^16) multiplication factor.
 ///
-/// The tables are assembled from the shared nibble scratch
-/// ([`NibbleScratch`]) rather than rebuilt with field arithmetic: the entries
-/// are XOR-linear in `factor`, so four scratch reads and three XOR folds give
-/// the identical bytes that [`mul_tables_from_field`] computes. This is the
-/// per-(input, output) cost on every table-shuffle kernel, so the difference
-/// between 64 `gf::mul` log/antilog lookups and 128 bytes of L1-resident XOR
-/// lands on every coefficient pair an encode touches.
+/// The entries are XOR-linear in `factor`. A shared nibble cache supplies the
+/// tables without repeating scalar field multiplication for each coefficient.
+/// Retain the returned tables when applying the same factor to several regions.
 #[inline]
 pub fn precompute_mul_tables(factor: u16) -> MulTables {
     let scratch = nibble_scratch();
@@ -367,11 +363,8 @@ pub struct AffineMulMatrices {
 /// record which output bits are set. The result is packed into the GFNI
 /// row-major format.
 ///
-/// Assembled from the shared nibble scratch ([`NibbleScratch`]) with four reads
-/// and three XOR folds per matrix, mirroring the reference encoder's
-/// `gf16_affine_load_matrix`. The from-field construction below stays as
-/// [`affine_matrices_from_field`], which builds the scratch and anchors the
-/// byte-identity tests.
+/// A shared nibble cache supplies the matrices using four reads and three XOR
+/// folds per matrix. This produces the same map as the scalar field construction.
 #[inline]
 pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
     let scratch = nibble_scratch();
@@ -807,11 +800,8 @@ pub fn altmap_uses_avx2() -> bool {
     false
 }
 
-/// Whether the folded split-layout path should use the GFNI affine kernel
-/// (`gfni`+`avx2`) rather than the non-GFNI shuffle2x kernel. Only meaningful
-/// when [`altmap_supported`] is true.
 /// Whether the folded path's non-GFNI arm runs the 512-bit shuffle2x kernel
-/// (see [`shuffle2x_avx512_enabled`], including its env pin). Kernel ladders
+/// under the current runtime configuration. Kernel ladders
 /// use this to place the folded family the way the oracle places
 /// `SHUFFLE_AVX512`: ahead of the AVX2-line XOR-JIT on wide silicon.
 pub fn folded_wide_shuffle_available() -> bool {
@@ -2225,7 +2215,7 @@ pub const INPUT_BATCH_BLOCK_BYTES: usize = 32;
 /// Source lanes a caller should block-interleave into one contiguous stream for
 /// [`mul_acc_input_batch_prepared_interleaved`].
 ///
-/// On aarch64 this is [`CLMUL_SRC_GROUP_WIDE`] — the sources the wide kernel
+/// On aarch64 this is the wide kernel's source-group width — the sources its
 /// pass folds into the destination — so a full group runs one pass that reads
 /// exactly one sequential stream plus its destination: two streams, which even
 /// a 2-way L1D holds, with the pass's fixed per-block cost divided by sixteen.

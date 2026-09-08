@@ -52,14 +52,13 @@ pub(crate) fn create_md5_batch_lanes(block_size: usize) -> usize {
 /// per-slice checksums are read by exactly one place, the FileDesc and IFSC
 /// bodies in `output.rs`, and those are only written when outputs are.
 ///
-/// So [`collect_sources`] fills only the identity, leaving `hash_full` zero
+/// Planning fills only the identity, leaving `hash_full` zero
 /// and one zeroed [`SliceChecksum`] per slice — correctly *sized*, so every
 /// quantity derived from a source (packet lengths, the memory plan, the
 /// staged packet layout) is already final at planning time — and creation
-/// fills the contents in, either from the encoder's own feed
-/// ([`FusedSourceHasher`], the fast path: the bytes are hashed as the
-/// arithmetic reads them, so there is no separate hashing pass at all) or
-/// from [`hydrate_source_hashes`] where the feed cannot serve them.
+/// fills the content hashes from the encoder's input feed where possible,
+/// avoiding a separate hashing pass. Other paths read the source to compute
+/// the hashes before writing the final packets.
 ///
 /// A source held by a [`Par2CreatePlan`](super::plan::Par2CreatePlan)
 /// therefore carries placeholder content hashes; the sources handed to

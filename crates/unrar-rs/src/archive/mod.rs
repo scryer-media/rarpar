@@ -362,7 +362,7 @@ impl RarArchive {
         self.limits = limits;
     }
 
-    /// The settings an [`Entry`](crate::Entry) extracts under.
+    /// The settings an [`Entry`] extracts under.
     pub(crate) fn effective_options(&self) -> ExtractOptions {
         ExtractOptions {
             verify: self.verify,

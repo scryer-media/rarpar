@@ -28,8 +28,8 @@
 //!     Repairability::Repairable { blocks_needed, .. } => {
 //!         println!("repairable: {blocks_needed} blocks to rebuild")
 //!     }
-//!     Repairability::Insufficient { blocks_needed, .. } => {
-//!         println!("not enough recovery data: {blocks_needed} blocks short")
+//!     Repairability::Insufficient { deficit, .. } => {
+//!         println!("not enough recovery data: {deficit} blocks short")
 //!     }
 //!     other => println!("{other:?}"),
 //! }

@@ -3,17 +3,18 @@
 [![crates.io](https://img.shields.io/crates/v/reedsolomon-rs.svg)](https://crates.io/crates/reedsolomon-rs)
 [![docs.rs](https://docs.rs/reedsolomon-rs/badge.svg)](https://docs.rs/reedsolomon-rs)
 
-GF(2¹⁶) Reed-Solomon kernels for parity and archive repair: the finite-field
-arithmetic underneath PAR2 repair and RAR5 recovery records.
+GF(2⁸), GF(2¹⁶), and additive Cantor-transform kernels for PAR2, PAR3, and RAR
+recovery. Field representations and codec geometry must match the caller's format.
 
 ```toml
 [dependencies]
 reedsolomon-rs = "0.4"
 ```
 
-This is a kernel crate, not a codec. It provides field operations and
-multiply-accumulate primitives and leaves matrix semantics to its callers. To
-verify or repair a PAR2 set, use [`par2-rs`], which is built on this.
+This crate provides arithmetic kernels and RAR-specific recovery coders; it
+does not scan or repair PAR archive sets. Use [`par2-rs`] or
+[`par3-rs`](https://crates.io/crates/par3-rs) for those workflows. Packet layout,
+matrix selection, resource budgets, and job policy belong to callers.
 
 ## Usage
 
@@ -30,7 +31,7 @@ assert_eq!(gf::mul(0x89ab, gf::inv(0x89ab)), 1);
 
 ## Contents
 
-See [Cantor transform measurements](FFT_BENCHMARKS.md) for the reproducible
+See [Cantor transform measurements](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/FFT_BENCHMARKS.md) for the reproducible
 CPU comparison harness and the limits of the exploratory native results.
 
 - `gf`: scalar GF(2¹⁶) arithmetic shared by PAR2 and RAR5.

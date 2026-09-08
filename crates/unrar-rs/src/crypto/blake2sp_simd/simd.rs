@@ -571,7 +571,7 @@ mod neon {
         }
 
         /// ror8 via a byte-wise table permute: rotating each 32-bit lane right
-        /// by one byte. The index table selects bytes [1,2,3,0] of each lane.
+        /// by one byte. The index table selects bytes `[1, 2, 3, 0]` of each lane.
         ///
         /// A shift-insert form (`vshrq_n_u32::<8>` + `vsliq_n_u32::<24>`, the
         /// same shape as ror7/ror12) was benchmarked as an alternative: it frees
