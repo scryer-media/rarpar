@@ -267,13 +267,54 @@ pub fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
 ) -> RarResult<ParsedHeaders> {
-    match walk_all_headers(
+    parse_headers_with_scan(reader, password, kdf_cache, options, HeaderScan::ForDecode)
+}
+
+pub(crate) fn parse_headers_with_scan<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+    scan: HeaderScan,
+) -> RarResult<ParsedHeaders> {
+    match walk_all_headers(reader, password, kdf_cache, options, scan, &mut None)? {
+        HeaderWalk::Parsed(parsed) => Ok(parsed),
+        HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
+    }
+}
+
+/// Continue a physical walk at a previously validated file-data boundary.
+/// Only archive keying metadata survives; file and service vectors are new.
+pub(crate) fn resume_headers_with_scan<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    scan: HeaderScan,
+    main: Option<main_archive::MainArchiveHeader>,
+    encryption: Option<encryption::EncryptionHeader>,
+) -> RarResult<ParsedHeaders> {
+    let mut result = empty_parsed_headers();
+    result.main = main;
+    result.encryption = encryption;
+    if let Some(enc) = &result.encryption {
+        result.is_encrypted = true;
+        let password = password.ok_or(RarError::EncryptedArchive)?;
+        let mut key = kdf_cache.derive_key_rar5(password, &enc.salt, enc.kdf_count)?;
+        let parsed = parse_encrypted_headers(reader, &key, &mut result, scan, &mut None);
+        key.zeroize();
+        parsed?;
+        return Ok(result);
+    }
+    match walk_headers_from(
         reader,
         password,
         kdf_cache,
-        options,
-        HeaderScan::ForDecode,
+        HeaderParseOptions {
+            allow_quick_open: false,
+        },
+        scan,
         &mut None,
+        result,
     )? {
         HeaderWalk::Parsed(parsed) => Ok(parsed),
         HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
@@ -382,8 +423,27 @@ fn walk_all_headers<R: Read + Seek>(
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
 ) -> RarResult<HeaderWalk> {
-    let mut result = empty_parsed_headers();
+    walk_headers_from(
+        reader,
+        password,
+        kdf_cache,
+        options,
+        scan,
+        short,
+        empty_parsed_headers(),
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn walk_headers_from<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
+    mut result: ParsedHeaders,
+) -> RarResult<HeaderWalk> {
     // Parse plaintext headers until we hit an encryption header or end.
     loop {
         let header_start = reader.stream_position().map_err(RarError::Io)?;
@@ -478,6 +538,9 @@ fn walk_all_headers<R: Read + Seek>(
             }
             _ => {
                 dispatch_header(&raw, data_offset, &mut result)?;
+                if scan.reached_file_limit(result.files.len()) {
+                    return Ok(HeaderWalk::Parsed(result));
+                }
                 common::skip_data_area(reader, &raw)?;
             }
         }
@@ -638,6 +701,9 @@ fn parse_encrypted_headers<R: Read + Seek>(
             }
             _ => {
                 dispatch_header(&raw, data_offset, result)?;
+                if scan.reached_file_limit(result.files.len()) {
+                    break;
+                }
                 // Skip data area (not part of the encrypted header block).
                 // Via `common::skip_data_area` so the `i64` range check applies
                 // here too: `data_area_size` is an unbounded vint, and a value

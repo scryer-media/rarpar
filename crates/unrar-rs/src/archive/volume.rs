@@ -151,6 +151,114 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Extend a physical header prefix while retaining the decoder's solid
+    /// state. Returns the number of file headers found in this volume; fewer
+    /// than requested means the physical walk reached its end.
+    ///
+    /// Call in volume order, increasing `file_headers` within each volume.
+    /// Header traversal resumes after the last accepted data range, including
+    /// encrypted headers. Existing segments are not inserted twice. The input must be unchanged
+    /// since earlier calls; replacing consumed bytes requires a new archive.
+    /// As with `open_prefix`, the reader must wait at temporary input gaps.
+    pub fn extend_volume_prefix(
+        &mut self,
+        index: usize,
+        reader: Box<dyn ReadSeek>,
+        file_headers: std::num::NonZeroUsize,
+    ) -> RarResult<usize> {
+        let previous = self
+            .prefix_cursor
+            .as_ref()
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "prefix extension requires an archive opened with open_prefix".into(),
+            })?;
+        let resume = if index == previous.volume {
+            if file_headers.get() < previous.file_headers {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR prefix cannot rewind its header count".into(),
+                });
+            }
+            if previous.finished || file_headers.get() == previous.file_headers {
+                return Ok(previous.file_headers);
+            }
+            Some(previous.clone())
+        } else if previous.finished && previous.volume.checked_add(1) == Some(index) {
+            None
+        } else {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR prefixes must finish each volume in order".into(),
+            });
+        };
+        let additional = std::num::NonZeroUsize::new(
+            file_headers.get() - resume.as_ref().map_or(0, |cursor| cursor.file_headers),
+        )
+        .expect("an unchanged prefix returned above");
+        let mut prefix = Self::open_boxed_at_prefix(
+            reader,
+            self.password.as_deref(),
+            Arc::clone(&self.kdf_cache),
+            crate::short_read::HeaderScan::ThroughFile(additional),
+            resume,
+        )?;
+        if prefix.format != self.format || prefix.is_solid != self.is_solid {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR prefix changed archive format or solid mode".into(),
+            });
+        }
+        self.ensure_volume_header_encryption_matches(index, prefix.is_encrypted)?;
+        let mut cursor = prefix
+            .prefix_cursor
+            .take()
+            .expect("prefix scan creates a cursor");
+        cursor.volume = index;
+        let count = cursor.file_headers;
+        // Validate the complete delta before mutating the live catalog. A bad
+        // later header in a multi-header extension must leave retry idempotent.
+        for (position, entry) in prefix.members.iter().enumerate() {
+            if !self.format.is_rar4_family() && entry.segments[0].volume_index != index {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR prefix declared an unexpected volume number".into(),
+                });
+            }
+            if entry.file_header.split_before
+                && (position != 0
+                    || !self.members.last().is_some_and(|previous| {
+                        previous.file_header.split_after
+                            && previous
+                                .segments
+                                .last()
+                                .is_some_and(|old| old.volume_index.checked_add(1) == Some(index))
+                            && (entry.file_header.name.is_empty()
+                                || previous.file_header.name == entry.file_header.name)
+                    }))
+            {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR prefix has an unmatched continuation".into(),
+                });
+            }
+        }
+        for mut entry in prefix.members {
+            let segment = &mut entry.segments[0];
+            if self.format.is_rar4_family() {
+                segment.volume_index = index;
+            }
+            // Prefixes are ordered. Only the last logical member can continue
+            // into the next volume; no catalog-wide reconciliation is needed.
+            if entry.file_header.split_before {
+                let previous = self
+                    .members
+                    .last_mut()
+                    .expect("continuation validated above");
+                Self::merge_continuation(previous, &entry, entry.segments[0].clone());
+            } else {
+                self.members.push(entry);
+            }
+        }
+        self.volume_set.add_volume(index);
+        self.prefix_cursor = Some(cursor);
+        Ok(count)
+    }
+
     /// Re-parse and replace the cached topology contribution for a volume.
     ///
     /// This is used after external placement correction swaps volume contents
@@ -859,6 +967,7 @@ mod tests {
             limits: Limits::default(),
             password: None,
             kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),
+            prefix_cursor: None,
         }
     }
 

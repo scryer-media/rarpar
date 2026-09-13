@@ -72,17 +72,17 @@ pub struct Rar4ParsedVolume {
 /// The guard also knows what the scan is *for* ([`HeaderScan`]). A reader that
 /// cannot state its length — one that answers `SeekFrom::End(0)` with
 /// `ErrorKind::Unsupported`, the way a sparse image of a volume still arriving
-/// does — is refused by a decode-bound scan, which needs the length for
-/// [`Self::check_member_data_fits`], and accepted by a facts walk, which
-/// decodes nothing and for which a volume with no end yet is the expected
-/// input.
+/// does — is refused by an ordinary decode-bound scan, which needs the length
+/// for [`Self::check_member_data_fits`]. Facts and explicit physical-prefix
+/// walks accept it. Prefix extraction instead requires a gated reader that
+/// enforces payload availability and reports a true truncated end as an error.
 struct ScanGuard {
     scan: HeaderScan,
     position: u64,
     headers: usize,
     /// The stream's length, when the reader can state one.
     ///
-    /// `None` only under [`HeaderScan::ForFacts`], for a reader that refuses
+    /// `None` only for facts or physical-prefix walks, for a reader that refuses
     /// end-relative seeks with `ErrorKind::Unsupported`. Such a reader is not a
     /// corrupt archive: the scan forgoes [`Self::check_member_data_fits`], the
     /// one check that needs a length, and keeps the other two properties.
@@ -96,7 +96,7 @@ impl ScanGuard {
             Ok(len) => Some(len),
             Err(error)
                 if error.kind() == std::io::ErrorKind::Unsupported
-                    && scan == HeaderScan::ForFacts =>
+                    && scan != HeaderScan::ForDecode =>
             {
                 None
             }
@@ -402,14 +402,25 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     )
 }
 
-fn parse_rar4_headers_with<R: Read + Seek>(
+pub(crate) fn parse_rar4_headers_with<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
-    let mut archive_header = None;
+    resume_rar4_headers(reader, password, kdf_cache, scan, short, None)
+}
+
+pub(crate) fn resume_rar4_headers<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
+    mut archive_header: Option<Rar4ArchiveHeader>,
+) -> RarResult<Rar4ParsedVolume> {
+    let resumed = archive_header.is_some();
     let mut files = Vec::new();
     let mut services = Vec::new();
     let mut old_services = Vec::new();
@@ -418,13 +429,35 @@ fn parse_rar4_headers_with<R: Read + Seek>(
     let mut end = None;
 
     let mut guard = ScanGuard::new(reader, scan)?;
-    loop {
-        let header_start = reader.stream_position().map_err(RarError::Io)?;
-        // The least the next header can occupy: the fixed seven-byte common
-        // block.
-        let floor = header_start + MIN_RAR4_HEADER_BYTES;
-        let raw =
-            match absorb_short_read(header::read_raw_header(reader), scan, reader, floor, short)? {
+    let resume_encrypted = archive_header
+        .as_ref()
+        .is_some_and(|header| header.is_encrypted);
+    if resume_encrypted {
+        parse_rar4_encrypted_headers(
+            reader,
+            password.ok_or(RarError::EncryptedArchive)?,
+            &mut files,
+            &mut services,
+            &mut old_services,
+            &mut end,
+            kdf_cache,
+            scan,
+            short,
+        )?;
+    }
+    if !resume_encrypted {
+        loop {
+            let header_start = reader.stream_position().map_err(RarError::Io)?;
+            // The least the next header can occupy: the fixed seven-byte common
+            // block.
+            let floor = header_start + MIN_RAR4_HEADER_BYTES;
+            let raw = match absorb_short_read(
+                header::read_raw_header(reader),
+                scan,
+                reader,
+                floor,
+                short,
+            )? {
                 Some(Some(raw)) => raw,
                 Some(None) => {
                     // The stream ended at a header boundary with no end record, so
@@ -436,149 +469,152 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                 // now says where, and what a strict parse raises.
                 None => break,
             };
-        // Checked here rather than at the bottom of the body because several
-        // arms `continue`. At this point the header itself has been consumed,
-        // so the position is strictly ahead of the previous iteration's unless
-        // a data-area skip rewound the stream.
-        guard.advanced(reader)?;
-        match raw.header_type {
-            Rar4HeaderType::Mark => {
-                // Marker header — skip, it's just the signature confirmation.
-            }
-            Rar4HeaderType::Archive => {
-                let arch = header::parse_archive_header(&raw)?;
-                debug!(
-                    "RAR4 archive: solid={} volume={} encrypted={}",
-                    arch.is_solid, arch.is_volume, arch.is_encrypted
-                );
-                if arch.is_encrypted {
-                    let pwd = password.ok_or(RarError::EncryptedArchive)?;
-                    archive_header = Some(arch);
-
-                    // Parse remaining headers — each has its own salt.
-                    parse_rar4_encrypted_headers(
-                        reader,
-                        pwd,
-                        &mut files,
-                        &mut services,
-                        &mut old_services,
-                        &mut end,
-                        kdf_cache,
-                        scan,
-                        short,
-                    )?;
-                    break;
+            // Checked here rather than at the bottom of the body because several
+            // arms `continue`. At this point the header itself has been consumed,
+            // so the position is strictly ahead of the previous iteration's unless
+            // a data-area skip rewound the stream.
+            guard.advanced(reader)?;
+            match raw.header_type {
+                Rar4HeaderType::Mark => {
+                    // Marker header — skip, it's just the signature confirmation.
                 }
-                archive_header = Some(arch);
-            }
-            Rar4HeaderType::File => {
-                let fh = header::parse_file_header(&raw)?;
-                debug!(
-                    "RAR4 file: name={:?} packed={} unpacked={:?} method={:?}",
-                    fh.name, fh.packed_size, fh.unpacked_size, fh.method
-                );
-                if let Some(short_read) = guard.member_data_short_read(
-                    &fh.name,
-                    fh.data_offset,
-                    fh.packed_size,
-                    fh.split_after,
-                )? {
-                    // The header is whole; only its data is not here yet.
-                    files.push(fh);
-                    *short = Some(short_read);
-                    break;
-                }
-                // For files with LARGE flag, the raw header's data_area_size only
-                // has the low 32 bits. Use the fully-resolved packed_size instead.
-                let skip_size = fh.packed_size;
-                files.push(fh);
-                header::skip_forward(reader, skip_size)?;
-                continue;
-            }
-            Rar4HeaderType::EndArchive => {
-                let e = header::parse_end_header(&raw);
-                debug!("RAR4 end: more_volumes={}", e.more_volumes);
-                end = Some(e);
-                break;
-            }
-            Rar4HeaderType::Recovery => {
-                let recovery = header::parse_recovery_header(&raw)?;
-                debug!(
-                    "RAR4 recovery: sectors={} blocks={} data_size={}",
-                    recovery.recovery_sectors, recovery.total_blocks, recovery.data_size
-                );
-                recovery_records.push(recovery);
-            }
-            Rar4HeaderType::NewSub => {
-                let service = header::parse_file_header(&raw)?;
-                debug!(
-                    "RAR4 service: name={:?} packed={} unpacked={:?} method={:?}",
-                    service.name, service.packed_size, service.unpacked_size, service.method
-                );
-                if let Some(short_read) = guard.member_data_short_read(
-                    &service.name,
-                    service.data_offset,
-                    service.packed_size,
-                    service.split_after,
-                )? {
-                    // The header is whole; only its data is not here yet.
-                    attach_rar4_uowner_to_previous_file(&service, &mut files);
-                    services.push(service);
-                    *short = Some(short_read);
-                    break;
-                }
-                attach_rar4_uowner_to_previous_file(&service, &mut files);
-                let skip_size = service.packed_size;
-                services.push(service);
-                header::skip_forward(reader, skip_size)?;
-                continue;
-            }
-            Rar4HeaderType::Comment => {
-                let comment = header::parse_comment_header(&raw)?;
-                debug!(
-                    "RAR4 old comment: packed={} unpacked={} method={:?}",
-                    comment.packed_size, comment.unpacked_size, comment.method
-                );
-                comments.push(comment);
-            }
-            Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Sign => {
-                if matches!(
-                    raw.header_type,
-                    Rar4HeaderType::Extra | Rar4HeaderType::Sign
-                ) && let Some(header) = archive_header.as_mut()
-                {
-                    header.has_authenticity_verification = true;
-                }
-
-                if raw.header_type == Rar4HeaderType::Sub {
-                    let old_service = header::parse_old_service_header(&raw)?;
+                Rar4HeaderType::Archive => {
+                    let arch = header::parse_archive_header(&raw)?;
                     debug!(
-                        "RAR4 old service: subtype={:#x} level={} data_size={}",
-                        old_service.subtype, old_service.level, old_service.data_size
+                        "RAR4 archive: solid={} volume={} encrypted={}",
+                        arch.is_solid, arch.is_volume, arch.is_encrypted
                     );
-                    old_services.push(old_service);
-                } else {
-                    debug!("RAR4 skipping header type {:?}", raw.header_type);
+                    if arch.is_encrypted {
+                        let pwd = password.ok_or(RarError::EncryptedArchive)?;
+                        archive_header = Some(arch);
+
+                        // Parse remaining headers — each has its own salt.
+                        parse_rar4_encrypted_headers(
+                            reader,
+                            pwd,
+                            &mut files,
+                            &mut services,
+                            &mut old_services,
+                            &mut end,
+                            kdf_cache,
+                            scan,
+                            short,
+                        )?;
+                        break;
+                    }
+                    archive_header = Some(arch);
+                }
+                Rar4HeaderType::File => {
+                    let fh = header::parse_file_header(&raw)?;
+                    debug!(
+                        "RAR4 file: name={:?} packed={} unpacked={:?} method={:?}",
+                        fh.name, fh.packed_size, fh.unpacked_size, fh.method
+                    );
+                    if let Some(short_read) = guard.member_data_short_read(
+                        &fh.name,
+                        fh.data_offset,
+                        fh.packed_size,
+                        fh.split_after,
+                    )? {
+                        // The header is whole; only its data is not here yet.
+                        files.push(fh);
+                        *short = Some(short_read);
+                        break;
+                    }
+                    // For files with LARGE flag, the raw header's data_area_size only
+                    // has the low 32 bits. Use the fully-resolved packed_size instead.
+                    let skip_size = fh.packed_size;
+                    files.push(fh);
+                    if scan.reached_file_limit(files.len()) {
+                        break;
+                    }
+                    header::skip_forward(reader, skip_size)?;
+                    continue;
+                }
+                Rar4HeaderType::EndArchive => {
+                    let e = header::parse_end_header(&raw);
+                    debug!("RAR4 end: more_volumes={}", e.more_volumes);
+                    end = Some(e);
+                    break;
+                }
+                Rar4HeaderType::Recovery => {
+                    let recovery = header::parse_recovery_header(&raw)?;
+                    debug!(
+                        "RAR4 recovery: sectors={} blocks={} data_size={}",
+                        recovery.recovery_sectors, recovery.total_blocks, recovery.data_size
+                    );
+                    recovery_records.push(recovery);
+                }
+                Rar4HeaderType::NewSub => {
+                    let service = header::parse_file_header(&raw)?;
+                    debug!(
+                        "RAR4 service: name={:?} packed={} unpacked={:?} method={:?}",
+                        service.name, service.packed_size, service.unpacked_size, service.method
+                    );
+                    if let Some(short_read) = guard.member_data_short_read(
+                        &service.name,
+                        service.data_offset,
+                        service.packed_size,
+                        service.split_after,
+                    )? {
+                        // The header is whole; only its data is not here yet.
+                        attach_rar4_uowner_to_previous_file(&service, &mut files);
+                        services.push(service);
+                        *short = Some(short_read);
+                        break;
+                    }
+                    attach_rar4_uowner_to_previous_file(&service, &mut files);
+                    let skip_size = service.packed_size;
+                    services.push(service);
+                    header::skip_forward(reader, skip_size)?;
+                    continue;
+                }
+                Rar4HeaderType::Comment => {
+                    let comment = header::parse_comment_header(&raw)?;
+                    debug!(
+                        "RAR4 old comment: packed={} unpacked={} method={:?}",
+                        comment.packed_size, comment.unpacked_size, comment.method
+                    );
+                    comments.push(comment);
+                }
+                Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Sign => {
+                    if matches!(
+                        raw.header_type,
+                        Rar4HeaderType::Extra | Rar4HeaderType::Sign
+                    ) && let Some(header) = archive_header.as_mut()
+                    {
+                        header.has_authenticity_verification = true;
+                    }
+
+                    if raw.header_type == Rar4HeaderType::Sub {
+                        let old_service = header::parse_old_service_header(&raw)?;
+                        debug!(
+                            "RAR4 old service: subtype={:#x} level={} data_size={}",
+                            old_service.subtype, old_service.level, old_service.data_size
+                        );
+                        old_services.push(old_service);
+                    } else {
+                        debug!("RAR4 skipping header type {:?}", raw.header_type);
+                    }
+                }
+                Rar4HeaderType::Unknown(t) => {
+                    warn!("RAR4 unknown header type {:#04x}", t);
+                    if raw.flags & types::common_flags::SKIP_IF_UNKNOWN == 0 {
+                        return Err(RarError::CorruptArchive {
+                            detail: format!("RAR4 unknown required header type {:#04x}", t),
+                        });
+                    }
                 }
             }
-            Rar4HeaderType::Unknown(t) => {
-                warn!("RAR4 unknown header type {:#04x}", t);
-                if raw.flags & types::common_flags::SKIP_IF_UNKNOWN == 0 {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("RAR4 unknown required header type {:#04x}", t),
-                    });
-                }
-            }
+
+            // Skip data area if present.
+            header::skip_data_area(reader, &raw)?;
         }
-
-        // Skip data area if present.
-        header::skip_data_area(reader, &raw)?;
     }
-
     let mut archive_header = archive_header.ok_or_else(|| RarError::CorruptArchive {
         detail: "RAR4 archive missing archive header".into(),
     })?;
-    if archive_header.is_volume {
+    if archive_header.is_volume && !resumed {
         if let Some(first_file) = files.first() {
             archive_header.is_first_volume = !first_file.split_before;
         } else if let Some(last_service) = services.last() {
@@ -726,6 +762,9 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 }
                 let skip_size = fh.packed_size;
                 files.push(fh);
+                if scan.reached_file_limit(files.len()) {
+                    break;
+                }
                 header::skip_forward(reader, skip_size)?;
             }
             Rar4HeaderType::NewSub => {

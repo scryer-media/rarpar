@@ -6116,9 +6116,8 @@ impl RarArchive {
             None
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
-        // Build the chained reader first. For RAR5 this can feed the decoder
-        // directly; RAR4 still falls back to a buffered compressed-input path
-        // because its PPM path depends on contiguous remaining bytes.
+        // Both RAR5 and RAR4 (including PPM) consume this stream through their
+        // bounded input buffers; neither needs the whole packed member first.
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
             .with_member_name(&fh.name)
@@ -7078,6 +7077,7 @@ pub struct ChainedSegmentReader<'a> {
     segments: Vec<DataSegment>,
     provider: &'a dyn VolumeProvider,
     member_name: String,
+    member_name_known: bool,
     max_data_segment: u64,
     current_seg: usize,
     current_reader: Option<Box<dyn ReadSeek>>,
@@ -7240,6 +7240,7 @@ impl<'a> ChainedSegmentReader<'a> {
             segments: segments.to_vec(),
             provider,
             member_name: "RAR member".to_string(),
+            member_name_known: false,
             max_data_segment: crate::limits::Limits::default().max_data_segment,
             current_seg: 0,
             current_reader: None,
@@ -7263,6 +7264,7 @@ impl<'a> ChainedSegmentReader<'a> {
 
     fn with_member_name(mut self, member_name: &str) -> Self {
         self.member_name = member_name.to_string();
+        self.member_name_known = true;
         self
     }
 
@@ -7362,17 +7364,30 @@ impl<'a> ChainedSegmentReader<'a> {
         let format = crate::signature::read_signature(&mut reader)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        if format != self.format {
+            return Err(std::io::Error::other(
+                "RAR continuation changed archive format",
+            ));
+        }
+        let scan = crate::short_read::HeaderScan::ThroughFile(std::num::NonZeroUsize::MIN);
+
         if format.is_rar4_family() {
             // RAR4: parse headers to find the continuation file entry.
-            let parsed = crate::rar4::parse_rar4_headers_with_kdf_cache(
+            let parsed = crate::rar4::parse_rar4_headers_with(
                 &mut reader,
                 self.password.as_deref(),
                 &self.kdf_cache,
+                scan,
+                &mut None,
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
-                if fh.split_before {
+                if fh.split_before
+                    && (!self.member_name_known
+                        || fh.name.is_empty()
+                        || fh.name == self.member_name)
+                {
                     if fh.packed_size > self.max_data_segment {
                         return Err(std::io::Error::other(format!(
                             "data segment size {} exceeds limit {}",
@@ -7401,15 +7416,23 @@ impl<'a> ChainedSegmentReader<'a> {
             }
         } else {
             // RAR5: parse headers.
-            let parsed = crate::header::parse_all_headers_with_kdf_cache(
+            let parsed = crate::header::parse_headers_with_scan(
                 &mut reader,
                 self.password.as_deref(),
                 &self.kdf_cache,
+                crate::header::HeaderParseOptions {
+                    allow_quick_open: false,
+                },
+                scan,
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file header with split_before.
             for pf in &parsed.files {
-                if pf.header.split_before {
+                if pf.header.split_before
+                    && (!self.member_name_known
+                        || pf.header.name.is_empty()
+                        || pf.header.name == self.member_name)
+                {
                     if pf.header.data_size > self.max_data_segment {
                         return Err(std::io::Error::other(format!(
                             "data segment size {} exceeds limit {}",
@@ -7447,9 +7470,13 @@ impl<'a> ChainedSegmentReader<'a> {
             }
         }
 
-        // No continuation found — member is complete.
-        self.split_after = false;
-        Ok(false)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "volume {vol_idx} is missing the continuation of {}",
+                self.member_name
+            ),
+        ))
     }
 }
 
@@ -8319,6 +8346,7 @@ mod tests {
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),
+            prefix_cursor: None,
         }
     }
 

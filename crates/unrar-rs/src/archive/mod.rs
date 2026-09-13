@@ -209,6 +209,24 @@ pub(super) struct VolumeData {
 pub trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
+#[derive(Clone)]
+enum PrefixMetadata {
+    Rar4(crate::rar4::types::Rar4ArchiveHeader),
+    Rar5 {
+        main: Option<crate::header::main_archive::MainArchiveHeader>,
+        encryption: Option<crate::header::encryption::EncryptionHeader>,
+    },
+}
+
+#[derive(Clone)]
+struct PrefixCursor {
+    volume: usize,
+    offset: u64,
+    file_headers: usize,
+    finished: bool,
+    metadata: PrefixMetadata,
+}
+
 /// A parsed RAR5 archive that can list members and extract files.
 ///
 /// Supports both single-volume and multi-volume archives. For multi-volume
@@ -274,6 +292,8 @@ pub struct RarArchive {
     pub(super) restore_owners: bool,
     /// Cache for expensive key derivation (shared across member extractions).
     pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
+    /// Forward-only physical header walk, independent of decoder seeks.
+    prefix_cursor: Option<PrefixCursor>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +307,40 @@ impl RarArchive {
     /// Open and parse a RAR archive from a reader.
     pub fn open(reader: impl Read + Seek + Send + 'static) -> RarResult<Self> {
         Self::open_with_shared_kdf_cache(reader, Arc::new(crate::crypto::KdfCache::new()))
+    }
+
+    /// Read a physical RAR4/RAR5 header prefix without reading past the last
+    /// requested file header. Suitable for a seekable volume still arriving.
+    ///
+    /// The reader must wait for missing bytes: temporary unavailability must
+    /// never be returned as EOF. It may return `Unsupported` for end-relative
+    /// seeks until the logical volume length is known. In that case declared
+    /// payload bounds are enforced when the gated reader consumes them; header
+    /// checks and extraction limits still apply.
+    /// Quick Open and recovery-record lookahead are disabled. The returned
+    /// catalog is incomplete and must not be used to assert archive completion.
+    /// Use entry streaming extraction with a similarly gated volume provider.
+    /// `file_headers` counts physical file headers, including continuations.
+    pub fn open_prefix(
+        reader: impl Read + Seek + Send + 'static,
+        password: Option<&str>,
+        file_headers: std::num::NonZeroUsize,
+    ) -> RarResult<Self> {
+        let mut archive = Self::open_boxed_with_scan(
+            Box::new(reader),
+            password,
+            Arc::new(crate::crypto::KdfCache::new()),
+            crate::short_read::HeaderScan::ThroughFile(file_headers),
+        )?;
+        let mut volumes = VolumeSet::new();
+        for (index, volume) in archive.volumes.iter().enumerate() {
+            if volume.is_some() {
+                volumes.add_volume(index);
+            }
+        }
+        archive.volume_set = volumes;
+        archive.more_volumes = true;
+        Ok(archive)
     }
 
     pub fn open_with_shared_kdf_cache(
@@ -989,6 +1043,7 @@ mod tests {
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
+            prefix_cursor: None,
         }
     }
 

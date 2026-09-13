@@ -17,35 +17,122 @@ impl RarArchive {
     }
 
     pub(super) fn open_boxed_inner(
-        mut reader: Box<dyn ReadSeek>,
+        reader: Box<dyn ReadSeek>,
         password: Option<&str>,
         kdf_cache: Arc<crate::crypto::KdfCache>,
     ) -> RarResult<Self> {
-        // Seek to start
-        reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+        Self::open_boxed_with_scan(
+            reader,
+            password,
+            kdf_cache,
+            crate::short_read::HeaderScan::ForDecode,
+        )
+    }
 
-        // Read and validate signature
-        let format = signature::read_signature(&mut reader)?;
+    pub(super) fn open_boxed_with_scan(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+        scan: crate::short_read::HeaderScan,
+    ) -> RarResult<Self> {
+        Self::open_boxed_at_prefix(reader, password, kdf_cache, scan, None)
+    }
+
+    pub(super) fn open_boxed_at_prefix(
+        mut reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+        scan: crate::short_read::HeaderScan,
+        resume: Option<PrefixCursor>,
+    ) -> RarResult<Self> {
+        let format = if let Some(cursor) = &resume {
+            reader
+                .seek(SeekFrom::Start(cursor.offset))
+                .map_err(RarError::Io)?;
+            match cursor.metadata {
+                PrefixMetadata::Rar4(_) => ArchiveFormat::Rar4,
+                PrefixMetadata::Rar5 { .. } => ArchiveFormat::Rar5,
+            }
+        } else {
+            reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+            signature::read_signature(&mut reader)?
+        };
         let headers_start = reader.stream_position().map_err(RarError::Io)?;
         tracing::debug!("detected format: {:?}", format);
 
         // Dispatch based on format.
         if format == ArchiveFormat::Rar14 {
+            if matches!(scan, crate::short_read::HeaderScan::ThroughFile(_)) {
+                return Err(RarError::CorruptArchive {
+                    detail: "physical header prefixes are supported only for RAR4 and RAR5".into(),
+                });
+            }
             return Self::open_rar14(reader, password, kdf_cache);
         }
         if format == ArchiveFormat::Rar4 {
-            return Self::open_rar4(reader, password, kdf_cache);
+            if scan == crate::short_read::HeaderScan::ForDecode {
+                return Self::open_rar4(reader, password, kdf_cache);
+            }
+            let previous_header = resume.as_ref().and_then(|cursor| match &cursor.metadata {
+                PrefixMetadata::Rar4(header) => Some(header.clone()),
+                _ => None,
+            });
+            let parsed = crate::rar4::resume_rar4_headers(
+                &mut reader,
+                password,
+                &kdf_cache,
+                scan,
+                &mut None,
+                previous_header,
+            )?;
+            let cursor = Self::next_prefix_cursor(
+                &mut reader,
+                scan,
+                resume.as_ref(),
+                parsed.files.len(),
+                parsed
+                    .files
+                    .last()
+                    .map(|file| (file.data_offset, file.packed_size)),
+                PrefixMetadata::Rar4(parsed.archive_header.clone()),
+                0,
+            )?;
+            let mut archive = Self::open_rar4_parsed(reader, password, kdf_cache, format, parsed)?;
+            archive.prefix_cursor = cursor;
+            return Ok(archive);
         }
 
-        // Parse all headers (RAR5)
-        let mut parsed =
-            header::parse_all_headers_with_kdf_cache(&mut reader, password, &kdf_cache)?;
+        let prefix = matches!(scan, crate::short_read::HeaderScan::ThroughFile(_));
+        let mut parsed = if let Some(PrefixCursor {
+            metadata: PrefixMetadata::Rar5 { main, encryption },
+            ..
+        }) = &resume
+        {
+            header::resume_headers_with_scan(
+                &mut reader,
+                password,
+                &kdf_cache,
+                scan,
+                main.clone(),
+                encryption.clone(),
+            )?
+        } else {
+            header::parse_headers_with_scan(
+                &mut reader,
+                password,
+                &kdf_cache,
+                header::HeaderParseOptions {
+                    allow_quick_open: !prefix,
+                },
+                scan,
+            )?
+        };
 
         let rr_already_parsed = parsed
             .services
             .iter()
             .any(|service| service.header.service_name() == "RR");
-        if !rr_already_parsed {
+        if !prefix && !rr_already_parsed {
             let main = parsed.main.as_ref();
             let locator_rr = main.and_then(|m| m.recovery_record_offset);
             let mut rr_service = if let Some(rr_offset) = locator_rr {
@@ -74,6 +161,22 @@ impl RarArchive {
             Some(declared) => crate::limits::checked_volume_number(declared)?,
             None => 0,
         };
+
+        let prefix_cursor = Self::next_prefix_cursor(
+            &mut reader,
+            scan,
+            resume.as_ref(),
+            parsed.files.len(),
+            parsed
+                .files
+                .last()
+                .map(|file| (file.header.data_offset, file.header.data_size)),
+            PrefixMetadata::Rar5 {
+                main: parsed.main.clone(),
+                encryption: parsed.encryption.clone(),
+            },
+            volume_number,
+        )?;
 
         let mut volume_set = if is_volume {
             let mut vs = VolumeSet::new();
@@ -202,7 +305,51 @@ impl RarArchive {
             limits: Limits::default(),
             password: password.map(String::from),
             kdf_cache,
+            prefix_cursor,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn next_prefix_cursor(
+        reader: &mut dyn ReadSeek,
+        scan: crate::short_read::HeaderScan,
+        previous: Option<&PrefixCursor>,
+        count: usize,
+        last_data: Option<(u64, u64)>,
+        metadata: PrefixMetadata,
+        volume: usize,
+    ) -> RarResult<Option<PrefixCursor>> {
+        let crate::short_read::HeaderScan::ThroughFile(requested) = scan else {
+            return Ok(None);
+        };
+        let finished = count < requested.get();
+        let offset = if !finished && let Some((offset, size)) = last_data {
+            offset
+                .checked_add(size)
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "RAR prefix data boundary overflow".into(),
+                })?
+        } else {
+            reader.stream_position().map_err(RarError::Io)?
+        };
+        let file_headers = previous
+            .map_or(0, |cursor| cursor.file_headers)
+            .checked_add(count)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR prefix header count overflow".into(),
+            })?;
+        if file_headers > crate::limits::MAX_HEADERS_PER_VOLUME {
+            return Err(RarError::ResourceLimit {
+                detail: "RAR prefix exceeds the per-volume file header limit".into(),
+            });
+        }
+        Ok(Some(PrefixCursor {
+            volume: previous.map_or(volume, |cursor| cursor.volume),
+            offset,
+            file_headers,
+            finished,
+            metadata,
+        }))
     }
 
     /// Open a RAR4 archive.
@@ -337,6 +484,7 @@ impl RarArchive {
             limits: Limits::default(),
             password: password.map(String::from),
             kdf_cache,
+            prefix_cursor: None,
         };
         archive.hydrate_rar4_uowner_payloads();
         Ok(archive)
