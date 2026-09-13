@@ -177,6 +177,13 @@ pub mod session;
 pub mod session_repair;
 pub mod source;
 
+// Share the embedded official reference packets with crate-local regressions.
+#[cfg(test)]
+extern crate self as par3_rs;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_reference;
+
 pub use session::Par3RepairSession;
 pub mod packet;
 pub mod repair;

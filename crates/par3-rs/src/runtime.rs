@@ -171,6 +171,41 @@ impl MemoryBudget {
         self.limit().saturating_sub(self.used())
     }
 
+    /// Reserve aligned stripes atomically; another session may consume the
+    /// observed headroom before our reservation, so shrink on contention.
+    pub(crate) fn reserve_stripes(
+        &self,
+        target: usize,
+        count: usize,
+        alignment: usize,
+    ) -> EngineResult<(usize, Reservation)> {
+        self.reserve_stripes_with_overhead(target, count, alignment, 0)
+    }
+
+    pub(crate) fn reserve_stripes_with_overhead(
+        &self,
+        target: usize,
+        count: usize,
+        alignment: usize,
+        overhead: usize,
+    ) -> EngineResult<(usize, Reservation)> {
+        if count == 0 || alignment == 0 {
+            return Err(EngineError::InvalidState("invalid repair stripe layout"));
+        }
+        let available = || self.available().saturating_sub(overhead) / count;
+        let mut stripe = target.min(available()) / alignment * alignment;
+        while stripe != 0 {
+            match self.reserve(stripe * count + overhead) {
+                Ok(reservation) => return Ok((stripe, reservation)),
+                Err(EngineError::ResourceLimit(_)) => {
+                    stripe = (stripe / 2).min(available()) / alignment * alignment;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(EngineError::ResourceLimit("minimum repair stripe"))
+    }
+
     pub(crate) fn reserve(&self, bytes: usize) -> EngineResult<Reservation> {
         let mut previous = self.used();
         loop {
@@ -329,6 +364,18 @@ impl WorkerPool {
     const STACK_BYTES: usize = 256 << 10;
     const WORKER_BYTES: usize = Self::STACK_BYTES + (64 << 10);
 
+    pub(crate) fn for_work_with_scratch(
+        options: &ExecutionOptions,
+        maximum: usize,
+        per_worker: usize,
+    ) -> EngineResult<Option<Self>> {
+        let workers = options
+            .workers
+            .min(maximum)
+            .min(options.memory.available() / Self::WORKER_BYTES.saturating_add(per_worker));
+        Self::for_work(options, workers, workers.saturating_mul(per_worker))
+    }
+
     pub(crate) fn for_work(
         options: &ExecutionOptions,
         maximum: usize,
@@ -393,5 +440,44 @@ impl ExecutionOptions {
             ));
         }
         self.cancel.check()
+    }
+}
+
+#[cfg(test)]
+mod stripe_tests {
+    use super::*;
+
+    #[test]
+    fn verification_workers_include_only_admitted_scratch() {
+        let options = ExecutionOptions {
+            workers: 8,
+            memory: MemoryBudget::new(1 << 20),
+            ..ExecutionOptions::default()
+        };
+        let pool = WorkerPool::for_work_with_scratch(&options, 8, 128 << 10)
+            .unwrap()
+            .expect("two workers and their scratch fit");
+        assert_eq!(pool.pool().current_num_threads(), 2);
+        let scratch = options.memory.reserve(2 * (128 << 10)).unwrap();
+        assert!(options.memory.used() <= options.memory.limit());
+        drop(scratch);
+        drop(pool);
+        assert_eq!(options.memory.used(), 0);
+    }
+
+    #[test]
+    fn aligned_stripes_share_and_release_the_physical_budget() {
+        let memory = MemoryBudget::new(1024);
+        let held = memory.reserve(400).unwrap();
+        let (stripe, reservation) = memory.reserve_stripes(1024, 3, 2).unwrap();
+        assert_eq!(stripe, 208);
+        assert_eq!(memory.used(), 1024);
+        assert!(memory.reserve_stripes(8, 2, 2).is_err());
+        drop(reservation);
+        drop(held);
+        assert_eq!(memory.used(), 0);
+        assert!(memory.reserve_stripes(8, 0, 2).is_err());
+        assert!(memory.reserve_stripes(8, 2, 0).is_err());
+        assert!(memory.reserve_stripes(1, 2, 2).is_err());
     }
 }

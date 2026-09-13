@@ -5,6 +5,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.0 (unreleased)
 
+- Require `par3-rs` 0.3.1 for bounded parallel source verification and adaptive
+  aligned repair stripes. The CLI remains at its existing prospective 0.5.0;
+  this change introduces no CLI options or third-party dependency changes.
 - Keep repair dry runs read-only and reject layouts requiring explicit
   self-repair. Size CLI handle budgets for retained carrier collections, count
   only admitted carrier siblings, and expand inferred RAR cleanup members to

@@ -386,16 +386,19 @@ where
             .checked_mul(F::SYMBOL_BYTES)
             .ok_or(EngineError::ResourceLimit("minimum repair stripe"))?,
     )?;
-    let stripe = session
-        .options
-        .stripe_bytes
-        .min(session.options.memory.available() / buffer_count)
-        .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX));
-    let stripe = stripe / F::SYMBOL_BYTES * F::SYMBOL_BYTES;
-    if stripe == 0 {
-        return Err(EngineError::ResourceLimit("minimum repair stripe"));
-    }
-    let _buffers = session.options.memory.reserve(buffer_count * stripe)?;
+    let (stripe, _buffers) = session.options.memory.reserve_stripes(
+        session
+            .options
+            .stripe_bytes
+            .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX)),
+        buffer_count,
+        F::SYMBOL_BYTES,
+    )?;
+    tracing::debug!(
+        stripe_bytes = stripe,
+        buffer_count,
+        "PAR3 Cauchy stripe admitted"
+    );
     let mut syndromes = vec![vec![0u8; stripe]; n];
     let mut recovered = vec![vec![0u8; stripe]; n];
     let mut input = vec![0u8; stripe];
@@ -483,13 +486,24 @@ where
     Ok(())
 }
 
+fn fft_codec_with_source_stripes(
+    geometry: crate::fft::FftGeometry,
+    options: ExecutionOptions,
+    block_size: u64,
+    recovery_count: usize,
+) -> EngineResult<(crate::fft::FftCodec, usize, crate::runtime::Reservation)> {
+    let mut codec = crate::fft::FftCodec::new(geometry, options)?;
+    let (stripe, scratch) = codec.reserve_source_stripes(block_size, recovery_count)?;
+    Ok((codec, stripe, scratch))
+}
+
 fn reconstruct_fft(
     session: &Par3RepairSession,
     layout: &BlockLayout,
     outputs: &[StagedFile],
     matrix: &crate::packet::FftMatrixPacket,
 ) -> EngineResult<()> {
-    use crate::fft::{FftCodec, FftGeometry, FftInput};
+    use crate::fft::{FftGeometry, FftInput};
     use crate::ingest::PayloadKind;
     let assessment = session.assessment.as_ref().expect("assessment");
     let coverage = block_range(matrix.range, layout.block_count)?;
@@ -501,21 +515,14 @@ fn reconstruct_fft(
         (coverage.end - coverage.start).div_ceil(cohorts),
         matrix.max_recovery_blocks_log2,
     )?;
-    let stripe = session
-        .options
-        .stripe_bytes
-        .min(64 << 10)
-        .min(layout.block_size as usize);
-    let _scratch = session.options.memory.reserve(
-        stripe
-            .checked_mul(2)
-            .ok_or(EngineError::ResourceLimit("FFT source stripes"))?,
+    let (codec, stripe, _scratch) = fft_codec_with_source_stripes(
+        geometry,
+        session.options.clone(),
+        layout.block_size,
+        assessment.recovery.len(),
     )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
-    let mut options = session.options.clone();
-    options.stripe_bytes = stripe;
-    let codec = FftCodec::new(geometry, options)?;
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
     for block in 0..layout.block_count {
@@ -796,6 +803,58 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_fft_source_stripes_leave_room_for_gf16_decode_state() {
+        let options = ExecutionOptions {
+            memory: crate::runtime::MemoryBudget::new(1 << 20),
+            stripe_bytes: 1 << 20,
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let budget = options.memory.clone();
+        let geometry = crate::fft::FftGeometry::new(129, 7).unwrap();
+        assert_eq!(geometry.field_bytes(), 2);
+        let (codec, stripe, scratch) =
+            fft_codec_with_source_stripes(geometry, options, 256 << 10, 1).unwrap();
+        assert!(stripe > 0 && stripe <= 256 << 10 && stripe.is_multiple_of(2));
+        // Another session may consume the sizing headroom before decode.
+        // Admission must fail safely, without output or leaked reservations,
+        // and the same codec must remain usable after the peer returns memory.
+        let peer = budget.reserve(budget.available()).unwrap();
+        let held = budget.used();
+        let blocked = codec.decode(
+            2,
+            &[0],
+            &[0],
+            |_, _, _| panic!("no source reads before decode admission"),
+            |_, _, _| panic!("no output before decode admission"),
+        );
+        assert!(matches!(blocked, Err(EngineError::ResourceLimit(_))));
+        assert_eq!(budget.used(), held);
+        drop(peer);
+        let mut repaired = Vec::new();
+        codec
+            .decode(
+                2,
+                &[0],
+                &[0],
+                |_, _, out| {
+                    out.fill(0);
+                    Ok(())
+                },
+                |index, offset, out| {
+                    assert_eq!((index, offset), (0, 0));
+                    repaired.extend_from_slice(out);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(repaired, [0, 0]);
+        assert!(budget.used() <= budget.limit());
+        drop((codec, scratch));
+        assert_eq!(budget.used(), 0);
+    }
 
     struct TestDirectory(PathBuf);
 
