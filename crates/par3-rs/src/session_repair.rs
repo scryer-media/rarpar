@@ -486,13 +486,24 @@ where
     Ok(())
 }
 
+fn fft_codec_with_source_stripes(
+    geometry: crate::fft::FftGeometry,
+    options: ExecutionOptions,
+    block_size: u64,
+    recovery_count: usize,
+) -> EngineResult<(crate::fft::FftCodec, usize, crate::runtime::Reservation)> {
+    let mut codec = crate::fft::FftCodec::new(geometry, options)?;
+    let (stripe, scratch) = codec.reserve_source_stripes(block_size, recovery_count)?;
+    Ok((codec, stripe, scratch))
+}
+
 fn reconstruct_fft(
     session: &Par3RepairSession,
     layout: &BlockLayout,
     outputs: &[StagedFile],
     matrix: &crate::packet::FftMatrixPacket,
 ) -> EngineResult<()> {
-    use crate::fft::{FftCodec, FftGeometry, FftInput};
+    use crate::fft::{FftGeometry, FftInput};
     use crate::ingest::PayloadKind;
     let assessment = session.assessment.as_ref().expect("assessment");
     let coverage = block_range(matrix.range, layout.block_count)?;
@@ -504,21 +515,14 @@ fn reconstruct_fft(
         (coverage.end - coverage.start).div_ceil(cohorts),
         matrix.max_recovery_blocks_log2,
     )?;
-    let target = session
-        .options
-        .stripe_bytes
-        .min(session.options.memory.available() / 4)
-        .min(layout.block_size as usize);
-    let (stripe, _scratch) =
-        session
-            .options
-            .memory
-            .reserve_stripes(target, 2, geometry.field_bytes())?;
+    let (codec, stripe, _scratch) = fft_codec_with_source_stripes(
+        geometry,
+        session.options.clone(),
+        layout.block_size,
+        assessment.recovery.len(),
+    )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
-    let mut options = session.options.clone();
-    options.stripe_bytes = stripe;
-    let codec = FftCodec::new(geometry, options)?;
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
     for block in 0..layout.block_count {
@@ -799,6 +803,43 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_fft_source_stripes_leave_room_for_gf16_decode_state() {
+        let options = ExecutionOptions {
+            memory: crate::runtime::MemoryBudget::new(1 << 20),
+            stripe_bytes: 1 << 20,
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let budget = options.memory.clone();
+        let geometry = crate::fft::FftGeometry::new(129, 7).unwrap();
+        assert_eq!(geometry.field_bytes(), 2);
+        let (codec, stripe, scratch) =
+            fft_codec_with_source_stripes(geometry, options, 256 << 10, 1).unwrap();
+        assert!(stripe > 0 && stripe <= 256 << 10 && stripe.is_multiple_of(2));
+        let mut repaired = Vec::new();
+        codec
+            .decode(
+                2,
+                &[0],
+                &[0],
+                |_, _, out| {
+                    out.fill(0);
+                    Ok(())
+                },
+                |index, offset, out| {
+                    assert_eq!((index, offset), (0, 0));
+                    repaired.extend_from_slice(out);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(repaired, [0, 0]);
+        assert!(budget.used() <= budget.limit());
+        drop((codec, scratch));
+        assert_eq!(budget.used(), 0);
+    }
 
     struct TestDirectory(PathBuf);
 

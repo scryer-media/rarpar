@@ -137,6 +137,33 @@ impl FftCodec {
         })
     }
 
+    /// Admit the repair adapter's two source buffers only after tables and
+    /// worker stacks, retaining room for a minimally sized decode operation.
+    pub(crate) fn reserve_source_stripes(
+        &mut self,
+        block_size: u64,
+        recovery_count: usize,
+    ) -> EngineResult<(usize, Reservation)> {
+        let g = self.geometry;
+        let unit = if g.is_trivial() { 1 } else { g.field_bytes() };
+        let decode_floor = if g.is_trivial() {
+            recovery_count.min(g.capacity) * size_of::<usize>() + 64 + 2
+        } else {
+            // Locator, row metadata, and the smallest field-aligned row/input
+            // buffers. These are the same layouts admitted by decode/buffers.
+            g.domain * 32 + g.domain * 32 + (g.domain * (2 / unit) + 2) * unit
+        };
+        let _decode = self.options.memory.reserve(decode_floor)?;
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX))
+            .min(self.options.memory.available() / 4);
+        let (stripe, reservation) = self.options.memory.reserve_stripes(target, 2, unit)?;
+        self.options.stripe_bytes = stripe;
+        Ok((stripe, reservation))
+    }
+
     /// Admitted execution workers. One runs on the caller's thread; larger
     /// counts use a private pool whose stacks remain charged until joined.
     #[must_use]

@@ -680,23 +680,25 @@ impl Par3RepairSession {
         cost: usize,
     ) -> EngineResult<()> {
         use rayon::prelude::*;
-        let _roster = self.options.memory.reserve(
-            layout
-                .files
-                .len()
-                .checked_mul(128)
-                .ok_or(EngineError::ResourceLimit("verification roster"))?,
-        )?;
         let mut pending = Vec::new();
         for (index, file) in layout.files.iter().enumerate() {
             if !self.evidence.contains_key(&file.path)
                 && let Some(source) = self.bindings.get(&file.path).copied()
                 && self.access.snapshot(source)?.is_some()
             {
-                pending.push((index, source));
+                // Admit only actual work, before growing the roster. Four
+                // entry widths also cover Vec's initial capacity and growth.
+                let reservation = self
+                    .options
+                    .memory
+                    .reserve(size_of::<(usize, SourceId, Reservation)>() * 4)?;
+                pending.push((index, source, reservation));
             }
         }
-        let headroom = pending.len().saturating_mul(128 << 10);
+        let headroom = pending
+            .len()
+            .min(self.options.workers)
+            .saturating_mul(128 << 10);
         let mut pool =
             match crate::runtime::WorkerPool::for_work(&self.options, pending.len(), headroom) {
                 Ok(pool) => pool,
@@ -713,7 +715,7 @@ impl Par3RepairSession {
                 .saturating_sub(self.retained_bytes())
                 .saturating_sub(cost)
                 / batch.len();
-            let verify = |&(index, source): &(usize, SourceId)| {
+            let verify = |&(index, source, _): &(usize, SourceId, Reservation)| {
                 verify_source(
                     Arc::clone(layout),
                     index,
@@ -746,7 +748,7 @@ impl Par3RepairSession {
                 .sum();
             // Merge in layout order after workers exit. Check each generation
             // at acceptance, including after an earlier source's serial retry.
-            for (&(index, source), result) in batch.iter().zip(results) {
+            for (&(index, source, _), result) in batch.iter().zip(results) {
                 let evidence = match result {
                     Err(EngineError::ResourceLimit(_)) => {
                         let mut options = self.options.clone();
@@ -1013,6 +1015,54 @@ mod tests {
     use super::*;
     use crate::cauchy::element;
     use crate::gf::{Gf8, Gf16};
+
+    #[test]
+    fn review_empty_verification_rosters_need_no_spare_memory() {
+        use crate::source::MemorySourceAccess;
+        let set = crate::test_reference::gf8_set();
+        for mode in ["unbound", "unavailable", "cached", "pending"] {
+            let options = ExecutionOptions::default();
+            let budget = options.memory.clone();
+            let layout = Arc::new(BlockLayout::new(&set, &options).unwrap());
+            assert!(!layout.files.is_empty());
+            let mut access = MemorySourceAccess::default();
+            if matches!(mode, "cached" | "pending") {
+                for (index, file) in layout.files.iter().enumerate() {
+                    access.insert(SourceId(index as u64), 1, vec![0; file.len as usize].into());
+                }
+            }
+            let access = Arc::new(access);
+            let mut session =
+                Par3RepairSession::new(set.input_set_id(), access.clone(), options.clone())
+                    .unwrap();
+            if mode != "unbound" {
+                for (index, file) in layout.files.iter().enumerate() {
+                    let id = SourceId(index as u64);
+                    session.bind_file(&file.path, id).unwrap();
+                    if mode == "cached" {
+                        let evidence =
+                            verify_source(layout.clone(), index, access.as_ref(), id, &options)
+                                .unwrap();
+                        session.evidence.insert(file.path.clone(), evidence);
+                    }
+                }
+            }
+            let before = budget.used();
+            let held = budget.reserve(budget.available()).unwrap();
+            let result = session.verify_missing_sources(&layout, 0);
+            if mode == "pending" {
+                assert!(matches!(result, Err(EngineError::ResourceLimit(_))));
+            } else {
+                result.unwrap();
+            }
+            drop(held);
+            assert_eq!(
+                budget.used(),
+                before,
+                "roster reservations must be returned"
+            );
+        }
+    }
 
     #[test]
     fn cauchy_prefix_capacity_ignores_blocks_outside_the_matrix() {

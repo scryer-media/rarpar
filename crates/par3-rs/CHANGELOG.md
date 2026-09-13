@@ -10,8 +10,12 @@
 - Reserve aligned Cauchy and FFT repair stripes atomically and shrink them
   under contention without increasing memory ceilings. Account for retained
   peer evidence before a failed parallel verification retries serially.
+- Allocate FFT tables and worker stacks before source scratch, retaining room
+  for locator state and minimal decode buffers under constrained budgets.
+- Charge verification rosters only for available sources needing verification;
+  cached-evidence and unbound assessments require no spare roster memory.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-09-08)
 
 - Pin Windows packet carriers with budgeted read-only sharing locks to avoid
   full-file generation hashes inside scan and payload loops. Charge fallback
