@@ -765,6 +765,7 @@ impl RarArchive {
             limits: Limits::default(),
             password: password.into(),
             kdf_cache,
+            prefix_cursor: None,
         };
         archive.sort_members_by_physical_order();
         archive

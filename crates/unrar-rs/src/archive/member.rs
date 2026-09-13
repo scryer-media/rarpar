@@ -7383,7 +7383,11 @@ impl<'a> ChainedSegmentReader<'a> {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
-                if fh.split_before && (!self.member_name_known || fh.name == self.member_name) {
+                if fh.split_before
+                    && (!self.member_name_known
+                        || fh.name.is_empty()
+                        || fh.name == self.member_name)
+                {
                     if fh.packed_size > self.max_data_segment {
                         return Err(std::io::Error::other(format!(
                             "data segment size {} exceeds limit {}",
@@ -7425,7 +7429,9 @@ impl<'a> ChainedSegmentReader<'a> {
             // Find the first file header with split_before.
             for pf in &parsed.files {
                 if pf.header.split_before
-                    && (!self.member_name_known || pf.header.name == self.member_name)
+                    && (!self.member_name_known
+                        || pf.header.name.is_empty()
+                        || pf.header.name == self.member_name)
                 {
                     if pf.header.data_size > self.max_data_segment {
                         return Err(std::io::Error::other(format!(
@@ -8340,6 +8346,7 @@ mod tests {
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),
+            prefix_cursor: None,
         }
     }
 

@@ -283,6 +283,44 @@ pub(crate) fn parse_headers_with_scan<R: Read + Seek>(
     }
 }
 
+/// Continue a physical walk at a previously validated file-data boundary.
+/// Only archive keying metadata survives; file and service vectors are new.
+pub(crate) fn resume_headers_with_scan<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    scan: HeaderScan,
+    main: Option<main_archive::MainArchiveHeader>,
+    encryption: Option<encryption::EncryptionHeader>,
+) -> RarResult<ParsedHeaders> {
+    let mut result = empty_parsed_headers();
+    result.main = main;
+    result.encryption = encryption;
+    if let Some(enc) = &result.encryption {
+        result.is_encrypted = true;
+        let password = password.ok_or(RarError::EncryptedArchive)?;
+        let mut key = kdf_cache.derive_key_rar5(password, &enc.salt, enc.kdf_count)?;
+        let parsed = parse_encrypted_headers(reader, &key, &mut result, scan, &mut None);
+        key.zeroize();
+        parsed?;
+        return Ok(result);
+    }
+    match walk_headers_from(
+        reader,
+        password,
+        kdf_cache,
+        HeaderParseOptions {
+            allow_quick_open: false,
+        },
+        scan,
+        &mut None,
+        result,
+    )? {
+        HeaderWalk::Parsed(parsed) => Ok(parsed),
+        HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
+    }
+}
+
 /// [`parse_all_headers_with_kdf_cache_and_options`] for a volume-facts walk:
 /// the result is reported, never decoded from, so a volume still arriving is
 /// the expected input.
@@ -385,8 +423,27 @@ fn walk_all_headers<R: Read + Seek>(
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
 ) -> RarResult<HeaderWalk> {
-    let mut result = empty_parsed_headers();
+    walk_headers_from(
+        reader,
+        password,
+        kdf_cache,
+        options,
+        scan,
+        short,
+        empty_parsed_headers(),
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn walk_headers_from<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+    scan: HeaderScan,
+    short: &mut Option<ShortRead>,
+    mut result: ParsedHeaders,
+) -> RarResult<HeaderWalk> {
     // Parse plaintext headers until we hit an encryption header or end.
     loop {
         let header_start = reader.stream_position().map_err(RarError::Io)?;

@@ -421,3 +421,151 @@ fn rar4_decodes_with_partial_encrypted_payload_and_unknown_length() {
 fn rar5_decodes_with_partial_encrypted_payload_and_unknown_length() {
     before_packed_tail("rar5");
 }
+
+struct CountedReader {
+    inner: Cursor<Vec<u8>>,
+    reads: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Read for CountedReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let start = self.inner.position();
+        let count = self.inner.read(out)?;
+        if count > 0 {
+            self.reads
+                .lock()
+                .unwrap()
+                .push((start, start + count as u64));
+        }
+        Ok(count)
+    }
+}
+
+impl Seek for CountedReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(from)
+    }
+}
+
+#[test]
+fn prefix_extension_reads_each_physical_header_only_once() {
+    for (format, name, password) in [
+        ("rar4", "rar4_multifile_lz.rar", None),
+        ("rar4", "rar4_hp_lz.rar", Some("secretpass")),
+        ("rar5", "rar5_multifile_lz.rar", None),
+        ("rar5", "rar5_hp_lz.rar", Some("secretpass")),
+        (
+            "rar5",
+            "test_read_format_rar5_multiarchive_solid.part01.rar",
+            None,
+        ),
+    ] {
+        let bytes = fixture(format, name);
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reader = || CountedReader {
+            inner: Cursor::new(bytes.clone()),
+            reads: Arc::clone(&reads),
+        };
+        let mut archive = RarArchive::open_prefix(reader(), password, NonZeroUsize::MIN).unwrap();
+        // Signature detection peeks past the seven-byte RAR4 signature. Pin
+        // extension's reads against the preceding prefix's high-water mark.
+        let mut frontier = reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|range| range.1)
+            .max()
+            .unwrap();
+        reads.lock().unwrap().clear();
+        let mut requested = NonZeroUsize::MIN;
+        loop {
+            let count = archive
+                .extend_volume_prefix(0, Box::new(reader()), requested)
+                .unwrap();
+            let previous = frontier;
+            for (start, end) in reads.lock().unwrap().drain(..) {
+                assert!(
+                    start >= previous,
+                    "{name} reread an earlier prefix at {start} < {previous}"
+                );
+                frontier = frontier.max(end);
+            }
+            if count < requested.get() {
+                break;
+            }
+            requested = requested.checked_add(1).unwrap();
+        }
+        assert!(!archive.is_empty());
+    }
+}
+
+#[test]
+fn prefix_rejects_rewind_and_unfinished_volume_advance() {
+    let bytes = fixture("rar5", "rar5_multifile_lz.rar");
+    let mut archive =
+        RarArchive::open_prefix(Cursor::new(bytes.clone()), None, NonZeroUsize::MIN).unwrap();
+    assert!(
+        archive
+            .extend_volume_prefix(1, Box::new(Cursor::new(bytes.clone())), NonZeroUsize::MIN)
+            .is_err()
+    );
+    archive
+        .extend_volume_prefix(
+            0,
+            Box::new(Cursor::new(bytes.clone())),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        archive
+            .extend_volume_prefix(0, Box::new(Cursor::new(bytes.clone())), NonZeroUsize::MIN)
+            .is_err()
+    );
+    assert_eq!(archive.len(), 2);
+    assert_eq!(
+        archive
+            .extend_volume_prefix(
+                0,
+                Box::new(Cursor::new(bytes)),
+                NonZeroUsize::new(4).unwrap()
+            )
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn missing_continuation_is_an_error_instead_of_a_completed_member() {
+    for format in ["rar4", "rar5"] {
+        let first = fixture(
+            format,
+            &format!("generated_matrix_{format}_lz_plain.part1.rar"),
+        );
+        // An unchanged, valid single-volume archive cannot continue this file.
+        let unrelated = fixture(format, &format!("{format}_multifile_lz.rar"));
+        let provider = Provider(
+            [first, unrelated]
+                .into_iter()
+                .map(|bytes| {
+                    Arc::new(Input {
+                        available: Mutex::new(bytes.len()),
+                        bytes: bytes.into(),
+                        changed: Condvar::new(),
+                    })
+                })
+                .collect(),
+        );
+        let mut archive =
+            RarArchive::open_prefix(provider.get_volume(0).unwrap(), None, NonZeroUsize::MIN)
+                .unwrap();
+        let error = archive
+            .by_index_via(0, &provider)
+            .unwrap()
+            .copy_to(&mut io::sink())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing the continuation"),
+            "{error}"
+        );
+    }
+}

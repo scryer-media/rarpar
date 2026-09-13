@@ -209,6 +209,24 @@ pub(super) struct VolumeData {
 pub trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
+#[derive(Clone)]
+enum PrefixMetadata {
+    Rar4(crate::rar4::types::Rar4ArchiveHeader),
+    Rar5 {
+        main: Option<crate::header::main_archive::MainArchiveHeader>,
+        encryption: Option<crate::header::encryption::EncryptionHeader>,
+    },
+}
+
+#[derive(Clone)]
+struct PrefixCursor {
+    volume: usize,
+    offset: u64,
+    file_headers: usize,
+    finished: bool,
+    metadata: PrefixMetadata,
+}
+
 /// A parsed RAR5 archive that can list members and extract files.
 ///
 /// Supports both single-volume and multi-volume archives. For multi-volume
@@ -274,6 +292,8 @@ pub struct RarArchive {
     pub(super) restore_owners: bool,
     /// Cache for expensive key derivation (shared across member extractions).
     pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
+    /// Forward-only physical header walk, independent of decoder seeks.
+    prefix_cursor: Option<PrefixCursor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1023,6 +1043,7 @@ mod tests {
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
+            prefix_cursor: None,
         }
     }
 
