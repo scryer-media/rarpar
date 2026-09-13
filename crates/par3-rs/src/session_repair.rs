@@ -386,16 +386,19 @@ where
             .checked_mul(F::SYMBOL_BYTES)
             .ok_or(EngineError::ResourceLimit("minimum repair stripe"))?,
     )?;
-    let stripe = session
-        .options
-        .stripe_bytes
-        .min(session.options.memory.available() / buffer_count)
-        .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX));
-    let stripe = stripe / F::SYMBOL_BYTES * F::SYMBOL_BYTES;
-    if stripe == 0 {
-        return Err(EngineError::ResourceLimit("minimum repair stripe"));
-    }
-    let _buffers = session.options.memory.reserve(buffer_count * stripe)?;
+    let (stripe, _buffers) = session.options.memory.reserve_stripes(
+        session
+            .options
+            .stripe_bytes
+            .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX)),
+        buffer_count,
+        F::SYMBOL_BYTES,
+    )?;
+    tracing::debug!(
+        stripe_bytes = stripe,
+        buffer_count,
+        "PAR3 Cauchy stripe admitted"
+    );
     let mut syndromes = vec![vec![0u8; stripe]; n];
     let mut recovered = vec![vec![0u8; stripe]; n];
     let mut input = vec![0u8; stripe];
@@ -501,16 +504,16 @@ fn reconstruct_fft(
         (coverage.end - coverage.start).div_ceil(cohorts),
         matrix.max_recovery_blocks_log2,
     )?;
-    let stripe = session
+    let target = session
         .options
         .stripe_bytes
-        .min(64 << 10)
+        .min(session.options.memory.available() / 4)
         .min(layout.block_size as usize);
-    let _scratch = session.options.memory.reserve(
-        stripe
-            .checked_mul(2)
-            .ok_or(EngineError::ResourceLimit("FFT source stripes"))?,
-    )?;
+    let (stripe, _scratch) =
+        session
+            .options
+            .memory
+            .reserve_stripes(target, 2, geometry.field_bytes())?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
     let mut options = session.options.clone();

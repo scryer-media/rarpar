@@ -171,6 +171,41 @@ impl MemoryBudget {
         self.limit().saturating_sub(self.used())
     }
 
+    /// Reserve aligned stripes atomically; another session may consume the
+    /// observed headroom before our reservation, so shrink on contention.
+    pub(crate) fn reserve_stripes(
+        &self,
+        target: usize,
+        count: usize,
+        alignment: usize,
+    ) -> EngineResult<(usize, Reservation)> {
+        self.reserve_stripes_with_overhead(target, count, alignment, 0)
+    }
+
+    pub(crate) fn reserve_stripes_with_overhead(
+        &self,
+        target: usize,
+        count: usize,
+        alignment: usize,
+        overhead: usize,
+    ) -> EngineResult<(usize, Reservation)> {
+        if count == 0 || alignment == 0 {
+            return Err(EngineError::InvalidState("invalid repair stripe layout"));
+        }
+        let available = || self.available().saturating_sub(overhead) / count;
+        let mut stripe = target.min(available()) / alignment * alignment;
+        while stripe != 0 {
+            match self.reserve(stripe * count + overhead) {
+                Ok(reservation) => return Ok((stripe, reservation)),
+                Err(EngineError::ResourceLimit(_)) => {
+                    stripe = (stripe / 2).min(available()) / alignment * alignment;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(EngineError::ResourceLimit("minimum repair stripe"))
+    }
+
     pub(crate) fn reserve(&self, bytes: usize) -> EngineResult<Reservation> {
         let mut previous = self.used();
         loop {
@@ -393,5 +428,26 @@ impl ExecutionOptions {
             ));
         }
         self.cancel.check()
+    }
+}
+
+#[cfg(test)]
+mod stripe_tests {
+    use super::*;
+
+    #[test]
+    fn aligned_stripes_share_and_release_the_physical_budget() {
+        let memory = MemoryBudget::new(1024);
+        let held = memory.reserve(400).unwrap();
+        let (stripe, reservation) = memory.reserve_stripes(1024, 3, 2).unwrap();
+        assert_eq!(stripe, 208);
+        assert_eq!(memory.used(), 1024);
+        assert!(memory.reserve_stripes(8, 2, 2).is_err());
+        drop(reservation);
+        drop(held);
+        assert_eq!(memory.used(), 0);
+        assert!(memory.reserve_stripes(8, 0, 2).is_err());
+        assert!(memory.reserve_stripes(8, 2, 0).is_err());
+        assert!(memory.reserve_stripes(1, 2, 2).is_err());
     }
 }

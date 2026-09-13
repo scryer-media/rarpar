@@ -517,6 +517,68 @@ fn sliding_placement_restores_a_missing_file_from_an_explicit_virtual_candidate(
     );
 }
 
+#[test]
+fn independent_verification_uses_bounded_workers_and_limit_changes_keep_evidence() {
+    struct ConcurrentSources {
+        inner: MemorySourceAccess,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        reads: AtomicUsize,
+    }
+    impl SourceAccess for ConcurrentSources {
+        fn snapshot(&self, id: SourceId) -> io::Result<Option<SourceSnapshot>> {
+            self.inner.snapshot(id)
+        }
+        fn next_available(&self, id: SourceId, offset: u64) -> io::Result<Option<Range<u64>>> {
+            self.inner.next_available(id, offset)
+        }
+        fn read_at(&self, id: SourceId, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while self.peak.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let result = self.inner.read_at(id, offset, out);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+    let mut inner = MemorySourceAccess::default();
+    inner.insert(SourceId(1), 1, common::a_bin().into());
+    inner.insert(SourceId(2), 1, common::b_txt().into());
+    inner.insert(SourceId(3), 1, common::c_bin().into());
+    let source = Arc::new(ConcurrentSources {
+        inner,
+        active: 0.into(),
+        peak: 0.into(),
+        reads: 0.into(),
+    });
+    let options = ExecutionOptions::default();
+    let mut session =
+        par3_rs::Par3RepairSession::new(common::SET_ID, source.clone(), options.clone()).unwrap();
+    merge_carrier(&mut session, common::set_par3(), &options);
+    for (name, id) in [("a.bin", 1), ("b.txt", 2), ("sub/c.bin", 3)] {
+        session.bind_file(name, SourceId(id)).unwrap();
+    }
+    session.set_execution_limits(2, 1 << 20).unwrap();
+    assert!(session.set_execution_limits(0, 1 << 20).is_err());
+    assert!(session.set_execution_limits(2, 0).is_err());
+    assert_eq!(
+        session.assess().unwrap().status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    assert_eq!(source.peak.load(Ordering::SeqCst), 2);
+    let reads = source.reads.load(Ordering::Relaxed);
+    session.set_execution_limits(1, 64 << 10).unwrap();
+    assert_eq!(
+        session.assess().unwrap().status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    assert_eq!(source.reads.load(Ordering::Relaxed), reads);
+}
+
 fn merge_carrier(
     session: &mut par3_rs::Par3RepairSession,
     bytes: Vec<u8>,

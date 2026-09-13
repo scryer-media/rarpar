@@ -429,15 +429,14 @@ impl FftCodec {
         if block_size == 0 {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
-        let stripe = self
-            .options
-            .stripe_bytes
-            .min(self.options.memory.available().saturating_sub(64) / 2)
-            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
-        if stripe == 0 {
-            return Err(EngineError::ResourceLimit("minimum FFT stripe"));
-        }
-        Ok((stripe, self.options.memory.reserve(64 + stripe * 2)?))
+        self.options.memory.reserve_stripes_with_overhead(
+            self.options
+                .stripe_bytes
+                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+            2,
+            1,
+            64,
+        )
     }
 
     fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
@@ -453,20 +452,16 @@ impl FftCodec {
             .checked_mul(2 / unit)
             .and_then(|n| n.checked_add(2))
             .ok_or(EngineError::ResourceLimit("FFT stripes"))?;
-        let available = self.options.memory.available().saturating_sub(overhead);
-        let stripe = self
-            .options
-            .stripe_bytes
-            .min(available / per_byte)
-            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
-        let stripe = stripe / unit * unit;
-        if stripe == 0 {
-            return Err(EngineError::ResourceLimit("minimum FFT stripe"));
-        }
-        Ok((
-            stripe,
-            self.options.memory.reserve(overhead + stripe * per_byte)?,
-        ))
+        let buffers = self.options.memory.reserve_stripes_with_overhead(
+            self.options
+                .stripe_bytes
+                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+            per_byte,
+            unit,
+            overhead,
+        )?;
+        tracing::debug!(stripe_bytes = buffers.0, rows, "PAR3 FFT stripes admitted");
+        Ok(buffers)
     }
 }
 

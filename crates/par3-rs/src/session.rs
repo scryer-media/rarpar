@@ -430,29 +430,11 @@ impl Par3RepairSession {
             .ok_or(EngineError::ResourceLimit("assessment blocks"))?;
         self.admit_retained(cost)?;
         let reservation = self.options.memory.reserve(cost)?;
+        self.verify_missing_sources(&layout, cost)?;
         let mut files = Vec::with_capacity(layout.files.len());
-        for (index, file) in layout.files.iter().enumerate() {
+        for file in &layout.files {
             self.options.cancel.check()?;
             let source = self.bindings.get(&file.path).copied();
-            if !self.evidence.contains_key(&file.path)
-                && let Some(source) = source
-                && self.access.snapshot(source)?.is_some()
-            {
-                let mut options = self.options.clone();
-                options.retained_bytes = options
-                    .retained_bytes
-                    .saturating_sub(self.retained_bytes())
-                    .saturating_sub(cost);
-                let evidence = verify_source(
-                    Arc::clone(&layout),
-                    index,
-                    self.access.as_ref(),
-                    source,
-                    &options,
-                )?;
-                self.diagnostics.source_verifications += 1;
-                self.evidence.insert(file.path.clone(), evidence);
-            }
             let evidence = self.evidence.get(&file.path);
             files.push(AssessedFile {
                 path: file.path.clone(),
@@ -692,6 +674,110 @@ impl Par3RepairSession {
         Ok(())
     }
 
+    fn verify_missing_sources(
+        &mut self,
+        layout: &Arc<BlockLayout>,
+        cost: usize,
+    ) -> EngineResult<()> {
+        use rayon::prelude::*;
+        let _roster = self.options.memory.reserve(
+            layout
+                .files
+                .len()
+                .checked_mul(128)
+                .ok_or(EngineError::ResourceLimit("verification roster"))?,
+        )?;
+        let mut pending = Vec::new();
+        for (index, file) in layout.files.iter().enumerate() {
+            if !self.evidence.contains_key(&file.path)
+                && let Some(source) = self.bindings.get(&file.path).copied()
+                && self.access.snapshot(source)?.is_some()
+            {
+                pending.push((index, source));
+            }
+        }
+        let headroom = pending.len().saturating_mul(128 << 10);
+        let mut pool =
+            match crate::runtime::WorkerPool::for_work(&self.options, pending.len(), headroom) {
+                Ok(pool) => pool,
+                Err(EngineError::ResourceLimit(_)) => None,
+                Err(error) => return Err(error),
+            };
+        let width = pool
+            .as_ref()
+            .map_or(1, |pool| pool.pool().current_num_threads());
+        for batch in pending.chunks(width) {
+            let mut options = self.options.clone();
+            options.retained_bytes = options
+                .retained_bytes
+                .saturating_sub(self.retained_bytes())
+                .saturating_sub(cost)
+                / batch.len();
+            let verify = |&(index, source): &(usize, SourceId)| {
+                verify_source(
+                    Arc::clone(layout),
+                    index,
+                    self.access.as_ref(),
+                    source,
+                    &options,
+                )
+            };
+            let results: Vec<_> = match &pool {
+                Some(pool) => pool
+                    .pool()
+                    .install(|| batch.par_iter().map(verify).collect()),
+                None => batch.iter().map(verify).collect(),
+            };
+            if results
+                .iter()
+                .any(|result| matches!(result, Err(EngineError::ResourceLimit(_))))
+            {
+                // Return worker stacks before attempting the serial fallback.
+                // A failed parallel admission must not reserve the capacity
+                // that its own retry needs.
+                drop(pool.take());
+            }
+            // Successful peers retain evidence while a failed source retries.
+            // Include those unmerged results in the retry's retained allowance.
+            let mut pending_retained: usize = results
+                .iter()
+                .filter_map(|result| result.as_ref().ok())
+                .map(FileEvidence::retained_bytes)
+                .sum();
+            // Merge in layout order after workers exit. Check each generation
+            // at acceptance, including after an earlier source's serial retry.
+            for (&(index, source), result) in batch.iter().zip(results) {
+                let evidence = match result {
+                    Err(EngineError::ResourceLimit(_)) => {
+                        let mut options = self.options.clone();
+                        options.retained_bytes = options
+                            .retained_bytes
+                            .saturating_sub(self.retained_bytes())
+                            .saturating_sub(cost)
+                            .saturating_sub(pending_retained);
+                        verify_source(
+                            Arc::clone(layout),
+                            index,
+                            self.access.as_ref(),
+                            source,
+                            &options,
+                        )?
+                    }
+                    Ok(evidence) => {
+                        pending_retained -= evidence.retained_bytes();
+                        evidence
+                    }
+                    Err(error) => return Err(error),
+                };
+                ensure_snapshot(self.access.as_ref(), evidence.source(), evidence.snapshot())?;
+                self.diagnostics.source_verifications += 1;
+                self.evidence
+                    .insert(layout.files[index].path.clone(), evidence);
+            }
+        }
+        Ok(())
+    }
+
     /// Reconstruct damaged files into an explicitly selected output directory.
     /// Sources remain read-only; verified temporary outputs are installed only
     /// after their complete protected-data hashes match.
@@ -703,6 +789,23 @@ impl Par3RepairSession {
         let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
         self.assess()?;
         crate::session_repair::repair(self, output, backup)
+    }
+
+    /// Change CPU and stripe limits between operations without discarding
+    /// authenticated metadata or generation-bound verification evidence.
+    /// The exclusive borrow prevents changes while an operation is running.
+    pub fn set_execution_limits(
+        &mut self,
+        workers: usize,
+        stripe_bytes: usize,
+    ) -> EngineResult<()> {
+        let mut options = self.options.clone();
+        options.workers = workers;
+        options.stripe_bytes = stripe_bytes;
+        options.validate()?;
+        self.options.workers = workers;
+        self.options.stripe_bytes = stripe_bytes;
+        Ok(())
     }
 
     /// Current diagnostics; reading them performs no work.
