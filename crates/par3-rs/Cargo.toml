@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

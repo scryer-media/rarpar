@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+- Add `Par3RepairSession::set_execution_limits` to adjust worker and stripe
+  limits between operations without discarding authenticated session evidence.
+- Verify independent sources with the existing private, budgeted worker pool.
+  Preserve ordered source hashing, deterministic evidence acceptance and
+  generation checks, with serial fallback under resource pressure.
+- Reserve aligned Cauchy and FFT repair stripes atomically and shrink them
+  under contention without increasing memory ceilings. Account for retained
+  peer evidence before a failed parallel verification retries serially.
+
 ## 0.3.0 (unreleased)
 
 - Pin Windows packet carriers with budgeted read-only sharing locks to avoid

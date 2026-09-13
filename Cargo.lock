@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "crc-fast",
