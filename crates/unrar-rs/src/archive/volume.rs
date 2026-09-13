@@ -151,6 +151,68 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Extend a physical header prefix while retaining the decoder's solid
+    /// state. Returns the number of file headers found in this volume; fewer
+    /// than requested means the physical walk reached its end.
+    ///
+    /// Call in volume order, increasing `file_headers` within each volume.
+    /// Existing segments are not inserted twice. The input must be unchanged
+    /// since earlier calls; replacing consumed bytes requires a new archive.
+    /// As with `open_prefix`, the reader must wait at temporary input gaps.
+    pub fn extend_volume_prefix(
+        &mut self,
+        index: usize,
+        reader: Box<dyn ReadSeek>,
+        file_headers: std::num::NonZeroUsize,
+    ) -> RarResult<usize> {
+        let prefix = Self::open_boxed_with_scan(
+            reader,
+            self.password.as_deref(),
+            Arc::clone(&self.kdf_cache),
+            crate::short_read::HeaderScan::ThroughFile(file_headers),
+        )?;
+        if prefix.format != self.format || prefix.is_solid != self.is_solid {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR prefix changed archive format or solid mode".into(),
+            });
+        }
+        self.ensure_volume_header_encryption_matches(index, prefix.is_encrypted)?;
+        let count = prefix.members.len();
+        for mut entry in prefix.members {
+            let segment = &mut entry.segments[0];
+            if self.format.is_rar4_family() {
+                segment.volume_index = index;
+            } else if segment.volume_index != index {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR prefix declared an unexpected volume number".into(),
+                });
+            }
+            if let Some(previous) = self.members.iter().find(|previous| {
+                previous
+                    .segments
+                    .iter()
+                    .any(|old| old.volume_index == index && old.data_offset == segment.data_offset)
+            }) {
+                let old = previous
+                    .segments
+                    .iter()
+                    .find(|old| old.volume_index == index && old.data_offset == segment.data_offset)
+                    .expect("located above");
+                if old.data_size != segment.data_size
+                    || previous.file_header.name != entry.file_header.name
+                {
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR prefix changed an existing member".into(),
+                    });
+                }
+                continue;
+            }
+            self.integrate_member(index, entry);
+        }
+        self.volume_set.add_volume(index);
+        Ok(count)
+    }
+
     /// Re-parse and replace the cached topology contribution for a volume.
     ///
     /// This is used after external placement correction swaps volume contents

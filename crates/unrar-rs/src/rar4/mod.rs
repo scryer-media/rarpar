@@ -72,17 +72,17 @@ pub struct Rar4ParsedVolume {
 /// The guard also knows what the scan is *for* ([`HeaderScan`]). A reader that
 /// cannot state its length — one that answers `SeekFrom::End(0)` with
 /// `ErrorKind::Unsupported`, the way a sparse image of a volume still arriving
-/// does — is refused by a decode-bound scan, which needs the length for
-/// [`Self::check_member_data_fits`], and accepted by a facts walk, which
-/// decodes nothing and for which a volume with no end yet is the expected
-/// input.
+/// does — is refused by an ordinary decode-bound scan, which needs the length
+/// for [`Self::check_member_data_fits`]. Facts and explicit physical-prefix
+/// walks accept it. Prefix extraction instead requires a gated reader that
+/// enforces payload availability and reports a true truncated end as an error.
 struct ScanGuard {
     scan: HeaderScan,
     position: u64,
     headers: usize,
     /// The stream's length, when the reader can state one.
     ///
-    /// `None` only under [`HeaderScan::ForFacts`], for a reader that refuses
+    /// `None` only for facts or physical-prefix walks, for a reader that refuses
     /// end-relative seeks with `ErrorKind::Unsupported`. Such a reader is not a
     /// corrupt archive: the scan forgoes [`Self::check_member_data_fits`], the
     /// one check that needs a length, and keeps the other two properties.
@@ -96,7 +96,7 @@ impl ScanGuard {
             Ok(len) => Some(len),
             Err(error)
                 if error.kind() == std::io::ErrorKind::Unsupported
-                    && scan == HeaderScan::ForFacts =>
+                    && scan != HeaderScan::ForDecode =>
             {
                 None
             }
@@ -402,7 +402,7 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
     )
 }
 
-fn parse_rar4_headers_with<R: Read + Seek>(
+pub(crate) fn parse_rar4_headers_with<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
@@ -492,6 +492,9 @@ fn parse_rar4_headers_with<R: Read + Seek>(
                 // has the low 32 bits. Use the fully-resolved packed_size instead.
                 let skip_size = fh.packed_size;
                 files.push(fh);
+                if scan.reached_file_limit(files.len()) {
+                    break;
+                }
                 header::skip_forward(reader, skip_size)?;
                 continue;
             }
@@ -726,6 +729,9 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 }
                 let skip_size = fh.packed_size;
                 files.push(fh);
+                if scan.reached_file_limit(files.len()) {
+                    break;
+                }
                 header::skip_forward(reader, skip_size)?;
             }
             Rar4HeaderType::NewSub => {

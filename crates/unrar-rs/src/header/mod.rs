@@ -267,14 +267,17 @@ pub fn parse_all_headers_with_kdf_cache_and_options<R: Read + Seek>(
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
 ) -> RarResult<ParsedHeaders> {
-    match walk_all_headers(
-        reader,
-        password,
-        kdf_cache,
-        options,
-        HeaderScan::ForDecode,
-        &mut None,
-    )? {
+    parse_headers_with_scan(reader, password, kdf_cache, options, HeaderScan::ForDecode)
+}
+
+pub(crate) fn parse_headers_with_scan<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+    options: HeaderParseOptions,
+    scan: HeaderScan,
+) -> RarResult<ParsedHeaders> {
+    match walk_all_headers(reader, password, kdf_cache, options, scan, &mut None)? {
         HeaderWalk::Parsed(parsed) => Ok(parsed),
         HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
     }
@@ -478,6 +481,9 @@ fn walk_all_headers<R: Read + Seek>(
             }
             _ => {
                 dispatch_header(&raw, data_offset, &mut result)?;
+                if scan.reached_file_limit(result.files.len()) {
+                    return Ok(HeaderWalk::Parsed(result));
+                }
                 common::skip_data_area(reader, &raw)?;
             }
         }
@@ -638,6 +644,9 @@ fn parse_encrypted_headers<R: Read + Seek>(
             }
             _ => {
                 dispatch_header(&raw, data_offset, result)?;
+                if scan.reached_file_limit(result.files.len()) {
+                    break;
+                }
                 // Skip data area (not part of the encrypted header block).
                 // Via `common::skip_data_area` so the `i64` range check applies
                 // here too: `data_area_size` is an unbounded vint, and a value

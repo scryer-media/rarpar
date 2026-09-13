@@ -17,9 +17,23 @@ impl RarArchive {
     }
 
     pub(super) fn open_boxed_inner(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<Self> {
+        Self::open_boxed_with_scan(
+            reader,
+            password,
+            kdf_cache,
+            crate::short_read::HeaderScan::ForDecode,
+        )
+    }
+
+    pub(super) fn open_boxed_with_scan(
         mut reader: Box<dyn ReadSeek>,
         password: Option<&str>,
         kdf_cache: Arc<crate::crypto::KdfCache>,
+        scan: crate::short_read::HeaderScan,
     ) -> RarResult<Self> {
         // Seek to start
         reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
@@ -31,21 +45,43 @@ impl RarArchive {
 
         // Dispatch based on format.
         if format == ArchiveFormat::Rar14 {
+            if matches!(scan, crate::short_read::HeaderScan::ThroughFile(_)) {
+                return Err(RarError::CorruptArchive {
+                    detail: "physical header prefixes are supported only for RAR4 and RAR5".into(),
+                });
+            }
             return Self::open_rar14(reader, password, kdf_cache);
         }
         if format == ArchiveFormat::Rar4 {
-            return Self::open_rar4(reader, password, kdf_cache);
+            if scan == crate::short_read::HeaderScan::ForDecode {
+                return Self::open_rar4(reader, password, kdf_cache);
+            }
+            let parsed = crate::rar4::parse_rar4_headers_with(
+                &mut reader,
+                password,
+                &kdf_cache,
+                scan,
+                &mut None,
+            )?;
+            return Self::open_rar4_parsed(reader, password, kdf_cache, format, parsed);
         }
 
-        // Parse all headers (RAR5)
-        let mut parsed =
-            header::parse_all_headers_with_kdf_cache(&mut reader, password, &kdf_cache)?;
+        let prefix = matches!(scan, crate::short_read::HeaderScan::ThroughFile(_));
+        let mut parsed = header::parse_headers_with_scan(
+            &mut reader,
+            password,
+            &kdf_cache,
+            header::HeaderParseOptions {
+                allow_quick_open: !prefix,
+            },
+            scan,
+        )?;
 
         let rr_already_parsed = parsed
             .services
             .iter()
             .any(|service| service.header.service_name() == "RR");
-        if !rr_already_parsed {
+        if !prefix && !rr_already_parsed {
             let main = parsed.main.as_ref();
             let locator_rr = main.and_then(|m| m.recovery_record_offset);
             let mut rr_service = if let Some(rr_offset) = locator_rr {

@@ -289,6 +289,40 @@ impl RarArchive {
         Self::open_with_shared_kdf_cache(reader, Arc::new(crate::crypto::KdfCache::new()))
     }
 
+    /// Read a physical RAR4/RAR5 header prefix without reading past the last
+    /// requested file header. Suitable for a seekable volume still arriving.
+    ///
+    /// The reader must wait for missing bytes: temporary unavailability must
+    /// never be returned as EOF. It may return `Unsupported` for end-relative
+    /// seeks until the logical volume length is known. In that case declared
+    /// payload bounds are enforced when the gated reader consumes them; header
+    /// checks and extraction limits still apply.
+    /// Quick Open and recovery-record lookahead are disabled. The returned
+    /// catalog is incomplete and must not be used to assert archive completion.
+    /// Use entry streaming extraction with a similarly gated volume provider.
+    /// `file_headers` counts physical file headers, including continuations.
+    pub fn open_prefix(
+        reader: impl Read + Seek + Send + 'static,
+        password: Option<&str>,
+        file_headers: std::num::NonZeroUsize,
+    ) -> RarResult<Self> {
+        let mut archive = Self::open_boxed_with_scan(
+            Box::new(reader),
+            password,
+            Arc::new(crate::crypto::KdfCache::new()),
+            crate::short_read::HeaderScan::ThroughFile(file_headers),
+        )?;
+        let mut volumes = VolumeSet::new();
+        for (index, volume) in archive.volumes.iter().enumerate() {
+            if volume.is_some() {
+                volumes.add_volume(index);
+            }
+        }
+        archive.volume_set = volumes;
+        archive.more_volumes = true;
+        Ok(archive)
+    }
+
     pub fn open_with_shared_kdf_cache(
         reader: impl Read + Seek + Send + 'static,
         kdf_cache: Arc<crate::crypto::KdfCache>,

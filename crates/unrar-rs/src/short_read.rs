@@ -27,6 +27,16 @@ pub(crate) enum HeaderScan {
     /// is the expected input: the walk stops where the image ends, records a
     /// [`ShortRead`], and returns what it reached.
     ForFacts,
+    /// Strict physical walk ending immediately after this many file headers.
+    /// Payload reads remain the decoder's responsibility, through a reader
+    /// that waits for missing bytes rather than reporting temporary EOF.
+    ThroughFile(std::num::NonZeroUsize),
+}
+
+impl HeaderScan {
+    pub(crate) fn reached_file_limit(self, files: usize) -> bool {
+        matches!(self, Self::ThroughFile(limit) if files >= limit.get())
+    }
 }
 
 /// Where a facts walk ran out of image, and what a decode-bound parse of the
