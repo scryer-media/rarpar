@@ -705,10 +705,15 @@ impl Par3RepairSession {
                 Err(EngineError::ResourceLimit(_)) => None,
                 Err(error) => return Err(error),
             };
-        let width = pool
-            .as_ref()
-            .map_or(1, |pool| pool.pool().current_num_threads());
-        for batch in pending.chunks(width) {
+        let mut remaining = pending.as_slice();
+        while !remaining.is_empty() {
+            // After pool fallback, accept each serial result before starting
+            // another source. Its verifier already checked the final snapshot.
+            let width = pool
+                .as_ref()
+                .map_or(1, |pool| pool.pool().current_num_threads());
+            let (batch, rest) = remaining.split_at(width.min(remaining.len()));
+            remaining = rest;
             let mut options = self.options.clone();
             options.retained_bytes = options
                 .retained_bytes
@@ -749,7 +754,7 @@ impl Par3RepairSession {
             // Merge in layout order after workers exit. Check each generation
             // at acceptance, including after an earlier source's serial retry.
             for (&(index, source, _), result) in batch.iter().zip(results) {
-                let evidence = match result {
+                let (evidence, needs_acceptance_check) = match result {
                     Err(EngineError::ResourceLimit(_)) => {
                         let mut options = self.options.clone();
                         options.retained_bytes = options
@@ -757,21 +762,26 @@ impl Par3RepairSession {
                             .saturating_sub(self.retained_bytes())
                             .saturating_sub(cost)
                             .saturating_sub(pending_retained);
-                        verify_source(
-                            Arc::clone(layout),
-                            index,
-                            self.access.as_ref(),
-                            source,
-                            &options,
-                        )?
+                        (
+                            verify_source(
+                                Arc::clone(layout),
+                                index,
+                                self.access.as_ref(),
+                                source,
+                                &options,
+                            )?,
+                            false,
+                        )
                     }
                     Ok(evidence) => {
                         pending_retained -= evidence.retained_bytes();
-                        evidence
+                        (evidence, batch.len() > 1)
                     }
                     Err(error) => return Err(error),
                 };
-                ensure_snapshot(self.access.as_ref(), evidence.source(), evidence.snapshot())?;
+                if needs_acceptance_check {
+                    ensure_snapshot(self.access.as_ref(), evidence.source(), evidence.snapshot())?;
+                }
                 self.diagnostics.source_verifications += 1;
                 self.evidence
                     .insert(layout.files[index].path.clone(), evidence);
@@ -1015,6 +1025,114 @@ mod tests {
     use super::*;
     use crate::cauchy::element;
     use crate::gf::{Gf8, Gf16};
+
+    struct AcceptanceSource {
+        inner: crate::source::MemorySourceAccess,
+        snapshots: Vec<std::sync::atomic::AtomicUsize>,
+        work: crate::runtime::ScanWorkBudget,
+        retry: bool,
+        mutate_on_retry: bool,
+        changed: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceAccess for AcceptanceSource {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let call = self.snapshots[source.0 as usize].fetch_add(1, SeqCst) + 1;
+            if self.retry && source == SourceId(0) {
+                if call == 2 {
+                    return Err(EngineError::ResourceLimit("injected worker pressure").into_io());
+                }
+                if call == 3 && self.mutate_on_retry {
+                    self.changed.store(true, SeqCst);
+                }
+            }
+            let mut snapshot = self.inner.snapshot(source)?;
+            if let Some(snapshot) = &mut snapshot {
+                // Model the full-file snapshot cost of an unpinned Windows source.
+                self.work
+                    .charge(snapshot.len as usize + 1)
+                    .map_err(EngineError::into_io)?;
+                if source == SourceId(1) && self.changed.load(SeqCst) {
+                    snapshot.generation += 1;
+                }
+            }
+            Ok(snapshot)
+        }
+
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read_at(source, offset, out)
+        }
+
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    #[test]
+    fn serial_acceptance_avoids_redundant_snapshot_work() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        for mode in ["serial", "no_pool", "retry", "mutated_peer"] {
+            let options = ExecutionOptions {
+                workers: if mode == "serial" { 1 } else { 2 },
+                memory: crate::runtime::MemoryBudget::new(if mode == "no_pool" {
+                    512 << 10
+                } else {
+                    64 << 20
+                }),
+                ..ExecutionOptions::default()
+            };
+            let set = crate::test_reference::gf8_set();
+            let layout = Arc::new(BlockLayout::new(&set, &options).unwrap());
+            assert_eq!(layout.files.len(), 3);
+            let retry = matches!(mode, "retry" | "mutated_peer");
+            let mut inner = crate::source::MemorySourceAccess::default();
+            for (index, file) in layout.files.iter().enumerate() {
+                inner.insert(SourceId(index as u64), 1, vec![0; file.len as usize].into());
+            }
+            let expected: u64 = layout
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (file.len + 1) * if retry && index == 1 { 4 } else { 3 })
+                .sum();
+            let access = Arc::new(AcceptanceSource {
+                inner,
+                snapshots: (0..3).map(|_| AtomicUsize::new(0)).collect(),
+                work: crate::runtime::ScanWorkBudget::new(expected),
+                retry,
+                mutate_on_retry: mode == "mutated_peer",
+                changed: AtomicBool::new(false),
+            });
+            let mut session =
+                Par3RepairSession::new(set.input_set_id(), access.clone(), options).unwrap();
+            for (index, file) in layout.files.iter().enumerate() {
+                session
+                    .bind_file(&file.path, SourceId(index as u64))
+                    .unwrap();
+            }
+            let result = session.verify_missing_sources(&layout, 0);
+            if mode == "mutated_peer" {
+                assert!(matches!(
+                    result,
+                    Err(EngineError::SourceChanged(SourceId(1)))
+                ));
+                assert!(!session.evidence.contains_key(&layout.files[1].path));
+            } else {
+                result.unwrap();
+                assert_eq!(session.evidence.len(), 3, "{mode}");
+                assert_eq!(access.work.used(), expected, "{mode}");
+                assert_eq!(access.snapshots[2].load(SeqCst), 3, "{mode}");
+            }
+        }
+    }
 
     #[test]
     fn review_empty_verification_rosters_need_no_spare_memory() {

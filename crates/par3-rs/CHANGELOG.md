@@ -14,6 +14,8 @@
   for locator state and minimal decode buffers under constrained budgets.
 - Charge verification rosters only for available sources needing verification;
   cached-evidence and unbound assessments require no spare roster memory.
+- Accept serial verification immediately without a redundant snapshot read;
+  retain acceptance checks for concurrent results delayed by peers or retries.
 
 ## 0.3.0 (2026-09-08)
 
