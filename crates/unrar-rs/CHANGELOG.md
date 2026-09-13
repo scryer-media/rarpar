@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.4 (unreleased)
+
+### Added
+
+- Incremental RAR4/RAR5 header prefixes let consumers begin extracting
+  members while later archive data is still arriving. Readers must wait for
+  committed input; the member catalog remains incomplete until the volume
+  tails have been parsed. Encrypted headers, split members and solid decoder
+  state are supported.
+
+### Fixed
+
+- Prefix extensions resume at the next physical header instead of rescanning
+  prior headers and repeatedly reconciling the full member catalog. Parsed
+  deltas are validated before catalog mutation, with cumulative header limits
+  and ordered continuation binding preserved.
+- Missing required split-member continuations return an error instead of
+  reporting a short member as complete. Continuation headers may omit the
+  member name.
+
 ## 0.10.3
 
 Reading a volume image that is still arriving no longer re-derives its key on
