@@ -364,6 +364,18 @@ impl WorkerPool {
     const STACK_BYTES: usize = 256 << 10;
     const WORKER_BYTES: usize = Self::STACK_BYTES + (64 << 10);
 
+    pub(crate) fn for_work_with_scratch(
+        options: &ExecutionOptions,
+        maximum: usize,
+        per_worker: usize,
+    ) -> EngineResult<Option<Self>> {
+        let workers = options
+            .workers
+            .min(maximum)
+            .min(options.memory.available() / Self::WORKER_BYTES.saturating_add(per_worker));
+        Self::for_work(options, workers, workers.saturating_mul(per_worker))
+    }
+
     pub(crate) fn for_work(
         options: &ExecutionOptions,
         maximum: usize,
@@ -434,6 +446,24 @@ impl ExecutionOptions {
 #[cfg(test)]
 mod stripe_tests {
     use super::*;
+
+    #[test]
+    fn verification_workers_include_only_admitted_scratch() {
+        let options = ExecutionOptions {
+            workers: 8,
+            memory: MemoryBudget::new(1 << 20),
+            ..ExecutionOptions::default()
+        };
+        let pool = WorkerPool::for_work_with_scratch(&options, 8, 128 << 10)
+            .unwrap()
+            .expect("two workers and their scratch fit");
+        assert_eq!(pool.pool().current_num_threads(), 2);
+        let scratch = options.memory.reserve(2 * (128 << 10)).unwrap();
+        assert!(options.memory.used() <= options.memory.limit());
+        drop(scratch);
+        drop(pool);
+        assert_eq!(options.memory.used(), 0);
+    }
 
     #[test]
     fn aligned_stripes_share_and_release_the_physical_budget() {

@@ -138,7 +138,9 @@ impl FftCodec {
     }
 
     /// Admit the repair adapter's two source buffers only after tables and
-    /// worker stacks, retaining room for a minimally sized decode operation.
+    /// worker stacks, leaving room for a minimally sized decode operation.
+    /// This is a sizing floor, not a lease on future decode allocations: shared
+    /// contention can still return ResourceLimit, and the caller may retry.
     pub(crate) fn reserve_source_stripes(
         &mut self,
         block_size: u64,

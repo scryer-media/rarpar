@@ -16,6 +16,8 @@
   cached-evidence and unbound assessments require no spare roster memory.
 - Accept serial verification immediately without a redundant snapshot read;
   retain acceptance checks for concurrent results delayed by peers or retries.
+- Probe bounded verification batches and preserve validated peer evidence before
+  returning errors. Size worker admission from combined stack and scratch costs.
 
 ## 0.3.0 (2026-09-08)
 

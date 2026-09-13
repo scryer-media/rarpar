@@ -818,6 +818,21 @@ mod tests {
         let (codec, stripe, scratch) =
             fft_codec_with_source_stripes(geometry, options, 256 << 10, 1).unwrap();
         assert!(stripe > 0 && stripe <= 256 << 10 && stripe.is_multiple_of(2));
+        // Another session may consume the sizing headroom before decode.
+        // Admission must fail safely, without output or leaked reservations,
+        // and the same codec must remain usable after the peer returns memory.
+        let peer = budget.reserve(budget.available()).unwrap();
+        let held = budget.used();
+        let blocked = codec.decode(
+            2,
+            &[0],
+            &[0],
+            |_, _, _| panic!("no source reads before decode admission"),
+            |_, _, _| panic!("no output before decode admission"),
+        );
+        assert!(matches!(blocked, Err(EngineError::ResourceLimit(_))));
+        assert_eq!(budget.used(), held);
+        drop(peer);
         let mut repaired = Vec::new();
         codec
             .decode(
