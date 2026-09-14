@@ -762,6 +762,7 @@ impl RarArchive {
             solid_poison: None,
             verify: true,
             restore_owners: false,
+            decode_mode: crate::DecodeMode::Auto,
             limits: Limits::default(),
             password: password.into(),
             kdf_cache,

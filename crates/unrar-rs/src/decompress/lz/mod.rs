@@ -140,7 +140,7 @@ pub struct LzDecoder {
     current_file_unpacked_size: u64,
     /// Recycled decoded-item buffers for one bounded RAR5 controller batch.
     /// Workers fill these slots before the caller applies them in archive order.
-    parallel_item_buffer_sets: Vec<Vec<Vec<parallel::DecodedItem>>>,
+    parallel_item_buffer_sets: Vec<Vec<parallel::DecodedItems>>,
     /// Recycled per-batch controller bookkeeping (assignments, worker results).
     ///
     /// More than one is cached: the pipelined controller keeps one batch in

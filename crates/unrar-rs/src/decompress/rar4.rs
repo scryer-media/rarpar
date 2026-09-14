@@ -789,6 +789,9 @@ pub(crate) mod mt_test_hooks {
 /// as a bool) so a harness can sweep it the way it sweeps the RAR5 worker
 /// count, and so `1` means "serial" everywhere.
 fn rar4_mt_threads() -> usize {
+    if crate::decompress::policy::serial() {
+        return 1;
+    }
     #[cfg(test)]
     if let Some(forced) = mt_test_hooks::forced_threads() {
         return forced;

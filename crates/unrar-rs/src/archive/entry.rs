@@ -167,6 +167,7 @@ impl<'a> Entry<'a> {
     ///
     /// Returns the number of bytes written.
     pub fn copy_to<W: Write + ?Sized>(self, writer: &mut W) -> RarResult<u64> {
+        let _decode = self.archive.decode_mode.enter();
         self.check_solid_poison()?;
         let options = self.options();
         let Entry {
@@ -211,6 +212,7 @@ impl<'a> Entry<'a> {
         W: Write,
         F: FnMut(usize) -> RarResult<W>,
     {
+        let _decode = self.archive.decode_mode.enter();
         self.check_solid_poison()?;
         let options = self.options();
         let Entry {
@@ -247,6 +249,7 @@ impl<'a> Entry<'a> {
     ///
     /// Returns the number of bytes written.
     pub fn unpack_to<P: AsRef<Path>>(self, path: P) -> RarResult<u64> {
+        let _decode = self.archive.decode_mode.enter();
         self.check_solid_poison()?;
         let options = self.options();
         let Entry {
@@ -280,6 +283,7 @@ impl<'a> Entry<'a> {
     /// non-solid archive nothing is decoded and the member's declared size is
     /// returned.
     pub fn skip(self) -> RarResult<u64> {
+        let _decode = self.archive.decode_mode.enter();
         if !self.archive.member_is_solid_at(self.index) {
             return Ok(self.info.unpacked_size.unwrap_or(0));
         }
@@ -300,6 +304,7 @@ impl<'a> Entry<'a> {
 
     /// Decode the whole member into the spool a [`Read`] serves from.
     fn fill_spool(&mut self) -> io::Result<()> {
+        let _decode = self.archive.decode_mode.enter();
         if self.spool.is_some() {
             return Ok(());
         }

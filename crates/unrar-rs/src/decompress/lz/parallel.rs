@@ -43,7 +43,7 @@ const MIN_PARALLEL_BLOCKS: usize = 2;
 const PIPELINE_DEPTH: usize = 2;
 
 /// Per-block decoded item buffer size.
-const DECODED_ITEMS_CAPACITY: usize = 0x4100;
+const DECODED_ITEMS_CAPACITY: usize = 256;
 
 /// Maximum worker count to consider when sizing parallel decode batches.
 const MAX_PARALLEL_THREADS: usize = 8;
@@ -67,7 +67,10 @@ const MAX_FILTER_BLOCK_SIZE: u32 = 0x400000;
 /// state (window, dist_cache, last_length) is deferred to the apply phase.
 #[derive(Clone, Copy)]
 pub enum DecodedItem {
-    /// 1–8 consecutive literal bytes, batched for cache efficiency.
+    /// Byte range in this block's packed literal storage.
+    LiteralRun { start: u32, len: u32 },
+    /// Compact fixtures for apply-only tests; production emits LiteralRun.
+    #[cfg(test)]
     Literals { bytes: [u8; 8], count: u8 },
     /// Inline match (sym >= 262): length and distance fully resolved.
     /// Distance is 1-based. Length includes distance-based adjustment.
@@ -85,6 +88,70 @@ pub enum DecodedItem {
         block_length: u32,
         channels: u8,
     },
+}
+
+/// Recycled operation tape with byte-native literal runs. A worker only
+/// accepts blocks up to LARGE_BLOCK_BITS, and each symbol consumes at least
+/// one bit, bounding both vectors even for hostile Huffman tables. Two batches
+/// retain at most the existing bounded worker/block count.
+#[derive(Default)]
+pub(super) struct DecodedItems {
+    ops: Vec<DecodedItem>,
+    literals: Vec<u8>,
+}
+
+impl DecodedItems {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ops: Vec::with_capacity(capacity),
+            literals: Vec::new(),
+        }
+    }
+    fn clear(&mut self) {
+        self.ops.clear();
+        self.literals.clear();
+    }
+    fn finish_literals(&mut self, start: &mut usize) {
+        let len = self.literals.len() - *start;
+        if len != 0 {
+            self.ops.push(DecodedItem::LiteralRun {
+                start: *start as u32,
+                len: len as u32,
+            });
+            *start = self.literals.len();
+        }
+    }
+}
+
+impl std::ops::Deref for DecodedItems {
+    type Target = Vec<DecodedItem>;
+    fn deref(&self) -> &Self::Target {
+        &self.ops
+    }
+}
+impl std::ops::DerefMut for DecodedItems {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ops
+    }
+}
+impl<'a> IntoIterator for &'a DecodedItems {
+    type Item = &'a DecodedItem;
+    type IntoIter = std::slice::Iter<'a, DecodedItem>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.ops.iter()
+    }
+}
+#[cfg(test)]
+impl From<Vec<DecodedItem>> for DecodedItems {
+    fn from(ops: Vec<DecodedItem>) -> Self {
+        Self {
+            ops,
+            literals: Vec::new(),
+        }
+    }
 }
 
 /// Metadata for one LZ block, parsed during the sequential header scan.
@@ -171,7 +238,8 @@ pub(super) fn parallel_enabled() -> bool {
     // native branch below is preserved verbatim) and to `false` on wasm, so
     // every LZ decode takes the single-thread path there and the rayon
     // `rar_decode_pool` is never built (wasip1 has no thread spawn).
-    !cfg!(target_family = "wasm")
+    !crate::decompress::policy::serial()
+        && !cfg!(target_family = "wasm")
         && parallel_enabled_from_disable_env(
             std::env::var_os("UNRAR_RS_DISABLE_PARALLEL").as_deref(),
         )
@@ -512,7 +580,7 @@ fn decode_block_symbols(
     block: &BlockInfo,
     tables: &TableSet,
     extra_dist: bool,
-    items: &mut Vec<DecodedItem>,
+    items: &mut DecodedItems,
 ) -> RarResult<()> {
     let mut counters = WorkerCounters::new();
     let mut padded = Vec::new();
@@ -556,7 +624,7 @@ fn decode_block_symbols_counted(
     tables: &TableSet,
     extra_dist: bool,
     diagnostics: bool,
-    items: &mut Vec<DecodedItem>,
+    items: &mut DecodedItems,
     counters: &mut WorkerCounters,
     padded: &mut Vec<u8>,
 ) -> RarResult<()> {
@@ -634,11 +702,10 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
     block_end_bits: usize,
     tables: &TableSet,
     extra_dist: bool,
-    items: &mut Vec<DecodedItem>,
+    items: &mut DecodedItems,
     counters: &mut WorkerCounters,
 ) -> RarResult<()> {
-    let mut lit_bytes = [0u8; 8];
-    let mut lit_count: usize = 0;
+    let mut literal_start = items.literals.len();
 
     while reader.position() < block_end_bits && reader.has_bits() {
         let (sym, quick) = reader.decode_symbol::<DIAGNOSTICS>(&tables.nc)?;
@@ -655,25 +722,11 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
             if DIAGNOSTICS {
                 counters.record_symbol(SymbolKind::Literal);
             }
-            lit_bytes[lit_count] = sym as u8;
-            lit_count += 1;
-            if lit_count == 8 {
-                items.push(DecodedItem::Literals {
-                    bytes: lit_bytes,
-                    count: 7,
-                });
-                lit_count = 0;
-            }
+            items.literals.push(sym as u8);
             continue;
         }
 
-        if lit_count > 0 {
-            items.push(DecodedItem::Literals {
-                bytes: lit_bytes,
-                count: (lit_count - 1) as u8,
-            });
-            lit_count = 0;
-        }
+        items.finish_literals(&mut literal_start);
 
         if sym >= 262 {
             if DIAGNOSTICS {
@@ -735,12 +788,7 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
         });
     }
 
-    if lit_count > 0 {
-        items.push(DecodedItem::Literals {
-            bytes: lit_bytes,
-            count: (lit_count - 1) as u8,
-        });
-    }
+    items.finish_literals(&mut literal_start);
 
     reader.validate_end(block_end_bits)
 }
@@ -763,15 +811,14 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
 ///
 /// * the guard is a single `pos < end` compare, because for a [`BlockReader`]
 ///   built over this block `has_bits()` *is* that compare;
-/// * literals accumulate into a `u64` rather than an indexed `[u8; 8]`, which
-///   drops a bounds check and a panic branch per literal and turns the batch
-///   flush from eight byte stores plus a reload into one register move.
+/// * literals append to a byte-native tape; only run boundaries emit operations,
+///   avoiding packed-item expansion and a replay dispatch per eight bytes.
 fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
     reader: &mut BlockReader<'a>,
     block_end_bits: usize,
     tables: &TableSet,
     extra_dist: bool,
-    items: &mut Vec<DecodedItem>,
+    items: &mut DecodedItems,
     counters: &mut WorkerCounters,
 ) -> RarResult<()> {
     let data: &'a [u8] = reader.data();
@@ -781,15 +828,7 @@ fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
     debug_assert_eq!(reader.end(), block_end_bits);
     let mut cur = reader.export_cursor();
 
-    // Literal byte `i` of the batch sits at bits `8 * i`, so `to_le_bytes` at
-    // the flush reproduces the `[u8; 8]` the generic loop fills index 0..n —
-    // `to_le_bytes` is defined on the value, not on the target, so byte `i` of
-    // the result is bits `8 * i` on every target. Both consumers of that array
-    // agree with the array order: `put_literal_batch` byte-indexes `bytes[..n]`
-    // for a short batch and passes the full array to `u64::from_ne_bytes` for a
-    // complete one, exactly as before.
-    let mut lit_acc: u64 = 0;
-    let mut lit_count: u32 = 0;
+    let mut literal_start = items.literals.len();
 
     while cur.pos < end {
         let (sym, quick) = tables.nc.decode_cursor(&mut cur, data, end);
@@ -806,27 +845,11 @@ fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
             if DIAGNOSTICS {
                 counters.record_symbol(SymbolKind::Literal);
             }
-            lit_acc |= u64::from(sym as u8) << (lit_count * 8);
-            lit_count += 1;
-            if lit_count == 8 {
-                items.push(DecodedItem::Literals {
-                    bytes: lit_acc.to_le_bytes(),
-                    count: 7,
-                });
-                lit_acc = 0;
-                lit_count = 0;
-            }
+            items.literals.push(sym as u8);
             continue;
         }
 
-        if lit_count > 0 {
-            items.push(DecodedItem::Literals {
-                bytes: lit_acc.to_le_bytes(),
-                count: (lit_count - 1) as u8,
-            });
-            lit_acc = 0;
-            lit_count = 0;
-        }
+        items.finish_literals(&mut literal_start);
 
         if sym >= 262 {
             if DIAGNOSTICS {
@@ -896,12 +919,7 @@ fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
         });
     }
 
-    if lit_count > 0 {
-        items.push(DecodedItem::Literals {
-            bytes: lit_acc.to_le_bytes(),
-            count: (lit_count - 1) as u8,
-        });
-    }
+    items.finish_literals(&mut literal_start);
 
     reader.import_cursor(cur);
     DecodeBits::validate_end(reader, block_end_bits)
@@ -1364,7 +1382,7 @@ fn decode_worker_assignment(
     inherited_tables: Option<TableSet>,
     initial_code_lengths: &[u8],
     options: WorkerOptions,
-    items: &mut [Vec<DecodedItem>],
+    items: &mut [DecodedItems],
 ) -> AssignmentResult {
     let mut tables = inherited_tables;
     let mut code_lengths = initial_code_lengths.to_vec();
@@ -1558,7 +1576,7 @@ fn spawn_batch_assignments<'scope>(
     inherited_tables: Option<&TableSet>,
     initial_code_lengths: &'scope [u8],
     options: WorkerOptions,
-    items: &'scope mut [Vec<DecodedItem>],
+    items: &'scope mut [DecodedItems],
     results: &'scope mut [Option<AssignmentResult>],
 ) -> u64 {
     let dispatch_started = options.diagnostics_enabled.then(Instant::now);
@@ -1643,7 +1661,7 @@ fn parallel_decode_static(
     inherited_tables: Option<&TableSet>,
     initial_code_lengths: &[u8],
     extra_dist: bool,
-    items: &mut [Vec<DecodedItem>],
+    items: &mut [DecodedItems],
     scratch: &mut BatchScratch,
 ) -> RarResult<ParallelDecodeOutcome> {
     let pool = rar_decode_pool().ok_or_else(|| RarError::CorruptArchive {
@@ -1689,12 +1707,11 @@ fn parallel_decode_static(
 // ─── Phase 4: Parallel dispatch ──────────────────────────────────────────────
 
 /// Decode a batch of (non-large) blocks in parallel using rayon.
-fn decoded_item_buffers(
-    buffers: &mut Vec<Vec<DecodedItem>>,
-    active_len: usize,
-) -> &mut [Vec<DecodedItem>] {
+fn decoded_item_buffers(buffers: &mut Vec<DecodedItems>, active_len: usize) -> &mut [DecodedItems] {
     if buffers.len() < active_len {
-        buffers.resize_with(active_len, || Vec::with_capacity(DECODED_ITEMS_CAPACITY));
+        buffers.resize_with(active_len, || {
+            DecodedItems::with_capacity(DECODED_ITEMS_CAPACITY)
+        });
     }
 
     for buffer in buffers.iter_mut() {
@@ -1814,13 +1831,13 @@ struct PendingBatch {
 }
 
 impl LzDecoder {
-    fn take_item_buffer_set(&mut self) -> Vec<Vec<DecodedItem>> {
+    fn take_item_buffer_set(&mut self) -> Vec<DecodedItems> {
         self.parallel_item_buffer_sets.pop().unwrap_or_default()
     }
 
     /// The pipelined controller holds [`PIPELINE_DEPTH`] sets at once — one
     /// being applied, one being filled — so the cache keeps both.
-    fn recycle_item_buffer_set(&mut self, set: Vec<Vec<DecodedItem>>) {
+    fn recycle_item_buffer_set(&mut self, set: Vec<DecodedItems>) {
         if self.parallel_item_buffer_sets.len() < PIPELINE_DEPTH {
             self.parallel_item_buffer_sets.push(set);
         }
@@ -2112,7 +2129,7 @@ impl LzDecoder {
     fn drain_pending_batch<W: std::io::Write + ?Sized>(
         &mut self,
         pending: &mut Option<PendingBatch>,
-        items: &[Vec<DecodedItem>],
+        items: &[DecodedItems],
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
@@ -2138,7 +2155,7 @@ impl LzDecoder {
         input: &[u8],
         blocks: &[BlockInfo],
         range: std::ops::Range<usize>,
-        items: &mut Vec<Vec<DecodedItem>>,
+        items: &mut Vec<DecodedItems>,
         scratch: &mut BatchScratch,
     ) -> RarResult<PendingBatch> {
         let worker_count = rar_decode_worker_count();
@@ -2218,8 +2235,8 @@ impl LzDecoder {
         blocks: &[BlockInfo],
         range: std::ops::Range<usize>,
         pending: PendingBatch,
-        pending_items: &[Vec<DecodedItem>],
-        next_items: &mut Vec<Vec<DecodedItem>>,
+        pending_items: &[DecodedItems],
+        next_items: &mut Vec<DecodedItems>,
         next_scratch: &mut BatchScratch,
         unpacked_size: u64,
         output_size: &mut u64,
@@ -2509,7 +2526,7 @@ impl LzDecoder {
     /// bound comes from `decode_limit`, which the serial loop uses too.
     fn apply_decoded_items_parallel<W: std::io::Write + ?Sized>(
         &mut self,
-        all_items: &[Vec<DecodedItem>],
+        all_items: &[DecodedItems],
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
@@ -2527,6 +2544,22 @@ impl LzDecoder {
                 }
 
                 match *item {
+                    DecodedItem::LiteralRun { start, len } => {
+                        let mut bytes = &block_items.literals[start as usize..][..len as usize];
+                        while !bytes.is_empty() && *output_size < decode_limit {
+                            if self.window.total_written() >= self.flush_at {
+                                self.flush_stream_output(writer)?;
+                            }
+                            let take = bytes
+                                .len()
+                                .min((self.flush_at - self.window.total_written()) as usize)
+                                .min((decode_limit - *output_size).min(usize::MAX as u64) as usize);
+                            self.window.put_bytes(&bytes[..take]);
+                            *output_size += take as u64;
+                            bytes = &bytes[take..];
+                        }
+                    }
+                    #[cfg(test)]
                     DecodedItem::Literals { bytes, count } => {
                         let n = count as usize + 1;
                         self.window.put_literal_batch(&bytes, n);
@@ -2895,6 +2928,64 @@ mod tests {
     }
 
     #[test]
+    fn literal_only_huffman_block_uses_one_byte_per_symbol() {
+        let symbols = 10_000usize;
+        // The existing uniform nine-bit NC table maps zero bits to literal 0.
+        let bits = symbols * 9;
+        let input = vec![0; bits.div_ceil(8) + LOOKAHEAD_BYTES];
+        let block = BlockInfo {
+            payload_bit_offset: 0,
+            payload_bits: bits,
+            table_present: false,
+            is_large: false,
+        };
+        let mut items = DecodedItems::new();
+        decode_block_symbols(&input, &block, &rar7_tables(), true, &mut items).unwrap();
+        assert_eq!(items.len(), 1, "one operation per literal run");
+        assert_eq!(items.literals, vec![0; symbols]);
+        assert!(items.literals.capacity() <= symbols.next_power_of_two());
+        items.clear();
+        assert!(items.literals.is_empty());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn packed_literal_run_crosses_flush_borders_without_expansion() {
+        let expected: Vec<_> = (0..300_000).map(|i| (i * 31) as u8).collect();
+        let mut items = DecodedItems::new();
+        items.literals.extend_from_slice(&expected);
+        items.finish_literals(&mut 0);
+        assert_eq!(items.len(), 1);
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.begin_file_decode(expected.len() as u64);
+        let mut output = Vec::new();
+        let mut count = 0;
+        decoder
+            .apply_decoded_items_parallel(&[items], &mut count, &mut output)
+            .unwrap();
+        decoder.flush_filters_and_write(&mut output).unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(count, expected.len() as u64);
+    }
+
+    #[test]
+    fn packed_literal_run_honors_declared_output_limit() {
+        let mut items = DecodedItems::new();
+        items.literals.extend_from_slice(b"abcdef");
+        items.finish_literals(&mut 0);
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.begin_file_decode(3);
+        let mut output = Vec::new();
+        let mut count = 0;
+        decoder
+            .apply_decoded_items_parallel(&[items], &mut count, &mut output)
+            .unwrap();
+        decoder.flush_filters_and_write(&mut output).unwrap();
+        assert_eq!(output, b"abc");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn decoded_item_stays_cache_sized() {
         // The apply loop streams these items, so the u64 distance must not grow
         // the item beyond 16 bytes.
@@ -2926,14 +3017,14 @@ mod tests {
             is_large: true,
             ..block.clone()
         };
-        let mut checked_items = Vec::new();
+        let mut checked_items = DecodedItems::new();
         decode_block_symbols(&input, &checked_block, &tables, true, &mut checked_items).unwrap();
         assert_eq!(fast_reader_selection_count(), 0);
         assert_eq!(padded_reader_selection_count(), 0);
 
         // The same unpadded slice as a normal block: the tail is staged into a
         // guarded scratch instead of falling back to the checked reader.
-        let mut padded_items = Vec::new();
+        let mut padded_items = DecodedItems::new();
         decode_block_symbols(&input, &block, &tables, true, &mut padded_items).unwrap();
         assert_eq!(padded_reader_selection_count(), 1);
         assert_eq!(fast_reader_selection_count(), 1);
@@ -2941,7 +3032,7 @@ mod tests {
 
         let mut guarded_input = input[..6].to_vec();
         guarded_input.resize(6 + LOOKAHEAD_BYTES, 0);
-        let mut items = Vec::new();
+        let mut items = DecodedItems::new();
         decode_block_symbols(&guarded_input, &block, &tables, true, &mut items).unwrap();
         assert_eq!(fast_reader_selection_count(), 2);
         assert_eq!(padded_reader_selection_count(), 1);
@@ -2970,7 +3061,7 @@ mod tests {
             payload_bit_offset: 3,
             ..block.clone()
         };
-        let mut shifted_items = Vec::new();
+        let mut shifted_items = DecodedItems::new();
         decode_block_symbols(
             &shifted_input,
             &shifted_block,
@@ -2993,7 +3084,7 @@ mod tests {
             payload_bits: 47,
             ..block
         };
-        let mut malformed_items = Vec::new();
+        let mut malformed_items = DecodedItems::new();
         let error = decode_block_symbols(
             &guarded_input,
             &short_block,
@@ -3024,15 +3115,12 @@ mod tests {
 
     /// A decoded item reduced to everything the apply phase can observe.
     ///
-    /// Only `count + 1` of a `Literals` item's eight bytes are ever consumed:
-    /// `put_literal_batch` byte-indexes `bytes[..n]` with `n <= count + 1`, and
-    /// hands the whole array to `from_ne_bytes` only for a full batch, where
-    /// all eight are live. The generic loop's `[u8; 8]` staging leaves the
-    /// bytes above that live prefix holding whatever the previous full batch
-    /// wrote; the fast loop's accumulator zeroes them. Comparing the live
-    /// prefix compares the item's entire observable content.
-    fn item_shape(item: &DecodedItem) -> ItemShape {
+    /// Compare literal bytes, independent of their offset in recycled storage.
+    fn item_shape(item: &DecodedItem, block: &DecodedItems) -> ItemShape {
         match *item {
+            DecodedItem::LiteralRun { start, len } => {
+                ItemShape::Literals(block.literals[start as usize..][..len as usize].to_vec())
+            }
             DecodedItem::Literals { bytes, count } => {
                 ItemShape::Literals(bytes[..=count as usize].to_vec())
             }
@@ -3088,7 +3176,7 @@ mod tests {
             // agree only on failing, which proves much less.
             let mut payload_bits = BLOCK_BYTES * 8 - bit_remainder;
             let mut block = test_block(payload_bit_offset, payload_bits, false);
-            let mut items = Vec::new();
+            let mut items = DecodedItems::new();
             while decode_block_symbols(&stream, &block, &tables, true, &mut items).is_err() {
                 assert!(
                     payload_bits > BLOCK_BYTES * 4,
@@ -3100,7 +3188,7 @@ mod tests {
             }
 
             reset_fast_reader_selection_count();
-            let mut fast = Vec::new();
+            let mut fast = DecodedItems::new();
             decode_block_symbols(&stream, &block, &tables, true, &mut fast).unwrap();
             assert_eq!(
                 fast_reader_selection_count(),
@@ -3124,7 +3212,7 @@ mod tests {
                 ..block.clone()
             };
             reset_fast_reader_selection_count();
-            let mut checked = Vec::new();
+            let mut checked = DecodedItems::new();
             decode_block_symbols(truncated, &checked_block, &tables, true, &mut checked).unwrap();
             assert_eq!(
                 fast_reader_selection_count(),
@@ -3133,15 +3221,19 @@ mod tests {
             );
             assert_eq!(padded_reader_selection_count(), 0);
 
-            let fast_shapes: Vec<ItemShape> = fast.iter().map(item_shape).collect();
-            let checked_shapes: Vec<ItemShape> = checked.iter().map(item_shape).collect();
+            let fast_shapes: Vec<ItemShape> =
+                fast.iter().map(|item| item_shape(item, &fast)).collect();
+            let checked_shapes: Vec<ItemShape> = checked
+                .iter()
+                .map(|item| item_shape(item, &checked))
+                .collect();
             assert_eq!(fast_shapes, checked_shapes, "block {index}");
 
             // The diagnostics instantiation of the fast loop decodes the same
             // items and counts one Huffman classification per decoded symbol.
             let mut counters = WorkerCounters::new();
             let mut padded = Vec::new();
-            let mut diagnostic = Vec::new();
+            let mut diagnostic = DecodedItems::new();
             decode_block_symbols_counted(
                 &stream,
                 &block,
@@ -3156,7 +3248,7 @@ mod tests {
             assert_eq!(
                 diagnostic
                     .iter()
-                    .map(item_shape)
+                    .map(|item| item_shape(item, &diagnostic))
                     .collect::<Vec<ItemShape>>(),
                 fast_shapes,
                 "block {index} under diagnostics"
@@ -3166,7 +3258,7 @@ mod tests {
             total_items += fast.len();
             for item in &fast {
                 match item {
-                    DecodedItem::Literals { .. } => {}
+                    DecodedItem::Literals { .. } | DecodedItem::LiteralRun { .. } => {}
                     DecodedItem::Match { .. } => {
                         matches += 1;
                         non_literals += 1;
@@ -3182,6 +3274,18 @@ mod tests {
             non_literals > matches,
             "randomized stream produced no repeats or cache references"
         );
+    }
+
+    #[test]
+    fn serial_archive_policy_disables_parallel_controller_locally() {
+        let before = parallel_enabled();
+        {
+            let _scope = crate::DecodeMode::Serial.enter();
+            assert!(!parallel_enabled());
+            let _nested = crate::DecodeMode::Auto.enter();
+            assert!(!parallel_enabled());
+        }
+        assert_eq!(parallel_enabled(), before);
     }
 
     #[test]
@@ -3217,18 +3321,21 @@ mod tests {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         let mut output_size = 0u64;
         let mut out = Vec::new();
-        let all_items = vec![vec![
-            DecodedItem::Filter {
-                filter_type: 7,
-                block_start_delta: 0,
-                block_length: 1,
-                channels: 0,
-            },
-            DecodedItem::Literals {
-                bytes: [b'X', 0, 0, 0, 0, 0, 0, 0],
-                count: 0,
-            },
-        ]];
+        let all_items = vec![
+            vec![
+                DecodedItem::Filter {
+                    filter_type: 7,
+                    block_start_delta: 0,
+                    block_length: 1,
+                    channels: 0,
+                },
+                DecodedItem::Literals {
+                    bytes: [b'X', 0, 0, 0, 0, 0, 0, 0],
+                    count: 0,
+                },
+            ]
+            .into(),
+        ];
 
         decoder
             .apply_decoded_items_parallel(&all_items, &mut output_size, &mut out)
@@ -3276,7 +3383,7 @@ mod tests {
         let mut output_size = 0u64;
 
         // 64 "blocks" of 512 literal items each: 8 bytes per item.
-        let blocks: Vec<Vec<DecodedItem>> = (0..64)
+        let blocks: Vec<DecodedItems> = (0..64)
             .map(|_| {
                 vec![
                     DecodedItem::Literals {
@@ -3285,6 +3392,7 @@ mod tests {
                     };
                     512
                 ]
+                .into()
             })
             .collect();
         let produced = 64 * 512 * 8;
@@ -3314,12 +3422,15 @@ mod tests {
         decoder.current_file_base_total = 1_000;
         let mut output_size = 7u64;
         let mut out = Vec::new();
-        let all_items = vec![vec![DecodedItem::Filter {
-            filter_type: 1,
-            block_start_delta: 5,
-            block_length: 4,
-            channels: 0,
-        }]];
+        let all_items = vec![
+            vec![DecodedItem::Filter {
+                filter_type: 1,
+                block_start_delta: 5,
+                block_length: 4,
+                channels: 0,
+            }]
+            .into(),
+        ];
 
         decoder
             .apply_decoded_items_parallel(&all_items, &mut output_size, &mut out)
@@ -3345,7 +3456,8 @@ mod tests {
                 &[vec![DecodedItem::Match {
                     length: 3,
                     distance: 1,
-                }]],
+                }]
+                .into()],
                 &mut output_size,
                 &mut out,
             )
@@ -3458,7 +3570,7 @@ mod tests {
             test_block((input.len() + 1) * 8, 1, true),
             test_block(0, 48, false),
         ];
-        let mut items = vec![Vec::new(), Vec::new()];
+        let mut items = vec![DecodedItems::new(), DecodedItems::new()];
         let result = decode_worker_assignment(
             &input,
             &blocks,
@@ -3536,8 +3648,8 @@ mod tests {
         }
         let blocks = vec![test_block(0, 0, true); 4];
         let mut items = (0..4)
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<DecodedItem>>>();
+            .map(|_| DecodedItems::new())
+            .collect::<Vec<DecodedItems>>();
         let mut scratch = BatchScratch::default();
         // A uniform span is planned as at most one contiguous run per worker,
         // so the assignment count follows the pool width, not the block count:

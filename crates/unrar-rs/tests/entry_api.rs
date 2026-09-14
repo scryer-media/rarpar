@@ -905,3 +905,42 @@ fn with_progress_reports_on_every_consuming_call() {
         "a failed copy completes with the failure"
     );
 }
+
+/// A serial chase and an automatic extraction can coexist without changing
+/// process environment, bytes, checksums, or solid dictionary continuation.
+#[test]
+fn archive_decode_modes_match_across_families_and_providers() {
+    for family in FAMILIES {
+        let expected = reference_bytes(family);
+        for mode in [unrar_rs::DecodeMode::Auto, unrar_rs::DecodeMode::Serial] {
+            let provider =
+                StaticVolumeProvider::new(volume_paths(family).into_iter().enumerate().collect());
+            let mut archive = open(family);
+            assert_eq!(archive.decode_mode(), unrar_rs::DecodeMode::Auto);
+            archive.set_decode_mode(mode);
+            for (index, _, directory) in member_list(&archive) {
+                if directory {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                archive
+                    .by_index_via(index, &provider)
+                    .unwrap()
+                    .copy_to(&mut bytes)
+                    .unwrap();
+                assert_eq!(
+                    bytes,
+                    expected[index],
+                    "{} {mode:?} member {index}",
+                    label(family)
+                );
+                // Switching between operations must preserve a solid dictionary.
+                archive.set_decode_mode(if index % 2 == 0 {
+                    unrar_rs::DecodeMode::Serial
+                } else {
+                    mode
+                });
+            }
+        }
+    }
+}

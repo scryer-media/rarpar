@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Archive-local `DecodeMode::Serial` selects inline RAR4/RAR5 decoding for
+  input-limited readers, without changing process environment, checksum policy
+  or solid continuation. The default remains `Auto`.
+
+### Performance
+
+- Group all eight BLAKE2sp leaves on one x86 hash worker, with portable,
+  SSE2, SSSE3, AVX2 and AVX-512F+VL runtime dispatch. Other architecture
+  backends remain unchanged.
+- Store RAR5 parallel-decoder literals as bytes plus one descriptor per run,
+  and replay runs with bounded bulk window writes instead of expanding each
+  eight literal bytes into a sixteen-byte operation.
+- Serial chases keep large-member checksums on one hash worker rather than
+  fanning out to additional CRC/BLAKE2sp lanes. Completed archives retain
+  parallel CRC acquisition, now with bounded incremental result folding.
+  Large writer updates are split into bounded chunks. Worker failures are
+  reported as errors and remaining workers are joined during cleanup.
+
 ## 0.10.4 (unreleased)
 
 ### Added

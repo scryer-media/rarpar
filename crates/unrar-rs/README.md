@@ -56,6 +56,13 @@ match is an error rather than a silently wrong result. `set_verify` turns it
 off; `set_password` and `set_restore_owners` are the other two settings an
 entry extracts under.
 
+For an archive whose input is still arriving, use
+`archive.set_decode_mode(unrar_rs::DecodeMode::Serial)` before consuming its
+entries. This decodes on the calling thread and avoids worker/replay overhead
+while waiting for input. Completed archives retain the default `DecodeMode::Auto`.
+The setting is local to the archive, can change between members without resetting
+a solid dictionary, and leaves checksum verification and hash workers enabled.
+
 To land a member on disk with the metadata the archive carries — times,
 permissions, Windows attributes, and symlinks and hardlinks as such — use
 `unpack_to`, or `unpack_in` to let the member's own sanitized name choose the

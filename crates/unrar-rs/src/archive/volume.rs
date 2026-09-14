@@ -964,6 +964,7 @@ mod tests {
             solid_poison: None,
             verify: true,
             restore_owners: false,
+            decode_mode: crate::DecodeMode::Auto,
             limits: Limits::default(),
             password: None,
             kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),

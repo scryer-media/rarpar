@@ -290,6 +290,7 @@ pub struct RarArchive {
     pub(super) verify: bool,
     /// Whether extraction applies archived Unix owner and group.
     pub(super) restore_owners: bool,
+    pub(super) decode_mode: crate::DecodeMode,
     /// Cache for expensive key derivation (shared across member extractions).
     pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
     /// Forward-only physical header walk, independent of decoder seeks.
@@ -409,6 +410,18 @@ impl RarArchive {
     /// Whether extraction applies the archived Unix owner and group.
     pub fn restore_owners(&self) -> bool {
         self.restore_owners
+    }
+
+    /// Select compressed-member execution for this archive. Existing solid
+    /// dictionary state is preserved; the next entry consumption uses this mode.
+    /// Serial decoding does not disable independent checksum workers.
+    pub fn set_decode_mode(&mut self, mode: crate::DecodeMode) {
+        self.decode_mode = mode;
+    }
+
+    /// The archive's compressed-member execution policy (Auto by default).
+    pub fn decode_mode(&self) -> crate::DecodeMode {
+        self.decode_mode
     }
 
     /// Set resource limits for archive processing.
@@ -1040,6 +1053,7 @@ mod tests {
             solid_poison: None,
             verify: true,
             restore_owners: false,
+            decode_mode: crate::DecodeMode::Auto,
             limits: Limits::default(),
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
