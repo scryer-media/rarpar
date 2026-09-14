@@ -2,6 +2,52 @@
 
 ## 0.3.2 (unreleased)
 
+- Store a contiguous protected chunk mapping as a run (file, first block, block
+  count, byte offset) instead of one materialised extent per block, and expand a
+  `FileExtent` only when one is asked for. Described tails, inline tail bytes,
+  unprotected ranges and blocks named by more than one extent are the charged
+  exceptions. Cohort membership remains a property of the recovery index, not of
+  the layout.
+- **Breaking:** `FileLayout::extents` is now a `FileExtents` container rather
+  than `Vec<FileExtent>`. `len`, `is_empty`, `iter` and `get` answer what they
+  answered before, but `iter` and `get` yield `FileExtent` *by value*, because
+  no such value is stored; `range`, `block_at`, `is_unprotected`,
+  `inline_bytes`, `first_after` and `all_unprotected` read one extent's
+  properties without materialising it. `ExtentKind` and `FileExtent` are
+  unchanged.
+- **Breaking:** `BlockLayout::blocks` returns an iterator of
+  `(u64, BlockLocations)` in ascending block order instead of
+  `&BTreeMap<u64, Vec<ExtentLocation>>`. `BlockLayout::locations(block)` answers
+  one block; `BlockLocations` dereferences to `&[ExtentLocation]`.
+  `BlockLayout::referenced_blocks`, `aliased_blocks`, `widest_block` and
+  `checksums` are new.
+- Share authenticated checksum ownership between a set and the layouts resolved
+  from it. Whole-block extents report `fingerprint` and `rolling_hash` from the
+  set's storage instead of copying them, and the layout holds that storage
+  through shared ownership, so it can never dangle and the bytes are charged
+  once, by the set, under `resolved metadata`.
+- **Breaking:** `Par3Set::block_checksums` returns `&BlockChecksums` instead of
+  `&BTreeMap<u64, BlockChecksum>`. The new type stores checksums as sorted
+  disjoint runs — External Data packets describe consecutive blocks — and offers
+  `len`, `is_empty`, `runs`, `get`, `contains` and `iter`.
+  `Par3Set::block_checksum` is unchanged; `Par3Set::shared_block_checksums` is
+  new.
+- **Breaking:** `FileEvidence::verdicts` returns `&ExtentVerdicts` instead of
+  `&[ExtentVerdict]`. Verdicts are packed two bits per extent and keep all four
+  states `ExtentVerdict` names, along with per-extent fingerprints, partial
+  verification, source generations and whole-file results. Sealing, invalidation
+  and `replay_evidence` are unchanged.
+- The evidence checkpoint format is unchanged: the same magic, the same 73-byte
+  header, and one state byte per extent, anchored by the same host-trusted
+  digest. A checkpoint written before this representation change replays against
+  a layout built after it; a blob with a different version is refused with
+  `EngineError::Unsupported("evidence checkpoint version")` rather than misread.
+- Retained metadata and peak working memory are now reported separately, per
+  stage and per block, by the stage inventory and the geometry probe. On the
+  16,384-block single-file set the retained total falls from 365.3 to 53.6 bytes
+  per block and the budget's high-water mark from 21,126,190 to 1,794,446 bytes;
+  on the 131,072-block probe the peak falls from 53,694,630 to 13,706,159 bytes
+  and the retained total to 48.9 bytes per block.
 - Add a categorised allocation ledger to `MemoryBudget`. `MemoryBudget::ledger`
   returns a `MemoryLedger` giving each `MemoryCategory` its current and peak
   reserved bytes and its reservation count. Reading it allocates nothing and

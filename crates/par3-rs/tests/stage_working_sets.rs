@@ -57,6 +57,24 @@ fn every_stage_of_a_many_block_repair_states_what_it_holds() {
         "assessment retains {assessment} bytes for {blocks} blocks, which is per-block state"
     );
 
+    // Layout and evidence no longer follow the block count: a contiguous
+    // mapping is one run, and its checksums are the set's, shared not copied.
+    let layout = resident("verify + assess", MemoryCategory::LayoutEvidence);
+    assert!(
+        layout < blocks as u64 * 8,
+        "layout and evidence retain {layout} bytes for {blocks} blocks, \
+         which is per-block extent state"
+    );
+
+    // The set's checksums are stored once, as runs, at what a `BlockChecksum`
+    // actually is rather than at what an ordered-map node would cost.
+    let metadata = resident("verify + assess", MemoryCategory::ResolvedMetadata);
+    assert!(
+        metadata < blocks as u64 * 40,
+        "resolved metadata retains {metadata} bytes for {blocks} blocks; \
+         a block checksum is 24 bytes"
+    );
+
     // Carrier bytes do not survive the metadata they were parsed into.
     let carrier_after_layout = resident("metadata + layout", MemoryCategory::CarrierPackets);
     let carrier_after_merge = resident("scan + merge", MemoryCategory::CarrierPackets);
@@ -302,11 +320,13 @@ fn the_layout_charge_follows_the_layout_it_built() {
         ),
     ] {
         let per_block = point.layout as f64 / point.blocks as f64;
-        println!("{}: layout {per_block:.1} bytes per block", point.label);
+        println!("{}: layout {per_block:.2} bytes per block", point.label);
+        // A contiguous mapping is a run and its checksums are the set's, so the
+        // only per-block cost left in this category is the packed verdict.
         assert!(
-            per_block < 400.0,
-            "{}: layout and evidence hold {per_block:.1} bytes per block, \
-             which is the flat estimate again",
+            per_block < 8.0,
+            "{}: layout and evidence hold {per_block:.2} bytes per block, \
+             which is per-block extent state again",
             point.label
         );
     }

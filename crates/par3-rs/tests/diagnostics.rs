@@ -396,7 +396,7 @@ fn pressure_narrows_the_stripe_before_it_refuses_and_refuses_only_once() {
     };
 
     // Small enough that no arrangement of this session fits: terminal.
-    let (terminal, terminal_options) = attempt(96 << 10);
+    let (terminal, terminal_options) = attempt(48 << 10);
     println!(
         "terminal: what={} need={} limit={} available={} cause={:?}",
         terminal.what,

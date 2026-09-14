@@ -22,7 +22,9 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
+use crate::checksums::{BlockChecksums, BlockChecksumsBuilder};
 use crate::error::{Par3Error, Result};
 use crate::hash::{Fingerprint, FingerprintHasher, RollingHasher};
 use crate::packet::{
@@ -310,8 +312,11 @@ pub(crate) fn resolution_cost(packet: &Packet) -> usize {
     let indexed = match packet.body() {
         PacketBody::File(_) => hash_entry_bytes::<Fingerprint, FilePacket>(),
         PacketBody::Directory(_) => hash_entry_bytes::<Fingerprint, DirectoryPacket>(),
+        // Input-block checksums are collected as `(index, checksum)` pairs and
+        // then compacted into runs, so resolution holds the pair vector and the
+        // compact values at once rather than an ordered-map node per block.
         PacketBody::ExternalData(this) => {
-            this.checksums.len() * btree_entry_bytes::<u64, BlockChecksum>()
+            this.checksums.len() * (size_of::<(u64, BlockChecksum)>() + size_of::<BlockChecksum>())
         }
         PacketBody::RecoveryExternalData(this) => {
             this.checksums.len() * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
@@ -351,7 +356,7 @@ pub struct Par3Set {
     root_hash: Fingerprint,
     files: Vec<Par3File>,
     directories: Vec<Par3Directory>,
-    block_checksums: BTreeMap<u64, BlockChecksum>,
+    block_checksums: Arc<BlockChecksums>,
     matrix_packets: Vec<Packet>,
     recovery_blocks: Vec<RecoveryBlock>,
     foreign_recovery_packets: Vec<RecoveryDataPacket>,
@@ -453,7 +458,7 @@ impl Par3Set {
             total += directory.path.capacity() + directory.packet.heap_bytes();
         }
 
-        total += self.block_checksums.len() * btree_entry_bytes::<u64, BlockChecksum>();
+        total += self.block_checksums.capacity_bytes();
         total += self.recovery_block_checksums.len()
             * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>();
 
@@ -544,7 +549,7 @@ impl Par3Set {
         let mut root: Option<(Fingerprint, RootPacket)> = None;
         let mut file_packets: HashMap<Fingerprint, FilePacket> = HashMap::new();
         let mut directory_packets: HashMap<Fingerprint, DirectoryPacket> = HashMap::new();
-        let mut block_checksums: BTreeMap<u64, BlockChecksum> = BTreeMap::new();
+        let mut block_checksums = BlockChecksumsBuilder::default();
         let mut matrix_packets = Vec::new();
         let mut recovery_packets = Vec::new();
         let mut recovery_external_data = Vec::new();
@@ -594,7 +599,7 @@ impl Par3Set {
                         let Some(index) = first.checked_add(step as u64) else {
                             break;
                         };
-                        block_checksums.entry(index).or_insert(checksum);
+                        block_checksums.push(index, checksum);
                     }
                 }
                 PacketBody::CauchyMatrix(_)
@@ -703,7 +708,7 @@ impl Par3Set {
             root_hash,
             files,
             directories,
-            block_checksums,
+            block_checksums: Arc::new(block_checksums.build()),
             matrix_packets,
             recovery_blocks,
             foreign_recovery_packets,
@@ -796,14 +801,24 @@ impl Par3Set {
     /// Coverage is normally partial: the reference implementation omits blocks
     /// that hold chunk tails.
     #[must_use]
-    pub fn block_checksums(&self) -> &BTreeMap<u64, BlockChecksum> {
+    pub fn block_checksums(&self) -> &BlockChecksums {
         &self.block_checksums
+    }
+
+    /// Shared ownership of the set's checksum storage, so a [`BlockLayout`]
+    /// built from this set can reference the same authenticated checksums for
+    /// its whole lifetime instead of copying them into every extent.
+    ///
+    /// [`BlockLayout`]: crate::layout::BlockLayout
+    #[must_use]
+    pub fn shared_block_checksums(&self) -> Arc<BlockChecksums> {
+        Arc::clone(&self.block_checksums)
     }
 
     /// The checksum for one input block, if the set carries it.
     #[must_use]
     pub fn block_checksum(&self, index: u64) -> Option<&BlockChecksum> {
-        self.block_checksums.get(&index)
+        self.block_checksums.get(index)
     }
 
     /// The set's Matrix packets, whichever kinds they are.

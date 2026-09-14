@@ -162,15 +162,20 @@ consumer no longer needs before the next one charges its own. Measured on a
 16,384-block single-file set with a 128 MiB budget and a 64 MiB retained
 ceiling, sampling `MemoryBudget::ledger()` at each stage boundary:
 
-| stage | category | resident bytes | bytes per block | coexists with the previous stage |
+| stage | category | retained bytes | bytes per block | coexists with the previous stage |
 | --- | --- | ---: | ---: | --- |
 | scan and merge | carrier and packet storage | 398,673 | 24.3 | — |
-| metadata and layout | resolved metadata | 1,640,199 | 100.1 | yes, carriers stay for regeneration |
-| metadata and layout | layout and evidence | 3,805,281 | 232.3 | yes |
-| verify and assess | layout and evidence | 3,940,449 | 240.5 | yes, evidence extends the layout entry |
+| metadata and layout | resolved metadata | 460,559 | 28.1 | yes, carriers stay for regeneration |
+| metadata and layout | layout and evidence | 4,337 | 0.3 | yes |
+| verify and assess | layout and evidence | 12,609 | 0.8 | yes, evidence extends the layout entry |
 | verify and assess | assessment state | 6,228 | 0.4 | no, the scratch is released at the handover |
-| after repair | all categories | 5,985,549 | 365.3 | codec banks are released with the codec |
+| after repair | all categories | 878,069 | 53.6 | codec banks are released with the codec |
 | session dropped | all categories | 0 | 0 | — |
+
+Retained bytes and peak working memory are different answers and are reported
+separately: the table above is what each stage leaves resident, and the budget's
+high-water mark over the same run is 1,794,446 bytes (109.5 per block), reached
+while metadata resolution holds both the carriers and the set it is building.
 
 Two properties hold across block, file, carrier and damage counts, and are
 regression-tested at a fixed budget:
@@ -180,9 +185,68 @@ regression-tested at a fixed budget:
   at the handover, and retains only what the result's own containers measure. At
   sixteen times the blocks that retained figure does not move: it follows files
   and losses. The scratch and the result never coexist at full size.
-- **The layout charges what it built.** Extents, inline bytes, paths and the
+- **The layout charges what it built.** Runs, tails, inline bytes, paths and the
   block index are charged from their container capacities and trued up to the
   built layout's measurement, rather than a flat per-extent estimate.
+- **The layout does not follow the block count.** A contiguous protected chunk
+  is one run whatever it maps, and the checksums its extents report are the
+  set's, shared rather than copied. At sixteen times the blocks the layout entry
+  does not move.
+
+### Layout and evidence representation
+
+A protected chunk that covers whole blocks maps a contiguous span of file bytes
+onto a contiguous span of block indices. The layout stores that as a **run** —
+file, first block, block count, byte offset — and expands a `FileExtent` only
+when one is asked for. What a run cannot express is stored and charged
+individually:
+
+| exception | stored as | charged |
+| --- | --- | --- |
+| described chunk tail | its own block, offset, fingerprint and CRC64 | one entry per tail |
+| inline tail | the authenticated bytes themselves | one entry plus the bytes |
+| unprotected range | one run of one extent | one entry |
+| a block named by more than one extent (aliases, shared and packed blocks) | an ordered-map entry with every location | one map entry and its list per aliased block |
+
+`FileLayout::extents` is a `FileExtents` container rather than a `Vec`: `len`,
+`iter` and indexed access answer what they always answered, but `FileExtent` is
+yielded **by value**, because no such value is stored. `ExtentKind` and
+`FileExtent` are unchanged, in the same order, with the same meanings.
+
+Whole-block extents take `fingerprint` and `rolling_hash` from the set's
+authenticated checksum storage instead of copying them. The layout holds that
+storage through shared ownership, so it can never dangle and never needs a
+second copy; the bytes are charged once, by the `Par3Set` that owns them, under
+`resolved metadata`. Those checksums are themselves run-compact: External Data
+packets describe consecutive blocks, so a set's checksums are stored as sorted
+disjoint runs of `BlockChecksum` values rather than one ordered-map node per
+block. `Par3Set::block_checksums` returns a `BlockChecksums` view over that;
+`block_checksum(index)` is unchanged.
+
+Cohort membership stays a property of the recovery index, not of the layout: the
+block index says which extents name a block and nothing about which cohort it
+falls in. Cohort deficits and lost-index lists are produced by walking blocks in
+ascending order, so the same inputs in any arrival order yield byte-identical
+`RecoveryRequirement` lists.
+
+Verdicts are stored two bits per extent. All four states `ExtentVerdict` names —
+unknown, intact, damaged, unprotected — survive, as do per-extent fingerprints
+where the metadata records them, partial verification, source generations and
+whole-file results. `FileEvidence::verdicts` returns an `ExtentVerdicts` view
+with `len`, `get` and `iter`. Sealing, invalidation, `checkpoint_file` and
+`replay_evidence` mean exactly what they meant.
+
+### Checkpoint versioning
+
+The evidence checkpoint format is **unchanged** by the compact representation:
+the same `P3EV\x01\0\0\0` magic, the same 73-byte header, and one state byte
+per extent in layout order, anchored by the same host-trusted digest. A
+checkpoint written before this representation change replays against a layout
+built after it, because the bytes are the same bytes and the layout identity is
+computed from the same authenticated inputs in the same order. A blob whose
+magic or version differs is refused with `EngineError::Unsupported("evidence
+checkpoint version")`; a blob that does not describe this layout is refused with
+`EngineError::InvalidState`. Nothing is ever misread as a different version.
 
 Carrier bytes survive the metadata they were parsed into, deliberately: carrier
 regeneration and re-resolution need them, and dropping them would trade memory

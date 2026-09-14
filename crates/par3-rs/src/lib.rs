@@ -143,6 +143,14 @@
 //! when the host runs several jobs. [`runtime::ExecutionOptions::fft_backend`]
 //! selects automatic or scalar FFT butterflies.
 //!
+//! A resolved [`Par3Set`] stores its input-block checksums as sorted runs, and a
+//! [`layout::BlockLayout`] stores a contiguous protected chunk as a run rather
+//! than one materialised extent per block, sharing the set's checksums instead
+//! of copying them. [`layout::FileExtent`] values are therefore produced on
+//! demand — `FileLayout::extents` yields them by value — and evidence verdicts
+//! are packed two bits per extent. None of this changes what a layout, an
+//! extent or a verdict means, and the evidence checkpoint format is unchanged.
+//!
 //! Windows scanners pin a budgeted read-only carrier handle through
 //! [`source::SourceAccess::pin`]. Drop the scanner and its authenticated packets
 //! before replacing that carrier. Pinning hashes once; all generation hashes consume scan-work
@@ -165,6 +173,7 @@
 
 pub mod carrier;
 pub mod cauchy;
+pub mod checksums;
 pub mod create;
 pub mod creation;
 pub mod error;
@@ -196,6 +205,7 @@ pub mod set;
 pub mod verify;
 
 pub use cauchy::{CodecLimits, Decoder, Encoder, Geometry, RecoveredBlock, RecoveryRow};
+pub use checksums::BlockChecksums;
 pub use create::{
     CreateLimits, CreateOptions, CreateReport, InputSpec, RecoveryAmount, create,
     suggest_block_size,

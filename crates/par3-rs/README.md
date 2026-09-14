@@ -209,14 +209,27 @@ are: nothing else draws on that ceiling.
 
 Each stage of a repair holds a bounded set and releases what its consumer is
 finished with before the next stage charges its own. On a 16,384-block set the
-resident total across all categories is about 365 bytes per block: 24 for
-carrier and packet storage, 100 for resolved metadata, 240 for the layout and
-its verification evidence, and a fraction of a byte for assessment state.
+retained total across all categories is about 54 bytes per block: 24.3 for
+carrier and packet storage, 28.1 for resolved metadata, 0.8 for the layout and
+its verification evidence, and 0.4 for assessment state. Peak working memory is
+reported separately and reaches about 110 bytes per block on the same run, while
+metadata resolution holds the carriers and the set it is building at once.
 Assessment takes a scratch reservation while it accumulates coverage and
 per-cohort deficits, releases it at the handover, and retains only what the
 result's own containers measure — so what survives assessment follows files and
 losses, not the block count. The layout is charged from its containers'
-capacities and trued up to the built layout's measurement. Carrier bytes and
+capacities and trued up to the built layout's measurement.
+
+A contiguous protected chunk is stored as a run — file, first block, block
+count, byte offset — and extents are expanded on demand, so the layout no longer
+follows the block count. Described tails, inline tail bytes, unprotected ranges
+and blocks named by more than one extent are the exceptions, stored and charged
+individually. Whole-block extents report the set's authenticated checksums
+through shared ownership instead of copying a fingerprint and CRC64 per extent,
+and the set stores those checksums as sorted runs rather than an ordered-map
+node per block. Verdicts are packed two bits to an extent. Nothing about what a
+layout or a verdict means changed, and the evidence checkpoint format is
+unchanged and replays across the representation change. Carrier bytes and
 verification evidence deliberately outlive the stages that produced them,
 because carrier regeneration and reassessment read them and dropping them would
 buy memory with source rereads; `ExecutionDiagnostics::amplification()` reports

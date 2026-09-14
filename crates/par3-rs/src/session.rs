@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::evidence::{ExtentVerdict, FileEvidence, verify_source};
 use crate::ingest::{IncrementalSet, IngestedPacket, MergeEffect, PayloadKind, PayloadRef};
-use crate::layout::{BlockLayout, ExtentKind};
+use crate::layout::BlockLayout;
 use crate::packet::{BlockRange, PacketBody};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceAccess, SourceId, ensure_snapshot, read_exact_at};
@@ -665,26 +665,27 @@ impl Par3RepairSession {
     }
 
     fn block_available(&self, layout: &BlockLayout, block: u64) -> bool {
-        let Some(locations) = layout.blocks.get(&block) else {
+        let Some(locations) = layout.locations(block) else {
             return false;
         };
         let mut required = Vec::new();
         let mut available = Vec::new();
-        for location in locations {
+        for location in locations.iter() {
             let file = &layout.files[location.file];
-            let extent = &file.extents[location.extent];
-            let ExtentKind::Block { offset, .. } = extent.kind else {
+            let Some(extent) = file.extents.range(location.extent) else {
                 continue;
             };
-            let range = offset..offset + extent.range.end - extent.range.start;
+            let Some((_, offset)) = file.extents.block_at(location.extent) else {
+                continue;
+            };
+            let range = offset..offset + extent.end - extent.start;
             required.push(range.clone());
             if self
                 .placements
                 .contains_key(&(location.file, location.extent))
-                || self
-                    .evidence
-                    .get(&file.path)
-                    .is_some_and(|proof| proof.verdicts[location.extent] == ExtentVerdict::Intact)
+                || self.evidence.get(&file.path).is_some_and(|proof| {
+                    proof.verdicts.get(location.extent) == Some(ExtentVerdict::Intact)
+                })
             {
                 available.push(range);
             }
@@ -948,11 +949,7 @@ impl Par3RepairSession {
             .expect("ready layout")
             .files
             .iter()
-            .any(|file| {
-                file.extents
-                    .iter()
-                    .any(|extent| matches!(extent.kind, ExtentKind::Unprotected))
-            })
+            .any(|file| (0..file.extents.len()).any(|extent| file.extents.is_unprotected(extent)))
         {
             return Err(EngineError::Unsupported(
                 "unprotected ranges require explicit self-repair",
@@ -1275,32 +1272,29 @@ impl Par3RepairSession {
             return Ok(());
         }
         let locations = layout
-            .blocks
-            .get(&block)
+            .locations(block)
             .ok_or(EngineError::InvalidState("unresolved input block"))?;
         let stripe_end = offset + out.len() as u64;
-        for location in locations {
+        for location in locations.iter() {
             let file = &layout.files[location.file];
-            let extent = &file.extents[location.extent];
-            let ExtentKind::Block {
-                offset: block_offset,
-                ..
-            } = extent.kind
-            else {
+            let Some(extent) = file.extents.range(location.extent) else {
+                continue;
+            };
+            let Some((_, block_offset)) = file.extents.block_at(location.extent) else {
                 continue;
             };
             let (source, snapshot, source_offset) =
                 if let Some(placement) = self.placements.get(&(location.file, location.extent)) {
                     (placement.source, placement.snapshot, placement.offset)
                 } else if let Some(proof) = self.evidence.get(&file.path)
-                    && proof.verdicts[location.extent] == ExtentVerdict::Intact
+                    && proof.verdicts.get(location.extent) == Some(ExtentVerdict::Intact)
                 {
-                    (proof.source, proof.snapshot, extent.range.start)
+                    (proof.source, proof.snapshot, extent.start)
                 } else {
                     continue;
                 };
             let start = offset.max(block_offset);
-            let end = stripe_end.min(block_offset + extent.range.end - extent.range.start);
+            let end = stripe_end.min(block_offset + extent.end - extent.start);
             if start >= end {
                 continue;
             }
@@ -1346,17 +1340,16 @@ impl Par3RepairSession {
             ensure_snapshot(self.access.as_ref(), source, snapshot)?;
             covered[begin..finish].fill(1);
         }
-        for location in locations {
-            let extent = &layout.files[location.file].extents[location.extent];
-            let ExtentKind::Block {
-                offset: block_offset,
-                ..
-            } = extent.kind
-            else {
+        for location in locations.iter() {
+            let extents = &layout.files[location.file].extents;
+            let Some(extent) = extents.range(location.extent) else {
+                continue;
+            };
+            let Some((_, block_offset)) = extents.block_at(location.extent) else {
                 continue;
             };
             let start = offset.max(block_offset);
-            let end = stripe_end.min(block_offset + extent.range.end - extent.range.start);
+            let end = stripe_end.min(block_offset + extent.end - extent.start);
             if start < end
                 && covered[(start - offset) as usize..(end - offset) as usize].contains(&0)
             {
@@ -1408,11 +1401,7 @@ fn assessment_scratch_bytes(layout: &BlockLayout) -> Option<usize> {
             .checked_add(file.extents.len().checked_mul(size_of::<Range<u64>>())?)
     })?;
     let aliases = layout
-        .blocks
-        .values()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
+        .widest_block()
         .checked_mul(size_of::<Range<u64>>())?
         .checked_mul(UNION_LISTS * 2)?;
     losses

@@ -91,7 +91,7 @@ fn validate_extents(
     options: &ExecutionOptions,
 ) -> EngineResult<bool> {
     payload.validate(options)?;
-    let Some(locations) = layout.blocks.get(&index) else {
+    let Some(locations) = layout.locations(index) else {
         return Err(EngineError::InvalidState(
             "Data packet has no protected extents",
         ));
@@ -106,8 +106,11 @@ fn validate_extents(
         .memory
         .reserve_as(MemoryCategory::SourceScratch, bookkeeping)?;
     let mut expected = BTreeMap::new();
-    for location in locations {
-        let extent = &layout.files[location.file].extents[location.extent];
+    for location in locations.iter() {
+        let extent = layout.files[location.file]
+            .extents
+            .get(location.extent)
+            .ok_or(EngineError::InvalidState("unknown Data extent"))?;
         if let ExtentKind::Block {
             offset,
             fingerprint: Some(hash),
@@ -131,10 +134,13 @@ fn validate_extents(
             .map(|&(offset, length)| offset..offset + length)
             .collect(),
     );
-    for location in locations {
-        let extent = &layout.files[location.file].extents[location.extent];
-        if let ExtentKind::Block { offset, .. } = extent.kind {
-            let end = offset + extent.range.end - extent.range.start;
+    for location in locations.iter() {
+        let extents = &layout.files[location.file].extents;
+        let Some(extent) = extents.range(location.extent) else {
+            continue;
+        };
+        if let Some((_, offset)) = extents.block_at(location.extent) {
+            let end = offset + extent.end - extent.start;
             if !authenticated
                 .iter()
                 .any(|range| range.start <= offset && range.end >= end)

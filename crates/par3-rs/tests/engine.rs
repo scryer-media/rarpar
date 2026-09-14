@@ -425,7 +425,7 @@ fn bounded_out_of_order_evidence_distinguishes_damage_and_verified_prefix() {
     let evidence = verifier.finish();
     assert!(!evidence.protected_complete());
     assert_eq!(evidence.verified_prefix(&layout).unwrap(), 2000);
-    assert_eq!(evidence.verdicts()[1], ExtentVerdict::Damaged);
+    assert_eq!(evidence.verdicts().get(1), Some(ExtentVerdict::Damaged));
     assert_eq!(
         evidence.unresolved_ranges(&layout).unwrap(),
         vec![2000..4000]

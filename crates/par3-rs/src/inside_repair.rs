@@ -11,7 +11,6 @@ use super::{ContainerKind, ContainerLayout, ContainerLimits};
 use crate::Fingerprint;
 use crate::carrier::CarrierPlan;
 use crate::ingest::IngestedPacket;
-use crate::layout::ExtentKind;
 use crate::packet::PacketBody;
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::Par3RepairSession;
@@ -101,17 +100,12 @@ impl SelfRepairPlan {
             ));
         }
         let file = &layout.files[0];
-        let mut gaps = file
-            .extents
-            .iter()
-            .filter(|extent| matches!(extent.kind, ExtentKind::Unprotected));
-        let gap = gaps
-            .next()
-            .ok_or(EngineError::InvalidState(
-                "embedded layout has no packet gap",
-            ))?
-            .range
-            .clone();
+        let mut gaps = (0..file.extents.len())
+            .filter(|index| file.extents.is_unprotected(*index))
+            .filter_map(|index| file.extents.range(index));
+        let gap = gaps.next().ok_or(EngineError::InvalidState(
+            "embedded layout has no packet gap",
+        ))?;
         if gaps.next().is_some() || gap.start == 0 || gap.end > file.len {
             return Err(EngineError::Unsupported("ambiguous embedded packet gaps"));
         }

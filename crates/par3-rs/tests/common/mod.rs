@@ -1631,48 +1631,51 @@ pub struct StageSample {
     pub peak: usize,
 }
 
-/// Print the inventory: per stage, each category's resident bytes, the bytes
-/// per protected block, and what the stage cost the budget's high-water mark.
+/// Print the inventory: per stage, what is still retained when the stage ends
+/// and what the budget's high-water mark reached while it ran, both in bytes
+/// and per protected block. Retained metadata and peak working memory are
+/// separate answers: the first is what a host pays for as long as the session
+/// lives, the second is what it must have free for the stage to run at all.
 pub fn report(samples: &[StageSample], blocks: u64, title: &str) {
     println!("--- stage working sets: {title} ({blocks} blocks) ---");
     println!(
-        "{:<22} {:<28} {:>12} {:>10} {:>12}",
-        "stage", "category", "resident", "per block", "budget peak"
+        "{:<22} {:<28} {:>12} {:>10} {:>12} {:>10} {:>12}",
+        "stage", "category", "retained", "ret B/blk", "peak", "peak B/blk", "peak added"
     );
     let mut previous = 0usize;
     for sample in samples {
-        let mut first = true;
+        let mut printed = false;
         for (category, entry) in sample.ledger.iter() {
             if entry.current == 0 {
                 continue;
             }
             println!(
-                "{:<22} {:<28} {:>12} {:>10.1} {:>12}",
-                if first { sample.label } else { "" },
+                "{:<22} {:<28} {:>12} {:>10.1} {:>12} {:>10} {:>12}",
+                if printed { "" } else { sample.label },
                 category.name(),
                 entry.current,
                 entry.current as f64 / blocks as f64,
-                if first {
-                    format!("+{}", sample.peak.saturating_sub(previous))
-                } else {
-                    String::new()
-                }
+                "",
+                "",
+                ""
             );
-            first = false;
+            printed = true;
         }
-        if first {
+        if !printed {
             println!(
-                "{:<22} {:<28} {:>12} {:>10} {:>12}",
-                sample.label, "(nothing resident)", 0, "-", ""
+                "{:<22} {:<28} {:>12} {:>10} {:>12} {:>10} {:>12}",
+                sample.label, "(nothing retained)", 0, "-", "", "", ""
             );
         }
         println!(
-            "{:<22} {:<28} {:>12} {:>10.1} {:>12}",
+            "{:<22} {:<28} {:>12} {:>10.1} {:>12} {:>10.1} {:>12}",
             "",
-            "TOTAL RESIDENT",
+            "TOTAL",
             sample.used,
             sample.used as f64 / blocks as f64,
-            sample.peak
+            sample.peak,
+            sample.peak as f64 / blocks as f64,
+            format!("+{}", sample.peak.saturating_sub(previous))
         );
         previous = sample.peak;
     }

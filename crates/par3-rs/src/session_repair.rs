@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 
 use crate::gf::{Field, Gf8, Gf16};
-use crate::layout::{BlockLayout, ExtentKind};
+use crate::layout::BlockLayout;
 use crate::packet::PacketBody;
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::{Par3RepairSession, RepairStatus, block_range};
@@ -174,9 +174,11 @@ fn repair_inner(
         let mut file = OpenOptions::new()
             .write(true)
             .open_budgeted(&target.temporary, &session.options)?;
-        for extent in &layout.files[target.index].extents {
-            if let ExtentKind::Inline(bytes) = &extent.kind {
-                file.seek(SeekFrom::Start(extent.range.start))?;
+        let extents = &layout.files[target.index].extents;
+        for index in 0..extents.len() {
+            if let Some(bytes) = extents.inline_bytes(index) {
+                let range = extents.range(index).expect("bounded extent");
+                file.seek(SeekFrom::Start(range.start))?;
                 file.write_all(bytes)?;
             }
         }
@@ -268,9 +270,11 @@ pub(crate) fn stage_embedded(
     let mut output = OpenOptions::new()
         .write(true)
         .open_budgeted(temporary, &session.options)?;
-    for extent in &layout.files[0].extents {
-        if let ExtentKind::Inline(bytes) = &extent.kind {
-            output.seek(SeekFrom::Start(extent.range.start))?;
+    let extents = &layout.files[0].extents;
+    for index in 0..extents.len() {
+        if let Some(bytes) = extents.inline_bytes(index) {
+            let range = extents.range(index).expect("bounded extent");
+            output.seek(SeekFrom::Start(range.start))?;
             output.write_all(bytes)?;
         }
     }
@@ -302,7 +306,7 @@ fn copy_available(
         .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
-    for (&block, locations) in &layout.blocks {
+    for (block, locations) in layout.blocks() {
         if !locations
             .iter()
             .any(|location| outputs.iter().any(|target| target.index == location.file))
@@ -600,7 +604,7 @@ fn reconstruct_fft(
         {
             continue;
         }
-        if !layout.blocks.get(&block).is_some_and(|locations| {
+        if !layout.locations(block).is_some_and(|locations| {
             locations
                 .iter()
                 .any(|location| outputs.iter().any(|output| output.index == location.file))
@@ -690,31 +694,29 @@ fn scatter(
     offset: u64,
     bytes: &[u8],
 ) -> EngineResult<()> {
-    let Some(locations) = layout.blocks.get(&block) else {
+    let Some(locations) = layout.locations(block) else {
         return Ok(());
     };
-    for location in locations {
+    for location in locations.iter() {
         let Some(target) = outputs.iter().find(|target| target.index == location.file) else {
             continue;
         };
-        let extent = &layout.files[location.file].extents[location.extent];
-        let ExtentKind::Block {
-            offset: block_offset,
-            ..
-        } = extent.kind
-        else {
+        let extents = &layout.files[location.file].extents;
+        let Some(extent) = extents.range(location.extent) else {
+            continue;
+        };
+        let Some((_, block_offset)) = extents.block_at(location.extent) else {
             continue;
         };
         let start = offset.max(block_offset);
-        let end =
-            (offset + bytes.len() as u64).min(block_offset + extent.range.end - extent.range.start);
+        let end = (offset + bytes.len() as u64).min(block_offset + extent.end - extent.start);
         if start >= end {
             continue;
         }
         let mut file = OpenOptions::new()
             .write(true)
             .open_budgeted(&target.temporary, options)?;
-        file.seek(SeekFrom::Start(extent.range.start + start - block_offset))?;
+        file.seek(SeekFrom::Start(extent.start + start - block_offset))?;
         file.write_all(&bytes[(start - offset) as usize..(end - offset) as usize])?;
     }
     Ok(())
@@ -735,12 +737,13 @@ fn verify_staged(
     let mut buffer = vec![0u8; size];
     let mut file = File::open(&target.temporary, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
-    for extent in &expected.extents {
-        if matches!(extent.kind, ExtentKind::Unprotected) {
+    for index in 0..expected.extents.len() {
+        if expected.extents.is_unprotected(index) {
             continue;
         }
-        file.seek(SeekFrom::Start(extent.range.start))?;
-        let mut remaining = extent.range.end - extent.range.start;
+        let range = expected.extents.range(index).expect("bounded extent");
+        file.seek(SeekFrom::Start(range.start))?;
+        let mut remaining = range.end - range.start;
         while remaining != 0 {
             session.options.cancel.check()?;
             let take = remaining.min(size as u64) as usize;

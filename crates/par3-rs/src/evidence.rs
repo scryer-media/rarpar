@@ -26,6 +26,100 @@ pub enum ExtentVerdict {
     Unprotected,
 }
 
+/// Every extent verdict of one file, two bits each.
+///
+/// The four states are exactly the ones [`ExtentVerdict`] names, so nothing the
+/// evidence exposes is lost; only the byte per extent the verdicts used to
+/// occupy is. Verdicts are read and written by extent index, in layout order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtentVerdicts {
+    bits: Vec<u8>,
+    len: usize,
+}
+
+impl ExtentVerdicts {
+    /// `len` verdicts, all [`ExtentVerdict::Unknown`].
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        Self {
+            bits: vec![0; len.div_ceil(4)],
+            len,
+        }
+    }
+
+    /// Number of extents these verdicts describe.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the file has no extents.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One extent's verdict, or `None` past the last extent.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<ExtentVerdict> {
+        if index >= self.len {
+            return None;
+        }
+        Some(match (self.bits[index / 4] >> ((index % 4) * 2)) & 0b11 {
+            0 => ExtentVerdict::Unknown,
+            1 => ExtentVerdict::Intact,
+            2 => ExtentVerdict::Damaged,
+            _ => ExtentVerdict::Unprotected,
+        })
+    }
+
+    /// Record one extent's verdict.
+    pub fn set(&mut self, index: usize, verdict: ExtentVerdict) {
+        assert!(index < self.len, "extent verdict out of range");
+        let code = match verdict {
+            ExtentVerdict::Unknown => 0u8,
+            ExtentVerdict::Intact => 1,
+            ExtentVerdict::Damaged => 2,
+            ExtentVerdict::Unprotected => 3,
+        };
+        let shift = (index % 4) * 2;
+        let slot = &mut self.bits[index / 4];
+        *slot = (*slot & !(0b11 << shift)) | (code << shift);
+    }
+
+    /// Every verdict in layout order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = ExtentVerdict> + '_ {
+        (0..self.len).map(|index| self.get(index).expect("bounded verdict"))
+    }
+
+    /// Bytes this storage holds, from its real capacity.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.bits.capacity()
+    }
+}
+
+impl<'a> IntoIterator for &'a ExtentVerdicts {
+    type Item = ExtentVerdict;
+    type IntoIter = Box<dyn ExactSizeIterator<Item = ExtentVerdict> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+/// Bytes one file's sealed evidence holds: its packed verdicts, its own value,
+/// and a fixed allowance for the hashing frontier's bookkeeping.
+pub(crate) fn evidence_bytes(extents: usize) -> Option<usize> {
+    extents
+        .div_ceil(4)
+        .checked_add(size_of::<FileEvidence>())?
+        .checked_add(EVIDENCE_BASE_BYTES)
+}
+
+/// Fixed allowance for one file's evidence beyond its verdicts.
+const EVIDENCE_BASE_BYTES: usize = 4096;
+
 /// Sealed evidence produced by hashing bytes against an authenticated layout,
 /// or replaying such verdicts using a checkpoint digest trusted by the host.
 #[derive(Clone, Debug)]
@@ -34,7 +128,7 @@ pub struct FileEvidence {
     pub(crate) file: usize,
     pub(crate) source: SourceId,
     pub(crate) snapshot: SourceSnapshot,
-    pub(crate) verdicts: Arc<[ExtentVerdict]>,
+    pub(crate) verdicts: Arc<ExtentVerdicts>,
     pub(crate) whole_matches: Option<bool>,
     pub(crate) expected_len: u64,
     _reservation: Arc<Reservation>,
@@ -72,7 +166,7 @@ impl FileEvidence {
 
     /// Extent verdicts in layout order.
     #[must_use]
-    pub fn verdicts(&self) -> &[ExtentVerdict] {
+    pub fn verdicts(&self) -> &ExtentVerdicts {
         &self.verdicts
     }
 
@@ -98,16 +192,13 @@ impl FileEvidence {
     /// Largest verified prefix, stopping at unknown, damaged or unprotected data.
     pub fn verified_prefix(&self, layout: &BlockLayout) -> EngineResult<u64> {
         self.check_layout(layout)?;
+        let extents = &layout.files[self.file].extents;
         let mut end = 0;
-        for (extent, verdict) in layout.files[self.file]
-            .extents
-            .iter()
-            .zip(self.verdicts.iter())
-        {
-            if *verdict != ExtentVerdict::Intact {
+        for (index, verdict) in self.verdicts.iter().enumerate() {
+            if verdict != ExtentVerdict::Intact {
                 break;
             }
-            end = extent.range.end;
+            end = extents.range(index).expect("checked extent").end;
         }
         Ok(end)
     }
@@ -115,21 +206,19 @@ impl FileEvidence {
     /// File-coordinate ranges that need verification or reconstruction.
     pub fn unresolved_ranges(&self, layout: &BlockLayout) -> EngineResult<Vec<Range<u64>>> {
         self.check_layout(layout)?;
+        let extents = &layout.files[self.file].extents;
         let mut ranges: Vec<Range<u64>> = Vec::new();
-        for (extent, verdict) in layout.files[self.file]
-            .extents
-            .iter()
-            .zip(self.verdicts.iter())
-        {
+        for (index, verdict) in self.verdicts.iter().enumerate() {
             if !matches!(verdict, ExtentVerdict::Unknown | ExtentVerdict::Damaged) {
                 continue;
             }
+            let range = extents.range(index).expect("checked extent");
             if let Some(previous) = ranges.last_mut()
-                && previous.end == extent.range.start
+                && previous.end == range.start
             {
-                previous.end = extent.range.end;
+                previous.end = range.end;
             } else {
-                ranges.push(extent.range.clone());
+                ranges.push(range);
             }
         }
         Ok(ranges)
@@ -172,7 +261,7 @@ pub struct StreamingVerifier {
     source: SourceId,
     snapshot: SourceSnapshot,
     options: ExecutionOptions,
-    verdicts: Vec<ExtentVerdict>,
+    verdicts: ExtentVerdicts,
     partial: BTreeMap<usize, Box<PartialExtent>>,
     whole: FingerprintHasher,
     whole_next: u64,
@@ -195,11 +284,7 @@ impl StreamingVerifier {
             .files
             .get(file)
             .ok_or(EngineError::InvalidState("unknown file index"))?;
-        let cost = description
-            .extents
-            .len()
-            .checked_mul(8)
-            .and_then(|n| n.checked_add(4096))
+        let cost = evidence_bytes(description.extents.len())
             .ok_or(EngineError::resource_limit("verification evidence"))?;
         if cost > options.retained_bytes {
             return Err(EngineError::budget_limit(
@@ -212,17 +297,12 @@ impl StreamingVerifier {
         let reservation = options
             .memory
             .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
-        let verdicts = description
-            .extents
-            .iter()
-            .map(|extent| {
-                if matches!(extent.kind, ExtentKind::Unprotected) {
-                    ExtentVerdict::Unprotected
-                } else {
-                    ExtentVerdict::Unknown
-                }
-            })
-            .collect();
+        let mut verdicts = ExtentVerdicts::new(description.extents.len());
+        for index in 0..verdicts.len() {
+            if description.extents.is_unprotected(index) {
+                verdicts.set(index, ExtentVerdict::Unprotected);
+            }
+        }
         Ok(Self {
             layout,
             file,
@@ -253,23 +333,23 @@ impl StreamingVerifier {
         if !bytes.is_empty() && !unprotected_between(file, self.whole_next, offset) {
             self.whole_ordered = false;
         }
-        let mut index = file
-            .extents
-            .partition_point(|extent| extent.range.end <= offset);
+        let mut index = file.extents.first_after(offset);
         while index < self.layout.files[self.file].extents.len() {
             self.options.cancel.check()?;
-            let extent = &self.layout.files[self.file].extents[index];
-            if extent.range.start >= end {
+            let extents = &self.layout.files[self.file].extents;
+            let range = extents.range(index).expect("bounded extent");
+            if range.start >= end {
                 break;
             }
-            let start = extent.range.start.max(offset);
-            let stop = extent.range.end.min(end);
+            let unprotected = extents.is_unprotected(index);
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
             let data = &bytes[(start - offset) as usize..(stop - offset) as usize];
-            if self.whole_ordered && !matches!(extent.kind, ExtentKind::Unprotected) {
+            if self.whole_ordered && !unprotected {
                 self.whole.update(data);
             }
-            if self.verdicts[index] == ExtentVerdict::Unknown {
-                let relative = start - extent.range.start;
+            if self.verdicts.get(index) == Some(ExtentVerdict::Unknown) {
+                let relative = start - range.start;
                 match self.feed_extent(index, relative, data) {
                     Err(EngineError::ResourceLimit(_)) => {
                         self.partial.remove(&index);
@@ -344,19 +424,21 @@ impl StreamingVerifier {
             partial.hasher.update(&fragment.bytes[skip..]);
             partial.next += (fragment.bytes.len() - skip) as u64;
         }
-        let extent = &self.layout.files[self.file].extents[index];
-        if partial.next == extent.range.end - extent.range.start {
-            let expected = match &extent.kind {
-                ExtentKind::Block { fingerprint, .. } => *fingerprint,
-                ExtentKind::Inline(bytes) => Some(crate::fingerprint(bytes)),
+        let extents = &self.layout.files[self.file].extents;
+        let range = extents.range(index).expect("bounded extent");
+        if partial.next == range.end - range.start {
+            let expected = match extents.get(index).expect("bounded extent").kind {
+                ExtentKind::Block { fingerprint, .. } => fingerprint,
+                ExtentKind::Inline(bytes) => Some(crate::fingerprint(&bytes)),
                 ExtentKind::Unprotected => None,
             };
             if let Some(expected) = expected {
-                self.verdicts[index] = if partial.hasher.finalize() == expected {
+                let verdict = if partial.hasher.finalize() == expected {
                     ExtentVerdict::Intact
                 } else {
                     ExtentVerdict::Damaged
                 };
+                self.verdicts.set(index, verdict);
             }
             self.partial.remove(&index);
         }
@@ -385,7 +467,7 @@ impl StreamingVerifier {
             previous.snapshot,
             options,
         )?;
-        verifier.verdicts.copy_from_slice(&previous.verdicts);
+        verifier.verdicts = previous.verdicts.as_ref().clone();
         verifier.whole_ordered = false;
         Ok(verifier)
     }
@@ -398,9 +480,9 @@ impl StreamingVerifier {
             && file.fingerprint != [0; 16])
             .then(|| self.whole.finalize() == file.fingerprint);
         if whole_matches == Some(true) {
-            for state in &mut self.verdicts {
-                if *state == ExtentVerdict::Unknown {
-                    *state = ExtentVerdict::Intact;
+            for index in 0..self.verdicts.len() {
+                if self.verdicts.get(index) == Some(ExtentVerdict::Unknown) {
+                    self.verdicts.set(index, ExtentVerdict::Intact);
                 }
             }
         }
@@ -409,7 +491,7 @@ impl StreamingVerifier {
             file: self.file,
             source: self.source,
             snapshot: self.snapshot,
-            verdicts: self.verdicts.into(),
+            verdicts: Arc::new(self.verdicts),
             whole_matches,
             expected_len: file.len,
             _reservation: Arc::new(self.reservation),
@@ -418,17 +500,7 @@ impl StreamingVerifier {
 }
 
 fn unprotected_between(file: &crate::layout::FileLayout, start: u64, end: u64) -> bool {
-    start <= end
-        && end <= file.len
-        && file
-            .extents
-            .iter()
-            .skip(
-                file.extents
-                    .partition_point(|extent| extent.range.end <= start),
-            )
-            .take_while(|extent| extent.range.start < end)
-            .all(|extent| matches!(extent.kind, ExtentKind::Unprotected))
+    start <= end && end <= file.len && file.extents.all_unprotected(start, end)
 }
 
 /// Recheck only unknown extents after new bytes arrive within an immutable source
@@ -446,16 +518,16 @@ pub fn verify_arrivals(
         .memory
         .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut bytes = vec![0; size];
-    for (extent, verdict) in layout.files[previous.file]
-        .extents
-        .iter()
-        .zip(previous.verdicts.iter())
-    {
-        if *verdict != ExtentVerdict::Unknown {
+    for (index, verdict) in previous.verdicts.iter().enumerate() {
+        if verdict != ExtentVerdict::Unknown {
             continue;
         }
-        let mut at = extent.range.start;
-        while at < extent.range.end {
+        let extent = layout.files[previous.file]
+            .extents
+            .range(index)
+            .expect("bounded extent");
+        let mut at = extent.start;
+        while at < extent.end {
             options.cancel.check()?;
             let Some(range) = access.next_available(previous.source, at)? else {
                 break;
@@ -466,7 +538,7 @@ pub fn verify_arrivals(
                 ));
             }
             at = range.start;
-            let end = range.end.min(extent.range.end);
+            let end = range.end.min(extent.end);
             while at < end {
                 options.cancel.check()?;
                 let take = (end - at).min(size as u64) as usize;
