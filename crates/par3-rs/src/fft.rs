@@ -2,7 +2,7 @@
 
 use reedsolomon_rs::fft::{TransformError, TransformField};
 
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
 /// Validated codec geometry for one cohort. Dummy input slots are supplied as
 /// zero by the layout adapter; they are not unavailable source bytes.
@@ -24,7 +24,7 @@ impl FftGeometry {
             ));
         }
         let inputs =
-            usize::try_from(inputs).map_err(|_| EngineError::ResourceLimit("FFT inputs"))?;
+            usize::try_from(inputs).map_err(|_| EngineError::resource_limit("FFT inputs"))?;
         let capacity = 1usize << capacity_log2;
         let domain = inputs
             .checked_add(capacity)
@@ -117,9 +117,10 @@ impl FftCodec {
                 workers: None,
             });
         }
-        let reservation = options
-            .memory
-            .reserve(TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?)?;
+        let reservation = options.memory.reserve_as(
+            MemoryCategory::CodecTables,
+            TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?,
+        )?;
         let field = TransformField::new(geometry.bits).map_err(transform_error)?;
         // Keep enough admission space for locator bookkeeping and a minimal
         // stripe; a worker limit is a ceiling, not a request to exhaust memory.
@@ -155,13 +156,19 @@ impl FftCodec {
             // buffers. These are the same layouts admitted by decode/buffers.
             g.domain * 32 + g.domain * 32 + (g.domain * (2 / unit) + 2) * unit
         };
-        let _decode = self.options.memory.reserve(decode_floor)?;
+        let _decode = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, decode_floor)?;
         let target = self
             .options
             .stripe_bytes
             .min(usize::try_from(block_size).unwrap_or(usize::MAX))
             .min(self.options.memory.available() / 4);
-        let (stripe, reservation) = self.options.memory.reserve_stripes(target, 2, unit)?;
+        let (stripe, reservation) =
+            self.options
+                .memory
+                .reserve_stripes(MemoryCategory::CodecScratch, target, 2, unit)?;
         self.options.stripe_bytes = stripe;
         Ok((stripe, reservation))
     }
@@ -227,7 +234,7 @@ impl FftCodec {
         let rows = g
             .capacity
             .checked_mul(2)
-            .ok_or(EngineError::ResourceLimit("FFT encoder rows"))?;
+            .ok_or(EngineError::resource_limit("FFT encoder rows"))?;
         let (stripe, _buffers) = self.buffers(block_size, rows)?;
         let symbols = stripe / g.field_bytes();
         let mut work = vec![vec![0u16; symbols]; g.capacity];
@@ -295,10 +302,11 @@ impl FftCodec {
             return self.decode_trivial(block_size, lost, recovery, read, write);
         }
         let field = self.field.as_ref().expect("nontrivial FFT field");
-        let _plan = self.options.memory.reserve(
+        let _plan = self.options.memory.reserve_as(
+            MemoryCategory::CodecScratch,
             g.domain
                 .checked_mul(32)
-                .ok_or(EngineError::ResourceLimit("FFT locator"))?,
+                .ok_or(EngineError::resource_limit("FFT locator"))?,
         )?;
         let mut erased = vec![false; g.domain];
         erased[..g.capacity].fill(true);
@@ -411,11 +419,12 @@ impl FftCodec {
             return Err(EngineError::InvalidState("invalid or duplicate FFT loss"));
         }
         // Charge only supplied indices; a large copy geometry needs no locator.
-        let _indices = self.options.memory.reserve(
+        let _indices = self.options.memory.reserve_as(
+            MemoryCategory::CodecScratch,
             recovery
                 .len()
                 .checked_mul(size_of::<usize>())
-                .ok_or(EngineError::ResourceLimit("FFT recovery indices"))?,
+                .ok_or(EngineError::resource_limit("FFT recovery indices"))?,
         )?;
         let mut indices = recovery.to_vec();
         indices.sort_unstable();
@@ -459,6 +468,7 @@ impl FftCodec {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
         self.options.memory.reserve_stripes_with_overhead(
+            MemoryCategory::CodecScratch,
             self.options
                 .stripe_bytes
                 .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
@@ -476,12 +486,13 @@ impl FftCodec {
         }
         let overhead = rows
             .checked_mul(32)
-            .ok_or(EngineError::ResourceLimit("FFT rows"))?;
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
         let per_byte = rows
             .checked_mul(2 / unit)
             .and_then(|n| n.checked_add(2))
-            .ok_or(EngineError::ResourceLimit("FFT stripes"))?;
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
         let buffers = self.options.memory.reserve_stripes_with_overhead(
+            MemoryCategory::CodecScratch,
             self.options
                 .stripe_bytes
                 .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
@@ -568,5 +579,144 @@ mod tests {
             })
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::runtime::{MemoryBudget, MemoryCategory};
+
+    fn options(limit: usize) -> ExecutionOptions {
+        ExecutionOptions {
+            memory: MemoryBudget::new(limit),
+            workers: 1,
+            stripe_bytes: 64 << 10,
+            ..ExecutionOptions::default()
+        }
+    }
+
+    /// The transform field's charge must cover building it, not just holding
+    /// it: `TransformField::new` fills a polynomial-log table that is freed
+    /// again before the constructor returns.
+    #[test]
+    fn transform_field_charge_covers_setup_and_the_tables_it_leaves() {
+        for bits in [8u32, 16] {
+            let order = 1usize << bits;
+            let charge = TransformField::allocation_bytes(bits).unwrap();
+            // log and exp survive; polynomial_log does not.
+            let retained = (order + 2 * (order - 1)) * size_of::<u16>();
+            let peak = retained + order * size_of::<u16>();
+            assert!(
+                charge >= peak,
+                "{bits}-bit field charges {charge} for a {peak} peak"
+            );
+            assert!(
+                charge < peak * 2,
+                "{bits}-bit field charges {charge}, more than twice its {peak} peak"
+            );
+
+            let geometry = FftGeometry::new(order as u64 / 4, 1).unwrap();
+            assert_eq!(geometry.bits, bits);
+            let options = options(64 << 20);
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let tables = options
+                .memory
+                .ledger()
+                .category(MemoryCategory::CodecTables);
+            assert_eq!(tables.current, charge as u64);
+            drop(codec);
+            assert_eq!(
+                options
+                    .memory
+                    .ledger()
+                    .category(MemoryCategory::CodecTables)
+                    .current,
+                0
+            );
+        }
+    }
+
+    /// One cohort's row workspace is `domain` transform rows plus one byte
+    /// stripe. The charge is taken before any of it is allocated, so it must
+    /// cover every row's capacity and its vector header.
+    #[test]
+    fn row_workspace_charge_matches_the_rows_a_cohort_allocates() {
+        for inputs in [200u64, 5_000] {
+            let geometry = FftGeometry::new(inputs, 1).unwrap();
+            let options = options(256 << 20);
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let unit = geometry.field_bytes();
+            let block_size = 1 << 16;
+            let before = options.memory.used();
+            let (stripe, buffers) = codec.buffers(block_size, geometry.domain).unwrap();
+            assert_eq!(options.memory.used() - before, buffers.bytes());
+
+            // Exactly what `decode` allocates once the charge is granted.
+            let symbols = stripe / unit;
+            let rows = vec![vec![0u16; symbols]; geometry.domain];
+            let bytes = vec![0u8; stripe];
+            let measured = rows.capacity() * size_of::<Vec<u16>>()
+                + rows
+                    .iter()
+                    .map(|row| row.capacity() * size_of::<u16>())
+                    .sum::<usize>()
+                + bytes.capacity();
+            assert!(
+                buffers.bytes() >= measured,
+                "{inputs} inputs charge {} for a {measured} byte workspace",
+                buffers.bytes()
+            );
+            assert!(
+                buffers.bytes() < measured * 2,
+                "{inputs} inputs charge {}, more than twice their {measured} byte workspace",
+                buffers.bytes()
+            );
+            drop(buffers);
+            drop(rows);
+            assert_eq!(options.memory.used(), before);
+            drop(codec);
+            assert_eq!(options.memory.used(), 0);
+        }
+    }
+
+    /// The repair adapter keeps two byte buffers for the whole reconstruction
+    /// and briefly reserves a decode floor while sizing them. The floor must be
+    /// released again, and the buffers charged for exactly what they hold.
+    #[test]
+    fn source_adapter_buffers_outlive_the_decode_floor_they_were_sized_against() {
+        let geometry = FftGeometry::new(1_000, 1).unwrap();
+        let options = options(64 << 20);
+        let mut codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let tables = options.memory.used();
+        let (stripe, buffers) = codec.reserve_source_stripes(1 << 16, 4).unwrap();
+        let held = options.memory.used() - tables;
+        assert_eq!(held, buffers.bytes(), "the decode floor was not released");
+
+        let first = vec![0u8; stripe];
+        let second = vec![0u8; stripe];
+        let measured = first.capacity() + second.capacity();
+        assert!(
+            buffers.bytes() >= measured,
+            "adapter buffers charge {} for {measured} bytes",
+            buffers.bytes()
+        );
+        assert!(
+            buffers.bytes() < measured * 2,
+            "adapter buffers charge {}, more than twice their {measured} bytes",
+            buffers.bytes()
+        );
+        let peak = options
+            .memory
+            .ledger()
+            .category(MemoryCategory::CodecScratch)
+            .peak;
+        assert!(
+            peak > buffers.bytes() as u64,
+            "the decode floor must show in the ledger's peak"
+        );
+        drop(buffers);
+        drop(codec);
+        assert_eq!(options.memory.used(), 0);
     }
 }

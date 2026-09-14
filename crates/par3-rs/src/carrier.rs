@@ -1,6 +1,6 @@
 //! Explicit recovery-carrier reconstruction from authenticated packet layouts.
 
-use crate::runtime::{EngineFile as File, OpenBudgeted};
+use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -94,14 +94,14 @@ impl CarrierPlan {
             }
             next = next
                 .checked_add(at.length)
-                .ok_or(EngineError::ResourceLimit("carrier length"))?;
+                .ok_or(EngineError::resource_limit("carrier length"))?;
             cost = cost
                 .checked_add(packet.metadata().map_or(512, |packet| {
                     (packet.len() as usize)
                         .saturating_mul(2)
                         .saturating_add(512)
                 }))
-                .ok_or(EngineError::ResourceLimit("carrier manifest"))?;
+                .ok_or(EngineError::resource_limit("carrier manifest"))?;
         }
         if next != range.end {
             return Err(EngineError::InvalidState(
@@ -109,9 +109,14 @@ impl CarrierPlan {
             ));
         }
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained carrier manifest"));
+            return Err(EngineError::budget_limit(
+                "retained carrier manifest",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
+        let reservation = options.memory.reserve_as(MemoryCategory::Caches, cost)?;
         let entries: Vec<Entry> = packets
             .iter()
             .map(|packet| match (packet.metadata(), packet.payload()) {
@@ -177,13 +182,21 @@ impl CarrierPlan {
                 indices
                     .len()
                     .checked_mul(512)
-                    .ok_or(EngineError::ResourceLimit("replacement indices"))?,
+                    .ok_or(EngineError::resource_limit("replacement indices"))?,
             )
-            .ok_or(EngineError::ResourceLimit("replacement manifest"))?;
+            .ok_or(EngineError::resource_limit("replacement manifest"))?;
         if cost > session.options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained replacement manifest"));
+            return Err(EngineError::budget_limit(
+                "retained replacement manifest",
+                cost,
+                session.options.retained_bytes,
+                session.options.retained_bytes,
+            ));
         }
-        let reservation = session.options.memory.reserve(cost)?;
+        let reservation = session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::Caches, cost)?;
         let mut entries: Vec<Entry> = session
             .input
             .packets()
@@ -239,7 +252,7 @@ impl CarrierPlan {
                     }
                 })
             })
-            .ok_or(EngineError::ResourceLimit("replacement length"))?;
+            .ok_or(EngineError::resource_limit("replacement length"))?;
         Ok(Self {
             id: set.input_set_id(),
             scratch_rows: Self::count_recovery(&entries),
@@ -266,7 +279,7 @@ impl CarrierPlan {
     pub fn scratch_bytes(&self, block_size: u64) -> EngineResult<u64> {
         block_size
             .checked_mul(self.scratch_rows as u64)
-            .ok_or(EngineError::ResourceLimit("carrier scratch size"))
+            .ok_or(EngineError::resource_limit("carrier scratch size"))
     }
 
     fn count_recovery(entries: &[Entry]) -> usize {
@@ -311,7 +324,7 @@ impl CarrierPlan {
             ));
         }
         if session.options.open_handles < 3 {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "carrier reconstruction requires three handles",
             ));
         }
@@ -322,11 +335,12 @@ impl CarrierPlan {
             )
             .into());
         }
-        let _reuse_memory = session.options.memory.reserve(
+        let _reuse_memory = session.options.memory.reserve_as(
+            MemoryCategory::Caches,
             self.entries
                 .len()
                 .checked_mul(256)
-                .ok_or(EngineError::ResourceLimit("carrier reuse map"))?,
+                .ok_or(EngineError::resource_limit("carrier reuse map"))?,
         )?;
         let mut reusable = BTreeMap::new();
         for entry in &self.entries {
@@ -395,11 +409,12 @@ impl CarrierPlan {
                 }
             }
         }
-        let _work = session.options.memory.reserve(
+        let _work = session.options.memory.reserve_as(
+            MemoryCategory::CodecScratch,
             slots
                 .len()
                 .checked_mul(256)
-                .ok_or(EngineError::ResourceLimit("carrier equations"))?,
+                .ok_or(EngineError::resource_limit("carrier equations"))?,
         )?;
         let scratch_file = crate::session_repair::ScratchFile::new(
             &scratch_directory.join("carrier-spool"),
@@ -412,7 +427,7 @@ impl CarrierPlan {
         scratch.set_len(
             (slots.len() as u64)
                 .checked_mul(set.block_size())
-                .ok_or(EngineError::ResourceLimit("carrier scratch size"))?,
+                .ok_or(EngineError::resource_limit("carrier scratch size"))?,
         )?;
         for matrix in slots
             .keys()
@@ -429,15 +444,14 @@ impl CarrierPlan {
             match packet.body() {
                 PacketBody::CauchyMatrix(description) => {
                     let range = block_range(description.range, set.block_count())?;
-                    let _field =
-                        session
-                            .options
-                            .memory
-                            .reserve(if set.galois_field().size == 2 {
-                                512 << 10
-                            } else {
-                                4096
-                            })?;
+                    let _field = session.options.memory.reserve_as(
+                        MemoryCategory::CodecTables,
+                        if set.galois_field().size == 2 {
+                            512 << 10
+                        } else {
+                            4096
+                        },
+                    )?;
                     match crate::gf::for_set(&set.galois_field())? {
                         crate::gf::AnyField::Gf8(field) => {
                             encode_cauchy(session, matrix, range, &slots, &mut scratch, field)?
@@ -459,7 +473,10 @@ impl CarrierPlan {
                     )?;
                     geometry.validate_field(set.galois_field())?;
                     let stripe = session.options.stripe_bytes.min(64 << 10);
-                    let _buffer = session.options.memory.reserve(stripe)?;
+                    let _buffer = session
+                        .options
+                        .memory
+                        .reserve_as(MemoryCategory::SourceScratch, stripe)?;
                     let mut covered = vec![0; stripe];
                     let mut options = session.options.clone();
                     options.stripe_bytes = stripe;
@@ -519,11 +536,12 @@ impl CarrierPlan {
             .write(true)
             .open_budgeted(temporary, &session.options)?;
         let stripe = session.options.stripe_bytes.min(64 << 10);
-        let _buffers = session.options.memory.reserve(
+        let _buffers = session.options.memory.reserve_as(
+            MemoryCategory::OutputStaging,
             stripe
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(512))
-                .ok_or(EngineError::ResourceLimit("carrier output buffers"))?,
+                .ok_or(EngineError::resource_limit("carrier output buffers"))?,
         )?;
         let mut bytes = vec![0; stripe];
         let mut covered = vec![0; stripe];
@@ -646,10 +664,11 @@ fn encode_cauchy<F: Field>(
     if stripe == 0 || !set.block_size().is_multiple_of(F::SYMBOL_BYTES as u64) {
         return Err(EngineError::InvalidState("carrier field alignment"));
     }
-    let _buffers = session.options.memory.reserve(
+    let _buffers = session.options.memory.reserve_as(
+        MemoryCategory::CodecScratch,
         stripe
             .checked_mul(3)
-            .ok_or(EngineError::ResourceLimit("carrier encoding stripes"))?,
+            .ok_or(EngineError::resource_limit("carrier encoding stripes"))?,
     )?;
     let mut input = vec![0; stripe];
     let mut covered = vec![0; stripe];

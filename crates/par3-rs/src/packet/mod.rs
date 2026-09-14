@@ -260,7 +260,91 @@ pub struct Packet {
     body: PacketBody,
 }
 
+/// Bytes charged for one `BTreeMap` entry.
+///
+/// The standard map packs up to eleven pairs into a node and splits a node when
+/// it fills, so a live map holds between one and two slots per entry, plus each
+/// node's own length, edge and parent bookkeeping. Charging two slots and a
+/// fixed node allowance bounds both shapes without measuring the tree.
+pub(crate) const fn btree_entry_bytes<K, V>() -> usize {
+    2 * (size_of::<K>() + size_of::<V>()) + 32
+}
+
+/// Bytes charged for one `HashMap` entry.
+///
+/// The table stores one control byte per slot and grows at seven eighths load,
+/// so a live table holds fewer than two slots per entry. The allowance also
+/// covers the transient old/new overlap while a table doubles.
+pub(crate) const fn hash_entry_bytes<K, V>() -> usize {
+    2 * (size_of::<K>() + size_of::<V>() + 1) + 8
+}
+
+impl PacketBody {
+    /// Bytes this body owns beyond its own value, from real container
+    /// capacities. Parsed bodies allocate exactly, so capacity equals length.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Creator(this) => this.as_bytes().len(),
+            Self::Comment(this) => this.as_bytes().len(),
+            Self::Start(_)
+            | Self::CauchyMatrix(_)
+            | Self::SparseRandomMatrix(_)
+            | Self::FftMatrix(_) => 0,
+            Self::Data(this) => this.data.capacity(),
+            Self::ExternalData(this) => this.checksums.capacity() * size_of::<BlockChecksum>(),
+            Self::ExplicitMatrix(this) => {
+                this.entries.capacity() * size_of::<ExplicitMatrixEntry>()
+            }
+            Self::RecoveryData(this) => this.data.capacity(),
+            Self::RecoveryExternalData(this) => {
+                this.checksums.capacity() * size_of::<BlockChecksum>()
+            }
+            Self::File(this) => this.heap_bytes(),
+            Self::Directory(this) => this.heap_bytes(),
+            Self::Root(this) => {
+                this.option_hashes.capacity() * size_of::<Fingerprint>()
+                    + this.children.capacity() * size_of::<Fingerprint>()
+            }
+            Self::Opaque { body, .. } => body.capacity(),
+        }
+    }
+}
+
+impl FilePacket {
+    /// Heap bytes this packet's own containers hold, measured from capacities.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.name.capacity()
+            + self.option_hashes.capacity() * size_of::<Fingerprint>()
+            + self.chunks.capacity() * size_of::<ChunkDescription>()
+            + self
+                .chunks
+                .iter()
+                .map(|chunk| match chunk {
+                    ChunkDescription::Protected {
+                        tail: ChunkTail::Inline(bytes),
+                        ..
+                    } => bytes.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+    }
+}
+
+impl DirectoryPacket {
+    /// Heap bytes this packet's own containers hold, measured from capacities.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.name.capacity()
+            + self.option_hashes.capacity() * size_of::<Fingerprint>()
+            + self.children.capacity() * size_of::<Fingerprint>()
+    }
+}
+
 impl Packet {
+    /// Bytes one owned copy of this packet occupies, value and heap together.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        size_of::<Self>() + self.body.heap_bytes()
+    }
+
     /// Build a packet, computing its header hash from the body.
     #[must_use]
     pub fn new(input_set_id: InputSetId, body: PacketBody) -> Self {

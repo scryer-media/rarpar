@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};
 use crate::{Fingerprint, FingerprintHasher};
 
@@ -66,7 +66,11 @@ impl PlacedExtent {
 
     pub(crate) fn rehome(&mut self, options: &ExecutionOptions) -> EngineResult<()> {
         if !self._reservation.belongs_to(&options.memory) {
-            self._reservation = Arc::new(options.memory.reserve(self._reservation.bytes())?);
+            self._reservation = Arc::new(
+                options
+                    .memory
+                    .reserve_as(self._reservation.category(), self._reservation.bytes())?,
+            );
         }
         Ok(())
     }
@@ -122,7 +126,7 @@ pub fn search_extent(
         }
     };
     let window =
-        usize::try_from(window).map_err(|_| EngineError::ResourceLimit("placement window"))?;
+        usize::try_from(window).map_err(|_| EngineError::resource_limit("placement window"))?;
     if window == 0 || window as u64 > length {
         return Err(EngineError::InvalidState("invalid placement window"));
     }
@@ -131,12 +135,14 @@ pub fn search_extent(
         .checked_add(
             stripe
                 .checked_mul(2)
-                .ok_or(EngineError::ResourceLimit("placement buffers"))?,
+                .ok_or(EngineError::resource_limit("placement buffers"))?,
         )
         .and_then(|size| size.checked_add(8192))
         .and_then(|size| size.checked_add(candidates.len().checked_mul(32)?))
-        .ok_or(EngineError::ResourceLimit("placement buffers"))?;
-    let _buffers = options.memory.reserve(size)?;
+        .ok_or(EngineError::resource_limit("placement buffers"))?;
+    let _buffers = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut ring = vec![0; window];
     let mut input = vec![0; stripe];
     let mut confirmation = vec![0; stripe];
@@ -158,7 +164,7 @@ pub fn search_extent(
             continue;
         }
         if report.candidates >= limits.max_candidates {
-            return Err(EngineError::ResourceLimit("placement candidates"));
+            return Err(EngineError::resource_limit("placement candidates"));
         }
         visited.insert(source);
         report.candidates += 1;
@@ -211,9 +217,11 @@ pub fn search_extent(
                     if hash.finalize() == expected {
                         ensure_snapshot(access, source, snapshot)?;
                         if report.matches.len() >= limits.max_matches {
-                            return Err(EngineError::ResourceLimit("placement matches"));
+                            return Err(EngineError::resource_limit("placement matches"));
                         }
-                        let reservation = options.memory.reserve(512)?;
+                        let reservation = options
+                            .memory
+                            .reserve_as(MemoryCategory::LayoutEvidence, 512)?;
                         report.matches.push(PlacedExtent {
                             layout: layout.identity,
                             file,
@@ -265,7 +273,7 @@ pub fn search_extent(
                     if hash.finalize() == expected {
                         ensure_snapshot(access, source, snapshot)?;
                         if report.matches.len() >= limits.max_matches {
-                            return Err(EngineError::ResourceLimit("placement matches"));
+                            return Err(EngineError::resource_limit("placement matches"));
                         }
                         report.matches.push(PlacedExtent {
                             layout: layout.identity,
@@ -274,7 +282,11 @@ pub fn search_extent(
                             source,
                             snapshot,
                             offset: start,
-                            _reservation: Arc::new(options.memory.reserve(512)?),
+                            _reservation: Arc::new(
+                                options
+                                    .memory
+                                    .reserve_as(MemoryCategory::LayoutEvidence, 512)?,
+                            ),
                         });
                     }
                 }
@@ -290,7 +302,7 @@ fn charge(report: &mut PlacementReport, bytes: u64, limits: &PlacementOptions) -
         .read_bytes
         .checked_add(bytes)
         .filter(|bytes| *bytes <= limits.max_read_bytes)
-        .ok_or(EngineError::ResourceLimit("placement read work"))?;
+        .ok_or(EngineError::resource_limit("placement read work"))?;
     Ok(())
 }
 

@@ -182,6 +182,39 @@ engine accounting; it is not a process-RSS limit. Out-of-order verification
 drops incomplete hash work when its budget is exhausted, leaving those extents
 unknown for later reading.
 
+Every reservation names what it is for. `MemoryBudget::ledger()` returns a
+snapshot giving each `MemoryCategory` — carrier and packet storage, resolved
+metadata, layout and evidence, assessment state, caches, queued payloads, codec
+tables, codec scratch, source scratch, worker stacks and output staging — its
+current and peak reserved bytes and how many reservations it has taken. Reading
+the ledger allocates nothing and takes no lock, so a host may sample it from
+another thread while a job runs. Anything the engine reserves without naming a
+category is reported under `Uncategorized`; that count is zero on the verify,
+repair and creation paths.
+
+A refusal says whether it could ever have succeeded.
+`EngineError::ResourceLimit` carries `what`, `need`, `limit` and `available`,
+and `ResourceLimit::cause()` separates two outcomes a host must treat
+differently. `ExceedsLimit` means this request would still be refused if the
+session were alone on the budget with the same options, so no amount of waiting
+helps. `PeerContention` means that with the same options this exact request is
+admitted once other reservations release — those may belong to a peer session
+or to this session's own earlier reservations, and only the host knows which.
+`Unmeasured` covers refusals that were never expressed in bytes and is terminal
+like `ExceedsLimit`. A host queues `PeerContention` and reports the other two as
+terminal. Refusals against a per-session ceiling — `retained_bytes` and the
+limits derived from it — report the session's total demand rather than the
+increment that tripped them, so they classify as terminal, which is what they
+are: nothing else draws on that ceiling.
+
+Metadata resolution is charged for what it allocates rather than for the
+ceiling it might have needed: packet decode, description resolution and
+directory expansion each take their bytes as they go, and what survives is the
+resolved set's measured container capacity, which
+`Par3Set::retained_capacity_bytes()` reports. Directory graphs are still bounded
+— the same packet may hang under many parents, so expansion is charged per
+entry and refused by name rather than by exhaustion.
+
 Windows scanning pins a read-only carrier handle, preventing repeated full-file
 generation hashes after one acquisition hash. Retained packets keep that handle
 alive; drop them before replacing or deleting carriers. All generation hashes

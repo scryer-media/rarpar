@@ -1,6 +1,6 @@
 //! Explicit self-repair from an authenticated embedded carrier manifest.
 
-use crate::runtime::{EngineFile as File, OpenBudgeted};
+use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -117,7 +117,7 @@ impl SelfRepairPlan {
         }
         let carrier = carrier(session, gap.clone())?;
         if carrier.output_bytes() > gap.end - gap.start {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "replacement exceeds authenticated packet gap",
             ));
         }
@@ -145,7 +145,7 @@ impl SelfRepairPlan {
         self.carrier
             .scratch_bytes(block_size)?
             .checked_add(self.carrier.output_bytes())
-            .ok_or(EngineError::ResourceLimit("self-repair scratch size"))
+            .ok_or(EngineError::resource_limit("self-repair scratch size"))
     }
 
     /// Restore to an absent destination, preserving the authenticated original
@@ -178,7 +178,9 @@ impl SelfRepairPlan {
         let options = session.options.clone();
         options.validate()?;
         let size = options.stripe_bytes.min(64 << 10);
-        let _buffer = options.memory.reserve(size + 4096)?;
+        let _buffer = options
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size + 4096)?;
         let mut buffer = vec![0; size];
         let staging = crate::session_repair::ScratchFile::new(destination, &options)?;
         let temporary = staging.path().to_owned();

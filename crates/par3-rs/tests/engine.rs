@@ -10,7 +10,7 @@ use par3_rs::ScanLimits;
 use par3_rs::evidence::{ExtentVerdict, StreamingVerifier, verify_source};
 use par3_rs::ingest::{IncrementalSet, MergeEffect, PacketScanner, ScanEvent};
 use par3_rs::layout::BlockLayout;
-use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget};
+use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget, ResourceLimit};
 use par3_rs::source::{MemorySourceAccess, SourceAccess, SourceId, SourceSnapshot};
 
 struct ArrivingSource {
@@ -238,11 +238,17 @@ fn scan_work_is_cumulative_across_replays_seeks_and_scanners() {
     exact.seek(0).unwrap();
     assert!(matches!(
         exact.poll(),
-        Err(EngineError::ResourceLimit("cumulative scanning work"))
+        Err(EngineError::ResourceLimit(ResourceLimit {
+            what: "cumulative scanning work",
+            ..
+        }))
     ));
     assert!(matches!(
         scan(&options).poll(),
-        Err(EngineError::ResourceLimit("cumulative scanning work"))
+        Err(EngineError::ResourceLimit(ResourceLimit {
+            what: "cumulative scanning work",
+            ..
+        }))
     ));
     assert_eq!(source.reads.load(Ordering::Relaxed), reads);
     // Empty polls are work too: callers cannot retry missing bytes indefinitely.
@@ -260,7 +266,10 @@ fn scan_work_is_cumulative_across_replays_seeks_and_scanners() {
     ));
     assert!(matches!(
         waiting.poll(),
-        Err(EngineError::ResourceLimit("cumulative scanning work"))
+        Err(EngineError::ResourceLimit(ResourceLimit {
+            what: "cumulative scanning work",
+            ..
+        }))
     ));
 }
 

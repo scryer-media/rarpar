@@ -1,6 +1,42 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.2 (unreleased)
+
+- Add a categorised allocation ledger to `MemoryBudget`. `MemoryBudget::ledger`
+  returns a `MemoryLedger` giving each `MemoryCategory` its current and peak
+  reserved bytes and its reservation count. Reading it allocates nothing and
+  takes no lock. Every reservation the engine takes names a category; anything
+  that does not is reported as `MemoryCategory::Uncategorized`.
+- **Breaking:** `EngineError::ResourceLimit` now carries a `ResourceLimit`
+  struct (`what`, `need`, `limit`, `available`) instead of a `&'static str`.
+  `ResourceLimit::cause` distinguishes a request that would still be refused
+  with this session alone on the budget (`LimitCause::ExceedsLimit`) from one
+  that the same options admit once other reservations release
+  (`LimitCause::PeerContention`), so a host can queue the second and refuse the
+  first. The holder in the contended case may be a peer session or this
+  session's own earlier reservations; the engine cannot tell them apart and says
+  so. Refusals measure against the ceiling the session would have alone, and
+  refusals against a per-session ceiling report the session's total demand
+  rather than the increment that tripped them, so neither reads as retryable
+  when waiting cannot help. Patterns of the form `EngineError::ResourceLimit(_)`
+  are unaffected; patterns naming the string need
+  `ResourceLimit { what: "...", .. }`.
+- Charge metadata resolution for the allocations it makes instead of reserving
+  the whole retained ceiling up front. Packet decode, description resolution and
+  directory expansion are charged as they happen, and the charge that survives
+  resolution is the resolved set's measured container capacity
+  (`Par3Set::retained_capacity_bytes`) rather than a flat multiple of the packet
+  bytes it was built from. Sets with many blocks now resolve under ceilings that
+  previously refused them; hostile directory graphs are still refused as
+  `ResourceLimit` naming the limit they hit.
+- Charge retained packets their parsed capacity rather than sixteen times their
+  wire length, and resize a scanner's carrier reservation to the packet it
+  authenticated.
+- Charge GF(2^16) field construction for the `u32` working tables it holds while
+  narrowing, which were previously understated by about 400 KiB, and charge the
+  Cauchy stripe banks for their per-row vector headers.
+
+## 0.3.1 (2026-09-13)
 
 - Add `Par3RepairSession::set_execution_limits` to adjust worker and stripe
   limits between operations without discarding authenticated session evidence.

@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot};
 use crate::{Fingerprint, FingerprintHasher};
 
@@ -61,7 +61,11 @@ impl FileEvidence {
 
     pub(crate) fn rehome(&mut self, options: &ExecutionOptions) -> EngineResult<()> {
         if !self._reservation.belongs_to(&options.memory) {
-            self._reservation = Arc::new(options.memory.reserve(self.retained_bytes())?);
+            self._reservation = Arc::new(
+                options
+                    .memory
+                    .reserve_as(self._reservation.category(), self.retained_bytes())?,
+            );
         }
         Ok(())
     }
@@ -196,11 +200,18 @@ impl StreamingVerifier {
             .len()
             .checked_mul(8)
             .and_then(|n| n.checked_add(4096))
-            .ok_or(EngineError::ResourceLimit("verification evidence"))?;
+            .ok_or(EngineError::resource_limit("verification evidence"))?;
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained verification evidence"));
+            return Err(EngineError::budget_limit(
+                "retained verification evidence",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
         let verdicts = description
             .extents
             .iter()
@@ -278,7 +289,10 @@ impl StreamingVerifier {
 
     fn feed_extent(&mut self, index: usize, offset: u64, bytes: &[u8]) -> EngineResult<()> {
         if !self.partial.contains_key(&index) {
-            let reservation = self.options.memory.reserve(4096)?;
+            let reservation = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::QueuedPayloads, 4096)?;
             self.partial.insert(
                 index,
                 Box::new(PartialExtent {
@@ -300,13 +314,14 @@ impl StreamingVerifier {
             if partial.pending.iter().any(|(at, fragment)| {
                 offset < *at + fragment.bytes.len() as u64 && *at < offset + bytes.len() as u64
             }) {
-                return Err(EngineError::ResourceLimit("overlapping pending fragments"));
+                return Err(EngineError::resource_limit("overlapping pending fragments"));
             }
-            let reservation = self.options.memory.reserve(
+            let reservation = self.options.memory.reserve_as(
+                MemoryCategory::QueuedPayloads,
                 bytes
                     .len()
                     .checked_add(128)
-                    .ok_or(EngineError::ResourceLimit("pending fragment"))?,
+                    .ok_or(EngineError::resource_limit("pending fragment"))?,
             )?;
             partial.pending.insert(
                 offset,
@@ -427,7 +442,9 @@ pub fn verify_arrivals(
     ensure_snapshot(access, previous.source, previous.snapshot)?;
     let mut verifier = StreamingVerifier::resume(Arc::clone(&layout), previous, options.clone())?;
     let size = options.stripe_bytes.min(64 << 10);
-    let _buffer = options.memory.reserve(size)?;
+    let _buffer = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut bytes = vec![0; size];
     for (extent, verdict) in layout.files[previous.file]
         .extents
@@ -491,7 +508,9 @@ pub fn verify_source(
     })?;
     let mut verifier = StreamingVerifier::new(layout, file, source, snapshot, options.clone())?;
     let size = options.stripe_bytes.min(64 << 10);
-    let _reservation = options.memory.reserve(size)?;
+    let _reservation = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut buffer = vec![0; size];
     let mut offset = 0;
     if let Some(mut reader) = access.open_sequential(source)? {

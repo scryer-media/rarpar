@@ -9,7 +9,7 @@ use crate::evidence::{ExtentVerdict, FileEvidence, verify_source};
 use crate::ingest::{IncrementalSet, IngestedPacket, MergeEffect, PayloadKind, PayloadRef};
 use crate::layout::{BlockLayout, ExtentKind};
 use crate::packet::{BlockRange, PacketBody};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceAccess, SourceId, ensure_snapshot, read_exact_at};
 use crate::{Fingerprint, InputSetId, Packet, Par3Set};
 
@@ -182,9 +182,12 @@ impl Par3RepairSession {
                 .len()
                 .checked_mul(3)
                 .and_then(|n| n.checked_add(512))
-                .ok_or(EngineError::ResourceLimit("source bindings"))?;
+                .ok_or(EngineError::resource_limit("source bindings"))?;
             self.admit_retained(bytes)?;
-            let reservation = self.options.memory.reserve(bytes)?;
+            let reservation = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::Assessment, bytes)?;
             self.binding_memory.insert(path.to_owned(), reservation);
         }
         self.bindings.insert(path.to_owned(), source);
@@ -409,7 +412,10 @@ impl Par3RepairSession {
                 requirements: Vec::new(),
                 matrix: None,
                 recovery: Vec::new(),
-                _reservation: self.options.memory.reserve(512)?,
+                _reservation: self
+                    .options
+                    .memory
+                    .reserve_as(MemoryCategory::Assessment, 512)?,
             });
             return Ok(self.assessment.as_ref().expect("stored assessment"));
         };
@@ -427,9 +433,12 @@ impl Par3RepairSession {
                         .checked_add(file.extents.len().checked_mul(128)?)
                 })
             })
-            .ok_or(EngineError::ResourceLimit("assessment blocks"))?;
+            .ok_or(EngineError::resource_limit("assessment blocks"))?;
         self.admit_retained(cost)?;
-        let reservation = self.options.memory.reserve(cost)?;
+        let reservation = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::Assessment, cost)?;
         self.verify_missing_sources(&layout, cost)?;
         let mut files = Vec::with_capacity(layout.files.len());
         for file in &layout.files {
@@ -664,10 +673,10 @@ impl Par3RepairSession {
             Some(PacketBody::CauchyMatrix(_))
         ) && assessment.lost_blocks.len() as u64 > self.options.max_cauchy_lost_blocks
         {
-            return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+            return Err(EngineError::resource_limit("Cauchy lost blocks"));
         }
         if self.options.open_handles < 2 {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "repair requires two open handles",
             ));
         }
@@ -705,7 +714,10 @@ impl Par3RepairSession {
                     // Cover roster growth and result bookkeeping before allocation.
                     self.options
                         .memory
-                        .reserve(size_of::<(usize, SourceId, Reservation)>() * 4)
+                        .reserve_as(
+                            MemoryCategory::Assessment,
+                            size_of::<(usize, SourceId, Reservation)>() * 4,
+                        )
                         .map(Some)
                 })();
                 match admission {
@@ -922,13 +934,20 @@ impl Par3RepairSession {
     }
 
     fn admit_retained(&self, additional: usize) -> EngineResult<()> {
-        if self
-            .retained_bytes()
+        let held = self.retained_bytes();
+        if held
             .checked_add(additional)
             .is_none_or(|total| total > self.options.retained_bytes)
         {
-            return Err(EngineError::ResourceLimit(
+            // A per-session ceiling drawn on by this session alone. Report the
+            // total it would need under that ceiling rather than the increment:
+            // the bytes already held are its own and never release while it
+            // lives, so a refusal here can never be waited out.
+            return Err(EngineError::budget_limit(
                 "aggregate retained session state",
+                held.saturating_add(additional),
+                self.options.retained_bytes,
+                self.options.retained_bytes.saturating_sub(held),
             ));
         }
         Ok(())
@@ -982,7 +1001,10 @@ impl Par3RepairSession {
             let finish = (end - offset) as usize;
             ensure_snapshot(self.access.as_ref(), source, snapshot)?;
             if covered[begin..finish].iter().any(|value| *value != 0) {
-                let _scratch = self.options.memory.reserve(4096)?;
+                let _scratch = self
+                    .options
+                    .memory
+                    .reserve_as(MemoryCategory::SourceScratch, 4096)?;
                 let mut scratch = [0; 4096];
                 let mut position = begin;
                 while position < finish {
@@ -1100,7 +1122,7 @@ mod tests {
             }
             if self.retry && source == SourceId(0) {
                 if call == 2 {
-                    return Err(EngineError::ResourceLimit("injected worker pressure").into_io());
+                    return Err(EngineError::resource_limit("injected worker pressure").into_io());
                 }
                 if call == 3 && self.mutate_on_retry {
                     self.changed.store(true, SeqCst);

@@ -3,12 +3,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::packet::{HEADER_SIZE, PacketHeader, PacketType, ParseContext};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::packet::{HEADER_SIZE, PacketHeader, PacketType, ParseContext, btree_entry_bytes};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
+use crate::set::{ExpansionCharge, RESOLUTION_BASE_BYTES, resolution_cost};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};
 use crate::{
     Fingerprint, FingerprintHasher, InputSetId, Packet, Par3Error, Par3Set, ScanLimits, SetLimits,
 };
+
+/// Bytes charged for one retained packet beyond the bytes it holds: its own
+/// value, the map entry that indexes it, and its carrier origin.
+const PACKET_OVERHEAD_BYTES: usize = 512;
+
+/// Granule the directory walk's charges are batched into, so that resolving a
+/// tree of many small entries does not take one atomic round trip per entry.
+const EXPANSION_GRANULE_BYTES: usize = 64 * 1024;
 
 /// Meaning of a lazy packet's data bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +127,9 @@ impl PayloadRef {
         options.validate()?;
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
         let size = options.stripe_bytes.min(64 << 10);
-        let _buffer_reservation = options.memory.reserve(size)?;
+        let _buffer_reservation = options
+            .memory
+            .reserve_as(MemoryCategory::CarrierPackets, size)?;
         let mut buffer = vec![0; size];
         let mut hash = FingerprintHasher::new();
         let mut offset = 24;
@@ -252,24 +263,94 @@ impl IngestedPacket {
             IngestedContents::Payload(payload) => &mut Arc::make_mut(payload).reservation,
         };
         if !reservation.belongs_to(&options.memory) {
-            *reservation = Arc::new(options.memory.reserve(reservation.bytes())?);
+            *reservation = Arc::new(
+                options
+                    .memory
+                    .reserve_as(reservation.category(), reservation.bytes())?,
+            );
         }
         Ok(())
     }
 
+    /// Bytes this packet keeps alive, measured from the structures that exist:
+    /// the parsed body's own container capacities plus the fixed cost of the
+    /// map entry and carrier origin that index it.
     pub(crate) fn retained_bytes(&self) -> usize {
+        let indexed = size_of::<Self>()
+            .saturating_add(btree_entry_bytes::<Fingerprint, Self>())
+            .saturating_add(PACKET_OVERHEAD_BYTES);
         match &self.contents {
-            IngestedContents::Metadata(packet, reservation) => {
-                let _ = reservation;
-                (packet.len() as usize)
-                    .saturating_mul(16)
-                    .saturating_add(512)
-            }
-            IngestedContents::Payload(payload) => {
-                let _ = &payload.reservation;
-                512
-            }
+            IngestedContents::Metadata(packet, _) => packet.owned_bytes().saturating_add(indexed),
+            IngestedContents::Payload(_) => size_of::<PayloadRef>().saturating_add(indexed),
         }
+    }
+}
+
+/// Charges the directory walk's allocations to a live reservation.
+///
+/// The walk is the only part of resolution whose size is not a function of its
+/// input, so it is the only part that pays as it goes. Charges are batched into
+/// granules so a tree of many small entries does not cost one atomic round trip
+/// per entry, and a refusal is stashed so the caller can report the measured
+/// ceiling rather than the walk's own structural limit message.
+struct BudgetCharge<'a> {
+    reservation: &'a mut Reservation,
+    /// Expansion room this walk would have if nothing else held the budget.
+    /// This is the ceiling a refusal is classified against: a walk that does
+    /// not fit here does not fit alone either, so waiting cannot admit it.
+    ceiling: usize,
+    /// Expansion room actually left when the walk started, after peers and this
+    /// session's own earlier reservations. Reported as what was available, and
+    /// never used to decide whether the walk can ever fit.
+    headroom: usize,
+    taken: usize,
+    pending: usize,
+    failure: Option<EngineError>,
+}
+
+impl BudgetCharge<'_> {
+    fn flush(&mut self) -> Result<(), Par3Error> {
+        let bytes = std::mem::take(&mut self.pending);
+        if bytes == 0 {
+            return Ok(());
+        }
+        let next = self.taken.saturating_add(bytes);
+        let refuse = |this: &mut Self, error: EngineError| {
+            this.failure = Some(error);
+            Par3Error::ScanLimitExceeded {
+                reason: "resolving this input set needs more memory than the budget allows"
+                    .to_owned(),
+            }
+        };
+        // Only the uncontended ceiling decides whether this walk can ever fit.
+        // Measuring against the contended headroom would report a walk that
+        // fits alone as terminal the moment a peer happens to hold memory.
+        if next > self.ceiling {
+            let error = EngineError::budget_limit(
+                "metadata expansion",
+                next,
+                self.ceiling,
+                self.headroom.saturating_sub(self.taken),
+            );
+            return Err(refuse(self, error));
+        }
+        // Inside the ceiling, the budget itself is the authority on whether the
+        // bytes are there right now, and its refusal already carries the shape.
+        if let Err(error) = self.reservation.grow_by(bytes) {
+            return Err(refuse(self, error));
+        }
+        self.taken = next;
+        Ok(())
+    }
+}
+
+impl ExpansionCharge for BudgetCharge<'_> {
+    fn charge(&mut self, bytes: usize) -> Result<(), Par3Error> {
+        self.pending = self.pending.saturating_add(bytes);
+        if self.pending < EXPANSION_GRANULE_BYTES {
+            return Ok(());
+        }
+        self.flush()
     }
 }
 
@@ -379,7 +460,9 @@ impl PacketScanner {
             offset: 0,
         })?;
         let size = options.stripe_bytes.clamp(HEADER_SIZE, 64 << 10);
-        let reservation = options.memory.reserve(size * 2)?;
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::CarrierPackets, size * 2)?;
         Ok(Self {
             access,
             source,
@@ -522,20 +605,33 @@ impl PacketScanner {
                 }
                 let retained_len = if prefix_len == 0 {
                     usize::try_from(header.length)
-                        .map_err(|_| EngineError::ResourceLimit("metadata packet size"))?
+                        .map_err(|_| EngineError::resource_limit("metadata packet size"))?
                 } else {
                     0
                 };
+                // Charge the bytes actually about to be allocated: the carrier
+                // copy this scanner buffers, plus the fixed per-packet
+                // bookkeeping. The parsed body is measured and the charge
+                // resized once the packet authenticates.
                 let cost = retained_len
-                    .checked_mul(16)
-                    .and_then(|size| size.checked_add(512))
-                    .ok_or(EngineError::ResourceLimit("metadata packet size"))?;
-                if cost > self.options.retained_bytes
-                    || cost as u64 > self.limits.max_retained_bytes
-                {
-                    return Err(EngineError::ResourceLimit("metadata packet retention"));
+                    .checked_add(PACKET_OVERHEAD_BYTES)
+                    .ok_or(EngineError::resource_limit("metadata packet size"))?;
+                let retention_ceiling = self
+                    .options
+                    .retained_bytes
+                    .min(usize::try_from(self.limits.max_retained_bytes).unwrap_or(usize::MAX));
+                if cost > retention_ceiling {
+                    return Err(EngineError::budget_limit(
+                        "metadata packet retention",
+                        cost,
+                        retention_ceiling,
+                        retention_ceiling,
+                    ));
                 }
-                let reservation = self.options.memory.reserve(cost)?;
+                let reservation = self
+                    .options
+                    .memory
+                    .reserve_as(MemoryCategory::CarrierPackets, cost)?;
                 let mut retained = Vec::with_capacity(retained_len);
                 if prefix_len == 0 {
                     retained.extend_from_slice(&header_bytes);
@@ -601,21 +697,33 @@ impl PacketScanner {
                         .len
                         .saturating_mul(self.limits.max_failed_hash_passes)
                 {
-                    return Err(EngineError::ResourceLimit("failed packet hashing work"));
+                    return Err(EngineError::resource_limit("failed packet hashing work"));
                 }
                 self.offset = candidate.offset + 8;
                 continue;
             }
             if self.packets >= self.limits.max_packets {
-                return Err(EngineError::ResourceLimit("packet count"));
+                return Err(EngineError::resource_limit("packet count"));
             }
             self.packets += 1;
             self.offset = candidate.offset + candidate.header.length;
             self.at_packet_boundary = true;
+            let mut reservation = candidate.reservation;
+            let retained = candidate.retained;
             let contents = if candidate.prefix_len == 0 {
-                let packet =
-                    Packet::parse(&candidate.retained, candidate.offset, &ParseContext::new())?;
-                IngestedContents::Metadata(Arc::new(packet), Arc::new(candidate.reservation))
+                let packet = Packet::parse(&retained, candidate.offset, &ParseContext::new())?;
+                // The carrier copy and the parsed body overlap until the copy is
+                // dropped, so cover both before releasing down to what survives.
+                let owned = packet
+                    .owned_bytes()
+                    .saturating_add(PACKET_OVERHEAD_BYTES)
+                    .min(isize::MAX as usize);
+                if let Some(growth) = owned.checked_sub(reservation.bytes()) {
+                    reservation.grow_by(growth)?;
+                }
+                drop(retained);
+                reservation.shrink_to(owned);
+                IngestedContents::Metadata(Arc::new(packet), Arc::new(reservation))
             } else {
                 let kind = if candidate.prefix_len == 8 {
                     PayloadKind::Data {
@@ -643,7 +751,7 @@ impl PacketScanner {
                         + candidate.prefix_len as u64,
                     header: candidate.header,
                     kind,
-                    reservation: Arc::new(candidate.reservation),
+                    reservation: Arc::new(reservation),
                 }))
             };
             return Ok(ScanEvent::Packet(IngestedPacket {
@@ -715,9 +823,18 @@ impl IncrementalSet {
         let retained = self
             .retained
             .checked_add(packet.retained_bytes())
-            .ok_or(EngineError::ResourceLimit("retained metadata"))?;
+            .ok_or(EngineError::resource_limit("retained metadata"))?;
         if retained > self.options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained metadata"));
+            // `retained_bytes` is this session's own ceiling: nobody else draws
+            // on it and it only grows, so waiting never admits the packet. The
+            // demand reported is the session total under that ceiling, not this
+            // packet's increment, or the refusal would read as contention.
+            return Err(EngineError::budget_limit(
+                "retained metadata",
+                retained,
+                self.options.retained_bytes,
+                self.options.retained_bytes.saturating_sub(self.retained),
+            ));
         }
         packet.rehome(&self.options)?;
         let effect = if packet.payload().is_some() {
@@ -785,20 +902,19 @@ impl IncrementalSet {
         use crate::packet::PacketBody;
         let mut has_start = false;
         let mut has_root = false;
-        let mut fixed = 8192usize;
+        // What resolution allocates before the tree is walked: one clone of each
+        // retained body plus the maps that index them, measured from the
+        // packets that exist rather than from a multiple of their wire length.
+        let mut working = RESOLUTION_BASE_BYTES;
         let mut entry_cost = 1024usize;
         for packet in self.packets.values().filter_map(IngestedPacket::metadata) {
             self.options.cancel.check()?;
             has_start |= matches!(packet.body(), PacketBody::Start(_));
             has_root |= matches!(packet.body(), PacketBody::Root(_));
-            let cost = usize::try_from(packet.len())
-                .ok()
-                .and_then(|n| n.checked_mul(16))
-                .and_then(|n| n.checked_add(1024))
-                .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
-            fixed = fixed
+            let cost = resolution_cost(packet);
+            working = working
                 .checked_add(cost)
-                .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
+                .ok_or(EngineError::resource_limit("resolved metadata"))?;
             if matches!(
                 packet.body(),
                 PacketBody::File(_) | PacketBody::Directory(_)
@@ -809,13 +925,32 @@ impl IncrementalSet {
         if !has_start || !has_root {
             return Ok(None);
         }
-        // Reserve before cloning or expanding a shared metadata graph. Split
-        // expansion headroom between owned entry descriptions and path copies.
-        let ceiling = retained_limit.min(self.options.memory.available());
-        let extra = ceiling
-            .checked_sub(fixed)
-            .ok_or(EngineError::ResourceLimit("resolved metadata"))?;
-        let mut reservation = self.options.memory.reserve(ceiling)?;
+
+        // Only the working set is reserved up front. Everything the directory
+        // walk materialises is charged as it is materialised, so a set that
+        // resolves small is never asked to fit the whole retained ceiling.
+        let available = self.options.memory.available();
+        let ceiling = retained_limit.min(available);
+        // The same ceiling computed as if this session were alone on the budget.
+        // Every refusal below is classified against this figure rather than the
+        // contended one: a set that resolves alone must never be reported as
+        // terminal merely because a peer holds memory at this instant.
+        let uncontended = retained_limit.min(self.options.memory.limit());
+        let Some(extra) = ceiling.checked_sub(working) else {
+            return Err(EngineError::budget_limit(
+                "resolved metadata",
+                working,
+                uncontended,
+                available,
+            ));
+        };
+        let mut reservation = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::ResolvedMetadata, working)?;
+
+        // Split the expansion headroom between owned entry descriptions and the
+        // path text they carry, exactly as the pre-reserved ceiling did.
         let limits = SetLimits {
             max_entries: (extra / 2 / entry_cost).min(SetLimits::DEFAULT_MAX_ENTRIES),
             max_path_bytes: (extra / 8) as u64,
@@ -827,31 +962,46 @@ impl IncrementalSet {
             .filter_map(IngestedPacket::metadata)
             .cloned()
             .collect();
-        match Par3Set::from_packets_for_with_limits(packets, self.id, &limits) {
+
+        let mut charge = BudgetCharge {
+            reservation: &mut reservation,
+            ceiling: uncontended.saturating_sub(working),
+            headroom: extra,
+            taken: 0,
+            pending: 0,
+            failure: None,
+        };
+        let mut resolved =
+            Par3Set::from_packets_for_charged(packets, self.id, &limits, &mut charge);
+        if resolved.is_ok()
+            && let Err(error) = charge.flush()
+        {
+            resolved = Err(error);
+        }
+        let refusal = charge.failure.take();
+        drop(charge);
+
+        match resolved {
             Ok(set) => {
-                let entries = set
-                    .files()
-                    .len()
-                    .checked_add(set.directories().len())
-                    .ok_or(EngineError::ResourceLimit("resolved entries"))?;
-                let paths = set
-                    .files()
-                    .iter()
-                    .map(|file| file.path().len())
-                    .chain(
-                        set.directories()
-                            .iter()
-                            .map(|directory| directory.path().len()),
-                    )
-                    .try_fold(0usize, |sum, len| sum.checked_add(len))
-                    .ok_or(EngineError::ResourceLimit("resolved paths"))?;
-                let actual = entries
-                    .checked_mul(entry_cost)
-                    .and_then(|n| n.checked_add(paths.checked_mul(4)?))
-                    .and_then(|n| n.checked_add(fixed))
-                    .filter(|n| *n <= ceiling)
-                    .ok_or(EngineError::ResourceLimit("resolved metadata accounting"))?;
-                reservation.shrink_to(actual);
+                // What survives resolution is the set itself: the working copies
+                // and index maps are already gone. Charge its real capacity.
+                let actual = set
+                    .retained_capacity_bytes()
+                    .checked_add(RESOLUTION_BASE_BYTES)
+                    .ok_or(EngineError::resource_limit("resolved metadata accounting"))?;
+                if actual > retained_limit {
+                    return Err(EngineError::budget_limit(
+                        "resolved metadata",
+                        actual,
+                        uncontended,
+                        available,
+                    ));
+                }
+                if let Some(growth) = actual.checked_sub(reservation.bytes()) {
+                    reservation.grow_by(growth)?;
+                } else {
+                    reservation.shrink_to(actual);
+                }
                 Ok(Some((set, reservation)))
             }
             Err(
@@ -860,9 +1010,22 @@ impl IncrementalSet {
                 | Par3Error::MissingChildPacket { .. }
                 | Par3Error::UnknownInputSet { .. },
             ) => Ok(None),
-            Err(Par3Error::ScanLimitExceeded { .. }) => {
-                Err(EngineError::ResourceLimit("metadata expansion"))
-            }
+            Err(Par3Error::ScanLimitExceeded { .. }) => Err(refusal.unwrap_or_else(|| {
+                // The walk stopped on a structural bound derived from `extra`,
+                // which means it needs strictly more room than it was given but
+                // stops before it can say how much more. Report it as a total
+                // demand against the uncontended resolution ceiling: when the
+                // walk already had that whole ceiling nothing can release to
+                // grow it, so name one byte past it and the refusal reads as
+                // terminal; otherwise the difference is held by someone else
+                // and releasing it admits this same walk.
+                let need = if ceiling < uncontended {
+                    ceiling
+                } else {
+                    uncontended.saturating_add(1)
+                };
+                EngineError::budget_limit("metadata expansion", need, uncontended, ceiling)
+            })),
             Err(error) => Err(error.into()),
         }
     }
@@ -881,5 +1044,78 @@ impl IncrementalSet {
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.retained
+    }
+}
+
+#[cfg(test)]
+mod charge_classification_tests {
+    //! The directory walk is charged against two different ceilings, and which
+    //! one a refusal names decides whether a host retries or fails the job.
+    //! `BudgetCharge` is private, so these drive it directly rather than trying
+    //! to steer a whole resolution onto the branch under test.
+    use super::{BudgetCharge, EXPANSION_GRANULE_BYTES, ExpansionCharge};
+    use crate::runtime::{EngineError, LimitCause, MemoryBudget, MemoryCategory};
+
+    #[test]
+    fn a_walk_that_fits_alone_is_retryable_when_something_else_holds_the_budget() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut reservation = budget
+            .reserve_as(MemoryCategory::ResolvedMetadata, 4096)
+            .unwrap();
+        // Everything but a sliver is spoken for, so the walk cannot take the
+        // bytes now even though the ceiling it is measured against has room.
+        let peer = budget
+            .reserve_as(MemoryCategory::Caches, budget.available() - 4096)
+            .unwrap();
+        let mut charge = BudgetCharge {
+            reservation: &mut reservation,
+            ceiling: 512 << 10,
+            headroom: 8192,
+            taken: 0,
+            pending: 0,
+            failure: None,
+        };
+        charge
+            .charge(EXPANSION_GRANULE_BYTES)
+            .expect_err("the budget has no room for a granule");
+        let failure = charge.failure.take().expect("a refusal is recorded");
+        let EngineError::ResourceLimit(limit) = failure else {
+            panic!("expected a measured resource limit: {failure:?}");
+        };
+        assert_eq!(
+            limit.cause(),
+            LimitCause::PeerContention,
+            "this walk fits the uncontended ceiling, so waiting admits it: {limit}"
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn a_walk_that_outgrows_the_uncontended_ceiling_is_terminal() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut reservation = budget
+            .reserve_as(MemoryCategory::ResolvedMetadata, 4096)
+            .unwrap();
+        let mut charge = BudgetCharge {
+            reservation: &mut reservation,
+            ceiling: EXPANSION_GRANULE_BYTES / 2,
+            headroom: EXPANSION_GRANULE_BYTES / 2,
+            taken: 0,
+            pending: 0,
+            failure: None,
+        };
+        charge
+            .charge(EXPANSION_GRANULE_BYTES)
+            .expect_err("the walk wants more than it could ever have");
+        let failure = charge.failure.take().expect("a refusal is recorded");
+        let EngineError::ResourceLimit(limit) = failure else {
+            panic!("expected a measured resource limit: {failure:?}");
+        };
+        assert_eq!(limit.what, "metadata expansion");
+        assert_eq!(
+            limit.cause(),
+            LimitCause::ExceedsLimit,
+            "no release can grow the uncontended ceiling: {limit}"
+        );
     }
 }

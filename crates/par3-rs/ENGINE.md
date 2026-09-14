@@ -118,6 +118,43 @@ process RSS; provider storage and allocator bookkeeping are outside that count.
 and measurement. Set explicit worker limits when Weaver schedules concurrent
 jobs. Clone the same memory, handle, and scan-work budgets to share ceilings.
 
+`MemoryBudget::ledger()` attributes those reservations. It returns a snapshot of
+every `MemoryCategory` — carrier and packet storage, resolved metadata, layout
+and evidence, assessment state, caches, queued payloads, codec tables, codec
+scratch, source scratch, worker stacks and output staging — with current bytes,
+peak bytes and reservation count. The snapshot allocates nothing and takes no
+lock, so a host may sample it from another thread during a job. Categories are
+sampled independently: their peaks need not have occurred together, and their
+sum is not the budget's own peak. Reservations taken without a category appear
+as `Uncategorized`, which stays at zero on the verify, repair and creation paths.
+
+A refusal states whether it could ever have succeeded.
+`EngineError::ResourceLimit` carries `{ what, need, limit, available }`, and
+`ResourceLimit::cause()` returns `ExceedsLimit` when `need > limit`, meaning
+this request would still be refused if this session were alone on the budget
+with the same options; the outcome is terminal. It returns `PeerContention` when
+`need` fits the ceiling, meaning that with the same options this exact request
+is admitted once other reservations release. Which reservations those are is not
+something the engine can say: the holder may be a peer session on the same
+budget, or this session's own earlier reservations — layout, evidence and
+assessment state are all still held when codec scratch is requested — so the
+host decides using its own knowledge of what it has in flight. `Unmeasured`
+marks the structural refusals that have no byte count, such as an exhausted
+packet-count or scanning-work ceiling; treat it as terminal.
+
+Two rules keep the classification honest, and both matter to a host that
+requeues on contention. Refusals are measured against the ceiling this session
+would have *alone*: metadata expansion compares its demand to
+`min(retained_bytes, budget.limit())`, never to `budget.available()`, so a walk
+that fits alone is never reported as terminal because a peer happens to hold
+memory at that instant. And a refusal against a per-session ceiling —
+`retained_bytes`, `max_retained_bytes`, the aggregate retained session state, and
+the `SetLimits` derived from them — reports the session's *total* demand under
+that ceiling rather than the increment that tripped it, because nothing else
+draws on that ceiling and waiting can never admit the request. Weaver should map
+`PeerContention` to "waiting for memory" and both `ExceedsLimit` and
+`Unmeasured` to "does not fit".
+
 `max_cauchy_lost_blocks` separately caps each Cauchy solve at 4,096 losses by
 default. The limit is checked before staging or building the quadratic
 coefficient matrix; callers may explicitly raise it. FFT selection and carrier
@@ -152,12 +189,20 @@ with unprotected ranges that require explicit self-repair. Dry-run consumers sho
 it instead of treating `Ready` as an unconditional execution guarantee. Sources
 can still change and later allocations or output I/O can fail.
 
-Packet admission charges parsed structures as well as wire bytes. Resolving
-shared directory/file descriptions has a separate reservation and expansion
-limits derived from remaining memory and retained-state headroom. Sessions keep
-that reservation for the resolved set's lifetime. The `IncrementalSet::metadata`
-convenience method budgets construction but transfers the returned legacy set
-to the caller; use a session for retained accounting. Assessment charges include
+Packet admission charges parsed structures as well as wire bytes: an
+authenticated packet is charged its parsed container capacity, not a multiple of
+its wire length. Resolving shared directory/file descriptions has a separate
+reservation, and expansion limits are still derived from remaining memory and
+retained-state headroom. Resolution now takes its bytes as it allocates them —
+one working charge for decoding and indexing the packets, then a per-entry
+charge as the directory walk materialises paths, descriptions and frames — and
+resizes to the resolved set's measured container capacity when it finishes.
+`Par3Set::retained_capacity_bytes()` reports that measurement. A failed charge
+part-way through releases everything the resolution took, and a graph that
+expands past its headroom fails as a named `ResourceLimit` rather than by
+exhaustion. Sessions keep that reservation for the resolved set's lifetime. The
+`IncrementalSet::metadata` convenience method budgets construction but transfers
+the returned legacy set to the caller; use a session for retained accounting. Assessment charges include
 cohort candidates, recovery references, file paths, damage ranges, and temporary
 coverage unions. Incomplete streaming hashes are boxed so one pending extent
 does not multiply large hasher storage across unused tree-node slots.

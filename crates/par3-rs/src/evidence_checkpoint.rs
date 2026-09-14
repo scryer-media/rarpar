@@ -1,7 +1,7 @@
 //! Versioned evidence persistence; the host retains the digest in trusted storage.
 use super::{ExtentVerdict, FileEvidence};
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceId, SourceSnapshot};
 use std::sync::Arc;
 
@@ -46,14 +46,21 @@ impl FileEvidence {
         let _progress = options.stage(crate::runtime::Stage::Checkpoint)?;
         let size = HEADER
             .checked_add(self.verdicts.len())
-            .ok_or(EngineError::ResourceLimit("evidence checkpoint"))?;
+            .ok_or(EngineError::resource_limit("evidence checkpoint"))?;
         let cost = size
             .checked_add(256)
-            .ok_or(EngineError::ResourceLimit("evidence checkpoint"))?;
+            .ok_or(EngineError::resource_limit("evidence checkpoint"))?;
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained evidence checkpoint"));
+            return Err(EngineError::budget_limit(
+                "retained evidence checkpoint",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&self.layout);
@@ -97,7 +104,12 @@ impl FileEvidence {
     ) -> EngineResult<Self> {
         let _progress = options.stage(crate::runtime::Stage::Checkpoint)?;
         if bytes.len() > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained evidence checkpoint"));
+            return Err(EngineError::budget_limit(
+                "retained evidence checkpoint",
+                bytes.len(),
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
         if digest(bytes, options)? != trusted_digest {
             return Err(EngineError::InvalidState(
@@ -111,7 +123,7 @@ impl FileEvidence {
         let file = usize::try_from(number(24))
             .map_err(|_| EngineError::InvalidState("checkpoint file index"))?;
         let count = usize::try_from(number(64))
-            .map_err(|_| EngineError::ResourceLimit("checkpoint extents"))?;
+            .map_err(|_| EngineError::resource_limit("checkpoint extents"))?;
         let description = layout
             .files
             .get(file)
@@ -143,11 +155,18 @@ impl FileEvidence {
         let cost = count
             .checked_mul(8)
             .and_then(|n| n.checked_add(4096))
-            .ok_or(EngineError::ResourceLimit("verification evidence"))?;
+            .ok_or(EngineError::resource_limit("verification evidence"))?;
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained verification evidence"));
+            return Err(EngineError::budget_limit(
+                "retained verification evidence",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
         let mut verdicts = Vec::with_capacity(count);
         for (state, extent) in bytes[HEADER..].iter().zip(&description.extents) {
             options.cancel.check()?;

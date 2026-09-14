@@ -6,7 +6,7 @@ use super::Par3RepairSession;
 use crate::FingerprintHasher;
 use crate::ingest::{PayloadKind, PayloadRef};
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
 pub(super) const ADMISSION_BYTES: usize = 1024;
 
@@ -52,7 +52,10 @@ impl Par3RepairSession {
                 ));
             }
             self.admit_retained(ADMISSION_BYTES)?;
-            let reservation = self.options.memory.reserve(ADMISSION_BYTES)?;
+            let reservation = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::Caches, ADMISSION_BYTES)?;
             if !validate_extents(layout, index, payload, &self.options)? {
                 // Keep the payload pending until checksum metadata arrives.
                 continue;
@@ -94,8 +97,10 @@ fn validate_extents(
         .len()
         .checked_mul(256)
         .and_then(|n| n.checked_add(size))
-        .ok_or(EngineError::ResourceLimit("Data extent validation"))?;
-    let _memory = options.memory.reserve(bookkeeping)?;
+        .ok_or(EngineError::resource_limit("Data extent validation"))?;
+    let _memory = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, bookkeeping)?;
     let mut expected = BTreeMap::new();
     for location in locations {
         let extent = &layout.files[location.file].extents[location.extent];
@@ -164,7 +169,9 @@ fn compare_aliases(
     options: &ExecutionOptions,
 ) -> EngineResult<()> {
     let size = options.stripe_bytes.min(64 << 10);
-    let _memory = options.memory.reserve(size * 2)?;
+    let _memory = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut a = vec![0; size];
     let mut b = vec![0; size];
     let mut at = 0;

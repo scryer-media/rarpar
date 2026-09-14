@@ -1,6 +1,6 @@
 //! Striped repair and verified installation for retained sessions.
 
-use crate::runtime::{EngineFile as File, ExecutionOptions, OpenBudgeted};
+use crate::runtime::{EngineFile as File, ExecutionOptions, MemoryCategory, OpenBudgeted};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -126,8 +126,11 @@ fn repair_inner(
                 .and_then(|n| n.checked_add(2048))
                 .and_then(|n| n.checked_add(sum))
         })
-        .ok_or(EngineError::ResourceLimit("repair output paths"))?;
-    let _paths = session.options.memory.reserve(path_cost)?;
+        .ok_or(EngineError::resource_limit("repair output paths"))?;
+    let _paths = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::OutputStaging, path_cost)?;
     let mut staged = Vec::new();
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
@@ -154,12 +157,12 @@ fn repair_inner(
     {
         reconstruct_fft(session, layout, &staged, matrix)?;
     } else {
-        let field_bytes = if session.set.as_ref().expect("ready set").galois_field().size == 2 {
-            512 << 10
-        } else {
-            4096
-        };
-        let _field_reservation = session.options.memory.reserve(field_bytes)?;
+        let field_bytes =
+            crate::gf::construction_cost(&session.set.as_ref().expect("ready set").galois_field());
+        let _field_reservation = session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
         let field = crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
         match field {
             crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &staged, field)?,
@@ -215,7 +218,7 @@ pub(crate) fn stage_embedded(
         return Err(EngineError::InvalidState("embedded repair is not ready"));
     }
     if session.options.open_handles < 3 {
-        return Err(EngineError::ResourceLimit(
+        return Err(EngineError::resource_limit(
             "embedded repair requires three handles",
         ));
     }
@@ -253,14 +256,10 @@ pub(crate) fn stage_embedded(
         copy_available(session, layout, &targets)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
-        let _field = session
-            .options
-            .memory
-            .reserve(if set.galois_field().size == 2 {
-                512 << 10
-            } else {
-                4096
-            })?;
+        let _field = session.options.memory.reserve_as(
+            MemoryCategory::CodecTables,
+            crate::gf::construction_cost(&set.galois_field()),
+        )?;
         match crate::gf::for_set(&set.galois_field())? {
             crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &targets, field)?,
             crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &targets, field)?,
@@ -297,7 +296,10 @@ fn copy_available(
     // Data packets, aliases and inline-only files require no field or matrix.
     // In particular, the reference emits field size zero for degenerate codes.
     let size = session.options.stripe_bytes.min(64 << 10);
-    let _memory = session.options.memory.reserve(size * 2)?;
+    let _memory = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
     for (&block, locations) in &layout.blocks {
@@ -327,6 +329,18 @@ fn copy_available(
     Ok(())
 }
 
+/// Bytes building the Cauchy inverse costs at its peak.
+///
+/// [`crate::cauchy::inverse_coefficients`] returns the `n` by `n` inverse and,
+/// while it computes it, holds four vectors of `n` symbols — the two node sets
+/// and their weight vectors. The per-row allowance also covers the recovery row
+/// bookkeeping the solve is driven from.
+fn cauchy_coefficient_bytes<F: Field>(n: usize) -> Option<usize> {
+    n.checked_mul(n)?
+        .checked_mul(F::SYMBOL_BYTES)?
+        .checked_add(n.checked_mul(64)?)
+}
+
 fn reconstruct<F>(
     session: &Par3RepairSession,
     layout: &BlockLayout,
@@ -340,13 +354,16 @@ where
     let mut progress = session.options.stage(crate::runtime::Stage::Decode)?;
     let assessment = session.assessment.as_ref().expect("assessment");
     let lost = &assessment.lost_blocks;
-    let _rows = session.options.memory.reserve(
+    // One `u64` per selected recovery row, collected from an exactly sized
+    // iterator, so the vector is allocated once at its final capacity.
+    let _rows = session.options.memory.reserve_as(
+        MemoryCategory::CodecScratch,
         assessment
             .recovery
             .len()
-            .checked_mul(16)
+            .checked_mul(size_of::<u64>())
             .and_then(|n| n.checked_add(256))
-            .ok_or(EngineError::ResourceLimit("recovery row indices"))?,
+            .ok_or(EngineError::resource_limit("recovery row indices"))?,
     )?;
     let rows: Vec<u64> = assessment
         .recovery
@@ -366,33 +383,43 @@ where
     }
     let n = lost.len();
     if n as u64 > session.options.max_cauchy_lost_blocks {
-        return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+        return Err(EngineError::resource_limit("Cauchy lost blocks"));
     }
-    let coefficient_bytes = n
-        .checked_mul(n)
-        .and_then(|count| count.checked_mul(F::SYMBOL_BYTES))
-        .and_then(|bytes| bytes.checked_add(n.checked_mul(64)?))
-        .ok_or(EngineError::ResourceLimit("Cauchy coefficients"))?;
-    let _coefficients = session.options.memory.reserve(coefficient_bytes)?;
+    let coefficient_bytes = cauchy_coefficient_bytes::<F>(n)
+        .ok_or(EngineError::resource_limit("Cauchy coefficients"))?;
+    let _coefficients = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::CodecTables, coefficient_bytes)?;
     let inverse = crate::cauchy::inverse_coefficients(&field, lost, &rows)?;
+    // Two banks of `n` rows, an input stripe and a coverage stripe, with one
+    // stripe of slack. The banks are vectors of vectors, so their headers are
+    // charged separately: they do not scale with the stripe size, and a small
+    // stripe would otherwise leave thousands of them unpaid for.
     let buffer_count = n
         .checked_mul(2)
         .and_then(|count| count.checked_add(3))
-        .ok_or(EngineError::ResourceLimit("repair stripes"))?;
+        .ok_or(EngineError::resource_limit("repair stripes"))?;
+    let bank_headers = n
+        .checked_mul(2)
+        .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
+        .ok_or(EngineError::resource_limit("repair stripes"))?;
     let pool = crate::runtime::WorkerPool::for_work(
         &session.options,
         n,
         buffer_count
             .checked_mul(F::SYMBOL_BYTES)
-            .ok_or(EngineError::ResourceLimit("minimum repair stripe"))?,
+            .ok_or(EngineError::resource_limit("minimum repair stripe"))?,
     )?;
-    let (stripe, _buffers) = session.options.memory.reserve_stripes(
+    let (stripe, _buffers) = session.options.memory.reserve_stripes_with_overhead(
+        MemoryCategory::CodecScratch,
         session
             .options
             .stripe_bytes
             .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX)),
         buffer_count,
         F::SYMBOL_BYTES,
+        bank_headers,
     )?;
     tracing::debug!(
         stripe_bytes = stripe,
@@ -662,7 +689,10 @@ fn verify_staged(
     let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
     let expected = &layout.files[target.index];
     let size = session.options.stripe_bytes.min(64 << 10);
-    let _buffer = session.options.memory.reserve(size)?;
+    let _buffer = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut buffer = vec![0u8; size];
     let mut file = File::open(&target.temporary, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
@@ -745,7 +775,7 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
             Err(error) => return Err(error),
         }
     }
-    Err(EngineError::ResourceLimit("temporary output names"))
+    Err(EngineError::resource_limit("temporary output names"))
 }
 
 pub(crate) fn install(
@@ -775,7 +805,7 @@ pub(crate) fn install(
                 }
             }
             if saved.is_none() {
-                return Err(EngineError::ResourceLimit("backup names"));
+                return Err(EngineError::resource_limit("backup names"));
             }
         }
         Ok(_) => {}
@@ -904,5 +934,100 @@ mod tests {
     #[test]
     fn install_replaces_an_existing_file_without_a_backup() {
         replacement_keeps_expected_bytes(false);
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::gf::{Gf8, Gf16};
+    use crate::runtime::{MemoryBudget, MemoryCategory};
+
+    /// The coefficient charge is taken before `inverse_coefficients` runs, so
+    /// it has to cover the vectors that solve builds as well as the inverse it
+    /// keeps — and must not ask for so much more that a solvable set is refused.
+    #[test]
+    fn cauchy_coefficient_charge_covers_the_solve_and_what_it_returns() {
+        for n in [1usize, 17, 256, 4096] {
+            let lost: Vec<u64> = (0..n as u64).collect();
+            let rows: Vec<u64> = (0..n as u64).collect();
+            let gf16 = Gf16::default();
+            let inverse = crate::cauchy::inverse_coefficients(&gf16, &lost, &rows).unwrap();
+            // What the solve holds at its peak: the returned inverse plus the
+            // four `n`-symbol vectors it is built from.
+            let retained = inverse.capacity() * size_of::<u16>();
+            let peak = retained + 4 * n * size_of::<u16>();
+            let charge = cauchy_coefficient_bytes::<Gf16>(n).unwrap();
+            assert!(
+                charge >= peak,
+                "{n} lost blocks charge {charge} for a {peak} byte solve"
+            );
+            assert!(
+                charge < peak * 2 + 4096,
+                "{n} lost blocks charge {charge}, far above their {peak} byte solve"
+            );
+            assert!(
+                charge > retained,
+                "the charge must outlast nothing but the peak"
+            );
+        }
+        // GF(2^8) symbols are half the width, and the charge must follow.
+        assert!(
+            cauchy_coefficient_bytes::<Gf8>(256).unwrap()
+                < cauchy_coefficient_bytes::<Gf16>(256).unwrap()
+        );
+    }
+
+    /// The stripe banks are vectors of vectors. Their row headers do not scale
+    /// with the stripe, so a small stripe and many lost blocks must still be
+    /// charged for every header.
+    #[test]
+    fn cauchy_stripe_banks_charge_their_row_headers_as_well_as_their_bytes() {
+        for (n, limit) in [(4usize, 1 << 20), (512, 8 << 20), (4096, 64 << 20)] {
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(limit),
+                workers: 1,
+                stripe_bytes: 4096,
+                ..ExecutionOptions::default()
+            };
+            let buffer_count = n * 2 + 3;
+            let bank_headers = n * 2 * size_of::<Vec<u8>>();
+            let (stripe, reservation) = options
+                .memory
+                .reserve_stripes_with_overhead(
+                    MemoryCategory::CodecScratch,
+                    options.stripe_bytes,
+                    buffer_count,
+                    Gf16::SYMBOL_BYTES,
+                    bank_headers,
+                )
+                .unwrap();
+
+            // Exactly what `reconstruct` allocates once the charge is granted.
+            let syndromes = vec![vec![0u8; stripe]; n];
+            let recovered = vec![vec![0u8; stripe]; n];
+            let input = vec![0u8; stripe];
+            let covered = vec![0u8; stripe];
+            let bank = |bank: &Vec<Vec<u8>>| {
+                bank.capacity() * size_of::<Vec<u8>>()
+                    + bank.iter().map(Vec::capacity).sum::<usize>()
+            };
+            let measured =
+                bank(&syndromes) + bank(&recovered) + input.capacity() + covered.capacity();
+            assert!(
+                reservation.bytes() >= measured,
+                "{n} lost blocks charge {} for {measured} bytes of stripe banks",
+                reservation.bytes()
+            );
+            assert!(
+                reservation.bytes() < measured * 2,
+                "{n} lost blocks charge {}, more than twice their {measured} bytes",
+                reservation.bytes()
+            );
+            drop((syndromes, recovered, input, covered));
+            drop(reservation);
+            assert_eq!(options.memory.used(), 0);
+            assert_eq!(options.memory.ledger().current(), 0);
+        }
     }
 }

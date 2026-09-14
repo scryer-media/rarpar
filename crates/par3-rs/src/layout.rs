@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::packet::{ChunkDescription, ChunkTail};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::{Fingerprint, Par3Set};
 
 /// What supplies a protected-file extent.
@@ -127,7 +127,7 @@ impl BlockLayout {
         for file in set.files() {
             path_bytes = path_bytes
                 .checked_add(file.path().len())
-                .ok_or(EngineError::ResourceLimit("layout paths"))?;
+                .ok_or(EngineError::resource_limit("layout paths"))?;
             for chunk in file.chunks() {
                 let amount = match chunk {
                     ChunkDescription::Protected { length, .. } => {
@@ -137,7 +137,7 @@ impl BlockLayout {
                 };
                 count = count
                     .checked_add(amount)
-                    .ok_or(EngineError::ResourceLimit("layout extents"))?;
+                    .ok_or(EngineError::resource_limit("layout extents"))?;
             }
         }
         let cost = usize::try_from(count)
@@ -145,11 +145,18 @@ impl BlockLayout {
             .and_then(|n| n.checked_mul(512))
             .and_then(|n| n.checked_add(set.files().len().checked_mul(256)?))
             .and_then(|n| n.checked_add(path_bytes))
-            .ok_or(EngineError::ResourceLimit("layout extents"))?;
+            .ok_or(EngineError::resource_limit("layout extents"))?;
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained layout"));
+            return Err(EngineError::budget_limit(
+                "retained layout",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
         let mut result = Self {
             files: Vec::with_capacity(set.files().len()),
             blocks: BTreeMap::new(),

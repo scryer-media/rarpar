@@ -28,7 +28,7 @@ use crate::hash::{Fingerprint, FingerprintHasher, RollingHasher};
 use crate::packet::{
     BlockChecksum, ChunkDescription, ChunkTail, DataPacket, DirectoryPacket, FilePacket,
     GaloisField, InputSetId, Packet, PacketBody, PacketType, ParseContext, RecoveryDataPacket,
-    RecoveryExternalDataPacket, RootPacket, StartPacket,
+    RecoveryExternalDataPacket, RootPacket, StartPacket, btree_entry_bytes, hash_entry_bytes,
 };
 use crate::scan::ScanLimits;
 
@@ -269,6 +269,71 @@ impl RecoveryBlock {
     }
 }
 
+/// Somewhere to charge bytes as a set's directory tree is materialised.
+///
+/// Resolution is the one place in the engine whose output size is not a
+/// function of its input size: the same File or Directory packet may hang under
+/// many parents, so a small graph can expand into an arbitrarily large tree.
+/// [`SetLimits`] bounds that expansion in entries and path bytes, but the caller
+/// paying for the memory wants the bound expressed in bytes it has actually
+/// reserved. Implementors are handed each allocation's size before it is made
+/// and refuse by returning an error, which fails the whole resolution.
+pub(crate) trait ExpansionCharge {
+    /// Charge `bytes` before the allocation they pay for is made.
+    fn charge(&mut self, bytes: usize) -> Result<()>;
+}
+
+/// The charger used when nobody is paying: every public constructor.
+pub(crate) struct NoExpansionCharge;
+
+impl ExpansionCharge for NoExpansionCharge {
+    fn charge(&mut self, _bytes: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Fixed bytes one resolution holds beyond its packets: the dedup set's own
+/// table, the per-type maps' headers, and the walk's stack and frames.
+pub(crate) const RESOLUTION_BASE_BYTES: usize = 64 * 1024;
+
+/// Bytes charged for one resolved entry beyond its measured contents: the
+/// vector slot it occupies, the spare capacity a doubling vector keeps, and the
+/// transient overlap while a reallocation copies old slots into new ones.
+const ENTRY_SLOT_FACTOR: usize = 3;
+
+/// Bytes resolving one packet needs on top of the packet itself.
+///
+/// `build` clones each body it keeps and indexes it by header hash, and it
+/// copies External Data checksums into ordered maps, so a packet costs more
+/// while it is being resolved than the bytes it arrived as.
+pub(crate) fn resolution_cost(packet: &Packet) -> usize {
+    let indexed = match packet.body() {
+        PacketBody::File(_) => hash_entry_bytes::<Fingerprint, FilePacket>(),
+        PacketBody::Directory(_) => hash_entry_bytes::<Fingerprint, DirectoryPacket>(),
+        PacketBody::ExternalData(this) => {
+            this.checksums.len() * btree_entry_bytes::<u64, BlockChecksum>()
+        }
+        PacketBody::RecoveryExternalData(this) => {
+            this.checksums.len() * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
+        }
+        PacketBody::RecoveryData(_) => size_of::<RecoveryBlock>() * ENTRY_SLOT_FACTOR,
+        // A packet whose type needs the Start packet is reparsed here, and the
+        // widest such body is a checksum list that also lands in an ordered map.
+        PacketBody::Opaque { packet_type, body } if PacketBody::needs_context(*packet_type) => {
+            body.capacity()
+                + (body.len() / size_of::<BlockChecksum>() + 1)
+                    * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
+        }
+        PacketBody::Opaque { .. } => hash_entry_bytes::<Fingerprint, Packet>(),
+        _ => 0,
+    };
+    packet
+        .owned_bytes()
+        .saturating_add(indexed)
+        .saturating_add(hash_entry_bytes::<(u64, Fingerprint), ()>())
+        .saturating_add(size_of::<Packet>())
+}
+
 /// One PAR3 input set: everything that shares an InputSetID.
 ///
 /// # What a set does not tell you
@@ -325,7 +390,7 @@ impl Par3Set {
         }
         grouped
             .into_iter()
-            .map(|(id, packets)| Self::build(id, packets, limits))
+            .map(|(id, packets)| Self::build(id, packets, limits, &mut NoExpansionCharge))
             .collect()
     }
 
@@ -347,10 +412,109 @@ impl Par3Set {
         if mine.is_empty() {
             return Err(Par3Error::UnknownInputSet { input_set_id });
         }
-        Self::build(input_set_id, mine, limits)
+        Self::build(input_set_id, mine, limits, &mut NoExpansionCharge)
     }
 
-    fn build(input_set_id: InputSetId, packets: Vec<Packet>, limits: &SetLimits) -> Result<Self> {
+    /// Resolve one named input set, charging every byte the directory walk
+    /// materialises to `charge` before it is allocated.
+    pub(crate) fn from_packets_for_charged(
+        packets: Vec<Packet>,
+        input_set_id: InputSetId,
+        limits: &SetLimits,
+        charge: &mut dyn ExpansionCharge,
+    ) -> Result<Self> {
+        let mine: Vec<Packet> = packets
+            .into_iter()
+            .filter(|packet| packet.input_set_id() == input_set_id)
+            .collect();
+        if mine.is_empty() {
+            return Err(Par3Error::UnknownInputSet { input_set_id });
+        }
+        Self::build(input_set_id, mine, limits, charge)
+    }
+
+    /// Bytes this resolved set's own structures hold, measured from real
+    /// container capacities rather than from the packets it was built from.
+    ///
+    /// This describes what exists, not a ceiling: it is what a caller holding a
+    /// reservation across the set's lifetime should be charged.
+    #[must_use]
+    pub fn retained_capacity_bytes(&self) -> usize {
+        let mut total = size_of::<Self>();
+        total += self.root.option_hashes.capacity() * size_of::<Fingerprint>();
+        total += self.root.children.capacity() * size_of::<Fingerprint>();
+
+        total += self.files.capacity() * size_of::<Par3File>();
+        for file in &self.files {
+            total += file.path.capacity() + file.packet.heap_bytes();
+        }
+        total += self.directories.capacity() * size_of::<Par3Directory>();
+        for directory in &self.directories {
+            total += directory.path.capacity() + directory.packet.heap_bytes();
+        }
+
+        total += self.block_checksums.len() * btree_entry_bytes::<u64, BlockChecksum>();
+        total += self.recovery_block_checksums.len()
+            * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>();
+
+        total += self.matrix_packets.capacity() * size_of::<Packet>();
+        total += self
+            .matrix_packets
+            .iter()
+            .map(|packet| packet.owned_bytes() - size_of::<Packet>())
+            .sum::<usize>();
+
+        total += self.recovery_blocks.capacity() * size_of::<RecoveryBlock>();
+        total += self
+            .recovery_blocks
+            .iter()
+            .map(|block| block.packet.data.capacity())
+            .sum::<usize>();
+        total += self.foreign_recovery_packets.capacity() * size_of::<RecoveryDataPacket>();
+        total += self
+            .foreign_recovery_packets
+            .iter()
+            .map(|packet| packet.data.capacity())
+            .sum::<usize>();
+
+        total += self.recovery_external_data.capacity() * size_of::<RecoveryExternalDataPacket>();
+        total += self
+            .recovery_external_data
+            .iter()
+            .map(|packet| packet.checksums.capacity() * size_of::<BlockChecksum>())
+            .sum::<usize>();
+
+        total += self.data_packets.capacity() * size_of::<DataPacket>();
+        total += self
+            .data_packets
+            .iter()
+            .map(|packet| packet.data.capacity())
+            .sum::<usize>();
+
+        total += self.creator_texts.capacity() * size_of::<String>();
+        total += self
+            .creator_texts
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>();
+        total += self.comments.capacity() * size_of::<String>();
+        total += self.comments.iter().map(String::capacity).sum::<usize>();
+
+        total += self.option_packets.len() * hash_entry_bytes::<Fingerprint, Packet>();
+        total += self
+            .option_packets
+            .values()
+            .map(|packet| packet.owned_bytes() - size_of::<Packet>())
+            .sum::<usize>();
+        total
+    }
+
+    fn build(
+        input_set_id: InputSetId,
+        packets: Vec<Packet>,
+        limits: &SetLimits,
+        charge: &mut dyn ExpansionCharge,
+    ) -> Result<Self> {
         let mut seen: HashSet<(u64, Fingerprint)> = HashSet::new();
         let mut duplicate_packet_count = 0usize;
         let mut unique = Vec::with_capacity(packets.len());
@@ -517,6 +681,7 @@ impl Par3Set {
             files: Vec::new(),
             directories: Vec::new(),
             path_bytes: 0,
+            charge,
         };
         walk.run(&root.children)?;
         let TreeWalk {
@@ -851,6 +1016,8 @@ struct TreeWalk<'a> {
     /// Path bytes resolved so far, charged against
     /// [`SetLimits::max_path_bytes`].
     path_bytes: u64,
+    /// Where the bytes each materialised entry costs are charged.
+    charge: &'a mut dyn ExpansionCharge,
 }
 
 struct Frame {
@@ -899,6 +1066,9 @@ impl TreeWalk<'_> {
                 })?;
                 let path = join_path(&parent_path, &file.name);
                 self.charge_path(&path)?;
+                self.charge.charge(
+                    size_of::<Par3File>() * ENTRY_SLOT_FACTOR + path.capacity() + file.heap_bytes(),
+                )?;
                 self.files.push(Par3File {
                     path,
                     packet_hash: child,
@@ -930,6 +1100,14 @@ impl TreeWalk<'_> {
                 });
             }
             self.check_names(&directory.children, &path)?;
+            self.charge.charge(
+                size_of::<Par3Directory>() * ENTRY_SLOT_FACTOR
+                    + path.capacity() * 2
+                    + directory.heap_bytes()
+                    + size_of::<Frame>() * ENTRY_SLOT_FACTOR
+                    + directory.children.len() * size_of::<Fingerprint>()
+                    + hash_entry_bytes::<Fingerprint, ()>(),
+            )?;
             self.directories.push(Par3Directory {
                 path: path.clone(),
                 packet_hash: child,
