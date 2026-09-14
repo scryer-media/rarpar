@@ -1972,8 +1972,14 @@ impl LzDecoder {
         writer: &mut W,
         pipelined: bool,
     ) -> RarResult<()> {
-        // Both callers already gated the whole member on `parallel_enabled`,
-        // so the env lookup does not repeat per staged round.
+        // Adaptive staged callers may select inline work for this round.
+        // Bypass worker buffers entirely while retaining the same live window.
+        if crate::decompress::policy::serial() {
+            return phase_diagnostics::measure(Phase::SerialApply, || {
+                self.decode_span_inline(input, blocks, unpacked_size, output_size, writer)
+            });
+        }
+        // The environment override was checked at the member boundary.
         let worker_count = rar_decode_worker_count();
         // The sequential path lets `decode_and_apply_static_batch` own its
         // buffers, so it keeps hitting the same recycled set.
@@ -3739,6 +3745,49 @@ mod tests {
         );
         // The scratch is reusable: both batches ran through the same buffers.
         assert!(scratch.assignments.capacity() >= 2);
+    }
+
+    #[test]
+    fn adaptive_rounds_switch_engines_without_restarting_the_window() {
+        let per_round = batch_plan::capacity(MAX_PARALLEL_THREADS) * 2;
+        let (input, blocks, expected) = literal_block_stream(per_round * 4);
+        let mut decoder = LzDecoder::new(128 * 1024, 1);
+        decoder.install_inline_tables(&rar7_tables());
+        let mut output_size = 0;
+        let mut output = Vec::new();
+        let mut feedback = super::super::adaptive::AdaptiveDecode::default();
+        let bytes = 1024 * 1024;
+        feedback.observe_inline(bytes, std::time::Duration::from_millis(10));
+        for (round, blocks) in blocks.chunks(per_round).enumerate() {
+            feedback.observe_input(
+                bytes,
+                std::time::Duration::from_millis(if round % 2 == 0 { 100 } else { 1 }),
+            );
+            let parallel = feedback.use_parallel(bytes);
+            assert_eq!(parallel, round % 2 == 1);
+            let before = global_pipelined_dispatches();
+            {
+                let _inline = (!parallel).then(|| crate::DecodeMode::Serial.enter());
+                decoder
+                    .run_block_controller(
+                        &input,
+                        blocks,
+                        expected.len() as u64,
+                        &mut output_size,
+                        &mut output,
+                        true,
+                    )
+                    .unwrap();
+            }
+            if !parallel {
+                assert_eq!(global_pipelined_dispatches(), before);
+            } else if rar_decode_worker_count() > 1 {
+                assert!(global_pipelined_dispatches() > before);
+            }
+        }
+        decoder.flush_filters_and_write(&mut output).unwrap();
+        assert_eq!(output_size, expected.len() as u64);
+        assert_eq!(output, expected);
     }
 
     #[test]

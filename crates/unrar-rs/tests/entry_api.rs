@@ -912,7 +912,11 @@ fn with_progress_reports_on_every_consuming_call() {
 fn archive_decode_modes_match_across_families_and_providers() {
     for family in FAMILIES {
         let expected = reference_bytes(family);
-        for mode in [unrar_rs::DecodeMode::Auto, unrar_rs::DecodeMode::Serial] {
+        for mode in [
+            unrar_rs::DecodeMode::Auto,
+            unrar_rs::DecodeMode::Serial,
+            unrar_rs::DecodeMode::Adaptive,
+        ] {
             let provider =
                 StaticVolumeProvider::new(volume_paths(family).into_iter().enumerate().collect());
             let mut archive = open(family);

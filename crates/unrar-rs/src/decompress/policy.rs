@@ -10,29 +10,40 @@ pub enum DecodeMode {
     /// Use the decoder's normal parallel selection and environment overrides.
     #[default]
     Auto,
+    /// Adapt staged RAR5 batches to measured input and inline decode costs.
+    /// Keeps the live dictionary; RAR4 and chunked extraction retain Auto behavior.
+    Adaptive,
     /// Decode on the calling thread, including solid dictionary continuation.
     /// Hashing retains its independent execution policy.
     Serial,
 }
 
 thread_local! {
-    static SERIAL: Cell<bool> = const { Cell::new(false) };
+    static MODE: Cell<DecodeMode> = const { Cell::new(DecodeMode::Auto) };
 }
 
 pub(crate) fn serial() -> bool {
-    SERIAL.get()
+    MODE.get() == DecodeMode::Serial
+}
+
+pub(crate) fn adaptive() -> bool {
+    MODE.get() == DecodeMode::Adaptive
 }
 
 pub(crate) struct Scope {
-    previous: bool,
+    previous: DecodeMode,
     // The policy must be restored on the same thread, even during unwinding.
     _thread: PhantomData<Rc<()>>,
 }
 
 impl DecodeMode {
     pub(crate) fn enter(self) -> Scope {
-        let previous = SERIAL.get();
-        SERIAL.set(previous || self == Self::Serial);
+        let previous = MODE.get();
+        MODE.set(match (previous, self) {
+            (Self::Serial, _) | (_, Self::Serial) => Self::Serial,
+            (Self::Adaptive, _) | (_, Self::Adaptive) => Self::Adaptive,
+            _ => Self::Auto,
+        });
         Scope {
             previous,
             _thread: PhantomData,
@@ -42,7 +53,7 @@ impl DecodeMode {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        SERIAL.set(self.previous);
+        MODE.set(self.previous);
     }
 }
 

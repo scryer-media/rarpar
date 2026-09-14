@@ -4,6 +4,9 @@
 
 ### Added
 
+- `DecodeMode::Adaptive` selects staged RAR5 inline or parallel batches from
+  measured input and decode costs, preserving dictionary/filter state across
+  switches. Existing pool and staging limits still apply; `Auto` is unchanged.
 - Archive-local `DecodeMode::Serial` selects inline RAR4/RAR5 decoding for
   input-limited readers, without changing process environment, checksum policy
   or solid continuation. The default remains `Auto`.
