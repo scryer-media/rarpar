@@ -3327,7 +3327,10 @@ mod tests {
         {
             let _scope = crate::DecodeMode::Serial.enter();
             assert!(!parallel_enabled());
-            let _nested = crate::DecodeMode::Auto.enter();
+            {
+                let _nested = crate::DecodeMode::Auto.enter();
+                assert_eq!(parallel_enabled(), before);
+            }
             assert!(!parallel_enabled());
         }
         assert_eq!(parallel_enabled(), before);

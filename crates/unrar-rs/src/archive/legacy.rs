@@ -209,13 +209,38 @@ mod tests {
 
     #[test]
     fn all_legacy_consumers_scope_decode_policy_and_restore_it() {
+        check_legacy_consumers(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+        );
+    }
+
+    #[test]
+    fn legacy_consumers_allow_an_unhydrated_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        check_legacy_consumers(dir.path());
+        std::fs::create_dir(dir.path().join("rar5")).unwrap();
+        std::fs::write(
+            dir.path().join("rar5/rar5_solid.rar"),
+            b"version https://git-lfs.github.com/spec/v1\n",
+        )
+        .unwrap();
+        check_legacy_consumers(dir.path());
+    }
+
+    fn check_legacy_consumers(root: &std::path::Path) {
         for fixture in ["rar5/rar5_solid.rar", "rar4/rar4_lz_solid_mv.rar"] {
+            let path = root.join(fixture);
+            let mut magic = [0; 4];
+            if !File::open(&path)
+                .is_ok_and(|mut file| file.read_exact(&mut magic).is_ok() && &magic == b"Rar!")
+            {
+                eprintln!("skipping unhydrated fixture: {}", path.display());
+                continue;
+            }
             for mode in [crate::DecodeMode::Auto, crate::DecodeMode::Serial] {
                 for consumer in 0..8 {
                     let provider = ObservedProvider {
-                        path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join("tests/fixtures")
-                            .join(fixture),
+                        path: path.clone(),
                         armed: Arc::new(AtomicBool::new(false)),
                         reads: Arc::new(AtomicUsize::new(0)),
                         expected_serial: mode == crate::DecodeMode::Serial,
@@ -227,6 +252,7 @@ mod tests {
                     let dir = tempfile::tempdir().unwrap();
                     let mut sink = std::io::sink();
                     provider.armed.store(true, Ordering::Relaxed);
+                    let outer = crate::DecodeMode::Serial.enter();
                     match consumer {
                         0 => {
                             archive.extract_member(0, &options, None).unwrap();
@@ -272,12 +298,14 @@ mod tests {
                         provider.reads.load(Ordering::Relaxed) > 0,
                         "{fixture} {consumer}"
                     );
-                    assert!(!crate::decompress::policy::serial());
+                    assert!(crate::decompress::policy::serial());
                     assert!(archive.extract_member(usize::MAX, &options, None).is_err());
                     assert!(
-                        !crate::decompress::policy::serial(),
+                        crate::decompress::policy::serial(),
                         "restore policy on error"
                     );
+                    drop(outer);
+                    assert!(!crate::decompress::policy::serial());
                 }
             }
         }

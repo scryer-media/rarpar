@@ -38,12 +38,8 @@ pub(crate) struct Scope {
 
 impl DecodeMode {
     pub(crate) fn enter(self) -> Scope {
-        let previous = MODE.get();
-        MODE.set(match (previous, self) {
-            (Self::Serial, _) | (_, Self::Serial) => Self::Serial,
-            (Self::Adaptive, _) | (_, Self::Adaptive) => Self::Adaptive,
-            _ => Self::Auto,
-        });
+        // Reentrant callbacks may consume an independent archive with its own policy.
+        let previous = MODE.replace(self);
         Scope {
             previous,
             _thread: PhantomData,
@@ -62,12 +58,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nested_archives_install_their_own_mode_and_restore_the_caller() {
+        for outer in [DecodeMode::Auto, DecodeMode::Adaptive, DecodeMode::Serial] {
+            let _outer = outer.enter();
+            for inner in [DecodeMode::Auto, DecodeMode::Adaptive, DecodeMode::Serial] {
+                {
+                    let _inner = inner.enter();
+                    assert_eq!(MODE.get(), inner);
+                }
+                assert_eq!(MODE.get(), outer);
+            }
+        }
+        assert_eq!(MODE.get(), DecodeMode::Auto);
+    }
+
+    #[test]
     fn serial_scope_is_nested_thread_local_and_unwind_safe() {
         assert!(!serial());
         let result = std::panic::catch_unwind(|| {
             let _serial = DecodeMode::Serial.enter();
             assert!(serial());
-            let _auto = DecodeMode::Auto.enter();
+            {
+                let _auto = DecodeMode::Auto.enter();
+                assert!(!serial());
+            }
             assert!(serial());
             assert!(!std::thread::spawn(serial).join().unwrap());
             panic!("exercise restoration");
