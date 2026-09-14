@@ -2588,15 +2588,13 @@ impl LzDecoder {
                         self.insert_old_dist(distance as usize);
 
                         self.last_length = full_len;
-                        self.window.copy(distance as usize, full_len)?;
-                        *output_size += full_len as u64;
+                        self.replay_match(distance as usize, full_len, output_size, writer)?;
                     }
                     DecodedItem::RepeatPrev => {
                         if self.last_length != 0 {
                             let distance = self.dist_cache[0];
                             let full_len = self.last_length;
-                            self.window.copy(distance, full_len)?;
-                            *output_size += full_len as u64;
+                            self.replay_match(distance, full_len, output_size, writer)?;
                         }
                     }
                     DecodedItem::CacheRef { cache_idx, length } => {
@@ -2605,8 +2603,7 @@ impl LzDecoder {
 
                         let full_len = length as usize;
                         self.last_length = full_len;
-                        self.window.copy(distance, full_len)?;
-                        *output_size += full_len as u64;
+                        self.replay_match(distance, full_len, output_size, writer)?;
                     }
                     DecodedItem::Filter {
                         filter_type,
@@ -2635,6 +2632,39 @@ impl LzDecoder {
             }
         }
 
+        Ok(())
+    }
+
+    // Literal replay may enter the soft border's match slack while a filter is
+    // incomplete. Bound subsequent copies by retained capacity as well. Splitting
+    // an overlapping match preserves its distance and lets completed filters flush
+    // before the remaining bytes reuse their dictionary space.
+    fn replay_match<W: std::io::Write + ?Sized>(
+        &mut self,
+        distance: usize,
+        mut remaining: usize,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        while remaining != 0 {
+            let retained = self
+                .window
+                .total_written()
+                .saturating_sub(self.window.total_flushed());
+            let room = (self.window.dict_size() as u64).saturating_sub(retained) as usize;
+            if room == 0 {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 match replay cannot advance within dictionary window".into(),
+                });
+            }
+            let take = remaining.min(room);
+            self.window.copy(distance, take)?;
+            *output_size += take as u64;
+            remaining -= take;
+            if remaining != 0 {
+                self.flush_stream_output(writer)?;
+            }
+        }
         Ok(())
     }
 
@@ -3490,6 +3520,48 @@ mod tests {
             decoder.pending_filters[0].block_start,
             decoder.current_file_base_total + output_size + 5
         );
+    }
+
+    #[test]
+    fn match_variants_finish_a_retained_filter_before_reusing_window_space() {
+        for item in [
+            DecodedItem::Match {
+                length: 8,
+                distance: 1,
+            },
+            DecodedItem::RepeatPrev,
+            DecodedItem::CacheRef {
+                cache_idx: 0,
+                length: 8,
+            },
+        ] {
+            let mut decoder = LzDecoder::new(128 * 1024, 0);
+            let size = decoder.window.dict_size();
+            decoder.begin_file_decode((size + 6) as u64);
+            let mut out = Vec::new();
+            decoder
+                .register_pending_filter(
+                    PendingFilter {
+                        filter_type: FilterType::E8,
+                        block_start: 0,
+                        block_length: size,
+                        channels: 0,
+                    },
+                    &mut out,
+                )
+                .unwrap();
+            decoder.window.put_bytes(&vec![b'A'; size - 2]);
+            decoder.dist_cache[0] = 1;
+            decoder.last_length = 8;
+            let mut count = (size - 2) as u64;
+            decoder
+                .apply_decoded_items_parallel(&[vec![item].into()], &mut count, &mut out)
+                .unwrap();
+            decoder.flush_filters_and_write(&mut out).unwrap();
+            assert_eq!(out, vec![b'A'; size + 6]);
+            assert_eq!(count, (size + 6) as u64);
+            assert!(decoder.pending_filters.is_empty());
+        }
     }
 
     #[test]
