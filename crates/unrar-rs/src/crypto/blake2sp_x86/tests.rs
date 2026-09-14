@@ -8,14 +8,8 @@ fn available() -> Vec<Backend> {
     if is_x86_feature_detected!("ssse3") {
         result.push(Backend::Ssse3);
     }
-    if is_x86_feature_detected!("avx2") {
-        result.push(Backend::Avx2);
-    }
-    if is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx512vl")
-    {
-        result.push(Backend::Avx512);
+    if is_x86_feature_detected!("sse4.1") || is_x86_feature_detected!("avx2") {
+        result.push(Backend::Upstream);
     }
     eprintln!("exercising x86 hash backends: {result:?}");
     result
@@ -27,10 +21,10 @@ fn ladder_requires_every_feature() {
         Backend::select(false, false, false, false),
         Backend::Portable
     );
-    assert_eq!(Backend::select(true, false, false, true), Backend::Sse2);
+    assert_eq!(Backend::select(true, false, false, false), Backend::Sse2);
     assert_eq!(Backend::select(true, true, false, false), Backend::Ssse3);
-    assert_eq!(Backend::select(true, true, true, false), Backend::Avx2);
-    assert_eq!(Backend::select(true, true, true, true), Backend::Avx512);
+    assert_eq!(Backend::select(true, true, true, false), Backend::Upstream);
+    assert_eq!(Backend::select(true, true, true, true), Backend::Upstream);
 }
 
 #[test]
@@ -42,8 +36,7 @@ fn all_supported_backends_match_oracle_across_tails_and_chunks() {
         for len in (0..1100).chain([4095, 4096, 4097, 8192, 16383, 18000]) {
             let expected = *blake2s_simd::blake2sp::blake2sp(&data[..len]).as_array();
             for chunk in [1, 63, 64, 65, 511, 512, 513, 4096, 18000] {
-                let mut state = State::new();
-                state.backend = backend;
+                let mut state = State::with_backend(backend);
                 for part in data[..len].chunks(chunk) {
                     state.update(part);
                 }
@@ -57,7 +50,9 @@ fn all_supported_backends_match_oracle_across_tails_and_chunks() {
                     expected,
                     "finalization must be idempotent"
                 );
-                assert!(state.len < 961);
+                if let Hasher::Legacy(state) = &state.0 {
+                    assert!(state.len < 961);
+                }
             }
         }
     }
@@ -79,13 +74,20 @@ fn vector_counters_flags_and_unaligned_messages_match_scalar() {
     ];
     let f0 = [0, !0, 0, !0, 0, !0, 0, !0];
     let f1 = [!0, 0, 0, 0, 0, 0, 0, !0];
-    let mut oracle = State::new();
-    oracle.backend = Backend::Portable;
+    let mut oracle = LegacyState::new(Backend::Portable);
     oracle.compress(b, counts, f0, f1);
-    for backend in available() {
-        let mut state = State::new();
-        state.backend = backend;
+    for backend in available().into_iter().filter(|b| *b != Backend::Upstream) {
+        let mut state = LegacyState::new(backend);
         state.compress(b, counts, f0, f1);
         assert_eq!(state.h, oracle.h, "{backend:?}");
     }
+}
+
+#[test]
+fn runtime_dispatch_uses_upstream_state_on_modern_hosts() {
+    let state = State::new();
+    assert_eq!(
+        matches!(state.0, Hasher::Upstream(_)),
+        is_x86_feature_detected!("sse4.1") || is_x86_feature_detected!("avx2")
+    );
 }

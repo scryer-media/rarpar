@@ -469,7 +469,7 @@ impl CrcShiftOp {
 }
 
 /// Leaves grouped on one worker: four on NEON, eight on x86 (runtime
-/// SSE2/SSSE3/AVX2/AVX-512 dispatch), one on other targets. Keeping x86 leaves
+/// upstream SSE4.1/AVX2 or legacy SSE2/SSSE3 dispatch), one on other targets. Keeping x86 leaves
 /// together enables cross-leaf SIMD and avoids eight worker wakeups per chunk.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const LEAVES_PER_WORKER: usize = 8;
@@ -523,13 +523,19 @@ fn new_worker_state(worker: usize) -> BlakeWorkerState {
     BlakeWorkerState::new()
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
-    state.finalize_leaves()
+fn finish_worker_state(state: &BlakeWorkerState) -> BlakeWorkerOutput {
+    state.finalize()
 }
+
+// x86 owns the full stream and returns the final checksum, not leaf digests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type BlakeWorkerOutput = [u8; 32];
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+type BlakeWorkerOutput = [[u8; 32]; LEAVES_PER_WORKER];
 
 struct BlakeLanes {
     lane_tx: Vec<mpsc::SyncSender<LaneMsg>>,
-    lane_handles: Vec<JoinHandle<[[u8; 32]; LEAVES_PER_WORKER]>>,
+    lane_handles: Vec<JoinHandle<BlakeWorkerOutput>>,
     /// Absolute stream offset of the next incoming byte.
     stream_offset: u64,
 }
@@ -591,6 +597,17 @@ impl BlakeLanes {
         Ok(())
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn finalize(mut self) -> io::Result<[u8; 32]> {
+        self.lane_tx.clear();
+        debug_assert_eq!(self.lane_handles.len(), 1);
+        self.lane_handles
+            .remove(0)
+            .join()
+            .map_err(|_| io::Error::other("BLAKE2sp worker panicked"))
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     fn finalize(mut self) -> io::Result<[u8; 32]> {
         self.lane_tx.clear();
 
@@ -712,6 +729,7 @@ fn blake2sp_leaf_params(lane: usize) -> Blake2sParams {
 }
 
 /// BLAKE2sp root-node parameters.
+#[cfg(any(test, not(any(target_arch = "x86", target_arch = "x86_64"))))]
 fn blake2sp_root_params() -> Blake2sParams {
     let mut params = Blake2sParams::new();
     params

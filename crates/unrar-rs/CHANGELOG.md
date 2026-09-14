@@ -10,9 +10,10 @@
 
 ### Performance
 
-- Group all eight BLAKE2sp leaves on one x86 hash worker, with portable,
-  SSE2, SSSE3, AVX2 and AVX-512F+VL runtime dispatch. Other architecture
-  backends remain unchanged.
+- Group all eight BLAKE2sp leaves on one x86 hash worker. Use the upstream
+  `blake2s_simd` streaming state with runtime SSE4.1/AVX2 detection; retain
+  local SSE2/SSSE3 fallbacks for older hosts. Remove the custom AVX2 and
+  AVX-512 kernels. Other architecture backends remain unchanged.
 - Store RAR5 parallel-decoder literals as bytes plus one descriptor per run,
   and replay runs with bounded bulk window writes instead of expanding each
   eight literal bytes into a sixteen-byte operation.

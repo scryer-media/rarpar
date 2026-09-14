@@ -1,8 +1,6 @@
-//! Eight BLAKE2sp leaves grouped on x86. SSE2/SSSE3 use two four-leaf
-//! groups, AVX2 uses eight lanes, and AVX-512F+VL uses eight lanes with native
-//! rotations. BLAKE2sp has only eight leaves: widening to sixteen lanes would
-//! not create sixteen independent chains. Dispatch includes OS register-state
-//! support through Rust's feature detection; unsupported CPUs stay portable.
+//! BLAKE2sp on x86 uses upstream streaming SIMD on SSE4.1/AVX2 hosts.
+//! Older SSE2/SSSE3 hosts retain two local four-leaf groups. Runtime
+//! detection includes OS register-state support; unsupported CPUs stay portable.
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -30,23 +28,20 @@ enum Backend {
     Portable,
     Sse2,
     Ssse3,
-    Avx2,
-    Avx512,
+    Upstream,
 }
 impl Backend {
     fn detect() -> Self {
         Self::select(
             is_x86_feature_detected!("sse2"),
             is_x86_feature_detected!("ssse3"),
+            is_x86_feature_detected!("sse4.1"),
             is_x86_feature_detected!("avx2"),
-            is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl"),
         )
     }
-    fn select(sse2: bool, ssse3: bool, avx2: bool, avx512: bool) -> Self {
-        if avx512 && avx2 {
-            Self::Avx512
-        } else if avx2 {
-            Self::Avx2
+    fn select(sse2: bool, ssse3: bool, sse41: bool, avx2: bool) -> Self {
+        if sse41 || avx2 {
+            Self::Upstream
         } else if ssse3 && sse2 {
             Self::Ssse3
         } else if sse2 {
@@ -57,17 +52,57 @@ impl Backend {
     }
 }
 
-/// Fixed-space state shared by the inline hasher and the off-thread group.
+/// Whole-stream state: upstream retains its vector state across input blocks.
+/// Both variants use fixed-size inline storage without per-update allocation.
+#[derive(Clone, Debug)]
+pub(crate) struct State(Hasher);
+
+#[derive(Clone, Debug)]
+enum Hasher {
+    Upstream(blake2s_simd::blake2sp::State),
+    Legacy(LegacyState),
+}
+
+impl State {
+    pub(crate) fn new() -> Self {
+        Self::with_backend(Backend::detect())
+    }
+
+    fn with_backend(backend: Backend) -> Self {
+        Self(match backend {
+            Backend::Upstream => Hasher::Upstream(blake2s_simd::blake2sp::State::new()),
+            backend => Hasher::Legacy(LegacyState::new(backend)),
+        })
+    }
+
+    pub(crate) fn update(&mut self, input: &[u8]) {
+        match &mut self.0 {
+            Hasher::Upstream(state) => {
+                state.update(input);
+            }
+            Hasher::Legacy(state) => state.update(input),
+        }
+    }
+
+    pub(crate) fn finalize(&self) -> [u8; 32] {
+        match &self.0 {
+            Hasher::Upstream(state) => *state.finalize().as_array(),
+            Hasher::Legacy(state) => state.finalize(),
+        }
+    }
+}
+
+/// Fixed-space fallback for hosts without upstream SIMD support.
 /// Input to this group is the full eight-leaf stream, with arbitrary chunks.
 #[derive(Clone)]
-pub(crate) struct State {
+struct LegacyState {
     h: [[u32; 8]; 8],
     tail: [u8; 1024],
     len: usize,
     count: u64,
     backend: Backend,
 }
-impl std::fmt::Debug for State {
+impl std::fmt::Debug for LegacyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Blake2spState")
             .field("backend", &self.backend)
@@ -75,8 +110,9 @@ impl std::fmt::Debug for State {
             .finish_non_exhaustive()
     }
 }
-impl State {
-    pub(crate) fn new() -> Self {
+impl LegacyState {
+    fn new(backend: Backend) -> Self {
+        debug_assert_ne!(backend, Backend::Upstream);
         let mut h = [IV; 8];
         for (leaf, words) in h.iter_mut().enumerate() {
             words[0] ^= 32 | (8 << 16) | (2 << 24);
@@ -88,7 +124,7 @@ impl State {
             tail: [0; 1024],
             len: 0,
             count: 0,
-            backend: Backend::detect(),
+            backend,
         }
     }
     fn compress(&mut self, block: &[u8; 512], counts: [u64; 8], f0: [u32; 8], f1: [u32; 8]) {
@@ -99,8 +135,7 @@ impl State {
                 Backend::Portable => compress::<Scalar, 8>(&mut self.h, block, counts, f0, f1),
                 Backend::Sse2 => compress_sse2(&mut self.h, block, counts, f0, f1),
                 Backend::Ssse3 => compress_ssse3(&mut self.h, block, counts, f0, f1),
-                Backend::Avx2 => compress_avx2(&mut self.h, block, counts, f0, f1),
-                Backend::Avx512 => compress_avx512(&mut self.h, block, counts, f0, f1),
+                Backend::Upstream => unreachable!("upstream owns its complete streaming state"),
             }
         }
     }
@@ -345,25 +380,6 @@ unsafe fn rotate_ssse3<const R: i32>(v: __m128i) -> __m128i {
         }
     }
 }
-#[inline(always)]
-unsafe fn rotate_avx2<const R: i32>(v: __m256i) -> __m256i {
-    unsafe {
-        if R == 8 || R == 16 {
-            let mask: [u8; 32] =
-                std::array::from_fn(|i| (((i % 16) / 4) * 4 + (i % 4 + R as usize / 8) % 4) as u8);
-            _mm256_shuffle_epi8(v, _mm256_loadu_si256(mask.as_ptr().cast()))
-        } else {
-            _mm256_or_si256(
-                _mm256_srl_epi32(v, _mm_cvtsi32_si128(R)),
-                _mm256_sll_epi32(v, _mm_cvtsi32_si128(32 - R)),
-            )
-        }
-    }
-}
-#[inline(always)]
-unsafe fn rotate_avx512<const R: i32>(v: __m256i) -> __m256i {
-    unsafe { _mm256_ror_epi32::<R>(v) }
-}
 vector!(
     Sse2,
     4,
@@ -384,26 +400,6 @@ vector!(
     _mm_xor_si128,
     rotate_ssse3
 );
-vector!(
-    Avx2,
-    8,
-    __m256i,
-    _mm256_loadu_si256,
-    _mm256_storeu_si256,
-    _mm256_add_epi32,
-    _mm256_xor_si256,
-    rotate_avx2
-);
-vector!(
-    Avx512,
-    8,
-    __m256i,
-    _mm256_loadu_si256,
-    _mm256_storeu_si256,
-    _mm256_add_epi32,
-    _mm256_xor_si256,
-    rotate_avx512
-);
 macro_rules! entry {
     ($name:ident, $features:literal, $backend:ty, $n:literal) => {
         #[target_feature(enable = $features)]
@@ -420,8 +416,6 @@ macro_rules! entry {
 }
 entry!(compress_sse2, "sse2", Sse2, 4);
 entry!(compress_ssse3, "ssse3", Ssse3, 4);
-entry!(compress_avx2, "avx2", Avx2, 8);
-entry!(compress_avx512, "avx2,avx512f,avx512vl", Avx512, 8);
 
 #[cfg(test)]
 #[path = "blake2sp_x86/tests.rs"]
