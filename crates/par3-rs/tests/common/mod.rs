@@ -37,11 +37,23 @@
 
 // Each test binary uses a different part of this module.
 #![allow(dead_code)]
+// `ExecutionOptions` is `#[non_exhaustive]`, so a struct literal is illegal in
+// the integration-test crates; field assignment after `default()` is the only
+// form that compiles everywhere this module is included.
+#![allow(clippy::field_reassign_with_default)]
 
 use std::collections::BTreeMap;
 
+use par3_rs::ScanLimits;
+use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::packet::{ChunkDescription, ChunkTail};
+use par3_rs::runtime::{
+    ExecutionOptions, MemoryBudget, MemoryLedger, ProgressCallback, ProgressPhase, Stage,
+};
+use par3_rs::session::{Par3RepairSession, RepairStatus};
+use par3_rs::source::{MemorySourceAccess, SourceId};
 use par3_rs::{InputSetId, Packet, Par3Set, scan_packets};
+use std::sync::{Arc, Mutex};
 
 /// InputSetID of the GF(2^8) oracle archive.
 pub const SET_ID: InputSetId = InputSetId([0x24, 0xa1, 0xad, 0x60, 0x1a, 0xe5, 0xbc, 0x72]);
@@ -1426,4 +1438,325 @@ pub fn type_sequence(data: &[u8]) -> Vec<String> {
 /// The body bytes of a packet: everything after the 48-byte header.
 pub fn body_of(packet: &Packet) -> Vec<u8> {
     packet.to_bytes()[48..].to_vec()
+}
+
+/// Create a single-file set of `blocks` 64-byte blocks with three recovery
+/// blocks across `interleave + 1` FFT cohorts, written into `tree`.
+///
+/// Returns the input-set identity, the protected bytes, and the carrier paths.
+/// Nothing here is hand-assembled: the carriers come from this crate's own
+/// creation engine, and damage cases flip bytes of the returned input.
+pub fn many_block_carriers(
+    blocks: usize,
+    interleave: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> (InputSetId, Vec<u8>, Vec<std::path::PathBuf>) {
+    use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
+    let mut bytes = vec![0; blocks * 64];
+    let mut hash = blake3::Hasher::new();
+    hash.update(seed);
+    hash.finalize_xof().fill(&mut bytes);
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.clone().into());
+    let mut options = CreationOptions {
+        block_size: 64,
+        recovery_count: 3,
+        codec: CreationCodec::Fft {
+            capacity_log2: 0,
+            interleave,
+        },
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(768 << 20);
+    options.execution.retained_bytes = 384 << 20;
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options.clone(),
+    )
+    .unwrap();
+    let id = plan.input_set_id();
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+    (id, bytes, paths)
+}
+
+/// A multi-file, multi-carrier many-block set, for the scaling regressions.
+///
+/// `files` protected files of `blocks_per_file` 64-byte blocks each, `recovery`
+/// recovery blocks spread one per carrier, across `interleave + 1` FFT cohorts.
+/// Like [`many_block_carriers`], every byte comes from this crate's own creation
+/// engine; damage is applied by the caller to the returned contents.
+pub struct ManyBlockSet {
+    pub id: InputSetId,
+    pub contents: Vec<(String, Vec<u8>)>,
+    pub paths: Vec<std::path::PathBuf>,
+}
+
+pub fn many_block_set(
+    files: usize,
+    blocks_per_file: usize,
+    interleave: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
+    let mut access = MemorySourceAccess::default();
+    let mut contents = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..files {
+        let mut bytes = vec![0; blocks_per_file * 64];
+        let mut hash = blake3::Hasher::new();
+        hash.update(seed);
+        hash.update(&(index as u64).to_le_bytes());
+        hash.finalize_xof().fill(&mut bytes);
+        let name = format!("input{index}.bin");
+        access.insert(SourceId(index as u64 + 1), 1, bytes.clone().into());
+        sources.push(CreationSource {
+            name: name.clone(),
+            source: SourceId(index as u64 + 1),
+        });
+        contents.push((name, bytes));
+    }
+    // Each cohort must have room for its share of the recovery blocks.
+    let per_cohort = recovery.div_ceil(interleave + 1).max(1);
+    let capacity_log2 = per_cohort.next_power_of_two().trailing_zeros() as i8;
+    let mut options = CreationOptions {
+        block_size: 64,
+        recovery_count: recovery,
+        // One recovery block per carrier, so carrier count scales with recovery.
+        volumes: VolumeLayout::Uniform(1),
+        codec: CreationCodec::Fft {
+            capacity_log2,
+            interleave,
+        },
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(768 << 20);
+    options.execution.retained_bytes = 384 << 20;
+    let plan = CreationPlan::build(Arc::new(access), &sources, options.clone()).unwrap();
+    let id = plan.input_set_id();
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+    ManyBlockSet {
+        id,
+        contents,
+        paths,
+    }
+}
+
+/// A Cauchy-coded many-block set, one recovery block per carrier. Used where a
+/// test needs the row-bank path rather than the FFT cohorts.
+pub fn cauchy_block_set(
+    blocks: usize,
+    block_size: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
+    let mut bytes = vec![0; blocks * block_size as usize];
+    let mut hash = blake3::Hasher::new();
+    hash.update(seed);
+    hash.finalize_xof().fill(&mut bytes);
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.clone().into());
+    let mut options = CreationOptions {
+        block_size,
+        recovery_count: recovery,
+        volumes: VolumeLayout::Uniform(1),
+        codec: CreationCodec::Cauchy,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(768 << 20);
+    options.execution.retained_bytes = 384 << 20;
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options.clone(),
+    )
+    .unwrap();
+    let id = plan.input_set_id();
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+    ManyBlockSet {
+        id,
+        contents: vec![("input.bin".to_owned(), bytes)],
+        paths,
+    }
+}
+
+// --- Stage working-set inventory -------------------------------------------
+//
+// Shared by the many-blocks inventory test and the 131,072-block probe so both
+// report the same table from the same ledger samples.
+
+pub fn scanned_packets(
+    bytes: Vec<u8>,
+    options: &ExecutionOptions,
+) -> Vec<par3_rs::ingest::IngestedPacket> {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(9), 1, bytes.into());
+    let mut scanner = PacketScanner::new(
+        Arc::new(access),
+        SourceId(9),
+        options.clone(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    let mut collected = Vec::new();
+    while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+        collected.push(packet);
+    }
+    collected
+}
+
+/// One stage boundary: what is resident, and the budget's high-water mark.
+pub struct StageSample {
+    pub label: &'static str,
+    pub ledger: MemoryLedger,
+    pub used: usize,
+    pub peak: usize,
+}
+
+/// Print the inventory: per stage, each category's resident bytes, the bytes
+/// per protected block, and what the stage cost the budget's high-water mark.
+pub fn report(samples: &[StageSample], blocks: u64, title: &str) {
+    println!("--- stage working sets: {title} ({blocks} blocks) ---");
+    println!(
+        "{:<22} {:<28} {:>12} {:>10} {:>12}",
+        "stage", "category", "resident", "per block", "budget peak"
+    );
+    let mut previous = 0usize;
+    for sample in samples {
+        let mut first = true;
+        for (category, entry) in sample.ledger.iter() {
+            if entry.current == 0 {
+                continue;
+            }
+            println!(
+                "{:<22} {:<28} {:>12} {:>10.1} {:>12}",
+                if first { sample.label } else { "" },
+                category.name(),
+                entry.current,
+                entry.current as f64 / blocks as f64,
+                if first {
+                    format!("+{}", sample.peak.saturating_sub(previous))
+                } else {
+                    String::new()
+                }
+            );
+            first = false;
+        }
+        if first {
+            println!(
+                "{:<22} {:<28} {:>12} {:>10} {:>12}",
+                sample.label, "(nothing resident)", 0, "-", ""
+            );
+        }
+        println!(
+            "{:<22} {:<28} {:>12} {:>10.1} {:>12}",
+            "",
+            "TOTAL RESIDENT",
+            sample.used,
+            sample.used as f64 / blocks as f64,
+            sample.peak
+        );
+        previous = sample.peak;
+    }
+}
+
+/// Drive one damaged many-block set through every stage, sampling at each
+/// boundary. Returns the samples and the blocks the repair reconstructed.
+pub fn walk_stages(
+    blocks: usize,
+    interleave: u64,
+    damage: &[usize],
+    seed: &[u8],
+    budget: usize,
+    retained: usize,
+) -> (Vec<StageSample>, u64) {
+    let tree = TempTree::new("stage-inventory");
+    let (id, bytes, paths) = many_block_carriers(blocks, interleave, seed, &tree);
+    let mut damaged = bytes.clone();
+    for block in damage {
+        damaged[block * 64 + 11] ^= 0x80;
+    }
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 2, damaged.into());
+
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    options.memory = MemoryBudget::new(budget);
+    options.retained_bytes = retained;
+
+    // Sampled from inside the repair, at the point the codec has admitted its
+    // banks: the only moment the whole pipeline is resident at once.
+    let inside: Arc<Mutex<Option<StageSample>>> = Arc::new(Mutex::new(None));
+    let memory = options.memory.clone();
+    let sink = Arc::clone(&inside);
+    options.progress = Some(ProgressCallback::new(move |event| {
+        if event.stage == Stage::Decode && event.phase == ProgressPhase::Begin {
+            let mut slot = sink.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(StageSample {
+                    label: "repair (decoding)",
+                    ledger: memory.ledger(),
+                    used: memory.used(),
+                    peak: memory.peak(),
+                });
+            }
+        }
+    }));
+
+    let mut samples = Vec::new();
+    let sample = |label: &'static str, options: &ExecutionOptions| StageSample {
+        label,
+        ledger: options.memory.ledger(),
+        used: options.memory.used(),
+        peak: options.memory.peak(),
+    };
+
+    let mut session = Par3RepairSession::new(id, Arc::new(access), options.clone()).unwrap();
+    session.bind_file("input.bin", SourceId(1)).unwrap();
+    for path in &paths {
+        for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    samples.push(sample("scan + merge", &options));
+
+    assert!(session.layout().unwrap().is_some());
+    samples.push(sample("metadata + layout", &options));
+
+    let status = session.assess().unwrap().status;
+    assert_eq!(status, RepairStatus::Ready);
+    samples.push(sample("verify + assess", &options));
+
+    let output = TempTree::new("stage-inventory-out");
+    let repaired = session.repair(output.path(), false).unwrap();
+    assert_eq!(
+        std::fs::read(output.path().join("input.bin")).unwrap(),
+        bytes
+    );
+    if let Some(inside) = inside.lock().unwrap().take() {
+        samples.push(inside);
+    }
+    samples.push(sample("after repair", &options));
+
+    drop(session);
+    samples.push(sample("session dropped", &options));
+    (samples, repaired.reconstructed_blocks)
 }

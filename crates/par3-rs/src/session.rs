@@ -50,6 +50,75 @@ pub struct RecoveryRequirement {
     pub available: Vec<u64>,
     /// Minimum additional recovery blocks in this specific cohort.
     pub additional: u64,
+    /// How many of `additional` a host has already declared it is fetching,
+    /// through [`Par3RepairSession::note_recovery_in_flight`]. Indices that
+    /// have since arrived are not counted here; they are in `available`.
+    pub in_flight: u64,
+    /// `additional` less `in_flight`: what still has to be asked for. Zero
+    /// means the cohort is fully spoken for even though it is not yet ready.
+    pub outstanding: u64,
+    /// Exactly `outstanding` admissible indices in this cohort that are
+    /// neither available nor in flight, lowest first. A host can fetch these
+    /// and reassess without ever requesting the same index twice.
+    pub next_indices: Vec<u64>,
+}
+
+/// What a candidate matrix covers, and how its recovery indices divide into
+/// cohorts. Derived once per candidate and never retained.
+struct MatrixGeometry {
+    covered: Range<u64>,
+    cohorts: u64,
+    capacity: u64,
+    block_size: u64,
+}
+
+/// Read a candidate matrix's geometry, or `None` when this build cannot
+/// execute it. Reading a candidate allocates nothing.
+fn matrix_geometry(
+    set: &Par3Set,
+    layout: &BlockLayout,
+    packet: &Packet,
+) -> EngineResult<Option<MatrixGeometry>> {
+    let (range, cohorts, capacity) = match packet.body() {
+        PacketBody::CauchyMatrix(matrix) => {
+            let capacity = match set.galois_field().size {
+                1 => 256u64,
+                2 => 65536,
+                _ => return Ok(None),
+            };
+            let capacity = cauchy_recovery_capacity(matrix.range, layout.block_count, capacity)?;
+            if capacity == 0 {
+                return Ok(None);
+            }
+            (matrix.range, 1, capacity)
+        }
+        PacketBody::FftMatrix(matrix) => {
+            let Some(cohorts) = matrix.interleave.checked_add(1) else {
+                return Ok(None);
+            };
+            let covered = block_range(matrix.range, layout.block_count)?;
+            let Ok(geometry) = crate::fft::FftGeometry::new(
+                (covered.end - covered.start).div_ceil(cohorts),
+                matrix.max_recovery_blocks_log2,
+            ) else {
+                return Ok(None);
+            };
+            if geometry.validate_field(set.galois_field()).is_err() {
+                return Ok(None);
+            }
+            if (geometry.capacity() as u64).checked_mul(cohorts).is_none() {
+                return Ok(None);
+            }
+            (matrix.range, cohorts, geometry.capacity() as u64)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(MatrixGeometry {
+        covered: block_range(range, layout.block_count)?,
+        cohorts,
+        capacity,
+        block_size: layout.block_size,
+    }))
 }
 
 /// One file's current state in an assessment.
@@ -115,6 +184,10 @@ pub struct Par3RepairSession {
     data_dirty: bool,
     data_checked: BTreeMap<Fingerprint, data::DataAdmission>,
     data_blocks: BTreeMap<u64, PayloadRef>,
+    /// Recovery indices the host has declared it is acquiring, by matrix. This
+    /// is the continuation that keeps a reassessment from asking twice.
+    recovery_in_flight: BTreeMap<Fingerprint, std::collections::BTreeSet<u64>>,
+    in_flight_memory: Option<Reservation>,
     diagnostics: SessionDiagnostics,
 }
 
@@ -143,12 +216,23 @@ impl Par3RepairSession {
             data_dirty: true,
             data_checked: BTreeMap::new(),
             data_blocks: BTreeMap::new(),
+            recovery_in_flight: BTreeMap::new(),
+            in_flight_memory: None,
             diagnostics: SessionDiagnostics::default(),
         })
     }
 
     /// Admit an authenticated packet. Replays preserve the assessment unchanged.
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`].
     pub fn merge(&mut self, packet: IngestedPacket) -> EngineResult<MergeEffect> {
+        let outcome = self.merge_admitted(packet);
+        if let Err(error) = &outcome {
+            self.options.diagnostics.note_refusal(error);
+        }
+        outcome
+    }
+
+    fn merge_admitted(&mut self, packet: IngestedPacket) -> EngineResult<MergeEffect> {
         let is_data = packet
             .payload()
             .is_some_and(|payload| matches!(payload.kind(), PayloadKind::Data { .. }));
@@ -194,6 +278,73 @@ impl Par3RepairSession {
         self.evidence.remove(path);
         self.assessment = None;
         Ok(())
+    }
+
+    /// Declare recovery indices this host is acquiring for `matrix`, so the
+    /// next assessment does not ask for them again.
+    ///
+    /// The state is a continuation, not a promise: an index that never arrives
+    /// simply keeps appearing as `in_flight` until the host retracts it with
+    /// [`Self::forget_recovery_in_flight`], and an index that does arrive moves
+    /// to `available` on its own. The set is bounded and charged; declaring
+    /// more indices than the budget admits is refused rather than truncated.
+    pub fn note_recovery_in_flight(
+        &mut self,
+        matrix: Fingerprint,
+        indices: &[u64],
+    ) -> EngineResult<()> {
+        self.options.cancel.check()?;
+        let entry = self.recovery_in_flight.entry(matrix).or_default();
+        let added = indices
+            .iter()
+            .filter(|index| !entry.contains(index))
+            .count();
+        if added == 0 {
+            return Ok(());
+        }
+        let held = self.in_flight_memory.as_ref().map_or(0, Reservation::bytes);
+        let growth = added
+            .checked_mul(IN_FLIGHT_INDEX_BYTES)
+            .ok_or(EngineError::resource_limit("recovery acquisition state"))?;
+        self.admit_retained(growth)?;
+        match &mut self.in_flight_memory {
+            Some(reservation) => reservation.grow_by(growth)?,
+            slot => {
+                *slot = Some(
+                    self.options
+                        .memory
+                        .reserve_as(MemoryCategory::Assessment, held + growth)?,
+                );
+            }
+        }
+        let entry = self.recovery_in_flight.entry(matrix).or_default();
+        entry.extend(indices.iter().copied());
+        self.assessment = None;
+        Ok(())
+    }
+
+    /// Retract recovery indices that are no longer being acquired. Passing an
+    /// empty slice retracts every index recorded for `matrix`.
+    pub fn forget_recovery_in_flight(&mut self, matrix: Fingerprint, indices: &[u64]) {
+        let removed = match self.recovery_in_flight.get_mut(&matrix) {
+            None => 0,
+            Some(entry) if indices.is_empty() => std::mem::take(entry).len(),
+            Some(entry) => indices.iter().filter(|index| entry.remove(index)).count(),
+        };
+        if removed == 0 {
+            return;
+        }
+        self.recovery_in_flight.retain(|_, set| !set.is_empty());
+        if let Some(reservation) = &mut self.in_flight_memory {
+            let keep = reservation
+                .bytes()
+                .saturating_sub(removed.saturating_mul(IN_FLIGHT_INDEX_BYTES));
+            reservation.shrink_to(keep);
+            if keep == 0 {
+                self.in_flight_memory = None;
+            }
+        }
+        self.assessment = None;
     }
 
     /// Invalidate evidence after replacement or rebinding. Use `source_arrived`
@@ -259,8 +410,12 @@ impl Par3RepairSession {
     }
 
     /// Resolve currently available metadata, returning `None` while incomplete.
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`].
     pub fn layout(&mut self) -> EngineResult<Option<Arc<BlockLayout>>> {
-        self.refresh_layout()?;
+        if let Err(error) = self.refresh_layout() {
+            self.options.diagnostics.note_refusal(&error);
+            return Err(error);
+        }
         Ok(self.layout.as_ref().map(Arc::clone))
     }
 
@@ -356,7 +511,19 @@ impl Par3RepairSession {
 
     /// Assess losses and precise recovery requirements. Unchanged evidence costs
     /// only source snapshot checks; a recovery merge never triggers source reads.
+    ///
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`]. This is
+    /// the boundary a host sees, so a request refused deep inside the stage is
+    /// reported here exactly once rather than at every frame it passes.
     pub fn assess(&mut self) -> EngineResult<&RepairAssessment> {
+        if let Err(error) = self.refresh_assessment() {
+            self.options.diagnostics.note_refusal(&error);
+            return Err(error);
+        }
+        Ok(self.assessment.as_ref().expect("stored assessment"))
+    }
+
+    fn refresh_assessment(&mut self) -> EngineResult<()> {
         let _progress = self.options.stage(crate::runtime::Stage::Assess)?;
         match self.input.discard_changed_payloads() {
             Ok(0) => {}
@@ -398,10 +565,11 @@ impl Par3RepairSession {
         }
         if self.assessment.is_some() {
             self.diagnostics.assessment_reuses += 1;
-            return self
-                .assessment
-                .as_ref()
-                .ok_or(EngineError::InvalidState("missing cached assessment"));
+            return if self.assessment.is_some() {
+                Ok(())
+            } else {
+                Err(EngineError::InvalidState("missing cached assessment"))
+            };
         }
         let Some(layout) = self.layout.as_ref().map(Arc::clone) else {
             self.admit_retained(512)?;
@@ -417,29 +585,23 @@ impl Par3RepairSession {
                     .memory
                     .reserve_as(MemoryCategory::Assessment, 512)?,
             });
-            return Ok(self.assessment.as_ref().expect("stored assessment"));
+            return Ok(());
         };
-        let cost = usize::try_from(layout.block_count)
-            .ok()
-            // Include simultaneous best/current matrix candidates, cohort maps,
-            // recovery references, and temporary block-coverage unions.
-            .and_then(|count| count.checked_mul(512))
-            .and_then(|count| count.checked_add(self.input.payloads().count().checked_mul(2048)?))
-            .and_then(|count| {
-                layout.files.iter().try_fold(count, |total, file| {
-                    total
-                        .checked_add(1024)?
-                        .checked_add(file.path.len().checked_mul(2)?)?
-                        .checked_add(file.extents.len().checked_mul(128)?)
-                })
-            })
-            .ok_or(EngineError::resource_limit("assessment blocks"))?;
-        self.admit_retained(cost)?;
-        let reservation = self
+        // Assessment holds two different things with two different lifetimes,
+        // and charging them as one made the transient part permanent. `scratch`
+        // covers what the walk allocates and drops — the loss vector as it
+        // doubles, the per-block coverage unions, the file roster as it grows.
+        // It is released before this call returns. What the assessment keeps is
+        // measured from the structures actually built and charged separately,
+        // so the resident cost after assessing is a function of files and
+        // losses rather than of the block count.
+        let scratch_bytes = assessment_scratch_bytes(&layout)
+            .ok_or(EngineError::resource_limit("assessment working set"))?;
+        let scratch = self
             .options
             .memory
-            .reserve_as(MemoryCategory::Assessment, cost)?;
-        self.verify_missing_sources(&layout, cost)?;
+            .reserve_as(MemoryCategory::Assessment, scratch_bytes)?;
+        self.verify_missing_sources(&layout, scratch_bytes)?;
         let mut files = Vec::with_capacity(layout.files.len());
         for file in &layout.files {
             self.options.cancel.check()?;
@@ -468,6 +630,16 @@ impl Par3RepairSession {
             }
         }
         let (matrix, requirements, recovery) = self.select_matrix(&layout, &lost)?;
+        // Charge what survives, measured, and only then release the walk's
+        // working set. Both exist at this instant and the ledger says so.
+        let retained_bytes = assessment_retained_bytes(&files, &lost, &requirements, &recovery)
+            .ok_or(EngineError::resource_limit("assessment result"))?;
+        self.admit_retained(retained_bytes)?;
+        let reservation = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::Assessment, retained_bytes)?;
+        drop(scratch);
         let status = if files.iter().all(|file| file.complete) {
             RepairStatus::Complete
         } else if lost.is_empty() {
@@ -489,7 +661,7 @@ impl Par3RepairSession {
             _reservation: reservation,
         });
         self.diagnostics.assessments += 1;
-        Ok(self.assessment.as_ref().expect("stored assessment"))
+        Ok(())
     }
 
     fn block_available(&self, layout: &BlockLayout, block: u64) -> bool {
@@ -536,106 +708,224 @@ impl Par3RepairSession {
         lost: &[u64],
     ) -> EngineResult<(Option<Packet>, Vec<RecoveryRequirement>, Vec<PayloadRef>)> {
         let set = self.set.as_ref().expect("layout has a set");
-        let mut best: Option<(u64, Packet, Vec<RecoveryRequirement>, Vec<PayloadRef>)> = None;
+        // Scoring never materialises a candidate. Only a deficit and an
+        // identity cross from one iteration to the next, so two candidates'
+        // requirement lists, availability maps and payload references are never
+        // alive at the same time; the winner alone is built, once, below.
+        let mut best: Option<(u64, Fingerprint)> = None;
         for packet in set.matrix_packets() {
-            let (range, cohorts, capacity) = match packet.body() {
-                PacketBody::CauchyMatrix(matrix) => {
-                    let capacity = match set.galois_field().size {
-                        1 => 256u64,
-                        2 => 65536,
-                        _ => continue,
-                    };
-                    let capacity =
-                        cauchy_recovery_capacity(matrix.range, layout.block_count, capacity)?;
-                    if capacity == 0 {
-                        continue;
-                    }
-                    (matrix.range, 1, capacity)
-                }
-                PacketBody::FftMatrix(matrix) => {
-                    let Some(cohorts) = matrix.interleave.checked_add(1) else {
-                        continue;
-                    };
-                    let covered = block_range(matrix.range, layout.block_count)?;
-                    let Ok(geometry) = crate::fft::FftGeometry::new(
-                        (covered.end - covered.start).div_ceil(cohorts),
-                        matrix.max_recovery_blocks_log2,
-                    ) else {
-                        continue;
-                    };
-                    if geometry.validate_field(set.galois_field()).is_err() {
-                        continue;
-                    }
-                    if (geometry.capacity() as u64).checked_mul(cohorts).is_none() {
-                        continue;
-                    }
-                    (matrix.range, cohorts, geometry.capacity() as u64)
-                }
-                _ => continue,
+            self.options.cancel.check()?;
+            let Some(geometry) = matrix_geometry(set, layout, packet)? else {
+                continue;
             };
-            let covered = block_range(range, layout.block_count)?;
-            if lost.iter().any(|index| !covered.contains(index)) {
+            if lost.iter().any(|index| !geometry.covered.contains(index)) {
                 continue;
             }
-            let mut unique: BTreeMap<u64, Option<PayloadRef>> = BTreeMap::new();
-            for payload in self.input.payloads() {
-                if let PayloadKind::Recovery {
-                    root,
-                    matrix,
-                    index,
-                } = payload.kind()
-                    && root == set.root_hash()
-                    && matrix == packet.hash()
-                    && index < capacity * cohorts
-                    && payload.len() <= layout.block_size
-                {
-                    unique
-                        .entry(index)
-                        .and_modify(|entry| *entry = None)
-                        .or_insert_with(|| Some(payload.clone()));
-                }
-            }
-            let mut requirements = Vec::new();
-            let mut selected = Vec::new();
+            let (_charge, present) = self.distinct_recovery(set, packet.hash(), &geometry)?;
+            let (_cohort_charge, losses) = self.losses_by_cohort(lost, geometry.cohorts)?;
             let mut deficit = 0u64;
-            let mut losses_by_cohort = BTreeMap::<u64, u64>::new();
-            for index in lost {
-                *losses_by_cohort.entry(index % cohorts).or_default() += 1;
-            }
-            for (cohort, count) in losses_by_cohort {
-                let available: Vec<u64> = unique
+            for (cohort, count) in &losses {
+                let available = present
                     .iter()
-                    .filter_map(|(index, payload)| {
-                        (index % cohorts == cohort && payload.is_some()).then_some(*index)
-                    })
-                    .collect();
-                let additional = count.saturating_sub(available.len() as u64);
-                deficit = deficit.saturating_add(additional);
-                if additional == 0 {
-                    selected.extend(
-                        available
-                            .iter()
-                            .take(count as usize)
-                            .filter_map(|index| unique[index].clone()),
-                    );
-                }
-                requirements.push(RecoveryRequirement {
-                    matrix: packet.hash(),
-                    cohort,
-                    cohorts,
-                    recovery_indices: cohort..capacity * cohorts,
-                    lost: count,
-                    available,
-                    additional,
-                });
+                    .filter(|(index, usable)| **usable && *index % geometry.cohorts == *cohort)
+                    .count() as u64;
+                deficit = deficit.saturating_add(count.saturating_sub(available));
             }
-            if best.as_ref().is_none_or(|previous| deficit < previous.0) {
-                best = Some((deficit, packet.clone(), requirements, selected));
+            if best
+                .as_ref()
+                .is_none_or(|(previous, _)| deficit < *previous)
+            {
+                best = Some((deficit, packet.hash()));
             }
         }
-        Ok(best
-            .map(|(_, matrix, requirements, recovery)| (Some(matrix), requirements, recovery))
-            .unwrap_or_default())
+        let Some((_, winner)) = best else {
+            return Ok(Default::default());
+        };
+        let packet = set
+            .matrix_packets()
+            .iter()
+            .find(|packet| packet.hash() == winner)
+            .ok_or(EngineError::InvalidState("selected matrix disappeared"))?;
+        let geometry = matrix_geometry(set, layout, packet)?.ok_or(EngineError::InvalidState(
+            "selected matrix is no longer executable",
+        ))?;
+
+        // The winner, and only the winner, is materialised with its payload
+        // references attached.
+        let (_charge, usable) = self.usable_recovery(set, packet.hash(), &geometry)?;
+        let (_cohort_charge, losses) = self.losses_by_cohort(lost, geometry.cohorts)?;
+        let in_flight = self.recovery_in_flight.get(&winner);
+        let mut requirements = Vec::with_capacity(losses.len());
+        let mut selected = Vec::new();
+        for (cohort, count) in losses {
+            self.options.cancel.check()?;
+            let available: Vec<u64> = usable
+                .iter()
+                .filter_map(|(index, payload)| {
+                    (index % geometry.cohorts == cohort && payload.is_some()).then_some(*index)
+                })
+                .collect();
+            let additional = count.saturating_sub(available.len() as u64);
+            if additional == 0 {
+                selected.extend(
+                    available
+                        .iter()
+                        .take(count as usize)
+                        .filter_map(|index| usable[index].clone()),
+                );
+            }
+            // What the host has already asked for does not need asking for
+            // again, so a reassessment after a recovery-only merge advances the
+            // plan instead of restating it.
+            let claimed = |index: &u64| {
+                usable.get(index).is_some_and(Option::is_some)
+                    || in_flight.is_some_and(|set| set.contains(index))
+            };
+            let pending = in_flight.map_or(0, |set| {
+                set.iter()
+                    .filter(|index| {
+                        *index % geometry.cohorts == cohort
+                            && !usable.get(index).is_some_and(Option::is_some)
+                    })
+                    .count() as u64
+            });
+            let outstanding = additional.saturating_sub(pending);
+            let mut next_indices = Vec::with_capacity(outstanding as usize);
+            let mut index = cohort;
+            let ceiling = geometry.capacity.saturating_mul(geometry.cohorts);
+            while next_indices.len() as u64 != outstanding && index < ceiling {
+                if !claimed(&index) {
+                    next_indices.push(index);
+                }
+                index = index.saturating_add(geometry.cohorts);
+            }
+            requirements.push(RecoveryRequirement {
+                matrix: winner,
+                cohort,
+                cohorts: geometry.cohorts,
+                recovery_indices: cohort..ceiling,
+                lost: count,
+                available,
+                additional,
+                in_flight: pending,
+                outstanding,
+                next_indices,
+            });
+        }
+        Ok((Some(packet.clone()), requirements, selected))
+    }
+
+    /// Lost blocks grouped by cohort, with the map charged for its lifetime.
+    /// At most one entry per cohort survives, and a cohort exists only because
+    /// a lost block falls in it, so the map is bounded by the losses.
+    fn losses_by_cohort(
+        &self,
+        lost: &[u64],
+        cohorts: u64,
+    ) -> EngineResult<(Reservation, BTreeMap<u64, u64>)> {
+        let entries = usize::try_from(cohorts)
+            .unwrap_or(usize::MAX)
+            .min(lost.len());
+        let charge = self.options.memory.reserve_as(
+            MemoryCategory::Assessment,
+            entries
+                .checked_mul(crate::packet::btree_entry_bytes::<u64, u64>())
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(EngineError::resource_limit("assessment cohorts"))?,
+        )?;
+        let mut losses = BTreeMap::<u64, u64>::new();
+        for index in lost {
+            *losses.entry(index % cohorts).or_default() += 1;
+        }
+        Ok((charge, losses))
+    }
+
+    /// Which recovery indices this matrix has exactly one payload for. Scoring
+    /// only needs to know that, so no payload reference is cloned.
+    fn distinct_recovery(
+        &self,
+        set: &Par3Set,
+        matrix: Fingerprint,
+        geometry: &MatrixGeometry,
+    ) -> EngineResult<(Reservation, BTreeMap<u64, bool>)> {
+        let charge = self.recovery_map_charge::<bool>()?;
+        let mut present = BTreeMap::new();
+        for index in self.recovery_indices(set, matrix, geometry) {
+            present
+                .entry(index)
+                .and_modify(|usable| *usable = false)
+                .or_insert(true);
+        }
+        Ok((charge, present))
+    }
+
+    /// The same index map as `distinct_recovery`, carrying the payload for each
+    /// index a single payload claims. Built for the selected matrix only.
+    fn usable_recovery(
+        &self,
+        set: &Par3Set,
+        matrix: Fingerprint,
+        geometry: &MatrixGeometry,
+    ) -> EngineResult<(Reservation, BTreeMap<u64, Option<PayloadRef>>)> {
+        let charge = self.recovery_map_charge::<Option<PayloadRef>>()?;
+        let mut usable: BTreeMap<u64, Option<PayloadRef>> = BTreeMap::new();
+        for payload in self.input.payloads() {
+            if let PayloadKind::Recovery {
+                root,
+                matrix: claimed,
+                index,
+            } = payload.kind()
+                && root == set.root_hash()
+                && claimed == matrix
+                && index < geometry.capacity.saturating_mul(geometry.cohorts)
+                && payload.len() <= geometry.block_size
+            {
+                usable
+                    .entry(index)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert_with(|| Some(payload.clone()));
+            }
+        }
+        Ok((charge, usable))
+    }
+
+    /// One recovery index per payload that claims this matrix, undeduplicated.
+    fn recovery_indices<'a>(
+        &'a self,
+        set: &'a Par3Set,
+        matrix: Fingerprint,
+        geometry: &'a MatrixGeometry,
+    ) -> impl Iterator<Item = u64> + 'a {
+        self.input
+            .payloads()
+            .filter_map(move |payload| match payload.kind() {
+                PayloadKind::Recovery {
+                    root,
+                    matrix: claimed,
+                    index,
+                } if root == set.root_hash()
+                    && claimed == matrix
+                    && index < geometry.capacity.saturating_mul(geometry.cohorts)
+                    && payload.len() <= geometry.block_size =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+    }
+
+    /// One index map, bounded by the payloads that could populate it. Recovery
+    /// payloads are already admitted and counted, so this does not scale with
+    /// the block count.
+    fn recovery_map_charge<V>(&self) -> EngineResult<Reservation> {
+        let payloads = self.input.payloads().count();
+        self.options.memory.reserve_as(
+            MemoryCategory::Assessment,
+            payloads
+                .checked_mul(crate::packet::btree_entry_bytes::<u64, V>())
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(EngineError::resource_limit("assessment recovery map"))?,
+        )
     }
 
     /// Check readiness, ordinary-repair layout support, and configured
@@ -760,6 +1050,17 @@ impl Par3RepairSession {
             if batch.is_empty() {
                 return probe_error.map_or(Ok(()), Err);
             }
+            // A batch shorter than the pool width because the layout ran out of
+            // unverified files is not a narrowing; only a refused probe is.
+            let width = pool
+                .as_ref()
+                .map_or(1, |pool| pool.pool().current_num_threads());
+            let wanted = if probe_error.is_some() {
+                width.max(batch.len().saturating_add(1))
+            } else {
+                batch.len()
+            };
+            self.options.diagnostics.note_batch(batch.len(), wanted);
             let mut options = self.options.clone();
             options.retained_bytes = options
                 .retained_bytes
@@ -863,8 +1164,13 @@ impl Par3RepairSession {
         backup: bool,
     ) -> EngineResult<crate::session_repair::SessionRepairReport> {
         let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
+        // `assess` already counts its own refusals; only the repair's are added.
         self.assess()?;
-        crate::session_repair::repair(self, output, backup)
+        let outcome = crate::session_repair::repair(self, output, backup);
+        if let Err(error) = &outcome {
+            self.options.diagnostics.note_refusal(error);
+        }
+        outcome
     }
 
     /// Change CPU and stripe limits between operations without discarding
@@ -926,6 +1232,7 @@ impl Par3RepairSession {
                     .sum::<usize>(),
             )
             .saturating_add(self.placements.len().saturating_mul(512))
+            .saturating_add(self.in_flight_memory.as_ref().map_or(0, Reservation::bytes))
             .saturating_add(
                 self.assessment
                     .as_ref()
@@ -1078,6 +1385,85 @@ pub(crate) fn block_range(range: BlockRange, count: u64) -> EngineResult<Range<u
     }
     Ok(range.first..range.end)
 }
+
+/// Bytes `assess` allocates while it runs and does not keep.
+///
+/// Three things grow inside the walk. The loss vector takes one `u64` per lost
+/// block and can end up holding every block, and it doubles as it grows, so it
+/// is charged at twice the block count. The file roster is built by pushing,
+/// so it too is charged at twice what it ends up holding, including the
+/// unresolved ranges each entry carries — in the worst case one per extent.
+/// And `block_available` builds, sorts and merges two range lists per block:
+/// those are freed each call, so only the widest block's lists are charged.
+fn assessment_scratch_bytes(layout: &BlockLayout) -> Option<usize> {
+    const UNION_LISTS: usize = 4;
+    let losses = usize::try_from(layout.block_count)
+        .ok()?
+        .checked_mul(size_of::<u64>())?
+        .checked_mul(2)?;
+    let roster = layout.files.iter().try_fold(0usize, |total, file| {
+        total
+            .checked_add(size_of::<AssessedFile>())?
+            .checked_add(file.path.len())?
+            .checked_add(file.extents.len().checked_mul(size_of::<Range<u64>>())?)
+    })?;
+    let aliases = layout
+        .blocks
+        .values()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .checked_mul(size_of::<Range<u64>>())?
+        .checked_mul(UNION_LISTS * 2)?;
+    losses
+        .checked_add(roster.checked_mul(2)?)?
+        .checked_add(aliases)?
+        .checked_add(crate::set::RESOLUTION_BASE_BYTES)
+}
+
+/// Bytes the finished assessment keeps, measured from what it built.
+///
+/// Every term is a real container capacity: the roster and its unresolved
+/// ranges, one `u64` per lost block, one requirement per cohort with the
+/// recovery indices it names, and the payload references the selection kept.
+/// The matrix packet is charged by its owning session, not here.
+fn assessment_retained_bytes(
+    files: &[AssessedFile],
+    lost: &Vec<u64>,
+    requirements: &[RecoveryRequirement],
+    recovery: &Vec<PayloadRef>,
+) -> Option<usize> {
+    let roster = files.iter().try_fold(0usize, |total, file| {
+        total
+            .checked_add(size_of::<AssessedFile>())?
+            .checked_add(file.path.capacity())?
+            .checked_add(
+                file.unresolved
+                    .capacity()
+                    .checked_mul(size_of::<Range<u64>>())?,
+            )
+    })?;
+    let needs = requirements.iter().try_fold(0usize, |total, need| {
+        total
+            .checked_add(size_of::<RecoveryRequirement>())?
+            .checked_add(need.available.capacity().checked_mul(size_of::<u64>())?)?
+            .checked_add(need.next_indices.capacity().checked_mul(size_of::<u64>())?)
+    })?;
+    roster
+        .checked_add(lost.capacity().checked_mul(size_of::<u64>())?)?
+        .checked_add(needs)?
+        .checked_add(recovery.capacity().checked_mul(size_of::<PayloadRef>())?)?
+        .checked_add(size_of::<RepairAssessment>())?
+        .checked_add(ASSESSMENT_BASE_BYTES)
+}
+
+/// Fixed allowance for the assessment's own bookkeeping and the matrix clone's
+/// header, independent of the set's geometry.
+const ASSESSMENT_BASE_BYTES: usize = 4096;
+
+/// One declared in-flight recovery index: a `BTreeSet` node slot plus the map
+/// entry amortised over the indices a matrix usually carries.
+const IN_FLIGHT_INDEX_BYTES: usize = 2 * size_of::<u64>() + 48;
 
 fn union(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
     ranges.sort_by_key(|range| (range.start, range.end));

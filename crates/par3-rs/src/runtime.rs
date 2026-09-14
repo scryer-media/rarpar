@@ -14,8 +14,9 @@ pub use handles::{HandleBudget, HandleLease};
 mod diagnostics;
 pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
-    ExecutionDiagnostics, IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, Stage,
-    StageSnapshot,
+    AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, ExecutionDiagnostics, IoSnapshot,
+    ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage, StageSnapshot,
+    WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -451,8 +452,14 @@ impl MemoryBudget {
         self.limit().saturating_sub(self.used())
     }
 
-    /// Reserve aligned stripes atomically; another session may consume the
-    /// observed headroom before our reservation, so shrink on contention.
+    /// Reserve aligned stripes atomically, sized from what the budget has now.
+    ///
+    /// The width is computed, not searched. Halving a request until something
+    /// fits is an allocate-fail-wake loop: it charges the budget once per
+    /// failed step and reports only the last failure. One recomputation is
+    /// allowed because a peer may take bytes between reading the headroom and
+    /// reserving it; after that the request is refused with honest numbers
+    /// rather than retried again.
     pub(crate) fn reserve_stripes(
         &self,
         category: MemoryCategory,
@@ -474,14 +481,17 @@ impl MemoryBudget {
         if count == 0 || alignment == 0 {
             return Err(EngineError::InvalidState("invalid repair stripe layout"));
         }
-        let available = || self.available().saturating_sub(overhead) / count;
-        let mut stripe = target.min(available()) / alignment * alignment;
-        while stripe != 0 {
+        for attempt in 0..2 {
+            let room = self.available().saturating_sub(overhead) / count;
+            let stripe = target.min(room) / alignment * alignment;
+            if stripe == 0 {
+                break;
+            }
             match self.reserve_as(category, stripe * count + overhead) {
                 Ok(reservation) => return Ok((stripe, reservation)),
-                Err(EngineError::ResourceLimit(_)) => {
-                    stripe = (stripe / 2).min(available()) / alignment * alignment;
-                }
+                // A peer moved between the measurement and the charge. Measure
+                // once more against what it left, then stop.
+                Err(EngineError::ResourceLimit(_)) if attempt == 0 => {}
                 Err(error) => return Err(error),
             }
         }
@@ -705,10 +715,14 @@ impl WorkerPool {
         headroom: usize,
     ) -> EngineResult<Option<Self>> {
         options.validate()?;
+        let wanted = options.workers.min(maximum).max(1);
         let workers = options
             .workers
             .min(maximum)
             .min(options.memory.available().saturating_sub(headroom) / Self::WORKER_BYTES);
+        // Shrinking the worker count is the first thing pressure takes, and a
+        // stage that ends up serial says so rather than failing.
+        options.diagnostics.note_workers(workers.max(1), wanted);
         if workers < 2 {
             return Ok(None);
         }

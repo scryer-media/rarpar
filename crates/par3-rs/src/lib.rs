@@ -52,7 +52,11 @@
 //! Admit it with [`Par3RepairSession::add_evidence`]. Unchanged assessments and
 //! recovery-only merges retain it without rereading protected sources.
 //! [`session::RecoveryRequirement`] exposes per-cohort deficits and admissible
-//! recovery indices; surplus in one interleaved cohort cannot cover another.
+//! recovery indices; surplus in one interleaved cohort cannot cover another. It
+//! also carries a resumable continuation: declare what is being fetched with
+//! [`Par3RepairSession::note_recovery_in_flight`] and the next assessment
+//! reports it as `in_flight`, leaving `outstanding` and `next_indices` as the
+//! part of the plan that still has to be asked for.
 //!
 //! Unknown ranges remain unavailable, never implicit zeroes. A checkpoint's
 //! digest must be retained in trusted host metadata separately from its bytes;

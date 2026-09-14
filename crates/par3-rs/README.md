@@ -207,6 +207,42 @@ limits derived from it — report the session's total demand rather than the
 increment that tripped them, so they classify as terminal, which is what they
 are: nothing else draws on that ceiling.
 
+Each stage of a repair holds a bounded set and releases what its consumer is
+finished with before the next stage charges its own. On a 16,384-block set the
+resident total across all categories is about 365 bytes per block: 24 for
+carrier and packet storage, 100 for resolved metadata, 240 for the layout and
+its verification evidence, and a fraction of a byte for assessment state.
+Assessment takes a scratch reservation while it accumulates coverage and
+per-cohort deficits, releases it at the handover, and retains only what the
+result's own containers measure — so what survives assessment follows files and
+losses, not the block count. The layout is charged from its containers'
+capacities and trued up to the built layout's measurement. Carrier bytes and
+verification evidence deliberately outlive the stages that produced them,
+because carrier regeneration and reassessment read them and dropping them would
+buy memory with source rereads; `ExecutionDiagnostics::amplification()` reports
+reread and reconstructed bytes so that trade can never be made invisibly.
+
+Under pressure the engine narrows before it refuses — stripes, worker pools and
+verification batches are admitted at the width the budget actually has, and each
+narrowing is recorded in `ExecutionDiagnostics::waits()`. Widths are never found
+by halving a request until something fits. When even the minimum useful set does
+not fit, the stage returns one `ResourceLimit` and stops; there is no
+allocate-fail-wake loop, and the refusal is counted once by cause in
+`ExecutionDiagnostics::refusals()` at the session boundary the host sees.
+
+A recovery deficit leaves a resumable continuation. `RecoveryRequirement` adds
+`in_flight`, `outstanding` and `next_indices` alongside its existing fields;
+`Par3RepairSession::note_recovery_in_flight` declares the indices a host is
+fetching and `forget_recovery_in_flight` retracts them, so a reassessment after
+a recovery-only merge advances the acquisition plan rather than asking for the
+same indices again.
+
+Cauchy repair produces recovered rows in tiles, scattering each tile before
+producing the next, so the output row bank costs `(m + t)` stripes rather than
+`2m`. The tile width comes from admitted worker capacity, is reported as
+`ExecutionDiagnostics::admission().output_tile`, and changes neither the output
+bytes nor the number of writes.
+
 Metadata resolution is charged for what it allocates rather than for the
 ceiling it might have needed: packet decode, description resolution and
 directory expansion each take their bytes as they go, and what survives is the

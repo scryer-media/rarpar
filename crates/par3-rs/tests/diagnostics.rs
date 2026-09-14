@@ -139,3 +139,327 @@ fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() 
         assert_eq!(options.memory.used(), 0);
     }
 }
+
+// --- Admission, amplification and output tiling (work package M1) -----------
+
+use par3_rs::runtime::{LimitCause, MemoryBudget, MemoryCategory};
+use par3_rs::session::{Par3RepairSession, RepairStatus};
+
+/// Repair one Cauchy set at a chosen worker count and budget, returning the
+/// repaired bytes and the options the run used, so a caller can read both the
+/// output and every counter the run produced.
+#[allow(clippy::too_many_arguments)]
+fn repair_cauchy(
+    blocks: usize,
+    block_size: u64,
+    recovery: u64,
+    damage: &[usize],
+    workers: usize,
+    stripe_bytes: usize,
+    budget: usize,
+    seed: &[u8],
+) -> (Vec<u8>, ExecutionOptions) {
+    let tree = common::TempTree::new("tiled-cauchy");
+    let set = common::cauchy_block_set(blocks, block_size, recovery, seed, &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in damage {
+        damaged[block * block_size as usize + 11] ^= 0x80;
+    }
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 2, damaged.into());
+
+    let mut options = ExecutionOptions::default();
+    options.workers = workers;
+    options.stripe_bytes = stripe_bytes;
+    options.memory = MemoryBudget::new(budget);
+    options.retained_bytes = budget / 2;
+
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+    session.bind_file(&name, SourceId(1)).unwrap();
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    let output = common::TempTree::new("tiled-cauchy-out");
+    let repaired = session.repair(output.path(), false).unwrap();
+    assert_eq!(repaired.reconstructed_blocks, damage.len() as u64);
+    let rebuilt = std::fs::read(output.path().join(&name)).unwrap();
+    assert_eq!(rebuilt, bytes, "the repair did not reproduce the input");
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+    (rebuilt, options)
+}
+
+/// Deliverable 6. The Cauchy row bank no longer materialises every recovered
+/// row before scattering any of them: it produces `t` rows at a time, where `t`
+/// comes from the admitted worker capacity. The output must not care.
+///
+/// Both runs are hashed and compared, and so are the write calls: tiling
+/// preserves column order and still issues one scatter per column, so it buys
+/// its smaller bank without extra seeks.
+#[test]
+fn output_tiling_changes_the_row_bank_and_nothing_else() {
+    let damage = [1usize, 3, 5, 7, 9, 11, 13, 15];
+    let seed = b"PAR3 cauchy output tiling";
+    let (serial, serial_options) = repair_cauchy(512, 64, 16, &damage, 1, 4096, 32 << 20, seed);
+    let (tiled, tiled_options) = repair_cauchy(512, 64, 16, &damage, 8, 4096, 32 << 20, seed);
+
+    let digest = |bytes: &[u8]| {
+        let mut hash = blake3::Hasher::new();
+        hash.update(bytes);
+        hash.finalize().to_hex().to_string()
+    };
+    assert_eq!(
+        digest(&serial),
+        digest(&tiled),
+        "tiling changed the repaired bytes"
+    );
+
+    let narrow = serial_options.diagnostics.admission();
+    let wide = tiled_options.diagnostics.admission();
+    println!(
+        "tile {} -> {} ({} rows lost), stripe {} -> {}",
+        narrow.output_tile,
+        wide.output_tile,
+        damage.len(),
+        narrow.stripe_bytes,
+        wide.stripe_bytes
+    );
+    assert_eq!(
+        narrow.output_tile, 1,
+        "one worker must tile one row at a time"
+    );
+    assert!(
+        wide.output_tile > narrow.output_tile,
+        "more workers did not widen the tile"
+    );
+    assert!(
+        wide.output_tile <= damage.len() as u64,
+        "the tile exceeded the rows there are to recover"
+    );
+
+    // Extra seeks: the measurement the brief asks for. Scattering is per
+    // column, so a narrower tile costs no additional writes.
+    let narrow_io = serial_options.diagnostics.file_io();
+    let wide_io = tiled_options.diagnostics.file_io();
+    println!(
+        "write calls {} -> {}, write bytes {} -> {}",
+        narrow_io.write_calls, wide_io.write_calls, narrow_io.write_bytes, wide_io.write_bytes
+    );
+    assert_eq!(
+        narrow_io.write_calls, wide_io.write_calls,
+        "tiling changed the number of writes"
+    );
+    assert_eq!(narrow_io.write_bytes, wide_io.write_bytes);
+}
+
+/// Deliverable 5. Every counter the brief names is readable after a repair, the
+/// ledger is reachable through the diagnostics without a second copy, and the
+/// amplification counters actually moved.
+#[test]
+fn a_repair_reports_its_widths_its_caches_and_what_it_moved_onto_io() {
+    let (_, options) = repair_cauchy(
+        512,
+        64,
+        8,
+        &[1usize, 3, 5, 7],
+        2,
+        4096,
+        32 << 20,
+        b"PAR3 admission diagnostics",
+    );
+    let diagnostics = &options.diagnostics;
+
+    // The ledger is delegated, not duplicated.
+    let ledger = diagnostics
+        .memory()
+        .expect("a stage ran against the budget");
+    assert_eq!(
+        ledger.category(MemoryCategory::Assessment).peak,
+        options
+            .memory
+            .ledger()
+            .category(MemoryCategory::Assessment)
+            .peak
+    );
+    assert!(
+        ledger.category(MemoryCategory::CodecScratch).peak > 0,
+        "the codec ran but charged no scratch"
+    );
+    for (category, entry) in ledger.iter() {
+        assert_eq!(entry.current, 0, "{} is still held", category.name());
+    }
+
+    let admission = diagnostics.admission();
+    assert!(admission.stripe_bytes > 0, "no stripe was recorded");
+    assert!(admission.stripe_buffers > 0);
+    assert!(admission.output_tile > 0);
+    assert!(admission.workers > 0);
+    assert!(admission.verify_batch > 0, "no verification batch recorded");
+
+    let amplification = diagnostics.amplification();
+    println!(
+        "reread {} bytes, reconstructed {} bytes",
+        amplification.reread_bytes, amplification.reconstructed_bytes
+    );
+    assert!(
+        amplification.reconstructed_bytes > 0,
+        "four blocks were rebuilt but nothing was counted"
+    );
+
+    // A repair that fits needs no refusals and no narrowing.
+    assert_eq!(diagnostics.refusals(), Default::default());
+    println!(
+        "waits {:?}, caches {:?}",
+        diagnostics.waits(),
+        diagnostics.caches()
+    );
+}
+
+/// Deliverable 4. Under pressure the engine narrows rather than failing, and
+/// when even the minimum will not fit it refuses once, with honest numbers, and
+/// never spins.
+#[test]
+fn pressure_narrows_the_stripe_before_it_refuses_and_refuses_only_once() {
+    // A budget that cannot hold the configured 1 MiB stripes but can hold a
+    // narrow one. The repair must still complete, with the narrowing recorded.
+    let (_, tight) = repair_cauchy(
+        64,
+        64 << 10,
+        8,
+        &[1usize, 3, 5, 7, 9, 11, 13, 15],
+        1,
+        1 << 20,
+        512 << 10,
+        b"PAR3 pressure narrowing",
+    );
+    let waits = tight.diagnostics.waits();
+    let admission = tight.diagnostics.admission();
+    println!(
+        "narrowed to {} bytes, waits {waits:?}",
+        admission.stripe_bytes
+    );
+    assert!(
+        admission.stripe_bytes < (64 << 10),
+        "the stripe was not narrowed below the block"
+    );
+    assert!(
+        waits.stripe_narrowed > 0 || waits.workers_refused > 0,
+        "narrowing happened but nothing recorded it"
+    );
+
+    // Under a budget below any useful working set the engine refuses instead of
+    // looping. The carriers are scanned under a budget of their own so that the
+    // refusal under test comes from the repair session.
+    let tree = common::TempTree::new("pressure-refusal");
+    let set = common::cauchy_block_set(64, 64 << 10, 8, b"PAR3 pressure refusal", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in [1usize, 3, 5, 7] {
+        damaged[block * (64 << 10) + 11] ^= 0x80;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+
+    let attempt = |budget: usize| -> (par3_rs::runtime::ResourceLimit, ExecutionOptions) {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.memory = MemoryBudget::new(budget);
+        options.retained_bytes = budget;
+        let refused = (|| -> Result<(), EngineError> {
+            let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone())?;
+            session.bind_file(&name, SourceId(1))?;
+            for packet in carriers.clone() {
+                session.merge(packet)?;
+            }
+            session.assess()?;
+            let output = common::TempTree::new("pressure-refusal-out");
+            session.repair(output.path(), false)?;
+            Ok(())
+        })();
+        let EngineError::ResourceLimit(limit) =
+            refused.expect_err("a starved budget admitted a repair")
+        else {
+            panic!("pressure produced something other than a resource limit");
+        };
+        assert_eq!(options.memory.used(), 0, "the refused attempt kept memory");
+        (limit, options)
+    };
+
+    // Small enough that no arrangement of this session fits: terminal.
+    let (terminal, terminal_options) = attempt(96 << 10);
+    println!(
+        "terminal: what={} need={} limit={} available={} cause={:?}",
+        terminal.what,
+        terminal.need,
+        terminal.limit,
+        terminal.available,
+        terminal.cause()
+    );
+    assert_eq!(
+        terminal.cause(),
+        LimitCause::ExceedsLimit,
+        "a request that cannot fit at all was offered as retryable"
+    );
+    assert!(
+        terminal.need > terminal.limit,
+        "a terminal refusal that fits"
+    );
+    // Counted exactly once, at the boundary the host sees, and by cause.
+    assert_eq!(
+        terminal_options.diagnostics.refusals(),
+        par3_rs::runtime::RefusalSnapshot {
+            exceeds_limit: 1,
+            peer_contention: 0,
+            unmeasured: 0,
+        }
+    );
+
+    // Large enough that the request would fit on an empty budget, but this
+    // session's own earlier reservations are still holding it. M0's semantics
+    // call that `PeerContention`: the holder may be a peer or this session, and
+    // the host decides which from its own in-flight knowledge.
+    let (contended, options) = attempt(160 << 10);
+    println!(
+        "contended: what={} need={} limit={} available={} cause={:?}",
+        contended.what,
+        contended.need,
+        contended.limit,
+        contended.available,
+        contended.cause()
+    );
+    assert_eq!(contended.cause(), LimitCause::PeerContention);
+    assert!(
+        contended.need <= contended.limit,
+        "a retryable refusal that cannot fit"
+    );
+    assert!(
+        contended.available <= contended.limit,
+        "more was available than the ceiling allows"
+    );
+    assert!(
+        contended.limit <= options.memory.limit(),
+        "the refusal measured against more than the budget"
+    );
+    // Nothing was refused without being measured, and no admission site spun.
+    let refusals = options.diagnostics.refusals();
+    println!("refusals {refusals:?}");
+    assert_eq!(
+        refusals,
+        par3_rs::runtime::RefusalSnapshot {
+            exceeds_limit: 0,
+            peer_contention: 1,
+            unmeasured: 0,
+        },
+        "an admission site retried instead of refusing once"
+    );
+}

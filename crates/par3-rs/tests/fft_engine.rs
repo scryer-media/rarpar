@@ -285,3 +285,174 @@ fn bounded_fft_decoding_restores_official_input_with_uneven_losses() {
         }
     }
 }
+
+/// Deliverable 3's continuation: after a recovery-only merge, reassessment
+/// must advance the acquisition plan rather than restate it.
+///
+/// The host declares what it is fetching with `note_recovery_in_flight`; the
+/// next assessment then reports those indices as `in_flight`, drops
+/// `outstanding` to zero and offers no `next_indices` to fetch again. Indices
+/// that actually arrive move to `available` on their own, and retracting a
+/// declaration returns exactly the bytes it charged.
+#[test]
+fn a_reassessment_after_a_recovery_merge_never_asks_for_the_same_index_twice() {
+    use par3_rs::ingest::{PacketScanner, PayloadKind, ScanEvent};
+    use par3_rs::runtime::MemoryBudget;
+    use par3_rs::session::RepairStatus;
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    let original: Vec<u8> = (0..14000)
+        .map(|i| ((i * 73 + i / 29) % 256) as u8)
+        .collect();
+    let mut damaged = original.clone();
+    for index in [0, 3, 6] {
+        damaged[index * 1024 + 11] ^= 1;
+    }
+    let mut source = MemorySourceAccess::default();
+    source.insert(SourceId(1), 1, damaged.into());
+    let mut options = ExecutionOptions::default();
+    options.memory = MemoryBudget::new(64 << 20);
+    let index = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/advanced/interleaved.par3"),
+    )
+    .unwrap();
+    let id = common::scan(&index)[0].1.input_set_id();
+    let mut session =
+        par3_rs::Par3RepairSession::new(id, Arc::new(source), options.clone()).unwrap();
+    session.bind_file("input.bin", SourceId(1)).unwrap();
+
+    // Hold back cohort zero's recovery, exactly as a host holds back volumes it
+    // has not downloaded yet.
+    let mut pending = Vec::new();
+    for name in [
+        "interleaved.par3",
+        "interleaved.vol0+1.par3",
+        "interleaved.vol1+2.par3",
+    ] {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/advanced")
+                .join(name),
+        )
+        .unwrap();
+        let mut source = MemorySourceAccess::default();
+        source.insert(SourceId(99), 1, bytes.into());
+        let mut scanner = PacketScanner::new(
+            Arc::new(source),
+            SourceId(99),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        loop {
+            match scanner.poll().unwrap() {
+                ScanEvent::Packet(packet) => {
+                    if packet.payload().is_some_and(
+                        |payload| matches!(payload.kind(), PayloadKind::Recovery { index, .. } if index != 0 && index % 3 == 0),
+                    ) {
+                        pending.push(packet);
+                    } else {
+                        session.merge(packet).unwrap();
+                    }
+                }
+                ScanEvent::End => break,
+                ScanEvent::NeedData { .. } => panic!("complete reference carrier"),
+            }
+        }
+    }
+
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::NeedRecovery);
+    let need = assessment.requirements[0].clone();
+    assert_eq!(need.additional, 2);
+    assert_eq!(need.in_flight, 0, "nothing was declared yet");
+    assert_eq!(need.outstanding, need.additional);
+    assert_eq!(need.next_indices.len() as u64, need.outstanding);
+    for index in &need.next_indices {
+        assert_eq!(index % need.cohorts, need.cohort, "wrong cohort offered");
+        assert!(
+            !need.available.contains(index),
+            "offered an index the set already holds"
+        );
+        assert!(need.recovery_indices.contains(index), "outside capacity");
+    }
+
+    // The host declares the fetch. The plan must now be fully spoken for.
+    let declared = need.next_indices.clone();
+    // Declare the first index on its own. That also drops the cached
+    // assessment, so the next declaration's delta is the charge and nothing
+    // else.
+    session
+        .note_recovery_in_flight(need.matrix, &declared[..1])
+        .unwrap();
+    let before = options.memory.used();
+    session
+        .note_recovery_in_flight(need.matrix, &declared)
+        .unwrap();
+    assert!(
+        options.memory.used() > before,
+        "the continuation was not charged"
+    );
+    let again = session.assess().unwrap();
+    assert_eq!(again.status, RepairStatus::NeedRecovery);
+    let need = again.requirements[0].clone();
+    assert_eq!(need.additional, 2, "the deficit itself did not change");
+    assert_eq!(need.in_flight, 2);
+    assert_eq!(need.outstanding, 0);
+    assert!(
+        need.next_indices.is_empty(),
+        "a second assessment asked for the same indices again: {:?}",
+        need.next_indices
+    );
+
+    // A recovery-only merge: what arrived becomes available, not in flight.
+    for packet in pending {
+        session.merge(packet).unwrap();
+    }
+    let ready = session.assess().unwrap();
+    assert_eq!(ready.status, RepairStatus::Ready);
+    for need in &ready.requirements {
+        assert_eq!(need.additional, 0, "a ready set still has a deficit");
+        assert_eq!(need.outstanding, 0);
+        assert!(need.next_indices.is_empty());
+        // The declared indices arrived, so they are available, not in flight.
+        assert_eq!(
+            need.in_flight, 0,
+            "an index that arrived is still counted as in flight"
+        );
+        for index in &declared {
+            if index % need.cohorts == need.cohort {
+                assert!(
+                    need.available.contains(index),
+                    "index {index} arrived but is not available"
+                );
+            }
+        }
+    }
+
+    // Retraction returns exactly what the declaration charged.
+    session.forget_recovery_in_flight(need.matrix, &declared[..1]);
+    let held = options.memory.used();
+    session.forget_recovery_in_flight(need.matrix, &[]);
+    assert!(
+        options.memory.used() < held,
+        "retracting the continuation returned nothing"
+    );
+
+    let output = common::TempTree::new("interleaved-continuation");
+    assert_eq!(
+        session
+            .repair(output.path(), false)
+            .unwrap()
+            .reconstructed_blocks,
+        3
+    );
+    assert_eq!(
+        std::fs::read(output.path().join("input.bin")).unwrap(),
+        original
+    );
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+}

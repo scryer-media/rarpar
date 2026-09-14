@@ -35,6 +35,40 @@
 - Charge GF(2^16) field construction for the `u32` working tables it holds while
   narrowing, which were previously understated by about 400 KiB, and charge the
   Cauchy stripe banks for their per-row vector headers.
+- Bound each repair stage's resident working set. `assess` now takes a scratch
+  reservation for coverage and per-cohort deficit accumulation, releases it at
+  the handover, and retains only what the result's own containers measure, so
+  what survives assessment follows files and losses rather than the block count.
+  On a 16,384-block set the retained assessment state falls from 10,493,485
+  bytes to 6,228, and stays flat from 2,048 to 16,384 blocks.
+- Charge the block layout from its containers' capacities — extents, inline
+  bytes, paths and the block index — and true the charge up to the built
+  layout's measurement, instead of a flat 512 bytes per extent. The same
+  16,384-block set falls from 512.0 to 232.3 bytes per block. Together with the
+  assessment change, the budget's peak for that repair falls from 21,126,190
+  bytes to 6,901,926.
+- Produce Cauchy recovery rows in tiles. The syndrome bank is unchanged, but
+  recovered rows are materialised and scattered `t` at a time, moving the output
+  row bank from `2m` stripes toward `(m + t)`. `t` comes from admitted worker
+  capacity. Column order, write count and output bytes are unchanged.
+- Add a resumable acquisition continuation. `RecoveryRequirement` gains
+  `in_flight`, `outstanding` and `next_indices`; existing fields are unchanged.
+  `Par3RepairSession::note_recovery_in_flight` declares indices a host is
+  fetching and `forget_recovery_in_flight` retracts them, so reassessment after
+  a recovery-only merge advances the plan instead of requesting the same indices
+  again. The declared set is bounded and charged against the retained ceiling.
+- Report admission on `ExecutionDiagnostics`: `memory()` delegates to the
+  budget's ledger, `admission()` gives the effective stripe, stripe buffers,
+  output tile, verification batch, workers and read window, `waits()` gives the
+  narrowings, `refusals()` counts refused admissions by `LimitCause`, `caches()`
+  gives cache occupancy, and `amplification()` gives reread and reconstructed
+  bytes so a memory saving cannot hide I/O amplification. Writes are one relaxed
+  atomic operation per event; reads allocate nothing.
+- Narrow before refusing, and refuse once. Stripe admission computes the width
+  from real headroom instead of halving a request until something fits, and
+  remeasures at most once after losing a race to a peer. A refusal that reaches
+  a host through `merge`, `layout`, `assess` or `repair` is counted exactly once,
+  by cause.
 
 ## 0.3.1 (2026-09-13)
 

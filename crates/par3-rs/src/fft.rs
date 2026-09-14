@@ -169,6 +169,8 @@ impl FftCodec {
             self.options
                 .memory
                 .reserve_stripes(MemoryCategory::CodecScratch, target, 2, unit)?;
+        self.options.diagnostics.note_stripe(stripe, 2, target);
+        self.options.diagnostics.note_window(stripe);
         self.options.stripe_bytes = stripe;
         Ok((stripe, reservation))
     }
@@ -288,6 +290,7 @@ impl FftCodec {
         let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
         let mut write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
+            self.options.diagnostics.note_reconstructed(bytes.len());
             progress.advance(bytes.len() as u64);
             self.options.cancel.check()
         };
@@ -467,15 +470,19 @@ impl FftCodec {
         if block_size == 0 {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
-        self.options.memory.reserve_stripes_with_overhead(
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        let admitted = self.options.memory.reserve_stripes_with_overhead(
             MemoryCategory::CodecScratch,
-            self.options
-                .stripe_bytes
-                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+            target,
             2,
             1,
             64,
-        )
+        )?;
+        self.options.diagnostics.note_stripe(admitted.0, 2, target);
+        Ok(admitted)
     }
 
     fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
@@ -491,15 +498,20 @@ impl FftCodec {
             .checked_mul(2 / unit)
             .and_then(|n| n.checked_add(2))
             .ok_or(EngineError::resource_limit("FFT stripes"))?;
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
         let buffers = self.options.memory.reserve_stripes_with_overhead(
             MemoryCategory::CodecScratch,
-            self.options
-                .stripe_bytes
-                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+            target,
             per_byte,
             unit,
             overhead,
         )?;
+        self.options
+            .diagnostics
+            .note_stripe(buffers.0, per_byte, target);
         tracing::debug!(stripe_bytes = buffers.0, rows, "PAR3 FFT stripes admitted");
         Ok(buffers)
     }

@@ -104,50 +104,11 @@ fn a_verify_and_repair_returns_every_ledger_category_to_zero() {
 }
 
 /// Build a set of `blocks` 64-byte blocks and return its carriers' bytes.
-fn many_block_carriers(
-    blocks: usize,
-    interleave: u64,
-    seed: &[u8],
-    tree: &common::TempTree,
-) -> (par3_rs::InputSetId, Vec<u8>, Vec<std::path::PathBuf>) {
-    use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
-    let mut bytes = vec![0; blocks * 64];
-    let mut hash = blake3::Hasher::new();
-    hash.update(seed);
-    hash.finalize_xof().fill(&mut bytes);
-    let mut access = MemorySourceAccess::default();
-    access.insert(SourceId(1), 1, bytes.clone().into());
-    let mut options = CreationOptions {
-        block_size: 64,
-        recovery_count: 3,
-        codec: CreationCodec::Fft {
-            capacity_log2: 0,
-            interleave,
-        },
-        ..CreationOptions::default()
-    };
-    options.execution.workers = 1;
-    options.execution.memory = MemoryBudget::new(768 << 20);
-    options.execution.retained_bytes = 384 << 20;
-    let plan = CreationPlan::build(
-        Arc::new(access),
-        &[CreationSource {
-            name: "input.bin".into(),
-            source: SourceId(1),
-        }],
-        options.clone(),
-    )
-    .unwrap();
-    let id = plan.input_set_id();
-    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
-    (id, bytes, paths)
-}
-
 #[test]
 fn a_many_block_set_resolves_under_a_ceiling_the_old_whole_ceiling_reservation_refused() {
     let tree = common::TempTree::new("measured-resolution");
     let (id, _bytes, paths) =
-        many_block_carriers(16_384, 2, b"PAR3 measured metadata charge", &tree);
+        common::many_block_carriers(16_384, 2, b"PAR3 measured metadata charge", &tree);
 
     // Resolution is budgeted on its own, so read the index carrier alone.
     let index = std::fs::read(&paths[0]).unwrap();
@@ -558,28 +519,70 @@ fn cancelling_metadata_resolution_leaves_no_bytes_behind() {
     assert_eq!(options.memory.ledger().current(), 0);
 }
 
+/// Cancellation at every stage of a repair, including the two M1 added to the
+/// inventory: the assessment handover, where scratch is released and the
+/// measured result is charged, and the tiled Cauchy decode, where only part of
+/// the row bank is materialised at a time.
+///
+/// Every stage must refund exactly: the ledger and `available()` return to
+/// their pre-session values, no output is installed, and a fresh session over
+/// the same inputs still produces the same bytes.
 #[test]
 fn cancelling_verification_and_repair_leaves_no_bytes_behind() {
-    for stage in [Stage::Verify, Stage::Repair] {
+    for stage in [Stage::Verify, Stage::Assess, Stage::Repair, Stage::Decode] {
         let options = cancel_at(stage);
         let before = options.memory.available();
         let mut session = damaged_session(&options);
         let tree = common::TempTree::new("cancel-ledger");
-        let error = match stage {
-            Stage::Verify => session.assess().map(|_| ()).unwrap_err(),
-            _ => {
-                // Assessment must complete before repair can be cancelled, so
-                // arm the token only once the repair stage opens.
-                let mut plain = ExecutionOptions::default();
-                plain.workers = 1;
-                let mut ready = damaged_session(&plain);
-                assert_eq!(ready.assess().unwrap().status, RepairStatus::Ready);
-                drop(ready);
-                let _ = session.assess();
-                session.repair(tree.path(), false).map(|_| ()).unwrap_err()
-            }
+        let during_repair = matches!(stage, Stage::Repair | Stage::Decode);
+        let error = if during_repair {
+            // Assessment must complete before repair can be cancelled, so
+            // arm the token only once the repair stage opens.
+            let mut plain = ExecutionOptions::default();
+            plain.workers = 1;
+            let mut ready = damaged_session(&plain);
+            assert_eq!(ready.assess().unwrap().status, RepairStatus::Ready);
+            drop(ready);
+            let _ = session.assess();
+            session.repair(tree.path(), false).map(|_| ()).unwrap_err()
+        } else {
+            session.assess().map(|_| ()).unwrap_err()
         };
-        assert!(matches!(error, EngineError::Cancelled), "{error}");
+        match &error {
+            // Cancelled before anything was staged.
+            EngineError::Cancelled => {}
+            // Cancelled with work on disk. That is recoverable, not silent: the
+            // error names what was installed and what was left behind. Nothing
+            // was verified here, so nothing was installed.
+            EngineError::RepairInterrupted {
+                installed,
+                temporary,
+                cause,
+            } if during_repair => {
+                assert!(
+                    matches!(**cause, EngineError::Cancelled),
+                    "{stage:?}: {cause}"
+                );
+                assert!(
+                    installed.is_empty(),
+                    "{stage:?} installed output before it was cancelled: {installed:?}"
+                );
+                for path in temporary {
+                    assert_ne!(
+                        path,
+                        &tree.path().join("a.bin"),
+                        "{stage:?} left a temporary in an installed file's place"
+                    );
+                }
+            }
+            other => panic!("{stage:?} failed for another reason: {other}"),
+        }
+        if during_repair {
+            assert!(
+                !tree.path().join("a.bin").exists(),
+                "{stage:?} installed a file it never verified"
+            );
+        }
         drop(session);
         assert_eq!(options.memory.used(), 0, "{stage:?} leaked bytes");
         assert_eq!(options.memory.available(), before);
@@ -591,6 +594,26 @@ fn cancelling_verification_and_repair_leaves_no_bytes_behind() {
                 category.name()
             );
         }
+
+        // The same inputs still repair to the same bytes afterwards.
+        let mut plain = ExecutionOptions::default();
+        plain.workers = 1;
+        let mut retry = damaged_session(&plain);
+        assert_eq!(retry.assess().unwrap().status, RepairStatus::Ready);
+        let output = common::TempTree::new("cancel-ledger-retry");
+        assert_eq!(
+            retry
+                .repair(output.path(), false)
+                .unwrap()
+                .reconstructed_blocks,
+            1,
+            "{stage:?} left the inputs unrepairable"
+        );
+        assert_eq!(
+            std::fs::read(output.path().join("a.bin")).unwrap(),
+            common::a_bin(),
+            "{stage:?} changed the repaired bytes"
+        );
     }
 }
 
@@ -606,7 +629,7 @@ fn a_hundred_and_thirty_one_thousand_block_set_under_half_a_gigabyte() {
     let tree = common::TempTree::new("geometry-probe");
     // `interleave` is the count above one, so two gives three cohorts.
     let (id, bytes, paths) =
-        many_block_carriers(131_072, 2, b"PAR3 geometry probe 131072 blocks", &tree);
+        common::many_block_carriers(131_072, 2, b"PAR3 geometry probe 131072 blocks", &tree);
 
     let mut damaged = bytes.clone();
     // One block in each of the three cohorts, so every cohort has to decode.
@@ -621,7 +644,16 @@ fn a_hundred_and_thirty_one_thousand_block_set_under_half_a_gigabyte() {
     options.memory = MemoryBudget::new(512 << 20);
     options.retained_bytes = 256 << 20;
 
+    // Sample the ledger at every stage boundary, so the probe reports the same
+    // working-set inventory as the many-blocks fixture at eight times the size.
+    let mut samples = Vec::new();
     let report = (|| -> Result<usize, EngineError> {
+        let sample = |label: &'static str, options: &ExecutionOptions| common::StageSample {
+            label,
+            ledger: options.memory.ledger(),
+            used: options.memory.used(),
+            peak: options.memory.peak(),
+        };
         let mut session = Par3RepairSession::new(id, Arc::new(access), options.clone())?;
         session.bind_file("input.bin", SourceId(1))?;
         for path in &paths {
@@ -629,18 +661,34 @@ fn a_hundred_and_thirty_one_thousand_block_set_under_half_a_gigabyte() {
                 session.merge(packet)?;
             }
         }
+        samples.push(sample("scan + merge", &options));
+        assert!(session.layout()?.is_some());
+        samples.push(sample("metadata + layout", &options));
         let assessment = session.assess()?;
         assert_eq!(assessment.status, RepairStatus::Ready);
+        samples.push(sample("verify + assess", &options));
         let output = common::TempTree::new("geometry-probe-out");
         let repaired = session.repair(output.path(), false)?.reconstructed_blocks;
+        samples.push(sample("after repair", &options));
         assert_eq!(
             std::fs::read(output.path().join("input.bin")).unwrap(),
             bytes
         );
         Ok(repaired as usize)
     })();
+    samples.push(common::StageSample {
+        label: "session dropped",
+        ledger: options.memory.ledger(),
+        used: options.memory.used(),
+        peak: options.memory.peak(),
+    });
 
     println!("--- 131,072-block probe, 512 MiB budget, 256 MiB retained ---");
+    common::report(
+        &samples,
+        131_072,
+        "131,072 blocks, one file, 256 MiB retained",
+    );
     match &report {
         Ok(blocks) => println!("repaired {blocks} blocks"),
         Err(EngineError::ResourceLimit(limit)) => println!(

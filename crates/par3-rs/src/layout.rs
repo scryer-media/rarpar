@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use crate::packet::{ChunkDescription, ChunkTail};
+use crate::packet::{ChunkDescription, ChunkTail, btree_entry_bytes};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::{Fingerprint, Par3Set};
 
@@ -60,6 +60,9 @@ pub struct ExtentLocation {
     pub extent: usize,
 }
 
+/// Fixed allowance for a layout's own value and its containers' headers.
+const LAYOUT_BASE_BYTES: usize = 4096;
+
 /// Authenticated layout supporting packed tails, aliases and unprotected regions.
 #[derive(Debug)]
 pub struct BlockLayout {
@@ -107,10 +110,49 @@ impl BlockLayout {
         self.identity
     }
 
-    /// Conservative retained allocation charged for this layout.
+    /// Retained allocation charged for this layout, which after construction is
+    /// its measured container capacity.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self._reservation.bytes()
+    }
+
+    /// Bytes this layout's containers hold, from their real capacities.
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        let files = self
+            .files
+            .capacity()
+            .saturating_mul(size_of::<FileLayout>())
+            .saturating_add(
+                self.files
+                    .iter()
+                    .map(|file| {
+                        file.path.capacity()
+                            + file.extents.capacity() * size_of::<FileExtent>()
+                            + file
+                                .extents
+                                .iter()
+                                .map(|extent| match &extent.kind {
+                                    ExtentKind::Inline(bytes) => bytes.capacity(),
+                                    _ => 0,
+                                })
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            );
+        let blocks = self
+            .blocks
+            .len()
+            .saturating_mul(btree_entry_bytes::<u64, Vec<ExtentLocation>>())
+            .saturating_add(
+                self.blocks
+                    .values()
+                    .map(|locations| locations.capacity() * size_of::<ExtentLocation>())
+                    .sum::<usize>(),
+            );
+        files
+            .saturating_add(blocks)
+            .saturating_add(LAYOUT_BASE_BYTES)
     }
 
     /// Resolve a set without reading any protected source bytes.
@@ -123,28 +165,66 @@ impl BlockLayout {
             return Err(EngineError::Unsupported("incremental parent sets"));
         }
         let mut count = 0u64;
+        let mut locations = 0u64;
+        let mut inline_bytes = 0usize;
         let mut path_bytes = 0usize;
         for file in set.files() {
             path_bytes = path_bytes
                 .checked_add(file.path().len())
                 .ok_or(EngineError::resource_limit("layout paths"))?;
             for chunk in file.chunks() {
-                let amount = match chunk {
-                    ChunkDescription::Protected { length, .. } => {
-                        length / set.block_size() + u64::from(length % set.block_size() != 0)
+                let (extents, blocks) = match chunk {
+                    ChunkDescription::Protected { length, tail, .. } => {
+                        let whole = length / set.block_size();
+                        let remainder = length % set.block_size();
+                        // An inline tail owns its bytes; a described tail names
+                        // a block and is indexed like any other block extent.
+                        let inline = matches!(tail, ChunkTail::Inline(bytes)
+                            if bytes.len() as u64 == remainder);
+                        if inline {
+                            inline_bytes = inline_bytes
+                                .checked_add(usize::try_from(remainder).unwrap_or(usize::MAX))
+                                .ok_or(EngineError::resource_limit("layout inline tails"))?;
+                        }
+                        let tails = u64::from(remainder != 0);
+                        (whole + tails, whole + tails - u64::from(inline))
                     }
-                    ChunkDescription::Unprotected { .. } => 1,
+                    ChunkDescription::Unprotected { .. } => (1, 0),
                 };
                 count = count
-                    .checked_add(amount)
+                    .checked_add(extents)
+                    .ok_or(EngineError::resource_limit("layout extents"))?;
+                locations = locations
+                    .checked_add(blocks)
                     .ok_or(EngineError::resource_limit("layout extents"))?;
             }
         }
+        // Measured from the containers this layout builds rather than from a
+        // flat allowance per extent. Extent vectors are sized exactly below so
+        // they never double; the block index holds one map entry per distinct
+        // block and one location per block extent, and a location vector does
+        // double as aliases accumulate. The alias cross-check allocates its own
+        // map later, when the widest block is known, and releases it there.
+        let block_entries = usize::try_from(set.block_count().min(locations)).unwrap_or(usize::MAX);
         let cost = usize::try_from(count)
             .ok()
-            .and_then(|n| n.checked_mul(512))
-            .and_then(|n| n.checked_add(set.files().len().checked_mul(256)?))
+            .and_then(|extents| extents.checked_mul(size_of::<FileExtent>()))
+            .and_then(|n| n.checked_add(inline_bytes))
+            .and_then(|n| n.checked_add(set.files().len().checked_mul(size_of::<FileLayout>())?))
             .and_then(|n| n.checked_add(path_bytes))
+            .and_then(|n| {
+                n.checked_add(
+                    block_entries.checked_mul(btree_entry_bytes::<u64, Vec<ExtentLocation>>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    usize::try_from(locations)
+                        .ok()?
+                        .checked_mul(2 * size_of::<ExtentLocation>())?,
+                )
+            })
+            .and_then(|n| n.checked_add(LAYOUT_BASE_BYTES))
             .ok_or(EngineError::resource_limit("layout extents"))?;
         if cost > options.retained_bytes {
             return Err(EngineError::budget_limit(
@@ -177,12 +257,28 @@ impl BlockLayout {
         for (file_index, file) in set.files().iter().enumerate() {
             options.cancel.check()?;
             identity.update(&file.packet_hash());
+            // Sized exactly from the chunk descriptions, so pushing extents
+            // never reallocates and the charge above never pays for a doubling
+            // that does not happen.
+            let expected = file.chunks().iter().try_fold(0usize, |total, chunk| {
+                let amount = match chunk {
+                    ChunkDescription::Protected { length, .. } => {
+                        length / set.block_size() + u64::from(length % set.block_size() != 0)
+                    }
+                    ChunkDescription::Unprotected { .. } => 1,
+                };
+                usize::try_from(amount)
+                    .ok()
+                    .and_then(|n| total.checked_add(n))
+            });
             let mut layout = FileLayout {
                 path: file.path().to_owned(),
                 packet_hash: file.packet_hash(),
                 fingerprint: file.fingerprint(),
                 len: file.size(),
-                extents: Vec::new(),
+                extents: Vec::with_capacity(
+                    expected.ok_or(EngineError::resource_limit("layout extents"))?,
+                ),
             };
             let mut at = 0;
             for chunk in file.chunks() {
@@ -274,6 +370,20 @@ impl BlockLayout {
         }
         // Identical aliases must describe identical content. Partially overlapping
         // tails are checked against actual bytes when a block is assembled.
+        // The comparison map is rebuilt per block and never outlives the loop,
+        // so it is charged once at the width of the widest block.
+        let _aliases = options.memory.reserve_as(
+            MemoryCategory::LayoutEvidence,
+            result
+                .blocks
+                .values()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+                .checked_mul(btree_entry_bytes::<(u64, u64), Fingerprint>())
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(EngineError::resource_limit("layout aliases"))?,
+        )?;
         for locations in result.blocks.values() {
             let mut descriptions = BTreeMap::new();
             for location in locations {
@@ -295,6 +405,15 @@ impl BlockLayout {
             }
         }
         result.identity = identity.finalize();
+        // Resize to what was actually built. The estimate above is an upper
+        // bound taken from the descriptions; this is the capacity the layout
+        // will hold for as long as it lives.
+        let actual = result.capacity_bytes();
+        if let Some(growth) = actual.checked_sub(result._reservation.bytes()) {
+            result._reservation.grow_by(growth)?;
+        } else {
+            result._reservation.shrink_to(actual);
+        }
         Ok(result)
     }
 }

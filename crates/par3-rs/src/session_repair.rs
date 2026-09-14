@@ -314,6 +314,10 @@ fn copy_available(
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
+            if offset != 0 {
+                // A block wider than the copy window is read once per window.
+                session.options.diagnostics.note_reread(take);
+            }
             scatter(
                 &session.options,
                 layout,
@@ -392,16 +396,19 @@ where
         .memory
         .reserve_as(MemoryCategory::CodecTables, coefficient_bytes)?;
     let inverse = crate::cauchy::inverse_coefficients(&field, lost, &rows)?;
-    // Two banks of `n` rows, an input stripe and a coverage stripe, with one
-    // stripe of slack. The banks are vectors of vectors, so their headers are
-    // charged separately: they do not scale with the stripe size, and a small
-    // stripe would otherwise leave thousands of them unpaid for.
+    // Recovered rows are produced and scattered a tile at a time. The syndrome
+    // bank has to stay whole — every output row reads all of it — but the
+    // output bank only has to be as wide as the rows being solved right now,
+    // so the row payload is `(n + tile)` stripes instead of `2n`. The tile is
+    // the width the workers can actually use, so no parallelism is given up,
+    // and a serial repair keeps exactly one output row alive.
+    let tile = session.options.workers.max(1).min(n);
     let buffer_count = n
-        .checked_mul(2)
+        .checked_add(tile)
         .and_then(|count| count.checked_add(3))
         .ok_or(EngineError::resource_limit("repair stripes"))?;
     let bank_headers = n
-        .checked_mul(2)
+        .checked_add(tile)
         .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
         .ok_or(EngineError::resource_limit("repair stripes"))?;
     let pool = crate::runtime::WorkerPool::for_work(
@@ -411,23 +418,32 @@ where
             .checked_mul(F::SYMBOL_BYTES)
             .ok_or(EngineError::resource_limit("minimum repair stripe"))?,
     )?;
+    let target = session
+        .options
+        .stripe_bytes
+        .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX));
     let (stripe, _buffers) = session.options.memory.reserve_stripes_with_overhead(
         MemoryCategory::CodecScratch,
-        session
-            .options
-            .stripe_bytes
-            .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX)),
+        target,
         buffer_count,
         F::SYMBOL_BYTES,
         bank_headers,
     )?;
+    session
+        .options
+        .diagnostics
+        .note_stripe(stripe, buffer_count, target);
     tracing::debug!(
         stripe_bytes = stripe,
         buffer_count,
         "PAR3 Cauchy stripe admitted"
     );
+    session
+        .options
+        .diagnostics
+        .note_tiling(stripe, buffer_count, tile);
     let mut syndromes = vec![vec![0u8; stripe]; n];
-    let mut recovered = vec![vec![0u8; stripe]; n];
+    let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut input = vec![0u8; stripe];
     let mut covered = vec![0u8; stripe];
     let mut offset = 0;
@@ -443,6 +459,12 @@ where
                 continue;
             }
             session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
+            if offset != 0 {
+                // A stripe narrower than the block means the surviving blocks
+                // are read once per pass. That is the cost of the bounded
+                // working set, and it is reported rather than hidden.
+                session.options.diagnostics.note_reread(take);
+            }
             scatter(
                 &session.options,
                 layout,
@@ -477,36 +499,53 @@ where
                 *to ^= from;
             }
         }
-        let recover = |(column, bytes): (usize, &mut Vec<u8>)| -> EngineResult<()> {
-            session.options.cancel.check()?;
-            bytes[..take].fill(0);
-            for (row, syndrome) in syndromes.iter().enumerate() {
+        // Solve and scatter the lost columns a tile at a time. Columns are
+        // still visited in order and each is written exactly once, so the
+        // staged bytes and the writes that produce them are unchanged.
+        let mut base = 0;
+        while base < n {
+            let width = tile.min(n - base);
+            let recover = |(slot, bytes): (usize, &mut Vec<u8>)| -> EngineResult<()> {
+                let column = base + slot;
                 session.options.cancel.check()?;
-                field.mul_acc(
-                    &mut bytes[..take],
-                    &syndrome[..take],
-                    inverse[column * n + row],
-                );
+                bytes[..take].fill(0);
+                for (row, syndrome) in syndromes.iter().enumerate() {
+                    session.options.cancel.check()?;
+                    field.mul_acc(
+                        &mut bytes[..take],
+                        &syndrome[..take],
+                        inverse[column * n + row],
+                    );
+                }
+                Ok(())
+            };
+            if let Some(pool) = &pool {
+                pool.pool().install(|| {
+                    recovered[..width]
+                        .par_iter_mut()
+                        .enumerate()
+                        .try_for_each(recover)
+                })?;
+            } else {
+                recovered[..width]
+                    .iter_mut()
+                    .enumerate()
+                    .try_for_each(recover)?;
             }
-            Ok(())
-        };
-        if let Some(pool) = &pool {
-            pool.pool()
-                .install(|| recovered.par_iter_mut().enumerate().try_for_each(recover))?;
-        } else {
-            recovered.iter_mut().enumerate().try_for_each(recover)?;
-        }
-        for (index, bytes) in lost.iter().zip(&recovered) {
-            scatter(
-                &session.options,
-                layout,
-                outputs,
-                *index,
-                offset,
-                &bytes[..take],
-            )?;
-            progress.advance(take as u64);
-            session.options.cancel.check()?;
+            for (index, bytes) in lost[base..base + width].iter().zip(&recovered[..width]) {
+                scatter(
+                    &session.options,
+                    layout,
+                    outputs,
+                    *index,
+                    offset,
+                    &bytes[..take],
+                )?;
+                session.options.diagnostics.note_reconstructed(take);
+                progress.advance(take as u64);
+                session.options.cancel.check()?;
+            }
+            base += width;
         }
         offset += take as u64;
     }
@@ -980,7 +1019,8 @@ mod charge_tests {
 
     /// The stripe banks are vectors of vectors. Their row headers do not scale
     /// with the stripe, so a small stripe and many lost blocks must still be
-    /// charged for every header.
+    /// charged for every header. Output tiling narrows the recovered bank from
+    /// `n` rows to `tile` rows; the charge must follow that too.
     #[test]
     fn cauchy_stripe_banks_charge_their_row_headers_as_well_as_their_bytes() {
         for (n, limit) in [(4usize, 1 << 20), (512, 8 << 20), (4096, 64 << 20)] {
@@ -990,8 +1030,15 @@ mod charge_tests {
                 stripe_bytes: 4096,
                 ..ExecutionOptions::default()
             };
-            let buffer_count = n * 2 + 3;
-            let bank_headers = n * 2 * size_of::<Vec<u8>>();
+            // Exactly the shape `reconstruct` computes: the syndrome bank keeps
+            // every row, the output bank keeps one tile.
+            let tile = options.workers.max(1).min(n);
+            let buffer_count = n + tile + 3;
+            let bank_headers = (n + tile) * size_of::<Vec<u8>>();
+            assert!(
+                buffer_count < n * 2 + 3,
+                "tiling did not narrow the {n}-row bank"
+            );
             let (stripe, reservation) = options
                 .memory
                 .reserve_stripes_with_overhead(
@@ -1005,7 +1052,7 @@ mod charge_tests {
 
             // Exactly what `reconstruct` allocates once the charge is granted.
             let syndromes = vec![vec![0u8; stripe]; n];
-            let recovered = vec![vec![0u8; stripe]; n];
+            let recovered = vec![vec![0u8; stripe]; tile];
             let input = vec![0u8; stripe];
             let covered = vec![0u8; stripe];
             let bank = |bank: &Vec<Vec<u8>>| {

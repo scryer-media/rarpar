@@ -155,6 +155,88 @@ draws on that ceiling and waiting can never admit the request. Weaver should map
 `PeerContention` to "waiting for memory" and both `ExceedsLimit` and
 `Unmeasured` to "does not fit".
 
+### Stage working sets
+
+Each stage of a repair holds a bounded set, and a stage releases what its
+consumer no longer needs before the next one charges its own. Measured on a
+16,384-block single-file set with a 128 MiB budget and a 64 MiB retained
+ceiling, sampling `MemoryBudget::ledger()` at each stage boundary:
+
+| stage | category | resident bytes | bytes per block | coexists with the previous stage |
+| --- | --- | ---: | ---: | --- |
+| scan and merge | carrier and packet storage | 398,673 | 24.3 | — |
+| metadata and layout | resolved metadata | 1,640,199 | 100.1 | yes, carriers stay for regeneration |
+| metadata and layout | layout and evidence | 3,805,281 | 232.3 | yes |
+| verify and assess | layout and evidence | 3,940,449 | 240.5 | yes, evidence extends the layout entry |
+| verify and assess | assessment state | 6,228 | 0.4 | no, the scratch is released at the handover |
+| after repair | all categories | 5,985,549 | 365.3 | codec banks are released with the codec |
+| session dropped | all categories | 0 | 0 | — |
+
+Two properties hold across block, file, carrier and damage counts, and are
+regression-tested at a fixed budget:
+
+- **Assessment retains a result, not a working set.** `assess` takes a scratch
+  reservation for the coverage and per-cohort deficit accumulation, releases it
+  at the handover, and retains only what the result's own containers measure. At
+  sixteen times the blocks that retained figure does not move: it follows files
+  and losses. The scratch and the result never coexist at full size.
+- **The layout charges what it built.** Extents, inline bytes, paths and the
+  block index are charged from their container capacities and trued up to the
+  built layout's measurement, rather than a flat per-extent estimate.
+
+Carrier bytes survive the metadata they were parsed into, deliberately: carrier
+regeneration and re-resolution need them, and dropping them would trade memory
+for source rereads. Verification evidence likewise survives sealing, because
+assessment reads it and re-deriving it means reading sources again. Both are
+reported rather than removed; `ExecutionDiagnostics::amplification()` exists so
+that a future change here cannot hide the I/O it would cost.
+
+### Continuations
+
+A refusal or a recovery deficit leaves a continuation rather than requiring the
+work to start over. `RecoveryRequirement` adds `in_flight`, `outstanding` and
+`next_indices` to its existing fields, which keep their names and meanings.
+`Par3RepairSession::note_recovery_in_flight` declares the indices a host is
+acquiring for a matrix, and `forget_recovery_in_flight` retracts them. The next
+assessment then counts those as `in_flight`, subtracts them from `outstanding`,
+and offers exactly `outstanding` further admissible indices in `next_indices` —
+lowest first, in the right cohort, and never one already available or already
+declared. A reassessment after a recovery-only merge therefore advances the
+acquisition plan instead of restating it. The declaration is a continuation, not
+a promise: an index that never arrives keeps appearing as `in_flight` until the
+host retracts it, and one that does arrive moves to `available` by itself. The
+set is bounded and charged against the session's retained ceiling, so declaring
+more than the budget admits is refused rather than silently truncated.
+
+### Behaviour under pressure
+
+When a stage's configured working set does not fit, the engine narrows before it
+refuses: repair and verification stripes are computed from the headroom that is
+actually there, worker pools fall back to serial execution, and verification
+batches are cut to what admission allows. Each narrowing is recorded in
+`ExecutionDiagnostics::waits()`. Widths are never searched by halving a request
+until something fits — that charges the budget once per failed step and reports
+only the last failure. A stripe admission measures the headroom, charges it, and
+on losing a race to a peer measures once more and then stops.
+
+When even the minimum useful set does not fit, the stage returns a single
+`ResourceLimit` with honest `need`, `limit` and `available` and the `cause()`
+rules above. There is no allocate-fail-wake loop and no internal retry spin. The
+refusal is counted once, by cause, in `ExecutionDiagnostics::refusals()`, at the
+session boundary the host sees — `merge`, `layout`, `assess` or `repair` — so a
+request refused deep inside a stage is reported once rather than at every frame
+it passes through.
+
+### Output tiling
+
+Cauchy repair keeps its syndrome bank for the whole solve but produces recovered
+rows in tiles: it materialises `t` output rows at a time and scatters them before
+producing the next tile, so the row-bank payload is `(m + t)` stripes rather than
+`2m`. `t` comes from the admitted worker capacity, bounded by the number of rows
+there are to recover. Column order and the one-scatter-per-column write pattern
+are unchanged, so a narrower tile costs no extra seeks and produces byte-identical
+output; `ExecutionDiagnostics::admission().output_tile` reports the width in force.
+
 `max_cauchy_lost_blocks` separately caps each Cauchy solve at 4,096 losses by
 default. The limit is checked before staging or building the quadratic
 coefficient matrix; callers may explicitly raise it. FFT selection and carrier
@@ -231,6 +313,18 @@ Cancellation is cooperative between work units and uses a shared token.
 
 `ExecutionOptions::diagnostics` shares cumulative source read counters, engine
 file read/write counters, and `stage(Stage)` timings. It retains no event log.
+It also reports what admission decided and what that cost: `memory()` returns
+the ledger of the budget the diagnostics were first used with, so retained and
+scratch bytes per category are read from the ledger itself rather than a second
+copy kept in step with it; `admission()` gives the effective stripe, stripe
+buffer count, output tile, verification batch, worker count and sequential read
+window; `waits()` gives the narrowings; `refusals()` counts refused admissions
+by `LimitCause`; `caches()` gives current cache occupancy; and `amplification()`
+gives the source bytes reread because a block was wider than its window and the
+bytes the codec reconstructed, so a memory reduction that only moved cost onto
+the I/O layer is visible next to it. Every write is one relaxed atomic operation
+per event and every read allocates nothing, so a host may sample these at
+work-unit handback from another thread.
 `file_sync()` measures file synchronization attempts, successes, and storage
 wait time; this time is already included in enclosing operation stages.
 Read requests include short reads and failures; byte counts measure successful
