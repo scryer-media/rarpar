@@ -27,6 +27,7 @@ impl RarArchive {
         options: &ExtractOptions,
         progress: Option<&dyn ProgressHandler>,
     ) -> RarResult<ExtractedMember> {
+        let _decode = self.decode_mode.enter();
         self.extract_member_with_link_policy(index, options, progress, false, None)
     }
 
@@ -41,6 +42,7 @@ impl RarArchive {
         options: &ExtractOptions,
         progress: Option<&dyn ProgressHandler>,
     ) -> RarResult<ExtractedMember> {
+        let _decode = self.decode_mode.enter();
         let index = self
             .find_member(name)
             .ok_or_else(|| RarError::MemberNotFound {
@@ -58,6 +60,7 @@ impl RarArchive {
         progress: Option<&dyn ProgressHandler>,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
+        let _decode = self.decode_mode.enter();
         self.extract_member_to_file_core(index, options, progress, out_path)
     }
 
@@ -69,12 +72,14 @@ impl RarArchive {
         options: &ExtractOptions,
         writer: &mut W,
     ) -> RarResult<u64> {
+        let _decode = self.decode_mode.enter();
         self.extract_member_solid_to_writer_local(index, options, writer)
     }
 
     /// Advance through a solid member while discarding its produced bytes.
     #[deprecated(since = "0.9.0", note = "use by_index(index)?.skip()")]
     pub fn skip_member_solid(&mut self, index: usize, options: &ExtractOptions) -> RarResult<u64> {
+        let _decode = self.decode_mode.enter();
         let mut sink = std::io::sink();
         self.extract_member_solid_to_writer_local(index, options, &mut sink)
     }
@@ -94,6 +99,7 @@ impl RarArchive {
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
+        let _decode = self.decode_mode.enter();
         self.extract_member_solid_chunked_core(index, options, writer_factory)
     }
 
@@ -112,6 +118,7 @@ impl RarArchive {
         provider: &dyn VolumeProvider,
         writer: &mut W,
     ) -> RarResult<u64> {
+        let _decode = self.decode_mode.enter();
         self.extract_member_streaming_core(index, options, provider, writer)
     }
 
@@ -133,6 +140,146 @@ impl RarArchive {
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
+        let _decode = self.decode_mode.enter();
         self.extract_member_streaming_chunked_core(index, options, provider, writer_factory)
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct ObservedReader {
+        file: File,
+        armed: Arc<AtomicBool>,
+        reads: Arc<AtomicUsize>,
+        expected_serial: bool,
+    }
+
+    impl Read for ObservedReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.armed.load(Ordering::Relaxed) {
+                assert_eq!(crate::decompress::policy::serial(), self.expected_serial);
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.file.read(bytes)
+        }
+    }
+
+    impl Seek for ObservedReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+
+    struct ObservedProvider {
+        path: std::path::PathBuf,
+        armed: Arc<AtomicBool>,
+        reads: Arc<AtomicUsize>,
+        expected_serial: bool,
+    }
+
+    impl ObservedProvider {
+        fn reader(&self) -> ObservedReader {
+            ObservedReader {
+                file: File::open(&self.path).unwrap(),
+                armed: Arc::clone(&self.armed),
+                reads: Arc::clone(&self.reads),
+                expected_serial: self.expected_serial,
+            }
+        }
+    }
+
+    impl VolumeProvider for ObservedProvider {
+        fn get_volume(
+            &self,
+            index: usize,
+        ) -> Result<Box<dyn crate::ReadSeek>, crate::VolumeProviderError> {
+            assert_eq!(index, 0);
+            Ok(Box::new(self.reader()))
+        }
+    }
+
+    #[test]
+    fn all_legacy_consumers_scope_decode_policy_and_restore_it() {
+        for fixture in ["rar5/rar5_solid.rar", "rar4/rar4_lz_solid_mv.rar"] {
+            for mode in [crate::DecodeMode::Auto, crate::DecodeMode::Serial] {
+                for consumer in 0..8 {
+                    let provider = ObservedProvider {
+                        path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures")
+                            .join(fixture),
+                        armed: Arc::new(AtomicBool::new(false)),
+                        reads: Arc::new(AtomicUsize::new(0)),
+                        expected_serial: mode == crate::DecodeMode::Serial,
+                    };
+                    let mut archive = RarArchive::open(provider.reader()).unwrap();
+                    archive.set_decode_mode(mode);
+                    let name = archive.members[0].file_header.name.clone();
+                    let options = ExtractOptions::default();
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut sink = std::io::sink();
+                    provider.armed.store(true, Ordering::Relaxed);
+                    match consumer {
+                        0 => {
+                            archive.extract_member(0, &options, None).unwrap();
+                        }
+                        1 => {
+                            archive.extract_by_name(&name, &options, None).unwrap();
+                        }
+                        2 => {
+                            archive
+                                .extract_member_to_file(0, &options, None, &dir.path().join("out"))
+                                .unwrap();
+                        }
+                        3 => {
+                            archive
+                                .extract_member_solid_to_writer(0, &options, &mut sink)
+                                .unwrap();
+                        }
+                        4 => {
+                            archive.skip_member_solid(0, &options).unwrap();
+                        }
+                        5 => {
+                            archive
+                                .extract_member_solid_chunked(0, &options, |_| {
+                                    Ok(Box::new(std::io::sink()))
+                                })
+                                .unwrap();
+                        }
+                        6 => {
+                            archive
+                                .extract_member_streaming(0, &options, &provider, &mut sink)
+                                .unwrap();
+                        }
+                        7 => {
+                            archive
+                                .extract_member_streaming_chunked(0, &options, &provider, |_| {
+                                    Ok(Box::new(std::io::sink()))
+                                })
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        provider.reads.load(Ordering::Relaxed) > 0,
+                        "{fixture} {consumer}"
+                    );
+                    assert!(!crate::decompress::policy::serial());
+                    assert!(archive.extract_member(usize::MAX, &options, None).is_err());
+                    assert!(
+                        !crate::decompress::policy::serial(),
+                        "restore policy on error"
+                    );
+                }
+            }
+        }
     }
 }

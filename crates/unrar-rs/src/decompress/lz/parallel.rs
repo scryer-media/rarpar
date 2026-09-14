@@ -2550,9 +2550,20 @@ impl LzDecoder {
                             if self.window.total_written() >= self.flush_at {
                                 self.flush_stream_output(writer)?;
                             }
+                            let room = literal_run_room(
+                                self.flush_at,
+                                self.window.total_written(),
+                                self.window.total_flushed(),
+                                self.window.dict_size(),
+                            );
+                            if room == 0 {
+                                return Err(RarError::CorruptArchive {
+                                    detail: "RAR5 literal replay cannot advance within dictionary window".into(),
+                                });
+                            }
                             let take = bytes
                                 .len()
-                                .min((self.flush_at - self.window.total_written()) as usize)
+                                .min(room)
                                 .min((decode_limit - *output_size).min(usize::MAX as u64) as usize);
                             self.window.put_bytes(&bytes[..take]);
                             *output_size += take as u64;
@@ -2664,6 +2675,16 @@ impl LzDecoder {
 
         Ok(Some(output_size))
     }
+}
+
+// The flush border is a soft threshold that reserves room for a whole LZ
+// item. A pending filter can keep it behind the write pointer. In that case
+// advance one literal, as the serial loop does, then retry the flush. Always
+// respect the hard retained-window capacity, even if no flush made progress.
+fn literal_run_room(flush_at: u64, written: u64, flushed: u64, dict_size: usize) -> usize {
+    let retained = written.saturating_sub(flushed);
+    let capacity = (dict_size as u64).saturating_sub(retained);
+    flush_at.saturating_sub(written).max(1).min(capacity) as usize
 }
 
 #[cfg(test)]
@@ -2983,6 +3004,24 @@ mod tests {
         decoder.flush_filters_and_write(&mut output).unwrap();
         assert_eq!(output, b"abc");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn literal_run_allowance_respects_soft_and_hard_capacity() {
+        for written in 0..=128 {
+            for flushed in 0..=written {
+                for border in [0, written, written + 16] {
+                    let room = literal_run_room(border, written, flushed, 128);
+                    let free = 128 - (written - flushed) as usize;
+                    assert!(room <= free);
+                    assert_eq!(room == 0, free == 0);
+                    if border <= written && free > 0 {
+                        assert_eq!(room, 1, "retry flushing after each literal in the slack");
+                    }
+                }
+            }
+        }
+        assert_eq!(literal_run_room(0, u64::MAX, u64::MAX - 1, 128), 1);
     }
 
     #[test]

@@ -8,6 +8,13 @@
   input-limited readers, without changing process environment, checksum policy
   or solid continuation. The default remains `Auto`.
 
+### Fixed
+
+- Literal-run replay respects retained dictionary capacity and makes bounded
+  progress when a pending filter holds the soft flush border.
+- Deprecated extraction and solid-skip entry points now honor archive-local
+  decode mode, with scope restoration on success and failure.
+
 ### Performance
 
 - Group all eight BLAKE2sp leaves on one x86 hash worker. Use the upstream
