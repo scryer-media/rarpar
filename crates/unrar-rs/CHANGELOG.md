@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.5 (unreleased)
 
 ### Added
 
@@ -22,7 +22,7 @@
   Large writer updates are split into bounded chunks. Worker failures are
   reported as errors and remaining workers are joined during cleanup.
 
-## 0.10.4 (unreleased)
+## 0.10.4
 
 ### Added
 
