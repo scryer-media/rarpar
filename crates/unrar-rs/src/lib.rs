@@ -322,6 +322,7 @@ pub use crypto::{
     decrypt_cipher_range_rar4, derive_rar5_material, encrypt_cipher_range,
     encrypt_cipher_range_rar4, rar4_derive_key,
 };
+pub use decompress::policy::DecodeMode;
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
 pub use extract::{ExtractOptions, ExtractedMember, ExtractedMemberReader};

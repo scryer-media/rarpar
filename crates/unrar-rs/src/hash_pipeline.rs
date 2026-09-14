@@ -4,8 +4,9 @@
 //! by hashing performed inline on the hot thread. This module moves checksum
 //! work onto dedicated worker threads:
 //!
-//! - CRC32 runs on one worker, fed whole chunks in stream order (an mpsc
-//!   channel preserves FIFO order, so a single sequential hasher suffices).
+//! - CRC32 uses two chunk workers for completed archives. Results are folded
+//!   in stream order as they arrive, with bounded outstanding work and no
+//!   end-of-member result accumulation or sorting.
 //! - BLAKE2sp is parallelized by construction: the format defines 8
 //!   independent BLAKE2s leaf streams, interleaved in 64-byte blocks. Each
 //!   incoming chunk is shared with the lane workers, and every worker walks
@@ -16,10 +17,12 @@
 //!
 //!   How many leaves one worker owns is a policy choice — see
 //!   [`LEAVES_PER_WORKER`]. On aarch64 each worker owns a 4-leaf group and
-//!   drives the in-crate NEON group kernel (2 vector workers); elsewhere it
-//!   is one scalar leaf per worker (8 workers). The constant's comment
-//!   carries the measured reasoning for both regimes.
+//!   drives the in-crate NEON group kernel (2 vector workers). On x86 one
+//!   worker owns all eight leaves for runtime-dispatched cross-leaf SIMD.
+//!   Other targets retain one leaf per worker.
 //!
+//! Serial chases and hosts with at most two logical CPUs compute requested
+//! hashes together on the coordinator, without additional lane threads.
 //! Pipelines spawn threads per instance, so callers should only use them for
 //! members large enough to amortize spawn cost (see [`PIPELINE_MIN_BYTES`]).
 
@@ -31,7 +34,7 @@ use std::thread::JoinHandle;
 #[cfg(target_arch = "aarch64")]
 use crate::crypto::GROUP_LEAVES;
 use blake2s_simd::Params as Blake2sParams;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 use blake2s_simd::State as Blake2sState;
 
 /// Chunk buffers cycled between the submitter and the hash workers.
@@ -76,7 +79,7 @@ enum LaneMsg {
 pub(crate) struct HashPipeline {
     chunk_tx: Option<mpsc::SyncSender<ChunkMsg>>,
     free_rx: mpsc::Receiver<Vec<u8>>,
-    coordinator: Option<JoinHandle<CoordinatorResult>>,
+    coordinator: Option<JoinHandle<io::Result<CoordinatorResult>>>,
     compute_crc: bool,
     compute_blake: bool,
 }
@@ -95,9 +98,19 @@ impl HashPipeline {
         let (chunk_tx, chunk_rx) = mpsc::sync_channel::<ChunkMsg>(MAX_IN_FLIGHT);
         let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
 
+        let parallel_lanes = !crate::decompress::policy::serial()
+            && std::thread::available_parallelism().is_ok_and(|n| n.get() > 2);
         let coordinator = std::thread::Builder::new()
             .name("weaver-rar-hash".into())
-            .spawn(move || coordinator_loop(chunk_rx, free_tx, compute_crc, compute_blake))
+            .spawn(move || {
+                coordinator_loop(
+                    chunk_rx,
+                    free_tx,
+                    compute_crc,
+                    compute_blake,
+                    parallel_lanes,
+                )
+            })
             .expect("spawn hash pipeline coordinator");
 
         Self {
@@ -161,7 +174,7 @@ impl HashPipeline {
             .take()
             .expect("hash pipeline already finalized")
             .join()
-            .map_err(|_| io::Error::other("hash pipeline coordinator panicked"))?;
+            .map_err(|_| io::Error::other("hash pipeline coordinator panicked"))??;
         debug_assert_eq!(result.crc32.is_some(), self.compute_crc);
         debug_assert_eq!(result.blake2sp.is_some(), self.compute_blake);
         Ok(HashPipelineOutputs {
@@ -185,28 +198,51 @@ fn coordinator_loop(
     free_tx: mpsc::Sender<Vec<u8>>,
     compute_crc: bool,
     compute_blake: bool,
-) -> CoordinatorResult {
-    let mut crc_lanes = compute_crc.then(CrcLanes::spawn);
-    let mut blake = compute_blake.then(BlakeLanes::spawn);
+    parallel_lanes: bool,
+) -> io::Result<CoordinatorResult> {
+    // Input-limited chases keep hashing off the decoder but need no fan-out.
+    let mut inline_crc = (compute_crc && !parallel_lanes).then(crate::crc::Crc32::new);
+    let mut inline_blake =
+        (compute_blake && !parallel_lanes).then(crate::crypto::Blake2spHasher::new);
+    let mut crc_lanes = (compute_crc && parallel_lanes).then(CrcLanes::spawn);
+    let mut blake = (compute_blake && parallel_lanes).then(BlakeLanes::spawn);
     // Chunks handed to the lanes, oldest first. Every lane reads the chunk in
     // place, so a buffer only becomes recyclable once they have all let go.
     let mut in_flight: VecDeque<SharedChunk> = VecDeque::new();
 
     while let Ok(ChunkMsg::Data(chunk)) = chunk_rx.recv() {
+        if !parallel_lanes {
+            if let Some(crc) = &mut inline_crc {
+                crc.update(&chunk);
+            }
+            if let Some(blake) = &mut inline_blake {
+                blake.update(&chunk);
+            }
+            let _ = free_tx.send(chunk);
+            continue;
+        }
         let shared: SharedChunk = Arc::new(chunk);
         if let Some(ref mut lanes) = blake {
-            lanes.dispatch(&shared);
+            lanes.dispatch(&shared)?;
         }
         if let Some(ref mut lanes) = crc_lanes {
-            lanes.submit(Arc::clone(&shared));
+            lanes.submit(Arc::clone(&shared))?;
         }
         in_flight.push_back(shared);
         recycle_spent_chunks(&mut in_flight, &free_tx);
     }
 
-    let crc32 = crc_lanes.take().map(CrcLanes::finalize);
-    let blake2sp = blake.take().map(BlakeLanes::finalize);
-    CoordinatorResult { crc32, blake2sp }
+    let crc32 = crc_lanes
+        .take()
+        .map(CrcLanes::finalize)
+        .transpose()?
+        .or_else(|| inline_crc.map(|crc| crc.finalize()));
+    let blake2sp = blake
+        .take()
+        .map(BlakeLanes::finalize)
+        .transpose()?
+        .or_else(|| inline_blake.map(|blake| blake.finalize()));
+    Ok(CoordinatorResult { crc32, blake2sp })
 }
 
 /// Return buffers whose lanes have all finished to the submitter's free pool.
@@ -231,8 +267,14 @@ fn recycle_spent_chunks(in_flight: &mut VecDeque<SharedChunk>, free_tx: &mpsc::S
 /// critical path even when a single lane cannot match the read rate.
 struct CrcLanes {
     txs: Vec<mpsc::SyncSender<(u64, SharedChunk)>>,
-    handles: Vec<JoinHandle<Vec<ChunkCrc>>>,
+    results: Vec<mpsc::Receiver<ChunkCrc>>,
+    handles: Vec<JoinHandle<()>>,
     next_seq: u64,
+    next_fold: u64,
+    crc: u32,
+    // Typical streams use one chunk size plus a tail. Keep even irregular
+    // producer writes bounded, instead of retaining every length ever seen.
+    ops: VecDeque<(u64, CrcShiftOp)>,
 }
 
 struct ChunkCrc {
@@ -245,62 +287,99 @@ const CRC_LANE_COUNT: usize = 2;
 
 impl CrcLanes {
     fn spawn() -> Self {
-        let mut txs = Vec::with_capacity(CRC_LANE_COUNT);
-        let mut handles = Vec::with_capacity(CRC_LANE_COUNT);
+        let mut lanes = Self {
+            txs: Vec::with_capacity(CRC_LANE_COUNT),
+            results: Vec::with_capacity(CRC_LANE_COUNT),
+            handles: Vec::with_capacity(CRC_LANE_COUNT),
+            next_seq: 0,
+            next_fold: 0,
+            crc: 0,
+            ops: VecDeque::new(),
+        };
         for lane in 0..CRC_LANE_COUNT {
             let (tx, rx) = mpsc::sync_channel::<(u64, SharedChunk)>(MAX_IN_FLIGHT);
+            let (result_tx, result_rx) = mpsc::sync_channel(MAX_IN_FLIGHT);
             let handle = std::thread::Builder::new()
                 .name(format!("weaver-rar-crc-{lane}"))
                 .spawn(move || {
-                    let mut results: Vec<ChunkCrc> = Vec::new();
                     while let Ok((seq, chunk)) = rx.recv() {
-                        results.push(ChunkCrc {
+                        let result = ChunkCrc {
                             seq,
                             crc: crc32fast::hash(&chunk),
                             len: chunk.len() as u64,
-                        });
+                        };
+                        drop(chunk);
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
                     }
-                    results
                 })
                 .expect("spawn CRC lane");
-            txs.push(tx);
-            handles.push(handle);
+            lanes.txs.push(tx);
+            lanes.results.push(result_rx);
+            lanes.handles.push(handle);
         }
-        Self {
-            txs,
-            handles,
-            next_seq: 0,
-        }
+        lanes
     }
 
-    fn submit(&mut self, chunk: SharedChunk) {
+    fn submit(&mut self, chunk: SharedChunk) -> io::Result<()> {
         let seq = self.next_seq;
-        self.next_seq += 1;
         let lane = (seq as usize) % self.txs.len();
-        let _ = self.txs[lane].send((seq, chunk));
+        self.txs[lane]
+            .send((seq, chunk))
+            .map_err(|_| io::Error::other("CRC worker terminated early"))?;
+        self.next_seq += 1;
+        if self.next_seq - self.next_fold >= MAX_IN_FLIGHT as u64 {
+            self.fold_next()?;
+        }
+        Ok(())
     }
 
-    fn finalize(mut self) -> u32 {
-        self.txs.clear();
-        let mut results: Vec<ChunkCrc> = Vec::new();
-        for handle in self.handles.drain(..) {
-            results.extend(handle.join().unwrap_or_default());
+    fn fold_next(&mut self) -> io::Result<()> {
+        // Each lane is FIFO. Waiting for the next lane bounds reordering and
+        // outstanding work even if that worker is slower than all its peers.
+        let lane = self.next_fold as usize % self.results.len();
+        let entry = self.results[lane]
+            .recv()
+            .map_err(|_| io::Error::other("CRC worker terminated before returning its result"))?;
+        if entry.seq != self.next_fold {
+            return Err(io::Error::other(
+                "CRC worker returned an out-of-order result",
+            ));
         }
-        results.sort_unstable_by_key(|entry| entry.seq);
+        if !self.ops.iter().any(|(len, _)| *len == entry.len) {
+            if self.ops.len() == MAX_IN_FLIGHT {
+                self.ops.pop_front();
+            }
+            self.ops.push_back((entry.len, CrcShiftOp::new(entry.len)));
+        }
+        let (_, op) = self.ops.iter().find(|(len, _)| *len == entry.len).unwrap();
+        self.crc = op.shift(self.crc) ^ entry.crc;
+        self.next_fold += 1;
+        Ok(())
+    }
 
-        let mut ops: Vec<(u64, CrcShiftOp)> = Vec::new();
-        let mut crc = 0u32;
-        for entry in results {
-            let op = match ops.iter().find(|(len, _)| *len == entry.len) {
-                Some((_, op)) => op,
-                None => {
-                    ops.push((entry.len, CrcShiftOp::new(entry.len)));
-                    &ops.last().expect("just pushed").1
-                }
-            };
-            crc = op.shift(crc) ^ entry.crc;
+    fn finalize(mut self) -> io::Result<u32> {
+        self.txs.clear();
+        while self.next_fold < self.next_seq {
+            self.fold_next()?;
         }
-        crc
+        while let Some(handle) = self.handles.pop() {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("CRC worker panicked"))?;
+        }
+        Ok(self.crc)
+    }
+}
+
+impl Drop for CrcLanes {
+    fn drop(&mut self) {
+        self.txs.clear();
+        self.results.clear();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -389,56 +468,17 @@ impl CrcShiftOp {
     }
 }
 
-/// How many BLAKE2sp leaves one worker thread owns.
-///
-/// The eight leaves are independent until the root combine, so any split of
-/// them across threads is correct; the choice is vector width versus thread
-/// count, and it is decided per target by which BLAKE2s implementation is
-/// actually vectorized there.
-///
-/// * Off `aarch64`, the upstream `blake2s_simd` leaf state has real SSE4.1 /
-///   AVX2 backends, so one leaf per thread is both wide and parallel: eight
-///   workers, each walking its own 64-byte blocks.
-/// * On `aarch64`, `blake2s_simd` ships **no** vector backend — every leaf
-///   there runs its portable scalar path — while this crate's own
-///   [`crate::crypto::Blake2spLeafGroup`] kernel is 4-wide NEON. So a worker
-///   owns a whole 4-leaf group and drives that kernel over the group's
-///   contiguous 256-byte half of each super-block: two vector workers instead
-///   of eight scalar ones, for the same digest.
-// One leaf per worker on EVERY arch for now — including aarch64, where the
-// 4-leaf NEON group arrangement exists but is deliberately not wired: it
-// saves 2.2x CPU (1.25 -> 0.56 cpu-s/GB) yet measures a 1.75x WALL
-// regression on the hash lane (6.22 -> 3.56 GB/s, 256 MiB, min-of-9)
-// because the group kernel reaches only ~55% of ideal 4-wide scaling, and
-// two vector workers cannot match eight scalar ones. Wall is the
-// user-visible metric on store-mode extraction, the dominant archive class.
-// Re-wire the aarch64 arms to `crate::crypto::Blake2spLeafGroup` (see git
-// history of this file for the exact shape) once the group kernel
-// approaches ~4x scaling — two vector workers then win BOTH axes
-// (~7.4 GB/s projected). The group kernel and its digest-equivalence tests
-// stay live regardless.
-//
-// A paired-compression attempt at that scaling (two interleaved groups
-// feeding eight chains of ILP) measured flat in the 2026-08-13
-// quiet-window A/B (+0.00%/-0.17% quiet, +0.17%/-0.11% contended) and
-// failed to reproduce its +12.48% exploratory read; NEON's missing 32-bit
-// rotate caps a worker near 3.5x of scalar, so the remaining gap is
-// structural, not schedulable. Reverted — do not re-attempt pairing
-// without a kernel shape that changes the per-worker instruction ceiling.
-// REVERSED 2026-08-14 (operator decision, concurrent-load evidence): the
-// wall-only reasoning above held only for one lone archive on an idle box.
-// Under K concurrent hash streams — the deployment shape — the group
-// arrangement wins aggregate throughput from K=4 (1.20x) and reaches 2.07x
-// at physical-core count, while its 2.2-2.3x lower CPU per byte holds under
-// load; scalar8 at high K oversubscribes (8 threads per stream). aarch64
-// only: the group kernel is 4-wide NEON; x86 keeps one scalar leaf per
-// worker until an x86 group kernel exists and is measured.
+/// Leaves grouped on one worker: four on NEON, eight on x86 (runtime
+/// upstream SSE4.1/AVX2 or legacy SSE2/SSSE3 dispatch), one on other targets. Keeping x86 leaves
+/// together enables cross-leaf SIMD and avoids eight worker wakeups per chunk.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const LEAVES_PER_WORKER: usize = 8;
 #[cfg(target_arch = "aarch64")]
 const LEAVES_PER_WORKER: usize = GROUP_LEAVES;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 const LEAVES_PER_WORKER: usize = 1;
 
-/// Number of BLAKE2sp worker threads (8 leaf workers, or 2 group workers).
+/// Number of BLAKE2sp workers: one x86 group, two NEON groups, or eight leaves.
 const BLAKE_WORKERS: usize = LANES / LEAVES_PER_WORKER;
 /// Contiguous bytes a worker owns each time the round robin comes back to it.
 /// The leaves a worker owns are adjacent, so its share of every `LANE_STRIDE`
@@ -449,7 +489,7 @@ const BLAKE_WORKER_SPAN: usize = LEAVES_PER_WORKER * BLAKE_BLOCK;
 /// 4-leaf NEON group. See [`LEAVES_PER_WORKER`].
 #[cfg(target_arch = "aarch64")]
 type BlakeWorkerState = crate::crypto::Blake2spLeafGroup;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 type BlakeWorkerState = Blake2sState;
 
 /// Build worker `worker`'s state, covering the `LEAVES_PER_WORKER` leaves that
@@ -458,7 +498,7 @@ type BlakeWorkerState = Blake2sState;
 fn new_worker_state(worker: usize) -> BlakeWorkerState {
     crate::crypto::Blake2spLeafGroup::new(worker)
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 fn new_worker_state(worker: usize) -> BlakeWorkerState {
     blake2sp_leaf_params(worker).to_state()
 }
@@ -468,16 +508,34 @@ fn new_worker_state(worker: usize) -> BlakeWorkerState {
 fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
     state.finalize_leaves()
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 fn finish_worker_state(state: &BlakeWorkerState) -> [[u8; 32]; LEAVES_PER_WORKER] {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(state.finalize().as_bytes());
     [digest]
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type BlakeWorkerState = crate::crypto::blake2sp_x86::State;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn new_worker_state(worker: usize) -> BlakeWorkerState {
+    debug_assert_eq!(worker, 0);
+    BlakeWorkerState::new()
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn finish_worker_state(state: &BlakeWorkerState) -> BlakeWorkerOutput {
+    state.finalize()
+}
+
+// x86 owns the full stream and returns the final checksum, not leaf digests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type BlakeWorkerOutput = [u8; 32];
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+type BlakeWorkerOutput = [[u8; 32]; LEAVES_PER_WORKER];
+
 struct BlakeLanes {
     lane_tx: Vec<mpsc::SyncSender<LaneMsg>>,
-    lane_handles: Vec<JoinHandle<[[u8; 32]; LEAVES_PER_WORKER]>>,
+    lane_handles: Vec<JoinHandle<BlakeWorkerOutput>>,
     /// Absolute stream offset of the next incoming byte.
     stream_offset: u64,
 }
@@ -517,9 +575,9 @@ impl BlakeLanes {
     /// Hand the chunk to every worker that owns bytes inside it. Nothing is
     /// deinterleaved here: each worker walks its own spans straight out of the
     /// shared buffer, exactly as unrar's blake2sp threads do.
-    fn dispatch(&mut self, chunk: &SharedChunk) {
+    fn dispatch(&mut self, chunk: &SharedChunk) -> io::Result<()> {
         if chunk.is_empty() {
-            return;
+            return Ok(());
         }
         let stream_offset = self.stream_offset;
         self.stream_offset += chunk.len() as u64;
@@ -530,28 +588,53 @@ impl BlakeLanes {
                 // Short chunk that stops before this worker's next span.
                 continue;
             }
-            let _ = tx.send(LaneMsg::Data {
+            tx.send(LaneMsg::Data {
                 chunk: Arc::clone(chunk),
                 stream_offset,
-            });
+            })
+            .map_err(|_| io::Error::other("BLAKE2sp worker terminated early"))?;
         }
+        Ok(())
     }
 
-    fn finalize(self) -> [u8; 32] {
-        drop(self.lane_tx);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn finalize(mut self) -> io::Result<[u8; 32]> {
+        self.lane_tx.clear();
+        debug_assert_eq!(self.lane_handles.len(), 1);
+        self.lane_handles
+            .remove(0)
+            .join()
+            .map_err(|_| io::Error::other("BLAKE2sp worker panicked"))
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    fn finalize(mut self) -> io::Result<[u8; 32]> {
+        self.lane_tx.clear();
 
         // Workers are ordered by first leaf, and each yields its leaves in
         // order, so joining in worker order visits leaves 0..8 in order.
         let mut root = blake2sp_root_params().to_state();
-        for handle in self.lane_handles {
-            let digests = handle.join().unwrap_or([[0u8; 32]; LEAVES_PER_WORKER]);
+        while !self.lane_handles.is_empty() {
+            let handle = self.lane_handles.remove(0);
+            let digests = handle
+                .join()
+                .map_err(|_| io::Error::other("BLAKE2sp worker panicked"))?;
             for digest in digests {
                 root.update(&digest);
             }
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(root.finalize().as_bytes());
-        out
+        Ok(out)
+    }
+}
+
+impl Drop for BlakeLanes {
+    fn drop(&mut self) {
+        self.lane_tx.clear();
+        for handle in self.lane_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -582,6 +665,10 @@ fn walk_owned_spans(
     chunk: &[u8],
     mut consume: impl FnMut(&[u8]),
 ) {
+    if LEAVES_PER_WORKER == LANES {
+        consume(chunk);
+        return;
+    }
     walk_spans(
         worker,
         BLAKE_WORKER_SPAN,
@@ -618,7 +705,13 @@ fn walk_spans(
 /// tree parameters.
 // Live on non-aarch64 (scalar workers) and in the aarch64 test suite's
 // reference implementations; dead only in aarch64 non-test builds.
-#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
+#[cfg_attr(
+    all(
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"),
+        not(test)
+    ),
+    allow(dead_code)
+)]
 fn blake2sp_leaf_params(lane: usize) -> Blake2sParams {
     let mut params = Blake2sParams::new();
     params
@@ -636,6 +729,7 @@ fn blake2sp_leaf_params(lane: usize) -> Blake2sParams {
 }
 
 /// BLAKE2sp root-node parameters.
+#[cfg(any(test, not(any(target_arch = "x86", target_arch = "x86_64"))))]
 fn blake2sp_root_params() -> Blake2sParams {
     let mut params = Blake2sParams::new();
     params
@@ -752,13 +846,15 @@ impl SharedHashStream {
                     // Vec from zero on the way to the flush threshold.
                     *pending = pipeline.take_buffer();
                 }
-                pending.extend_from_slice(data);
-                if pending.len() >= PENDING_FLUSH_BYTES {
-                    // Hand the filled buffer over and take a recycled one back,
-                    // so successive chunks cycle pool memory instead of
-                    // reallocating multiple MiB per chunk.
-                    let chunk = std::mem::replace(pending, pipeline.take_buffer());
-                    pipeline.submit(chunk)?;
+                let mut remaining = data;
+                while !remaining.is_empty() {
+                    let take = remaining.len().min(PENDING_FLUSH_BYTES - pending.len());
+                    pending.extend_from_slice(&remaining[..take]);
+                    remaining = &remaining[take..];
+                    if pending.len() == PENDING_FLUSH_BYTES {
+                        let chunk = std::mem::replace(pending, pipeline.take_buffer());
+                        pipeline.submit(chunk)?;
+                    }
                 }
                 Ok(())
             }
@@ -1198,5 +1294,106 @@ mod tests {
                 CrcShiftOp::new(b.len() as u64).shift(crc32fast::hash(a)) ^ crc32fast::hash(b);
             assert_eq!(folded, whole, "split at {split}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn crc_folds_during_acquisition_with_bounded_results_and_operator_cache() {
+        let mut lanes = CrcLanes::spawn();
+        let mut reference = crate::crc::Crc32::new();
+        for seq in 0..10_000 {
+            let bytes = vec![(seq * 31) as u8; 1 + seq % 127];
+            reference.update(&bytes);
+            lanes.submit(Arc::new(bytes)).unwrap();
+            assert!(lanes.next_seq - lanes.next_fold < MAX_IN_FLIGHT as u64);
+            assert!(lanes.ops.len() <= MAX_IN_FLIGHT);
+        }
+        assert!(lanes.next_fold > 9_990);
+        assert_eq!(lanes.finalize().unwrap(), reference.finalize());
+    }
+
+    #[test]
+    fn stopped_crc_worker_is_an_error_not_a_partial_checksum() {
+        let mut lanes = CrcLanes::spawn();
+        let (tx, rx) = mpsc::sync_channel(MAX_IN_FLIGHT);
+        drop(rx);
+        let old = std::mem::replace(&mut lanes.txs[0], tx);
+        drop(old);
+        assert!(lanes.submit(Arc::new(vec![1, 2, 3])).is_err());
+        // Drop closes the remaining worker and joins it too.
+    }
+
+    #[test]
+    fn stopped_blake_worker_is_an_error_not_a_zero_digest() {
+        let mut lanes = BlakeLanes::spawn();
+        let (tx, rx) = mpsc::sync_channel(MAX_IN_FLIGHT);
+        drop(rx);
+        drop(std::mem::replace(&mut lanes.lane_tx[0], tx));
+        assert!(lanes.dispatch(&Arc::new(vec![1; 512])).is_err());
+    }
+
+    #[test]
+    fn single_hash_worker_and_parallel_lanes_agree_on_irregular_chunks() {
+        for parallel in [false, true] {
+            for (crc, blake) in [(true, false), (false, true), (true, true)] {
+                let (tx, rx) = mpsc::sync_channel(MAX_IN_FLIGHT);
+                let (free_tx, _free_rx) = mpsc::channel();
+                let worker =
+                    std::thread::spawn(move || coordinator_loop(rx, free_tx, crc, blake, parallel));
+                let mut expected = Vec::new();
+                for seq in 0..128 {
+                    let chunk = vec![seq as u8; 1 + (seq * 107) % 8192];
+                    expected.extend_from_slice(&chunk);
+                    tx.send(ChunkMsg::Data(chunk)).unwrap();
+                }
+                drop(tx);
+                let result = worker.join().unwrap().unwrap();
+                assert_eq!(result.crc32, crc.then(|| crc32fast::hash(&expected)));
+                assert_eq!(
+                    result.blake2sp,
+                    blake.then(|| *blake2s_simd::blake2sp::blake2sp(&expected).as_array())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_writer_update_is_split_and_matches_reference() {
+        let data = vec![0xA7; 2 * CHUNK_CAPACITY + 97];
+        let stream = SharedHashStream::new(true, false, true, data.len() as u64);
+        stream.update(&data).unwrap();
+        {
+            let state = stream.lock();
+            let StreamState::Pipelined { pending, .. } = &*state else {
+                panic!("expected worker path")
+            };
+            assert!(pending.len() < PENDING_FLUSH_BYTES);
+            assert_eq!(pending.capacity(), CHUNK_CAPACITY);
+        }
+        let result = stream.finalize().unwrap();
+        assert_eq!(result.crc32, Some(crc32fast::hash(&data)));
+        assert_eq!(
+            result.blake2sp,
+            Some(*blake2s_simd::blake2sp::blake2sp(&data).as_array())
+        );
+    }
+
+    #[test]
+    fn abandoning_a_busy_hash_pipeline_releases_all_shared_buffers() {
+        let mut lanes = CrcLanes::spawn();
+        let shared = Arc::new(vec![0x5A; 1024 * 1024]);
+        for _ in 0..MAX_IN_FLIGHT - 1 {
+            lanes.submit(Arc::clone(&shared)).unwrap();
+        }
+        drop(lanes);
+        assert_eq!(Arc::strong_count(&shared), 1);
+        let mut lanes = BlakeLanes::spawn();
+        lanes.dispatch(&shared).unwrap();
+        drop(lanes);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 }

@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.10.4 (unreleased)
+## 0.10.5 (unreleased)
+
+### Added
+
+- `DecodeMode::Adaptive` selects staged RAR5 inline or parallel batches from
+  measured input and decode costs, preserving dictionary/filter state across
+  switches. Existing pool and staging limits still apply; `Auto` is unchanged.
+- Archive-local `DecodeMode::Serial` selects inline RAR4/RAR5 decoding for
+  input-limited readers, without changing process environment, checksum policy
+  or solid continuation. The default remains `Auto`.
+
+### Fixed
+
+- Literal-run replay respects retained dictionary capacity and makes bounded
+  progress when a pending filter holds the soft flush border.
+- Deprecated extraction and solid-skip entry points now honor archive-local
+  decode mode, with scope restoration on success and failure.
+
+### Performance
+
+- Group all eight BLAKE2sp leaves on one x86 hash worker. Use the upstream
+  `blake2s_simd` streaming state with runtime SSE4.1/AVX2 detection; retain
+  local SSE2/SSSE3 fallbacks for older hosts. Remove the custom AVX2 and
+  AVX-512 kernels. Other architecture backends remain unchanged.
+- Store RAR5 parallel-decoder literals as bytes plus one descriptor per run,
+  and replay runs with bounded bulk window writes instead of expanding each
+  eight literal bytes into a sixteen-byte operation.
+- Serial chases keep large-member checksums on one hash worker rather than
+  fanning out to additional CRC/BLAKE2sp lanes. Completed archives retain
+  parallel CRC acquisition, now with bounded incremental result folding.
+  Large writer updates are split into bounded chunks. Worker failures are
+  reported as errors and remaining workers are joined during cleanup.
+
+## 0.10.4
 
 ### Added
 

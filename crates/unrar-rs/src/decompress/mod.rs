@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 pub mod lz;
+pub(crate) mod policy;
 pub mod ppmd;
 pub mod rar4;
 pub(crate) mod rar4_old;

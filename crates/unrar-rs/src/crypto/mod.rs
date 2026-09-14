@@ -38,6 +38,9 @@ mod kdf_hmac;
 ))]
 mod blake2sp_simd;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) mod blake2sp_x86;
+
 // Differential tests comparing the two backends bit-for-bit; only compiled
 // when both are built (native, both features enabled).
 #[cfg(all(
@@ -57,6 +60,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // selected (see `Blake2spHasher` below); gate the import to that config so it
 // does not read as unused on aarch64 / wasm-simd128 builds.
 #[cfg(not(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128")
 )))]
@@ -383,93 +388,68 @@ pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
     backend::hmac_sha256(&backend::hmac_sha256_key(key), &value)
 }
 
-/// Incremental BLAKE2sp hasher.
-///
-/// The public API (`new` / `update` / `finalize`) and its byte output are the
-/// same on every target; only the backend differs. `blake2s_simd` ships only
-/// AVX2/SSE4.1/portable backends, so on `aarch64` and `wasm32 + simd128` its
-/// BLAKE2sp runs scalar; on exactly those targets we substitute the in-crate
-/// `blake2sp_simd` NEON / `simd128` kernel.
-/// Everywhere else (x86 AVX2, wasm without simd, other arches) it keeps calling
-/// `blake2s_simd` unchanged. The output is byte-identical either way.
+/// Incremental BLAKE2sp hasher with runtime-dispatched x86 groups,
+/// NEON/simd128 groups on ARM/wasm, and a portable upstream fallback.
+#[derive(Clone, Debug)]
+pub struct Blake2spHasher {
+    inner: Blake2State,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type Blake2State = blake2sp_x86::State;
 #[cfg(any(
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128")
 ))]
-#[derive(Clone, Debug)]
-pub struct Blake2spHasher {
-    inner: blake2sp_simd::Blake2spState,
-}
-
+type Blake2State = blake2sp_simd::Blake2spState;
 #[cfg(not(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128")
 )))]
-#[derive(Clone, Debug)]
-pub struct Blake2spHasher {
-    inner: blake2sp::State,
-}
+type Blake2State = blake2sp::State;
 
 impl Default for Blake2spHasher {
     fn default() -> Self {
         Self::new()
     }
 }
-
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128")
-))]
 impl Blake2spHasher {
     pub fn new() -> Self {
         Self {
-            inner: blake2sp_simd::Blake2spState::new(),
+            inner: Blake2State::new(),
         }
     }
-
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
-
     pub fn finalize(&self) -> [u8; 32] {
-        self.inner.finalize()
-    }
-}
-
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128")
-)))]
-impl Blake2spHasher {
-    pub fn new() -> Self {
-        Self {
-            inner: blake2sp::State::new(),
+        #[cfg(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
+        {
+            self.inner.finalize()
+        }
+        #[cfg(not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )))]
+        {
+            *self.inner.clone().finalize().as_array()
         }
     }
-
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    pub fn finalize(&self) -> [u8; 32] {
-        *self.inner.clone().finalize().as_array()
-    }
 }
 
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128")
-))]
 pub fn blake2sp_hash(data: &[u8]) -> [u8; 32] {
-    blake2sp_simd::hash(data)
-}
-
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128")
-)))]
-pub fn blake2sp_hash(data: &[u8]) -> [u8; 32] {
-    *blake2sp::blake2sp(data).as_array()
+    let mut state = Blake2spHasher::new();
+    state.update(data);
+    state.finalize()
 }
 
 /// Re-export of the in-crate SIMD BLAKE2sp differential-corpus runner, used by

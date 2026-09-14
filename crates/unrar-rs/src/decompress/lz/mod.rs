@@ -18,6 +18,7 @@
 //! - 258-261: repeat distance cache references (length from RC table)
 //! - 262-305: inline length codes with extra bits (distance from DC/LDC tables)
 
+mod adaptive;
 pub(super) mod batch_plan;
 pub mod bitstream;
 pub(super) mod block_reader;
@@ -140,7 +141,7 @@ pub struct LzDecoder {
     current_file_unpacked_size: u64,
     /// Recycled decoded-item buffers for one bounded RAR5 controller batch.
     /// Workers fill these slots before the caller applies them in archive order.
-    parallel_item_buffer_sets: Vec<Vec<Vec<parallel::DecodedItem>>>,
+    parallel_item_buffer_sets: Vec<Vec<parallel::DecodedItems>>,
     /// Recycled per-batch controller bookkeeping (assignments, worker results).
     ///
     /// More than one is cached: the pipelined controller keeps one batch in
@@ -1072,6 +1073,8 @@ impl LzDecoder {
         let mut reached_eof = false;
         let mut staged_bit_offset = 0usize;
         let mut staged_base = 0u64;
+        let mut adaptive =
+            crate::decompress::policy::adaptive().then(adaptive::AdaptiveDecode::default);
 
         while output_size < self.decode_limit() {
             if staged.read_space_len() == 0 {
@@ -1081,9 +1084,13 @@ impl LzDecoder {
             }
 
             if !reached_eof && staged.read_space_len() > 0 {
+                let started = adaptive.as_ref().map(|_| std::time::Instant::now());
                 let read = phase_diagnostics::measure(phase_diagnostics::Phase::Staging, || {
                     Self::refill_staged_input(&mut *input, &mut *staged)
                 })?;
+                if let (Some(state), Some(started)) = (&mut adaptive, started) {
+                    state.observe_input(read, started.elapsed());
+                }
                 if read == 0 {
                     reached_eof = true;
                 }
@@ -1172,14 +1179,26 @@ impl LzDecoder {
             } else {
                 staged_slice.len().saturating_sub(STREAMING_HEADER_MARGIN)
             };
-            let consumed = self.process_buffered_blocks(
-                staged.padded_input(),
-                staged.logical_len(),
-                header_limit,
-                unpacked_size,
-                &mut output_size,
-                writer,
-            )?;
+            let inline = adaptive
+                .as_mut()
+                .is_some_and(|state| !state.use_parallel(staged.logical_len()));
+            let started = inline.then(std::time::Instant::now);
+            let consumed = {
+                // Only complete staged blocks switch engines. No reader,
+                // dictionary, filter, or solid-member state is restarted.
+                let _inline = inline.then(|| crate::DecodeMode::Serial.enter());
+                self.process_buffered_blocks(
+                    staged.padded_input(),
+                    staged.logical_len(),
+                    header_limit,
+                    unpacked_size,
+                    &mut output_size,
+                    writer,
+                )?
+            };
+            if let (Some(state), Some(started)) = (&mut adaptive, started) {
+                state.observe_inline(consumed, started.elapsed());
+            }
             if consumed > 0 {
                 Self::consume_staged_prefix(staged, &mut staged_base, consumed)?;
                 staged_bit_offset = 0;
