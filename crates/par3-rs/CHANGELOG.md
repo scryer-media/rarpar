@@ -14,6 +14,13 @@
   and a host told it was contention parked and retried forever. A refusal a
   peer really is causing still reports `PeerContention`.
 
+- **Behaviour change:** `create` now holds every name it is asked to protect
+  against `paths::validate_relative_path`, the same table the session creator
+  uses, and refuses an unsafe one with the new `Par3Error::UnsafePath`. A set
+  naming a reserved device (`con.txt`) or a trailing-dot file could be created
+  here and then refused by this crate's own repair on the platform that cannot
+  write it.
+
 ## 0.4.0 (unreleased)
 
 - Version: this release is `0.4.0`, not `0.3.2`. The entries below change public

@@ -765,56 +765,122 @@ fn a_repaired_tree_verifies_the_same_way_the_repair_said_it_would() {
 /// settled before any file is staged.
 ///
 /// The parse-time name check is deliberately narrower than the writer's rule
-/// table — one unwritable name must not make a whole set unreadable — so a set
-/// this crate creates can legitimately carry a name the repair writer refuses.
-/// `con.txt` is such a name, and `create` writes it. Sorted, it is the second
-/// of the two files, so resolving destinations inside the staging loop stages
-/// `a.bin` first and then fails, handing the host a `RepairInterrupted` with a
-/// temporary on disk in place of the plain refusal the set deserves.
+/// table — one unwritable name must not make a whole *foreign* set unreadable —
+/// so a producer elsewhere can legitimately ship a set naming `con.txt`, which
+/// this platform reserves. Since PR #73 round 5, finding C, this crate's own
+/// `create` refuses such a name (`tests/create.rs`), so the set here is built
+/// the way a foreign one arrives: created under safe names by this crate's own
+/// creation engine, then renamed inside its own File packet and rerooted
+/// through this crate's packet types. No byte of it is hand-assembled, and
+/// nothing else in the set points at either packet: it carries no recovery
+/// data, so no payload is bound to the Root hash.
+///
+/// The two files hold identical bytes, so aligned deduplication leaves every
+/// block of each named by the other. Damaging a different block in each leaves
+/// nothing lost — every block survives in its twin — and both files incomplete,
+/// so both are staged. Sorted, `con.txt` is the second of them, so resolving
+/// destinations inside the staging loop stages `a.bin` first and then fails,
+/// handing the host a `RepairInterrupted` with a temporary on disk in place of
+/// the plain refusal the set deserves.
 #[test]
 fn an_unwritable_destination_is_refused_before_the_first_file_is_staged() {
+    use par3_rs::Packet;
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, Deduplication};
+    use par3_rs::packet::PacketBody;
     use par3_rs::runtime::{EngineError, ExecutionOptions};
     use par3_rs::session::{Par3RepairSession, RepairStatus};
     use par3_rs::source::{MemorySourceAccess, SourceId};
     use std::sync::Arc;
 
-    let tree = TempTree::new("unwritable-second-destination");
-    let contents = [("a.bin", filler(11, 3000)), ("con.txt", filler(12, 3000))];
-    for (name, bytes) in &contents {
-        tree.write(name, bytes);
-    }
-    let names: Vec<PathBuf> = contents
-        .iter()
-        .map(|(name, _)| PathBuf::from(name))
-        .collect();
-    let mut options = CreateOptions::default();
-    options.block_size = Some(1024);
-    options.recovery = RecoveryAmount::Blocks(4);
-    let report = create(
-        &InputSpec::new(tree.path(), &names),
-        &tree.path().join("set"),
-        &options,
+    let bytes = filler(11, 3000);
+    let mut creating = MemorySourceAccess::default();
+    creating.insert(SourceId(1), 1, bytes.clone().into());
+    creating.insert(SourceId(2), 1, bytes.clone().into());
+    let mut options = CreationOptions {
+        block_size: 1024,
+        recovery_count: 0,
+        deduplication: Deduplication::Aligned,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    let plan = CreationPlan::build(
+        Arc::new(creating),
+        &[
+            CreationSource {
+                name: "a.bin".into(),
+                source: SourceId(1),
+            },
+            CreationSource {
+                name: "b.bin".into(),
+                source: SourceId(2),
+            },
+        ],
+        options,
     )
-    .expect("the reader's own name rules accept `con.txt`");
+    .expect("the set plans under safe names");
+    let id = plan.input_set_id();
+    let carriers = TempTree::new("unwritable-carriers");
+    let written = plan
+        .execute(&carriers.path().join("set"), carriers.path())
+        .expect("the carriers are written");
 
-    // Both files damaged, so both are incomplete and both would be staged.
+    let mut packets: BTreeMap<_, Packet> = written
+        .iter()
+        .flat_map(|path| packets_of(&std::fs::read(path).unwrap()))
+        .map(|packet| (packet.hash(), packet))
+        .collect();
+    let (renamed_from, renamed) = packets
+        .values()
+        .find_map(|packet| match packet.body() {
+            PacketBody::File(file) if file.name == "b.bin" => {
+                let mut file = file.clone();
+                file.name = "con.txt".to_owned();
+                Some((packet.hash(), Packet::new(id, PacketBody::File(file))))
+            }
+            _ => None,
+        })
+        .expect("the set names `b.bin`");
+    packets.remove(&renamed_from);
+    let renamed_to = renamed.hash();
+    packets.insert(renamed_to, renamed);
+    let (rooted_from, rerooted) = packets
+        .values()
+        .find_map(|packet| match packet.body() {
+            PacketBody::Root(root) => {
+                let mut root = root.clone();
+                for child in &mut root.children {
+                    if *child == renamed_from {
+                        *child = renamed_to;
+                    }
+                }
+                Some((packet.hash(), Packet::new(id, PacketBody::Root(root))))
+            }
+            _ => None,
+        })
+        .expect("the set has a Root packet");
+    packets.remove(&rooted_from);
+    packets.insert(rerooted.hash(), rerooted);
+    let carrier: Vec<u8> = packets
+        .values()
+        .flat_map(|packet| packet.to_bytes())
+        .collect();
+
+    // A different block damaged in each file, so each one's loss survives in
+    // the other and both files are incomplete.
+    let contents = [("a.bin", bytes.clone()), ("con.txt", bytes)];
     let mut access = MemorySourceAccess::default();
     for (index, (_, bytes)) in contents.iter().enumerate() {
         let mut damaged = bytes.clone();
-        damaged[100 + index] ^= 0x80;
+        damaged[100 + index * 1024] ^= 0x80;
         access.insert(SourceId(index as u64 + 1), 1, damaged.into());
     }
-    let packets = packets_of(&std::fs::read(&report.files_written[0]).unwrap());
-    let id = packets[0].input_set_id();
     let execution = ExecutionOptions::default();
     let mut session = Par3RepairSession::new(id, Arc::new(access), execution.clone()).unwrap();
     for (index, (name, _)) in contents.iter().enumerate() {
         session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
     }
-    for path in &report.files_written {
-        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &execution) {
-            session.merge(packet).unwrap();
-        }
+    for packet in common::scanned_packets(carrier, &execution) {
+        session.merge(packet).unwrap();
     }
     let assessment = session.assess().unwrap();
     assert_eq!(assessment.status, RepairStatus::Ready);

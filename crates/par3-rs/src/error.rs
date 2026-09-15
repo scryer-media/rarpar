@@ -229,6 +229,15 @@ pub enum Par3Error {
         reason: String,
     },
 
+    /// A name a create was asked to protect breaks a name-safety rule.
+    ///
+    /// This is the same verdict `EngineError::UnsafePath` carries, from the
+    /// same table: it depends only on the bytes of the name, so a name refused
+    /// here is refused on every platform, and a set this crate creates names
+    /// nothing a repair would later refuse to write.
+    #[error("unsafe PAR3 path: {0}")]
+    UnsafePath(#[from] crate::paths::PathViolation),
+
     /// A create exceeded one of the [`CreateLimits`](crate::create::CreateLimits).
     #[error("PAR3 create limit exceeded: {reason}")]
     CreateLimitExceeded {
