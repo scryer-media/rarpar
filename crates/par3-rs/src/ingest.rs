@@ -303,6 +303,13 @@ impl IngestedPacket {
 /// granules so a tree of many small entries does not cost one atomic round trip
 /// per entry, and a refusal is stashed so the caller can report the measured
 /// ceiling rather than the walk's own structural limit message.
+///
+/// The batching runs *ahead* of the walk, never behind it. The walk allocates
+/// an entry the moment it is charged for it, so a reservation that lagged by up
+/// to a granule would let the heap sit a granule over the ceiling the budget
+/// believes it is holding the line at. Growth is therefore taken a granule at a
+/// time before the charge is acknowledged, and [`Self::flush`] hands back
+/// whatever the walk did not use.
 struct BudgetCharge<'a> {
     reservation: &'a mut Reservation,
     /// Expansion room this walk would have if nothing else held the budget.
@@ -313,43 +320,76 @@ struct BudgetCharge<'a> {
     /// session's own earlier reservations. Reported as what was available, and
     /// never used to decide whether the walk can ever fit.
     headroom: usize,
+    /// Bytes the walk has been charged for and that are settled into `taken`.
     taken: usize,
+    /// Bytes this charge has grown the reservation by. Never less than
+    /// `taken + pending`: that is the whole point of reserving ahead.
+    reserved: usize,
+    /// Charged bytes not yet settled into `taken`, so the counter moves once a
+    /// granule rather than once an entry.
     pending: usize,
     failure: Option<EngineError>,
 }
 
 impl BudgetCharge<'_> {
-    fn flush(&mut self) -> Result<(), Par3Error> {
-        let bytes = std::mem::take(&mut self.pending);
-        if bytes == 0 {
+    /// Stash the engine's own refusal and hand the walk its structural one.
+    fn refuse(&mut self, error: EngineError) -> Par3Error {
+        self.failure = Some(error);
+        Par3Error::ScanLimitExceeded {
+            reason: "resolving this input set needs more memory than the budget allows".to_owned(),
+        }
+    }
+
+    /// Grow the reservation until it covers every byte charged so far.
+    ///
+    /// This runs before a charge is acknowledged, so the walk never allocates
+    /// against bytes the budget has not granted. One granule is taken at a
+    /// time, which keeps the atomic traffic of a tree of small entries at one
+    /// round trip per 64 KiB rather than one per entry.
+    fn reserve_ahead(&mut self) -> Result<(), Par3Error> {
+        let need = self.taken.saturating_add(self.pending);
+        if need <= self.reserved {
             return Ok(());
         }
-        let next = self.taken.saturating_add(bytes);
-        let refuse = |this: &mut Self, error: EngineError| {
-            this.failure = Some(error);
-            Par3Error::ScanLimitExceeded {
-                reason: "resolving this input set needs more memory than the budget allows"
-                    .to_owned(),
-            }
-        };
         // Only the uncontended ceiling decides whether this walk can ever fit.
         // Measuring against the contended headroom would report a walk that
         // fits alone as terminal the moment a peer happens to hold memory.
-        if next > self.ceiling {
+        if need > self.ceiling {
             let error = EngineError::budget_limit(
                 "metadata expansion",
-                next,
+                need,
                 self.ceiling,
                 self.headroom.saturating_sub(self.taken),
             );
-            return Err(refuse(self, error));
+            return Err(self.refuse(error));
         }
+        // A granule beyond what is needed, but never beyond the ceiling the
+        // refusal above just cleared: reserving ahead must not itself become
+        // the thing that refuses a walk that fits.
+        let ahead = need
+            .saturating_add(EXPANSION_GRANULE_BYTES)
+            .min(self.ceiling)
+            .max(need);
+        let growth = ahead - self.reserved;
         // Inside the ceiling, the budget itself is the authority on whether the
         // bytes are there right now, and its refusal already carries the shape.
-        if let Err(error) = self.reservation.grow_by(bytes) {
-            return Err(refuse(self, error));
+        if let Err(error) = self.reservation.grow_by(growth) {
+            return Err(self.refuse(error));
         }
-        self.taken = next;
+        self.reserved = ahead;
+        Ok(())
+    }
+
+    /// Settle the pending charges and give back what was reserved ahead.
+    fn flush(&mut self) -> Result<(), Par3Error> {
+        self.reserve_ahead()?;
+        self.taken = self.taken.saturating_add(std::mem::take(&mut self.pending));
+        if self.reserved > self.taken {
+            let slack = self.reserved - self.taken;
+            let target = self.reservation.bytes().saturating_sub(slack);
+            self.reservation.shrink_to(target);
+            self.reserved = self.taken;
+        }
         Ok(())
     }
 }
@@ -357,10 +397,11 @@ impl BudgetCharge<'_> {
 impl ExpansionCharge for BudgetCharge<'_> {
     fn charge(&mut self, bytes: usize) -> Result<(), Par3Error> {
         self.pending = self.pending.saturating_add(bytes);
-        if self.pending < EXPANSION_GRANULE_BYTES {
-            return Ok(());
+        self.reserve_ahead()?;
+        if self.pending >= EXPANSION_GRANULE_BYTES {
+            self.taken = self.taken.saturating_add(std::mem::take(&mut self.pending));
         }
-        self.flush()
+        Ok(())
     }
 }
 
@@ -1069,6 +1110,7 @@ impl IncrementalSet {
             ceiling: uncontended.saturating_sub(working),
             headroom: extra,
             taken: 0,
+            reserved: 0,
             pending: 0,
             failure: None,
         };
@@ -1173,6 +1215,7 @@ mod charge_classification_tests {
             ceiling: 512 << 10,
             headroom: 8192,
             taken: 0,
+            reserved: 0,
             pending: 0,
             failure: None,
         };
@@ -1191,6 +1234,107 @@ mod charge_classification_tests {
         drop(peer);
     }
 
+    /// PR #73 round 3, finding 2. The granule batching used to run *behind* the
+    /// walk: `TreeWalk` allocates an entry the moment it is charged for it, and
+    /// the reservation only caught up once a granule of charges had piled up,
+    /// so the heap sat up to 64 KiB past what the budget believed it was
+    /// holding. The reservation now leads the walk, and the final flush gives
+    /// back whatever it led by.
+    #[test]
+    fn the_reservation_is_never_behind_what_the_walk_has_already_allocated() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut reservation = budget
+            .reserve_as(MemoryCategory::ResolvedMetadata, 0)
+            .unwrap();
+        assert_eq!(budget.used(), 0, "the walk starts owing nothing");
+        let ceiling = 256 << 10;
+        let mut charge = BudgetCharge {
+            reservation: &mut reservation,
+            ceiling,
+            headroom: ceiling,
+            taken: 0,
+            reserved: 0,
+            pending: 0,
+            failure: None,
+        };
+        // Entry-sized charges, well under a granule, so the old code would
+        // acknowledge thousands of them before growing anything.
+        let entry = 96usize;
+        let entries = ceiling / entry;
+        let mut charged = 0usize;
+        for step in 0..entries {
+            charge.charge(entry).expect("this walk fits its ceiling");
+            charged += entry;
+            assert!(
+                budget.used() >= charged,
+                "entry {step}: the walk has allocated {charged} bytes against {} reserved",
+                budget.used()
+            );
+            assert!(
+                budget.used() <= ceiling,
+                "entry {step}: reserving ahead overshot the ceiling"
+            );
+        }
+        charge.flush().expect("settles");
+        drop(charge);
+        assert_eq!(
+            reservation.bytes(),
+            charged,
+            "the slack reserved ahead was not handed back"
+        );
+        assert_eq!(budget.used(), charged);
+    }
+
+    /// The other half: a ceiling one byte under what the walk needs refuses at
+    /// the charge that crosses it, and nothing was allocated past the ceiling
+    /// on the way there.
+    #[test]
+    fn a_ceiling_one_byte_short_refuses_before_the_allocation_it_would_cover() {
+        let entry = 96usize;
+        let entries = 1024usize;
+        let budget = MemoryBudget::new(1 << 20);
+        let mut reservation = budget
+            .reserve_as(MemoryCategory::ResolvedMetadata, 0)
+            .unwrap();
+        let ceiling = entry * entries - 1;
+        let mut charge = BudgetCharge {
+            reservation: &mut reservation,
+            ceiling,
+            headroom: ceiling,
+            taken: 0,
+            reserved: 0,
+            pending: 0,
+            failure: None,
+        };
+        let mut charged = 0usize;
+        let mut refused_at = None;
+        for step in 0..entries {
+            if charge.charge(entry).is_err() {
+                refused_at = Some(step);
+                break;
+            }
+            charged += entry;
+            assert!(budget.used() >= charged, "entry {step} outran its charge");
+            assert!(
+                budget.used() <= ceiling,
+                "entry {step} overshot the ceiling"
+            );
+        }
+        assert_eq!(
+            refused_at,
+            Some(entries - 1),
+            "the refusal did not land on the charge that crossed the ceiling"
+        );
+        let failure = charge.failure.take().expect("a refusal is recorded");
+        let EngineError::ResourceLimit(limit) = failure else {
+            panic!("expected a measured resource limit: {failure:?}");
+        };
+        assert_eq!(limit.what, "metadata expansion");
+        assert_eq!(limit.need, entry * entries);
+        assert_eq!(limit.limit, ceiling);
+        assert_eq!(limit.cause(), LimitCause::ExceedsLimit);
+    }
+
     #[test]
     fn a_walk_that_outgrows_the_uncontended_ceiling_is_terminal() {
         let budget = MemoryBudget::new(1 << 20);
@@ -1202,6 +1346,7 @@ mod charge_classification_tests {
             ceiling: EXPANSION_GRANULE_BYTES / 2,
             headroom: EXPANSION_GRANULE_BYTES / 2,
             taken: 0,
+            reserved: 0,
             pending: 0,
             failure: None,
         };

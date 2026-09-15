@@ -82,6 +82,24 @@
   `MemoryBudget::new(0)` raises for everything — is `ExceedsLimit` with its
   figures intact, and `Display` still prints them.
 - `MemoryBudget::is_same` reports whether two handles are clones of one budget.
+- `FileExtents::all_unprotected` answers `true` for an empty interval wherever
+  it sits, instead of `false` when the two offsets fall inside one protected
+  extent. Whole-file verification asks it about the gap between two consecutive
+  reads, so any read narrower than a block — a stripe smaller than the block
+  size, or a block wider than the 64 KiB serial read — used to look like a skip
+  over protected bytes and the whole-file hash came back as `None` on an
+  undamaged file.
+- Metadata expansion grows its reservation before the entries it covers are
+  allocated, not after. The charge still batches in 64 KiB granules, but it now
+  reserves a granule ahead and hands the slack back at the end, so heap use
+  never runs ahead of the budget and a set that will not fit is refused before
+  the allocation it would have needed.
+- A Cauchy repair's pool headroom includes the row headers a serial stripe bank
+  needs, and if stripe admission is still refused while a pool is held, the pool
+  is dropped and the admission is retried once serially (noted through the
+  existing worker-narrowing diagnostic). A budget that admitted a pool could
+  otherwise take the memory the stripe headers needed and refuse a repair that
+  fits serially, so a larger budget could fail where a smaller one succeeded.
 
 - Store a contiguous protected chunk mapping as a run (file, first block, block
   count, byte offset) instead of one materialised extent per block, and expand a

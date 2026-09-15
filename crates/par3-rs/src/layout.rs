@@ -261,9 +261,15 @@ impl FileExtents {
 
     /// Whether every extent that ends after `start` and begins before `end` is
     /// unprotected. An extent that begins exactly at `end` is not one of them,
-    /// so an empty interval on an extent boundary is vacuously unprotected.
+    /// so an empty interval is vacuously unprotected wherever it sits — on an
+    /// extent boundary or in the middle of a protected block. Callers ask this
+    /// about the gap between two reads, and a gap of nothing is not a gap over
+    /// protected bytes.
     #[must_use]
     pub fn all_unprotected(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
         let mut index = self.first_after(start);
         while index < self.count {
             let range = self.range(index).expect("bounded extent");
@@ -1125,96 +1131,52 @@ fn push_span(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{ChunkTail, ExternalDataPacket, FilePacket, RootPacket, StartPacket};
-    use crate::packet::{GaloisField, Packet, PacketBody};
-    use crate::set::Par3Set;
-    use crate::{BlockChecksum, InputSetId};
-
-    const ID: InputSetId = InputSetId([9, 8, 7, 6, 5, 4, 3, 2]);
-
-    /// A one-file set whose single protected chunk is `blocks` whole blocks
-    /// plus `tail` trailing bytes. `tail == 0` is the shape the charge and the
-    /// allocation used to disagree on.
-    fn set_of(blocks: u64, block_size: u64, tail: u64) -> Par3Set {
-        let length = blocks * block_size + tail;
-        let block_count = blocks + u64::from(tail != 0);
-        let file = Packet::new(
-            ID,
-            PacketBody::File(FilePacket {
-                name: "whole.bin".to_owned(),
-                quick_rolling_hash: 0,
-                fingerprint: [0u8; 16],
-                option_hashes: Vec::new(),
-                chunks: vec![ChunkDescription::Protected {
-                    length,
-                    first_block_index: (blocks != 0).then_some(0),
-                    tail: if tail == 0 {
-                        ChunkTail::None
-                    } else {
-                        ChunkTail::Described {
-                            rolling_hash: 0,
-                            fingerprint: [0u8; 16],
-                            block_index: blocks,
-                            offset: 0,
-                        }
-                    },
-                }],
-            }),
-        );
-        let packets = vec![
-            Packet::new(
-                ID,
-                PacketBody::Start(StartPacket {
-                    parent_input_set_id: InputSetId::ZERO,
-                    parent_root_hash: [0u8; 16],
-                    block_size,
-                    galois_field: GaloisField {
-                        size: 1,
-                        generator: 0x1d,
-                    },
-                    legacy_random: None,
-                }),
-            ),
-            Packet::new(
-                ID,
-                PacketBody::Root(RootPacket {
-                    lowest_unused_block_index: block_count,
-                    attributes: 0,
-                    option_hashes: Vec::new(),
-                    children: vec![file.hash()],
-                }),
-            ),
-            Packet::new(
-                ID,
-                PacketBody::ExternalData(ExternalDataPacket {
-                    first_block_index: 0,
-                    checksums: (0..block_count)
-                        .map(|seed| BlockChecksum {
-                            rolling_hash: seed,
-                            fingerprint: [seed as u8; 16],
-                        })
-                        .collect(),
-                }),
-            ),
-            file,
-        ];
-        Par3Set::from_packets_for(packets, ID).expect("builds")
-    }
 
     /// PR #73 round 2, finding 1. `runs_of` sized the per-file run vector at two
     /// runs for every protected chunk while `Plan::measure` charged one for a
     /// chunk that is an exact number of blocks, so the vector held capacity the
     /// budget never saw and `shrink_to_fit` had to buy the exact copy back.
+    ///
+    /// Round 3, finding 4: the shapes are the reference's own now, not
+    /// assembled here. The embedded GF(2^8) oracle archive — written by
+    /// `par3cmdline` at the pinned commit, provenance in `tests/common/mod.rs`
+    /// — carries all three in one set at a 2000-byte block: `sub/c.bin` is
+    /// 4000 bytes, two whole blocks with no tail, which is the shape the charge
+    /// and the allocation disagreed on; `a.bin` is two whole blocks and a
+    /// 1000-byte described tail; `b.txt` is ten bytes, an inline tail with no
+    /// whole block at all. The GF(2^16) archive adds a 300-block file with a
+    /// tail, and neither needs the corpus to be hydrated.
     #[test]
     fn a_file_of_whole_blocks_allocates_exactly_the_runs_its_charge_paid_for() {
-        for (blocks, tail) in [(8u64, 0u64), (8, 40), (0, 40)] {
-            let set = set_of(blocks, 64, tail);
-            let file = &set.files()[0];
+        let mut whole = 0usize;
+        let mut whole_and_tail = 0usize;
+        let mut tail_only = 0usize;
+        for (name, set) in [
+            ("GF(2^8)", crate::test_reference::gf8_set()),
+            ("GF(2^16)", crate::test_reference::gf16_set()),
+        ] {
+            for file in set.files() {
+                for chunk in file.chunks() {
+                    if let ChunkDescription::Protected { length, .. } = chunk {
+                        match (length / set.block_size(), length % set.block_size()) {
+                            (0, 0) => {}
+                            (0, _) => tail_only += 1,
+                            (_, 0) => whole += 1,
+                            (_, _) => whole_and_tail += 1,
+                        }
+                    }
+                }
+            }
+
             let plan = Plan::measure(&set).expect("measures");
+            let charged: usize = set
+                .files()
+                .iter()
+                .map(|file| runs_of(file, set.block_size()))
+                .sum();
             assert_eq!(
-                runs_of(file, set.block_size()),
-                plan.runs,
-                "the allocation and the charge disagree for {blocks} blocks and a {tail}-byte tail"
+                charged, plan.runs,
+                "{name}: the allocation and the charge disagree about the run count"
             );
 
             let options = ExecutionOptions {
@@ -1224,13 +1186,34 @@ mod tests {
                 ..ExecutionOptions::default()
             };
             let layout = BlockLayout::new(&set, &options).expect("resolves");
-            let runs = &layout.files()[0].extents.runs;
+            let mut held = 0usize;
+            for file in layout.files() {
+                let runs = &file.extents.runs;
+                assert_eq!(
+                    runs.capacity(),
+                    runs.len(),
+                    "{name}: a run vector was not allocated at the size it holds"
+                );
+                held += runs.len();
+            }
             assert_eq!(
-                runs.capacity(),
-                runs.len(),
-                "the run vector was not allocated at the size it holds"
+                held, plan.runs,
+                "{name}: the charge did not predict the runs the layout holds"
             );
-            assert_eq!(runs.len(), plan.runs, "the charge did not predict the runs");
         }
+
+        assert!(
+            whole > 0,
+            "no chunk in either archive was a whole number of blocks with no tail, \
+             which is the shape this regression is about"
+        );
+        assert!(
+            whole_and_tail > 0,
+            "no chunk in either archive had whole blocks and a tail"
+        );
+        assert!(
+            tail_only > 0,
+            "no chunk in either archive was a tail with no whole block"
+        );
     }
 }

@@ -1529,48 +1529,85 @@ mod tests {
         assert!(set.block_checksum(2).is_none());
     }
 
-    /// PR #73 round 2, finding 2. The checksum builder is now allocated for
-    /// every described block before the first push, and this is the count it is
-    /// given: exact across several External Data packets, and blind to a packet
-    /// of another type that happens to sit between them.
+    /// PR #73 round 2, finding 2. The checksum builder is allocated for every
+    /// described block before the first push, and this is the count it is
+    /// given: exact across every External Data packet, and blind to the
+    /// packets of other types around them.
+    ///
+    /// Round 3, finding 4: the packets are the reference's own now, not
+    /// assembled here. The embedded GF(2^8) oracle archive — written by
+    /// `par3cmdline` at the pinned commit, provenance in `tests/common/mod.rs`
+    /// — describes its four input blocks in two External Data packets, two
+    /// blocks each, surrounded by File, Root, Start, Creator, Comment and
+    /// recovery packets, and repeats the lot across the index and both
+    /// volumes.
+    /// The GF(2^16) archive is the other end of the range: one packet of 300.
     #[test]
     fn the_described_checksum_count_is_exact_across_every_external_data_packet() {
-        let widths = [7usize, 31, 96];
-        let mut packets = vec![
-            packet(PacketBody::Start(start_packet())),
-            packet(PacketBody::Root(RootPacket {
-                lowest_unused_block_index: widths.iter().sum::<usize>() as u64,
-                attributes: 0,
-                option_hashes: Vec::new(),
-                children: Vec::new(),
-            })),
-            packet(PacketBody::Comment(CommentPacket::new("not a checksum"))),
-        ];
-        let mut first = 0u64;
-        for width in widths {
-            packets.push(packet(PacketBody::ExternalData(ExternalDataPacket {
-                first_block_index: first,
-                checksums: (0..width as u64)
-                    .map(|step| BlockChecksum {
-                        rolling_hash: first + step,
-                        fingerprint: [(first + step) as u8; 16],
-                    })
-                    .collect(),
-            })));
-            first += width as u64;
+        for (name, packets, id, widths) in [
+            (
+                "GF(2^8)",
+                crate::test_reference::gf8_packets(),
+                crate::test_reference::SET_ID,
+                &[2usize, 2][..],
+            ),
+            (
+                "GF(2^16)",
+                crate::test_reference::gf16_packets(),
+                crate::test_reference::SET16_ID,
+                &[300][..],
+            ),
+        ] {
+            // `build` counts over the deduplicated packets, because the index
+            // and every volume carry a copy of the whole description.
+            let mut seen: HashSet<(u64, Fingerprint)> = HashSet::new();
+            let unique: Vec<Packet> = packets
+                .into_iter()
+                .filter(|packet| seen.insert((packet.len(), packet.hash())))
+                .collect();
+
+            let mut positions: Vec<usize> = Vec::new();
+            let described: Vec<usize> = unique
+                .iter()
+                .enumerate()
+                .filter_map(|(at, packet)| match packet.body() {
+                    PacketBody::ExternalData(this) => {
+                        positions.push(at);
+                        Some(this.checksums.len())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                described, widths,
+                "{name}: the reference's External Data packets are not the shape this test reads"
+            );
+            assert!(
+                unique.len() > described.len(),
+                "{name}: the archive holds nothing but External Data packets, so this \
+                 cannot show the count ignores the other types"
+            );
+            let first = positions[0];
+            let last = positions[positions.len() - 1];
+            assert!(
+                first > 0 && last + 1 < unique.len(),
+                "{name}: the External Data packets are not surrounded by packets of other \
+                 types, so this cannot show the pre-pass walks past them"
+            );
+
+            let total: usize = widths.iter().sum();
+            assert_eq!(
+                described_checksums(&unique),
+                total,
+                "{name}: the pre-pass did not count every described block"
+            );
+            let set = Par3Set::from_packets_for(unique, id).expect("builds");
+            assert_eq!(
+                set.block_checksums().len(),
+                total,
+                "{name}: the set did not keep one checksum per described block"
+            );
         }
-        let total: usize = widths.iter().sum();
-        assert_eq!(
-            described_checksums(&packets),
-            total,
-            "the pre-pass did not count every described block"
-        );
-        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
-        assert_eq!(
-            set.block_checksums().len(),
-            total,
-            "the set did not keep one checksum per described block"
-        );
     }
 
     #[test]

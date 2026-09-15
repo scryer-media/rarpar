@@ -432,44 +432,66 @@ where
     //
     // The pool is admitted before the tile is chosen, against the headroom a
     // serial repair needs: `n` syndrome rows, one output row and three stripes
-    // of overhead. `for_work` narrows the worker count under pressure and
-    // returns `None` when fewer than two fit, so the requested `workers` is not
-    // what the repair gets. Tiling by the request would size the output bank
-    // for rows no worker exists to fill, reserving `workers` stripes for a
-    // repair that runs on one thread.
-    let serial_buffers = n
+    // of overhead, plus the row headers of the `n + 1` vectors that bank holds.
+    // The headers are part of what the stripe admission charges, so leaving
+    // them out of the headroom let a pool be admitted into the bytes the
+    // headers need and then refused a repair that would have run serially.
+    // `for_work` narrows the worker count under pressure and returns `None`
+    // when fewer than two fit, so the requested `workers` is not what the
+    // repair gets. Tiling by the request would size the output bank for rows no
+    // worker exists to fill, reserving `workers` stripes for a repair that runs
+    // on one thread.
+    let serial_rows = n
+        .checked_add(1)
+        .ok_or(EngineError::resource_limit("repair stripes"))?;
+    let serial_headroom = n
         .checked_add(4)
-        .ok_or(EngineError::resource_limit("repair stripes"))?;
-    let pool = crate::runtime::WorkerPool::for_work(
-        &session.options,
-        n,
-        serial_buffers
-            .checked_mul(F::SYMBOL_BYTES)
-            .ok_or(EngineError::resource_limit("minimum repair stripe"))?,
-    )?;
-    let tile = pool
-        .as_ref()
-        .map_or(1, crate::runtime::WorkerPool::current_num_threads)
-        .min(n);
-    let buffer_count = n
-        .checked_add(tile)
-        .and_then(|count| count.checked_add(3))
-        .ok_or(EngineError::resource_limit("repair stripes"))?;
-    let bank_headers = n
-        .checked_add(tile)
-        .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
-        .ok_or(EngineError::resource_limit("repair stripes"))?;
+        .and_then(|buffers| buffers.checked_mul(F::SYMBOL_BYTES))
+        .and_then(|bytes| bytes.checked_add(serial_rows.checked_mul(size_of::<Vec<u8>>())?))
+        .ok_or(EngineError::resource_limit("minimum repair stripe"))?;
+    let mut pool = crate::runtime::WorkerPool::for_work(&session.options, n, serial_headroom)?;
     let target = session
         .options
         .stripe_bytes
         .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX));
-    let (stripe, _buffers) = session.options.memory.reserve_stripes_with_overhead(
-        MemoryCategory::CodecScratch,
-        target,
-        buffer_count,
-        F::SYMBOL_BYTES,
-        bank_headers,
-    )?;
+    // Admit the stripe bank at the tile the pool can actually use; if even that
+    // is refused, the pool's own stacks are the likeliest thing standing in the
+    // way, so give them back and try once more at the serial width. A repair
+    // that fits on one thread must not be refused because a pool was admitted
+    // in front of it.
+    let admit = |tile: usize| -> EngineResult<(usize, usize, crate::runtime::Reservation)> {
+        let buffer_count = n
+            .checked_add(tile)
+            .and_then(|count| count.checked_add(3))
+            .ok_or(EngineError::resource_limit("repair stripes"))?;
+        let bank_headers = n
+            .checked_add(tile)
+            .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
+            .ok_or(EngineError::resource_limit("repair stripes"))?;
+        let (stripe, buffers) = session.options.memory.reserve_stripes_with_overhead(
+            MemoryCategory::CodecScratch,
+            target,
+            buffer_count,
+            F::SYMBOL_BYTES,
+            bank_headers,
+        )?;
+        Ok((stripe, buffer_count, buffers))
+    };
+    let mut tile = pool
+        .as_ref()
+        .map_or(1, crate::runtime::WorkerPool::current_num_threads)
+        .min(n);
+    let admitted = match admit(tile) {
+        Ok(admitted) => admitted,
+        Err(EngineError::ResourceLimit(_)) if pool.is_some() => {
+            pool = None;
+            tile = 1;
+            session.options.diagnostics.note_workers(1, n);
+            admit(tile)?
+        }
+        Err(error) => return Err(error),
+    };
+    let (stripe, buffer_count, _buffers) = admitted;
     session
         .options
         .diagnostics

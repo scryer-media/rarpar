@@ -145,6 +145,55 @@ fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() 
 use par3_rs::runtime::{LimitCause, MemoryBudget, MemoryCategory};
 use par3_rs::session::{Par3RepairSession, RepairStatus};
 
+/// [`repair_cauchy`] that reports a refusal instead of unwrapping it.
+#[allow(clippy::too_many_arguments)]
+fn try_repair_cauchy(
+    blocks: usize,
+    block_size: u64,
+    recovery: u64,
+    damage: &[usize],
+    workers: usize,
+    stripe_bytes: usize,
+    budget: usize,
+    seed: &[u8],
+) -> Result<ExecutionOptions, par3_rs::runtime::EngineError> {
+    let tree = common::TempTree::new("serial-retry-cauchy");
+    let set = common::cauchy_block_set(blocks, block_size, recovery, seed, &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in damage {
+        damaged[block * block_size as usize + 11] ^= 0x80;
+    }
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 2, damaged.into());
+
+    let mut options = ExecutionOptions::default();
+    options.workers = workers;
+    options.stripe_bytes = stripe_bytes;
+    options.memory = MemoryBudget::new(budget);
+    options.retained_bytes = budget / 2;
+
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone())?;
+    session.bind_file(&name, SourceId(1))?;
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet)?;
+        }
+    }
+    assert_eq!(session.assess()?.status, RepairStatus::Ready);
+    let output = common::TempTree::new("serial-retry-cauchy-out");
+    let report = session.repair(output.path(), false)?;
+    assert_eq!(report.reconstructed_blocks, damage.len() as u64);
+    assert_eq!(
+        std::fs::read(output.path().join(&name)).unwrap(),
+        bytes,
+        "the repair did not reproduce the input"
+    );
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+    Ok(options)
+}
+
 /// Repair one Cauchy set at a chosen worker count and budget, returning the
 /// repaired bytes and the options the run used, so a caller can read both the
 /// output and every counter the run produced.
@@ -497,6 +546,51 @@ fn a_repair_squeezed_onto_one_thread_banks_one_output_row() {
     assert_eq!(
         wide.stripe_buffers,
         damage.len() as u64 + wide.output_tile + 3
+    );
+}
+
+/// PR #73 round 3, finding 3. The worker pool was admitted against a headroom
+/// that counted the serial bank's stripes but not its row headers, so there was
+/// a band of budgets in which the pool took the bytes the headers needed and the
+/// stripe admission then refused a repair that would have run serially. More
+/// memory refusing what less memory accepted is never acceptable.
+///
+/// The band is only a few hundred bytes wide — the headers are `(n + tile)`
+/// pointers — so this sweeps the budgets around the point where the pool starts
+/// being admitted and asserts the outcome is monotone. The two liveness
+/// assertions at the end keep it honest: the window has to straddle the
+/// admission threshold, or it proves nothing.
+#[test]
+fn a_larger_budget_never_refuses_a_repair_a_smaller_one_completed() {
+    if std::thread::available_parallelism().is_ok_and(|threads| threads.get() < 2) {
+        eprintln!("a single-core host never admits a pool here, skipping");
+        return;
+    }
+    let damage = [1usize, 3, 5, 7];
+    let seed = b"PAR3 serial retry";
+    let mut first_ok = None;
+    let mut widths = Vec::new();
+    for budget in ((732 << 10)..=(742 << 10)).step_by(128) {
+        match try_repair_cauchy(64, 1024, 8, &damage, 8, 4096, budget, seed) {
+            Ok(options) => {
+                let admission = options.diagnostics.admission();
+                widths.push(admission.workers);
+                if first_ok.is_none() {
+                    first_ok = Some(budget);
+                }
+            }
+            Err(error) => {
+                panic!("a repair that fits at {first_ok:?} bytes was refused at {budget}: {error}")
+            }
+        }
+    }
+    assert!(
+        widths.contains(&1),
+        "no budget in the window ran serially, so it does not straddle the pool threshold"
+    );
+    assert!(
+        widths.iter().any(|workers| *workers > 1),
+        "no budget in the window admitted a pool, so it does not straddle the threshold"
     );
 }
 
