@@ -4,8 +4,9 @@
 //! itself. Those bytes are attacker-controlled: a hostile set can name
 //! `../../etc/passwd`, `C:\Windows\System32\drivers\etc\hosts`, a Windows
 //! device (`CON`, `LPT1.txt`), a component ending in a space or a dot that
-//! Windows silently trims to an existing name, or a component carrying a NUL
-//! that truncates the path inside a C API. The engine is the last line of
+//! Windows silently trims to an existing name, a component carrying one of the
+//! characters Win32 forbids outright (`? * " < > |`), or a component carrying a
+//! NUL that truncates the path inside a C API. The engine is the last line of
 //! defence for such a set and must not rely on the host to notice.
 //!
 //! The same table runs at both ends, so par3-rs never writes a set it would
@@ -80,6 +81,17 @@ const RESERVED_DEVICES: [&str; 30] = [
     "LPT\u{b3}",
 ];
 
+/// Characters Win32 forbids in a file name, beyond the separators and the
+/// colon the table already names.
+///
+/// `?` and `*` are wildcards the shell and the API both expand, `<`, `>` and
+/// `|` are redirection operators, and `"` quotes an argument. A name carrying
+/// one of them cannot be created on Windows at all, and on a POSIX host it is
+/// a name no PAR3 set should be writing into an output directory, so the
+/// engine refuses it at both ends rather than producing a set only some
+/// platforms can repair.
+const FORBIDDEN_CHARACTERS: [char; 6] = ['?', '*', '"', '<', '>', '|'];
+
 /// The rule a relative path broke.
 ///
 /// The variants are ordered by the order the rules are applied, so the most
@@ -105,6 +117,9 @@ pub enum PathRule {
     Backslash,
     /// A component contains a colon, which opens an NTFS alternate data stream.
     Colon,
+    /// A component contains a character Win32 forbids in a file name:
+    /// `?`, `*`, `"`, `<`, `>` or `|`.
+    ForbiddenCharacter,
     /// A component contains NUL or another ASCII control byte, including DEL.
     Control,
     /// A component names a Windows character device, with or without an
@@ -126,6 +141,7 @@ impl PathRule {
             Self::ComponentTooLong => "is longer than 255 bytes",
             Self::Backslash => "contains a backslash",
             Self::Colon => "contains a colon",
+            Self::ForbiddenCharacter => "contains a character Windows forbids in a name",
             Self::Control => "contains an ASCII control byte",
             Self::ReservedDevice => "names a reserved device",
             Self::TrailingSpaceOrDot => "ends in a space or a dot",
@@ -236,6 +252,8 @@ fn check_component(path: &str, component: &str) -> Result<(), PathViolation> {
         PathRule::Backslash
     } else if component.contains(':') {
         PathRule::Colon
+    } else if component.contains(FORBIDDEN_CHARACTERS) {
+        PathRule::ForbiddenCharacter
     } else if component.bytes().any(|byte| byte.is_ascii_control()) {
         // `is_ascii_control` is 0x00-0x1F and 0x7F, so NUL and DEL are both in.
         PathRule::Control
@@ -305,6 +323,45 @@ mod tests {
             .rule
     }
 
+    /// PR #73 round 2, finding 3. Win32 forbids six more characters in a file
+    /// name than the separators and the colon the table already knew, so a set
+    /// naming one of them could be created here and never written on Windows.
+    /// The rule sits after `Colon`, so a drive prefix and a stream name still
+    /// report the more specific verdict.
+    #[test]
+    fn the_characters_win32_forbids_in_a_name_are_refused() {
+        for path in [
+            "what?.bin",
+            "star*.bin",
+            "quote\".bin",
+            "less<.bin",
+            "more>.bin",
+            "pipe|.bin",
+            "deep/dir/glob*.bin",
+            "*",
+        ] {
+            let violation = validate_relative_path(path).expect_err("should be refused");
+            assert_eq!(
+                violation.rule,
+                PathRule::ForbiddenCharacter,
+                "{path:?} broke the wrong rule"
+            );
+        }
+        // The more specific rules still win where they both apply.
+        assert_eq!(
+            validate_relative_path("a:b*").expect_err("refused").rule,
+            PathRule::Absolute
+        );
+        assert_eq!(
+            validate_relative_path("ab:c*").expect_err("refused").rule,
+            PathRule::Colon
+        );
+        assert_eq!(
+            validate_relative_path("a\\b*").expect_err("refused").rule,
+            PathRule::Backslash
+        );
+    }
+
     #[test]
     fn ordinary_relative_names_are_still_accepted() {
         for path in [
@@ -313,6 +370,8 @@ mod tests {
             "Season 1/S01E01 - pilot.mkv",
             "spaces are fine/and.dots.inside",
             "unicode/ünïcödé — dash.txt",
+            "Rock 'n' Roll/AC&DC — don't.flac",
+            "100% of it (a & b).bin",
             "connect.log",
             "console/comic.cbz",
             "lpt10.txt",

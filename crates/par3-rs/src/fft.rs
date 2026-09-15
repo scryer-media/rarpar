@@ -384,12 +384,14 @@ impl FftCodec {
     ) -> EngineResult<()> {
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let cancelled = || self.options.cancel.check().is_err();
-        self.options.diagnostics.note_transform(
-            1,
-            butterflies(rows.len()),
-            rows.first().map_or(0, Vec::len),
-            skipped,
-        );
+        // Measured before the call, which consumes the borrow, but reported
+        // only once the backend has actually done the work. A cancelled or
+        // failed transform performed no butterflies, and counting it as though
+        // it had would inflate the codec totals exactly where a host looks to
+        // find out why an operation cost what it did. The pruned path below
+        // has always reported afterwards; these two now agree.
+        let performed = butterflies(rows.len());
+        let symbols = rows.first().map_or(0, Vec::len);
         if let Some(workers) = &self.workers {
             field.transform_in_pool(
                 rows,
@@ -408,7 +410,11 @@ impl FftCodec {
                 &cancelled,
             )
         }
-        .map_err(transform_error)
+        .map_err(transform_error)?;
+        self.options
+            .diagnostics
+            .note_transform(1, performed, symbols, skipped);
+        Ok(())
     }
 
     /// The final forward transform of a decode, pruned to `plan`.
@@ -1114,6 +1120,42 @@ mod plan_tests {
         for (category, entry) in options.memory.ledger().iter() {
             assert_eq!(entry.current, 0, "{} leaked", category.name());
         }
+    }
+
+    /// PR #73 round 2, finding 5. `transform_counted` announced the calls,
+    /// butterflies, symbols and skipped work before handing the rows to the
+    /// backend, so a transform that was cancelled — or that failed — was
+    /// reported as performed. The pruned path has always counted afterwards;
+    /// a cancelled full transform now charges the codec counters nothing too.
+    #[test]
+    fn a_transform_that_never_ran_is_not_counted_as_work_performed() {
+        let geometry = FftGeometry::new(900, 7).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(64 << 20),
+            ..ExecutionOptions::default()
+        };
+        let codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let mut workspace = rows(geometry.domain, 64, geometry.bits, 0x9e37);
+
+        // One transform that does run, so the test is measuring a difference
+        // and not an engine that never counts anything.
+        codec.transform(&mut workspace, 0, false).expect("runs");
+        let ran = options.diagnostics.codec();
+        assert!(ran.transform_calls > 0 && ran.butterflies > 0, "{ran:?}");
+
+        options.cancel.cancel();
+        assert!(
+            matches!(
+                codec.transform(&mut workspace, 0, false),
+                Err(EngineError::Cancelled)
+            ),
+            "a cancelled transform did not report it"
+        );
+        assert_eq!(
+            options.diagnostics.codec(),
+            ran,
+            "the cancelled transform was counted as work performed"
+        );
     }
 
     /// The oracle for the pruned transform is the full one: every row a plan

@@ -51,6 +51,37 @@
 - `Par3RepairSession::layout` documents that the returned layout must not
   outlive the session: it shares the set's block checksums, which are charged to
   the session's resolved-set reservation and not to the layout's.
+- A layout allocates a file's extent runs at exactly the count its charge paid
+  for. The allocation assumed two runs for every protected chunk while the
+  charge counted one for a chunk that is a whole number of blocks, so a set of
+  full-block files held capacity the budget never saw and then bought an exact
+  copy of it back.
+- The block-checksum builder is allocated for every described block before the
+  first one is pushed, instead of doubling into as much as twice the slots the
+  set's resolution charge covers while the values and runs are laid out beside
+  it.
+- **Breaking:** `PathRule` gained `ForbiddenCharacter`. The six characters Win32
+  forbids in a name — `?`, `*`, `"`, `<`, `>`, `|` — are refused at both ends
+  like the separators and the colon already were, so par3-rs no longer creates a
+  set naming a file Windows could never write. The enum is `#[non_exhaustive]`,
+  and the more specific rules still win: `a:b` is `Absolute` and `ab:c` is
+  `Colon`.
+- Opening a stage against a second, different `MemoryBudget` with the same
+  `ExecutionDiagnostics` is refused with
+  `EngineError::InvalidState("diagnostics already bound to another memory
+  budget")` rather than silently ignored. One handle aggregates work counters
+  across everything sharing it but reports the ledger of one budget, so the two
+  must be the same budget; clones of one budget are fine.
+- Additive-transform work is counted after the backend has performed it, not
+  before, so a cancelled or failed transform no longer inflates the codec
+  counters with butterflies it never executed. The pruned path already counted
+  afterwards; the two now agree.
+- `ResourceLimit::cause` classifies a refusal as `Unmeasured` only when it
+  carries neither a need nor a ceiling, which is what the structural constructor
+  produces. A positive need against a ceiling of zero — the refusal a
+  `MemoryBudget::new(0)` raises for everything — is `ExceedsLimit` with its
+  figures intact, and `Display` still prints them.
+- `MemoryBudget::is_same` reports whether two handles are clones of one budget.
 
 - Store a contiguous protected chunk mapping as a run (file, first block, block
   count, byte offset) instead of one materialised extent per block, and expand a

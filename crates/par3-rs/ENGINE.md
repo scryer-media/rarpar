@@ -140,7 +140,13 @@ budget, or this session's own earlier reservations — layout, evidence and
 assessment state are all still held when codec scratch is requested — so the
 host decides using its own knowledge of what it has in flight. `Unmeasured`
 marks the structural refusals that have no byte count, such as an exhausted
-packet-count or scanning-work ceiling; treat it as terminal.
+packet-count or scanning-work ceiling; treat it as terminal. `Unmeasured` is
+decided by the absence of both figures, `need == 0 && limit == 0`, which is what
+the structural constructor produces and what no measured refusal can carry: a
+zero-byte charge is admitted even by a budget of zero, so every refusal a budget
+raises has a positive need. A positive need against a ceiling of zero — a
+`MemoryBudget::new(0)`, which admits nothing — is therefore `ExceedsLimit` with
+its figures intact, not `Unmeasured`.
 
 Two rules keep the classification honest, and both matter to a host that
 requeues on contention. Refusals are measured against the ceiling this session
@@ -516,12 +522,17 @@ The whole path is refused when it is empty, exceeds `paths::MAX_PATH_BYTES`
 because `c:file` is drive-relative, not a stream name. A `/`-separated
 component is refused when it is empty, `.`, `..`, exceeds
 `paths::MAX_COMPONENT_BYTES` (255, the per-entry ceiling of ext4, APFS and
-NTFS), contains `\`, `:` or an ASCII control byte (NUL and DEL included),
-names a Windows character device with or without an extension (`CON`, `PRN`,
-`AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, matched case-insensitively against
-the stem before the first dot, trailing spaces trimmed, so `con.txt` and
-`CON   .txt` are both refused), or ends in a space or a dot, which Windows
-silently trims onto an existing name. Bytes, not characters, throughout.
+NTFS), contains `\`, `:`, one of the six characters Win32 forbids outright
+(`?`, `*`, `"`, `<`, `>`, `|`, reported as `ForbiddenCharacter`) or an ASCII
+control byte (NUL and DEL included), names a Windows character device with or
+without an extension (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`
+and the superscript ports `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, matched
+case-insensitively against the stem before the first dot, trailing spaces
+trimmed, so `con.txt` and `CON   .txt` are both refused), or ends in a space or
+a dot, which Windows silently trims onto an existing name. Bytes, not
+characters, throughout. The rules are applied in that order and the first one
+broken is the one reported, so `a:b` is `Absolute` and `ab:c` is `Colon`
+rather than either being folded into the forbidden-character rule.
 
 Packet parsing is deliberately narrower and unchanged: `check_name` asks only
 whether a name field is a usable single component, because one unwritable name

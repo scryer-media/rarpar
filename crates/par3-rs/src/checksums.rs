@@ -106,6 +106,24 @@ pub(crate) struct BlockChecksumsBuilder {
 }
 
 impl BlockChecksumsBuilder {
+    /// Start with room for `pairs` records already allocated.
+    ///
+    /// The pair vector is what the set's resolution charge covers, one
+    /// slot per described checksum. Growing it by doubling would hold up to
+    /// twice that while `build` allocates the values and the runs beside it, so
+    /// the caller counts the checksums it is about to push and says so here.
+    pub(crate) fn with_capacity(pairs: usize) -> Self {
+        Self {
+            pairs: Vec::with_capacity(pairs),
+        }
+    }
+
+    /// How many records are allocated for. Test-facing.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.pairs.capacity()
+    }
+
     /// Record one block's checksum; the first record for a block wins.
     pub(crate) fn push(&mut self, index: u64, checksum: BlockChecksum) {
         self.pairs.push((index, checksum));
@@ -153,6 +171,33 @@ impl BlockChecksumsBuilder {
 mod tests {
     use super::*;
     use crate::Fingerprint;
+
+    /// PR #73 round 2, finding 2. The builder started empty and grew by
+    /// doubling, so the pair vector could hold twice the slots the set's
+    /// resolution charge paid for, and held them while `build` allocated the
+    /// values and the runs beside it. It is now told the count up front.
+    #[test]
+    fn the_pair_vector_never_grows_past_the_count_it_was_given() {
+        let total = 300usize;
+        let mut builder = BlockChecksumsBuilder::with_capacity(total);
+        assert_eq!(builder.capacity(), total, "the count was not allocated");
+        for index in 0..total as u64 {
+            builder.push(
+                index,
+                BlockChecksum {
+                    rolling_hash: index,
+                    fingerprint: [0u8; 16],
+                },
+            );
+            assert_eq!(
+                builder.capacity(),
+                total,
+                "the vector doubled past the charge at {index}"
+            );
+        }
+        let checksums = builder.build();
+        assert_eq!(checksums.len(), total);
+    }
 
     /// PR #73 finding 13. `shrink_to_fit` on a vector that grew by doubling
     /// allocates the exact copy while the oversized buffer is still live, so a

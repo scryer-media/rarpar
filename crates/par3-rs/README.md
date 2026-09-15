@@ -200,8 +200,9 @@ session were alone on the budget with the same options, so no amount of waiting
 helps. `PeerContention` means that with the same options this exact request is
 admitted once other reservations release — those may belong to a peer session
 or to this session's own earlier reservations, and only the host knows which.
-`Unmeasured` covers refusals that were never expressed in bytes and is terminal
-like `ExceedsLimit`. A host queues `PeerContention` and reports the other two as
+`Unmeasured` covers refusals that were never expressed in bytes at all — no
+need and no ceiling — and is terminal like `ExceedsLimit`; a refusal measured
+against a ceiling of zero keeps its figures and classifies as `ExceedsLimit`. A host queues `PeerContention` and reports the other two as
 terminal. Refusals against a per-session ceiling — `retained_bytes` and the
 limits derived from it — report the session's total demand rather than the
 increment that tripped them, so they classify as terminal, which is what they
@@ -359,9 +360,11 @@ reference. The deviations affecting interpretation are:
   device names, trailing spaces or dots, control bytes or a path length bound,
   and the reference rewrites an unusable name in place and warns. This crate
   refuses instead, at both ends. A name is refused if any `/`-separated
-  component is empty, `.`, `..`, longer than 255 bytes, contains `\\`, `:` or
-  an ASCII control byte, names a Windows character device (`CON`, `PRN`,
-  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, with or
+  component is empty, `.`, `..`, longer than 255 bytes, contains `\\`, `:`, one
+  of the six characters Win32 forbids outright (`?`, `*`, `"`, `<`, `>`, `|`)
+  or an ASCII control byte, names a Windows character device (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the superscript ports
+  `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, case-insensitive, with or
   without an extension) or ends in a space or a dot; if the whole path exceeds
   4096 bytes; or if it is absolute, by a leading separator or a `X:` drive
   prefix. Creation refuses such a name before producing the set, and repair

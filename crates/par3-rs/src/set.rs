@@ -303,6 +303,22 @@ pub(crate) const RESOLUTION_BASE_BYTES: usize = 64 * 1024;
 /// transient overlap while a reallocation copies old slots into new ones.
 const ENTRY_SLOT_FACTOR: usize = 3;
 
+/// How many block checksums the External Data packets of `packets` describe.
+///
+/// External Data does not need the Start packet to read, so every packet that
+/// parsed at all carries its checksum count on its face and this pass is exact.
+/// One that failed to parse stays opaque, pushes nothing, and is counted as
+/// unknown instead.
+fn described_checksums(packets: &[Packet]) -> usize {
+    packets
+        .iter()
+        .filter_map(|packet| match packet.body() {
+            PacketBody::ExternalData(this) => Some(this.checksums.len()),
+            _ => None,
+        })
+        .sum()
+}
+
 /// Bytes resolving one packet needs on top of the packet itself.
 ///
 /// `build` clones each body it keeps and indexes it by header hash, and it
@@ -560,7 +576,14 @@ impl Par3Set {
         let mut root: Option<(Fingerprint, RootPacket)> = None;
         let mut file_packets: HashMap<Fingerprint, FilePacket> = HashMap::new();
         let mut directory_packets: HashMap<Fingerprint, DirectoryPacket> = HashMap::new();
-        let mut block_checksums = BlockChecksumsBuilder::default();
+        // Every External Data packet that parsed carries its checksum count on
+        // its face, and the type does not need the Start packet to read, so one
+        // cheap pass over the deduplicated packets gives the exact number of
+        // pairs about to be pushed. That is the figure `resolution_cost`
+        // charges, so the builder allocates it once instead of doubling into
+        // twice the charge while `build` lays out the values beside it.
+        let mut block_checksums =
+            BlockChecksumsBuilder::with_capacity(described_checksums(&unique));
         let mut matrix_packets = Vec::new();
         let mut recovery_packets = Vec::new();
         let mut recovery_external_data = Vec::new();
@@ -1504,6 +1527,50 @@ mod tests {
         assert_eq!(set.block_checksum(3).expect("present").rolling_hash, 30);
         assert_eq!(set.block_checksum(4).expect("present").rolling_hash, 40);
         assert!(set.block_checksum(2).is_none());
+    }
+
+    /// PR #73 round 2, finding 2. The checksum builder is now allocated for
+    /// every described block before the first push, and this is the count it is
+    /// given: exact across several External Data packets, and blind to a packet
+    /// of another type that happens to sit between them.
+    #[test]
+    fn the_described_checksum_count_is_exact_across_every_external_data_packet() {
+        let widths = [7usize, 31, 96];
+        let mut packets = vec![
+            packet(PacketBody::Start(start_packet())),
+            packet(PacketBody::Root(RootPacket {
+                lowest_unused_block_index: widths.iter().sum::<usize>() as u64,
+                attributes: 0,
+                option_hashes: Vec::new(),
+                children: Vec::new(),
+            })),
+            packet(PacketBody::Comment(CommentPacket::new("not a checksum"))),
+        ];
+        let mut first = 0u64;
+        for width in widths {
+            packets.push(packet(PacketBody::ExternalData(ExternalDataPacket {
+                first_block_index: first,
+                checksums: (0..width as u64)
+                    .map(|step| BlockChecksum {
+                        rolling_hash: first + step,
+                        fingerprint: [(first + step) as u8; 16],
+                    })
+                    .collect(),
+            })));
+            first += width as u64;
+        }
+        let total: usize = widths.iter().sum();
+        assert_eq!(
+            described_checksums(&packets),
+            total,
+            "the pre-pass did not count every described block"
+        );
+        let set = Par3Set::from_packets_for(packets, ID).expect("builds");
+        assert_eq!(
+            set.block_checksums().len(),
+            total,
+            "the set did not keep one checksum per described block"
+        );
     }
 
     #[test]

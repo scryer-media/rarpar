@@ -331,9 +331,36 @@ struct State {
 }
 
 /// Shared counters with fixed storage; no unbounded internal event log.
+///
+/// # One budget per diagnostics
+///
+/// A diagnostics handle may be shared by any number of operations, and their
+/// work counters aggregate. [`Self::memory`], though, is the ledger of one
+/// [`MemoryBudget`]: the handle binds to the budget of the first stage opened
+/// against it and reports that one for its whole life. Sharing a handle across
+/// two different budgets would therefore aggregate the work of both while
+/// reporting the ledger of one, so the engine refuses it — the second stage
+/// fails with `EngineError::InvalidState("diagnostics already bound to another
+/// memory budget")`. Clones of one budget are one budget and are fine; a
+/// second `MemoryBudget::new` is not. Give each budget its own diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionDiagnostics(Arc<State>);
 impl ExecutionDiagnostics {
+    /// Bind these diagnostics to `budget`, or refuse a second, different one.
+    ///
+    /// Binds on the first call; afterwards it only checks. `get_or_init` makes
+    /// the decision once even if two threads open their first stage at the
+    /// same moment, so the loser of that race is checked against the winner
+    /// rather than silently ignored.
+    pub(crate) fn bind_budget(&self, budget: &MemoryBudget) -> EngineResult<()> {
+        if self.0.budget.get_or_init(|| budget.clone()).is_same(budget) {
+            Ok(())
+        } else {
+            Err(EngineError::InvalidState(
+                "diagnostics already bound to another memory budget",
+            ))
+        }
+    }
     /// Reads requested through SourceAccess, including virtual and disk sources.
     pub fn source_io(&self) -> IoSnapshot {
         self.0.source.snapshot()
@@ -377,6 +404,10 @@ impl ExecutionDiagnostics {
     }
     /// Reserved bytes by category, from the budget these diagnostics were first
     /// used with. `None` before any stage has run against a budget.
+    ///
+    /// One handle reports one budget for its whole life; opening a stage
+    /// against a second, different budget is refused. See the type's own
+    /// documentation.
     ///
     /// This is the ledger itself, not a copy kept in step with it: retained and
     /// scratch are told apart by category and by `current` against `peak`.
@@ -656,7 +687,9 @@ impl ExecutionOptions {
         self.validate()?;
         // Learn the budget once, so `ExecutionDiagnostics::memory` can report
         // the ledger without the host having to carry the budget separately.
-        let _ = self.diagnostics.0.budget.set(self.memory.clone());
+        // A second, different budget is refused rather than ignored: the work
+        // counters would aggregate both while the ledger named only the first.
+        self.diagnostics.bind_budget(&self.memory)?;
         let guard = StageGuard {
             stats: self.diagnostics.clone(),
             callback: self.progress.clone(),
@@ -668,5 +701,58 @@ impl ExecutionOptions {
         guard.emit(ProgressPhase::Begin);
         self.cancel.check()?;
         Ok(guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::ExecutionOptions;
+
+    fn options(diagnostics: &ExecutionDiagnostics, memory: MemoryBudget) -> ExecutionOptions {
+        ExecutionOptions {
+            workers: 1,
+            diagnostics: diagnostics.clone(),
+            memory,
+            ..ExecutionOptions::default()
+        }
+    }
+
+    /// PR #73 round 2, finding 4. The budget was learned with a `OnceLock` set
+    /// that discarded a later, different budget without a word, so diagnostics
+    /// shared across two budgets aggregated the work of both and reported the
+    /// ledger of one. The second binding is now refused.
+    #[test]
+    fn diagnostics_shared_across_two_budgets_are_refused_not_silently_merged() {
+        let diagnostics = ExecutionDiagnostics::default();
+        let first = MemoryBudget::new(1 << 20);
+        let second = MemoryBudget::new(1 << 20);
+
+        let one = options(&diagnostics, first.clone());
+        one.stage(Stage::Verify).expect("binds the first budget");
+
+        // The same budget, cloned into another options value, is the same
+        // ledger and is fine.
+        let same = options(&diagnostics, first.clone());
+        same.stage(Stage::Assess)
+            .expect("a clone of the bound budget is the bound budget");
+
+        // A second budget with an identical ceiling is a different ledger.
+        let other = options(&diagnostics, second);
+        match other.stage(Stage::Verify) {
+            Err(EngineError::InvalidState(message)) => assert_eq!(
+                message, "diagnostics already bound to another memory budget",
+                "refused for the wrong reason"
+            ),
+            Err(error) => panic!("refused with the wrong error: {error}"),
+            Ok(_) => panic!("a second, different budget was accepted"),
+        }
+
+        // And the ledger it reports is still the one it bound.
+        assert!(
+            diagnostics.memory().is_some(),
+            "the first budget was never bound"
+        );
+        assert_eq!(first.limit(), 1 << 20);
     }
 }

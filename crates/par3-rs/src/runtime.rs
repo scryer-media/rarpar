@@ -114,7 +114,10 @@ pub enum LimitCause {
     /// still held when codec scratch is requested. The host decides which,
     /// using its own knowledge of what it has in flight.
     PeerContention,
-    /// The refusal was not measured in bytes.
+    /// The refusal was not measured in bytes: it carries neither a need nor a
+    /// ceiling, because the limit it broke is structural rather than a budget.
+    /// A measured refusal against a ceiling of zero is `ExceedsLimit`, not
+    /// this.
     Unmeasured,
 }
 
@@ -153,9 +156,16 @@ impl ResourceLimit {
     ///
     /// The distinction is the one a host needs to requeue rather than fail:
     /// `PeerContention` is worth retrying, the other two never are.
+    ///
+    /// A refusal is unmeasured only when it carries no byte figures at all,
+    /// which is exactly what [`Self::named`] produces for a structural limit
+    /// (an overflowed count, a geometry the engine cannot express). A positive
+    /// need against a ceiling of zero is a real, measured refusal — a budget
+    /// of `MemoryBudget::new(0)` admits nothing — and is reported as
+    /// `ExceedsLimit`, because no release by any peer will ever admit it.
     #[must_use]
     pub fn cause(self) -> LimitCause {
-        if self.limit == 0 {
+        if self.need == 0 && self.limit == 0 {
             LimitCause::Unmeasured
         } else if self.need > self.limit {
             LimitCause::ExceedsLimit
@@ -433,6 +443,16 @@ impl MemoryBudget {
         MemoryLedger {
             entries: std::array::from_fn(|index| self.0.ledger[index].snapshot()),
         }
+    }
+
+    /// Whether this handle and `other` are clones of the same budget.
+    ///
+    /// A budget is shared by cloning it, so two handles are the same ledger
+    /// only when they point at the same state; two `MemoryBudget::new` calls
+    /// with the same ceiling are two separate budgets.
+    #[must_use]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     /// Configured ceiling.
@@ -799,6 +819,46 @@ impl ExecutionOptions {
 #[cfg(test)]
 mod stripe_tests {
     use super::*;
+
+    /// PR #73 round 2, finding 6. `cause` filed every refusal with a zero
+    /// ceiling as `Unmeasured`, so a budget of zero — which refuses everything
+    /// with an honest need and an honest ceiling — was reported as a refusal
+    /// that carried no numbers, and a host reading it could not tell a real
+    /// exhausted budget from an overflowed count. Only a refusal with neither
+    /// figure is unmeasured now.
+    #[test]
+    fn a_zero_ceiling_refuses_with_numbers_and_says_so() {
+        let budget = MemoryBudget::new(0);
+        let Err(EngineError::ResourceLimit(limit)) =
+            budget.reserve_as(MemoryCategory::CodecTables, 4096)
+        else {
+            panic!("a zero budget admitted a reservation");
+        };
+        assert_eq!(limit.need, 4096);
+        assert_eq!(limit.limit, 0);
+        assert_eq!(limit.cause(), LimitCause::ExceedsLimit);
+        assert!(!limit.contended(), "no peer can ever release this");
+        let text = limit.to_string();
+        assert!(
+            text.contains("4096") && text.contains("ceiling 0"),
+            "Display dropped the figures: {text}"
+        );
+
+        // The structural constructor is the one that carries no figures, and
+        // it is the only shape left that reports `Unmeasured`.
+        let structural = ResourceLimit::named("layout runs");
+        assert_eq!(structural.need, 0);
+        assert_eq!(structural.limit, 0);
+        assert_eq!(structural.cause(), LimitCause::Unmeasured);
+        assert_eq!(structural.to_string(), "layout runs");
+
+        // A measured refusal can never carry need == 0: a zero-byte charge is
+        // admitted even by a zero budget, so nothing else lands in that shape.
+        assert!(
+            budget.reserve_as(MemoryCategory::CodecTables, 0).is_ok(),
+            "a zero-byte charge was refused, which would be an unmeasured shape"
+        );
+    }
 
     #[test]
     fn verification_workers_include_only_admitted_scratch() {

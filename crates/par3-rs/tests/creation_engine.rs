@@ -545,6 +545,13 @@ fn creation_refuses_a_name_repair_would_refuse_to_write() {
         ("/absolute.bin", PathRule::Absolute),
         ("trailing.", PathRule::TrailingSpaceOrDot),
         ("nul\u{0}byte.bin", PathRule::Control),
+        // PR #73 round 2, finding 3: the six characters Win32 forbids outright.
+        ("what?.bin", PathRule::ForbiddenCharacter),
+        ("star*.bin", PathRule::ForbiddenCharacter),
+        ("quote\".bin", PathRule::ForbiddenCharacter),
+        ("less<.bin", PathRule::ForbiddenCharacter),
+        ("more>.bin", PathRule::ForbiddenCharacter),
+        ("pipe|.bin", PathRule::ForbiddenCharacter),
     ] {
         let sources = vec![CreationSource {
             name: name.to_owned(),

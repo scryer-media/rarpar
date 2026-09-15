@@ -700,6 +700,9 @@ fn checkpoint_allocation_and_cancellation_release_reservations() {
     assert_eq!(evidence.whole_matches(), Some(true));
     let mut constrained = options.clone();
     constrained.memory = MemoryBudget::new(1);
+    // A diagnostics handle reports the ledger of one budget, so a second
+    // budget gets its own handle; sharing them is refused as InvalidState.
+    constrained.diagnostics = par3_rs::runtime::ExecutionDiagnostics::default();
     assert!(matches!(
         evidence.checkpoint(&constrained),
         Err(EngineError::ResourceLimit(_))

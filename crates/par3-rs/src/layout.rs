@@ -697,7 +697,7 @@ impl BlockLayout {
             options.cancel.check()?;
             identity.update(&file.packet_hash());
             let mut extents = FileExtents {
-                runs: Vec::with_capacity(runs_of(file)),
+                runs: Vec::with_capacity(runs_of(file, result.block_size)),
                 tails: Vec::new(),
                 inline: Vec::new(),
                 checksums: Arc::clone(&result.checksums),
@@ -905,14 +905,19 @@ impl Plan {
     }
 }
 
-/// The most runs one file's chunk descriptions can produce: a protected chunk
-/// contributes a block run and a tail, an unprotected chunk contributes one.
-fn runs_of(file: &crate::Par3File) -> usize {
+/// The runs one file's chunk descriptions will produce, counted by the rule
+/// [`Plan::measure`] charges them with: an unprotected chunk is one run, a
+/// protected chunk is one run for its whole blocks and one more for a tail, so
+/// a chunk that is an exact number of blocks is one run and not two. The two
+/// must agree, or the per-file vector allocates capacity the budget never saw.
+fn runs_of(file: &crate::Par3File, block_size: u64) -> usize {
     file.chunks()
         .iter()
         .map(|chunk| match chunk {
             ChunkDescription::Unprotected { .. } => 1,
-            ChunkDescription::Protected { .. } => 2,
+            ChunkDescription::Protected { length, .. } => {
+                usize::from(length / block_size != 0) + usize::from(length % block_size != 0)
+            }
         })
         .sum()
 }
@@ -1115,4 +1120,117 @@ fn push_span(
                 .map_err(|_| EngineError::resource_limit("layout spans"))?,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{ChunkTail, ExternalDataPacket, FilePacket, RootPacket, StartPacket};
+    use crate::packet::{GaloisField, Packet, PacketBody};
+    use crate::set::Par3Set;
+    use crate::{BlockChecksum, InputSetId};
+
+    const ID: InputSetId = InputSetId([9, 8, 7, 6, 5, 4, 3, 2]);
+
+    /// A one-file set whose single protected chunk is `blocks` whole blocks
+    /// plus `tail` trailing bytes. `tail == 0` is the shape the charge and the
+    /// allocation used to disagree on.
+    fn set_of(blocks: u64, block_size: u64, tail: u64) -> Par3Set {
+        let length = blocks * block_size + tail;
+        let block_count = blocks + u64::from(tail != 0);
+        let file = Packet::new(
+            ID,
+            PacketBody::File(FilePacket {
+                name: "whole.bin".to_owned(),
+                quick_rolling_hash: 0,
+                fingerprint: [0u8; 16],
+                option_hashes: Vec::new(),
+                chunks: vec![ChunkDescription::Protected {
+                    length,
+                    first_block_index: (blocks != 0).then_some(0),
+                    tail: if tail == 0 {
+                        ChunkTail::None
+                    } else {
+                        ChunkTail::Described {
+                            rolling_hash: 0,
+                            fingerprint: [0u8; 16],
+                            block_index: blocks,
+                            offset: 0,
+                        }
+                    },
+                }],
+            }),
+        );
+        let packets = vec![
+            Packet::new(
+                ID,
+                PacketBody::Start(StartPacket {
+                    parent_input_set_id: InputSetId::ZERO,
+                    parent_root_hash: [0u8; 16],
+                    block_size,
+                    galois_field: GaloisField {
+                        size: 1,
+                        generator: 0x1d,
+                    },
+                    legacy_random: None,
+                }),
+            ),
+            Packet::new(
+                ID,
+                PacketBody::Root(RootPacket {
+                    lowest_unused_block_index: block_count,
+                    attributes: 0,
+                    option_hashes: Vec::new(),
+                    children: vec![file.hash()],
+                }),
+            ),
+            Packet::new(
+                ID,
+                PacketBody::ExternalData(ExternalDataPacket {
+                    first_block_index: 0,
+                    checksums: (0..block_count)
+                        .map(|seed| BlockChecksum {
+                            rolling_hash: seed,
+                            fingerprint: [seed as u8; 16],
+                        })
+                        .collect(),
+                }),
+            ),
+            file,
+        ];
+        Par3Set::from_packets_for(packets, ID).expect("builds")
+    }
+
+    /// PR #73 round 2, finding 1. `runs_of` sized the per-file run vector at two
+    /// runs for every protected chunk while `Plan::measure` charged one for a
+    /// chunk that is an exact number of blocks, so the vector held capacity the
+    /// budget never saw and `shrink_to_fit` had to buy the exact copy back.
+    #[test]
+    fn a_file_of_whole_blocks_allocates_exactly_the_runs_its_charge_paid_for() {
+        for (blocks, tail) in [(8u64, 0u64), (8, 40), (0, 40)] {
+            let set = set_of(blocks, 64, tail);
+            let file = &set.files()[0];
+            let plan = Plan::measure(&set).expect("measures");
+            assert_eq!(
+                runs_of(file, set.block_size()),
+                plan.runs,
+                "the allocation and the charge disagree for {blocks} blocks and a {tail}-byte tail"
+            );
+
+            let options = ExecutionOptions {
+                workers: 1,
+                memory: crate::runtime::MemoryBudget::new(8 << 20),
+                retained_bytes: 8 << 20,
+                ..ExecutionOptions::default()
+            };
+            let layout = BlockLayout::new(&set, &options).expect("resolves");
+            let runs = &layout.files()[0].extents.runs;
+            assert_eq!(
+                runs.capacity(),
+                runs.len(),
+                "the run vector was not allocated at the size it holds"
+            );
+            assert_eq!(runs.len(), plan.runs, "the charge did not predict the runs");
+        }
+    }
 }
