@@ -731,13 +731,12 @@ impl CreationPlan {
         if self.options.recovery_count != 0 {
             match self.options.codec {
                 CreationCodec::Cauchy => {
+                    // What building the field really peaks at, quoted by the
+                    // field itself rather than guessed, so creation and repair
+                    // refuse the same budget for the same set.
                     let _field = self.options.execution.memory.reserve_as(
                         MemoryCategory::CodecTables,
-                        if self.requirements.field.size == 2 {
-                            512 << 10
-                        } else {
-                            4096
-                        },
+                        crate::gf::construction_cost(&self.requirements.field),
                     )?;
                     match crate::gf::for_set(&self.requirements.field)? {
                         crate::gf::AnyField::Gf8(field) => {

@@ -167,16 +167,56 @@ impl ForwardPlan {
         let domain = geometry.domain;
         let levels = domain.trailing_zeros();
         let full = butterflies(domain);
+        // What a plan can hold: the blocks it keeps, the transpose's visited
+        // bitmap, and slack for both. Charged before anything is allocated.
+        // The plan is an optimisation, so a budget that cannot hold it narrows
+        // to the unpruned transform instead of refusing the decode. That shows
+        // in the diagnostics as a decode that skipped no butterflies.
+        let bytes = lost
+            .len()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(domain.div_ceil(8)))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or(EngineError::resource_limit("FFT transform plan"))?;
+        let mut reservation = match options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, bytes)
+        {
+            Ok(reservation) => reservation,
+            Err(EngineError::ResourceLimit(_)) => {
+                return Ok(Self {
+                    block_log2: 0,
+                    blocks: Vec::new(),
+                    visited: Vec::new(),
+                    skipped: 0,
+                    _reservation: options.memory.reserve_as(MemoryCategory::CodecScratch, 0)?,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        // The domain rows the decode will read, put in order once. `decode`
+        // checks that `lost` is in range and free of duplicates but never that
+        // it is ordered, and a public caller may hand over any order it likes.
+        // Both the cost model below and `transform_forward`'s binary search
+        // need order, so the plan establishes it rather than inheriting it: an
+        // unsorted list would otherwise misprice every split and then prune
+        // blocks the decode still needs, emitting wrong bytes silently.
+        let mut rows: Vec<usize> = lost
+            .iter()
+            .map(|&index| geometry.capacity + index)
+            .collect();
+        rows.sort_unstable();
+
         // The unpruned transform is one call over the whole domain, and a split
         // has to beat it on total work, not on butterflies alone.
         let mut best = (0u32, full, Self::work(full, 1, domain, symbols));
         for block_log2 in 1..=levels {
             let mut blocks = 0u64;
             let mut previous = None;
-            // `lost` is validated distinct and ascending by the caller, so the
-            // blocks it touches arrive in order and a single compare counts them.
-            for &index in lost {
-                let block = (geometry.capacity + index) >> block_log2;
+            // `rows` is ascending, so a single compare counts distinct blocks.
+            for &row in &rows {
+                let block = row >> block_log2;
                 if previous != Some(block) {
                     blocks += 1;
                     previous = Some(block);
@@ -189,44 +229,20 @@ impl ForwardPlan {
                 best = (block_log2, cost, work);
             }
         }
-        let (mut block_log2, mut cost, _) = best;
-        let mut blocks = Vec::new();
-        let mut visited = Vec::new();
-        let bytes = if block_log2 == 0 {
-            0
+        let (block_log2, cost, _) = best;
+        let (blocks, visited) = if block_log2 == 0 {
+            // No split was worth its calls: give the charge back rather than
+            // hold it for a transform that runs unpruned.
+            drop(rows);
+            reservation.shrink_to(0);
+            (Vec::new(), Vec::new())
         } else {
-            lost.len()
-                .checked_mul(size_of::<usize>())
-                .and_then(|bytes| bytes.checked_add(domain.div_ceil(8)))
-                .and_then(|bytes| bytes.checked_add(64))
-                .ok_or(EngineError::resource_limit("FFT transform plan"))?
-        };
-        // The plan is an optimisation, so a budget that cannot hold it narrows
-        // to the unpruned transform instead of refusing the decode. That shows
-        // in the diagnostics as a decode that skipped no butterflies.
-        let reservation = match options
-            .memory
-            .reserve_as(MemoryCategory::CodecScratch, bytes)
-        {
-            Ok(reservation) => reservation,
-            Err(EngineError::ResourceLimit(_)) => {
-                block_log2 = 0;
-                cost = full;
-                options.memory.reserve_as(MemoryCategory::CodecScratch, 0)?
+            for row in &mut rows {
+                *row >>= block_log2;
             }
-            Err(error) => return Err(error),
+            rows.dedup();
+            (rows, vec![0; domain.div_ceil(64)])
         };
-        if block_log2 > 0 {
-            let mut previous = None;
-            for &index in lost {
-                let block = (geometry.capacity + index) >> block_log2;
-                if previous != Some(block) {
-                    blocks.push(block);
-                    previous = Some(block);
-                }
-            }
-            visited = vec![0; domain.div_ceil(64)];
-        }
         Ok(Self {
             block_log2,
             blocks,

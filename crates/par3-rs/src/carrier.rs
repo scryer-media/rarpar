@@ -444,13 +444,11 @@ impl CarrierPlan {
             match packet.body() {
                 PacketBody::CauchyMatrix(description) => {
                     let range = block_range(description.range, set.block_count())?;
+                    // The field's own construction peak, as repair charges it,
+                    // rather than a round number that under-states GF(2^16).
                     let _field = session.options.memory.reserve_as(
                         MemoryCategory::CodecTables,
-                        if set.galois_field().size == 2 {
-                            512 << 10
-                        } else {
-                            4096
-                        },
+                        crate::gf::construction_cost(&set.galois_field()),
                     )?;
                     match crate::gf::for_set(&set.galois_field())? {
                         crate::gf::AnyField::Gf8(field) => {

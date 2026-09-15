@@ -384,9 +384,13 @@ copy kept in step with it; `admission()` gives the effective stripe, stripe
 buffer count, output tile, verification batch, worker count and sequential read
 window; `waits()` gives the narrowings; `refusals()` counts refused admissions
 by `LimitCause`; `caches()` gives current cache occupancy; and `amplification()`
-gives the source bytes reread because a block was wider than its window and the
-bytes the codec reconstructed, so a memory reduction that only moved cost onto
-the I/O layer is visible next to it. Every write is one relaxed atomic operation
+gives the source bytes genuinely fetched twice, the stripe passes a bounded
+working set forced over the source and the bytes the codec reconstructed, so a
+memory reduction that only moved cost onto the I/O layer is visible next to it.
+Successive stripe passes read disjoint slices of each block, so they are counted
+as passes and not as rereads; the bytes in `reread_bytes` are the ones a block
+named by more than one extent is fetched again for, so each copy can be compared
+with the bytes already assembled. Every write is one relaxed atomic operation
 per event and every read allocates nothing, so a host may sample these at
 work-unit handback from another thread.
 `file_sync()` measures file synchronization attempts, successes, and storage

@@ -311,12 +311,23 @@ const ENTRY_SLOT_FACTOR: usize = 3;
 pub(crate) fn resolution_cost(packet: &Packet) -> usize {
     let indexed = match packet.body() {
         PacketBody::File(_) => hash_entry_bytes::<Fingerprint, FilePacket>(),
-        PacketBody::Directory(_) => hash_entry_bytes::<Fingerprint, DirectoryPacket>(),
+        // A directory also pays for `check_names`, which builds a transient set
+        // holding one borrowed name per child while it looks for duplicates.
+        // It is gone by the time resolution ends, but it is live while the
+        // tree is being checked and has to be covered like anything else.
+        PacketBody::Directory(this) => hash_entry_bytes::<Fingerprint, DirectoryPacket>()
+            .saturating_add(this.children.len() * hash_entry_bytes::<&str, ()>()),
         // Input-block checksums are collected as `(index, checksum)` pairs and
         // then compacted into runs, so resolution holds the pair vector and the
         // compact values at once rather than an ordered-map node per block.
+        // ... and one run descriptor per block, which is the worst case: a
+        // set whose described blocks are not contiguous collapses into no runs
+        // at all, and the descriptors were charged nowhere before.
         PacketBody::ExternalData(this) => {
-            this.checksums.len() * (size_of::<(u64, BlockChecksum)>() + size_of::<BlockChecksum>())
+            this.checksums.len()
+                * (size_of::<(u64, BlockChecksum)>()
+                    + size_of::<BlockChecksum>()
+                    + crate::checksums::RUN_BYTES)
         }
         PacketBody::RecoveryExternalData(this) => {
             this.checksums.len() * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
@@ -808,6 +819,11 @@ impl Par3Set {
     /// Shared ownership of the set's checksum storage, so a [`BlockLayout`]
     /// built from this set can reference the same authenticated checksums for
     /// its whole lifetime instead of copying them into every extent.
+    ///
+    /// The charge does not travel with the clone. These bytes are accounted to
+    /// whatever reservation covers this set, so an `Arc` outliving the set — or
+    /// outliving the session that resolved it — holds memory nothing is charged
+    /// for. Hold it no longer than the set.
     ///
     /// [`BlockLayout`]: crate::layout::BlockLayout
     #[must_use]
@@ -1301,6 +1317,74 @@ mod tests {
 
     fn packet(body: PacketBody) -> Packet {
         Packet::new(ID, body)
+    }
+
+    /// PR #73 finding 13. External Data checksums are compacted into runs, and
+    /// a set whose described blocks are scattered gets one run descriptor per
+    /// block. Nothing budgeted them, so resolving such a packet allocated a
+    /// whole vector of descriptors outside the reservation that covers it.
+    #[test]
+    fn an_external_data_charge_covers_the_run_descriptors_it_will_build() {
+        let checksums: Vec<BlockChecksum> = (0..64u8)
+            .map(|seed| BlockChecksum {
+                rolling_hash: u64::from(seed),
+                fingerprint: [seed; 16],
+            })
+            .collect();
+        let count = checksums.len();
+        let external = packet(PacketBody::ExternalData(ExternalDataPacket {
+            first_block_index: 0,
+            checksums,
+        }));
+        let charge = resolution_cost(&external);
+        let pairs = count * (size_of::<(u64, BlockChecksum)>() + size_of::<BlockChecksum>());
+        assert!(
+            charge >= external.owned_bytes() + pairs + count * crate::checksums::RUN_BYTES,
+            "{charge} covers neither the pairs, the values nor one run per block"
+        );
+        // And the runs are what the fix added: the charge grew by exactly them.
+        assert_eq!(
+            charge - (external.owned_bytes() + pairs + count * crate::checksums::RUN_BYTES),
+            hash_entry_bytes::<(u64, Fingerprint), ()>() + size_of::<Packet>(),
+            "the run term is not the only thing that changed"
+        );
+    }
+
+    /// PR #73 finding 14. Resolving a directory runs `check_names`, which holds
+    /// a borrowed name per child in a transient set while it looks for
+    /// duplicates. It is short-lived, but it is live during resolution and a
+    /// directory with a great many children makes it large.
+    #[test]
+    fn a_directory_charge_covers_the_duplicate_name_check() {
+        let children: Vec<Fingerprint> = (0..100u8).map(|seed| [seed; 16]).collect();
+        let count = children.len();
+        let directory = packet(PacketBody::Directory(DirectoryPacket {
+            name: "season 1".to_owned(),
+            option_hashes: Vec::new(),
+            children,
+        }));
+        let charge = resolution_cost(&directory);
+        let indexed = hash_entry_bytes::<Fingerprint, DirectoryPacket>()
+            + count * hash_entry_bytes::<&str, ()>();
+        assert_eq!(
+            charge,
+            directory.owned_bytes()
+                + indexed
+                + hash_entry_bytes::<(u64, Fingerprint), ()>()
+                + size_of::<Packet>()
+        );
+        // An empty directory pays nothing for a check that has nothing to do.
+        let empty = packet(PacketBody::Directory(DirectoryPacket {
+            name: "season 1".to_owned(),
+            option_hashes: Vec::new(),
+            children: Vec::new(),
+        }));
+        assert_eq!(
+            charge - resolution_cost(&empty),
+            count * hash_entry_bytes::<&str, ()>()
+                + (directory.owned_bytes() - empty.owned_bytes()),
+            "the per-child name-set term is not what separates them"
+        );
     }
 
     #[test]

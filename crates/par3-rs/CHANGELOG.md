@@ -1,6 +1,56 @@
 # Changelog
 
-## 0.3.2 (unreleased)
+## 0.4.0 (unreleased)
+
+- Version: this release is `0.4.0`, not `0.3.2`. The entries below change public
+  types, and under Cargo's 0.x rules a `par3-rs = "0.3.1"` requirement resolves
+  to `0.3.2`, which would have handed those changes to callers that never asked
+  for them.
+- A transform plan sorts the lost rows it is given before it prices or prunes
+  anything. `decode` checks that they are in range and distinct but not that
+  they are ordered, and the pruned transform finds its blocks by binary search,
+  so an unordered list from a public caller used to misprice every split and
+  then prune blocks the decode still needed. The plan a caller gets no longer
+  depends on the order it names its losses in.
+- The layout's alias charge counts one location per (extent, block) pair rather
+  than a fixed two per block, and reserves it before the locations are built
+  instead of only comparing it with the ceiling. A carrier whose files alias the
+  same blocks deeply is now refused by name rather than admitted and
+  materialised. `build_index` also takes a scoped reservation for its own sweep
+  workspace, and checks cancellation inside the per-block loop.
+- Building a Galois field is charged what it really peaks at during creation and
+  carrier regeneration, as repair already did; GF(2^16) costs about 896 KiB, not
+  the 512 KiB that was reserved.
+- A metadata packet is admitted for its wire bytes and its parsed body together,
+  before it is parsed, rather than after the parsed body already exists.
+- A Cauchy repair's output tile comes from the worker pool that was admitted,
+  not the worker count that was configured, so a repair squeezed onto one thread
+  banks one output row instead of reserving rows no worker will fill.
+- Every repair destination is resolved before any file is staged, so a set
+  carrying a name this platform cannot write is refused with a plain
+  `EngineError::UnsafePath` and leaves no temporary behind.
+- `note_recovery_in_flight` charges what the in-flight set actually stores, so a
+  declaration naming the same index twice can be fully retracted; an index at or
+  past a matrix's capacity ceiling no longer cancels a requirement it could
+  never fill.
+- **Breaking:** `AmplificationSnapshot` gained `stripe_passes`, and
+  `reread_bytes` now means what it says. Successive stripe passes read disjoint
+  slices of a block, so they are counted as passes; `reread_bytes` counts only
+  bytes genuinely fetched twice, which is what a block named by more than one
+  extent costs.
+- Data-cache occupancy is reported as a per-session delta, so sessions sharing
+  one `ExecutionDiagnostics` sum instead of overwriting each other and a
+  finished session leaves no phantom cache behind.
+- `COM0`, `LPT0` and the superscript aliases `COM¹ COM² COM³ LPT¹ LPT² LPT³` are
+  refused as reserved device names.
+- Checksum runs are allocated at exactly the size they will hold, instead of
+  growing by doubling and then copying into an exact vector while the oversized
+  buffer is still live, and the run descriptors are charged in the resolution
+  budget. The transient name set a Directory's duplicate-name check builds is
+  charged too.
+- `Par3RepairSession::layout` documents that the returned layout must not
+  outlive the session: it shares the set's block checksums, which are charged to
+  the session's resolved-set reservation and not to the layout's.
 
 - Store a contiguous protected chunk mapping as a run (file, first block, block
   count, byte offset) instead of one materialised extent per block, and expand a

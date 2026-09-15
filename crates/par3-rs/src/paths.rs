@@ -40,9 +40,44 @@ const MAX_REPORTED_BYTES: usize = 255;
 
 /// Windows device names reserved on every path component, with or without an
 /// extension. Matched case-insensitively against the component's stem.
-const RESERVED_DEVICES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+///
+/// `COM0` and `LPT0` are reserved alongside the numbered ports, and Windows
+/// also resolves the superscript digits as ports one, two and three. Those six
+/// spellings are compared by exact character: the superscripts are not ASCII,
+/// so the case-insensitive comparison below leaves them untouched while still
+/// folding the `COM` and `LPT` letters. Only the superscripts Windows accepts
+/// are listed, not every digit-like character Unicode defines.
+const RESERVED_DEVICES: [&str; 30] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// The rule a relative path broke.
@@ -281,7 +316,8 @@ mod tests {
             "connect.log",
             "console/comic.cbz",
             "lpt10.txt",
-            "com0.txt",
+            "com10.txt",
+            "com\u{b4}.txt",
             &"n".repeat(MAX_COMPONENT_BYTES),
         ] {
             assert!(
@@ -342,6 +378,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_zero_and_superscript_device_aliases_are_reserved_too() {
+        for name in [
+            "COM0",
+            "lpt0",
+            "com0.txt",
+            "LPT0.tar.gz",
+            "COM\u{b9}.txt",
+            "com\u{b2}",
+            "media/LPT\u{b3}.bin",
+        ] {
+            assert_eq!(
+                rule(name),
+                PathRule::ReservedDevice,
+                "{name:?} names a Windows device"
+            );
+        }
+        // Only the three superscripts Windows resolves. A fourth is a name.
+        assert!(validate_relative_path("com\u{b4}").is_ok());
+        assert!(validate_relative_path("com\u{2074}.txt").is_ok());
     }
 
     #[test]

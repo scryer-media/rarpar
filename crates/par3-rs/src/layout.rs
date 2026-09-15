@@ -614,6 +614,11 @@ impl BlockLayout {
 
     /// Retained allocation charged for this layout, which after construction is
     /// its measured container capacity.
+    ///
+    /// The shared block checksums are not in this figure: they belong to the
+    /// [`Par3Set`] this layout was resolved from and are charged there. A
+    /// layout must therefore not outlive the accounting that resolved it; see
+    /// [`Par3RepairSession::layout`](crate::Par3RepairSession::layout).
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self._reservation.bytes()
@@ -812,7 +817,8 @@ impl BlockLayout {
                 extents,
             });
         }
-        result.index = build_index(spans, &result, options)?;
+        let index = build_index(spans, &result.files, &mut result._reservation, options)?;
+        result.index = index;
         result.identity = identity.finalize();
         // Resize to what was actually built. The estimate above is an upper
         // bound taken from the descriptions; this is the capacity the layout
@@ -915,10 +921,25 @@ fn runs_of(file: &crate::Par3File) -> usize {
 /// names into a charged alias list.
 fn build_index(
     mut spans: Vec<BlockSpan>,
-    layout: &BlockLayout,
+    files: &[FileLayout],
+    reservation: &mut Reservation,
     options: &ExecutionOptions,
 ) -> EngineResult<BlockIndex> {
     spans.sort_unstable_by_key(|span| (span.first_block, span.count, span.file, span.first_extent));
+    // The sweep's own workspace: the boundary vector, and room for the output
+    // spans it will lay down beside the input `spans` it is still reading.
+    // Neither is in `Plan::bytes`, which measures what the layout keeps, and
+    // both are live at once. Charged to `LayoutEvidence` because they exist
+    // only to build this layout, so a host reading the ledger sees the whole
+    // cost of a layout under one heading; the charge is scoped to this
+    // function and released when it returns, however it returns.
+    let workspace = spans
+        .len()
+        .checked_mul(2 * size_of::<(u64, i64)>() + size_of::<BlockSpan>())
+        .ok_or(EngineError::resource_limit("layout index workspace"))?;
+    let _workspace = options
+        .memory
+        .reserve_as(MemoryCategory::LayoutEvidence, workspace)?;
     // Depth over block indices: any block two spans cover is an alias and
     // leaves the run form. A sweep over span boundaries finds them without
     // materialising anything per block.
@@ -931,7 +952,23 @@ fn build_index(
     let mut contested: Vec<Range<u64>> = Vec::new();
     let mut depth = 0i64;
     let mut open: Option<u64> = None;
+    // Locations the alias loop below will push: one per (span, block) pair, so
+    // the sum of depth times width over every stretch the sweep runs at depth
+    // two or more. Counting it here is what makes the charge exact — `aliased`
+    // alone counts each block once, however many extents name it, and 128
+    // files aliasing the same 100,000 blocks push 12,800,000 locations, not
+    // 100,000. Boundaries at the same position leave a zero-width stretch and
+    // so contribute nothing, which is why ties need no grouping.
+    let mut locations = 0u64;
+    let mut previous = 0u64;
     for (at, delta) in boundaries {
+        if depth >= 2 {
+            locations = (at - previous)
+                .checked_mul(depth as u64)
+                .and_then(|pairs| locations.checked_add(pairs))
+                .ok_or(EngineError::resource_limit("layout aliases"))?;
+        }
+        previous = at;
         let was = depth;
         depth += delta;
         if was < 2 && depth >= 2 {
@@ -946,6 +983,8 @@ fn build_index(
             }
         }
     }
+    let locations =
+        usize::try_from(locations).map_err(|_| EngineError::resource_limit("layout aliases"))?;
     let aliased = contested
         .iter()
         .try_fold(0usize, |total, range| {
@@ -957,32 +996,37 @@ fn build_index(
     let mut index = BlockIndex::default();
     if aliased != 0 {
         // Every aliased block leaves the compact form, so it is charged at what
-        // an ordered-map entry and its location list actually cost.
+        // an ordered-map entry and its location list actually cost: one entry
+        // per aliased block, and one `ExtentLocation` per (span, block) pair,
+        // doubled because the per-block vectors grow by doubling and can hold
+        // up to twice what they carry.
         let extra = aliased
             .checked_mul(btree_entry_bytes::<u64, Vec<ExtentLocation>>())
             .and_then(|bytes| {
-                bytes.checked_add(
-                    spans
-                        .len()
-                        .checked_mul(2 * size_of::<ExtentLocation>())?
-                        .checked_add(aliased.checked_mul(2 * size_of::<ExtentLocation>())?)?,
-                )
+                bytes.checked_add(locations.checked_mul(2 * size_of::<ExtentLocation>())?)
             })
             .ok_or(EngineError::resource_limit("layout aliases"))?;
-        if layout._reservation.bytes().saturating_add(extra) > options.retained_bytes {
+        if reservation.bytes().saturating_add(extra) > options.retained_bytes {
             return Err(EngineError::budget_limit(
                 "retained layout aliases",
-                layout._reservation.bytes().saturating_add(extra),
+                reservation.bytes().saturating_add(extra),
                 options.retained_bytes,
                 options.retained_bytes,
             ));
         }
+        // Held for the whole of the loop below, not merely compared against a
+        // ceiling: the locations exist from the first push, and a peer sharing
+        // the budget must see them while they are being built.
+        reservation.grow_by(extra)?;
         for span in &spans {
-            options.cancel.check()?;
             for range in &contested {
                 let start = span.first_block.max(range.start);
                 let end = (span.first_block + span.count).min(range.end);
                 for block in start..end {
+                    // Inside the block loop, not merely once per span: one span
+                    // can cover millions of contested blocks, and a cancelled
+                    // host must not wait out the whole of it.
+                    options.cancel.check()?;
                     index
                         .aliases
                         .entry(block)
@@ -1034,7 +1078,7 @@ fn build_index(
         options.cancel.check()?;
         descriptions.clear();
         for location in locations {
-            let Some(extent) = layout.files[location.file].extents.get(location.extent) else {
+            let Some(extent) = files[location.file].extents.get(location.extent) else {
                 continue;
             };
             if let ExtentKind::Block {

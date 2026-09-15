@@ -463,3 +463,82 @@ fn pressure_narrows_the_stripe_before_it_refuses_and_refuses_only_once() {
         "an admission site retried instead of refusing once"
     );
 }
+
+/// PR #73 finding 4. The Cauchy output tile is the width the repair actually
+/// runs at, so it must come from the pool that was admitted, not the worker
+/// count that was configured. Under a budget too small for two worker stacks
+/// the pool is serial whatever `workers` says, and a tile taken from `workers`
+/// would size the row bank for parallelism that does not exist.
+#[test]
+fn a_repair_squeezed_onto_one_thread_banks_one_output_row() {
+    let damage = [1usize, 3, 5, 7];
+    let seed = b"PAR3 serial tile";
+    // Enough for the layout, the evidence and the stripe bank; not enough for
+    // the 320 KiB stacks two workers would need beside them.
+    let (_, squeezed) = repair_cauchy(64, 1024, 8, &damage, 8, 4096, 512 << 10, seed);
+    let narrow = squeezed.diagnostics.admission();
+    assert_eq!(narrow.workers, 1, "this budget was meant to be serial");
+    assert_eq!(
+        narrow.output_tile, 1,
+        "a serial pool tiled {} rows at a time",
+        narrow.output_tile
+    );
+    assert_eq!(
+        narrow.stripe_buffers,
+        damage.len() as u64 + 1 + 3,
+        "the row bank was sized for workers that were never admitted"
+    );
+
+    // The same repair with room for its workers banks a wider tile, so the
+    // narrow figures above are the budget's doing and not the geometry's.
+    let (_, roomy) = repair_cauchy(64, 1024, 8, &damage, 8, 4096, 32 << 20, seed);
+    let wide = roomy.diagnostics.admission();
+    assert!(wide.workers > 1 && wide.output_tile > 1, "{wide:?}");
+    assert_eq!(
+        wide.stripe_buffers,
+        damage.len() as u64 + wide.output_tile + 3
+    );
+}
+
+/// PR #73 finding 10. Successive stripe passes walk disjoint slices of every
+/// block, so a repair that cannot hold a whole block reads each source byte
+/// exactly once. `reread_bytes` is what a host uses to see I/O amplification,
+/// and reporting the whole source as reread made it useless. The cost of the
+/// extra walks is real and is reported as passes instead.
+#[test]
+fn stripe_passes_over_a_block_are_passes_and_not_rereads() {
+    let damage = [2usize, 9];
+    // A 64 KiB block walked in 4 KiB stripes: sixteen passes, no byte twice.
+    let (_, options) = repair_cauchy(
+        32,
+        64 << 10,
+        4,
+        &damage,
+        1,
+        4096,
+        32 << 20,
+        b"PAR3 stripe passes",
+    );
+    let amplification = options.diagnostics.amplification();
+    let admission = options.diagnostics.admission();
+    println!(
+        "stripe {} over a 65536 byte block: {} passes, {} bytes reread, {} reconstructed",
+        admission.stripe_bytes,
+        amplification.stripe_passes,
+        amplification.reread_bytes,
+        amplification.reconstructed_bytes
+    );
+    assert!(
+        admission.stripe_bytes < 64 << 10,
+        "the stripe was not narrower than the block"
+    );
+    assert!(
+        amplification.stripe_passes > 0,
+        "a narrow stripe made no extra passes"
+    );
+    assert_eq!(
+        amplification.reread_bytes, 0,
+        "disjoint stripe passes were counted as rereads"
+    );
+    assert!(amplification.reconstructed_bytes > 0);
+}

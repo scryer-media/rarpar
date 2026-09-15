@@ -131,13 +131,32 @@ fn repair_inner(
         .options
         .memory
         .reserve_as(MemoryCategory::OutputStaging, path_cost)?;
-    let mut staged = Vec::new();
+    // Every destination is resolved before any file is staged. Whether a path
+    // can be written under `output` is a property of the set and the output
+    // directory, not of how far the repair has got, so it is settled up front.
+    // Resolving inside the staging loop instead means a rule broken by the
+    // second file surfaces only after the first has been staged, and the host
+    // sees `RepairInterrupted` with a temporary left on disk where it should
+    // see a bare `UnsafePath` saying this set can never be written here.
+    // The destinations cost one path each, which the `path_cost` reservation
+    // above already covers four times over.
+    let mut destinations = Vec::with_capacity(
+        assessment
+            .files
+            .iter()
+            .filter(|file| !file.complete)
+            .count(),
+    );
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
             continue;
         }
         session.options.cancel.check()?;
-        let destination = contained_destination(output, &file.path)?;
+        destinations.push((index, contained_destination(output, &file.path)?));
+    }
+    let mut staged = Vec::with_capacity(destinations.len());
+    for (index, destination) in destinations {
+        session.options.cancel.check()?;
         let temporary = stage_path(&destination, &session.options)?;
         temporary_outputs.push(temporary.clone());
         OpenOptions::new()
@@ -319,8 +338,12 @@ fn copy_available(
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
             if offset != 0 {
-                // A block wider than the copy window is read once per window.
-                session.options.diagnostics.note_reread(take);
+                // A block wider than the copy window is walked in windows, but
+                // each window covers a different part of it, so no byte is
+                // fetched twice. The extra walk is what costs, and that is what
+                // is counted; `reread_bytes` stays reserved for bytes genuinely
+                // fetched again.
+                session.options.diagnostics.note_stripe_pass();
             }
             scatter(
                 &session.options,
@@ -406,7 +429,28 @@ where
     // so the row payload is `(n + tile)` stripes instead of `2n`. The tile is
     // the width the workers can actually use, so no parallelism is given up,
     // and a serial repair keeps exactly one output row alive.
-    let tile = session.options.workers.max(1).min(n);
+    //
+    // The pool is admitted before the tile is chosen, against the headroom a
+    // serial repair needs: `n` syndrome rows, one output row and three stripes
+    // of overhead. `for_work` narrows the worker count under pressure and
+    // returns `None` when fewer than two fit, so the requested `workers` is not
+    // what the repair gets. Tiling by the request would size the output bank
+    // for rows no worker exists to fill, reserving `workers` stripes for a
+    // repair that runs on one thread.
+    let serial_buffers = n
+        .checked_add(4)
+        .ok_or(EngineError::resource_limit("repair stripes"))?;
+    let pool = crate::runtime::WorkerPool::for_work(
+        &session.options,
+        n,
+        serial_buffers
+            .checked_mul(F::SYMBOL_BYTES)
+            .ok_or(EngineError::resource_limit("minimum repair stripe"))?,
+    )?;
+    let tile = pool
+        .as_ref()
+        .map_or(1, crate::runtime::WorkerPool::current_num_threads)
+        .min(n);
     let buffer_count = n
         .checked_add(tile)
         .and_then(|count| count.checked_add(3))
@@ -415,13 +459,6 @@ where
         .checked_add(tile)
         .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
         .ok_or(EngineError::resource_limit("repair stripes"))?;
-    let pool = crate::runtime::WorkerPool::for_work(
-        &session.options,
-        n,
-        buffer_count
-            .checked_mul(F::SYMBOL_BYTES)
-            .ok_or(EngineError::resource_limit("minimum repair stripe"))?,
-    )?;
     let target = session
         .options
         .stripe_bytes
@@ -465,9 +502,10 @@ where
             session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
             if offset != 0 {
                 // A stripe narrower than the block means the surviving blocks
-                // are read once per pass. That is the cost of the bounded
-                // working set, and it is reported rather than hidden.
-                session.options.diagnostics.note_reread(take);
+                // are walked once per pass. The passes read disjoint slices, so
+                // this is an extra walk over the source and not a byte fetched
+                // twice; it is reported as a pass rather than as amplification.
+                session.options.diagnostics.note_stripe_pass();
             }
             scatter(
                 &session.options,

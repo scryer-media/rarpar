@@ -188,6 +188,10 @@ pub struct Par3RepairSession {
     /// is the continuation that keeps a reassessment from asking twice.
     recovery_in_flight: BTreeMap<Fingerprint, std::collections::BTreeSet<u64>>,
     in_flight_memory: Option<Reservation>,
+    /// Data-cache entries this session has already added to the shared
+    /// diagnostics, so every later report is a delta against it and the
+    /// session can subtract exactly its own contribution when it goes away.
+    cache_reported: usize,
     diagnostics: SessionDiagnostics,
 }
 
@@ -218,6 +222,7 @@ impl Par3RepairSession {
             data_blocks: BTreeMap::new(),
             recovery_in_flight: BTreeMap::new(),
             in_flight_memory: None,
+            cache_reported: 0,
             diagnostics: SessionDiagnostics::default(),
         })
     }
@@ -300,10 +305,17 @@ impl Par3RepairSession {
     ) -> EngineResult<()> {
         self.options.cancel.check()?;
         let entry = self.recovery_in_flight.entry(matrix).or_default();
-        let added = indices
+        // What the set will really gain. `indices` is host-supplied and may
+        // name the same index twice; counting occurrences charges for entries
+        // the set stores once, and the refund in `forget_recovery_in_flight`
+        // gives back only what was stored, leaving the difference reserved for
+        // the life of the session.
+        let fresh: std::collections::BTreeSet<u64> = indices
             .iter()
+            .copied()
             .filter(|index| !entry.contains(index))
-            .count();
+            .collect();
+        let added = fresh.len();
         if added == 0 {
             return Ok(());
         }
@@ -323,7 +335,7 @@ impl Par3RepairSession {
             }
         }
         let entry = self.recovery_in_flight.entry(matrix).or_default();
-        entry.extend(indices.iter().copied());
+        entry.extend(fresh);
         self.assessment = None;
         Ok(())
     }
@@ -416,12 +428,43 @@ impl Par3RepairSession {
 
     /// Resolve currently available metadata, returning `None` while incomplete.
     /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`].
+    ///
+    /// # The returned layout must not outlive this session
+    ///
+    /// A [`BlockLayout`] holds shared ownership of the resolved set's block
+    /// checksums, and those bytes are charged to the session's own resolved-set
+    /// reservation, not to the layout's. The layout's
+    /// [`retained_bytes`](BlockLayout::retained_bytes) therefore excludes them,
+    /// which is what makes the same allocation charged exactly once while the
+    /// session lives.
+    ///
+    /// Keeping this `Arc` after the session is dropped — or across
+    /// [`Self::merge`] calls that rebuild the layout — keeps that allocation
+    /// alive with nothing charged for it: the budget reads lower than the
+    /// memory actually held, and a peer sharing the budget can be admitted on
+    /// the strength of bytes that are not free. Use the layout within the
+    /// session's lifetime, or copy out the parts needed and drop it.
     pub fn layout(&mut self) -> EngineResult<Option<Arc<BlockLayout>>> {
         if let Err(error) = self.refresh_layout() {
             self.options.diagnostics.note_refusal(&error);
             return Err(error);
         }
         Ok(self.layout.as_ref().map(Arc::clone))
+    }
+
+    /// Publish this session's Data-cache occupancy as a change to the shared
+    /// counters. Deltas keep sessions sharing one `ExecutionDiagnostics` from
+    /// overwriting each other, and make the subtraction on clear and on drop
+    /// exactly what this session added.
+    pub(crate) fn report_cache(&mut self, entries: usize) {
+        if entries == self.cache_reported {
+            return;
+        }
+        let delta = entries as i64 - self.cache_reported as i64;
+        self.options
+            .diagnostics
+            .note_cache_delta(delta, delta.saturating_mul(data::ADMISSION_BYTES as i64));
+        self.cache_reported = entries;
     }
 
     fn refresh_layout(&mut self) -> EngineResult<()> {
@@ -447,6 +490,11 @@ impl Par3RepairSession {
             self.placements.clear();
             self.data_checked.clear();
             self.data_blocks.clear();
+            // Reported here rather than left to the next `refresh_data`: the
+            // entries are gone now, and a host sampling the diagnostics between
+            // a layout change and the next admission pass must not be told this
+            // session still holds them.
+            self.report_cache(0);
             self.data_dirty = true;
         }
         self.layout = Some(layout);
@@ -787,10 +835,23 @@ impl Par3RepairSession {
                 usable.get(index).is_some_and(Option::is_some)
                     || in_flight.is_some_and(|set| set.contains(index))
             };
+            let ceiling = geometry.capacity.saturating_mul(geometry.cohorts);
+            // Only an index this matrix could ever carry counts against what is
+            // still outstanding. An index at or past the capacity ceiling can
+            // never arrive and can never appear in `next_indices`, so counting
+            // it would cancel a requirement the host still has to satisfy and
+            // leave it with `outstanding` zero and nothing to fetch.
+            //
+            // Such an index is ignored here, not dropped from the set: the
+            // recorded indices are the host's own declaration and are charged
+            // against its retained budget, and only `forget_recovery_in_flight`
+            // retracts them. Removing one here would take back state the host
+            // never retracted and break the pairing the charge depends on.
             let pending = in_flight.map_or(0, |set| {
                 set.iter()
                     .filter(|index| {
-                        *index % geometry.cohorts == cohort
+                        **index < ceiling
+                            && *index % geometry.cohorts == cohort
                             && !usable.get(index).is_some_and(Option::is_some)
                     })
                     .count() as u64
@@ -798,7 +859,6 @@ impl Par3RepairSession {
             let outstanding = additional.saturating_sub(pending);
             let mut next_indices = Vec::with_capacity(outstanding as usize);
             let mut index = cohort;
-            let ceiling = geometry.capacity.saturating_mul(geometry.cohorts);
             while next_indices.len() as u64 != outstanding && index < ceiling {
                 if !claimed(&index) {
                     next_indices.push(index);
@@ -1367,6 +1427,11 @@ impl Par3RepairSession {
             let finish = (end - offset) as usize;
             ensure_snapshot(self.access.as_ref(), source, snapshot)?;
             if covered[begin..finish].iter().any(|value| *value != 0) {
+                // A second extent naming this block: its bytes are fetched
+                // again so they can be compared with what the first extent
+                // already supplied. These are the only bytes this engine
+                // genuinely reads twice.
+                self.options.diagnostics.note_reread(finish - begin);
                 let _scratch = self
                     .options
                     .memory
@@ -1424,6 +1489,16 @@ impl Par3RepairSession {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Par3RepairSession {
+    fn drop(&mut self) {
+        // The Data cache goes with the session. Its reservations are released
+        // by their own `Drop`, and the shared occupancy counters have to lose
+        // exactly what this session put into them, or the last session to end
+        // leaves a permanent phantom cache behind for every peer to read.
+        self.report_cache(0);
     }
 }
 

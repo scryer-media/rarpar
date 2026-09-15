@@ -343,7 +343,7 @@ jobs:
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
               # The engine, its tests and ENGINE.md package at about 418 KB
-              # (428,018 bytes at 0.3.2), without fixtures or benchmarks. Four work
+              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
               # packages of source, tests and documentation grew it from about 314 KB.
               "par3-rs": 480_000,
           }
@@ -490,7 +490,7 @@ jobs:
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
               # The engine, its tests and ENGINE.md package at about 418 KB
-              # (428,018 bytes at 0.3.2), without fixtures or benchmarks. Four work
+              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
               # packages of source, tests and documentation grew it from about 314 KB.
               "par3-rs": 480_000,
           }

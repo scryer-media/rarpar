@@ -8,6 +8,9 @@
 
 use crate::packet::BlockChecksum;
 
+/// Bytes one [`ChecksumRun`] descriptor occupies, for the resolution budget.
+pub(crate) const RUN_BYTES: usize = size_of::<ChecksumRun>();
+
 /// One span of consecutive block indices whose checksums are stored together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ChecksumRun {
@@ -114,7 +117,21 @@ impl BlockChecksumsBuilder {
         // first packet that described a block is the one `dedup_by_key` keeps.
         self.pairs.sort_by_key(|(index, _)| *index);
         self.pairs.dedup_by_key(|(index, _)| *index);
-        let mut runs: Vec<ChecksumRun> = Vec::new();
+        // Count the runs before allocating the vector that holds them.
+        // `shrink_to_fit` on a vector that grew by doubling allocates the exact
+        // copy while the oversized buffer is still live, so the peak is the sum
+        // of both — for a set whose blocks are scattered that is one descriptor
+        // per block, twice over, none of it budgeted. One extra pass over a
+        // vector already in cache buys an exact allocation and no copy.
+        let mut count = 0usize;
+        let mut previous: Option<u64> = None;
+        for (index, _) in &self.pairs {
+            if previous.and_then(|last: u64| last.checked_add(1)) != Some(*index) {
+                count += 1;
+            }
+            previous = Some(*index);
+        }
+        let mut runs: Vec<ChecksumRun> = Vec::with_capacity(count);
         let mut values = Vec::with_capacity(self.pairs.len());
         for (index, checksum) in self.pairs {
             match runs.last_mut() {
@@ -127,7 +144,7 @@ impl BlockChecksumsBuilder {
             }
             values.push(checksum);
         }
-        runs.shrink_to_fit();
+        debug_assert_eq!(runs.len(), runs.capacity(), "the run count was exact");
         BlockChecksums { runs, values }
     }
 }
@@ -136,6 +153,38 @@ impl BlockChecksumsBuilder {
 mod tests {
     use super::*;
     use crate::Fingerprint;
+
+    /// PR #73 finding 13. `shrink_to_fit` on a vector that grew by doubling
+    /// allocates the exact copy while the oversized buffer is still live, so a
+    /// set whose blocks are scattered peaked at two descriptor arrays at once.
+    /// The run count is now known before the vector exists.
+    #[test]
+    fn the_run_vector_is_allocated_at_exactly_the_size_it_will_hold() {
+        for step in [1u64, 2, 7] {
+            let mut builder = BlockChecksumsBuilder::default();
+            for index in 0..300u64 {
+                builder.push(index * step, checksum(index as u8));
+            }
+            let built = builder.build();
+            assert_eq!(
+                built.runs.len(),
+                built.runs.capacity(),
+                "step {step} left {} spare run slots",
+                built.runs.capacity() - built.runs.len()
+            );
+            let expected = if step == 1 { 1 } else { 300 };
+            assert_eq!(built.runs.len(), expected, "step {step}");
+            assert_eq!(built.len(), 300);
+        }
+        // Duplicates and arrival order must not change the count either.
+        let mut builder = BlockChecksumsBuilder::default();
+        for index in [5u64, 1, 2, 5, 3, 9, 1] {
+            builder.push(index, checksum(index as u8));
+        }
+        let built = builder.build();
+        assert_eq!(built.runs.len(), built.runs.capacity());
+        assert_eq!(built.runs.len(), 3, "1..=3, then 5, then 9");
+    }
 
     fn checksum(seed: u8) -> BlockChecksum {
         BlockChecksum {

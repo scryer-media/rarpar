@@ -105,6 +105,22 @@ pub(crate) struct IoCounters {
     write_bytes: AtomicU64,
     errors: AtomicU64,
 }
+/// Move a counter by a signed delta, clamped at zero. A subtraction larger than
+/// the counter holds means a holder has already been accounted for; the floor
+/// keeps that from wrapping into an absurd total.
+fn adjust(counter: &AtomicU64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(if delta >= 0 {
+            current.saturating_add(delta as u64)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        })
+    });
+}
+
 fn add(counter: &AtomicU64, value: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(value))
@@ -208,10 +224,22 @@ pub struct WaitSnapshot {
 /// only pushed cost here is not a reduction, so these are reported beside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AmplificationSnapshot {
-    /// Source bytes read again because one pass could not hold the block.
+    /// Source bytes read again: bytes fetched from a source that had already
+    /// been fetched during this run. A block named by several aliased extents
+    /// is the case that produces them, because each extent's copy is fetched
+    /// and compared against the bytes already assembled.
+    ///
+    /// Reading a block in successive stripe passes does not appear here: each
+    /// pass fetches a different part of the block, so no byte is fetched twice.
+    /// The cost of running in passes at all is [`Self::stripe_passes`].
     pub reread_bytes: u64,
     /// Bytes the codec reconstructed and scattered into staged output.
     pub reconstructed_bytes: u64,
+    /// Stripe passes a bounded working set forced over the source beyond the
+    /// first. Zero means every block was covered in one pass; `n` means the
+    /// source was walked `n` extra times, each time for a different slice of
+    /// every block.
+    pub stripe_passes: u64,
 }
 
 /// Transform and coefficient work the codecs actually performed.
@@ -261,6 +289,7 @@ struct AdmissionCounters {
     batch_narrowed: AtomicU64,
     reread_bytes: AtomicU64,
     reconstructed_bytes: AtomicU64,
+    stripe_passes: AtomicU64,
     cache_entries: AtomicU64,
     cache_bytes: AtomicU64,
     transform_calls: AtomicU64,
@@ -404,6 +433,7 @@ impl ExecutionDiagnostics {
         AmplificationSnapshot {
             reread_bytes: get(&counters.reread_bytes),
             reconstructed_bytes: get(&counters.reconstructed_bytes),
+            stripe_passes: get(&counters.stripe_passes),
         }
     }
 
@@ -532,9 +562,17 @@ impl ExecutionDiagnostics {
         add(&self.0.admission.refusals[slot], 1);
     }
 
-    /// Source bytes read again because one pass could not hold the block.
+    /// Source bytes fetched that had already been fetched in this run. Only a
+    /// second fetch of the same bytes belongs here; walking disjoint slices of
+    /// a block in successive passes reads each byte once and is counted by
+    /// [`Self::note_stripe_pass`].
     pub(crate) fn note_reread(&self, bytes: usize) {
         add(&self.0.admission.reread_bytes, bytes as u64);
+    }
+
+    /// One stripe pass over the source beyond the first.
+    pub(crate) fn note_stripe_pass(&self) {
+        add(&self.0.admission.stripe_passes, 1);
     }
 
     /// Bytes reconstructed by the codec and scattered into staged output.
@@ -542,14 +580,17 @@ impl ExecutionDiagnostics {
         add(&self.0.admission.reconstructed_bytes, bytes as u64);
     }
 
-    /// Current cache occupancy. Absolute, not incremental: a cache reports what
-    /// it holds after it changes.
-    pub(crate) fn note_cache(&self, entries: usize, bytes: usize) {
+    /// Change cache occupancy by one holder's own delta.
+    ///
+    /// Deltas, not absolutes. Several sessions may share one
+    /// [`ExecutionDiagnostics`], and a holder that stored its own total would
+    /// erase what its peers hold and leave its own behind when it went away.
+    /// Every holder pairs its additions with subtractions when it clears and
+    /// when it is dropped, so the counters return to zero on their own.
+    pub(crate) fn note_cache_delta(&self, entries: i64, bytes: i64) {
         let counters = &self.0.admission;
-        counters
-            .cache_entries
-            .store(entries as u64, Ordering::Relaxed);
-        counters.cache_bytes.store(bytes as u64, Ordering::Relaxed);
+        adjust(&counters.cache_entries, entries);
+        adjust(&counters.cache_bytes, bytes);
     }
 
     pub(crate) fn files(&self) -> &IoCounters {

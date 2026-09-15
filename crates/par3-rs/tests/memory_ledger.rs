@@ -7,6 +7,7 @@
 mod common;
 
 use par3_rs::ScanLimits;
+use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, Deduplication};
 use par3_rs::ingest::{IncrementalSet, PacketScanner, ScanEvent};
 use par3_rs::runtime::{
     EngineError, ExecutionOptions, LimitCause, MemoryBudget, MemoryCategory, ProgressCallback,
@@ -888,4 +889,337 @@ fn cancelling_an_fft_decode_refunds_the_transform_plan() {
             );
         }
     }
+}
+
+/// A carrier whose `files` sources hold the same bytes, so aligned
+/// deduplication leaves every block named by one extent per file. The body's
+/// 251-byte period means the file also dedups against itself, which is why the
+/// aliased block count below is far smaller than `blocks`; what matters for the
+/// charge is the extent count, which is `files` per aliased block.
+fn aliased_set(files: usize, blocks: u64, block_size: u64) -> par3_rs::Par3Set {
+    let body: Arc<[u8]> = (0..blocks * block_size)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>()
+        .into();
+    let mut access = MemorySourceAccess::default();
+    let mut sources = Vec::new();
+    for index in 0..files {
+        access.insert(SourceId(index as u64), 1, Arc::clone(&body));
+        sources.push(CreationSource {
+            name: format!("copy{index}.bin"),
+            source: SourceId(index as u64),
+        });
+    }
+    let mut options = CreationOptions {
+        block_size,
+        recovery_count: 1,
+        deduplication: Deduplication::Aligned,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(1 << 30);
+    options.execution.retained_bytes = 1 << 30;
+    let plan = CreationPlan::build(Arc::new(access), &sources, options).unwrap();
+    let carriers = common::TempTree::new("alias-charge");
+    let paths = plan
+        .execute(&carriers.path().join("set"), carriers.path())
+        .unwrap();
+    let packets = common::packets_of(&std::fs::read(&paths[0]).unwrap());
+    par3_rs::Par3Set::from_packets_for(packets, plan.input_set_id()).unwrap()
+}
+
+/// Options with a private budget large enough for any layout here.
+fn roomy() -> ExecutionOptions {
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    options.memory = MemoryBudget::new(256 << 20);
+    options.retained_bytes = 256 << 20;
+    options
+}
+
+/// What the alias containers really hold: one ordered-map entry per aliased
+/// block and one location per extent naming it. Measured through the public
+/// iterator, so the test does not restate the charge's own arithmetic.
+fn measured_aliases(layout: &par3_rs::layout::BlockLayout) -> (usize, usize) {
+    let mut blocks = 0usize;
+    let mut locations = 0usize;
+    for (_, at) in layout.blocks() {
+        if at.len() > 1 {
+            blocks += 1;
+            locations += at.len();
+        }
+    }
+    (blocks, locations)
+}
+
+#[test]
+fn the_alias_charge_counts_one_location_for_every_extent_naming_a_block() {
+    let options = roomy();
+    let layout = par3_rs::layout::BlockLayout::new(&aliased_set(8, 50, 64), &options).unwrap();
+    let (blocks, locations) = measured_aliases(&layout);
+    assert_eq!(
+        (blocks, locations),
+        (50, 400),
+        "eight copies of fifty blocks name each of them eight times"
+    );
+    assert_eq!(layout.aliased_blocks(), blocks);
+
+    // The live bytes those containers hold. The charge rounds the per-block
+    // vectors up to the capacity doubling can leave them at, so it must sit
+    // between this and twice its location term, and never below it.
+    let entry = 2 * (size_of::<u64>() + size_of::<Vec<(usize, usize)>>()) + 32;
+    let live = blocks * entry + locations * size_of::<(usize, usize)>();
+    let settled = layout.retained_bytes();
+    assert!(
+        settled >= live,
+        "a layout holding {live} alias bytes settled at {settled}"
+    );
+    assert!(
+        settled < 2 * live,
+        "the alias charge is an upper bound, not a multiple: {settled} against {live}"
+    );
+    drop(layout);
+    assert_eq!(options.memory.used(), 0);
+}
+
+#[test]
+fn a_carrier_that_aliases_deeply_is_refused_before_the_locations_exist() {
+    // Under a roomy budget the same set settles well over a mebibyte, all of
+    // it locations: thirty-two files naming two thousand blocks each.
+    let wide = aliased_set(32, 2000, 64);
+    let roomy = roomy();
+    let materialised = par3_rs::layout::BlockLayout::new(&wide, &roomy)
+        .unwrap()
+        .retained_bytes();
+    assert!(
+        materialised > (1 << 20),
+        "the refusal below is only interesting if this really exceeds the ceiling: {materialised}"
+    );
+
+    let mut tight = ExecutionOptions::default();
+    tight.workers = 1;
+    tight.memory = MemoryBudget::new(256 << 20);
+    tight.retained_bytes = 1 << 20;
+    match par3_rs::layout::BlockLayout::new(&wide, &tight) {
+        Err(EngineError::ResourceLimit(limit)) => {
+            assert_eq!(limit.what, "retained layout aliases", "{limit}");
+            assert_eq!(limit.cause(), LimitCause::ExceedsLimit, "{limit}");
+            assert!(limit.need > limit.limit, "{limit}");
+        }
+        other => panic!("a 1 MiB ceiling must refuse {materialised} bytes: {other:?}"),
+    }
+    assert_eq!(tight.memory.used(), 0, "the refusal left bytes behind");
+    for (category, entry) in tight.memory.ledger().iter() {
+        assert_eq!(entry.current, 0, "{} leaked", category.name());
+    }
+
+    // The same blocks at a quarter of the depth still fit: it is the number of
+    // extents naming each block that the old charge missed, not the blocks.
+    let shallow = par3_rs::layout::BlockLayout::new(&aliased_set(4, 2000, 64), &tight).unwrap();
+    assert!(shallow.retained_bytes() < (1 << 20));
+    assert_eq!(shallow.aliased_blocks(), 251);
+}
+
+#[test]
+fn cancelling_inside_the_alias_loop_gives_back_the_sweep_workspace() {
+    let wide = aliased_set(32, 2000, 64);
+    let options = roomy();
+    let cancel = options.cancel.clone();
+    let budget = options.memory.clone();
+    // The alias reservation is over two megabytes and every other layout
+    // reservation together is under a hundred kilobytes, so crossing this
+    // threshold means the sweep has finished, the workspace is still held and
+    // the location loop has begun.
+    let watching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = Arc::clone(&watching);
+    let watcher = std::thread::spawn(move || {
+        ready.store(true, std::sync::atomic::Ordering::Release);
+        while budget.used() < 1 << 20 {
+            std::hint::spin_loop();
+        }
+        cancel.cancel();
+    });
+    while !watching.load(std::sync::atomic::Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+    let error = par3_rs::layout::BlockLayout::new(&wide, &options)
+        .expect_err("cancelled while the locations were being written");
+    watcher.join().unwrap();
+    assert!(matches!(error, EngineError::Cancelled), "{error:?}");
+    assert_eq!(options.memory.used(), 0, "a cancelled sweep leaked bytes");
+    for (category, entry) in options.memory.ledger().iter() {
+        assert_eq!(
+            entry.current,
+            0,
+            "{} leaked after a cancelled build_index",
+            category.name()
+        );
+    }
+}
+
+/// What building a GF(2^16) field peaks at, computed the way the engine's own
+/// `gf::construction_cost` does: two `u32` working tables and the narrowed
+/// table taken from the larger stage, plus the field itself. The engine's
+/// constant is internal, so the arithmetic is restated here and the refusal
+/// below proves the engine agrees with it.
+fn gf16_construction_bytes() -> usize {
+    const ORDER: usize = 1 << 16;
+    let log_words = ORDER * size_of::<u32>();
+    let exp_words = 2 * (ORDER - 1) * size_of::<u32>();
+    let log_symbols = ORDER * 2;
+    let exp_symbols = 2 * (ORDER - 1) * 2;
+    (log_words + exp_words + log_symbols).max(exp_words + log_symbols + exp_symbols)
+        + size_of::<par3_rs::Gf16>()
+}
+
+/// Encode a 300-block GF(2^16) Cauchy set under `budget`, returning what
+/// creation did with it. Three hundred blocks put the set past the 256-column
+/// GF(2^8) boundary, so the two-byte field is the one that gets built.
+fn create_gf16_under(budget: usize) -> Result<(), EngineError> {
+    let body: Arc<[u8]> = (0..300u64 * 64)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>()
+        .into();
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, body);
+    let mut options = CreationOptions {
+        block_size: 64,
+        recovery_count: 4,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(budget);
+    options.execution.retained_bytes = budget;
+    let sources = [CreationSource {
+        name: "a.bin".into(),
+        source: SourceId(1),
+    }];
+    let plan = CreationPlan::build(Arc::new(access), &sources, options)?;
+    assert_eq!(plan.requirements().field.size, 2, "not the two-byte field");
+    let carriers = common::TempTree::new("field-budget");
+    plan.execute(&carriers.path().join("set"), carriers.path())?;
+    Ok(())
+}
+
+#[test]
+fn creation_reserves_what_building_the_field_really_costs() {
+    let construction = gf16_construction_bytes();
+    assert!(
+        construction > (512 << 10),
+        "the round number this replaced was an under-statement of {construction}"
+    );
+
+    // One byte short of the field is a refusal, by name, before construction.
+    match create_gf16_under(construction - 1) {
+        Err(EngineError::ResourceLimit(limit)) => {
+            assert_eq!(limit.what, "codec tables", "{limit}");
+            assert_eq!(limit.need, construction, "{limit}");
+            assert_eq!(limit.cause(), LimitCause::ExceedsLimit, "{limit}");
+        }
+        other => panic!("a budget below the field's construction cost must refuse: {other:?}"),
+    }
+
+    // And the old constant is genuinely admitted by the old arithmetic and
+    // refused by the new: a budget above 512 KiB but below the real cost.
+    match create_gf16_under(768 << 10) {
+        Err(EngineError::ResourceLimit(limit)) => {
+            assert_eq!(limit.what, "codec tables", "{limit}");
+            assert_eq!(limit.need, construction, "{limit}");
+        }
+        other => panic!("768 KiB does not hold a {construction} byte field: {other:?}"),
+    }
+
+    // With room for the field and the rest of the encode, it succeeds.
+    create_gf16_under(construction + (1 << 20)).expect("a roomy budget builds the set");
+}
+
+/// A single-file carrier whose External Data packet describes 20 000 blocks,
+/// so one metadata packet is most of the carrier and its parsed body is the
+/// same order of size as the wire bytes it is read from.
+fn wide_external_data_carrier() -> Vec<u8> {
+    let body: Arc<[u8]> = (0..20_000u64 * 64)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>()
+        .into();
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, body);
+    let mut options = CreationOptions {
+        block_size: 64,
+        recovery_count: 1,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.memory = MemoryBudget::new(1 << 30);
+    options.execution.retained_bytes = 1 << 30;
+    let sources = [CreationSource {
+        name: "wide.bin".into(),
+        source: SourceId(1),
+    }];
+    let plan = CreationPlan::build(Arc::new(access), &sources, options).unwrap();
+    let carriers = common::TempTree::new("wide-external-data");
+    let paths = plan
+        .execute(&carriers.path().join("set"), carriers.path())
+        .unwrap();
+    std::fs::read(&paths[0]).unwrap()
+}
+
+/// Scan every packet of `bytes` under `budget`, returning the widest packet
+/// seen or the refusal that stopped the scan.
+fn scan_under(bytes: Vec<u8>, budget: usize) -> Result<u64, EngineError> {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(9), 1, bytes.into());
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    options.memory = MemoryBudget::new(budget);
+    options.retained_bytes = budget;
+    let mut scanner = PacketScanner::new(
+        Arc::new(access),
+        SourceId(9),
+        options,
+        ScanLimits::default(),
+    )?;
+    let mut widest = 0;
+    while let ScanEvent::Packet(packet) = scanner.poll()? {
+        widest = widest.max(packet.origin().length);
+    }
+    Ok(widest)
+}
+
+/// PR #73 finding 6. `Packet::parse` builds the parsed body's owned containers
+/// while the wire copy it reads from is still held, so both are live at once.
+/// The charge for the pair has to be taken before parsing: taking it afterwards
+/// means the allocation has already happened by the time the budget is asked,
+/// and a budget with room for one copy quietly holds two.
+#[test]
+fn a_metadata_packet_is_admitted_for_its_wire_bytes_and_its_parsed_body_together() {
+    let carrier = wide_external_data_carrier();
+    let wire = scan_under(carrier.clone(), 256 << 20).expect("a roomy budget scans it") as usize;
+    assert!(
+        wire > 400_000,
+        "the External Data packet should dominate this carrier: {wire}"
+    );
+
+    // Room for the wire copy and the scan buffer, but not for the parsed body
+    // beside them. The refusal must come from the second charge, not the first.
+    match scan_under(carrier.clone(), 2 * wire) {
+        Err(EngineError::ResourceLimit(limit)) => {
+            assert!(
+                limit.to_string().contains("carrier and packet storage"),
+                "{limit}"
+            );
+            let held = limit.limit - limit.available;
+            assert!(
+                held >= limit.need,
+                "the budget was refused while holding only {held} bytes, so this is the \
+                 first charge for the packet and not the parse overlap: {limit}"
+            );
+        }
+        other => panic!("a budget of {} must refuse the pair: {other:?}", 2 * wire),
+    }
+
+    // With room for both, the same carrier scans through.
+    assert_eq!(
+        scan_under(carrier, 4 * wire).expect("both copies fit"),
+        wire as u64
+    );
 }

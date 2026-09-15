@@ -767,6 +767,13 @@ impl WorkerPool {
     pub(crate) fn pool(&self) -> &rayon::ThreadPool {
         self.pool.as_ref().expect("live worker pool")
     }
+
+    /// Threads this pool was admitted, which is what a stage should tile its
+    /// work by. It is at most the count the caller asked for and is often
+    /// fewer, because `for_work` narrows under memory pressure.
+    pub(crate) fn current_num_threads(&self) -> usize {
+        self.pool().current_num_threads()
+    }
 }
 
 impl Drop for WorkerPool {

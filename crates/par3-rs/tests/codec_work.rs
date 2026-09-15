@@ -214,3 +214,34 @@ fn spread_damage_prunes_far_less_than_a_single_loss() {
         "one loss should prune far more than 32 spread ones: {light:?} {heavy:?}"
     );
 }
+
+#[test]
+fn the_plan_does_not_depend_on_the_order_the_caller_names_its_losses() {
+    // `decode` checks that `lost` is in range and free of duplicates, but never
+    // that it is sorted, and `transform_forward` decides which blocks to keep
+    // with a binary search. A plan that inherited the caller's order would
+    // prune blocks the decode still needs and return wrong bytes without
+    // saying so, which is why `round_trip` asserts the bytes on every call.
+    let ascending = [3usize, 40, 41, 200, 613];
+    let mut descending = ascending;
+    descending.reverse();
+    // An order with no run of adjacent losses left intact.
+    let shuffled = [200usize, 3, 613, 41, 40];
+    let recovery = [0usize, 1, 2, 3, 4];
+
+    let (sorted, domain, stripe) = round_trip(900, 7, 8192, 4096, &ascending, &recovery, 1);
+    assert_eq!((domain, stripe), (2048, 4096));
+    assert!(
+        sorted.butterflies_skipped > 0,
+        "the case must select a pruned plan to be worth ordering: {sorted:?}"
+    );
+
+    for lost in [&descending[..], &shuffled[..]] {
+        let (measured, _, _) = round_trip(900, 7, 8192, 4096, lost, &recovery, 1);
+        assert_eq!(
+            (measured.butterflies, measured.butterflies_skipped),
+            (sorted.butterflies, sorted.butterflies_skipped),
+            "{lost:?} must cost exactly what {ascending:?} costs"
+        );
+    }
+}

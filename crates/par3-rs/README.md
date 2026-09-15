@@ -232,8 +232,9 @@ layout or a verdict means changed, and the evidence checkpoint format is
 unchanged and replays across the representation change. Carrier bytes and
 verification evidence deliberately outlive the stages that produced them,
 because carrier regeneration and reassessment read them and dropping them would
-buy memory with source rereads; `ExecutionDiagnostics::amplification()` reports
-reread and reconstructed bytes so that trade can never be made invisibly.
+buy memory with extra passes over the source; `ExecutionDiagnostics::amplification()`
+reports those passes, the bytes genuinely fetched twice and the reconstructed
+bytes, so that trade can never be made invisibly.
 
 Parallel work is admitted, not assumed. Verification hashes one source across a
 private pool only when the source is at least 8 MiB, feeds that hash in updates

@@ -721,18 +721,33 @@ impl PacketScanner {
             let mut reservation = candidate.reservation;
             let retained = candidate.retained;
             let contents = if candidate.prefix_len == 0 {
+                // The carrier copy and the parsed body are live at the same
+                // time: `parse` builds the body's owned containers while
+                // `retained` still holds the bytes they are read from. Cover
+                // both *before* parsing, so a budget that cannot hold the pair
+                // refuses at admission rather than after the allocation has
+                // already happened.
+                //
+                // The wire length is a sound bound for the parsed body of every
+                // metadata type: each owned field is a copy of a wire range or
+                // a fixed-size value taken from one, so no body owns more bytes
+                // than the packet it came from. `reservation` already covers
+                // the wire copy plus one packet's overhead, so growing it by
+                // itself covers the pair. A tighter bound would have to be per
+                // type and computed from the same wire bytes, which is what
+                // parsing does; there is nothing cheaper to read first.
+                reservation.grow_by(reservation.bytes())?;
                 let packet = Packet::parse(&retained, candidate.offset, &ParseContext::new())?;
-                // The carrier copy and the parsed body overlap until the copy is
-                // dropped, so cover both before releasing down to what survives.
                 let owned = packet
                     .owned_bytes()
                     .saturating_add(PACKET_OVERHEAD_BYTES)
                     .min(isize::MAX as usize);
+                drop(retained);
                 if let Some(growth) = owned.checked_sub(reservation.bytes()) {
                     reservation.grow_by(growth)?;
+                } else {
+                    reservation.shrink_to(owned);
                 }
-                drop(retained);
-                reservation.shrink_to(owned);
                 IngestedContents::Metadata(Arc::new(packet), Arc::new(reservation))
             } else {
                 let kind = if candidate.prefix_len == 8 {

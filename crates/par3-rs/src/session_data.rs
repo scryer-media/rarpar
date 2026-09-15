@@ -75,10 +75,7 @@ impl Par3RepairSession {
             );
             self.diagnostics.data_validations += 1;
         }
-        self.options.diagnostics.note_cache(
-            self.data_checked.len(),
-            self.data_checked.len().saturating_mul(ADMISSION_BYTES),
-        );
+        self.report_cache(self.data_checked.len());
         self.data_dirty = false;
         Ok(())
     }

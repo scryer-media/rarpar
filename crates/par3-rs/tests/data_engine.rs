@@ -229,3 +229,66 @@ fn official_data_only_recovery_retains_proofs_across_replays_and_recovery_arriva
     assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
     assert_eq!(session.diagnostics().data_validations, 8);
 }
+
+/// PR #73 finding 11. Cache occupancy is shared state: several sessions may
+/// report into one `ExecutionDiagnostics`. A session that stored its own total
+/// erased what its peers held and left its own behind for ever when it ended,
+/// so the counters only ever told the truth for a single session that never
+/// stopped. They are per-session deltas now, added on admission and subtracted
+/// on clear and on drop.
+#[test]
+fn the_data_cache_is_reported_as_a_delta_and_handed_back() {
+    let options = ExecutionOptions::default();
+    let access = || {
+        Arc::new(Carriers {
+            generation: 1.into(),
+            reads: 0.into(),
+        })
+    };
+    let open = |options: &ExecutionOptions| {
+        let packets = scan(access(), options);
+        let mut session = Par3RepairSession::new(
+            packets[0].input_set_id(),
+            Arc::new(MemorySourceAccess::default()),
+            options.clone(),
+        )
+        .unwrap();
+        for packet in packets {
+            session.merge(packet).unwrap();
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        session
+    };
+
+    assert_eq!(
+        options.diagnostics.caches(),
+        Default::default(),
+        "nothing has run yet"
+    );
+    let first = open(&options);
+    let one = options.diagnostics.caches();
+    assert!(
+        one.entries > 0 && one.bytes > 0,
+        "the Data admissions were not reported: {one:?}"
+    );
+
+    // A peer on the same diagnostics adds to the total rather than replacing it.
+    let second = open(&options);
+    let both = options.diagnostics.caches();
+    assert_eq!(
+        (both.entries, both.bytes),
+        (one.entries * 2, one.bytes * 2),
+        "two sessions did not sum: {one:?} then {both:?}"
+    );
+
+    // Ending one session takes back exactly that session's contribution.
+    drop(second);
+    assert_eq!(options.diagnostics.caches(), one, "the peer took too much");
+    drop(first);
+    assert_eq!(
+        options.diagnostics.caches(),
+        Default::default(),
+        "a finished session left a phantom cache behind"
+    );
+    assert_eq!(options.memory.used(), 0);
+}
