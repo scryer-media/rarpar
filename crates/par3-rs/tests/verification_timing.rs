@@ -14,6 +14,13 @@
 //!
 //! Every byte it measures comes from this crate's own creation engine. No PAR3
 //! packet is assembled or edited here.
+//!
+//! Unix only. The probe's denominator is process CPU time, which it reads
+//! through `getrusage`; there is no Windows equivalent in `libc`, and the
+//! numbers behind the gates were measured on this host regardless. Gating the
+//! whole file keeps `libc` off every Windows build of this crate's tests.
+#![cfg(unix)]
+
 mod common;
 
 use common::TempTree;
