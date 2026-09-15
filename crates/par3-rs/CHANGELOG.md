@@ -8,6 +8,12 @@
   never been told about them; a budget that cannot hold them now refuses with
   `EngineError::ResourceLimit` instead of allocating them.
 
+- A session alone on a budget, whose own admitted packets leave no room to
+  resolve them, is refused with `LimitCause::ExceedsLimit` rather than
+  `PeerContention`. There is no peer to wait for, so the refusal is terminal,
+  and a host told it was contention parked and retried forever. A refusal a
+  peer really is causing still reports `PeerContention`.
+
 ## 0.4.0 (unreleased)
 
 - Version: this release is `0.4.0`, not `0.3.2`. The entries below change public

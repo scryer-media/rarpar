@@ -540,6 +540,68 @@ fn a_resolution_a_peer_is_squeezing_out_is_contention_and_resolves_once_the_peer
     assert_eq!(shared.ledger().current(), 0);
 }
 
+/// PR #73 round 5, finding B. A session alone on a budget, whose own admitted
+/// packets leave no room to resolve them, used to be told `PeerContention` —
+/// the one cause the contract calls retryable — so a host parked on it and
+/// polled forever. There is no peer: the bytes in the way are its own, they are
+/// not going to be released by anything the host is waiting for, and the
+/// refusal is terminal. The ceiling a refusal is classified against is now the
+/// one this session would have *without peers*, which its own held packets come
+/// off, so this reads as terminal while a peer's bytes still read as contention
+/// (`a_resolution_a_peer_is_squeezing_out_is_contention_and_resolves_once_the_peer_leaves`
+/// is the other half of this pair).
+#[test]
+fn a_standalone_session_its_own_packets_squeeze_out_is_not_called_contention() {
+    let scan_options = ExecutionOptions::default();
+
+    // What this set costs end to end when nothing is in the way: the bytes its
+    // packets hold, and the peak resolving them reaches.
+    let solo = ExecutionOptions::default();
+    let mut probe = IncrementalSet::new(common::SET_ID, solo.clone()).unwrap();
+    for packet in packets(common::set_vol0_par3(), &scan_options) {
+        probe.merge(packet).unwrap();
+    }
+    let held = solo.memory.used();
+    assert!(probe.metadata().unwrap().is_some());
+    let solo_peak = solo.memory.peak();
+    drop(probe);
+    assert!(held > 0 && solo_peak > held);
+
+    // Room for the packets and half of what resolving them needs, and a
+    // retained ceiling far above both, so the only thing in the way is the
+    // session's own admitted packets.
+    let budget = MemoryBudget::new(held + (solo_peak - held) / 2);
+    let mut options = ExecutionOptions::default();
+    options.memory = budget.clone();
+    options.retained_bytes = 64 << 20;
+    let mut alone = IncrementalSet::new(common::SET_ID, options.clone()).unwrap();
+    for packet in packets(common::set_vol0_par3(), &scan_options) {
+        alone.merge(packet).unwrap();
+    }
+    assert!(
+        alone.retained_bytes() > 0,
+        "the session has to be holding its own packets for this to be its own doing"
+    );
+
+    let error = alone
+        .metadata()
+        .expect_err("half the resolution's peak is not enough to resolve");
+    let EngineError::ResourceLimit(limit) = error else {
+        panic!("a refused resolution must be a measured resource limit: {error:?}");
+    };
+    assert_ne!(
+        limit.cause(),
+        LimitCause::PeerContention,
+        "nothing else is on this budget, so no release can ever admit it: {limit}"
+    );
+    assert!(!limit.contended(), "{limit}");
+    assert_eq!(limit.cause(), LimitCause::ExceedsLimit, "{limit}");
+
+    drop(alone);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.ledger().current(), 0);
+}
+
 #[test]
 fn a_retained_ceiling_refusal_is_terminal_even_when_the_budget_is_untouched() {
     let scan_options = ExecutionOptions::default();
