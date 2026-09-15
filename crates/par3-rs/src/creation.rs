@@ -256,10 +256,22 @@ impl CreationPlan {
         let mut tails = BTreeMap::<(u64, Fingerprint), (u64, u64)>::new();
         let mut packing: Option<usize> = None;
         let mut reused = 0;
-        let mut names = BTreeMap::new();
+        // Keyed by the name a case-insensitive filesystem would see, holding
+        // the name it was given: two paths that differ only by case are one
+        // path on macOS and Windows, where the second file written would take
+        // the first one's place, so a set naming both is refused here rather
+        // than produced and then found unwritable on the way back out.
+        let mut names: BTreeMap<String, &str> = BTreeMap::new();
         for (source, snapshot) in sources.iter().zip(snapshots) {
-            if names.insert(source.name.clone(), ()).is_some() {
-                return Err(EngineError::InvalidState("duplicate creation path"));
+            if let Some(existing) = names.insert(
+                crate::paths::case_folded(&source.name),
+                source.name.as_str(),
+            ) {
+                return Err(if existing == source.name {
+                    EngineError::InvalidState("duplicate creation path")
+                } else {
+                    EngineError::InvalidState("creation paths differ only by letter case")
+                });
             }
             let mut reader = PlanningReader {
                 access: access.as_ref(),

@@ -313,6 +313,24 @@ pub fn validate_component(component: &str) -> Result<(), PathViolation> {
     check_component(component, component)
 }
 
+/// The key two paths share when a case-insensitive filesystem cannot tell them
+/// apart.
+///
+/// macOS and Windows both fold case by default, so `Readme` and `README` in one
+/// directory are one file there and the second thing written takes the first
+/// one's place. par3-rs refuses that pair everywhere rather than producing a set
+/// that installs correctly on one filesystem and silently loses a file on
+/// another.
+///
+/// The fold is Unicode lowercase, not the full case folding of UAX #44: it
+/// catches every ASCII collision and the common Unicode ones, and it never
+/// merges two names that differ by more than case. Where it and a filesystem
+/// disagree it is the stricter of the two.
+#[must_use]
+pub(crate) fn case_folded(path: &str) -> String {
+    path.to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

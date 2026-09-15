@@ -1,6 +1,7 @@
 //! Striped repair and verified installation for retained sessions.
 
 use crate::runtime::{EngineFile as File, ExecutionOptions, MemoryCategory, OpenBudgeted};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -138,8 +139,8 @@ fn repair_inner(
     // second file surfaces only after the first has been staged, and the host
     // sees `RepairInterrupted` with a temporary left on disk where it should
     // see a bare `UnsafePath` saying this set can never be written here.
-    // The destinations cost one path each, which the `path_cost` reservation
-    // above already covers four times over.
+    // The destinations cost one path each, and the fold below one more, which
+    // the `path_cost` reservation above already covers four times over.
     let mut destinations = Vec::with_capacity(
         assessment
             .files
@@ -147,6 +148,7 @@ fn repair_inner(
             .filter(|file| !file.complete)
             .count(),
     );
+    refuse_case_folded_destinations(&assessment.files)?;
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
             continue;
@@ -840,6 +842,29 @@ fn verify_staged(
 /// ones set creation applies, and the same on every platform; what remains
 /// here is the part that must consult the filesystem, which is the refusal to
 /// follow a symbolic link out of `base`.
+/// Refuse a set whose paths a case-insensitive filesystem cannot tell apart.
+///
+/// macOS and Windows fold case by default, so `Readme` and `README` in one
+/// directory are one file there and the second output written takes the first
+/// one's place. Every file is checked, complete or not: one already whole on
+/// disk is just as lost if another file's output lands on its name. Only a pair
+/// that would actually be written is refused, and like every other destination
+/// rule this is settled before anything is staged, so the host sees a bare
+/// refusal rather than a half-finished repair.
+fn refuse_case_folded_destinations(files: &[crate::session::AssessedFile]) -> EngineResult<()> {
+    let mut folded: HashMap<String, usize> = HashMap::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        if let Some(first) = folded.insert(crate::paths::case_folded(&file.path), index)
+            && (!files[first].complete || !file.complete)
+        {
+            return Err(EngineError::InvalidState(
+                "repair destinations differ only by letter case",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult<PathBuf> {
     crate::paths::validate_relative_path(relative)?;
     let mut path = base.to_path_buf();
@@ -1270,5 +1295,49 @@ mod charge_tests {
             assert_eq!(options.memory.used(), 0);
             assert_eq!(options.memory.ledger().current(), 0);
         }
+    }
+    /// PR #73 round 4, finding D. Repair resolves every destination before it
+    /// stages anything, and a pair of set paths a case-insensitive filesystem
+    /// cannot tell apart is refused there: the second output written would take
+    /// the first one's place. No official set names such a pair and this
+    /// crate's own creation now refuses to write one, so the rule is exercised
+    /// on the assessment the preflight reads.
+    #[test]
+    fn destinations_that_differ_only_by_letter_case_are_refused() {
+        let assessed = |path: &str, complete: bool| crate::session::AssessedFile {
+            path: path.to_owned(),
+            source: None,
+            complete,
+            verified_prefix: 0,
+            unresolved: Vec::new(),
+        };
+
+        refuse_case_folded_destinations(&[assessed("a/Readme", false), assessed("a/notes", false)])
+            .expect("two names that share nothing");
+        refuse_case_folded_destinations(&[
+            assessed("one/Readme", false),
+            assessed("two/README", false),
+        ])
+        .expect("one spelling in two directories is two paths");
+
+        let error = refuse_case_folded_destinations(&[
+            assessed("a/Readme", false),
+            assessed("a/README", false),
+        ])
+        .expect_err("two outputs would be written to one file");
+        assert!(
+            matches!(error, EngineError::InvalidState(reason) if reason.contains("letter case")),
+            "refused for the wrong reason: {error}"
+        );
+
+        // A file already whole on disk is just as lost if another file's output
+        // lands on its name.
+        refuse_case_folded_destinations(&[assessed("a/Readme", true), assessed("a/README", false)])
+            .expect_err("an output would land on a file that is already whole");
+
+        // Two files that are both complete are written nowhere, so nothing is
+        // at risk and the repair is not refused for a collision it never makes.
+        refuse_case_folded_destinations(&[assessed("a/Readme", true), assessed("a/README", true)])
+            .expect("nothing is staged, so nothing collides");
     }
 }

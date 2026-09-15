@@ -1044,9 +1044,11 @@ impl IncrementalSet {
         use crate::packet::PacketBody;
         let mut has_start = false;
         let mut has_root = false;
-        // What resolution allocates before the tree is walked: one clone of each
-        // retained body plus the maps that index them, measured from the
-        // packets that exist rather than from a multiple of their wire length.
+        // What resolution allocates before the tree is walked: the one copy of
+        // each retained body it is handed, which `build` moves into whatever
+        // keeps it rather than cloning, plus the maps that index them, measured
+        // from the packets that exist rather than from a multiple of their wire
+        // length.
         let mut working = RESOLUTION_BASE_BYTES;
         let mut entry_cost = 1024usize;
         for packet in self.packets.values().filter_map(IngestedPacket::metadata) {

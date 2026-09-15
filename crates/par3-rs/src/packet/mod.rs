@@ -449,6 +449,35 @@ impl Packet {
         self.body
     }
 
+    /// Take a packet apart into the header fields and the body it owns.
+    ///
+    /// The counterpart of [`Self::from_parts`]. Resolution uses the pair to
+    /// move a body out of the packet that carried it and, for the few types it
+    /// retains whole, to put the packet back together again, instead of
+    /// cloning a body it already owns.
+    pub(crate) fn into_parts(self) -> (InputSetId, Fingerprint, u64, PacketBody) {
+        (self.input_set_id, self.hash, self.length, self.body)
+    }
+
+    /// Rebuild a packet from the parts [`Self::into_parts`] handed out.
+    ///
+    /// The header hash and length are the ones the packet was read with, not
+    /// recomputed from the body: a packet that round-trips through this pair
+    /// writes back the bytes it arrived as, exactly as it did before.
+    pub(crate) fn from_parts(
+        input_set_id: InputSetId,
+        hash: Fingerprint,
+        length: u64,
+        body: PacketBody,
+    ) -> Self {
+        Self {
+            input_set_id,
+            hash,
+            length,
+            body,
+        }
+    }
+
     /// Serialise the complete packet, header included.
     ///
     /// A packet read from a file writes back byte for byte.

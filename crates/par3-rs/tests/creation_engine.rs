@@ -589,3 +589,46 @@ fn creation_refuses_a_name_repair_would_refuse_to_write() {
         .map(|_| ())
         .unwrap();
 }
+
+/// PR #73 round 4, finding D. The engine's own creation plan refuses the same
+/// case-folded collision the file-based `create` refuses: on macOS and Windows
+/// `Readme` and `README` are one file, and a set naming both could never be
+/// repaired back onto the filesystem it came from.
+#[test]
+fn two_creation_paths_that_differ_only_by_letter_case_are_refused() {
+    let plan_for = |names: [&str; 2]| {
+        let mut access = MemorySourceAccess::default();
+        let sources: Vec<CreationSource> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let source = SourceId(index as u64);
+                access.insert(source, 1, data().into());
+                CreationSource {
+                    name: (*name).to_owned(),
+                    source,
+                }
+            })
+            .collect();
+        let options = CreationOptions {
+            block_size: 1024,
+            recovery_count: 1,
+            ..CreationOptions::default()
+        };
+        CreationPlan::build(Arc::new(access), &sources, options).map(|_| ())
+    };
+
+    let error = plan_for(["a/Readme", "a/README"])
+        .expect_err("two outputs would be written to one file on a case-insensitive filesystem");
+    assert!(
+        matches!(&error, EngineError::InvalidState(reason) if reason.contains("letter case")),
+        "refused for the wrong reason: {error}"
+    );
+    // The exact duplicate keeps its own, older refusal.
+    let error = plan_for(["a/Readme", "a/Readme"]).expect_err("one name twice is still refused");
+    assert!(
+        matches!(&error, EngineError::InvalidState(reason) if *reason == "duplicate creation path"),
+        "the exact-duplicate refusal changed: {error}"
+    );
+    plan_for(["one/Readme", "two/README"]).expect("one spelling in two directories is two paths");
+}

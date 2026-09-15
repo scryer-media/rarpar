@@ -828,43 +828,15 @@ impl Par3RepairSession {
                         .filter_map(|index| usable[index].clone()),
                 );
             }
-            // What the host has already asked for does not need asking for
-            // again, so a reassessment after a recovery-only merge advances the
-            // plan instead of restating it.
-            let claimed = |index: &u64| {
-                usable.get(index).is_some_and(Option::is_some)
-                    || in_flight.is_some_and(|set| set.contains(index))
-            };
             let ceiling = geometry.capacity.saturating_mul(geometry.cohorts);
-            // Only an index this matrix could ever carry counts against what is
-            // still outstanding. An index at or past the capacity ceiling can
-            // never arrive and can never appear in `next_indices`, so counting
-            // it would cancel a requirement the host still has to satisfy and
-            // leave it with `outstanding` zero and nothing to fetch.
-            //
-            // Such an index is ignored here, not dropped from the set: the
-            // recorded indices are the host's own declaration and are charged
-            // against its retained budget, and only `forget_recovery_in_flight`
-            // retracts them. Removing one here would take back state the host
-            // never retracted and break the pairing the charge depends on.
-            let pending = in_flight.map_or(0, |set| {
-                set.iter()
-                    .filter(|index| {
-                        **index < ceiling
-                            && *index % geometry.cohorts == cohort
-                            && !usable.get(index).is_some_and(Option::is_some)
-                    })
-                    .count() as u64
-            });
-            let outstanding = additional.saturating_sub(pending);
-            let mut next_indices = Vec::with_capacity(outstanding as usize);
-            let mut index = cohort;
-            while next_indices.len() as u64 != outstanding && index < ceiling {
-                if !claimed(&index) {
-                    next_indices.push(index);
-                }
-                index = index.saturating_add(geometry.cohorts);
-            }
+            let (pending, outstanding, next_indices) = cohort_demand(
+                &usable,
+                in_flight,
+                cohort,
+                geometry.cohorts,
+                ceiling,
+                additional,
+            );
             requirements.push(RecoveryRequirement {
                 matrix: winner,
                 cohort,
@@ -1502,6 +1474,56 @@ impl Drop for Par3RepairSession {
     }
 }
 
+/// What one cohort still needs: how much of it is already on its way, how much
+/// the host must still be asked for, and which indices to ask for.
+///
+/// `usable` holds one row per recovery index that has arrived for this matrix:
+/// `Some` when one payload claimed it, `None` when several did and contradicted
+/// each other. A `None` row has arrived as surely as a `Some` one and can never
+/// become usable — nothing sent under that index will settle payloads that
+/// already disagree — so it is never offered again and never counted as still
+/// in flight. The requirement it cannot fill is made up at another index.
+///
+/// What the host has already asked for does not need asking for again either,
+/// so a reassessment after a recovery-only merge advances the plan instead of
+/// restating it.
+///
+/// Only an index this matrix could ever carry counts against what is still
+/// outstanding. An index at or past `ceiling` can never arrive and can never
+/// appear in the offered indices, so counting it would cancel a requirement the
+/// host still has to satisfy and leave it with `outstanding` zero and nothing
+/// to fetch. Such an index is ignored here, not dropped: the recorded indices
+/// are the host's own declaration and are charged against its retained budget,
+/// and only `forget_recovery_in_flight` retracts them. Removing one here would
+/// take back state the host never retracted and break the pairing the charge
+/// depends on.
+fn cohort_demand(
+    usable: &BTreeMap<u64, Option<PayloadRef>>,
+    in_flight: Option<&std::collections::BTreeSet<u64>>,
+    cohort: u64,
+    cohorts: u64,
+    ceiling: u64,
+    additional: u64,
+) -> (u64, u64, Vec<u64>) {
+    let arrived = |index: &u64| usable.contains_key(index);
+    let claimed = |index: &u64| arrived(index) || in_flight.is_some_and(|set| set.contains(index));
+    let pending = in_flight.map_or(0, |set| {
+        set.iter()
+            .filter(|index| **index < ceiling && *index % cohorts == cohort && !arrived(index))
+            .count() as u64
+    });
+    let outstanding = additional.saturating_sub(pending);
+    let mut next_indices = Vec::with_capacity(outstanding as usize);
+    let mut index = cohort;
+    while next_indices.len() as u64 != outstanding && index < ceiling {
+        if !claimed(&index) {
+            next_indices.push(index);
+        }
+        index = index.saturating_add(cohorts);
+    }
+    (pending, outstanding, next_indices)
+}
+
 fn cauchy_recovery_capacity(range: BlockRange, count: u64, field_size: u64) -> EngineResult<u64> {
     let covered = block_range(range, count)?;
     // Columns retain their absolute block indices. Recovery row r uses
@@ -1891,5 +1913,53 @@ mod tests {
         ] {
             assert!(cauchy_recovery_capacity(range, 250, 256).is_err());
         }
+    }
+    /// PR #73 round 4, finding E. `usable_recovery` records `None` for an index
+    /// several payloads claimed and contradicted each other on. That row had
+    /// counted as unclaimed, so the plan offered the index again — asking the
+    /// host for something no payload it can send will ever settle — and counted
+    /// an in-flight copy of it as still on its way, cancelling a requirement
+    /// that still had to be met somewhere else.
+    #[test]
+    fn a_recovery_index_whose_payloads_conflict_is_never_offered_again() {
+        let mut usable: BTreeMap<u64, Option<PayloadRef>> = BTreeMap::new();
+        // Index 0 arrived twice and the copies disagreed: permanently unusable.
+        usable.insert(0, None);
+
+        let (pending, outstanding, next) = cohort_demand(&usable, None, 0, 1, 8, 2);
+        assert_eq!(pending, 0, "nothing was declared in flight");
+        assert_eq!(outstanding, 2, "two blocks are still needed");
+        assert!(
+            !next.contains(&0),
+            "the conflicted index was offered again: {next:?}"
+        );
+        assert_eq!(next, vec![1, 2], "the plan did not move past the bad row");
+
+        // The same index, also declared in flight: it has arrived, so it is not
+        // pending, and the requirement it cannot fill is made up elsewhere.
+        let declared: std::collections::BTreeSet<u64> = [0u64].into_iter().collect();
+        let (pending, outstanding, next) = cohort_demand(&usable, Some(&declared), 0, 1, 8, 2);
+        assert_eq!(
+            pending, 0,
+            "an index that already arrived is not still coming"
+        );
+        assert_eq!(outstanding, 2, "the conflicted row cancelled a requirement");
+        assert_eq!(next, vec![1, 2]);
+
+        // An index that has not arrived and is in flight still counts as one
+        // the host is already fetching, and is not asked for twice.
+        let coming: std::collections::BTreeSet<u64> = [3u64].into_iter().collect();
+        let (pending, outstanding, next) = cohort_demand(&usable, Some(&coming), 0, 1, 8, 2);
+        assert_eq!(pending, 1);
+        assert_eq!(outstanding, 1);
+        assert_eq!(
+            next,
+            vec![1],
+            "an index already on its way was asked for again"
+        );
+
+        // Cohorts still stride: with two of them, cohort 1 offers odd indices.
+        let (_, _, next) = cohort_demand(&BTreeMap::new(), None, 1, 2, 8, 3);
+        assert_eq!(next, vec![1, 3, 5]);
     }
 }

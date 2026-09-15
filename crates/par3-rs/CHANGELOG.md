@@ -100,6 +100,29 @@
   existing worker-narrowing diagnostic). A budget that admitted a pool could
   otherwise take the memory the stripe headers needed and refuse a repair that
   fits serially, so a larger budget could fail where a smaller one succeeded.
+- A Root packet is charged for the duplicate-name check the tree walk runs on
+  its children. The walk checks the root's children before it checks anything
+  else, and that set is as large as the one a directory of the same width
+  builds, but only `Directory` was charged for it.
+- Resolving a set moves each parsed body out of the packet that carried it
+  instead of cloning it. Every File, Directory, External Data, Root, matrix and
+  option packet used to exist twice for the length of the resolution — once in
+  the packet list and once in the set being built — while the budget was told
+  about one copy, so a set resolved close to its ceiling peaked above what it
+  had reserved.
+- Creation and repair refuse two paths in one set that differ only by letter
+  case. `Readme` and `README` are distinct names in a PAR3 set but one file on
+  macOS's default filesystem and on Windows, where the second would silently
+  clobber the first; both are now refused up front, on every platform, so a set
+  created here is installable everywhere. Creation reports it as a
+  `Par3Error::CreateInput` (or `EngineError::InvalidState` through
+  `CreationPlan`) naming the case collision, and a repair is refused before any
+  destination is staged.
+- A recovery index whose payloads conflict is never offered again. Two
+  different payloads claiming one index leave that index unusable for the rest
+  of the session, but it used to look unclaimed to the next-index search, which
+  handed the host an index it could never satisfy while a usable one went
+  unasked for.
 
 - Store a contiguous protected chunk mapping as a run (file, first block, block
   count, byte offset) instead of one materialised extent per block, and expand a
