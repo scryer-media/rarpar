@@ -327,6 +327,7 @@ fn copy_available(
         .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
+    let mut copied = false;
     for (block, locations) in layout.blocks() {
         if !locations
             .iter()
@@ -334,19 +335,12 @@ fn copy_available(
         {
             continue;
         }
+        copied = true;
         let mut offset = 0;
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
-            if offset != 0 {
-                // A block wider than the copy window is walked in windows, but
-                // each window covers a different part of it, so no byte is
-                // fetched twice. The extra walk is what costs, and that is what
-                // is counted; `reread_bytes` stays reserved for bytes genuinely
-                // fetched again.
-                session.options.diagnostics.note_stripe_pass();
-            }
             scatter(
                 &session.options,
                 layout,
@@ -357,6 +351,17 @@ fn copy_available(
             )?;
             progress.advance(take as u64);
             offset += take as u64;
+        }
+    }
+    // A block wider than the copy window is walked in windows, and each window
+    // covers a different part of it, so no byte is fetched twice: what costs is
+    // the extra walk. It is one walk over the copied blocks however many there
+    // are, so it is counted once here rather than once per block — taken inside
+    // the loop it reported N passes for a single extra pass over N blocks.
+    // `reread_bytes` stays reserved for bytes genuinely fetched again.
+    if copied {
+        for _ in 1..layout.block_size.div_ceil(size as u64) {
+            session.options.diagnostics.note_stripe_pass();
         }
     }
     Ok(())

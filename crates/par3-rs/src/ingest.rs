@@ -1229,7 +1229,20 @@ impl IncrementalSet {
         // Every refusal below is classified against this figure rather than the
         // contended one: a set that resolves alone must never be reported as
         // terminal merely because a peer holds memory at this instant.
-        let uncontended = retained_limit.min(self.options.memory.limit());
+        //
+        // "Alone" means without *peers*, not without this set's own packets:
+        // those are already admitted, they are not going to be released by
+        // anyone waiting, and a standalone session whose own retained packets
+        // fill the ceiling used to be told `PeerContention` — retryable — for a
+        // refusal no amount of waiting could ever lift. Its own held bytes come
+        // off the ceiling it is measured against, so that refusal now reads as
+        // terminal while a peer's bytes still read as contention.
+        let uncontended = retained_limit.min(
+            self.options
+                .memory
+                .limit()
+                .saturating_sub(self.retained_bytes()),
+        );
         let Some(extra) = ceiling.checked_sub(working) else {
             return Err(EngineError::budget_limit(
                 "resolved metadata",

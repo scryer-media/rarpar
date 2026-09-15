@@ -648,3 +648,109 @@ fn stripe_passes_over_a_block_are_passes_and_not_rereads() {
         admission.stripe_bytes
     );
 }
+
+/// PR #73 round 5, finding D again, at the second site. Round 5 fixed the pass
+/// counter in the reconstruction loop and left the copy loop — the one a repair
+/// with nothing lost takes, where every block is available from an alias — still
+/// counting a pass per block per window. A set with four blocks reported four
+/// times the passes a set with one block did, for the same walk.
+///
+/// The set here is two files with identical bytes under aligned deduplication,
+/// so every block of each is named by the other. Damaging one file loses
+/// nothing: the copy path stages it and fills it from its twin, in windows,
+/// because the block is wider than the copy window.
+#[test]
+fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, Deduplication};
+
+    let blocks = 4u64;
+    let block_size = 64u64 << 10;
+    let stripe = 4096usize;
+    let mut bytes = vec![0u8; (blocks * block_size) as usize];
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"PAR3 copy stripe passes");
+    hash.finalize_xof().fill(&mut bytes);
+
+    let mut creating = MemorySourceAccess::default();
+    creating.insert(SourceId(1), 1, bytes.clone().into());
+    creating.insert(SourceId(2), 1, bytes.clone().into());
+    let mut creation = CreationOptions {
+        block_size,
+        recovery_count: 0,
+        deduplication: Deduplication::Aligned,
+        ..CreationOptions::default()
+    };
+    creation.execution.workers = 1;
+    let tree = common::TempTree::new("copy-stripe-passes");
+    let plan = CreationPlan::build(
+        Arc::new(creating),
+        &[
+            CreationSource {
+                name: "original.bin".into(),
+                source: SourceId(1),
+            },
+            CreationSource {
+                name: "twin.bin".into(),
+                source: SourceId(2),
+            },
+        ],
+        creation,
+    )
+    .unwrap();
+    let id = plan.input_set_id();
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+
+    // Only the twin is damaged, and every block it loses survives in the
+    // original, so the repair copies rather than reconstructs.
+    let mut damaged = bytes.clone();
+    damaged[11] ^= 0x80;
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 2, bytes.clone().into());
+    access.insert(SourceId(2), 2, damaged.into());
+
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    options.stripe_bytes = stripe;
+    options.memory = MemoryBudget::new(64 << 20);
+    options.retained_bytes = 32 << 20;
+
+    let mut session = Par3RepairSession::new(id, Arc::new(access), options.clone()).unwrap();
+    session.bind_file("original.bin", SourceId(1)).unwrap();
+    session.bind_file("twin.bin", SourceId(2)).unwrap();
+    for path in &paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::Ready);
+    assert!(
+        assessment.lost_blocks.is_empty(),
+        "the damaged blocks must survive in the twin, or this is not the copy path"
+    );
+
+    let output = common::TempTree::new("copy-stripe-passes-out");
+    let report = session.repair(output.path(), false).unwrap();
+    assert_eq!(report.reconstructed_blocks, 0, "nothing was reconstructed");
+    assert_eq!(
+        std::fs::read(output.path().join("twin.bin")).unwrap(),
+        bytes,
+        "the copy did not reproduce the input"
+    );
+
+    let amplification = options.diagnostics.amplification();
+    let expected = block_size.div_ceil(stripe as u64) - 1;
+    println!(
+        "copying {blocks} blocks of {block_size} bytes in {stripe} byte windows: {} passes",
+        amplification.stripe_passes
+    );
+    assert_eq!(
+        amplification.stripe_passes,
+        expected,
+        "one walk over {blocks} blocks in {} windows is {expected} extra passes, not {} per block",
+        block_size.div_ceil(stripe as u64),
+        amplification.stripe_passes
+    );
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+}
