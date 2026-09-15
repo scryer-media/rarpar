@@ -426,6 +426,65 @@ fn unusable_inputs_and_settings_are_refused() {
     assert_eq!(first.files_written.len(), 1);
 }
 
+/// PR #73 round 5, finding C. `create` used to check its input names with the
+/// *reader's* rules alone, which are deliberately narrower than the writer's:
+/// they keep one unusable name from making a whole foreign set unreadable. That
+/// is the right rule for a set this crate is handed, and the wrong one for a set
+/// this crate is about to write — it let a create produce `con.txt`, a set whose
+/// own repair refuses to write it back on the platform that reserves the name.
+/// The session creator has always held its names against `paths`; this path now
+/// does too, so a name refused at one end is refused at the other.
+#[test]
+fn create_refuses_a_name_the_repair_writer_could_never_write() {
+    let tree = TempTree::new("create-unsafe-names");
+    tree.write("a.bin", &filler(31, 3000));
+    tree.write("con.txt", &filler(32, 3000));
+    tree.write("sub/deep.bin", &filler(33, 3000));
+    let options = CreateOptions::default().with_block_size(1024);
+
+    let attempt = |files: &[&str], stem: &str| {
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        create(
+            &InputSpec::new(tree.path(), &files),
+            &tree.path().join(stem),
+            &options,
+        )
+    };
+
+    // A `..` component never reaches the name table at all: the component walk
+    // refuses it first, and must go on doing so.
+    let error = attempt(&["../a.bin"], "parent.par3").expect_err("a `..` component");
+    assert!(
+        matches!(error, par3_rs::Par3Error::CreateInput { .. }),
+        "a `..` component is refused as an unusable input: {error:?}"
+    );
+
+    // A reserved device name is the one the reader accepts and the writer does
+    // not. It now stops here, carrying the writer's own verdict.
+    let error = attempt(&["con.txt"], "device.par3").expect_err("a reserved device name");
+    match error {
+        par3_rs::Par3Error::UnsafePath(violation) => {
+            assert_eq!(violation.component, "con.txt", "{violation}");
+            assert_eq!(
+                violation.rule,
+                par3_rs::PathRule::ReservedDevice,
+                "{violation}"
+            );
+        }
+        other => panic!("expected an unsafe-path refusal, got {other:?}"),
+    }
+    assert!(
+        !tree.path().join("device.par3").exists(),
+        "the refusal planned packets and wrote a set anyway"
+    );
+
+    // An ordinary nested name is untouched by any of this.
+    let report = attempt(&["sub/deep.bin", "a.bin"], "ordinary.par3").expect("ordinary names");
+    let set = Par3Set::from_packets_for(packets_written(&report), report.set_id).expect("a set");
+    let files: BTreeSet<&str> = set.files().iter().map(par3_rs::Par3File::path).collect();
+    assert_eq!(files, ["a.bin", "sub/deep.bin"].into_iter().collect());
+}
+
 // ---------------------------------------------------------------------------
 // 8. Directory trees
 // ---------------------------------------------------------------------------

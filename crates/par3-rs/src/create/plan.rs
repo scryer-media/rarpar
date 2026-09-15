@@ -41,6 +41,13 @@ pub(crate) struct PlannedFile {
 /// The rules are the ones this crate's *reader* enforces on the names it parses
 /// out of a packet, applied one component at a time, so nothing written here
 /// can fail to be read back.
+///
+/// The assembled name is then held against [`crate::paths`], the engine's
+/// write-side name-safety table, which is what the session creator already
+/// applies to every name it plans. The reader's rules alone let this path
+/// create a set naming a reserved device or a trailing-dot file — a name a
+/// repair would refuse to write on the platform that cannot hold it — so the
+/// set was creatable here and unrepairable there.
 pub(crate) fn relative_name(path: &Path) -> Result<String> {
     let refuse = |reason: String| -> Par3Error {
         Par3Error::CreateInput {
@@ -72,7 +79,9 @@ pub(crate) fn relative_name(path: &Path) -> Result<String> {
     if parts.is_empty() {
         return Err(refuse("names no file".to_owned()));
     }
-    Ok(parts.join("/"))
+    let name = parts.join("/");
+    crate::paths::validate_relative_path(&name)?;
+    Ok(name)
 }
 
 /// Order input files the way the reference implementation does before it
