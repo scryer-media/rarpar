@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+- An assessment charges the vectors its matrix selection builds — the winning
+  matrix's requirement list, each cohort's availability and next-index lists,
+  and the payload references it selects — before it builds them, from the
+  cohort, recovery and loss counts. They used to grow against a budget that had
+  never been told about them; a budget that cannot hold them now refuses with
+  `EngineError::ResourceLimit` instead of allocating them.
+
 ## 0.4.0 (unreleased)
 
 - Version: this release is `0.4.0`, not `0.3.2`. The entries below change public

@@ -54,6 +54,132 @@ fn damaged_session(options: &ExecutionOptions) -> Par3RepairSession {
     session
 }
 
+/// The bytes an assessment's matrix selection really holds: one requirement per
+/// cohort, and the two index lists each of them carries. Measured from the
+/// assessment a caller is handed, through capacities rather than lengths, so
+/// what is compared with the charge is what the allocator actually took.
+fn selection_live_bytes(assessment: &par3_rs::session::RepairAssessment) -> usize {
+    assessment
+        .requirements
+        .iter()
+        .map(|need| {
+            size_of::<par3_rs::session::RecoveryRequirement>()
+                + need.available.capacity() * size_of::<u64>()
+                + need.next_indices.capacity() * size_of::<u64>()
+        })
+        .sum()
+}
+
+/// A session over a multi-cohort set with `damage` blocks flipped, on `options`.
+fn cohort_session(
+    set: &common::ManyBlockSet,
+    damage: &[usize],
+    blocks_per_file: usize,
+    options: &ExecutionOptions,
+) -> Par3RepairSession {
+    let mut access = MemorySourceAccess::default();
+    for (index, (_, bytes)) in set.contents.iter().enumerate() {
+        let mut damaged = bytes.clone();
+        for block in damage {
+            let local = block.wrapping_sub(index * blocks_per_file);
+            if *block >= index * blocks_per_file && local < blocks_per_file {
+                damaged[local * 64 + 7] ^= 0x80;
+            }
+        }
+        access.insert(SourceId(index as u64 + 1), 2, damaged.into());
+    }
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+    for (index, (name, _)) in set.contents.iter().enumerate() {
+        session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+    }
+    // Scanning runs on its own ample budget, so the one under test carries only
+    // what the session itself holds.
+    let scanning = ExecutionOptions::default();
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &scanning) {
+            session.merge(packet).unwrap();
+        }
+    }
+    session
+}
+
+/// PR #73 round 5, finding A. The assessment's walk is charged before it runs
+/// and its result is charged from what was built, but the vectors in between —
+/// the winning matrix's requirement list, each cohort's availability and
+/// next-index lists, and the payload references it selects — were allocated
+/// against a budget that had never been told about them. They scale with the
+/// cohorts, the recovery indices and the losses, which is exactly the shape the
+/// memory contract prices.
+///
+/// Both halves are here: the charge covers the vectors the assessment hands
+/// back, and a budget that cannot hold them refuses instead of allocating them.
+#[test]
+fn the_assessment_charges_its_selection_vectors_before_it_builds_them() {
+    let tree = common::TempTree::new("selection-charge");
+    let blocks_per_file = 32;
+    let set = common::many_block_set(2, blocks_per_file, 3, 16, b"PAR3 selection charge", &tree);
+    let damage = [1usize, 2, 3, 4, 33, 34];
+
+    let mut roomy = ExecutionOptions::default();
+    roomy.workers = 1;
+    roomy.memory = MemoryBudget::new(64 << 20);
+    roomy.retained_bytes = 32 << 20;
+    let mut session = cohort_session(&set, &damage, blocks_per_file, &roomy);
+    let merged = roomy.memory.used();
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::Ready);
+    assert_eq!(
+        assessment.requirements.len(),
+        4,
+        "four cohorts must carry losses, or the vectors under test are trivial"
+    );
+    let live = selection_live_bytes(assessment);
+    let retained = roomy
+        .memory
+        .ledger()
+        .category(MemoryCategory::Assessment)
+        .current as usize;
+    let peak = roomy.memory.peak();
+    println!(
+        "selection holds {live} bytes; assessment retains {retained}; the budget peaked at {peak} \
+         with {merged} merged"
+    );
+    assert!(live > 0, "the selection built nothing to charge for");
+    // At the handover the ledger holds the surviving charge, the walk's working
+    // set and the selection's vectors at once, so the peak covers all three.
+    assert!(
+        peak >= merged + retained + live,
+        "the budget peaked at {peak}, below the {} bytes held at the handover",
+        merged + retained + live
+    );
+    drop(session);
+    assert_eq!(roomy.memory.used(), 0, "the session leaked");
+
+    // The same assessment on a budget that cannot hold what it measured. The
+    // vectors are not built and then regretted: the refusal is a measured
+    // resource limit, and the budget comes back to where the packets left it.
+    let mut tight = ExecutionOptions::default();
+    tight.workers = 1;
+    tight.memory = MemoryBudget::new(merged + 8192);
+    tight.retained_bytes = 32 << 20;
+    let mut session = cohort_session(&set, &damage, blocks_per_file, &tight);
+    let merged = tight.memory.used();
+    let error = session
+        .assess()
+        .expect_err("a budget with no room beyond the packets cannot assess");
+    assert!(
+        matches!(error, EngineError::ResourceLimit(_)),
+        "an assessment that does not fit must be refused, not allocated: {error:?}"
+    );
+    assert_eq!(
+        tight.memory.used(),
+        merged,
+        "the refused assessment left bytes reserved"
+    );
+    drop(session);
+    assert_eq!(tight.memory.used(), 0, "the refused session leaked");
+}
+
 #[test]
 fn a_verify_and_repair_returns_every_ledger_category_to_zero() {
     let options = ExecutionOptions::default();

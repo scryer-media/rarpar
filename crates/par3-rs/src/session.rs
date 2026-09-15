@@ -121,6 +121,15 @@ fn matrix_geometry(
     }))
 }
 
+/// The winning matrix, what it still needs, and the payloads it can already
+/// use, with the reservation that covers the vectors holding them.
+struct MatrixSelection {
+    charge: Reservation,
+    matrix: Option<Packet>,
+    requirements: Vec<RecoveryRequirement>,
+    recovery: Vec<PayloadRef>,
+}
+
 /// One file's current state in an assessment.
 #[derive(Clone, Debug)]
 pub struct AssessedFile {
@@ -702,7 +711,15 @@ impl Par3RepairSession {
                 lost.push(block);
             }
         }
-        let (matrix, requirements, recovery) = self.select_matrix(&layout, &lost)?;
+        // The selection's own vectors are charged inside `select_matrix`,
+        // before they are built, and that charge is held until the measured
+        // retained charge below has taken their place.
+        let MatrixSelection {
+            charge: selection,
+            matrix,
+            requirements,
+            recovery,
+        } = self.select_matrix(&layout, &lost)?;
         // Charge what survives, measured, and only then release the walk's
         // working set. Both exist at this instant and the ledger says so.
         let retained_bytes = assessment_retained_bytes(&files, &lost, &requirements, &recovery)
@@ -712,6 +729,7 @@ impl Par3RepairSession {
             .options
             .memory
             .reserve_as(MemoryCategory::Assessment, retained_bytes)?;
+        drop(selection);
         drop(scratch);
         let status = if files.iter().all(|file| file.complete) {
             RepairStatus::Complete
@@ -776,11 +794,15 @@ impl Par3RepairSession {
         &self.data_blocks
     }
 
-    fn select_matrix(
-        &self,
-        layout: &BlockLayout,
-        lost: &[u64],
-    ) -> EngineResult<(Option<Packet>, Vec<RecoveryRequirement>, Vec<PayloadRef>)> {
+    /// Pick the matrix that covers the losses most cheaply and build its
+    /// requirements.
+    ///
+    /// The returned [`Reservation`] covers the vectors returned beside it —
+    /// the requirement list, each cohort's availability and next-index lists,
+    /// and the selected payload references. It is computed from the cohort,
+    /// recovery and loss counts *before* any of them is allocated, and the
+    /// caller holds it until the measured retained charge replaces it.
+    fn select_matrix(&self, layout: &BlockLayout, lost: &[u64]) -> EngineResult<MatrixSelection> {
         let set = self.set.as_ref().expect("layout has a set");
         // Scoring never materialises a candidate. Only a deficit and an
         // identity cross from one iteration to the next, so two candidates'
@@ -813,7 +835,17 @@ impl Par3RepairSession {
             }
         }
         let Some((_, winner)) = best else {
-            return Ok(Default::default());
+            // No candidate: nothing is built, and the empty result is charged
+            // as the nothing it is.
+            return Ok(MatrixSelection {
+                charge: self
+                    .options
+                    .memory
+                    .reserve_as(MemoryCategory::Assessment, 0)?,
+                matrix: None,
+                requirements: Vec::new(),
+                recovery: Vec::new(),
+            });
         };
         let packet = set
             .matrix_packets()
@@ -829,6 +861,16 @@ impl Par3RepairSession {
         let (_charge, usable) = self.usable_recovery(set, packet.hash(), &geometry)?;
         let (_cohort_charge, losses) = self.losses_by_cohort(lost, geometry.cohorts)?;
         let in_flight = self.recovery_in_flight.get(&winner);
+        // Everything below this line is proportional to the cohort, recovery
+        // and loss counts, and until now none of it was priced: the vectors
+        // grew against a budget that did not know about them. The upper bound
+        // is taken first, and a budget that cannot hold it refuses here rather
+        // than after the allocation.
+        let selection = self.options.memory.reserve_as(
+            MemoryCategory::Assessment,
+            selection_bytes(losses.len(), usable.len(), lost.len())
+                .ok_or(EngineError::resource_limit("assessment selection"))?,
+        )?;
         let mut requirements = Vec::with_capacity(losses.len());
         let mut selected = Vec::new();
         for (cohort, count) in losses {
@@ -870,7 +912,12 @@ impl Par3RepairSession {
                 next_indices,
             });
         }
-        Ok((Some(packet.clone()), requirements, selected))
+        Ok(MatrixSelection {
+            charge: selection,
+            matrix: Some(packet.clone()),
+            requirements,
+            recovery: selected,
+        })
     }
 
     /// Lost blocks grouped by cohort, with the map charged for its lifetime.
@@ -1561,6 +1608,32 @@ pub(crate) fn block_range(range: BlockRange, count: u64) -> EngineResult<Range<u
     Ok(range.first..range.end)
 }
 
+/// Bytes the winning matrix's requirement vectors cost at their peak.
+///
+/// One `RecoveryRequirement` exists per cohort a loss falls in. Each carries an
+/// availability list, whose entries across every cohort are at most the usable
+/// recovery indices the matrix has, and a next-index list, whose entries across
+/// every cohort are at most the losses. Both are collected without a size hint,
+/// so doubling can leave each at twice its length plus the first allocation,
+/// which is what the factor of two and the per-cohort slack cover. The selected
+/// payload references are bounded by the losses the same way.
+fn selection_bytes(cohorts: usize, usable: usize, lost: usize) -> Option<usize> {
+    /// Entries a freshly grown `Vec` can hold beyond what was pushed into it.
+    const GROWTH_SLACK: usize = 4;
+    let grown = |entries: usize, width: usize| -> Option<usize> {
+        entries
+            .checked_mul(2)?
+            .checked_add(GROWTH_SLACK.checked_mul(cohorts.max(1))?)?
+            .checked_mul(width)
+    };
+    cohorts
+        .checked_mul(size_of::<RecoveryRequirement>())?
+        .checked_add(grown(usable, size_of::<u64>())?)?
+        .checked_add(grown(lost, size_of::<u64>())?)?
+        .checked_add(grown(lost, size_of::<PayloadRef>())?)?
+        .checked_add(256)
+}
+
 /// Bytes `assess` allocates while it runs and does not keep.
 ///
 /// Three things grow inside the walk. The loss vector takes one `u64` per lost
@@ -1649,6 +1722,59 @@ fn union(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod selection_charge_tests {
+    //! PR #73 round 5, finding A. The charge the matrix selection takes before
+    //! it builds anything has to be an upper bound on what it then builds, or
+    //! the budget is told a smaller number than the heap holds. The vectors are
+    //! built here exactly as `select_matrix` builds them — collected from
+    //! filtered iterators with no size hint, so the allocator's doubling is
+    //! what it would be there — and measured through their capacities.
+    use super::*;
+
+    #[test]
+    fn the_selection_charge_is_an_upper_bound_on_the_vectors_it_covers() {
+        for (cohorts, usable, lost) in [
+            (1usize, 0usize, 1usize),
+            (4, 16, 36),
+            (8, 256, 512),
+            (3, 5, 7),
+        ] {
+            let charge = selection_bytes(cohorts, usable, lost).expect("a representable bound");
+            let mut requirements: Vec<RecoveryRequirement> = Vec::with_capacity(cohorts);
+            let mut measured = 0usize;
+            for cohort in 0..cohorts {
+                let available: Vec<u64> = (0..usable as u64)
+                    .filter(|index| *index as usize % cohorts == cohort)
+                    .collect();
+                let next_indices: Vec<u64> = (0..lost as u64)
+                    .filter(|index| *index as usize % cohorts == cohort)
+                    .collect();
+                measured += available.capacity() * size_of::<u64>()
+                    + next_indices.capacity() * size_of::<u64>();
+                requirements.push(RecoveryRequirement {
+                    matrix: [0; 16],
+                    cohort: cohort as u64,
+                    cohorts: cohorts as u64,
+                    recovery_indices: 0..0,
+                    lost: 0,
+                    available,
+                    additional: 0,
+                    in_flight: 0,
+                    outstanding: 0,
+                    next_indices,
+                });
+            }
+            measured += requirements.capacity() * size_of::<RecoveryRequirement>();
+            assert!(
+                charge >= measured,
+                "{cohorts} cohorts over {usable} recovery indices and {lost} losses hold \
+                 {measured} bytes against a {charge} byte charge"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
