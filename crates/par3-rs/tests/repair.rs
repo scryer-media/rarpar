@@ -760,3 +760,100 @@ fn a_repaired_tree_verifies_the_same_way_the_repair_said_it_would() {
     );
     assert_eq!(report.plan().verify().files().len(), 3);
 }
+
+/// PR #73 finding 9. Whether a set can be written under an output directory is
+/// settled before any file is staged.
+///
+/// The parse-time name check is deliberately narrower than the writer's rule
+/// table — one unwritable name must not make a whole set unreadable — so a set
+/// this crate creates can legitimately carry a name the repair writer refuses.
+/// `con.txt` is such a name, and `create` writes it. Sorted, it is the second
+/// of the two files, so resolving destinations inside the staging loop stages
+/// `a.bin` first and then fails, handing the host a `RepairInterrupted` with a
+/// temporary on disk in place of the plain refusal the set deserves.
+#[test]
+fn an_unwritable_destination_is_refused_before_the_first_file_is_staged() {
+    use par3_rs::runtime::{EngineError, ExecutionOptions};
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    let tree = TempTree::new("unwritable-second-destination");
+    let contents = [("a.bin", filler(11, 3000)), ("con.txt", filler(12, 3000))];
+    for (name, bytes) in &contents {
+        tree.write(name, bytes);
+    }
+    let names: Vec<PathBuf> = contents
+        .iter()
+        .map(|(name, _)| PathBuf::from(name))
+        .collect();
+    let mut options = CreateOptions::default();
+    options.block_size = Some(1024);
+    options.recovery = RecoveryAmount::Blocks(4);
+    let report = create(
+        &InputSpec::new(tree.path(), &names),
+        &tree.path().join("set"),
+        &options,
+    )
+    .expect("the reader's own name rules accept `con.txt`");
+
+    // Both files damaged, so both are incomplete and both would be staged.
+    let mut access = MemorySourceAccess::default();
+    for (index, (_, bytes)) in contents.iter().enumerate() {
+        let mut damaged = bytes.clone();
+        damaged[100 + index] ^= 0x80;
+        access.insert(SourceId(index as u64 + 1), 1, damaged.into());
+    }
+    let packets = packets_of(&std::fs::read(&report.files_written[0]).unwrap());
+    let id = packets[0].input_set_id();
+    let execution = ExecutionOptions::default();
+    let mut session = Par3RepairSession::new(id, Arc::new(access), execution.clone()).unwrap();
+    for (index, (name, _)) in contents.iter().enumerate() {
+        session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+    }
+    for path in &report.files_written {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &execution) {
+            session.merge(packet).unwrap();
+        }
+    }
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::Ready);
+    let order: Vec<&str> = assessment
+        .files
+        .iter()
+        .filter(|file| !file.complete)
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        ["a.bin", "con.txt"],
+        "the unwritable name must not be first, or the test proves nothing"
+    );
+
+    let out = TempTree::new("unwritable-output");
+    let error = session
+        .repair(out.path(), false)
+        .expect_err("`con.txt` cannot be written on a platform that reserves it");
+    match &error {
+        EngineError::UnsafePath(violation) => {
+            assert_eq!(violation.component, "con.txt", "{violation}");
+            assert_eq!(
+                violation.rule,
+                par3_rs::PathRule::ReservedDevice,
+                "{violation}"
+            );
+        }
+        other => panic!("expected a bare unsafe-path refusal, got {other:?}"),
+    }
+
+    let left: Vec<PathBuf> = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the refused repair left {left:?} behind in the output directory"
+    );
+    drop(session);
+    assert_eq!(execution.memory.used(), 0, "the session leaked");
+}

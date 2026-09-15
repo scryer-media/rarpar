@@ -1,6 +1,6 @@
 //! Staged PAR-inside insertion without recompressing archive members.
 
-use crate::runtime::{EngineFile as File, OpenBudgeted};
+use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -88,13 +88,13 @@ impl InsertionPlan {
             .len
             .checked_add(protection_bytes)
             .and_then(|size| size.checked_add(footer.end - footer.start))
-            .ok_or(EngineError::ResourceLimit("embedded output length"))?;
+            .ok_or(EngineError::resource_limit("embedded output length"))?;
         let scratch_bytes = plan
             .requirements()
             .scratch_bytes
             .checked_add(protection_bytes)
             .and_then(|size| size.checked_add(plan.requirements().metadata_bytes))
-            .ok_or(EngineError::ResourceLimit("embedded scratch length"))?;
+            .ok_or(EngineError::resource_limit("embedded scratch length"))?;
         let requirements = InsertionRequirements {
             output_bytes,
             original_bytes: layout.snapshot().len,
@@ -139,7 +139,9 @@ impl InsertionPlan {
         // Admission before the first creation operation. Creation and final
         // verification independently admit their codec and metadata workspaces.
         let size = options.stripe_bytes.min(64 << 10);
-        let _memory = options.memory.reserve(size)?;
+        let _memory = options
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size)?;
         let mut buffer = vec![0; size];
         let carriers = match self
             .plan

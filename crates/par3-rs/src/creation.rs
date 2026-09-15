@@ -1,6 +1,6 @@
 //! Explicit advanced creation plans over stable source identities.
 
-use crate::runtime::{EngineFile as File, OpenBudgeted};
+use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -191,17 +191,20 @@ impl CreationPlan {
         let entry_bytes = sources
             .len()
             .checked_mul(64)
-            .ok_or(EngineError::ResourceLimit("creation source entries"))?;
+            .ok_or(EngineError::resource_limit("creation source entries"))?;
         if entry_bytes > options.execution.retained_bytes {
-            return Err(EngineError::ResourceLimit("creation source entries"));
+            return Err(EngineError::resource_limit("creation source entries"));
         }
-        let _entries = options.execution.memory.reserve(entry_bytes)?;
+        let _entries = options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::Caches, entry_bytes)?;
         let mut estimate = usize::try_from(options.recovery_count)
             .ok()
             .and_then(|n| n.checked_mul(128))
             .and_then(|n| n.checked_add(options.creator.len().checked_mul(4)?))
             .and_then(|n| n.checked_add(4096))
-            .ok_or(EngineError::ResourceLimit("creation plan"))?;
+            .ok_or(EngineError::resource_limit("creation plan"))?;
         let mut source_bytes = 0u64;
         let mut snapshots = Vec::with_capacity(sources.len());
         for source in sources {
@@ -213,27 +216,38 @@ impl CreationPlan {
                     offset: 0,
                 })?;
             let blocks = usize::try_from(snapshot.len.div_ceil(options.block_size))
-                .map_err(|_| EngineError::ResourceLimit("creation blocks"))?;
+                .map_err(|_| EngineError::resource_limit("creation blocks"))?;
             estimate = estimate
                 .checked_add(
                     blocks
                         .checked_mul(1024)
-                        .ok_or(EngineError::ResourceLimit("creation plan"))?,
+                        .ok_or(EngineError::resource_limit("creation plan"))?,
                 )
                 .and_then(|n| n.checked_add(source.name.len().checked_mul(16)?))
                 .and_then(|n| n.checked_add(2048))
-                .ok_or(EngineError::ResourceLimit("creation plan"))?;
+                .ok_or(EngineError::resource_limit("creation plan"))?;
             source_bytes = source_bytes
                 .checked_add(snapshot.len)
-                .ok_or(EngineError::ResourceLimit("creation source size"))?;
+                .ok_or(EngineError::resource_limit("creation source size"))?;
             snapshots.push(snapshot);
         }
         if estimate > options.execution.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained creation plan"));
+            return Err(EngineError::budget_limit(
+                "retained creation plan",
+                estimate,
+                options.execution.retained_bytes,
+                options.execution.retained_bytes,
+            ));
         }
-        let reservation = options.execution.memory.reserve(estimate)?;
+        let reservation = options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::Caches, estimate)?;
         let stripe = options.execution.stripe_bytes.min(64 << 10);
-        let _scratch = options.execution.memory.reserve(stripe)?;
+        let _scratch = options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::SourceScratch, stripe)?;
         let mut buffer = vec![0; stripe];
         let mut files = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
@@ -471,7 +485,7 @@ impl CreationPlan {
             scratch_bytes: options
                 .block_size
                 .checked_mul(options.recovery_count)
-                .ok_or(EngineError::ResourceLimit("recovery scratch size"))?,
+                .ok_or(EngineError::resource_limit("recovery scratch size"))?,
             metadata_bytes: 0,
             output_sizes: Vec::new(),
             field,
@@ -567,12 +581,16 @@ impl CreationPlan {
             .checked_add(88)
             .and_then(|size| size.checked_mul(self.options.recovery_count))
             .and_then(|size| size.checked_add(metadata_size))
-            .ok_or(EngineError::ResourceLimit("embedded packet bytes"))?;
+            .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
         self.files[0].packet.chunks[gap] = ChunkDescription::Unprotected {
             length: packet_bytes,
         };
         let size = self.options.execution.stripe_bytes.min(64 << 10);
-        let _memory = self.options.execution.memory.reserve(size)?;
+        let _memory = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size)?;
         let mut buffer = vec![0; size];
         let mut hash = FingerprintHasher::new();
         let mut feed = |source: SourceId, snapshot: SourceSnapshot| -> EngineResult<()> {
@@ -635,7 +653,7 @@ impl CreationPlan {
                 .try_fold(0u64, |total, chunk| {
                     total
                         .checked_add(chunk.length())
-                        .ok_or(EngineError::ResourceLimit("embedded file length"))
+                        .ok_or(EngineError::resource_limit("embedded file length"))
                 })?;
         Ok(packet_bytes)
     }
@@ -661,7 +679,7 @@ impl CreationPlan {
             .execution
             .stage(crate::runtime::Stage::Create)?;
         if self.options.execution.open_handles < 3 {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "creation requires three open handles",
             ));
         }
@@ -673,7 +691,7 @@ impl CreationPlan {
             .len()
             .checked_add(self.data_volumes.len())
             .and_then(|n| n.checked_add(1))
-            .ok_or(EngineError::ResourceLimit("output paths"))?;
+            .ok_or(EngineError::resource_limit("output paths"))?;
         let path_cost = stem
             .as_os_str()
             .len()
@@ -681,8 +699,12 @@ impl CreationPlan {
             .and_then(|n| n.checked_add(scratch_directory.as_os_str().len().checked_mul(2)?))
             .and_then(|n| n.checked_add(1024))
             .and_then(|n| n.checked_mul(output_count))
-            .ok_or(EngineError::ResourceLimit("output paths"))?;
-        let _paths = self.options.execution.memory.reserve(path_cost)?;
+            .ok_or(EngineError::resource_limit("output paths"))?;
+        let _paths = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, path_cost)?;
         let destinations: Vec<_> = self.output_paths(stem).collect();
         for destination in &destinations {
             match std::fs::symlink_metadata(destination) {
@@ -709,12 +731,12 @@ impl CreationPlan {
         if self.options.recovery_count != 0 {
             match self.options.codec {
                 CreationCodec::Cauchy => {
-                    let _field = self.options.execution.memory.reserve(
-                        if self.requirements.field.size == 2 {
-                            512 << 10
-                        } else {
-                            4096
-                        },
+                    // What building the field really peaks at, quoted by the
+                    // field itself rather than guessed, so creation and repair
+                    // refuse the same budget for the same set.
+                    let _field = self.options.execution.memory.reserve_as(
+                        MemoryCategory::CodecTables,
+                        crate::gf::construction_cost(&self.requirements.field),
                     )?;
                     match crate::gf::for_set(&self.requirements.field)? {
                         crate::gf::AnyField::Gf8(field) => {
@@ -778,7 +800,11 @@ impl CreationPlan {
             let temporary =
                 crate::session_repair::ScratchFile::new(destination, &self.options.execution)?;
             let buffer_size = self.options.execution.stripe_bytes.min(64 << 10);
-            let _output_buffer = self.options.execution.memory.reserve(buffer_size)?;
+            let _output_buffer = self
+                .options
+                .execution
+                .memory
+                .reserve_as(MemoryCategory::OutputStaging, buffer_size)?;
             let file = OpenOptions::new()
                 .write(true)
                 .open_budgeted(temporary.path(), &self.options.execution)?;
@@ -850,7 +876,7 @@ impl CreationPlan {
                         authenticated_end = origin
                             .offset
                             .checked_add(origin.length)
-                            .ok_or(EngineError::ResourceLimit("staged carrier length"))?;
+                            .ok_or(EngineError::resource_limit("staged carrier length"))?;
                     }
                     crate::ingest::ScanEvent::End => break,
                     crate::ingest::ScanEvent::NeedData { .. } => {
@@ -919,7 +945,7 @@ impl CreationPlan {
             .execution
             .stage(crate::runtime::Stage::Encode)?;
         let count = usize::try_from(self.options.recovery_count)
-            .map_err(|_| EngineError::ResourceLimit("Cauchy output count"))?;
+            .map_err(|_| EngineError::resource_limit("Cauchy output count"))?;
         let unit = F::SYMBOL_BYTES;
         let stripe = self
             .options
@@ -929,7 +955,9 @@ impl CreationPlan {
             .min(self.options.block_size as usize);
         let stripe = stripe / unit * unit;
         if stripe == 0 {
-            return Err(EngineError::ResourceLimit("minimum Cauchy encoding stripe"));
+            return Err(EngineError::resource_limit(
+                "minimum Cauchy encoding stripe",
+            ));
         }
         let batch = count.min(
             self.options
@@ -940,13 +968,13 @@ impl CreationPlan {
                 / (stripe + 64),
         );
         if batch == 0 {
-            return Err(EngineError::ResourceLimit("Cauchy encoding buffers"));
+            return Err(EngineError::resource_limit("Cauchy encoding buffers"));
         }
         let _memory = self
             .options
             .execution
             .memory
-            .reserve(batch * (stripe + 64) + stripe)?;
+            .reserve_as(MemoryCategory::CodecScratch, batch * (stripe + 64) + stripe)?;
         let mut rows = vec![vec![0; stripe]; batch];
         let mut bytes = vec![0; stripe];
         for first in (0..count).step_by(batch) {
@@ -991,7 +1019,11 @@ impl CreationPlan {
         mut read: impl FnMut(u64, &mut [u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
         let size = self.options.execution.stripe_bytes.min(64 << 10);
-        let _buffer = self.options.execution.memory.reserve(size + 512)?;
+        let _buffer = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size + 512)?;
         let mut bytes = vec![0; size];
         let mut header = PacketHeader {
             hash: [0; 16],
@@ -1162,7 +1194,7 @@ impl CreationPlan {
         if let VolumeLayout::SizeLimited(bytes) = self.options.volumes
             && bytes < self.requirements.metadata_bytes
         {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "volume limit is smaller than metadata",
             ));
         }
@@ -1191,7 +1223,7 @@ impl CreationPlan {
                 .options
                 .block_size
                 .checked_add(extra)
-                .ok_or(EngineError::ResourceLimit("payload packet size"))?;
+                .ok_or(EngineError::resource_limit("payload packet size"))?;
             let cap = match self.options.volumes {
                 VolumeLayout::Variable => u64::MAX,
                 VolumeLayout::Uniform(count) => count,
@@ -1200,7 +1232,7 @@ impl CreationPlan {
                 }
             };
             if cap == 0 && remaining != 0 {
-                return Err(EngineError::ResourceLimit(
+                return Err(EngineError::resource_limit(
                     "volume cannot hold one payload packet",
                 ));
             }
@@ -1219,9 +1251,9 @@ impl CreationPlan {
                         .checked_add(
                             packet
                                 .checked_mul(count)
-                                .ok_or(EngineError::ResourceLimit("volume size"))?,
+                                .ok_or(EngineError::resource_limit("volume size"))?,
                         )
-                        .ok_or(EngineError::ResourceLimit("volume size"))?,
+                        .ok_or(EngineError::resource_limit("volume size"))?,
                 );
                 first += count;
                 remaining -= count;
@@ -1232,18 +1264,13 @@ impl CreationPlan {
     }
 }
 
+/// Refuse a source name the engine would later refuse to repair.
+///
+/// This is the same rule table the repair destination applies, run before a
+/// byte of the set is produced, so par3-rs never writes a set it would have to
+/// refuse on the way back out.
 fn validate_name(name: &str) -> EngineResult<()> {
-    if name.is_empty()
-        || name.split('/').any(|part| {
-            part.is_empty()
-                || part == "."
-                || part == ".."
-                || part.contains(['\\', ':', '\0'])
-                || part.len() > u16::MAX as usize
-        })
-    {
-        return Err(EngineError::InvalidState("invalid creation path"));
-    }
+    crate::paths::validate_relative_path(name)?;
     Ok(())
 }
 fn suffix(stem: &Path, suffix: &str) -> PathBuf {
@@ -1304,13 +1331,14 @@ fn find_shift(
 ) -> EngineResult<Option<u64>> {
     use crate::placement::SlidingCrc;
     let window = usize::try_from(size)
-        .map_err(|_| EngineError::ResourceLimit("sliding deduplication window"))?;
+        .map_err(|_| EngineError::resource_limit("sliding deduplication window"))?;
     let stripe = options.stripe_bytes.min(64 << 10);
-    let _memory = options.memory.reserve(
+    let _memory = options.memory.reserve_as(
+        MemoryCategory::Caches,
         window
             .checked_add(stripe)
             .and_then(|n| n.checked_add(4096))
-            .ok_or(EngineError::ResourceLimit("sliding deduplication buffers"))?,
+            .ok_or(EngineError::resource_limit("sliding deduplication buffers"))?,
     )?;
     let mut ring = vec![0; window];
     let mut input = vec![0; stripe];

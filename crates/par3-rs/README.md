@@ -16,7 +16,7 @@ clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
-par3-rs = "0.3"
+par3-rs = "0.4"
 ```
 
 ## Choose an API
@@ -182,6 +182,109 @@ engine accounting; it is not a process-RSS limit. Out-of-order verification
 drops incomplete hash work when its budget is exhausted, leaving those extents
 unknown for later reading.
 
+Every reservation names what it is for. `MemoryBudget::ledger()` returns a
+snapshot giving each `MemoryCategory` — carrier and packet storage, resolved
+metadata, layout and evidence, assessment state, caches, queued payloads, codec
+tables, codec scratch, source scratch, worker stacks and output staging — its
+current and peak reserved bytes and how many reservations it has taken. Reading
+the ledger allocates nothing and takes no lock, so a host may sample it from
+another thread while a job runs. Anything the engine reserves without naming a
+category is reported under `Uncategorized`; that count is zero on the verify,
+repair and creation paths.
+
+A refusal says whether it could ever have succeeded.
+`EngineError::ResourceLimit` carries `what`, `need`, `limit` and `available`,
+and `ResourceLimit::cause()` separates two outcomes a host must treat
+differently. `ExceedsLimit` means this request would still be refused if the
+session were alone on the budget with the same options, so no amount of waiting
+helps. `PeerContention` means that with the same options this exact request is
+admitted once other reservations release — those may belong to a peer session
+or to this session's own earlier reservations, and only the host knows which.
+`Unmeasured` covers refusals that were never expressed in bytes at all — no
+need and no ceiling — and is terminal like `ExceedsLimit`; a refusal measured
+against a ceiling of zero keeps its figures and classifies as `ExceedsLimit`. A host queues `PeerContention` and reports the other two as
+terminal. Refusals against a per-session ceiling — `retained_bytes` and the
+limits derived from it — report the session's total demand rather than the
+increment that tripped them, so they classify as terminal, which is what they
+are: nothing else draws on that ceiling.
+
+Each stage of a repair holds a bounded set and releases what its consumer is
+finished with before the next stage charges its own. On a 16,384-block set the
+retained total across all categories is about 54 bytes per block: 24.3 for
+carrier and packet storage, 28.1 for resolved metadata, 0.8 for the layout and
+its verification evidence, and 0.4 for assessment state. Peak working memory is
+reported separately and reaches about 110 bytes per block on the same run, while
+metadata resolution holds the carriers and the set it is building at once.
+Assessment takes a scratch reservation while it accumulates coverage and
+per-cohort deficits, releases it at the handover, and retains only what the
+result's own containers measure — so what survives assessment follows files and
+losses, not the block count. The layout is charged from its containers'
+capacities and trued up to the built layout's measurement.
+
+A contiguous protected chunk is stored as a run — file, first block, block
+count, byte offset — and extents are expanded on demand, so the layout no longer
+follows the block count. Described tails, inline tail bytes, unprotected ranges
+and blocks named by more than one extent are the exceptions, stored and charged
+individually. Whole-block extents report the set's authenticated checksums
+through shared ownership instead of copying a fingerprint and CRC64 per extent,
+and the set stores those checksums as sorted runs rather than an ordered-map
+node per block. Verdicts are packed two bits to an extent. Nothing about what a
+layout or a verdict means changed, and the evidence checkpoint format is
+unchanged and replays across the representation change. Carrier bytes and
+verification evidence deliberately outlive the stages that produced them,
+because carrier regeneration and reassessment read them and dropping them would
+buy memory with extra passes over the source; `ExecutionDiagnostics::amplification()`
+reports those passes, the bytes genuinely fetched twice and the reconstructed
+bytes, so that trade can never be made invisibly.
+
+Parallel work is admitted, not assumed. Verification hashes one source across a
+private pool only when the source is at least 8 MiB, feeds that hash in updates
+of at least 1 MiB (combining adjacent protected extents into runs first), and
+holds the pool to at most four workers — measured on an 18-core host, four
+workers verify a 512 MiB source at 1.51x the serial wall time for 1.09x the CPU,
+while eighteen reach 1.23x for 4.0x. The verification buffer grows from 64 KiB
+to 1 MiB only when the budget admits the charge, under `SourceScratch`, and
+falls back rather than failing. Serial, parallel and constrained-memory
+verification produce identical evidence.
+
+An FFT decode charges a transform plan to `CodecScratch` and skips the stages of
+its final forward transform that would produce only rows nobody reads; the rows
+the caller reads are byte-identical either way. The plan is taken only where the
+cohort's rows are wide enough to pay for splitting one transform call into many.
+`ExecutionDiagnostics::codec()` reports transform calls, butterflies performed
+and skipped, multiply-accumulates, and the Cauchy code-matrix factors a repair
+computes — which measure at under half a percent of repair wall time on the
+corpus, so nothing caches them.
+
+Under pressure the engine narrows before it refuses — stripes, worker pools and
+verification batches are admitted at the width the budget actually has, and each
+narrowing is recorded in `ExecutionDiagnostics::waits()`. Widths are never found
+by halving a request until something fits. When even the minimum useful set does
+not fit, the stage returns one `ResourceLimit` and stops; there is no
+allocate-fail-wake loop, and the refusal is counted once by cause in
+`ExecutionDiagnostics::refusals()` at the session boundary the host sees.
+
+A recovery deficit leaves a resumable continuation. `RecoveryRequirement` adds
+`in_flight`, `outstanding` and `next_indices` alongside its existing fields;
+`Par3RepairSession::note_recovery_in_flight` declares the indices a host is
+fetching and `forget_recovery_in_flight` retracts them, so a reassessment after
+a recovery-only merge advances the acquisition plan rather than asking for the
+same indices again.
+
+Cauchy repair produces recovered rows in tiles, scattering each tile before
+producing the next, so the output row bank costs `(m + t)` stripes rather than
+`2m`. The tile width comes from admitted worker capacity, is reported as
+`ExecutionDiagnostics::admission().output_tile`, and changes neither the output
+bytes nor the number of writes.
+
+Metadata resolution is charged for what it allocates rather than for the
+ceiling it might have needed: packet decode, description resolution and
+directory expansion each take their bytes as they go, and what survives is the
+resolved set's measured container capacity, which
+`Par3Set::retained_capacity_bytes()` reports. Directory graphs are still bounded
+— the same packet may hang under many parents, so expansion is charged per
+entry and refused by name rather than by exhaustion.
+
 Windows scanning pins a read-only carrier handle, preventing repeated full-file
 generation hashes after one acquisition hash. Retained packets keep that handle
 alive; drop them before replacing or deleting carriers. All generation hashes
@@ -253,6 +356,21 @@ reference. The deviations affecting interpretation are:
 - **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
   fields too; member count alone is insufficient. Corpus recipes normalize
   those original ZIP fields before official insertion.
+- **Name rules (stricter than both):** the draft says nothing about reserved
+  device names, trailing spaces or dots, control bytes or a path length bound,
+  and the reference rewrites an unusable name in place and warns. This crate
+  refuses instead, at both ends. A name is refused if any `/`-separated
+  component is empty, `.`, `..`, longer than 255 bytes, contains `\\`, `:`, one
+  of the six characters Win32 forbids outright (`?`, `*`, `"`, `<`, `>`, `|`)
+  or an ASCII control byte, names a Windows character device (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the superscript ports
+  `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, case-insensitive, with or
+  without an extension) or ends in a space or a dot; if the whole path exceeds
+  4096 bytes; or if it is absolute, by a leading separator or a `X:` drive
+  prefix. Creation refuses such a name before producing the set, and repair
+  refuses such a destination before writing an output byte, with the same
+  verdict on every platform. A set produced elsewhere that carries such a name
+  still parses and still verifies; only writing it is refused.
 
 The [interoperability record](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/INTEROPERABILITY.md)
 documents reference verification and repair, including both fields, uneven

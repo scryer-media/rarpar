@@ -2,7 +2,7 @@
 mod common;
 
 use par3_rs::inside::{ContainerKind, ContainerLayout, ContainerLimits};
-use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget};
+use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget, ResourceLimit};
 use par3_rs::source::{MemorySourceAccess, SourceId};
 
 #[test]
@@ -331,9 +331,10 @@ fn replacement_cases(export: Option<&std::path::Path>) {
                     &excessive,
                     ContainerLimits::default()
                 ),
-                Err(EngineError::ResourceLimit(
-                    "replacement exceeds authenticated packet gap"
-                ))
+                Err(EngineError::ResourceLimit(ResourceLimit {
+                    what: "replacement exceeds authenticated packet gap",
+                    ..
+                }))
             ));
             let tree = common::TempTree::new(&format!("replacement-{kind:?}"));
             let destination = tree.path().join("replaced.archive");
@@ -520,6 +521,9 @@ fn inspection_refuses_trailing_data_damage_and_exhausted_budgets() {
             Err(EngineError::ResourceLimit(_))
         ));
         options.memory = MemoryBudget::new(16);
+        // A diagnostics handle reports the ledger of one budget, so a second
+        // budget gets its own handle; sharing them is refused as InvalidState.
+        options.diagnostics = par3_rs::runtime::ExecutionDiagnostics::default();
         assert!(matches!(
             ContainerLayout::inspect(&access, SourceId(1), &options, &ContainerLimits::default()),
             Err(EngineError::ResourceLimit(_))

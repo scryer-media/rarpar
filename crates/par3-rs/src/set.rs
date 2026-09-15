@@ -22,13 +22,15 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
+use crate::checksums::{BlockChecksums, BlockChecksumsBuilder};
 use crate::error::{Par3Error, Result};
 use crate::hash::{Fingerprint, FingerprintHasher, RollingHasher};
 use crate::packet::{
     BlockChecksum, ChunkDescription, ChunkTail, DataPacket, DirectoryPacket, FilePacket,
     GaloisField, InputSetId, Packet, PacketBody, PacketType, ParseContext, RecoveryDataPacket,
-    RecoveryExternalDataPacket, RootPacket, StartPacket,
+    RecoveryExternalDataPacket, RootPacket, StartPacket, btree_entry_bytes, hash_entry_bytes,
 };
 use crate::scan::ScanLimits;
 
@@ -269,6 +271,131 @@ impl RecoveryBlock {
     }
 }
 
+/// Somewhere to charge bytes as a set's directory tree is materialised.
+///
+/// Resolution is the one place in the engine whose output size is not a
+/// function of its input size: the same File or Directory packet may hang under
+/// many parents, so a small graph can expand into an arbitrarily large tree.
+/// [`SetLimits`] bounds that expansion in entries and path bytes, but the caller
+/// paying for the memory wants the bound expressed in bytes it has actually
+/// reserved. Implementors are handed each allocation's size before it is made
+/// and refuse by returning an error, which fails the whole resolution.
+pub(crate) trait ExpansionCharge {
+    /// Charge `bytes` before the allocation they pay for is made.
+    fn charge(&mut self, bytes: usize) -> Result<()>;
+}
+
+/// The charger used when nobody is paying: every public constructor.
+pub(crate) struct NoExpansionCharge;
+
+impl ExpansionCharge for NoExpansionCharge {
+    fn charge(&mut self, _bytes: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Fixed bytes one resolution holds beyond its packets: the dedup set's own
+/// table, the per-type maps' headers, and the walk's stack and frames.
+pub(crate) const RESOLUTION_BASE_BYTES: usize = 64 * 1024;
+
+/// Bytes charged for one resolved entry beyond its measured contents: the
+/// vector slot it occupies, the spare capacity a doubling vector keeps, and the
+/// transient overlap while a reallocation copies old slots into new ones.
+const ENTRY_SLOT_FACTOR: usize = 3;
+
+/// How many block checksums the External Data packets of `packets` describe.
+///
+/// External Data does not need the Start packet to read, so every packet that
+/// parsed at all carries its checksum count on its face and this pass is exact.
+/// One that failed to parse stays opaque, pushes nothing, and is counted as
+/// unknown instead.
+fn described_checksums(packets: &[Packet]) -> usize {
+    packets
+        .iter()
+        .filter_map(|packet| match packet.body() {
+            PacketBody::ExternalData(this) => Some(this.checksums.len()),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Bytes resolving one packet needs on top of the packet itself.
+///
+/// `build` takes each body it keeps out of the packet that carried it — it
+/// never holds two copies of one body — and indexes it by header hash, and it
+/// copies External Data checksums into ordered maps, so a packet costs more
+/// while it is being resolved than the bytes it arrived as.
+pub(crate) fn resolution_cost(packet: &Packet) -> usize {
+    let indexed = match packet.body() {
+        PacketBody::File(_) => hash_entry_bytes::<Fingerprint, FilePacket>(),
+        // A directory also pays for `check_names`, which builds a transient set
+        // holding one borrowed name per child while it looks for duplicates.
+        // It is gone by the time resolution ends, but it is live while the
+        // tree is being checked and has to be covered like anything else.
+        PacketBody::Directory(this) => hash_entry_bytes::<Fingerprint, DirectoryPacket>()
+            .saturating_add(this.children.len() * hash_entry_bytes::<&str, ()>()),
+        // The Root packet is not indexed by hash — the walk keeps the one it
+        // finds — but `TreeWalk::run` checks its children for duplicate names
+        // before it checks anything else, and that set is as large as the set a
+        // directory of the same width builds. It is the first allocation the
+        // walk makes, and it used to be the one nothing paid for.
+        PacketBody::Root(this) => this.children.len() * hash_entry_bytes::<&str, ()>(),
+        // Input-block checksums are collected as `(index, checksum)` pairs and
+        // then compacted into runs, so resolution holds the pair vector and the
+        // compact values at once rather than an ordered-map node per block.
+        // ... and one run descriptor per block, which is the worst case: a
+        // set whose described blocks are not contiguous collapses into no runs
+        // at all, and the descriptors were charged nowhere before.
+        PacketBody::ExternalData(this) => {
+            this.checksums.len()
+                * (size_of::<(u64, BlockChecksum)>()
+                    + size_of::<BlockChecksum>()
+                    + crate::checksums::RUN_BYTES)
+        }
+        PacketBody::RecoveryExternalData(this) => {
+            this.checksums.len() * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
+        }
+        PacketBody::RecoveryData(_) => size_of::<RecoveryBlock>() * ENTRY_SLOT_FACTOR,
+        // A packet whose type needs the Start packet is reparsed here, and the
+        // widest such body is a checksum list that also lands in an ordered map.
+        PacketBody::Opaque { packet_type, body } if PacketBody::needs_context(*packet_type) => {
+            body.capacity()
+                + (body.len() / size_of::<BlockChecksum>() + 1)
+                    * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
+        }
+        PacketBody::Opaque { .. } => hash_entry_bytes::<Fingerprint, Packet>(),
+        // The set keeps these two as text, and nothing guarantees a producer
+        // wrote valid UTF-8. Valid text moves into its `String` and costs
+        // nothing beyond the body already counted below; text that is not
+        // valid is decoded into a second buffer where every byte the
+        // replacement character stands in for costs three, beside the body it
+        // is decoded from. These packets are small, so the worst case is what
+        // is charged rather than a guess at the encoding.
+        PacketBody::Creator(this) => this.byte_len().saturating_mul(3),
+        PacketBody::Comment(this) => this.byte_len().saturating_mul(3),
+        _ => 0,
+    };
+    packet
+        .owned_bytes()
+        .saturating_add(indexed)
+        .saturating_add(hash_entry_bytes::<(u64, Fingerprint), ()>())
+        .saturating_add(size_of::<Packet>())
+}
+
+/// Decode a Creator or Comment body into the text a set carries.
+///
+/// Valid UTF-8 moves into the `String` without a copy, which is the whole
+/// point of taking the bytes by value: the wire copy and the text used to be
+/// live at once for every one of these packets. Text that is not valid is
+/// decoded lossily as before — a mis-encoded creator string must not cost a
+/// caller the rest of the set — and [`resolution_cost`] charges that case.
+fn text_of(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
 /// One PAR3 input set: everything that shares an InputSetID.
 ///
 /// # What a set does not tell you
@@ -286,7 +413,7 @@ pub struct Par3Set {
     root_hash: Fingerprint,
     files: Vec<Par3File>,
     directories: Vec<Par3Directory>,
-    block_checksums: BTreeMap<u64, BlockChecksum>,
+    block_checksums: Arc<BlockChecksums>,
     matrix_packets: Vec<Packet>,
     recovery_blocks: Vec<RecoveryBlock>,
     foreign_recovery_packets: Vec<RecoveryDataPacket>,
@@ -325,7 +452,7 @@ impl Par3Set {
         }
         grouped
             .into_iter()
-            .map(|(id, packets)| Self::build(id, packets, limits))
+            .map(|(id, packets)| Self::build(id, packets, limits, &mut NoExpansionCharge))
             .collect()
     }
 
@@ -347,10 +474,109 @@ impl Par3Set {
         if mine.is_empty() {
             return Err(Par3Error::UnknownInputSet { input_set_id });
         }
-        Self::build(input_set_id, mine, limits)
+        Self::build(input_set_id, mine, limits, &mut NoExpansionCharge)
     }
 
-    fn build(input_set_id: InputSetId, packets: Vec<Packet>, limits: &SetLimits) -> Result<Self> {
+    /// Resolve one named input set, charging every byte the directory walk
+    /// materialises to `charge` before it is allocated.
+    pub(crate) fn from_packets_for_charged(
+        packets: Vec<Packet>,
+        input_set_id: InputSetId,
+        limits: &SetLimits,
+        charge: &mut dyn ExpansionCharge,
+    ) -> Result<Self> {
+        let mine: Vec<Packet> = packets
+            .into_iter()
+            .filter(|packet| packet.input_set_id() == input_set_id)
+            .collect();
+        if mine.is_empty() {
+            return Err(Par3Error::UnknownInputSet { input_set_id });
+        }
+        Self::build(input_set_id, mine, limits, charge)
+    }
+
+    /// Bytes this resolved set's own structures hold, measured from real
+    /// container capacities rather than from the packets it was built from.
+    ///
+    /// This describes what exists, not a ceiling: it is what a caller holding a
+    /// reservation across the set's lifetime should be charged.
+    #[must_use]
+    pub fn retained_capacity_bytes(&self) -> usize {
+        let mut total = size_of::<Self>();
+        total += self.root.option_hashes.capacity() * size_of::<Fingerprint>();
+        total += self.root.children.capacity() * size_of::<Fingerprint>();
+
+        total += self.files.capacity() * size_of::<Par3File>();
+        for file in &self.files {
+            total += file.path.capacity() + file.packet.heap_bytes();
+        }
+        total += self.directories.capacity() * size_of::<Par3Directory>();
+        for directory in &self.directories {
+            total += directory.path.capacity() + directory.packet.heap_bytes();
+        }
+
+        total += self.block_checksums.capacity_bytes();
+        total += self.recovery_block_checksums.len()
+            * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>();
+
+        total += self.matrix_packets.capacity() * size_of::<Packet>();
+        total += self
+            .matrix_packets
+            .iter()
+            .map(|packet| packet.owned_bytes() - size_of::<Packet>())
+            .sum::<usize>();
+
+        total += self.recovery_blocks.capacity() * size_of::<RecoveryBlock>();
+        total += self
+            .recovery_blocks
+            .iter()
+            .map(|block| block.packet.data.capacity())
+            .sum::<usize>();
+        total += self.foreign_recovery_packets.capacity() * size_of::<RecoveryDataPacket>();
+        total += self
+            .foreign_recovery_packets
+            .iter()
+            .map(|packet| packet.data.capacity())
+            .sum::<usize>();
+
+        total += self.recovery_external_data.capacity() * size_of::<RecoveryExternalDataPacket>();
+        total += self
+            .recovery_external_data
+            .iter()
+            .map(|packet| packet.checksums.capacity() * size_of::<BlockChecksum>())
+            .sum::<usize>();
+
+        total += self.data_packets.capacity() * size_of::<DataPacket>();
+        total += self
+            .data_packets
+            .iter()
+            .map(|packet| packet.data.capacity())
+            .sum::<usize>();
+
+        total += self.creator_texts.capacity() * size_of::<String>();
+        total += self
+            .creator_texts
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>();
+        total += self.comments.capacity() * size_of::<String>();
+        total += self.comments.iter().map(String::capacity).sum::<usize>();
+
+        total += self.option_packets.len() * hash_entry_bytes::<Fingerprint, Packet>();
+        total += self
+            .option_packets
+            .values()
+            .map(|packet| packet.owned_bytes() - size_of::<Packet>())
+            .sum::<usize>();
+        total
+    }
+
+    fn build(
+        input_set_id: InputSetId,
+        packets: Vec<Packet>,
+        limits: &SetLimits,
+        charge: &mut dyn ExpansionCharge,
+    ) -> Result<Self> {
         let mut seen: HashSet<(u64, Fingerprint)> = HashSet::new();
         let mut duplicate_packet_count = 0usize;
         let mut unique = Vec::with_capacity(packets.len());
@@ -380,7 +606,14 @@ impl Par3Set {
         let mut root: Option<(Fingerprint, RootPacket)> = None;
         let mut file_packets: HashMap<Fingerprint, FilePacket> = HashMap::new();
         let mut directory_packets: HashMap<Fingerprint, DirectoryPacket> = HashMap::new();
-        let mut block_checksums: BTreeMap<u64, BlockChecksum> = BTreeMap::new();
+        // Every External Data packet that parsed carries its checksum count on
+        // its face, and the type does not need the Start packet to read, so one
+        // cheap pass over the deduplicated packets gives the exact number of
+        // pairs about to be pushed. That is the figure `resolution_cost`
+        // charges, so the builder allocates it once instead of doubling into
+        // twice the charge while `build` lays out the values beside it.
+        let mut block_checksums =
+            BlockChecksumsBuilder::with_capacity(described_checksums(&unique));
         let mut matrix_packets = Vec::new();
         let mut recovery_packets = Vec::new();
         let mut recovery_external_data = Vec::new();
@@ -392,14 +625,20 @@ impl Par3Set {
         let mut unparsed_packet_count = 0usize;
 
         for packet in unique {
-            let hash = packet.hash();
+            // The packet is taken apart rather than read through a reference:
+            // every arm below either moves the body into what keeps it or puts
+            // the packet back together from the same parts. Cloning the body
+            // out of a packet this loop still owns would put a second copy of
+            // every File, Directory, External Data and Recovery Data body
+            // beside the first, and the resolution charge covers one.
+            let (packet_set_id, hash, length, body) = packet.into_parts();
             // A packet whose type needs the Start packet may have been read
             // before it was found; now that it has been, try again.
-            let body = match packet.body() {
+            let body = match body {
                 PacketBody::Opaque { packet_type, body }
-                    if PacketBody::needs_context(*packet_type) =>
+                    if PacketBody::needs_context(packet_type) =>
                 {
-                    match PacketBody::parse(*packet_type, body, &context) {
+                    match PacketBody::parse(packet_type, &body, &context) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             tracing::debug!(%error, "PAR3 packet could not be parsed for its set");
@@ -408,7 +647,7 @@ impl Par3Set {
                         }
                     }
                 }
-                other => other.clone(),
+                other => other,
             };
 
             match body {
@@ -430,24 +669,31 @@ impl Par3Set {
                         let Some(index) = first.checked_add(step as u64) else {
                             break;
                         };
-                        block_checksums.entry(index).or_insert(checksum);
+                        block_checksums.push(index, checksum);
                     }
                 }
                 PacketBody::CauchyMatrix(_)
                 | PacketBody::SparseRandomMatrix(_)
                 | PacketBody::ExplicitMatrix(_)
-                | PacketBody::FftMatrix(_) => matrix_packets.push(packet),
+                | PacketBody::FftMatrix(_) => {
+                    matrix_packets.push(Packet::from_parts(packet_set_id, hash, length, body));
+                }
                 PacketBody::RecoveryData(this) => recovery_packets.push(this),
                 PacketBody::RecoveryExternalData(this) => recovery_external_data.push(this),
                 PacketBody::Data(this) => data_packets.push(this),
-                PacketBody::Creator(this) => creator_texts.push(this.text().into_owned()),
-                PacketBody::Comment(this) => comments.push(this.text().into_owned()),
+                PacketBody::Creator(this) => {
+                    creator_texts.push(text_of(this.into_body_bytes()));
+                }
+                PacketBody::Comment(this) => comments.push(text_of(this.into_body_bytes())),
                 PacketBody::Opaque { packet_type, .. } => {
                     match packet_type {
                         PacketType::Link
                         | PacketType::UnixPermissions
                         | PacketType::FatPermissions => {
-                            option_packets.insert(hash, packet);
+                            option_packets.insert(
+                                hash,
+                                Packet::from_parts(packet_set_id, hash, length, body),
+                            );
                         }
                         PacketType::Unknown(_) => unknown_packet_count += 1,
                         // A reserved type this crate does know, but whose body
@@ -517,6 +763,7 @@ impl Par3Set {
             files: Vec::new(),
             directories: Vec::new(),
             path_bytes: 0,
+            charge,
         };
         walk.run(&root.children)?;
         let TreeWalk {
@@ -538,7 +785,7 @@ impl Par3Set {
             root_hash,
             files,
             directories,
-            block_checksums,
+            block_checksums: Arc::new(block_checksums.build()),
             matrix_packets,
             recovery_blocks,
             foreign_recovery_packets,
@@ -631,14 +878,29 @@ impl Par3Set {
     /// Coverage is normally partial: the reference implementation omits blocks
     /// that hold chunk tails.
     #[must_use]
-    pub fn block_checksums(&self) -> &BTreeMap<u64, BlockChecksum> {
+    pub fn block_checksums(&self) -> &BlockChecksums {
         &self.block_checksums
+    }
+
+    /// Shared ownership of the set's checksum storage, so a [`BlockLayout`]
+    /// built from this set can reference the same authenticated checksums for
+    /// its whole lifetime instead of copying them into every extent.
+    ///
+    /// The charge does not travel with the clone. These bytes are accounted to
+    /// whatever reservation covers this set, so an `Arc` outliving the set — or
+    /// outliving the session that resolved it — holds memory nothing is charged
+    /// for. Hold it no longer than the set.
+    ///
+    /// [`BlockLayout`]: crate::layout::BlockLayout
+    #[must_use]
+    pub fn shared_block_checksums(&self) -> Arc<BlockChecksums> {
+        Arc::clone(&self.block_checksums)
     }
 
     /// The checksum for one input block, if the set carries it.
     #[must_use]
     pub fn block_checksum(&self, index: u64) -> Option<&BlockChecksum> {
-        self.block_checksums.get(&index)
+        self.block_checksums.get(index)
     }
 
     /// The set's Matrix packets, whichever kinds they are.
@@ -765,6 +1027,17 @@ impl Par3Set {
         self.option_packets.get(hash)
     }
 
+    /// How many option packets the set retained verbatim.
+    ///
+    /// Option packets are the extension point of the format: this crate keeps
+    /// them, hashes them and hands them back, but interprets none of them. The
+    /// tally lets a host see that a set carries semantics this engine ignores
+    /// — permissions, ownership, links — without walking the packets itself.
+    #[must_use]
+    pub fn option_packet_count(&self) -> usize {
+        self.option_packets.len()
+    }
+
     /// How many packets were exact copies of one already seen.
     #[must_use]
     pub fn duplicate_packet_count(&self) -> usize {
@@ -851,6 +1124,8 @@ struct TreeWalk<'a> {
     /// Path bytes resolved so far, charged against
     /// [`SetLimits::max_path_bytes`].
     path_bytes: u64,
+    /// Where the bytes each materialised entry costs are charged.
+    charge: &'a mut dyn ExpansionCharge,
 }
 
 struct Frame {
@@ -899,6 +1174,9 @@ impl TreeWalk<'_> {
                 })?;
                 let path = join_path(&parent_path, &file.name);
                 self.charge_path(&path)?;
+                self.charge.charge(
+                    size_of::<Par3File>() * ENTRY_SLOT_FACTOR + path.capacity() + file.heap_bytes(),
+                )?;
                 self.files.push(Par3File {
                     path,
                     packet_hash: child,
@@ -930,6 +1208,14 @@ impl TreeWalk<'_> {
                 });
             }
             self.check_names(&directory.children, &path)?;
+            self.charge.charge(
+                size_of::<Par3Directory>() * ENTRY_SLOT_FACTOR
+                    + path.capacity() * 2
+                    + directory.heap_bytes()
+                    + size_of::<Frame>() * ENTRY_SLOT_FACTOR
+                    + directory.children.len() * size_of::<Fingerprint>()
+                    + hash_entry_bytes::<Fingerprint, ()>(),
+            )?;
             self.directories.push(Par3Directory {
                 path: path.clone(),
                 packet_hash: child,
@@ -1099,6 +1385,273 @@ mod tests {
         Packet::new(ID, body)
     }
 
+    /// One packet of a given type from an official archive.
+    ///
+    /// Every body examined by the charge tests below is one `par3cmdline`
+    /// wrote (provenance in `tests/common/mod.rs`); none is assembled here.
+    fn official(packets: &[Packet], want: PacketType) -> Packet {
+        packets
+            .iter()
+            .find(|packet| packet.packet_type() == want)
+            .unwrap_or_else(|| panic!("the official archive carries no {want:?} packet"))
+            .clone()
+    }
+
+    /// The packets of an official archive, deduplicated the way `build` does,
+    /// because the index and every volume carry a copy of the description.
+    fn official_unique(packets: Vec<Packet>) -> Vec<Packet> {
+        let mut seen: HashSet<(u64, Fingerprint)> = HashSet::new();
+        packets
+            .into_iter()
+            .filter(|packet| seen.insert((packet.len(), packet.hash())))
+            .collect()
+    }
+
+    /// PR #73 finding 13. External Data checksums are compacted into runs, and
+    /// a set whose described blocks are scattered gets one run descriptor per
+    /// block. Nothing budgeted them, so resolving such a packet allocated a
+    /// whole vector of descriptors outside the reservation that covers it.
+    ///
+    /// Round 4, finding B: the packet is the reference's own now. The GF(2^16)
+    /// archive describes 300 blocks in one External Data packet.
+    #[test]
+    fn an_external_data_charge_covers_the_run_descriptors_it_will_build() {
+        let external = official(
+            &crate::test_reference::gf16_packets(),
+            PacketType::ExternalData,
+        );
+        let PacketBody::ExternalData(this) = external.body() else {
+            unreachable!("asked for an External Data packet")
+        };
+        let count = this.checksums.len();
+        assert!(
+            count > 1,
+            "the official packet describes {count} blocks, too few to price the descriptors"
+        );
+        let charge = resolution_cost(&external);
+        let pairs = count * (size_of::<(u64, BlockChecksum)>() + size_of::<BlockChecksum>());
+        assert!(
+            charge >= external.owned_bytes() + pairs + count * crate::checksums::RUN_BYTES,
+            "{charge} covers neither the pairs, the values nor one run per block"
+        );
+        // And the runs are what the fix added: the charge grew by exactly them.
+        assert_eq!(
+            charge - (external.owned_bytes() + pairs + count * crate::checksums::RUN_BYTES),
+            hash_entry_bytes::<(u64, Fingerprint), ()>() + size_of::<Packet>(),
+            "the run term is not the only thing that changed"
+        );
+    }
+
+    /// PR #73 finding 14. Resolving a directory runs `check_names`, which holds
+    /// a borrowed name per child in a transient set while it looks for
+    /// duplicates. It is short-lived, but it is live during resolution and a
+    /// directory with a great many children makes it large.
+    ///
+    /// Round 4, finding B: the packet is the reference's own now — the `sub`
+    /// directory of the GF(2^8) archive.
+    #[test]
+    fn a_directory_charge_covers_the_duplicate_name_check() {
+        let directory = official(&crate::test_reference::gf8_packets(), PacketType::Directory);
+        let PacketBody::Directory(this) = directory.body() else {
+            unreachable!("asked for a Directory packet")
+        };
+        let count = this.children.len();
+        assert!(
+            count > 0,
+            "the official directory names no children, so the name check holds nothing"
+        );
+        let charge = resolution_cost(&directory);
+        let indexed = hash_entry_bytes::<Fingerprint, DirectoryPacket>()
+            + count * hash_entry_bytes::<&str, ()>();
+        assert_eq!(
+            charge,
+            directory.owned_bytes()
+                + indexed
+                + hash_entry_bytes::<(u64, Fingerprint), ()>()
+                + size_of::<Packet>()
+        );
+        // The per-child name-set term is the whole of what a directory pays
+        // beyond its own body and its place in the packet index.
+        let without_names = directory.owned_bytes()
+            + hash_entry_bytes::<Fingerprint, DirectoryPacket>()
+            + hash_entry_bytes::<(u64, Fingerprint), ()>()
+            + size_of::<Packet>();
+        assert_eq!(
+            charge - without_names,
+            count * hash_entry_bytes::<&str, ()>(),
+            "the per-child name-set term is not what separates them"
+        );
+    }
+
+    /// PR #73 round 5, finding F. A Creator or Comment body is bytes on the
+    /// wire and text in the set, and nothing says a producer wrote valid UTF-8.
+    /// The decode used to run beside the body it decoded, charged as nothing by
+    /// the catch-all arm. Valid text now moves into its `String`; the lossy
+    /// path still builds a second buffer, and the charge covers the worst that
+    /// buffer can be.
+    #[test]
+    fn a_creator_charge_covers_the_text_the_set_keeps() {
+        let packets = crate::test_reference::gf8_packets();
+        for want in [PacketType::Creator, PacketType::Comment] {
+            let Some(packet) = packets
+                .iter()
+                .find(|packet| packet.packet_type() == want)
+                .cloned()
+            else {
+                continue;
+            };
+            let body = match packet.body() {
+                PacketBody::Creator(this) => this.as_bytes().to_vec(),
+                PacketBody::Comment(this) => this.as_bytes().to_vec(),
+                other => panic!("a {want:?} packet parsed as {other:?}"),
+            };
+            assert!(!body.is_empty(), "the official {want:?} packet is empty");
+            let charge = resolution_cost(&packet);
+            assert!(
+                charge >= packet.owned_bytes() + body.len() * 3,
+                "a {want:?} body of {} bytes is charged {charge}, less than the {} a lossy \
+                 decode of it can reach beside the body it reads",
+                body.len(),
+                packet.owned_bytes() + body.len() * 3
+            );
+        }
+
+        // And the text itself is unchanged by moving the bytes into it.
+        let set = crate::test_reference::gf8_set();
+        let creator = set.creator_texts().first().expect("an official creator");
+        let wire = packets
+            .iter()
+            .find_map(|packet| match packet.body() {
+                PacketBody::Creator(this) => Some(this.as_bytes().to_vec()),
+                _ => None,
+            })
+            .expect("the official archive names its creator");
+        assert_eq!(*creator, String::from_utf8_lossy(&wire));
+    }
+
+    /// PR #73 round 4, finding A. `TreeWalk::run` checks the Root's children
+    /// for duplicate names before it checks anything else — the first
+    /// allocation the walk makes, and the same transient set a directory of
+    /// that width builds. `resolution_cost` charged a directory for it and let
+    /// the root fall to the catch-all arm, which pays nothing.
+    #[test]
+    fn a_root_charge_covers_the_duplicate_name_check_the_walk_runs_first() {
+        let root = official(&crate::test_reference::gf8_packets(), PacketType::Root);
+        let PacketBody::Root(this) = root.body() else {
+            unreachable!("asked for a Root packet")
+        };
+        let count = this.children.len();
+        assert!(
+            count > 1,
+            "the official root names {count} children, so a duplicate-name check on it holds \
+             nothing worth charging"
+        );
+        let charge = resolution_cost(&root);
+        let bare =
+            root.owned_bytes() + hash_entry_bytes::<(u64, Fingerprint), ()>() + size_of::<Packet>();
+        assert_eq!(
+            charge,
+            bare + count * hash_entry_bytes::<&str, ()>(),
+            "the root charge does not carry one name-set entry per child"
+        );
+        assert_eq!(
+            charge - bare,
+            count * hash_entry_bytes::<&str, ()>(),
+            "the name-set term is not what the root gained"
+        );
+        // A root is kept as it is found rather than indexed by hash, so it pays
+        // for the name check and for nothing else a directory pays for.
+        assert!(
+            charge
+                < bare
+                    + count * hash_entry_bytes::<&str, ()>()
+                    + hash_entry_bytes::<Fingerprint, DirectoryPacket>(),
+            "the root is being charged for an index entry it never takes"
+        );
+    }
+
+    /// PR #73 round 4, finding C. `build` used to clone every parsed body out
+    /// of the packet it still owned, so resolution held two copies of each
+    /// File, Directory, External Data and Recovery Data body while the charge
+    /// covered one. The bodies are moved now, which a recovery block's own
+    /// buffer proves: a moved `Vec` keeps its allocation, a cloned one does
+    /// not. The few packets a set keeps whole are put back together from the
+    /// parts they were taken apart into, and still write back the bytes the
+    /// reference wrote.
+    #[test]
+    fn resolution_moves_each_body_into_the_set_instead_of_copying_it() {
+        let unique = official_unique(crate::test_reference::gf8_packets());
+        let charged: usize = unique.iter().map(resolution_cost).sum();
+        let owned: usize = unique.iter().map(Packet::owned_bytes).sum();
+        assert!(
+            charged >= owned,
+            "the charge ({charged}) does not cover even one copy of every body ({owned})"
+        );
+
+        // Where each recovery block's bytes live before the set is built.
+        let buffers: Vec<((u64, Fingerprint), *const u8)> = unique
+            .iter()
+            .filter_map(|packet| match packet.body() {
+                PacketBody::RecoveryData(this) => Some((
+                    (this.recovery_block_index, this.matrix_hash),
+                    this.data.as_ptr(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !buffers.is_empty(),
+            "the official archive carries no Recovery Data packet to follow"
+        );
+        // And the bytes of every packet the set keeps whole, as they arrived.
+        let retained: Vec<(Fingerprint, Vec<u8>)> = unique
+            .iter()
+            .filter(|packet| {
+                matches!(
+                    packet.body(),
+                    PacketBody::CauchyMatrix(_)
+                        | PacketBody::SparseRandomMatrix(_)
+                        | PacketBody::ExplicitMatrix(_)
+                        | PacketBody::FftMatrix(_)
+                )
+            })
+            .map(|packet| (packet.hash(), packet.to_bytes()))
+            .collect();
+        assert!(
+            !retained.is_empty(),
+            "the official archive carries no Matrix packet to keep whole"
+        );
+
+        let set = Par3Set::from_packets_for(unique, crate::test_reference::SET_ID).expect("builds");
+
+        for block in set.recovery_blocks() {
+            let key = (block.index, block.matrix_hash);
+            let before = buffers
+                .iter()
+                .find(|(other, _)| *other == key)
+                .map(|(_, pointer)| *pointer)
+                .expect("the block came from one of the packets");
+            assert_eq!(
+                block.packet.data.as_ptr(),
+                before,
+                "recovery block {} was copied into the set rather than moved",
+                block.index
+            );
+        }
+        for packet in set.matrix_packets() {
+            let before = retained
+                .iter()
+                .find(|(hash, _)| *hash == packet.hash())
+                .map(|(_, bytes)| bytes)
+                .expect("the set kept a matrix packet it was not given");
+            assert_eq!(
+                &packet.to_bytes(),
+                before,
+                "a retained packet no longer writes back the bytes it arrived as"
+            );
+        }
+    }
+
     #[test]
     fn resolves_files_and_directories_into_paths() {
         let file = packet(PacketBody::File(file_packet("c.bin", 4000, Some(0))));
@@ -1216,6 +1769,87 @@ mod tests {
         assert_eq!(set.block_checksum(3).expect("present").rolling_hash, 30);
         assert_eq!(set.block_checksum(4).expect("present").rolling_hash, 40);
         assert!(set.block_checksum(2).is_none());
+    }
+
+    /// PR #73 round 2, finding 2. The checksum builder is allocated for every
+    /// described block before the first push, and this is the count it is
+    /// given: exact across every External Data packet, and blind to the
+    /// packets of other types around them.
+    ///
+    /// Round 3, finding 4: the packets are the reference's own now, not
+    /// assembled here. The embedded GF(2^8) oracle archive — written by
+    /// `par3cmdline` at the pinned commit, provenance in `tests/common/mod.rs`
+    /// — describes its four input blocks in two External Data packets, two
+    /// blocks each, surrounded by File, Root, Start, Creator, Comment and
+    /// recovery packets, and repeats the lot across the index and both
+    /// volumes.
+    /// The GF(2^16) archive is the other end of the range: one packet of 300.
+    #[test]
+    fn the_described_checksum_count_is_exact_across_every_external_data_packet() {
+        for (name, packets, id, widths) in [
+            (
+                "GF(2^8)",
+                crate::test_reference::gf8_packets(),
+                crate::test_reference::SET_ID,
+                &[2usize, 2][..],
+            ),
+            (
+                "GF(2^16)",
+                crate::test_reference::gf16_packets(),
+                crate::test_reference::SET16_ID,
+                &[300][..],
+            ),
+        ] {
+            // `build` counts over the deduplicated packets, because the index
+            // and every volume carry a copy of the whole description.
+            let mut seen: HashSet<(u64, Fingerprint)> = HashSet::new();
+            let unique: Vec<Packet> = packets
+                .into_iter()
+                .filter(|packet| seen.insert((packet.len(), packet.hash())))
+                .collect();
+
+            let mut positions: Vec<usize> = Vec::new();
+            let described: Vec<usize> = unique
+                .iter()
+                .enumerate()
+                .filter_map(|(at, packet)| match packet.body() {
+                    PacketBody::ExternalData(this) => {
+                        positions.push(at);
+                        Some(this.checksums.len())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                described, widths,
+                "{name}: the reference's External Data packets are not the shape this test reads"
+            );
+            assert!(
+                unique.len() > described.len(),
+                "{name}: the archive holds nothing but External Data packets, so this \
+                 cannot show the count ignores the other types"
+            );
+            let first = positions[0];
+            let last = positions[positions.len() - 1];
+            assert!(
+                first > 0 && last + 1 < unique.len(),
+                "{name}: the External Data packets are not surrounded by packets of other \
+                 types, so this cannot show the pre-pass walks past them"
+            );
+
+            let total: usize = widths.iter().sum();
+            assert_eq!(
+                described_checksums(&unique),
+                total,
+                "{name}: the pre-pass did not count every described block"
+            );
+            let set = Par3Set::from_packets_for(unique, id).expect("builds");
+            assert_eq!(
+                set.block_checksums().len(),
+                total,
+                "{name}: the set did not keep one checksum per described block"
+            );
+        }
     }
 
     #[test]

@@ -113,7 +113,10 @@ impl SourceAccess for DiskSourceAccess {
         let path = self.path(source)?;
         let reservation = options
             .memory
-            .reserve(std::mem::size_of::<PinnedDiskSource>())
+            .reserve_as(
+                crate::runtime::MemoryCategory::CarrierPackets,
+                std::mem::size_of::<PinnedDiskSource>(),
+            )
             .map_err(EngineError::into_io)?;
         // FILE_SHARE_READ denies writers and deletion for the view's lifetime.
         // An existing writer makes this fail instead of admitting unstable data.
@@ -242,7 +245,9 @@ fn hash_open_disk_contents(
     hash: &mut blake3::Hasher,
 ) -> EngineResult<()> {
     let size = options.stripe_bytes.min(64 << 10);
-    let _memory = options.memory.reserve(size)?;
+    let _memory = options
+        .memory
+        .reserve_as(crate::runtime::MemoryCategory::SourceScratch, size)?;
     let mut buffer = vec![0; size];
     let mut remaining = expected.len();
     while remaining != 0 {
@@ -467,7 +472,10 @@ mod tests {
         );
         assert!(matches!(
             replay.and_then(|mut scanner| scanner.poll()),
-            Err(EngineError::ResourceLimit("cumulative scanning work"))
+            Err(EngineError::ResourceLimit(crate::runtime::ResourceLimit {
+                what: "cumulative scanning work",
+                ..
+            }))
         ));
         std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     }
@@ -490,7 +498,10 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(EngineError::ResourceLimit("cumulative scanning work"))
+            Err(EngineError::ResourceLimit(crate::runtime::ResourceLimit {
+                what: "cumulative scanning work",
+                ..
+            }))
         ));
         assert_eq!(options.diagnostics.file_io().read_bytes, 0);
         assert_eq!(options.handles.used(), 0);

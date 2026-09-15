@@ -1,7 +1,7 @@
 //! Concurrent handle leases and their error boundaries through public APIs.
 mod common;
 
-use par3_rs::runtime::{EngineError, ExecutionOptions, HandleBudget};
+use par3_rs::runtime::{EngineError, ExecutionOptions, HandleBudget, ResourceLimit};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
 use std::sync::{Arc, Barrier};
 
@@ -42,7 +42,10 @@ fn cauchy_loss_ceiling_is_enforced_before_staging_outputs() {
         if ceiling == 0 {
             assert!(matches!(
                 result,
-                Err(EngineError::ResourceLimit("Cauchy lost blocks"))
+                Err(EngineError::ResourceLimit(ResourceLimit {
+                    what: "Cauchy lost blocks",
+                    ..
+                }))
             ));
             assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
         } else {
@@ -82,7 +85,10 @@ fn sequential_readers_share_a_ceiling_and_release_on_drop() {
         let error = disk.read_at(SourceId(1), 0, &mut [0; 1]).unwrap_err();
         assert!(matches!(
             EngineError::from(error),
-            EngineError::ResourceLimit("open handles")
+            EngineError::ResourceLimit(ResourceLimit {
+                what: "open handles",
+                ..
+            })
         ));
         assert_eq!(options.handles.peak(), 2);
         release.wait();

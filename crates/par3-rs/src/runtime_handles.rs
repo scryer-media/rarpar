@@ -32,7 +32,7 @@ impl HandleBudget {
         self.0
             .reserve(1)
             .map(HandleLease)
-            .map_err(|_| EngineError::ResourceLimit("open handles"))
+            .map_err(|_| EngineError::resource_limit("open handles"))
     }
 }
 
@@ -50,7 +50,7 @@ impl OpenBudgeted for OpenOptions {
         // The shared atomic reservation also makes the per-operation cap safe
         // when callers clone options and concurrently open files.
         if options.handles.used() > options.open_handles {
-            return Err(EngineError::ResourceLimit("open handles"));
+            return Err(EngineError::resource_limit("open handles"));
         }
         let file = self.open(path)?;
         Ok(EngineFile {

@@ -157,6 +157,28 @@ fn late_metadata_streamed_proofs_restart_selective_download_and_materialization(
     assert_eq!(assessment.files[0].unresolved, vec![2000..4000]);
     assert!(assessment.files[1].complete);
     assert_eq!(assessment.requirements[0].additional, 1);
+    // Source compatibility: every field a consumer read before M1 is still
+    // named the same and still carries the same meaning. `..` covers the
+    // fields M1 added, which is what a downstream pattern must already use.
+    let par3_rs::session::RecoveryRequirement {
+        matrix,
+        cohort,
+        cohorts,
+        recovery_indices,
+        lost,
+        available,
+        additional,
+        ..
+    } = &assessment.requirements[0];
+    let _ = (
+        matrix,
+        cohort,
+        cohorts,
+        recovery_indices,
+        lost,
+        available,
+        additional,
+    );
     assert_eq!(session.merge(first.clone()).unwrap(), MergeEffect::Replay);
     session.assess().unwrap();
     assert_eq!(source.reads.load(Ordering::Relaxed), 0);

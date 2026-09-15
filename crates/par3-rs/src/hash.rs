@@ -23,6 +23,26 @@ use crc_fast::{CrcAlgorithm, Digest};
 /// Length of a PAR3 fingerprint hash, in bytes.
 pub const FINGERPRINT_LEN: usize = 16;
 
+/// Smallest update split across an admitted worker pool, and the largest
+/// verification read buffer.
+///
+/// A parallel BLAKE3 update pays a fork and a join; below a mebibyte the
+/// serial SIMD path finishes first at every core count measured on this host.
+pub(crate) const PARALLEL_HASH_BYTES: usize = 1 << 20;
+
+/// Smallest single source that justifies starting a private pool solely to
+/// hash it. Below this the pool's own startup dominates the hash.
+pub(crate) const PARALLEL_SOURCE_BYTES: u64 = 8 << 20;
+
+/// Widest pool a single file's hash is split across.
+///
+/// Measured on this host (`tests/verification_timing.rs`): against the serial
+/// path, four workers verify a large source at 1.51x the wall time for 1.09x
+/// the CPU, eight reach 1.57x for 1.33x, and all eighteen fall back to 1.23x
+/// for 4.0x — the recursive split gets finer than the serial SIMD path it is
+/// racing. Four is the point where the extra wall time is nearly free.
+pub(crate) const PARALLEL_HASH_WORKERS: usize = 4;
+
 /// A 16-byte BLAKE3 fingerprint, the checksum PAR3 uses everywhere.
 pub type Fingerprint = [u8; FINGERPRINT_LEN];
 
@@ -74,6 +94,25 @@ impl FingerprintHasher {
     /// Feed more bytes into the hash.
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
+    }
+
+    /// Feed more bytes, splitting the work across the caller's admitted worker
+    /// pool when the update is large enough to pay for the fork.
+    ///
+    /// Call this only from inside a pool the ledger already admitted: BLAKE3
+    /// forks onto whatever Rayon pool is installed, so a call made outside one
+    /// would silently borrow the global pool and its unaccounted stacks. Small
+    /// updates keep the serial SIMD path; owning a pool is not by itself a
+    /// reason to split a 64 KiB read across workers. Returns whether the
+    /// update actually ran in parallel.
+    pub(crate) fn update_admitted(&mut self, data: &[u8], parallel: bool) -> bool {
+        let parallel = parallel && data.len() >= PARALLEL_HASH_BYTES;
+        if parallel {
+            self.inner.update_rayon(data);
+        } else {
+            self.inner.update(data);
+        }
+        parallel
     }
 
     /// Feed `count` zero bytes into the hash.
@@ -287,5 +326,51 @@ mod tests {
             rolling_hash(&data[..QUICK_HASH_LEN])
         );
         assert_eq!(quick_rolling_hash(&data[..10]), rolling_hash(&data[..10]));
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::runtime::{ExecutionOptions, MemoryBudget, WorkerPool};
+
+    #[test]
+    fn an_admitted_parallel_hash_matches_the_serial_one_across_the_gate() {
+        let options = ExecutionOptions {
+            workers: 2,
+            memory: MemoryBudget::new(8 << 20),
+            ..ExecutionOptions::default()
+        };
+        let pool = WorkerPool::for_work(&options, 2, 0).unwrap().unwrap();
+        let bytes: Vec<u8> = (0..2 * PARALLEL_HASH_BYTES + 1)
+            .map(|i| (i * 37) as u8)
+            .collect();
+        pool.pool().install(|| {
+            assert_eq!(rayon::current_num_threads(), 2);
+            for prefix in [0, 1, 1023, 1024, 1025] {
+                for len in [
+                    0,
+                    PARALLEL_HASH_BYTES - 1,
+                    PARALLEL_HASH_BYTES,
+                    PARALLEL_HASH_BYTES + 1,
+                ] {
+                    for enabled in [false, true] {
+                        let mut hash = FingerprintHasher::new();
+                        hash.update(&bytes[..prefix]);
+                        assert_eq!(
+                            hash.update_admitted(&bytes[prefix..prefix + len], enabled),
+                            enabled && len >= PARALLEL_HASH_BYTES
+                        );
+                        hash.update(b"tail");
+                        let mut expected = FingerprintHasher::new();
+                        expected.update(&bytes[..prefix + len]);
+                        expected.update(b"tail");
+                        assert_eq!(hash.finalize(), expected.finalize());
+                    }
+                }
+            }
+        });
+        drop(pool);
+        assert_eq!(options.memory.used(), 0);
     }
 }

@@ -50,6 +50,22 @@ impl CommentPacket {
     pub fn to_body_bytes(&self) -> Vec<u8> {
         self.bytes.clone()
     }
+
+    /// Take the body bytes, leaving nothing behind.
+    ///
+    /// The text a set carries is made from these, and a set is built from
+    /// packets it owns; moving the bytes out means the wire copy and the text
+    /// are not both live while the set is resolved.
+    #[must_use]
+    pub(crate) fn into_body_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Length of the body, without decoding it.
+    #[must_use]
+    pub(crate) fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot};
 use crate::{Fingerprint, FingerprintHasher};
 
@@ -26,6 +26,100 @@ pub enum ExtentVerdict {
     Unprotected,
 }
 
+/// Every extent verdict of one file, two bits each.
+///
+/// The four states are exactly the ones [`ExtentVerdict`] names, so nothing the
+/// evidence exposes is lost; only the byte per extent the verdicts used to
+/// occupy is. Verdicts are read and written by extent index, in layout order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtentVerdicts {
+    bits: Vec<u8>,
+    len: usize,
+}
+
+impl ExtentVerdicts {
+    /// `len` verdicts, all [`ExtentVerdict::Unknown`].
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        Self {
+            bits: vec![0; len.div_ceil(4)],
+            len,
+        }
+    }
+
+    /// Number of extents these verdicts describe.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the file has no extents.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One extent's verdict, or `None` past the last extent.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<ExtentVerdict> {
+        if index >= self.len {
+            return None;
+        }
+        Some(match (self.bits[index / 4] >> ((index % 4) * 2)) & 0b11 {
+            0 => ExtentVerdict::Unknown,
+            1 => ExtentVerdict::Intact,
+            2 => ExtentVerdict::Damaged,
+            _ => ExtentVerdict::Unprotected,
+        })
+    }
+
+    /// Record one extent's verdict.
+    pub fn set(&mut self, index: usize, verdict: ExtentVerdict) {
+        assert!(index < self.len, "extent verdict out of range");
+        let code = match verdict {
+            ExtentVerdict::Unknown => 0u8,
+            ExtentVerdict::Intact => 1,
+            ExtentVerdict::Damaged => 2,
+            ExtentVerdict::Unprotected => 3,
+        };
+        let shift = (index % 4) * 2;
+        let slot = &mut self.bits[index / 4];
+        *slot = (*slot & !(0b11 << shift)) | (code << shift);
+    }
+
+    /// Every verdict in layout order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = ExtentVerdict> + '_ {
+        (0..self.len).map(|index| self.get(index).expect("bounded verdict"))
+    }
+
+    /// Bytes this storage holds, from its real capacity.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.bits.capacity()
+    }
+}
+
+impl<'a> IntoIterator for &'a ExtentVerdicts {
+    type Item = ExtentVerdict;
+    type IntoIter = Box<dyn ExactSizeIterator<Item = ExtentVerdict> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+/// Bytes one file's sealed evidence holds: its packed verdicts, its own value,
+/// and a fixed allowance for the hashing frontier's bookkeeping.
+pub(crate) fn evidence_bytes(extents: usize) -> Option<usize> {
+    extents
+        .div_ceil(4)
+        .checked_add(size_of::<FileEvidence>())?
+        .checked_add(EVIDENCE_BASE_BYTES)
+}
+
+/// Fixed allowance for one file's evidence beyond its verdicts.
+const EVIDENCE_BASE_BYTES: usize = 4096;
+
 /// Sealed evidence produced by hashing bytes against an authenticated layout,
 /// or replaying such verdicts using a checkpoint digest trusted by the host.
 #[derive(Clone, Debug)]
@@ -34,7 +128,7 @@ pub struct FileEvidence {
     pub(crate) file: usize,
     pub(crate) source: SourceId,
     pub(crate) snapshot: SourceSnapshot,
-    pub(crate) verdicts: Arc<[ExtentVerdict]>,
+    pub(crate) verdicts: Arc<ExtentVerdicts>,
     pub(crate) whole_matches: Option<bool>,
     pub(crate) expected_len: u64,
     _reservation: Arc<Reservation>,
@@ -61,14 +155,18 @@ impl FileEvidence {
 
     pub(crate) fn rehome(&mut self, options: &ExecutionOptions) -> EngineResult<()> {
         if !self._reservation.belongs_to(&options.memory) {
-            self._reservation = Arc::new(options.memory.reserve(self.retained_bytes())?);
+            self._reservation = Arc::new(
+                options
+                    .memory
+                    .reserve_as(self._reservation.category(), self.retained_bytes())?,
+            );
         }
         Ok(())
     }
 
     /// Extent verdicts in layout order.
     #[must_use]
-    pub fn verdicts(&self) -> &[ExtentVerdict] {
+    pub fn verdicts(&self) -> &ExtentVerdicts {
         &self.verdicts
     }
 
@@ -94,16 +192,13 @@ impl FileEvidence {
     /// Largest verified prefix, stopping at unknown, damaged or unprotected data.
     pub fn verified_prefix(&self, layout: &BlockLayout) -> EngineResult<u64> {
         self.check_layout(layout)?;
+        let extents = &layout.files[self.file].extents;
         let mut end = 0;
-        for (extent, verdict) in layout.files[self.file]
-            .extents
-            .iter()
-            .zip(self.verdicts.iter())
-        {
-            if *verdict != ExtentVerdict::Intact {
+        for (index, verdict) in self.verdicts.iter().enumerate() {
+            if verdict != ExtentVerdict::Intact {
                 break;
             }
-            end = extent.range.end;
+            end = extents.range(index).expect("checked extent").end;
         }
         Ok(end)
     }
@@ -111,21 +206,19 @@ impl FileEvidence {
     /// File-coordinate ranges that need verification or reconstruction.
     pub fn unresolved_ranges(&self, layout: &BlockLayout) -> EngineResult<Vec<Range<u64>>> {
         self.check_layout(layout)?;
+        let extents = &layout.files[self.file].extents;
         let mut ranges: Vec<Range<u64>> = Vec::new();
-        for (extent, verdict) in layout.files[self.file]
-            .extents
-            .iter()
-            .zip(self.verdicts.iter())
-        {
+        for (index, verdict) in self.verdicts.iter().enumerate() {
             if !matches!(verdict, ExtentVerdict::Unknown | ExtentVerdict::Damaged) {
                 continue;
             }
+            let range = extents.range(index).expect("checked extent");
             if let Some(previous) = ranges.last_mut()
-                && previous.end == extent.range.start
+                && previous.end == range.start
             {
-                previous.end = extent.range.end;
+                previous.end = range.end;
             } else {
-                ranges.push(extent.range.clone());
+                ranges.push(range);
             }
         }
         Ok(ranges)
@@ -168,9 +261,12 @@ pub struct StreamingVerifier {
     source: SourceId,
     snapshot: SourceSnapshot,
     options: ExecutionOptions,
-    verdicts: Vec<ExtentVerdict>,
+    verdicts: ExtentVerdicts,
     partial: BTreeMap<usize, Box<PartialExtent>>,
     whole: FingerprintHasher,
+    /// Whether whole-file hashing may fork onto the caller's admitted pool.
+    /// Only a caller that is already inside one may set it.
+    parallel_hash: bool,
     whole_next: u64,
     whole_ordered: bool,
     dropped: u64,
@@ -191,27 +287,25 @@ impl StreamingVerifier {
             .files
             .get(file)
             .ok_or(EngineError::InvalidState("unknown file index"))?;
-        let cost = description
-            .extents
-            .len()
-            .checked_mul(8)
-            .and_then(|n| n.checked_add(4096))
-            .ok_or(EngineError::ResourceLimit("verification evidence"))?;
+        let cost = evidence_bytes(description.extents.len())
+            .ok_or(EngineError::resource_limit("verification evidence"))?;
         if cost > options.retained_bytes {
-            return Err(EngineError::ResourceLimit("retained verification evidence"));
+            return Err(EngineError::budget_limit(
+                "retained verification evidence",
+                cost,
+                options.retained_bytes,
+                options.retained_bytes,
+            ));
         }
-        let reservation = options.memory.reserve(cost)?;
-        let verdicts = description
-            .extents
-            .iter()
-            .map(|extent| {
-                if matches!(extent.kind, ExtentKind::Unprotected) {
-                    ExtentVerdict::Unprotected
-                } else {
-                    ExtentVerdict::Unknown
-                }
-            })
-            .collect();
+        let reservation = options
+            .memory
+            .reserve_as(MemoryCategory::LayoutEvidence, cost)?;
+        let mut verdicts = ExtentVerdicts::new(description.extents.len());
+        for index in 0..verdicts.len() {
+            if description.extents.is_unprotected(index) {
+                verdicts.set(index, ExtentVerdict::Unprotected);
+            }
+        }
         Ok(Self {
             layout,
             file,
@@ -221,6 +315,7 @@ impl StreamingVerifier {
             verdicts,
             partial: BTreeMap::new(),
             whole: FingerprintHasher::new(),
+            parallel_hash: false,
             whole_next: 0,
             whole_ordered: true,
             dropped: 0,
@@ -242,23 +337,40 @@ impl StreamingVerifier {
         if !bytes.is_empty() && !unprotected_between(file, self.whole_next, offset) {
             self.whole_ordered = false;
         }
-        let mut index = file
-            .extents
-            .partition_point(|extent| extent.range.end <= offset);
+        let mut index = file.extents.first_after(offset);
+        // Adjacent protected extents are hashed as one update. A PAR3 block is
+        // often far smaller than a read, and splitting the read at every block
+        // boundary would keep every update under the parallel gate.
+        let mut run: Option<Range<u64>> = None;
         while index < self.layout.files[self.file].extents.len() {
             self.options.cancel.check()?;
-            let extent = &self.layout.files[self.file].extents[index];
-            if extent.range.start >= end {
+            let extents = &self.layout.files[self.file].extents;
+            let range = extents.range(index).expect("bounded extent");
+            if range.start >= end {
                 break;
             }
-            let start = extent.range.start.max(offset);
-            let stop = extent.range.end.min(end);
+            let unprotected = extents.is_unprotected(index);
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
             let data = &bytes[(start - offset) as usize..(stop - offset) as usize];
-            if self.whole_ordered && !matches!(extent.kind, ExtentKind::Unprotected) {
-                self.whole.update(data);
+            if self.whole_ordered {
+                match (&mut run, unprotected) {
+                    (Some(open), false) if open.end == start => open.end = stop,
+                    (open, false) => {
+                        if let Some(closed) = open.take() {
+                            self.hash_run(&closed, offset, bytes);
+                        }
+                        *open = Some(start..stop);
+                    }
+                    (open, true) => {
+                        if let Some(closed) = open.take() {
+                            self.hash_run(&closed, offset, bytes);
+                        }
+                    }
+                }
             }
-            if self.verdicts[index] == ExtentVerdict::Unknown {
-                let relative = start - extent.range.start;
+            if self.verdicts.get(index) == Some(ExtentVerdict::Unknown) {
+                let relative = start - range.start;
                 match self.feed_extent(index, relative, data) {
                     Err(EngineError::ResourceLimit(_)) => {
                         self.partial.remove(&index);
@@ -269,6 +381,9 @@ impl StreamingVerifier {
             }
             index += 1;
         }
+        if let Some(closed) = run {
+            self.hash_run(&closed, offset, bytes);
+        }
         if self.whole_ordered {
             self.whole_next = end;
         }
@@ -276,9 +391,19 @@ impl StreamingVerifier {
         self.options.cancel.check()
     }
 
+    /// Feed one coalesced protected run of the current read into the
+    /// whole-file hash.
+    fn hash_run(&mut self, run: &Range<u64>, offset: u64, bytes: &[u8]) {
+        let data = &bytes[(run.start - offset) as usize..(run.end - offset) as usize];
+        self.whole.update_admitted(data, self.parallel_hash);
+    }
+
     fn feed_extent(&mut self, index: usize, offset: u64, bytes: &[u8]) -> EngineResult<()> {
         if !self.partial.contains_key(&index) {
-            let reservation = self.options.memory.reserve(4096)?;
+            let reservation = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::QueuedPayloads, 4096)?;
             self.partial.insert(
                 index,
                 Box::new(PartialExtent {
@@ -300,13 +425,14 @@ impl StreamingVerifier {
             if partial.pending.iter().any(|(at, fragment)| {
                 offset < *at + fragment.bytes.len() as u64 && *at < offset + bytes.len() as u64
             }) {
-                return Err(EngineError::ResourceLimit("overlapping pending fragments"));
+                return Err(EngineError::resource_limit("overlapping pending fragments"));
             }
-            let reservation = self.options.memory.reserve(
+            let reservation = self.options.memory.reserve_as(
+                MemoryCategory::QueuedPayloads,
                 bytes
                     .len()
                     .checked_add(128)
-                    .ok_or(EngineError::ResourceLimit("pending fragment"))?,
+                    .ok_or(EngineError::resource_limit("pending fragment"))?,
             )?;
             partial.pending.insert(
                 offset,
@@ -318,7 +444,9 @@ impl StreamingVerifier {
             return Ok(());
         }
         let skip = (partial.next - offset).min(bytes.len() as u64) as usize;
-        partial.hasher.update(&bytes[skip..]);
+        partial
+            .hasher
+            .update_admitted(&bytes[skip..], self.parallel_hash);
         partial.next += (bytes.len() - skip) as u64;
         while let Some((&at, _)) = partial.pending.first_key_value() {
             if at > partial.next {
@@ -326,22 +454,26 @@ impl StreamingVerifier {
             }
             let fragment = partial.pending.pop_first().expect("pending fragment").1;
             let skip = (partial.next - at).min(fragment.bytes.len() as u64) as usize;
-            partial.hasher.update(&fragment.bytes[skip..]);
+            partial
+                .hasher
+                .update_admitted(&fragment.bytes[skip..], self.parallel_hash);
             partial.next += (fragment.bytes.len() - skip) as u64;
         }
-        let extent = &self.layout.files[self.file].extents[index];
-        if partial.next == extent.range.end - extent.range.start {
-            let expected = match &extent.kind {
-                ExtentKind::Block { fingerprint, .. } => *fingerprint,
-                ExtentKind::Inline(bytes) => Some(crate::fingerprint(bytes)),
+        let extents = &self.layout.files[self.file].extents;
+        let range = extents.range(index).expect("bounded extent");
+        if partial.next == range.end - range.start {
+            let expected = match extents.get(index).expect("bounded extent").kind {
+                ExtentKind::Block { fingerprint, .. } => fingerprint,
+                ExtentKind::Inline(bytes) => Some(crate::fingerprint(&bytes)),
                 ExtentKind::Unprotected => None,
             };
             if let Some(expected) = expected {
-                self.verdicts[index] = if partial.hasher.finalize() == expected {
+                let verdict = if partial.hasher.finalize() == expected {
                     ExtentVerdict::Intact
                 } else {
                     ExtentVerdict::Damaged
                 };
+                self.verdicts.set(index, verdict);
             }
             self.partial.remove(&index);
         }
@@ -370,7 +502,7 @@ impl StreamingVerifier {
             previous.snapshot,
             options,
         )?;
-        verifier.verdicts.copy_from_slice(&previous.verdicts);
+        verifier.verdicts = previous.verdicts.as_ref().clone();
         verifier.whole_ordered = false;
         Ok(verifier)
     }
@@ -383,9 +515,9 @@ impl StreamingVerifier {
             && file.fingerprint != [0; 16])
             .then(|| self.whole.finalize() == file.fingerprint);
         if whole_matches == Some(true) {
-            for state in &mut self.verdicts {
-                if *state == ExtentVerdict::Unknown {
-                    *state = ExtentVerdict::Intact;
+            for index in 0..self.verdicts.len() {
+                if self.verdicts.get(index) == Some(ExtentVerdict::Unknown) {
+                    self.verdicts.set(index, ExtentVerdict::Intact);
                 }
             }
         }
@@ -394,7 +526,7 @@ impl StreamingVerifier {
             file: self.file,
             source: self.source,
             snapshot: self.snapshot,
-            verdicts: self.verdicts.into(),
+            verdicts: Arc::new(self.verdicts),
             whole_matches,
             expected_len: file.len,
             _reservation: Arc::new(self.reservation),
@@ -403,17 +535,7 @@ impl StreamingVerifier {
 }
 
 fn unprotected_between(file: &crate::layout::FileLayout, start: u64, end: u64) -> bool {
-    start <= end
-        && end <= file.len
-        && file
-            .extents
-            .iter()
-            .skip(
-                file.extents
-                    .partition_point(|extent| extent.range.end <= start),
-            )
-            .take_while(|extent| extent.range.start < end)
-            .all(|extent| matches!(extent.kind, ExtentKind::Unprotected))
+    start <= end && end <= file.len && file.extents.all_unprotected(start, end)
 }
 
 /// Recheck only unknown extents after new bytes arrive within an immutable source
@@ -427,18 +549,20 @@ pub fn verify_arrivals(
     ensure_snapshot(access, previous.source, previous.snapshot)?;
     let mut verifier = StreamingVerifier::resume(Arc::clone(&layout), previous, options.clone())?;
     let size = options.stripe_bytes.min(64 << 10);
-    let _buffer = options.memory.reserve(size)?;
+    let _buffer = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut bytes = vec![0; size];
-    for (extent, verdict) in layout.files[previous.file]
-        .extents
-        .iter()
-        .zip(previous.verdicts.iter())
-    {
-        if *verdict != ExtentVerdict::Unknown {
+    for (index, verdict) in previous.verdicts.iter().enumerate() {
+        if verdict != ExtentVerdict::Unknown {
             continue;
         }
-        let mut at = extent.range.start;
-        while at < extent.range.end {
+        let extent = layout.files[previous.file]
+            .extents
+            .range(index)
+            .expect("bounded extent");
+        let mut at = extent.start;
+        while at < extent.end {
             options.cancel.check()?;
             let Some(range) = access.next_available(previous.source, at)? else {
                 break;
@@ -449,7 +573,7 @@ pub fn verify_arrivals(
                 ));
             }
             at = range.start;
-            let end = range.end.min(extent.range.end);
+            let end = range.end.min(extent.end);
             while at < end {
                 options.cancel.check()?;
                 let take = (end - at).min(size as u64) as usize;
@@ -475,8 +599,42 @@ pub fn verify_arrivals(
     Ok(result)
 }
 
+/// The verification read buffer, grown to the parallel-hash size only when a
+/// pool is admitted, the source is large enough to use it, and the shared
+/// budget still leaves working room afterwards.
+///
+/// A refused growth is not a refused verification: the small buffer is the
+/// documented fallback, and it never reacquires workers.
+fn verification_buffer(
+    options: &ExecutionOptions,
+    len: u64,
+    parallel: bool,
+) -> EngineResult<Reservation> {
+    let small = options.stripe_bytes.min(64 << 10);
+    let large = crate::hash::PARALLEL_HASH_BYTES;
+    if parallel && len >= large as u64 {
+        match options
+            .memory
+            .reserve_as(MemoryCategory::SourceScratch, large)
+        {
+            Ok(reservation) if options.memory.available() >= 128 << 10 => return Ok(reservation),
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, small)
+}
+
 /// Verify through a source provider, using a forward reader when it is offered.
 /// Real I/O errors propagate; holes leave extents unknown.
+///
+/// A source of at least [`crate::hash::PARALLEL_SOURCE_BYTES`] may start a
+/// private worker pool solely to hash it; a smaller one never does, because the
+/// pool's own startup would cost more than the hash. A caller that already
+/// holds an admitted pool must call [`verify_source_in_pool`] instead, so that
+/// pools are never nested.
 pub fn verify_source(
     layout: Arc<BlockLayout>,
     file: usize,
@@ -485,22 +643,74 @@ pub fn verify_source(
     options: &ExecutionOptions,
 ) -> EngineResult<FileEvidence> {
     options.validate()?;
+    let large = layout
+        .files
+        .get(file)
+        .is_some_and(|file| file.len >= crate::hash::PARALLEL_SOURCE_BYTES);
+    let pool = if large {
+        match crate::runtime::WorkerPool::for_work(
+            options,
+            crate::hash::PARALLEL_HASH_WORKERS,
+            crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+        ) {
+            Ok(pool) => pool,
+            Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    match &pool {
+        Some(pool) => pool
+            .pool()
+            .install(|| verify_source_in_pool(layout, file, access, source, options, true)),
+        None => verify_source_in_pool(layout, file, access, source, options, false),
+    }
+}
+
+/// [`verify_source`] for a caller that is already inside an admitted worker
+/// pool. `parallel` must be true only from inside such a pool.
+pub(crate) fn verify_source_in_pool(
+    layout: Arc<BlockLayout>,
+    file: usize,
+    access: &dyn SourceAccess,
+    source: SourceId,
+    options: &ExecutionOptions,
+    parallel: bool,
+) -> EngineResult<FileEvidence> {
+    options.validate()?;
     let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
         source_id: source,
         offset: 0,
     })?;
     let mut verifier = StreamingVerifier::new(layout, file, source, snapshot, options.clone())?;
-    let size = options.stripe_bytes.min(64 << 10);
-    let _reservation = options.memory.reserve(size)?;
+    let reservation = verification_buffer(options, snapshot.len, parallel)?;
+    let size = reservation.bytes();
+    verifier.parallel_hash = parallel && size >= crate::hash::PARALLEL_HASH_BYTES;
+    let _reservation = reservation;
     let mut buffer = vec![0; size];
     let mut offset = 0;
     if let Some(mut reader) = access.open_sequential(source)? {
         while offset < snapshot.len {
             options.cancel.check()?;
             let take = (snapshot.len - offset).min(buffer.len() as u64) as usize;
-            let read = options
-                .diagnostics
-                .read(reader.as_mut(), &mut buffer[..take])?;
+            // Fill the buffer before hashing it. A provider is free to return
+            // short reads, and a megabyte buffer fed 17 bytes at a time would
+            // never reach the parallel gate.
+            let mut read = 0;
+            while read < take {
+                options.cancel.check()?;
+                let count = options
+                    .diagnostics
+                    .read(reader.as_mut(), &mut buffer[read..take])?;
+                if count == 0 {
+                    break;
+                }
+                if count > take - read {
+                    return Err(EngineError::InvalidState("invalid source read length"));
+                }
+                read += count;
+            }
             if read == 0 {
                 break;
             }
@@ -519,15 +729,25 @@ pub fn verify_source(
             while offset < range.end {
                 options.cancel.check()?;
                 let take = (range.end - offset).min(buffer.len() as u64) as usize;
-                let read =
-                    options
-                        .diagnostics
-                        .read_at(access, source, offset, &mut buffer[..take])?;
+                let mut read = 0;
+                while read < take {
+                    options.cancel.check()?;
+                    let count = options.diagnostics.read_at(
+                        access,
+                        source,
+                        offset + read as u64,
+                        &mut buffer[read..take],
+                    )?;
+                    if count == 0 {
+                        break;
+                    }
+                    if count > take - read {
+                        return Err(EngineError::InvalidState("invalid source read length"));
+                    }
+                    read += count;
+                }
                 if read == 0 {
                     break;
-                }
-                if read > take {
-                    return Err(EngineError::InvalidState("invalid source read length"));
                 }
                 verifier.feed(offset, &buffer[..read])?;
                 offset += read as u64;
@@ -537,4 +757,41 @@ pub fn verify_source(
     }
     ensure_snapshot(access, source, snapshot)?;
     Ok(verifier.finish())
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::hash::PARALLEL_HASH_BYTES;
+    use crate::runtime::MemoryBudget;
+
+    #[test]
+    fn a_refused_large_buffer_falls_back_without_leaking_its_reservation() {
+        for limit in [64 << 10, 1 << 20, (1 << 20) + (128 << 10), 8 << 20] {
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(limit),
+                stripe_bytes: 1 << 20,
+                ..ExecutionOptions::default()
+            };
+            for parallel in [false, true] {
+                for len in [
+                    0,
+                    (PARALLEL_HASH_BYTES - 1) as u64,
+                    PARALLEL_HASH_BYTES as u64,
+                ] {
+                    let buffer = verification_buffer(&options, len, parallel).unwrap();
+                    let large = parallel
+                        && len >= PARALLEL_HASH_BYTES as u64
+                        && limit >= PARALLEL_HASH_BYTES + (128 << 10);
+                    assert_eq!(
+                        buffer.bytes(),
+                        if large { PARALLEL_HASH_BYTES } else { 64 << 10 }
+                    );
+                    assert_eq!(buffer.category(), MemoryCategory::SourceScratch);
+                    drop(buffer);
+                    assert_eq!(options.memory.used(), 0);
+                }
+            }
+        }
+    }
 }

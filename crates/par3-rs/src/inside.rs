@@ -16,7 +16,7 @@ pub use repair::{SelfRepairPlan, SelfRepairReport};
 
 use crc_fast::{CrcAlgorithm, Digest};
 
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};
 
 /// Supported standalone container framing.
@@ -161,7 +161,7 @@ impl Inspector<'_> {
         self.remaining = self
             .remaining
             .checked_sub(bytes.len() as u64)
-            .ok_or(EngineError::ResourceLimit("container inspection bytes"))?;
+            .ok_or(EngineError::resource_limit("container inspection bytes"))?;
         read_exact_at(
             &self.options.diagnostics,
             self.access,
@@ -192,7 +192,10 @@ impl Inspector<'_> {
             return Err(unsupported());
         }
         let size = self.options.stripe_bytes.min(64 << 10);
-        let _memory = self.options.memory.reserve(size)?;
+        let _memory = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::SourceScratch, size)?;
         let mut buffer = vec![0; size];
         let mut crc = Digest::new(CrcAlgorithm::Crc32IsoHdlc);
         let mut position = 0;
@@ -219,7 +222,10 @@ impl Inspector<'_> {
         if length < 22 {
             return Err(unsupported());
         }
-        let _memory = self.options.memory.reserve(length + 65536)?;
+        let _memory = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::SourceScratch, length + 65536)?;
         let mut tail = vec![0; length];
         let base = self.snapshot.len - length as u64;
         self.read(base, &mut tail)?;
@@ -283,7 +289,7 @@ impl Inspector<'_> {
             return Err(unsupported());
         }
         if entries > max_entries {
-            return Err(EngineError::ResourceLimit("ZIP directory entries"));
+            return Err(EngineError::resource_limit("ZIP directory entries"));
         }
         let mut at = central;
         let mut extra = vec![0; 65535];

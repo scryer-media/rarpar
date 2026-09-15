@@ -131,6 +131,15 @@ pub(crate) fn decode_name(bytes: &[u8], packet: &'static str) -> Result<String> 
 }
 
 /// Refuse names that would let a set escape the directory it is verified in.
+///
+/// This is deliberately narrower than [`crate::paths`], which is the engine's
+/// name-safety table for paths it is about to *write*. The question here is
+/// only whether a name field is a usable single component, because a whole set
+/// must stay parseable: a set that names one Windows device or one
+/// trailing-dot file is still a set whose other files can be verified and
+/// repaired, and refusing it here would turn one bad name into an unreadable
+/// set. The write-side table refuses that name when, and only when, the engine
+/// would otherwise create it.
 pub(crate) fn check_name(name: &str) -> Result<()> {
     let reason = if name.is_empty() {
         Some("empty")

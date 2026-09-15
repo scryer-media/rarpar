@@ -14,8 +14,9 @@ pub use handles::{HandleBudget, HandleLease};
 mod diagnostics;
 pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
-    ExecutionDiagnostics, IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, Stage,
-    StageSnapshot,
+    AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, CodecSnapshot, ExecutionDiagnostics,
+    IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage,
+    StageSnapshot, WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -30,7 +31,7 @@ pub enum EngineError {
     Io(std::io::Error),
     /// The requested work exceeds a configured resource budget.
     #[error("PAR3 resource limit: {0}")]
-    ResourceLimit(&'static str),
+    ResourceLimit(ResourceLimit),
     /// Previously published source bytes changed.
     #[error("PAR3 source changed: {0:?}")]
     SourceChanged(crate::source::SourceId),
@@ -51,6 +52,13 @@ pub enum EngineError {
     /// A session operation cannot run in its current state.
     #[error("invalid PAR3 engine state: {0}")]
     InvalidState(&'static str),
+    /// A relative path carried by a set broke a name-safety rule.
+    ///
+    /// Raised by set creation before any set byte is produced, and by repair
+    /// before any output byte is written. The verdict depends only on the
+    /// bytes of the path, so it is the same on every platform.
+    #[error("unsafe PAR3 path: {0}")]
+    UnsafePath(#[from] crate::paths::PathViolation),
     /// Creation stopped after installing some independently authenticated carriers.
     #[error("PAR3 output installation stopped: {cause}")]
     OutputInterrupted {
@@ -72,6 +80,143 @@ pub enum EngineError {
         #[source]
         cause: Box<EngineError>,
     },
+}
+
+/// Why a budgeted request was refused.
+///
+/// A refusal that was never expressed in bytes — a handle ceiling, a packet
+/// count, a structural bound — reports `limit` zero and [`LimitCause::Unmeasured`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResourceLimit {
+    /// Name of the structure or budget that refused the request.
+    pub what: &'static str,
+    /// Bytes the refused request needed, when the refusal was measured.
+    pub need: usize,
+    /// Configured ceiling for `what`, when the refusal was measured.
+    pub limit: usize,
+    /// Bytes still available under that ceiling when the request was refused.
+    pub available: usize,
+}
+
+/// Whether a refused request could ever be admitted under the same ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitCause {
+    /// This request would still be refused if this session were alone on the
+    /// budget with the same options. No amount of waiting admits it.
+    ExceedsLimit,
+    /// With the same options, this exact request is admitted once other
+    /// reservations release.
+    ///
+    /// Which reservations those are is not something this type can tell: the
+    /// holder may be a peer session sharing the budget, or this session's own
+    /// earlier reservations — layout, evidence and assessment state are all
+    /// still held when codec scratch is requested. The host decides which,
+    /// using its own knowledge of what it has in flight.
+    PeerContention,
+    /// The refusal was not measured in bytes: it carries neither a need nor a
+    /// ceiling, because the limit it broke is structural rather than a budget.
+    /// A measured refusal against a ceiling of zero is `ExceedsLimit`, not
+    /// this.
+    Unmeasured,
+}
+
+impl ResourceLimit {
+    pub(crate) const fn named(what: &'static str) -> Self {
+        Self {
+            what,
+            need: 0,
+            limit: 0,
+            available: 0,
+        }
+    }
+
+    pub(crate) const fn measured(
+        what: &'static str,
+        need: usize,
+        limit: usize,
+        available: usize,
+    ) -> Self {
+        Self {
+            what,
+            need,
+            limit,
+            available,
+        }
+    }
+
+    /// Classify the refusal for a host deciding between queueing and failing.
+    ///
+    /// [`LimitCause::ExceedsLimit`] means "this request would still be refused
+    /// if this session were alone on the budget with the same options".
+    /// [`LimitCause::PeerContention`] means "with the same options, this exact
+    /// request is admitted once other reservations release".
+    /// [`LimitCause::Unmeasured`] means the refusal was never expressed in
+    /// bytes; treat it as terminal, like `ExceedsLimit`.
+    ///
+    /// The distinction is the one a host needs to requeue rather than fail:
+    /// `PeerContention` is worth retrying, the other two never are.
+    ///
+    /// A refusal is unmeasured only when it carries no byte figures at all,
+    /// which is exactly what [`Self::named`] produces for a structural limit
+    /// (an overflowed count, a geometry the engine cannot express). A positive
+    /// need against a ceiling of zero is a real, measured refusal — a budget
+    /// of `MemoryBudget::new(0)` admits nothing — and is reported as
+    /// `ExceedsLimit`, because no release by any peer will ever admit it.
+    #[must_use]
+    pub fn cause(self) -> LimitCause {
+        if self.need == 0 && self.limit == 0 {
+            LimitCause::Unmeasured
+        } else if self.need > self.limit {
+            LimitCause::ExceedsLimit
+        } else {
+            LimitCause::PeerContention
+        }
+    }
+
+    /// Whether the request could be admitted once the memory currently held —
+    /// by a peer, or by this session itself — is released. An unmeasured
+    /// refusal is never reported as contention.
+    #[must_use]
+    pub fn contended(self) -> bool {
+        self.cause() == LimitCause::PeerContention
+    }
+}
+
+impl std::fmt::Display for ResourceLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cause() {
+            LimitCause::Unmeasured => formatter.write_str(self.what),
+            LimitCause::ExceedsLimit => write!(
+                formatter,
+                "{} does not fit alone (needs {} bytes, ceiling {})",
+                self.what, self.need, self.limit
+            ),
+            LimitCause::PeerContention => write!(
+                formatter,
+                "{} does not fit beside the memory already reserved (needs {} bytes, {} of {} available)",
+                self.what, self.need, self.available, self.limit
+            ),
+        }
+    }
+}
+
+impl EngineError {
+    /// A refusal whose ceiling is structural rather than a byte count.
+    pub(crate) const fn resource_limit(what: &'static str) -> Self {
+        Self::ResourceLimit(ResourceLimit::named(what))
+    }
+
+    /// A refusal measured against a byte ceiling, distinguishing a request that
+    /// can never fit from one a peer is currently holding out.
+    pub(crate) const fn budget_limit(
+        what: &'static str,
+        need: usize,
+        limit: usize,
+        available: usize,
+    ) -> Self {
+        Self::ResourceLimit(ResourceLimit::measured(what, need, limit, available))
+    }
 }
 
 /// Result returned by incremental engine operations.
@@ -122,11 +267,154 @@ impl CancellationToken {
     }
 }
 
+/// What a reservation pays for, so a refusal or a peak names a structure rather
+/// than an anonymous total. Categories describe lifetimes, not allocators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(usize)]
+#[non_exhaustive]
+pub enum MemoryCategory {
+    /// Reservations taken by code paths that have not been categorised.
+    Uncategorized,
+    /// Scanner read-ahead and authenticated packet bytes held for a carrier.
+    CarrierPackets,
+    /// The resolved metadata tree: descriptions, paths and block checksums.
+    ResolvedMetadata,
+    /// Block layouts, extents and sealed verification evidence.
+    LayoutEvidence,
+    /// Retained assessment state, requirements and recovery references.
+    Assessment,
+    /// Admission caches and deduplication maps that outlive one operation.
+    Caches,
+    /// Lazy payload references and out-of-order verification fragments.
+    QueuedPayloads,
+    /// Transform fields, Cauchy coefficients and other codec tables.
+    CodecTables,
+    /// Per-operation codec rows, stripes, locators and syndrome banks.
+    CodecScratch,
+    /// Per-operation buffers for reading, hashing or searching source bytes.
+    SourceScratch,
+    /// Private worker pool stacks, charged until the workers are joined.
+    WorkerStacks,
+    /// Output path bookkeeping and staged write buffers.
+    OutputStaging,
+}
+
+/// Number of distinct [`MemoryCategory`] values.
+pub const MEMORY_CATEGORIES: usize = 12;
+
+impl MemoryCategory {
+    /// Every category, in ledger order.
+    pub const ALL: [Self; MEMORY_CATEGORIES] = [
+        Self::Uncategorized,
+        Self::CarrierPackets,
+        Self::ResolvedMetadata,
+        Self::LayoutEvidence,
+        Self::Assessment,
+        Self::Caches,
+        Self::QueuedPayloads,
+        Self::CodecTables,
+        Self::CodecScratch,
+        Self::SourceScratch,
+        Self::WorkerStacks,
+        Self::OutputStaging,
+    ];
+
+    /// Stable lowercase name, also used when a refusal names this category.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Uncategorized => "memory budget",
+            Self::CarrierPackets => "carrier and packet storage",
+            Self::ResolvedMetadata => "resolved metadata",
+            Self::LayoutEvidence => "layout and evidence",
+            Self::Assessment => "assessment state",
+            Self::Caches => "caches",
+            Self::QueuedPayloads => "queued payloads",
+            Self::CodecTables => "codec tables",
+            Self::CodecScratch => "codec scratch",
+            Self::SourceScratch => "source scratch",
+            Self::WorkerStacks => "worker stacks",
+            Self::OutputStaging => "output staging",
+        }
+    }
+}
+
+/// One category's reservations at a sampling instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryCategorySnapshot {
+    /// Bytes reserved right now.
+    pub current: u64,
+    /// Highest `current` observed for this category.
+    pub peak: u64,
+    /// Reservations taken, including those already released.
+    pub reservations: u64,
+}
+
+/// Categorised reservations at one sampling instant.
+///
+/// Categories are sampled independently, so their peaks need not have occurred
+/// together and their sum is not the budget's own peak.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryLedger {
+    entries: [MemoryCategorySnapshot; MEMORY_CATEGORIES],
+}
+
+impl MemoryLedger {
+    /// Reservations attributed to one category.
+    #[must_use]
+    pub fn category(&self, category: MemoryCategory) -> MemoryCategorySnapshot {
+        self.entries[category as usize]
+    }
+
+    /// Every category in ledger order.
+    pub fn iter(&self) -> impl Iterator<Item = (MemoryCategory, MemoryCategorySnapshot)> + '_ {
+        MemoryCategory::ALL
+            .into_iter()
+            .map(|category| (category, self.category(category)))
+    }
+
+    /// Sum of the categories' current reservations. This equals
+    /// [`MemoryBudget::used`] whenever no reservation is being taken concurrently.
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.entries.iter().map(|entry| entry.current).sum()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CategoryLedger {
+    current: AtomicU64,
+    peak: AtomicU64,
+    reservations: AtomicU64,
+}
+
+impl CategoryLedger {
+    fn acquire(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        let next = self.current.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak.fetch_max(next, Ordering::Relaxed);
+        self.reservations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: usize) {
+        self.current.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> MemoryCategorySnapshot {
+        MemoryCategorySnapshot {
+            current: self.current.load(Ordering::Relaxed),
+            peak: self.peak.load(Ordering::Relaxed),
+            reservations: self.reservations.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BudgetState {
     limit: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
+    ledger: [CategoryLedger; MEMORY_CATEGORIES],
 }
 
 /// A caller-owned allocation budget that may be shared across sessions.
@@ -144,7 +432,27 @@ impl MemoryBudget {
             limit,
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            ledger: std::array::from_fn(|_| CategoryLedger::default()),
         }))
+    }
+
+    /// Categorised reservations. Reading the ledger allocates nothing, takes no
+    /// lock, and does not synchronise the categories with each other.
+    #[must_use]
+    pub fn ledger(&self) -> MemoryLedger {
+        MemoryLedger {
+            entries: std::array::from_fn(|index| self.0.ledger[index].snapshot()),
+        }
+    }
+
+    /// Whether this handle and `other` are clones of the same budget.
+    ///
+    /// A budget is shared by cloning it, so two handles are the same ledger
+    /// only when they point at the same state; two `MemoryBudget::new` calls
+    /// with the same ceiling are two separate budgets.
+    #[must_use]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     /// Configured ceiling.
@@ -171,19 +479,27 @@ impl MemoryBudget {
         self.limit().saturating_sub(self.used())
     }
 
-    /// Reserve aligned stripes atomically; another session may consume the
-    /// observed headroom before our reservation, so shrink on contention.
+    /// Reserve aligned stripes atomically, sized from what the budget has now.
+    ///
+    /// The width is computed, not searched. Halving a request until something
+    /// fits is an allocate-fail-wake loop: it charges the budget once per
+    /// failed step and reports only the last failure. One recomputation is
+    /// allowed because a peer may take bytes between reading the headroom and
+    /// reserving it; after that the request is refused with honest numbers
+    /// rather than retried again.
     pub(crate) fn reserve_stripes(
         &self,
+        category: MemoryCategory,
         target: usize,
         count: usize,
         alignment: usize,
     ) -> EngineResult<(usize, Reservation)> {
-        self.reserve_stripes_with_overhead(target, count, alignment, 0)
+        self.reserve_stripes_with_overhead(category, target, count, alignment, 0)
     }
 
     pub(crate) fn reserve_stripes_with_overhead(
         &self,
+        category: MemoryCategory,
         target: usize,
         count: usize,
         alignment: usize,
@@ -192,27 +508,61 @@ impl MemoryBudget {
         if count == 0 || alignment == 0 {
             return Err(EngineError::InvalidState("invalid repair stripe layout"));
         }
-        let available = || self.available().saturating_sub(overhead) / count;
-        let mut stripe = target.min(available()) / alignment * alignment;
-        while stripe != 0 {
-            match self.reserve(stripe * count + overhead) {
+        for attempt in 0..2 {
+            let room = self.available().saturating_sub(overhead) / count;
+            let stripe = target.min(room) / alignment * alignment;
+            if stripe == 0 {
+                break;
+            }
+            match self.reserve_as(category, stripe * count + overhead) {
                 Ok(reservation) => return Ok((stripe, reservation)),
-                Err(EngineError::ResourceLimit(_)) => {
-                    stripe = (stripe / 2).min(available()) / alignment * alignment;
-                }
+                // A peer moved between the measurement and the charge. Measure
+                // once more against what it left, then stop.
+                Err(EngineError::ResourceLimit(_)) if attempt == 0 => {}
                 Err(error) => return Err(error),
             }
         }
-        Err(EngineError::ResourceLimit("minimum repair stripe"))
+        Err(EngineError::budget_limit(
+            "minimum repair stripe",
+            alignment.saturating_mul(count).saturating_add(overhead),
+            self.limit(),
+            self.available(),
+        ))
     }
 
+    /// Reserve without naming a structure. Kept for call sites that have not
+    /// been categorised; the ledger reports these as `Uncategorized`.
     pub(crate) fn reserve(&self, bytes: usize) -> EngineResult<Reservation> {
+        self.reserve_as(MemoryCategory::Uncategorized, bytes)
+    }
+
+    pub(crate) fn reserve_as(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> EngineResult<Reservation> {
+        self.charge(category, bytes)?;
+        Ok(Reservation {
+            budget: self.clone(),
+            category,
+            bytes,
+        })
+    }
+
+    fn charge(&self, category: MemoryCategory, bytes: usize) -> EngineResult<()> {
         let mut previous = self.used();
         loop {
-            let next = previous
+            let Some(next) = previous
                 .checked_add(bytes)
                 .filter(|next| *next <= self.limit())
-                .ok_or(EngineError::ResourceLimit("memory budget"))?;
+            else {
+                return Err(EngineError::budget_limit(
+                    category.name(),
+                    bytes,
+                    self.limit(),
+                    self.limit().saturating_sub(previous),
+                ));
+            };
             match self.0.used.compare_exchange_weak(
                 previous,
                 next,
@@ -221,10 +571,8 @@ impl MemoryBudget {
             ) {
                 Ok(_) => {
                     self.0.peak.fetch_max(next, Ordering::AcqRel);
-                    return Ok(Reservation {
-                        budget: self.clone(),
-                        bytes,
-                    });
+                    self.0.ledger[category as usize].acquire(bytes);
+                    return Ok(());
                 }
                 Err(current) => previous = current,
             }
@@ -235,20 +583,31 @@ impl MemoryBudget {
 #[derive(Debug)]
 pub(crate) struct Reservation {
     budget: MemoryBudget,
+    category: MemoryCategory,
     bytes: usize,
 }
 
 impl Reservation {
     pub(crate) fn shrink_to(&mut self, bytes: usize) {
         assert!(bytes <= self.bytes, "reservation can only shrink");
-        self.budget
-            .0
-            .used
-            .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        let released = self.bytes - bytes;
+        self.budget.0.used.fetch_sub(released, Ordering::AcqRel);
+        self.budget.0.ledger[self.category as usize].release(released);
         self.bytes = bytes;
+    }
+    /// Take `bytes` more of the same category, or leave the reservation intact.
+    /// Growing an existing reservation keeps one unwind point for a sequence of
+    /// allocations, so a refusal part-way through releases everything it took.
+    pub(crate) fn grow_by(&mut self, bytes: usize) -> EngineResult<()> {
+        self.budget.charge(self.category, bytes)?;
+        self.bytes += bytes;
+        Ok(())
     }
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub(crate) fn category(&self) -> MemoryCategory {
+        self.category
     }
     pub(crate) fn belongs_to(&self, budget: &MemoryBudget) -> bool {
         Arc::ptr_eq(&self.budget.0, &budget.0)
@@ -258,6 +617,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.budget.0.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.0.ledger[self.category as usize].release(self.bytes);
     }
 }
 
@@ -297,7 +657,7 @@ impl ScanWorkBudget {
                     .filter(|next| *next <= self.0.limit)
             })
             .map(|_| ())
-            .map_err(|_| EngineError::ResourceLimit("cumulative scanning work"))
+            .map_err(|_| EngineError::resource_limit("cumulative scanning work"))
     }
 }
 
@@ -382,14 +742,20 @@ impl WorkerPool {
         headroom: usize,
     ) -> EngineResult<Option<Self>> {
         options.validate()?;
+        let wanted = options.workers.min(maximum).max(1);
         let workers = options
             .workers
             .min(maximum)
             .min(options.memory.available().saturating_sub(headroom) / Self::WORKER_BYTES);
+        // Shrinking the worker count is the first thing pressure takes, and a
+        // stage that ends up serial says so rather than failing.
+        options.diagnostics.note_workers(workers.max(1), wanted);
         if workers < 2 {
             return Ok(None);
         }
-        let memory = options.memory.reserve(workers * Self::WORKER_BYTES)?;
+        let memory = options
+            .memory
+            .reserve_as(MemoryCategory::WorkerStacks, workers * Self::WORKER_BYTES)?;
         let mut threads = Vec::with_capacity(workers);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
@@ -421,6 +787,13 @@ impl WorkerPool {
     pub(crate) fn pool(&self) -> &rayon::ThreadPool {
         self.pool.as_ref().expect("live worker pool")
     }
+
+    /// Threads this pool was admitted, which is what a stage should tile its
+    /// work by. It is at most the count the caller asked for and is often
+    /// fewer, because `for_work` narrows under memory pressure.
+    pub(crate) fn current_num_threads(&self) -> usize {
+        self.pool().current_num_threads()
+    }
 }
 
 impl Drop for WorkerPool {
@@ -447,6 +820,46 @@ impl ExecutionOptions {
 mod stripe_tests {
     use super::*;
 
+    /// PR #73 round 2, finding 6. `cause` filed every refusal with a zero
+    /// ceiling as `Unmeasured`, so a budget of zero — which refuses everything
+    /// with an honest need and an honest ceiling — was reported as a refusal
+    /// that carried no numbers, and a host reading it could not tell a real
+    /// exhausted budget from an overflowed count. Only a refusal with neither
+    /// figure is unmeasured now.
+    #[test]
+    fn a_zero_ceiling_refuses_with_numbers_and_says_so() {
+        let budget = MemoryBudget::new(0);
+        let Err(EngineError::ResourceLimit(limit)) =
+            budget.reserve_as(MemoryCategory::CodecTables, 4096)
+        else {
+            panic!("a zero budget admitted a reservation");
+        };
+        assert_eq!(limit.need, 4096);
+        assert_eq!(limit.limit, 0);
+        assert_eq!(limit.cause(), LimitCause::ExceedsLimit);
+        assert!(!limit.contended(), "no peer can ever release this");
+        let text = limit.to_string();
+        assert!(
+            text.contains("4096") && text.contains("ceiling 0"),
+            "Display dropped the figures: {text}"
+        );
+
+        // The structural constructor is the one that carries no figures, and
+        // it is the only shape left that reports `Unmeasured`.
+        let structural = ResourceLimit::named("layout runs");
+        assert_eq!(structural.need, 0);
+        assert_eq!(structural.limit, 0);
+        assert_eq!(structural.cause(), LimitCause::Unmeasured);
+        assert_eq!(structural.to_string(), "layout runs");
+
+        // A measured refusal can never carry need == 0: a zero-byte charge is
+        // admitted even by a zero budget, so nothing else lands in that shape.
+        assert!(
+            budget.reserve_as(MemoryCategory::CodecTables, 0).is_ok(),
+            "a zero-byte charge was refused, which would be an unmeasured shape"
+        );
+    }
+
     #[test]
     fn verification_workers_include_only_admitted_scratch() {
         let options = ExecutionOptions {
@@ -469,15 +882,33 @@ mod stripe_tests {
     fn aligned_stripes_share_and_release_the_physical_budget() {
         let memory = MemoryBudget::new(1024);
         let held = memory.reserve(400).unwrap();
-        let (stripe, reservation) = memory.reserve_stripes(1024, 3, 2).unwrap();
+        let (stripe, reservation) = memory
+            .reserve_stripes(MemoryCategory::CodecScratch, 1024, 3, 2)
+            .unwrap();
         assert_eq!(stripe, 208);
         assert_eq!(memory.used(), 1024);
-        assert!(memory.reserve_stripes(8, 2, 2).is_err());
+        assert!(
+            memory
+                .reserve_stripes(MemoryCategory::CodecScratch, 8, 2, 2)
+                .is_err()
+        );
         drop(reservation);
         drop(held);
         assert_eq!(memory.used(), 0);
-        assert!(memory.reserve_stripes(8, 0, 2).is_err());
-        assert!(memory.reserve_stripes(8, 2, 0).is_err());
-        assert!(memory.reserve_stripes(1, 2, 2).is_err());
+        assert!(
+            memory
+                .reserve_stripes(MemoryCategory::CodecScratch, 8, 0, 2)
+                .is_err()
+        );
+        assert!(
+            memory
+                .reserve_stripes(MemoryCategory::CodecScratch, 8, 2, 0)
+                .is_err()
+        );
+        assert!(
+            memory
+                .reserve_stripes(MemoryCategory::CodecScratch, 1, 2, 2)
+                .is_err()
+        );
     }
 }

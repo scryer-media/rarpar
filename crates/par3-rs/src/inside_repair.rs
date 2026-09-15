@@ -1,6 +1,6 @@
 //! Explicit self-repair from an authenticated embedded carrier manifest.
 
-use crate::runtime::{EngineFile as File, OpenBudgeted};
+use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -11,7 +11,6 @@ use super::{ContainerKind, ContainerLayout, ContainerLimits};
 use crate::Fingerprint;
 use crate::carrier::CarrierPlan;
 use crate::ingest::IngestedPacket;
-use crate::layout::ExtentKind;
 use crate::packet::PacketBody;
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::Par3RepairSession;
@@ -101,23 +100,18 @@ impl SelfRepairPlan {
             ));
         }
         let file = &layout.files[0];
-        let mut gaps = file
-            .extents
-            .iter()
-            .filter(|extent| matches!(extent.kind, ExtentKind::Unprotected));
-        let gap = gaps
-            .next()
-            .ok_or(EngineError::InvalidState(
-                "embedded layout has no packet gap",
-            ))?
-            .range
-            .clone();
+        let mut gaps = (0..file.extents.len())
+            .filter(|index| file.extents.is_unprotected(*index))
+            .filter_map(|index| file.extents.range(index));
+        let gap = gaps.next().ok_or(EngineError::InvalidState(
+            "embedded layout has no packet gap",
+        ))?;
         if gaps.next().is_some() || gap.start == 0 || gap.end > file.len {
             return Err(EngineError::Unsupported("ambiguous embedded packet gaps"));
         }
         let carrier = carrier(session, gap.clone())?;
         if carrier.output_bytes() > gap.end - gap.start {
-            return Err(EngineError::ResourceLimit(
+            return Err(EngineError::resource_limit(
                 "replacement exceeds authenticated packet gap",
             ));
         }
@@ -145,7 +139,7 @@ impl SelfRepairPlan {
         self.carrier
             .scratch_bytes(block_size)?
             .checked_add(self.carrier.output_bytes())
-            .ok_or(EngineError::ResourceLimit("self-repair scratch size"))
+            .ok_or(EngineError::resource_limit("self-repair scratch size"))
     }
 
     /// Restore to an absent destination, preserving the authenticated original
@@ -178,7 +172,9 @@ impl SelfRepairPlan {
         let options = session.options.clone();
         options.validate()?;
         let size = options.stripe_bytes.min(64 << 10);
-        let _buffer = options.memory.reserve(size + 4096)?;
+        let _buffer = options
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size + 4096)?;
         let mut buffer = vec![0; size];
         let staging = crate::session_repair::ScratchFile::new(destination, &options)?;
         let temporary = staging.path().to_owned();

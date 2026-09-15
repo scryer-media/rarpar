@@ -285,3 +285,331 @@ fn bounded_fft_decoding_restores_official_input_with_uneven_losses() {
         }
     }
 }
+
+/// Deliverable 3's continuation: after a recovery-only merge, reassessment
+/// must advance the acquisition plan rather than restate it.
+///
+/// The host declares what it is fetching with `note_recovery_in_flight`; the
+/// next assessment then reports those indices as `in_flight`, drops
+/// `outstanding` to zero and offers no `next_indices` to fetch again. Indices
+/// that actually arrive move to `available` on their own, and retracting a
+/// declaration returns exactly the bytes it charged.
+#[test]
+fn a_reassessment_after_a_recovery_merge_never_asks_for_the_same_index_twice() {
+    use par3_rs::ingest::{PacketScanner, PayloadKind, ScanEvent};
+    use par3_rs::runtime::MemoryBudget;
+    use par3_rs::session::RepairStatus;
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    let original: Vec<u8> = (0..14000)
+        .map(|i| ((i * 73 + i / 29) % 256) as u8)
+        .collect();
+    let mut damaged = original.clone();
+    for index in [0, 3, 6] {
+        damaged[index * 1024 + 11] ^= 1;
+    }
+    let mut source = MemorySourceAccess::default();
+    source.insert(SourceId(1), 1, damaged.into());
+    let mut options = ExecutionOptions::default();
+    options.memory = MemoryBudget::new(64 << 20);
+    let index = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/advanced/interleaved.par3"),
+    )
+    .unwrap();
+    let id = common::scan(&index)[0].1.input_set_id();
+    let mut session =
+        par3_rs::Par3RepairSession::new(id, Arc::new(source), options.clone()).unwrap();
+    session.bind_file("input.bin", SourceId(1)).unwrap();
+
+    // Hold back cohort zero's recovery, exactly as a host holds back volumes it
+    // has not downloaded yet.
+    let mut pending = Vec::new();
+    for name in [
+        "interleaved.par3",
+        "interleaved.vol0+1.par3",
+        "interleaved.vol1+2.par3",
+    ] {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/advanced")
+                .join(name),
+        )
+        .unwrap();
+        let mut source = MemorySourceAccess::default();
+        source.insert(SourceId(99), 1, bytes.into());
+        let mut scanner = PacketScanner::new(
+            Arc::new(source),
+            SourceId(99),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        loop {
+            match scanner.poll().unwrap() {
+                ScanEvent::Packet(packet) => {
+                    if packet.payload().is_some_and(
+                        |payload| matches!(payload.kind(), PayloadKind::Recovery { index, .. } if index != 0 && index % 3 == 0),
+                    ) {
+                        pending.push(packet);
+                    } else {
+                        session.merge(packet).unwrap();
+                    }
+                }
+                ScanEvent::End => break,
+                ScanEvent::NeedData { .. } => panic!("complete reference carrier"),
+            }
+        }
+    }
+
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::NeedRecovery);
+    let need = assessment.requirements[0].clone();
+    assert_eq!(need.additional, 2);
+    assert_eq!(need.in_flight, 0, "nothing was declared yet");
+    assert_eq!(need.outstanding, need.additional);
+    assert_eq!(need.next_indices.len() as u64, need.outstanding);
+    for index in &need.next_indices {
+        assert_eq!(index % need.cohorts, need.cohort, "wrong cohort offered");
+        assert!(
+            !need.available.contains(index),
+            "offered an index the set already holds"
+        );
+        assert!(need.recovery_indices.contains(index), "outside capacity");
+    }
+
+    // The host declares the fetch. The plan must now be fully spoken for.
+    let declared = need.next_indices.clone();
+    // Declare the first index on its own. That also drops the cached
+    // assessment, so the next declaration's delta is the charge and nothing
+    // else.
+    session
+        .note_recovery_in_flight(need.matrix, &declared[..1])
+        .unwrap();
+    let before = options.memory.used();
+    session
+        .note_recovery_in_flight(need.matrix, &declared)
+        .unwrap();
+    assert!(
+        options.memory.used() > before,
+        "the continuation was not charged"
+    );
+    let again = session.assess().unwrap();
+    assert_eq!(again.status, RepairStatus::NeedRecovery);
+    let need = again.requirements[0].clone();
+    assert_eq!(need.additional, 2, "the deficit itself did not change");
+    assert_eq!(need.in_flight, 2);
+    assert_eq!(need.outstanding, 0);
+    assert!(
+        need.next_indices.is_empty(),
+        "a second assessment asked for the same indices again: {:?}",
+        need.next_indices
+    );
+
+    // A recovery-only merge: what arrived becomes available, not in flight.
+    for packet in pending {
+        session.merge(packet).unwrap();
+    }
+    let ready = session.assess().unwrap();
+    assert_eq!(ready.status, RepairStatus::Ready);
+    for need in &ready.requirements {
+        assert_eq!(need.additional, 0, "a ready set still has a deficit");
+        assert_eq!(need.outstanding, 0);
+        assert!(need.next_indices.is_empty());
+        // The declared indices arrived, so they are available, not in flight.
+        assert_eq!(
+            need.in_flight, 0,
+            "an index that arrived is still counted as in flight"
+        );
+        for index in &declared {
+            if index % need.cohorts == need.cohort {
+                assert!(
+                    need.available.contains(index),
+                    "index {index} arrived but is not available"
+                );
+            }
+        }
+    }
+
+    // Retraction returns exactly what the declaration charged.
+    session.forget_recovery_in_flight(need.matrix, &declared[..1]);
+    let held = options.memory.used();
+    session.forget_recovery_in_flight(need.matrix, &[]);
+    assert!(
+        options.memory.used() < held,
+        "retracting the continuation returned nothing"
+    );
+
+    let output = common::TempTree::new("interleaved-continuation");
+    assert_eq!(
+        session
+            .repair(output.path(), false)
+            .unwrap()
+            .reconstructed_blocks,
+        3
+    );
+    assert_eq!(
+        std::fs::read(output.path().join("input.bin")).unwrap(),
+        original
+    );
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+}
+
+/// A session on the interleaved reference set with cohort zero's recovery held
+/// back, so the next assessment reports a real deficit to declare against.
+fn needing_recovery() -> (par3_rs::Par3RepairSession, ExecutionOptions) {
+    use par3_rs::ingest::{PacketScanner, PayloadKind, ScanEvent};
+    use par3_rs::runtime::MemoryBudget;
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    let original: Vec<u8> = (0..14000)
+        .map(|i| ((i * 73 + i / 29) % 256) as u8)
+        .collect();
+    let mut damaged = original;
+    for index in [0usize, 3, 6] {
+        damaged[index * 1024 + 11] ^= 1;
+    }
+    let mut source = MemorySourceAccess::default();
+    source.insert(SourceId(1), 1, damaged.into());
+    let mut options = ExecutionOptions::default();
+    options.memory = MemoryBudget::new(64 << 20);
+    let index = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/advanced/interleaved.par3"),
+    )
+    .unwrap();
+    let id = common::scan(&index)[0].1.input_set_id();
+    let mut session =
+        par3_rs::Par3RepairSession::new(id, Arc::new(source), options.clone()).unwrap();
+    session.bind_file("input.bin", SourceId(1)).unwrap();
+    for name in [
+        "interleaved.par3",
+        "interleaved.vol0+1.par3",
+        "interleaved.vol1+2.par3",
+    ] {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/advanced")
+                .join(name),
+        )
+        .unwrap();
+        let mut source = MemorySourceAccess::default();
+        source.insert(SourceId(99), 1, bytes.into());
+        let mut scanner = PacketScanner::new(
+            Arc::new(source),
+            SourceId(99),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        loop {
+            match scanner.poll().unwrap() {
+                ScanEvent::Packet(packet) => {
+                    if !packet.payload().is_some_and(
+                        |payload| matches!(payload.kind(), PayloadKind::Recovery { index, .. } if index != 0 && index % 3 == 0),
+                    ) {
+                        session.merge(packet).unwrap();
+                    }
+                }
+                ScanEvent::End => break,
+                ScanEvent::NeedData { .. } => panic!("complete reference carrier"),
+            }
+        }
+    }
+    (session, options)
+}
+
+/// A host may name the same index more than once in a single declaration — a
+/// retry list, a union of two queues. The set stores it once, so it must be
+/// charged once; charging per occurrence and refunding per stored entry leaves
+/// a reservation nothing can ever retract.
+#[test]
+fn declaring_one_index_three_times_charges_it_once() {
+    let (mut session, options) = needing_recovery();
+    let need = session.assess().unwrap().requirements[0].clone();
+    assert!(need.next_indices.len() >= 2, "{:?}", need.next_indices);
+    let index = need.next_indices[0];
+    let other = need.next_indices[1];
+
+    // Declaring anything drops the cached assessment, so one declaration is
+    // made first and the measurement taken after it: the delta below is then
+    // the charge for the triple declaration and nothing else.
+    session
+        .note_recovery_in_flight(need.matrix, &[other])
+        .unwrap();
+    let before = options.memory.used();
+    session
+        .note_recovery_in_flight(need.matrix, &[index, index, index])
+        .unwrap();
+    assert!(
+        options.memory.used() > before,
+        "the declaration was not charged at all"
+    );
+
+    // One index was stored, so one retraction must give all of it back.
+    session.forget_recovery_in_flight(need.matrix, &[index]);
+    assert_eq!(
+        options.memory.used(),
+        before,
+        "retracting the one index the set stored left {} bytes reserved that          nothing can ever retract",
+        options.memory.used().saturating_sub(before)
+    );
+
+    // And the set really did hold it once: the reassessment counts two indices
+    // in flight, not four.
+    session
+        .note_recovery_in_flight(need.matrix, &[index, index])
+        .unwrap();
+    let again = session.assess().unwrap().requirements[0].clone();
+    assert_eq!(
+        again.in_flight, 2,
+        "indices declared twice were counted twice"
+    );
+    session.forget_recovery_in_flight(need.matrix, &[]);
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+}
+
+/// An index past the matrix's capacity can never arrive, so it can never
+/// satisfy a requirement. Counting it as in flight would cancel a deficit the
+/// host still has to fill and leave it with nothing to fetch.
+#[test]
+fn an_index_beyond_capacity_does_not_cancel_the_deficit_it_can_never_fill() {
+    let (mut session, options) = needing_recovery();
+    let need = session.assess().unwrap().requirements[0].clone();
+    assert!(need.outstanding > 0 && !need.next_indices.is_empty());
+    let ceiling = need.recovery_indices.end;
+    // In this cohort, so it passes the cohort filter, but past the ceiling.
+    let unusable = ceiling + (need.cohort - ceiling % need.cohorts) % need.cohorts;
+    assert!(unusable >= ceiling);
+
+    session
+        .note_recovery_in_flight(need.matrix, &[unusable])
+        .unwrap();
+    let after = session.assess().unwrap().requirements[0].clone();
+    assert_eq!(
+        after.additional, need.additional,
+        "the deficit itself changed"
+    );
+    assert_eq!(
+        after.in_flight, 0,
+        "an index past {ceiling} was counted against the deficit"
+    );
+    assert_eq!(after.outstanding, need.outstanding);
+    let offered = *after
+        .next_indices
+        .first()
+        .expect("a requirement with an unusable index recorded still has work to offer");
+    assert!(
+        offered < ceiling && offered % after.cohorts == after.cohort,
+        "offered {offered}, which is not a fetchable index of this cohort"
+    );
+
+    // The host's own declaration is left alone: only `forget` retracts it.
+    session.forget_recovery_in_flight(after.matrix, &[unusable]);
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+}

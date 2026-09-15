@@ -1,6 +1,7 @@
 //! Striped repair and verified installation for retained sessions.
 
-use crate::runtime::{EngineFile as File, ExecutionOptions, OpenBudgeted};
+use crate::runtime::{EngineFile as File, ExecutionOptions, MemoryCategory, OpenBudgeted};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 
 use crate::gf::{Field, Gf8, Gf16};
-use crate::layout::{BlockLayout, ExtentKind};
+use crate::layout::BlockLayout;
 use crate::packet::PacketBody;
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::{Par3RepairSession, RepairStatus, block_range};
@@ -111,7 +112,7 @@ fn repair_inner(
         .iter()
         .chain(session.data_payloads().values())
     {
-        payload.validate(&session.options)?;
+        session.input.validate_payload(payload, &session.options)?;
     }
     let path_cost = assessment
         .files
@@ -126,15 +127,38 @@ fn repair_inner(
                 .and_then(|n| n.checked_add(2048))
                 .and_then(|n| n.checked_add(sum))
         })
-        .ok_or(EngineError::ResourceLimit("repair output paths"))?;
-    let _paths = session.options.memory.reserve(path_cost)?;
-    let mut staged = Vec::new();
+        .ok_or(EngineError::resource_limit("repair output paths"))?;
+    let _paths = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::OutputStaging, path_cost)?;
+    // Every destination is resolved before any file is staged. Whether a path
+    // can be written under `output` is a property of the set and the output
+    // directory, not of how far the repair has got, so it is settled up front.
+    // Resolving inside the staging loop instead means a rule broken by the
+    // second file surfaces only after the first has been staged, and the host
+    // sees `RepairInterrupted` with a temporary left on disk where it should
+    // see a bare `UnsafePath` saying this set can never be written here.
+    // The destinations cost one path each, and the fold below one more, which
+    // the `path_cost` reservation above already covers four times over.
+    let mut destinations = Vec::with_capacity(
+        assessment
+            .files
+            .iter()
+            .filter(|file| !file.complete)
+            .count(),
+    );
+    refuse_case_folded_destinations(output, &assessment.files)?;
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
             continue;
         }
         session.options.cancel.check()?;
-        let destination = contained_destination(output, &file.path)?;
+        destinations.push((index, contained_destination(output, &file.path)?));
+    }
+    let mut staged = Vec::with_capacity(destinations.len());
+    for (index, destination) in destinations {
+        session.options.cancel.check()?;
         let temporary = stage_path(&destination, &session.options)?;
         temporary_outputs.push(temporary.clone());
         OpenOptions::new()
@@ -154,12 +178,12 @@ fn repair_inner(
     {
         reconstruct_fft(session, layout, &staged, matrix)?;
     } else {
-        let field_bytes = if session.set.as_ref().expect("ready set").galois_field().size == 2 {
-            512 << 10
-        } else {
-            4096
-        };
-        let _field_reservation = session.options.memory.reserve(field_bytes)?;
+        let field_bytes =
+            crate::gf::construction_cost(&session.set.as_ref().expect("ready set").galois_field());
+        let _field_reservation = session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
         let field = crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
         match field {
             crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &staged, field)?,
@@ -171,9 +195,11 @@ fn repair_inner(
         let mut file = OpenOptions::new()
             .write(true)
             .open_budgeted(&target.temporary, &session.options)?;
-        for extent in &layout.files[target.index].extents {
-            if let ExtentKind::Inline(bytes) = &extent.kind {
-                file.seek(SeekFrom::Start(extent.range.start))?;
+        let extents = &layout.files[target.index].extents;
+        for index in 0..extents.len() {
+            if let Some(bytes) = extents.inline_bytes(index) {
+                let range = extents.range(index).expect("bounded extent");
+                file.seek(SeekFrom::Start(range.start))?;
                 file.write_all(bytes)?;
             }
         }
@@ -215,7 +241,7 @@ pub(crate) fn stage_embedded(
         return Err(EngineError::InvalidState("embedded repair is not ready"));
     }
     if session.options.open_handles < 3 {
-        return Err(EngineError::ResourceLimit(
+        return Err(EngineError::resource_limit(
             "embedded repair requires three handles",
         ));
     }
@@ -238,7 +264,7 @@ pub(crate) fn stage_embedded(
         .iter()
         .chain(session.data_payloads().values())
     {
-        payload.validate(&session.options)?;
+        session.input.validate_payload(payload, &session.options)?;
     }
     let targets = [StagedFile {
         index: 0,
@@ -253,14 +279,10 @@ pub(crate) fn stage_embedded(
         copy_available(session, layout, &targets)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
-        let _field = session
-            .options
-            .memory
-            .reserve(if set.galois_field().size == 2 {
-                512 << 10
-            } else {
-                4096
-            })?;
+        let _field = session.options.memory.reserve_as(
+            MemoryCategory::CodecTables,
+            crate::gf::construction_cost(&set.galois_field()),
+        )?;
         match crate::gf::for_set(&set.galois_field())? {
             crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &targets, field)?,
             crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &targets, field)?,
@@ -269,9 +291,11 @@ pub(crate) fn stage_embedded(
     let mut output = OpenOptions::new()
         .write(true)
         .open_budgeted(temporary, &session.options)?;
-    for extent in &layout.files[0].extents {
-        if let ExtentKind::Inline(bytes) = &extent.kind {
-            output.seek(SeekFrom::Start(extent.range.start))?;
+    let extents = &layout.files[0].extents;
+    for index in 0..extents.len() {
+        if let Some(bytes) = extents.inline_bytes(index) {
+            let range = extents.range(index).expect("bounded extent");
+            output.seek(SeekFrom::Start(range.start))?;
             output.write_all(bytes)?;
         }
     }
@@ -297,10 +321,13 @@ fn copy_available(
     // Data packets, aliases and inline-only files require no field or matrix.
     // In particular, the reference emits field size zero for degenerate codes.
     let size = session.options.stripe_bytes.min(64 << 10);
-    let _memory = session.options.memory.reserve(size * 2)?;
+    let _memory = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
-    for (&block, locations) in &layout.blocks {
+    for (block, locations) in layout.blocks() {
         if !locations
             .iter()
             .any(|location| outputs.iter().any(|target| target.index == location.file))
@@ -312,6 +339,14 @@ fn copy_available(
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
+            if offset != 0 {
+                // A block wider than the copy window is walked in windows, but
+                // each window covers a different part of it, so no byte is
+                // fetched twice. The extra walk is what costs, and that is what
+                // is counted; `reread_bytes` stays reserved for bytes genuinely
+                // fetched again.
+                session.options.diagnostics.note_stripe_pass();
+            }
             scatter(
                 &session.options,
                 layout,
@@ -327,6 +362,18 @@ fn copy_available(
     Ok(())
 }
 
+/// Bytes building the Cauchy inverse costs at its peak.
+///
+/// [`crate::cauchy::inverse_coefficients`] returns the `n` by `n` inverse and,
+/// while it computes it, holds four vectors of `n` symbols — the two node sets
+/// and their weight vectors. The per-row allowance also covers the recovery row
+/// bookkeeping the solve is driven from.
+fn cauchy_coefficient_bytes<F: Field>(n: usize) -> Option<usize> {
+    n.checked_mul(n)?
+        .checked_mul(F::SYMBOL_BYTES)?
+        .checked_add(n.checked_mul(64)?)
+}
+
 fn reconstruct<F>(
     session: &Par3RepairSession,
     layout: &BlockLayout,
@@ -340,13 +387,16 @@ where
     let mut progress = session.options.stage(crate::runtime::Stage::Decode)?;
     let assessment = session.assessment.as_ref().expect("assessment");
     let lost = &assessment.lost_blocks;
-    let _rows = session.options.memory.reserve(
+    // One `u64` per selected recovery row, collected from an exactly sized
+    // iterator, so the vector is allocated once at its final capacity.
+    let _rows = session.options.memory.reserve_as(
+        MemoryCategory::CodecScratch,
         assessment
             .recovery
             .len()
-            .checked_mul(16)
+            .checked_mul(size_of::<u64>())
             .and_then(|n| n.checked_add(256))
-            .ok_or(EngineError::ResourceLimit("recovery row indices"))?,
+            .ok_or(EngineError::resource_limit("recovery row indices"))?,
     )?;
     let rows: Vec<u64> = assessment
         .recovery
@@ -366,47 +416,113 @@ where
     }
     let n = lost.len();
     if n as u64 > session.options.max_cauchy_lost_blocks {
-        return Err(EngineError::ResourceLimit("Cauchy lost blocks"));
+        return Err(EngineError::resource_limit("Cauchy lost blocks"));
     }
-    let coefficient_bytes = n
-        .checked_mul(n)
-        .and_then(|count| count.checked_mul(F::SYMBOL_BYTES))
-        .and_then(|bytes| bytes.checked_add(n.checked_mul(64)?))
-        .ok_or(EngineError::ResourceLimit("Cauchy coefficients"))?;
-    let _coefficients = session.options.memory.reserve(coefficient_bytes)?;
+    let coefficient_bytes = cauchy_coefficient_bytes::<F>(n)
+        .ok_or(EngineError::resource_limit("Cauchy coefficients"))?;
+    let _coefficients = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::CodecTables, coefficient_bytes)?;
     let inverse = crate::cauchy::inverse_coefficients(&field, lost, &rows)?;
-    let buffer_count = n
-        .checked_mul(2)
-        .and_then(|count| count.checked_add(3))
-        .ok_or(EngineError::ResourceLimit("repair stripes"))?;
-    let pool = crate::runtime::WorkerPool::for_work(
-        &session.options,
-        n,
-        buffer_count
-            .checked_mul(F::SYMBOL_BYTES)
-            .ok_or(EngineError::ResourceLimit("minimum repair stripe"))?,
-    )?;
-    let (stripe, _buffers) = session.options.memory.reserve_stripes(
-        session
-            .options
-            .stripe_bytes
-            .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX)),
-        buffer_count,
-        F::SYMBOL_BYTES,
-    )?;
+    // Recovered rows are produced and scattered a tile at a time. The syndrome
+    // bank has to stay whole — every output row reads all of it — but the
+    // output bank only has to be as wide as the rows being solved right now,
+    // so the row payload is `(n + tile)` stripes instead of `2n`. The tile is
+    // the width the workers can actually use, so no parallelism is given up,
+    // and a serial repair keeps exactly one output row alive.
+    //
+    // The pool is admitted before the tile is chosen, against the headroom a
+    // serial repair needs: `n` syndrome rows, one output row and three stripes
+    // of overhead, plus the row headers of the `n + 1` vectors that bank holds.
+    // The headers are part of what the stripe admission charges, so leaving
+    // them out of the headroom let a pool be admitted into the bytes the
+    // headers need and then refused a repair that would have run serially.
+    // `for_work` narrows the worker count under pressure and returns `None`
+    // when fewer than two fit, so the requested `workers` is not what the
+    // repair gets. Tiling by the request would size the output bank for rows no
+    // worker exists to fill, reserving `workers` stripes for a repair that runs
+    // on one thread.
+    let serial_rows = n
+        .checked_add(1)
+        .ok_or(EngineError::resource_limit("repair stripes"))?;
+    let serial_headroom = n
+        .checked_add(4)
+        .and_then(|buffers| buffers.checked_mul(F::SYMBOL_BYTES))
+        .and_then(|bytes| bytes.checked_add(serial_rows.checked_mul(size_of::<Vec<u8>>())?))
+        .ok_or(EngineError::resource_limit("minimum repair stripe"))?;
+    let mut pool = crate::runtime::WorkerPool::for_work(&session.options, n, serial_headroom)?;
+    let target = session
+        .options
+        .stripe_bytes
+        .min(usize::try_from(layout.block_size).unwrap_or(usize::MAX));
+    // Admit the stripe bank at the tile the pool can actually use; if even that
+    // is refused, the pool's own stacks are the likeliest thing standing in the
+    // way, so give them back and try once more at the serial width. A repair
+    // that fits on one thread must not be refused because a pool was admitted
+    // in front of it.
+    let admit = |tile: usize| -> EngineResult<(usize, usize, crate::runtime::Reservation)> {
+        let buffer_count = n
+            .checked_add(tile)
+            .and_then(|count| count.checked_add(3))
+            .ok_or(EngineError::resource_limit("repair stripes"))?;
+        let bank_headers = n
+            .checked_add(tile)
+            .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
+            .ok_or(EngineError::resource_limit("repair stripes"))?;
+        let (stripe, buffers) = session.options.memory.reserve_stripes_with_overhead(
+            MemoryCategory::CodecScratch,
+            target,
+            buffer_count,
+            F::SYMBOL_BYTES,
+            bank_headers,
+        )?;
+        Ok((stripe, buffer_count, buffers))
+    };
+    let mut tile = pool
+        .as_ref()
+        .map_or(1, crate::runtime::WorkerPool::current_num_threads)
+        .min(n);
+    let admitted = match admit(tile) {
+        Ok(admitted) => admitted,
+        Err(EngineError::ResourceLimit(_)) if pool.is_some() => {
+            pool = None;
+            tile = 1;
+            session.options.diagnostics.note_workers(1, n);
+            admit(tile)?
+        }
+        Err(error) => return Err(error),
+    };
+    let (stripe, buffer_count, _buffers) = admitted;
+    session
+        .options
+        .diagnostics
+        .note_stripe(stripe, buffer_count, target);
     tracing::debug!(
         stripe_bytes = stripe,
         buffer_count,
         "PAR3 Cauchy stripe admitted"
     );
+    session
+        .options
+        .diagnostics
+        .note_tiling(stripe, buffer_count, tile);
     let mut syndromes = vec![vec![0u8; stripe]; n];
-    let mut recovered = vec![vec![0u8; stripe]; n];
+    let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut input = vec![0u8; stripe];
     let mut covered = vec![0u8; stripe];
     let mut offset = 0;
     while offset < layout.block_size {
         session.options.cancel.check()?;
         let take = (layout.block_size - offset).min(stripe as u64) as usize;
+        if offset != 0 {
+            // A stripe narrower than the block means every surviving block is
+            // read once more, for the next slice of it. That is one extra walk
+            // over the source however many blocks it covers, so it is counted
+            // here, once, and not once per block. The passes read disjoint
+            // slices, so this is an extra walk and not a byte fetched twice.
+            session.options.diagnostics.note_stripe_pass();
+        }
         for syndrome in &mut syndromes {
             syndrome[..take].fill(0);
         }
@@ -431,6 +547,13 @@ where
                     field.mul_acc(&mut syndrome[..take], &input[..take], factor);
                     Ok(())
                 };
+                // One code-matrix element per surviving block per recovery row,
+                // recomputed on every stripe pass. Counted here so the report
+                // can say what that costs before anything caches it.
+                session
+                    .options
+                    .diagnostics
+                    .note_factors(rows.len() as u64, 0);
                 if let Some(pool) = &pool {
                     pool.pool().install(|| {
                         syndromes
@@ -450,36 +573,53 @@ where
                 *to ^= from;
             }
         }
-        let recover = |(column, bytes): (usize, &mut Vec<u8>)| -> EngineResult<()> {
-            session.options.cancel.check()?;
-            bytes[..take].fill(0);
-            for (row, syndrome) in syndromes.iter().enumerate() {
+        // Solve and scatter the lost columns a tile at a time. Columns are
+        // still visited in order and each is written exactly once, so the
+        // staged bytes and the writes that produce them are unchanged.
+        let mut base = 0;
+        while base < n {
+            let width = tile.min(n - base);
+            let recover = |(slot, bytes): (usize, &mut Vec<u8>)| -> EngineResult<()> {
+                let column = base + slot;
                 session.options.cancel.check()?;
-                field.mul_acc(
-                    &mut bytes[..take],
-                    &syndrome[..take],
-                    inverse[column * n + row],
-                );
+                bytes[..take].fill(0);
+                for (row, syndrome) in syndromes.iter().enumerate() {
+                    session.options.cancel.check()?;
+                    field.mul_acc(
+                        &mut bytes[..take],
+                        &syndrome[..take],
+                        inverse[column * n + row],
+                    );
+                }
+                Ok(())
+            };
+            if let Some(pool) = &pool {
+                pool.pool().install(|| {
+                    recovered[..width]
+                        .par_iter_mut()
+                        .enumerate()
+                        .try_for_each(recover)
+                })?;
+            } else {
+                recovered[..width]
+                    .iter_mut()
+                    .enumerate()
+                    .try_for_each(recover)?;
             }
-            Ok(())
-        };
-        if let Some(pool) = &pool {
-            pool.pool()
-                .install(|| recovered.par_iter_mut().enumerate().try_for_each(recover))?;
-        } else {
-            recovered.iter_mut().enumerate().try_for_each(recover)?;
-        }
-        for (index, bytes) in lost.iter().zip(&recovered) {
-            scatter(
-                &session.options,
-                layout,
-                outputs,
-                *index,
-                offset,
-                &bytes[..take],
-            )?;
-            progress.advance(take as u64);
-            session.options.cancel.check()?;
+            for (index, bytes) in lost[base..base + width].iter().zip(&recovered[..width]) {
+                scatter(
+                    &session.options,
+                    layout,
+                    outputs,
+                    *index,
+                    offset,
+                    &bytes[..take],
+                )?;
+                session.options.diagnostics.note_reconstructed(take);
+                progress.advance(take as u64);
+                session.options.cancel.check()?;
+            }
+            base += width;
         }
         offset += take as u64;
     }
@@ -534,7 +674,7 @@ fn reconstruct_fft(
         {
             continue;
         }
-        if !layout.blocks.get(&block).is_some_and(|locations| {
+        if !layout.locations(block).is_some_and(|locations| {
             locations
                 .iter()
                 .any(|location| outputs.iter().any(|output| output.index == location.file))
@@ -624,31 +764,29 @@ fn scatter(
     offset: u64,
     bytes: &[u8],
 ) -> EngineResult<()> {
-    let Some(locations) = layout.blocks.get(&block) else {
+    let Some(locations) = layout.locations(block) else {
         return Ok(());
     };
-    for location in locations {
+    for location in locations.iter() {
         let Some(target) = outputs.iter().find(|target| target.index == location.file) else {
             continue;
         };
-        let extent = &layout.files[location.file].extents[location.extent];
-        let ExtentKind::Block {
-            offset: block_offset,
-            ..
-        } = extent.kind
-        else {
+        let extents = &layout.files[location.file].extents;
+        let Some(extent) = extents.range(location.extent) else {
+            continue;
+        };
+        let Some((_, block_offset)) = extents.block_at(location.extent) else {
             continue;
         };
         let start = offset.max(block_offset);
-        let end =
-            (offset + bytes.len() as u64).min(block_offset + extent.range.end - extent.range.start);
+        let end = (offset + bytes.len() as u64).min(block_offset + extent.end - extent.start);
         if start >= end {
             continue;
         }
         let mut file = OpenOptions::new()
             .write(true)
             .open_budgeted(&target.temporary, options)?;
-        file.seek(SeekFrom::Start(extent.range.start + start - block_offset))?;
+        file.seek(SeekFrom::Start(extent.start + start - block_offset))?;
         file.write_all(&bytes[(start - offset) as usize..(end - offset) as usize])?;
     }
     Ok(())
@@ -662,16 +800,20 @@ fn verify_staged(
     let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
     let expected = &layout.files[target.index];
     let size = session.options.stripe_bytes.min(64 << 10);
-    let _buffer = session.options.memory.reserve(size)?;
+    let _buffer = session
+        .options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut buffer = vec![0u8; size];
     let mut file = File::open(&target.temporary, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
-    for extent in &expected.extents {
-        if matches!(extent.kind, ExtentKind::Unprotected) {
+    for index in 0..expected.extents.len() {
+        if expected.extents.is_unprotected(index) {
             continue;
         }
-        file.seek(SeekFrom::Start(extent.range.start))?;
-        let mut remaining = extent.range.end - extent.range.start;
+        let range = expected.extents.range(index).expect("bounded extent");
+        file.seek(SeekFrom::Start(range.start))?;
+        let mut remaining = range.end - range.start;
         while remaining != 0 {
             session.options.cancel.check()?;
             let take = remaining.min(size as u64) as usize;
@@ -692,13 +834,98 @@ fn verify_staged(
     Ok(())
 }
 
+/// Find the first pair of destinations a case-insensitive filesystem would
+/// merge, or `None` if no two paths fold together.
+///
+/// Every file is considered, complete or not: one already whole on disk is
+/// just as lost if another file's output lands on its name. A pair where
+/// neither file would be written collides with nothing and is not reported.
+/// This answer is pure — it reads the assessment and nothing else — so the
+/// filesystem is only consulted when there is something to consult it about.
+fn case_folded_collisions(files: &[crate::session::AssessedFile]) -> Option<(usize, usize)> {
+    let mut folded: HashMap<String, usize> = HashMap::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        if let Some(first) = folded.insert(crate::paths::case_folded(&file.path), index)
+            && (!files[first].complete || !file.complete)
+        {
+            return Some((first, index));
+        }
+    }
+    None
+}
+
+/// Ask `base` whether it folds letter case, by writing one file and looking
+/// for it under a different spelling.
+///
+/// There is no portable way to be told this: the answer belongs to the mounted
+/// filesystem, not to the platform, and one machine can carry both kinds at
+/// once. So a uniquely named probe carrying uppercase letters is created and
+/// the same name in lowercase is looked up; if that resolves, the two spellings
+/// are one file here. The probe is removed either way, including when the
+/// lookup fails.
+///
+/// A probe that cannot be created is reported as folding. The caller only asks
+/// when a set would otherwise be written in a way that could silently destroy
+/// one of its own files, and a set is not installed on a guess.
+fn destination_folds_case(base: &Path) -> bool {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    );
+    let probe = base.join(format!(".par3-CASE-PROBE-{unique}"));
+    let folded = base.join(format!(".par3-case-probe-{unique}"));
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_err()
+    {
+        return true;
+    }
+    let folds = std::fs::symlink_metadata(&folded).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    folds
+}
+
+/// Refuse a set whose paths the destination filesystem cannot tell apart.
+///
+/// A PAR3 set naming both `Readme` and `README` is legitimate — a case-
+/// sensitive producer makes one — and repairing it onto a case-sensitive
+/// filesystem writes two files, as it should. On macOS and Windows those two
+/// names are one file, and the second output written would take the first
+/// one's place, so the repair is refused there instead. The collisions are
+/// found first and the filesystem is asked only if there are any; like every
+/// other destination rule this is settled before anything is staged, so the
+/// host sees a bare refusal rather than a half-finished repair.
+fn refuse_case_folded_destinations(
+    base: &Path,
+    files: &[crate::session::AssessedFile],
+) -> EngineResult<()> {
+    if case_folded_collisions(files).is_some() && destination_folds_case(base) {
+        return Err(EngineError::InvalidState(
+            "repair destinations differ only by letter case",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve one set-carried relative path inside `base`, creating parents.
+///
+/// The name-safety rules in [`crate::paths`] are applied to the whole path
+/// before the first directory is created, so a path that breaks a rule in a
+/// late component never leaves a partial tree behind, and no output byte is
+/// ever written under a name the engine would refuse. The rules are the same
+/// ones set creation applies, and the same on every platform; what remains
+/// here is the part that must consult the filesystem, which is the refusal to
+/// follow a symbolic link out of `base`.
 pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult<PathBuf> {
+    crate::paths::validate_relative_path(relative)?;
     let mut path = base.to_path_buf();
     let parts: Vec<_> = relative.split('/').collect();
     for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() || *part == "." || *part == ".." || part.contains(['\\', ':']) {
-            return Err(EngineError::InvalidState("invalid output path component"));
-        }
         path.push(part);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -745,7 +972,7 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
             Err(error) => return Err(error),
         }
     }
-    Err(EngineError::ResourceLimit("temporary output names"))
+    Err(EngineError::resource_limit("temporary output names"))
 }
 
 pub(crate) fn install(
@@ -775,7 +1002,7 @@ pub(crate) fn install(
                 }
             }
             if saved.is_none() {
-                return Err(EngineError::ResourceLimit("backup names"));
+                return Err(EngineError::resource_limit("backup names"));
             }
         }
         Ok(_) => {}
@@ -904,5 +1131,338 @@ mod tests {
     #[test]
     fn install_replaces_an_existing_file_without_a_backup() {
         replacement_keeps_expected_bytes(false);
+    }
+
+    fn scratch(name: &str) -> TestDirectory {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "par3-{name}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        directory
+    }
+
+    fn refused(base: &Path, relative: &str) -> crate::paths::PathRule {
+        match contained_destination(base, relative) {
+            Err(EngineError::UnsafePath(violation)) => {
+                assert!(
+                    relative.starts_with(&violation.path),
+                    "the refusal names the path it refused, truncated at most"
+                );
+                violation.rule
+            }
+            other => panic!("{relative:?} should be refused as unsafe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_destination_is_still_resolved_and_its_parents_created() {
+        let directory = scratch("destination");
+        let base = &directory.0;
+        let resolved = contained_destination(base, "season 1/ep 01.mkv").unwrap();
+        assert_eq!(resolved, base.join("season 1").join("ep 01.mkv"));
+        assert!(base.join("season 1").is_dir());
+        // The leaf itself is never created here, only its parents.
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn every_unsafe_destination_class_is_refused_by_the_shared_rule_table() {
+        use crate::paths::PathRule;
+        let directory = scratch("unsafe-destination");
+        let base = &directory.0;
+        for (relative, rule) in [
+            ("", PathRule::Empty),
+            ("a//b", PathRule::Empty),
+            ("out/", PathRule::Empty),
+            ("/etc/passwd", PathRule::Absolute),
+            ("C:/Windows/System32", PathRule::Absolute),
+            ("c:hosts", PathRule::Absolute),
+            ("./file", PathRule::CurrentDirectory),
+            ("../escape", PathRule::ParentDirectory),
+            ("a/../../escape", PathRule::ParentDirectory),
+            ("a\\b", PathRule::Backslash),
+            ("a:b", PathRule::Absolute),
+            ("ab:c", PathRule::Colon),
+            ("dir/stream:$DATA", PathRule::Colon),
+            ("what?.bin", PathRule::ForbiddenCharacter),
+            ("star*.bin", PathRule::ForbiddenCharacter),
+            ("quote\".bin", PathRule::ForbiddenCharacter),
+            ("less<.bin", PathRule::ForbiddenCharacter),
+            ("more>.bin", PathRule::ForbiddenCharacter),
+            ("pipe|.bin", PathRule::ForbiddenCharacter),
+            ("deep/dir/glob*", PathRule::ForbiddenCharacter),
+            ("nul\u{0}byte", PathRule::Control),
+            ("bell\u{7}", PathRule::Control),
+            ("CON", PathRule::ReservedDevice),
+            ("con.txt", PathRule::ReservedDevice),
+            ("deep/dir/LPT9.tar.gz", PathRule::ReservedDevice),
+            ("trailing ", PathRule::TrailingSpaceOrDot),
+            ("trailing.", PathRule::TrailingSpaceOrDot),
+            ("dir./file", PathRule::TrailingSpaceOrDot),
+        ] {
+            assert_eq!(refused(base, relative), rule, "{relative:?}");
+        }
+        assert_eq!(
+            refused(base, &"n".repeat(crate::paths::MAX_COMPONENT_BYTES + 1)),
+            PathRule::ComponentTooLong
+        );
+        assert_eq!(
+            refused(base, &"a/".repeat(crate::paths::MAX_PATH_BYTES)),
+            PathRule::PathTooLong
+        );
+        // Nothing was created on the way to any of those refusals.
+        assert_eq!(std::fs::read_dir(base).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_this_filesystem_would_have_accepted_is_still_refused() {
+        // Every one of these is a legal file name on unix, so the refusal is
+        // the engine's alone: it must not depend on the host noticing.
+        let directory = scratch("hostile-but-legal");
+        let base = &directory.0;
+        for legal in ["con.txt", "COM1", "a\\b", "a:b", "trailing.", "trailing "] {
+            let native = base.join(legal);
+            std::fs::write(&native, b"proof this name is legal here").unwrap();
+            assert!(native.exists(), "{legal:?} should be a legal unix name");
+            std::fs::remove_file(&native).unwrap();
+            assert!(
+                matches!(
+                    contained_destination(base, legal),
+                    Err(EngineError::UnsafePath(_))
+                ),
+                "{legal:?} should still be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_unsafe_component_creates_no_directories_at_all() {
+        let directory = scratch("no-partial-tree");
+        let base = &directory.0;
+        assert!(matches!(
+            contained_destination(base, "keep/these/../escape"),
+            Err(EngineError::UnsafePath(_))
+        ));
+        assert!(!base.join("keep").exists());
+        assert_eq!(std::fs::read_dir(base).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::gf::{Gf8, Gf16};
+    use crate::runtime::{MemoryBudget, MemoryCategory};
+
+    /// The coefficient charge is taken before `inverse_coefficients` runs, so
+    /// it has to cover the vectors that solve builds as well as the inverse it
+    /// keeps — and must not ask for so much more that a solvable set is refused.
+    #[test]
+    fn cauchy_coefficient_charge_covers_the_solve_and_what_it_returns() {
+        for n in [1usize, 17, 256, 4096] {
+            let lost: Vec<u64> = (0..n as u64).collect();
+            let rows: Vec<u64> = (0..n as u64).collect();
+            let gf16 = Gf16::default();
+            let inverse = crate::cauchy::inverse_coefficients(&gf16, &lost, &rows).unwrap();
+            // What the solve holds at its peak: the returned inverse plus the
+            // four `n`-symbol vectors it is built from.
+            let retained = inverse.capacity() * size_of::<u16>();
+            let peak = retained + 4 * n * size_of::<u16>();
+            let charge = cauchy_coefficient_bytes::<Gf16>(n).unwrap();
+            assert!(
+                charge >= peak,
+                "{n} lost blocks charge {charge} for a {peak} byte solve"
+            );
+            assert!(
+                charge < peak * 2 + 4096,
+                "{n} lost blocks charge {charge}, far above their {peak} byte solve"
+            );
+            assert!(
+                charge > retained,
+                "the charge must outlast nothing but the peak"
+            );
+        }
+        // GF(2^8) symbols are half the width, and the charge must follow.
+        assert!(
+            cauchy_coefficient_bytes::<Gf8>(256).unwrap()
+                < cauchy_coefficient_bytes::<Gf16>(256).unwrap()
+        );
+    }
+
+    /// The stripe banks are vectors of vectors. Their row headers do not scale
+    /// with the stripe, so a small stripe and many lost blocks must still be
+    /// charged for every header. Output tiling narrows the recovered bank from
+    /// `n` rows to `tile` rows; the charge must follow that too.
+    #[test]
+    fn cauchy_stripe_banks_charge_their_row_headers_as_well_as_their_bytes() {
+        for (n, limit) in [(4usize, 1 << 20), (512, 8 << 20), (4096, 64 << 20)] {
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(limit),
+                workers: 1,
+                stripe_bytes: 4096,
+                ..ExecutionOptions::default()
+            };
+            // Exactly the shape `reconstruct` computes: the syndrome bank keeps
+            // every row, the output bank keeps one tile.
+            let tile = options.workers.max(1).min(n);
+            let buffer_count = n + tile + 3;
+            let bank_headers = (n + tile) * size_of::<Vec<u8>>();
+            assert!(
+                buffer_count < n * 2 + 3,
+                "tiling did not narrow the {n}-row bank"
+            );
+            let (stripe, reservation) = options
+                .memory
+                .reserve_stripes_with_overhead(
+                    MemoryCategory::CodecScratch,
+                    options.stripe_bytes,
+                    buffer_count,
+                    Gf16::SYMBOL_BYTES,
+                    bank_headers,
+                )
+                .unwrap();
+
+            // Exactly what `reconstruct` allocates once the charge is granted.
+            let syndromes = vec![vec![0u8; stripe]; n];
+            let recovered = vec![vec![0u8; stripe]; tile];
+            let input = vec![0u8; stripe];
+            let covered = vec![0u8; stripe];
+            let bank = |bank: &Vec<Vec<u8>>| {
+                bank.capacity() * size_of::<Vec<u8>>()
+                    + bank.iter().map(Vec::capacity).sum::<usize>()
+            };
+            let measured =
+                bank(&syndromes) + bank(&recovered) + input.capacity() + covered.capacity();
+            assert!(
+                reservation.bytes() >= measured,
+                "{n} lost blocks charge {} for {measured} bytes of stripe banks",
+                reservation.bytes()
+            );
+            assert!(
+                reservation.bytes() < measured * 2,
+                "{n} lost blocks charge {}, more than twice their {measured} bytes",
+                reservation.bytes()
+            );
+            drop((syndromes, recovered, input, covered));
+            drop(reservation);
+            assert_eq!(options.memory.used(), 0);
+            assert_eq!(options.memory.ledger().current(), 0);
+        }
+    }
+    /// PR #73 round 4, finding D. A set naming two paths one filesystem would
+    /// merge is found before anything is staged. The finder is pure — it reads
+    /// the assessment only — so it is asked here directly; what the repair
+    /// then does about a collision depends on the destination, and is the
+    /// subject of the test below.
+    #[test]
+    fn destinations_that_differ_only_by_letter_case_are_found() {
+        let assessed = |path: &str, complete: bool| crate::session::AssessedFile {
+            path: path.to_owned(),
+            source: None,
+            complete,
+            verified_prefix: 0,
+            unresolved: Vec::new(),
+        };
+
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/notes", false)]),
+            None,
+            "two names that share nothing"
+        );
+        assert_eq!(
+            case_folded_collisions(&[assessed("one/Readme", false), assessed("two/README", false)]),
+            None,
+            "one spelling in two directories is two paths"
+        );
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/README", false)]),
+            Some((0, 1)),
+            "two outputs would be written to one file"
+        );
+
+        // A file already whole on disk is just as lost if another file's output
+        // lands on its name.
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", false)]),
+            Some((0, 1)),
+            "an output would land on a file that is already whole"
+        );
+
+        // Two files that are both complete are written nowhere, so nothing is
+        // at risk and the repair is not refused for a collision it never makes.
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", true)]),
+            None,
+            "nothing is staged, so nothing collides"
+        );
+    }
+
+    /// PR #73 round 4, finding D, and the CI fix that followed it. A set naming
+    /// `Readme` and `README` is legitimate — a case-sensitive producer makes
+    /// one — so the refusal belongs to the destination, not to the set. The
+    /// preflight asks the directory it is about to write into, and must leave
+    /// no probe behind either way. The expected answer is whatever this
+    /// machine's temporary directory actually does, which the test discovers
+    /// the same way the preflight does.
+    #[test]
+    fn a_case_folded_pair_is_refused_only_where_the_destination_folds_case() {
+        let tree = crate::test_reference::TempTree::new("case-folded-destinations");
+        let assessed = |path: &str| crate::session::AssessedFile {
+            path: path.to_owned(),
+            source: None,
+            complete: false,
+            verified_prefix: 0,
+            unresolved: Vec::new(),
+        };
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(tree.path())
+                .expect("the destination is readable")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Nothing collides, so the filesystem is never consulted and the
+        // directory is not touched.
+        refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("notes")])
+            .expect("two names that share nothing");
+        assert!(
+            entries().is_empty(),
+            "a set with no collision probed the destination anyway: {:?}",
+            entries()
+        );
+
+        // Discover this directory's own answer exactly as the preflight does.
+        let probe = tree.path().join("CaseProbe");
+        std::fs::write(&probe, b"probe").expect("a writable destination");
+        let folds = std::fs::symlink_metadata(tree.path().join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("the discovery probe is removed");
+
+        let outcome =
+            refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("README")]);
+        if folds {
+            let error = outcome.expect_err("two outputs would be written to one file here");
+            assert!(
+                matches!(error, EngineError::InvalidState(reason) if reason.contains("letter case")),
+                "refused for the wrong reason: {error}"
+            );
+        } else {
+            outcome.expect("two distinct files on a case-sensitive destination");
+        }
+        assert!(
+            entries().is_empty(),
+            "the case probe was left behind: {:?}",
+            entries()
+        );
     }
 }

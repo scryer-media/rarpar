@@ -5,7 +5,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.0 (unreleased)
 
-- Require `par3-rs` 0.3.1 for bounded parallel source verification and adaptive
+- Require `par3-rs` 0.4.0 for bounded parallel source verification and adaptive
   aligned repair stripes. The CLI remains at its existing prospective 0.5.0;
   this change introduces no CLI options or third-party dependency changes.
 - Keep repair dry runs read-only and reject layouts requiring explicit
@@ -19,7 +19,7 @@ documented in each crate's own changelog so those notes ship with the crate.
   destinations that alias on the target filesystem. Apply Cauchy loss limits
   to repair dry runs and resolve cleanup membership against `-C`.
 - Add `par3 create`, `par3 verify`, and `par3 repair`, using the bounded engine
-  in `par3-rs` 0.3.0. Support FFT/interleaving, deduplication, Data packets,
+  in `par3-rs` 0.4.0. Support FFT/interleaving, deduplication, Data packets,
   content placement, configurable volumes, dry-run creation plans, and explicit
   memory, worker, and repair-loss limits.
 - Discover and repair PAR3 sets in `auto` before archive extraction. Handle

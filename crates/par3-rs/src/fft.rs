@@ -2,7 +2,7 @@
 
 use reedsolomon_rs::fft::{TransformError, TransformField};
 
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
 /// Validated codec geometry for one cohort. Dummy input slots are supplied as
 /// zero by the layout adapter; they are not unavailable source bytes.
@@ -24,7 +24,7 @@ impl FftGeometry {
             ));
         }
         let inputs =
-            usize::try_from(inputs).map_err(|_| EngineError::ResourceLimit("FFT inputs"))?;
+            usize::try_from(inputs).map_err(|_| EngineError::resource_limit("FFT inputs"))?;
         let capacity = 1usize << capacity_log2;
         let domain = inputs
             .checked_add(capacity)
@@ -94,6 +94,190 @@ pub enum FftInput {
     Recovery(usize),
 }
 
+/// Butterflies one full additive transform over `rows` rows performs.
+fn butterflies(rows: usize) -> u64 {
+    (rows as u64 / 2) * u64::from(rows.trailing_zeros())
+}
+
+/// Which of a decode's final forward transform the lost rows actually depend
+/// on.
+///
+/// The forward transform runs its stages from the widest stride down to the
+/// narrowest. A stage of stride `2^j` or wider never joins two rows whose low
+/// `j` bits differ, so those stages together are `2^j` independent transforms,
+/// one over each set of rows sharing its low `j` bits. Every stage narrower
+/// than that stays inside one aligned block of `2^j` rows. A decode reads only
+/// the lost rows, so only the blocks holding them need their narrow stages at
+/// all: the rest of that work produces rows nobody reads.
+///
+/// The plan is the choice of `j` and the list of blocks. `j = 0` means the
+/// whole transform is one block and nothing is pruned.
+struct ForwardPlan {
+    /// Rows per block the narrow stages are confined to, as an exponent.
+    block_log2: u32,
+    /// Block indices, ascending, that hold a row the caller will read.
+    blocks: Vec<usize>,
+    /// Visited bits for the row-handle transposes.
+    visited: Vec<u64>,
+    /// Butterflies this plan removes from the full transform.
+    skipped: u64,
+    _reservation: Reservation,
+}
+
+/// What one transform call costs beyond its butterflies, in symbol operations.
+///
+/// A plan replaces one transform call with `2^j + blocks` of them, and each
+/// carries a fixed setup the butterflies do not pay for. Measured on this host
+/// (`tests/codec_measurements.rs`): the pinned `fft16` reference geometry — a
+/// 512-row domain, 32 symbols a row — skipped 1024 butterflies but took 256
+/// more calls to do it, and ran about 0.2 ms slower for it, a few thousand
+/// symbol operations a call. This is the conservative end of that measurement:
+/// below it the plan stands aside and the full transform runs, which is what
+/// the same probe now measures for both pinned reference geometries.
+const PLAN_CALL_SYMBOLS: u64 = 8192;
+
+impl ForwardPlan {
+    /// Cost model, in butterflies: every wide stage in full, plus the narrow
+    /// stages of the blocks that are kept.
+    fn cost(domain: usize, levels: u32, block_log2: u32, blocks: u64) -> u64 {
+        let wide = (domain as u64 / 2) * u64::from(levels - block_log2);
+        let narrow = blocks * butterflies(1usize << block_log2);
+        wide + narrow
+    }
+
+    /// The same cost in symbol operations, plus what the split itself costs:
+    /// one call's setup per transform, and one handle move per row per
+    /// transpose for a plan that has to gather its classes.
+    fn work(cost: u64, calls: u64, domain: usize, symbols: usize) -> u64 {
+        cost.saturating_mul(symbols as u64)
+            .saturating_add(calls.saturating_mul(PLAN_CALL_SYMBOLS))
+            .saturating_add(if calls > 1 { 2 * domain as u64 } else { 0 })
+    }
+
+    /// Choose the block width that costs the fewest butterflies for this loss
+    /// pattern, and charge what the plan holds. Widths are compared, not
+    /// guessed: heavy damage spreads across every block and the model then
+    /// picks `j = 0`, which is the unpruned transform.
+    fn new(
+        geometry: FftGeometry,
+        lost: &[usize],
+        symbols: usize,
+        options: &ExecutionOptions,
+    ) -> EngineResult<Self> {
+        let domain = geometry.domain;
+        let levels = domain.trailing_zeros();
+        let full = butterflies(domain);
+        // What a plan can hold: the blocks it keeps, the transpose's visited
+        // bitmap, and slack for both. Charged before anything is allocated.
+        // The plan is an optimisation, so a budget that cannot hold it narrows
+        // to the unpruned transform instead of refusing the decode. That shows
+        // in the diagnostics as a decode that skipped no butterflies.
+        let bytes = lost
+            .len()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(domain.div_ceil(8)))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or(EngineError::resource_limit("FFT transform plan"))?;
+        let mut reservation = match options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, bytes)
+        {
+            Ok(reservation) => reservation,
+            Err(EngineError::ResourceLimit(_)) => {
+                return Ok(Self {
+                    block_log2: 0,
+                    blocks: Vec::new(),
+                    visited: Vec::new(),
+                    skipped: 0,
+                    _reservation: options.memory.reserve_as(MemoryCategory::CodecScratch, 0)?,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        // The domain rows the decode will read, put in order once. `decode`
+        // checks that `lost` is in range and free of duplicates but never that
+        // it is ordered, and a public caller may hand over any order it likes.
+        // Both the cost model below and `transform_forward`'s binary search
+        // need order, so the plan establishes it rather than inheriting it: an
+        // unsorted list would otherwise misprice every split and then prune
+        // blocks the decode still needs, emitting wrong bytes silently.
+        let mut rows: Vec<usize> = lost
+            .iter()
+            .map(|&index| geometry.capacity + index)
+            .collect();
+        rows.sort_unstable();
+
+        // The unpruned transform is one call over the whole domain, and a split
+        // has to beat it on total work, not on butterflies alone.
+        let mut best = (0u32, full, Self::work(full, 1, domain, symbols));
+        for block_log2 in 1..=levels {
+            let mut blocks = 0u64;
+            let mut previous = None;
+            // `rows` is ascending, so a single compare counts distinct blocks.
+            for &row in &rows {
+                let block = row >> block_log2;
+                if previous != Some(block) {
+                    blocks += 1;
+                    previous = Some(block);
+                }
+            }
+            let cost = Self::cost(domain, levels, block_log2, blocks);
+            let calls = (1u64 << block_log2) + blocks;
+            let work = Self::work(cost, calls, domain, symbols);
+            if work < best.2 {
+                best = (block_log2, cost, work);
+            }
+        }
+        let (block_log2, cost, _) = best;
+        let (blocks, visited) = if block_log2 == 0 {
+            // No split was worth its calls: give the charge back rather than
+            // hold it for a transform that runs unpruned.
+            drop(rows);
+            reservation.shrink_to(0);
+            (Vec::new(), Vec::new())
+        } else {
+            for row in &mut rows {
+                *row >>= block_log2;
+            }
+            rows.dedup();
+            (rows, vec![0; domain.div_ceil(64)])
+        };
+        Ok(Self {
+            block_log2,
+            blocks,
+            visited,
+            skipped: full.saturating_sub(cost),
+            _reservation: reservation,
+        })
+    }
+}
+
+/// Move row handles so that a `rows`-by-`columns` row-major arrangement becomes
+/// a `columns`-by-`rows` one. Only the handles move; no symbol is copied.
+fn transpose(handles: &mut [Vec<u16>], rows: usize, columns: usize, visited: &mut [u64]) {
+    debug_assert_eq!(handles.len(), rows * columns);
+    let mark = |visited: &mut [u64], at: usize| visited[at / 64] |= 1 << (at % 64);
+    let seen = |visited: &[u64], at: usize| visited[at / 64] >> (at % 64) & 1 == 1;
+    visited.fill(0);
+    for start in 0..handles.len() {
+        if seen(visited, start) {
+            continue;
+        }
+        let mut at = start;
+        let mut carry = std::mem::take(&mut handles[start]);
+        loop {
+            mark(visited, at);
+            let to = (at % columns) * rows + at / columns;
+            carry = std::mem::replace(&mut handles[to], carry);
+            if to == start {
+                break;
+            }
+            at = to;
+        }
+    }
+}
+
 /// Bounded synchronous FFT execution. Byte streams use the PAR3 on-disk layout:
 /// one byte per GF8 symbol and little-endian pairs per GF16 symbol.
 pub struct FftCodec {
@@ -117,9 +301,10 @@ impl FftCodec {
                 workers: None,
             });
         }
-        let reservation = options
-            .memory
-            .reserve(TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?)?;
+        let reservation = options.memory.reserve_as(
+            MemoryCategory::CodecTables,
+            TransformField::allocation_bytes(geometry.bits).map_err(transform_error)?,
+        )?;
         let field = TransformField::new(geometry.bits).map_err(transform_error)?;
         // Keep enough admission space for locator bookkeeping and a minimal
         // stripe; a worker limit is a ceiling, not a request to exhaust memory.
@@ -155,13 +340,21 @@ impl FftCodec {
             // buffers. These are the same layouts admitted by decode/buffers.
             g.domain * 32 + g.domain * 32 + (g.domain * (2 / unit) + 2) * unit
         };
-        let _decode = self.options.memory.reserve(decode_floor)?;
+        let _decode = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, decode_floor)?;
         let target = self
             .options
             .stripe_bytes
             .min(usize::try_from(block_size).unwrap_or(usize::MAX))
             .min(self.options.memory.available() / 4);
-        let (stripe, reservation) = self.options.memory.reserve_stripes(target, 2, unit)?;
+        let (stripe, reservation) =
+            self.options
+                .memory
+                .reserve_stripes(MemoryCategory::CodecScratch, target, 2, unit)?;
+        self.options.diagnostics.note_stripe(stripe, 2, target);
+        self.options.diagnostics.note_window(stripe);
         self.options.stripe_bytes = stripe;
         Ok((stripe, reservation))
     }
@@ -176,8 +369,29 @@ impl FftCodec {
     }
 
     fn transform(&self, rows: &mut [Vec<u16>], origin: usize, inverse: bool) -> EngineResult<()> {
+        self.transform_counted(rows, origin, inverse, 0)
+    }
+
+    /// One additive transform, counted. `skipped` is the butterflies a plan
+    /// removed from what this call would otherwise have had to perform, so the
+    /// diagnostics can report the pruned and unpruned costs side by side.
+    fn transform_counted(
+        &self,
+        rows: &mut [Vec<u16>],
+        origin: usize,
+        inverse: bool,
+        skipped: u64,
+    ) -> EngineResult<()> {
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let cancelled = || self.options.cancel.check().is_err();
+        // Measured before the call, which consumes the borrow, but reported
+        // only once the backend has actually done the work. A cancelled or
+        // failed transform performed no butterflies, and counting it as though
+        // it had would inflate the codec totals exactly where a host looks to
+        // find out why an operation cost what it did. The pruned path below
+        // has always reported afterwards; these two now agree.
+        let performed = butterflies(rows.len());
+        let symbols = rows.first().map_or(0, Vec::len);
         if let Some(workers) = &self.workers {
             field.transform_in_pool(
                 rows,
@@ -196,7 +410,79 @@ impl FftCodec {
                 &cancelled,
             )
         }
-        .map_err(transform_error)
+        .map_err(transform_error)?;
+        self.options
+            .diagnostics
+            .note_transform(1, performed, symbols, skipped);
+        Ok(())
+    }
+
+    /// The final forward transform of a decode, pruned to `plan`.
+    ///
+    /// The wide stages run as `2^j` independent transforms over the rows that
+    /// share their low `j` bits; those rows are strided, so their handles are
+    /// gathered and put back afterwards — pointer moves, never symbol copies.
+    /// The narrow stages then run only on the blocks the plan kept. Every
+    /// butterfly this performs is one the full transform would have performed,
+    /// with the same factor, in the same order relative to the rows it touches,
+    /// so the rows the caller reads come out byte for byte identical.
+    fn transform_forward(&self, rows: &mut [Vec<u16>], plan: &mut ForwardPlan) -> EngineResult<()> {
+        use rayon::prelude::*;
+        if plan.block_log2 == 0 {
+            return self.transform_counted(rows, 0, false, 0);
+        }
+        let field = self.field.as_ref().expect("nontrivial FFT field");
+        let backend = self.options.fft_backend;
+        let cancelled = || self.options.cancel.check().is_err();
+        // `width` rows to a block, and equally `width` classes; each class holds
+        // the `span` rows that share its low bits.
+        let width = 1usize << plan.block_log2;
+        let span = rows.len() >> plan.block_log2;
+        let symbols = rows.first().map_or(0, Vec::len);
+        let blocks = &plan.blocks;
+        let wide = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
+            let run = |class: &mut [Vec<u16>]| {
+                field
+                    .transform_with_backend(class, 0, false, backend, &cancelled)
+                    .map_err(transform_error)
+            };
+            match &self.workers {
+                Some(workers) => workers
+                    .pool()
+                    .install(|| rows.par_chunks_mut(span).try_for_each(run)),
+                None => rows.chunks_mut(span).try_for_each(run),
+            }
+        };
+        let narrow = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
+            let run = |(block, at): (usize, &mut [Vec<u16>])| {
+                if blocks.binary_search(&block).is_err() {
+                    return Ok(());
+                }
+                field
+                    .transform_with_backend(at, block * width, false, backend, &cancelled)
+                    .map_err(transform_error)
+            };
+            match &self.workers {
+                Some(workers) => workers
+                    .pool()
+                    .install(|| rows.par_chunks_mut(width).enumerate().try_for_each(run)),
+                None => rows.chunks_mut(width).enumerate().try_for_each(run),
+            }
+        };
+        transpose(rows, span, width, &mut plan.visited);
+        let result = wide(rows);
+        transpose(rows, width, span, &mut plan.visited);
+        result?;
+        narrow(rows)?;
+        let performed =
+            (width as u64) * butterflies(span) + blocks.len() as u64 * butterflies(width);
+        self.options.diagnostics.note_transform(
+            width as u64 + blocks.len() as u64,
+            performed,
+            symbols,
+            plan.skipped,
+        );
+        Ok(())
     }
 
     /// Encode a compatible recovery range. Input and output callbacks receive
@@ -227,7 +513,7 @@ impl FftCodec {
         let rows = g
             .capacity
             .checked_mul(2)
-            .ok_or(EngineError::ResourceLimit("FFT encoder rows"))?;
+            .ok_or(EngineError::resource_limit("FFT encoder rows"))?;
         let (stripe, _buffers) = self.buffers(block_size, rows)?;
         let symbols = stripe / g.field_bytes();
         let mut work = vec![vec![0u16; symbols]; g.capacity];
@@ -281,6 +567,7 @@ impl FftCodec {
         let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
         let mut write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
+            self.options.diagnostics.note_reconstructed(bytes.len());
             progress.advance(bytes.len() as u64);
             self.options.cancel.check()
         };
@@ -295,10 +582,11 @@ impl FftCodec {
             return self.decode_trivial(block_size, lost, recovery, read, write);
         }
         let field = self.field.as_ref().expect("nontrivial FFT field");
-        let _plan = self.options.memory.reserve(
+        let _plan = self.options.memory.reserve_as(
+            MemoryCategory::CodecScratch,
             g.domain
                 .checked_mul(32)
-                .ok_or(EngineError::ResourceLimit("FFT locator"))?,
+                .ok_or(EngineError::resource_limit("FFT locator"))?,
         )?;
         let mut erased = vec![false; g.domain];
         erased[..g.capacity].fill(true);
@@ -322,6 +610,7 @@ impl FftCodec {
             .map_err(transform_error)?;
         let (stripe, _buffers) = self.buffers(block_size, g.domain)?;
         let symbols = stripe / g.field_bytes();
+        let mut plan = ForwardPlan::new(g, lost, symbols, &self.options)?;
         let mut rows = vec![vec![0u16; symbols]; g.domain];
         let mut bytes = vec![0; stripe];
         let mut offset = 0;
@@ -350,7 +639,7 @@ impl FftCodec {
             field
                 .derivative(&mut rows, &cancelled)
                 .map_err(transform_error)?;
-            self.transform(&mut rows, 0, false)?;
+            self.transform_forward(&mut rows, &mut plan)?;
             for &index in lost {
                 let factor = field
                     .inverse(factors[g.capacity + index])
@@ -411,11 +700,12 @@ impl FftCodec {
             return Err(EngineError::InvalidState("invalid or duplicate FFT loss"));
         }
         // Charge only supplied indices; a large copy geometry needs no locator.
-        let _indices = self.options.memory.reserve(
+        let _indices = self.options.memory.reserve_as(
+            MemoryCategory::CodecScratch,
             recovery
                 .len()
                 .checked_mul(size_of::<usize>())
-                .ok_or(EngineError::ResourceLimit("FFT recovery indices"))?,
+                .ok_or(EngineError::resource_limit("FFT recovery indices"))?,
         )?;
         let mut indices = recovery.to_vec();
         indices.sort_unstable();
@@ -458,14 +748,19 @@ impl FftCodec {
         if block_size == 0 {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
-        self.options.memory.reserve_stripes_with_overhead(
-            self.options
-                .stripe_bytes
-                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        let admitted = self.options.memory.reserve_stripes_with_overhead(
+            MemoryCategory::CodecScratch,
+            target,
             2,
             1,
             64,
-        )
+        )?;
+        self.options.diagnostics.note_stripe(admitted.0, 2, target);
+        Ok(admitted)
     }
 
     fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
@@ -476,19 +771,25 @@ impl FftCodec {
         }
         let overhead = rows
             .checked_mul(32)
-            .ok_or(EngineError::ResourceLimit("FFT rows"))?;
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
         let per_byte = rows
             .checked_mul(2 / unit)
             .and_then(|n| n.checked_add(2))
-            .ok_or(EngineError::ResourceLimit("FFT stripes"))?;
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
         let buffers = self.options.memory.reserve_stripes_with_overhead(
-            self.options
-                .stripe_bytes
-                .min(usize::try_from(block_size).unwrap_or(usize::MAX)),
+            MemoryCategory::CodecScratch,
+            target,
             per_byte,
             unit,
             overhead,
         )?;
+        self.options
+            .diagnostics
+            .note_stripe(buffers.0, per_byte, target);
         tracing::debug!(stripe_bytes = buffers.0, rows, "PAR3 FFT stripes admitted");
         Ok(buffers)
     }
@@ -568,5 +869,372 @@ mod tests {
             })
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::runtime::{MemoryBudget, MemoryCategory};
+
+    fn options(limit: usize) -> ExecutionOptions {
+        ExecutionOptions {
+            memory: MemoryBudget::new(limit),
+            workers: 1,
+            stripe_bytes: 64 << 10,
+            ..ExecutionOptions::default()
+        }
+    }
+
+    /// The transform field's charge must cover building it, not just holding
+    /// it: `TransformField::new` fills a polynomial-log table that is freed
+    /// again before the constructor returns.
+    #[test]
+    fn transform_field_charge_covers_setup_and_the_tables_it_leaves() {
+        for bits in [8u32, 16] {
+            let order = 1usize << bits;
+            let charge = TransformField::allocation_bytes(bits).unwrap();
+            // log and exp survive; polynomial_log does not.
+            let retained = (order + 2 * (order - 1)) * size_of::<u16>();
+            let peak = retained + order * size_of::<u16>();
+            assert!(
+                charge >= peak,
+                "{bits}-bit field charges {charge} for a {peak} peak"
+            );
+            assert!(
+                charge < peak * 2,
+                "{bits}-bit field charges {charge}, more than twice its {peak} peak"
+            );
+
+            let geometry = FftGeometry::new(order as u64 / 4, 1).unwrap();
+            assert_eq!(geometry.bits, bits);
+            let options = options(64 << 20);
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let tables = options
+                .memory
+                .ledger()
+                .category(MemoryCategory::CodecTables);
+            assert_eq!(tables.current, charge as u64);
+            drop(codec);
+            assert_eq!(
+                options
+                    .memory
+                    .ledger()
+                    .category(MemoryCategory::CodecTables)
+                    .current,
+                0
+            );
+        }
+    }
+
+    /// One cohort's row workspace is `domain` transform rows plus one byte
+    /// stripe. The charge is taken before any of it is allocated, so it must
+    /// cover every row's capacity and its vector header.
+    #[test]
+    fn row_workspace_charge_matches_the_rows_a_cohort_allocates() {
+        for inputs in [200u64, 5_000] {
+            let geometry = FftGeometry::new(inputs, 1).unwrap();
+            let options = options(256 << 20);
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let unit = geometry.field_bytes();
+            let block_size = 1 << 16;
+            let before = options.memory.used();
+            let (stripe, buffers) = codec.buffers(block_size, geometry.domain).unwrap();
+            assert_eq!(options.memory.used() - before, buffers.bytes());
+
+            // Exactly what `decode` allocates once the charge is granted.
+            let symbols = stripe / unit;
+            let rows = vec![vec![0u16; symbols]; geometry.domain];
+            let bytes = vec![0u8; stripe];
+            let measured = rows.capacity() * size_of::<Vec<u16>>()
+                + rows
+                    .iter()
+                    .map(|row| row.capacity() * size_of::<u16>())
+                    .sum::<usize>()
+                + bytes.capacity();
+            assert!(
+                buffers.bytes() >= measured,
+                "{inputs} inputs charge {} for a {measured} byte workspace",
+                buffers.bytes()
+            );
+            assert!(
+                buffers.bytes() < measured * 2,
+                "{inputs} inputs charge {}, more than twice their {measured} byte workspace",
+                buffers.bytes()
+            );
+            drop(buffers);
+            drop(rows);
+            assert_eq!(options.memory.used(), before);
+            drop(codec);
+            assert_eq!(options.memory.used(), 0);
+        }
+    }
+
+    /// The repair adapter keeps two byte buffers for the whole reconstruction
+    /// and briefly reserves a decode floor while sizing them. The floor must be
+    /// released again, and the buffers charged for exactly what they hold.
+    #[test]
+    fn source_adapter_buffers_outlive_the_decode_floor_they_were_sized_against() {
+        let geometry = FftGeometry::new(1_000, 1).unwrap();
+        let options = options(64 << 20);
+        let mut codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let tables = options.memory.used();
+        let (stripe, buffers) = codec.reserve_source_stripes(1 << 16, 4).unwrap();
+        let held = options.memory.used() - tables;
+        assert_eq!(held, buffers.bytes(), "the decode floor was not released");
+
+        let first = vec![0u8; stripe];
+        let second = vec![0u8; stripe];
+        let measured = first.capacity() + second.capacity();
+        assert!(
+            buffers.bytes() >= measured,
+            "adapter buffers charge {} for {measured} bytes",
+            buffers.bytes()
+        );
+        assert!(
+            buffers.bytes() < measured * 2,
+            "adapter buffers charge {}, more than twice their {measured} bytes",
+            buffers.bytes()
+        );
+        let peak = options
+            .memory
+            .ledger()
+            .category(MemoryCategory::CodecScratch)
+            .peak;
+        assert!(
+            peak > buffers.bytes() as u64,
+            "the decode floor must show in the ledger's peak"
+        );
+        drop(buffers);
+        drop(codec);
+        assert_eq!(options.memory.used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::runtime::MemoryBudget;
+
+    fn rows(count: usize, symbols: usize, bits: u32, seed: u64) -> Vec<Vec<u16>> {
+        let mut state = seed | 1;
+        let mask = if bits == 8 { 0xff } else { 0xffff };
+        (0..count)
+            .map(|_| {
+                (0..symbols)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state & mask) as u16
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_transposed_row_order_matches_the_naive_one_and_returns_to_itself() {
+        for (rows, columns) in [
+            (1usize, 8usize),
+            (8, 1),
+            (2, 4),
+            (4, 2),
+            (8, 8),
+            (16, 4),
+            (3, 5),
+        ] {
+            let mut handles: Vec<Vec<u16>> = (0..rows * columns).map(|i| vec![i as u16]).collect();
+            let original = handles.clone();
+            let mut visited = vec![0u64; (rows * columns).div_ceil(64)];
+            transpose(&mut handles, rows, columns, &mut visited);
+            for y in 0..rows {
+                for x in 0..columns {
+                    assert_eq!(
+                        handles[x * rows + y],
+                        original[y * columns + x],
+                        "{rows}x{columns} at ({y},{x})"
+                    );
+                }
+            }
+            transpose(&mut handles, columns, rows, &mut visited);
+            assert_eq!(handles, original, "{rows}x{columns} did not return");
+        }
+    }
+
+    /// A budget with no room for the plan narrows to the unpruned transform
+    /// rather than refusing the decode, and charges nothing for the plan it did
+    /// not take.
+    #[test]
+    fn a_budget_too_small_for_a_plan_falls_back_to_the_full_transform() {
+        let geometry = FftGeometry::new(900, 7).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(64 << 20),
+            ..ExecutionOptions::default()
+        };
+        // Hold everything but a handful of bytes, which is less than the plan
+        // for 2048 rows and one loss needs.
+        let _held = options
+            .memory
+            .reserve(options.memory.available() - 8)
+            .unwrap();
+        let plan = ForwardPlan::new(geometry, &[5], 4096, &options).unwrap();
+        assert_eq!(plan.block_log2, 0, "a refused plan must not be taken");
+        assert_eq!(plan.skipped, 0, "a refused plan skips nothing");
+        assert!(plan.blocks.is_empty());
+        assert_eq!(
+            options.memory.available(),
+            8,
+            "it charged for a plan anyway"
+        );
+    }
+
+    /// Cancellation inside the pruned transform gives back exactly what the
+    /// plan holds. The token is set before the call, so the transform stops at
+    /// its first check with the plan's mask, block list and charge all live.
+    #[test]
+    fn a_cancelled_pruned_transform_gives_back_everything_the_plan_held() {
+        let geometry = FftGeometry::new(900, 7).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(64 << 20),
+            ..ExecutionOptions::default()
+        };
+        let before = options.memory.available();
+        let codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let mut plan = ForwardPlan::new(geometry, &[5], 4096, &options).unwrap();
+        assert!(plan.block_log2 > 0, "this geometry should plan a split");
+        assert!(options.memory.used() > 0, "the plan charged nothing");
+        let mut workspace = rows(geometry.domain, 4096, geometry.bits, 0x51ed);
+        options.cancel.cancel();
+        assert!(
+            matches!(
+                codec.transform_forward(&mut workspace, &mut plan),
+                Err(EngineError::Cancelled)
+            ),
+            "a cancelled transform did not report it"
+        );
+        drop(plan);
+        drop(codec);
+        assert_eq!(options.memory.used(), 0);
+        assert_eq!(options.memory.available(), before);
+        for (category, entry) in options.memory.ledger().iter() {
+            assert_eq!(entry.current, 0, "{} leaked", category.name());
+        }
+    }
+
+    /// PR #73 round 2, finding 5. `transform_counted` announced the calls,
+    /// butterflies, symbols and skipped work before handing the rows to the
+    /// backend, so a transform that was cancelled — or that failed — was
+    /// reported as performed. The pruned path has always counted afterwards;
+    /// a cancelled full transform now charges the codec counters nothing too.
+    #[test]
+    fn a_transform_that_never_ran_is_not_counted_as_work_performed() {
+        let geometry = FftGeometry::new(900, 7).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(64 << 20),
+            ..ExecutionOptions::default()
+        };
+        let codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let mut workspace = rows(geometry.domain, 64, geometry.bits, 0x9e37);
+
+        // One transform that does run, so the test is measuring a difference
+        // and not an engine that never counts anything.
+        codec.transform(&mut workspace, 0, false).expect("runs");
+        let ran = options.diagnostics.codec();
+        assert!(ran.transform_calls > 0 && ran.butterflies > 0, "{ran:?}");
+
+        options.cancel.cancel();
+        assert!(
+            matches!(
+                codec.transform(&mut workspace, 0, false),
+                Err(EngineError::Cancelled)
+            ),
+            "a cancelled transform did not report it"
+        );
+        assert_eq!(
+            options.diagnostics.codec(),
+            ran,
+            "the cancelled transform was counted as work performed"
+        );
+    }
+
+    /// The oracle for the pruned transform is the full one: every row a plan
+    /// keeps must come out exactly as the unpruned transform leaves it, at
+    /// every block width, in both fields, at widths either side of the SIMD
+    /// threshold.
+    #[test]
+    fn every_block_a_plan_keeps_holds_what_the_full_transform_would_have_left() {
+        for (inputs, capacity_log2, symbols) in [
+            (5u64, 2i8, 4usize),
+            (5, 2, 64),
+            (200, 6, 65),
+            (200, 6, 128),
+            (900, 7, 16),
+            (900, 7, 64),
+        ] {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(64 << 20),
+                ..ExecutionOptions::default()
+            };
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let levels = geometry.domain.trailing_zeros();
+            let start = rows(geometry.domain, symbols, geometry.bits, 0x9e37 + inputs);
+            let mut expected = start.clone();
+            codec.transform(&mut expected, 0, false).unwrap();
+            for block_log2 in 1..=levels {
+                let width = 1usize << block_log2;
+                for first in [0usize, 1, geometry.domain / 2] {
+                    if first + width > geometry.domain {
+                        continue;
+                    }
+                    let block = first >> block_log2;
+                    let mut plan = ForwardPlan {
+                        block_log2,
+                        blocks: vec![block],
+                        visited: vec![0; geometry.domain.div_ceil(64)],
+                        skipped: 0,
+                        _reservation: options.memory.reserve(0).unwrap(),
+                    };
+                    let mut actual = start.clone();
+                    codec.transform_forward(&mut actual, &mut plan).unwrap();
+                    let kept = block * width..block * width + width;
+                    assert_eq!(
+                        actual[kept.clone()],
+                        expected[kept],
+                        "domain {} width {width} block {block} symbols {symbols}",
+                        geometry.domain
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_never_costs_more_than_the_transform_it_replaces() {
+        for (inputs, capacity_log2) in [(5u64, 2i8), (200, 6), (900, 7), (30_000, 10)] {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(64 << 20),
+                ..ExecutionOptions::default()
+            };
+            let levels = geometry.domain.trailing_zeros();
+            let full = butterflies(geometry.domain);
+            for count in [1usize, 2, 8, geometry.inputs / 2, geometry.inputs] {
+                let lost: Vec<usize> = (0..count.min(geometry.inputs)).collect();
+                let plan = ForwardPlan::new(geometry, &lost, 4096, &options).unwrap();
+                let width = 1u64 << plan.block_log2;
+                let performed = if plan.block_log2 == 0 {
+                    full
+                } else {
+                    width * butterflies(geometry.domain >> plan.block_log2)
+                        + plan.blocks.len() as u64 * butterflies(width as usize)
+                };
+                assert_eq!(performed + plan.skipped, full, "{inputs} losing {count}");
+                assert!(performed <= full, "{inputs} losing {count}");
+                assert!(plan.block_log2 <= levels);
+            }
+            drop(options);
+        }
     }
 }

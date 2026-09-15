@@ -557,6 +557,60 @@ impl AnyField {
     }
 }
 
+/// Peak heap bytes building one field's lookup tables costs.
+///
+/// Both fields are built the same way: [`build_tables`] fills a pair of `u32`
+/// working tables sized by the field order, and each is then narrowed into a
+/// boxed table of symbols. A working table's buffer is released only once the
+/// table narrowed from it is finished, so the peak holds both working tables
+/// and one narrowed table at the same time. Charging the retained tables alone
+/// understates a GF(2^16) field by more than half a megabyte.
+const fn construction_bytes(width: u32, symbol: usize) -> usize {
+    let order = 1usize << width;
+    let log_words = order * size_of::<u32>();
+    let exp_words = 2 * (order - 1) * size_of::<u32>();
+    let log_symbols = order * symbol;
+    let exp_symbols = 2 * (order - 1) * symbol;
+    // Narrowing `log` first, then `exp`.
+    let first = log_words + exp_words + log_symbols;
+    let second = exp_words + log_symbols + exp_symbols;
+    if first > second { first } else { second }
+}
+
+impl Gf8 {
+    /// Peak bytes [`Gf8::new`] allocates, tables and setup together.
+    pub(crate) const CONSTRUCTION_BYTES: usize = construction_bytes(8, 1) + size_of::<Self>();
+
+    /// Bytes this field's retained tables hold.
+    #[cfg(test)]
+    pub(crate) fn retained_table_bytes(&self) -> usize {
+        size_of::<Self>() + self.log.len() + self.exp.len()
+    }
+}
+
+impl Gf16 {
+    /// Peak bytes [`Gf16::new`] allocates, tables and setup together.
+    pub(crate) const CONSTRUCTION_BYTES: usize = construction_bytes(16, 2) + size_of::<Self>();
+
+    /// Bytes this field's retained tables hold.
+    #[cfg(test)]
+    pub(crate) fn retained_table_bytes(&self) -> usize {
+        size_of::<Self>() + (self.log.len() + self.exp.len()) * size_of::<u16>()
+    }
+}
+
+/// Peak bytes constructing the field a set declares will cost.
+///
+/// A declared field this crate has no codec for still has to be admitted before
+/// [`for_set`] can refuse it, so the widest supported field is quoted.
+#[must_use]
+pub(crate) fn construction_cost(field: &GaloisField) -> usize {
+    match field.size {
+        1 => Gf8::CONSTRUCTION_BYTES,
+        _ => Gf16::CONSTRUCTION_BYTES,
+    }
+}
+
 /// Build the field a set's Start packet declares.
 ///
 /// Only the one- and two-byte fields have a codec here. A set that declares no
@@ -887,5 +941,96 @@ mod tests {
         ] {
             assert!(for_set(&field).is_err(), "accepted {field:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+
+    /// Building a field costs more than the tables that survive it: the `u32`
+    /// working tables are still alive while the narrowed table is filled. The
+    /// charge has to cover the peak, and must not be so much larger than the
+    /// peak that a caller is refused for memory nobody ever wanted.
+    #[test]
+    fn field_table_charges_cover_construction_without_doubling_it() {
+        let gf8 = Gf8::new(Gf8::DEFAULT_GENERATOR).unwrap();
+        let gf16 = Gf16::new(Gf16::DEFAULT_GENERATOR).unwrap();
+        let cases = [
+            (
+                "GF(2^8)",
+                Gf8::CONSTRUCTION_BYTES,
+                gf8.retained_table_bytes(),
+                8,
+            ),
+            (
+                "GF(2^16)",
+                Gf16::CONSTRUCTION_BYTES,
+                gf16.retained_table_bytes(),
+                16,
+            ),
+        ];
+        for (name, charge, retained, width) in cases {
+            let order = 1usize << width;
+            let symbol = width as usize / 8;
+            // Measured from the tables that exist: `build_tables` fills `log`
+            // and `exp` as `u32`, then each is narrowed in turn, so the live
+            // set is both working tables plus whichever narrowed table is
+            // being filled.
+            let log_words = order * size_of::<u32>();
+            let exp_words = 2 * (order - 1) * size_of::<u32>();
+            let log_symbols = order * symbol;
+            let exp_symbols = 2 * (order - 1) * symbol;
+            let peak =
+                (log_words + exp_words + log_symbols).max(exp_words + log_symbols + exp_symbols);
+            assert!(
+                charge >= peak,
+                "{name} charges {charge} for a {peak} byte construction peak"
+            );
+            assert!(
+                charge < peak * 2,
+                "{name} charges {charge}, more than twice its {peak} byte peak"
+            );
+            assert!(
+                retained <= log_symbols + exp_symbols + 128,
+                "{name} retains {retained}, more than its {} bytes of tables",
+                log_symbols + exp_symbols
+            );
+            assert!(
+                charge > retained,
+                "{name} charges {charge} but construction peaks above its {retained} retained bytes"
+            );
+        }
+    }
+
+    /// Declared-field admission is what decides whether a repair may build a
+    /// field at all, so it must never quote less than the field it will build.
+    #[test]
+    fn declared_field_admission_matches_the_field_it_builds() {
+        for (size, generator, expected) in [
+            (
+                1u8,
+                u64::from(Gf8::DEFAULT_GENERATOR & 0xff),
+                Gf8::CONSTRUCTION_BYTES,
+            ),
+            (
+                2,
+                u64::from(Gf16::DEFAULT_GENERATOR & 0xffff),
+                Gf16::CONSTRUCTION_BYTES,
+            ),
+        ] {
+            let field = GaloisField { size, generator };
+            assert_eq!(construction_cost(&field), expected);
+            assert!(for_set(&field).is_ok());
+        }
+        // A field this crate cannot build is still admitted before it is
+        // refused, and must be quoted at the widest field it might have been.
+        assert_eq!(
+            construction_cost(&GaloisField {
+                size: 4,
+                generator: 0
+            }),
+            Gf16::CONSTRUCTION_BYTES
+        );
     }
 }

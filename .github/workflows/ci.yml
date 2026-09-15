@@ -1203,8 +1203,10 @@ jobs:
               "reedsolomon-rs": 1_000_000,
               "unrar-rs": 2_500_000,
               "par2-rs": 2_500_000,
-              # The bounded engine and docs package at about 314 KB, without evidence archives.
-              "par3-rs": 350_000,
+              # The engine, its tests and ENGINE.md package at about 418 KB
+              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
+              # packages of source, tests and documentation grew it from about 314 KB.
+              "par3-rs": 480_000,
           }
           exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
           limits = {crate: limits[crate] for crate in exact_packaged_crates}

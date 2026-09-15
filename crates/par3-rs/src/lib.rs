@@ -52,7 +52,11 @@
 //! Admit it with [`Par3RepairSession::add_evidence`]. Unchanged assessments and
 //! recovery-only merges retain it without rereading protected sources.
 //! [`session::RecoveryRequirement`] exposes per-cohort deficits and admissible
-//! recovery indices; surplus in one interleaved cohort cannot cover another.
+//! recovery indices; surplus in one interleaved cohort cannot cover another. It
+//! also carries a resumable continuation: declare what is being fetched with
+//! [`Par3RepairSession::note_recovery_in_flight`] and the next assessment
+//! reports it as `in_flight`, leaving `outstanding` and `next_indices` as the
+//! part of the plan that still has to be asked for.
 //!
 //! Unknown ranges remain unavailable, never implicit zeroes. A checkpoint's
 //! digest must be retained in trusted host metadata separately from its bytes;
@@ -139,6 +143,14 @@
 //! when the host runs several jobs. [`runtime::ExecutionOptions::fft_backend`]
 //! selects automatic or scalar FFT butterflies.
 //!
+//! A resolved [`Par3Set`] stores its input-block checksums as sorted runs, and a
+//! [`layout::BlockLayout`] stores a contiguous protected chunk as a run rather
+//! than one materialised extent per block, sharing the set's checksums instead
+//! of copying them. [`layout::FileExtent`] values are therefore produced on
+//! demand — `FileLayout::extents` yields them by value — and evidence verdicts
+//! are packed two bits per extent. None of this changes what a layout, an
+//! extent or a verdict means, and the evidence checkpoint format is unchanged.
+//!
 //! Windows scanners pin a budgeted read-only carrier handle through
 //! [`source::SourceAccess::pin`]. Drop the scanner and its authenticated packets
 //! before replacing that carrier. Pinning hashes once; all generation hashes consume scan-work
@@ -161,6 +173,7 @@
 
 pub mod carrier;
 pub mod cauchy;
+pub mod checksums;
 pub mod create;
 pub mod creation;
 pub mod error;
@@ -186,12 +199,14 @@ mod test_reference;
 
 pub use session::Par3RepairSession;
 pub mod packet;
+pub mod paths;
 pub mod repair;
 pub mod scan;
 pub mod set;
 pub mod verify;
 
 pub use cauchy::{CodecLimits, Decoder, Encoder, Geometry, RecoveredBlock, RecoveryRow};
+pub use checksums::BlockChecksums;
 pub use create::{
     CreateLimits, CreateOptions, CreateReport, InputSpec, RecoveryAmount, create,
     suggest_block_size,
@@ -208,6 +223,7 @@ pub use packet::{
     Packet, PacketBody, PacketHeader, PacketType, ParseContext, RecoveryDataPacket,
     RecoveryExternalDataPacket, RootPacket, StartPacket,
 };
+pub use paths::{MAX_COMPONENT_BYTES, MAX_PATH_BYTES, PathRule, PathViolation};
 pub use repair::{
     RepairLimits, RepairOptions, RepairPlan, RepairReport, RepairedFile, plan_repair, repair_set,
 };

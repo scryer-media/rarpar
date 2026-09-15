@@ -118,6 +118,195 @@ process RSS; provider storage and allocator bookkeeping are outside that count.
 and measurement. Set explicit worker limits when Weaver schedules concurrent
 jobs. Clone the same memory, handle, and scan-work budgets to share ceilings.
 
+`MemoryBudget::ledger()` attributes those reservations. It returns a snapshot of
+every `MemoryCategory` — carrier and packet storage, resolved metadata, layout
+and evidence, assessment state, caches, queued payloads, codec tables, codec
+scratch, source scratch, worker stacks and output staging — with current bytes,
+peak bytes and reservation count. The snapshot allocates nothing and takes no
+lock, so a host may sample it from another thread during a job. Categories are
+sampled independently: their peaks need not have occurred together, and their
+sum is not the budget's own peak. Reservations taken without a category appear
+as `Uncategorized`, which stays at zero on the verify, repair and creation paths.
+
+A refusal states whether it could ever have succeeded.
+`EngineError::ResourceLimit` carries `{ what, need, limit, available }`, and
+`ResourceLimit::cause()` returns `ExceedsLimit` when `need > limit`, meaning
+this request would still be refused if this session were alone on the budget
+with the same options; the outcome is terminal. It returns `PeerContention` when
+`need` fits the ceiling, meaning that with the same options this exact request
+is admitted once other reservations release. Which reservations those are is not
+something the engine can say: the holder may be a peer session on the same
+budget, or this session's own earlier reservations — layout, evidence and
+assessment state are all still held when codec scratch is requested — so the
+host decides using its own knowledge of what it has in flight. `Unmeasured`
+marks the structural refusals that have no byte count, such as an exhausted
+packet-count or scanning-work ceiling; treat it as terminal. `Unmeasured` is
+decided by the absence of both figures, `need == 0 && limit == 0`, which is what
+the structural constructor produces and what no measured refusal can carry: a
+zero-byte charge is admitted even by a budget of zero, so every refusal a budget
+raises has a positive need. A positive need against a ceiling of zero — a
+`MemoryBudget::new(0)`, which admits nothing — is therefore `ExceedsLimit` with
+its figures intact, not `Unmeasured`.
+
+Two rules keep the classification honest, and both matter to a host that
+requeues on contention. Refusals are measured against the ceiling this session
+would have *alone*: metadata expansion compares its demand to
+`min(retained_bytes, budget.limit())`, never to `budget.available()`, so a walk
+that fits alone is never reported as terminal because a peer happens to hold
+memory at that instant. And a refusal against a per-session ceiling —
+`retained_bytes`, `max_retained_bytes`, the aggregate retained session state, and
+the `SetLimits` derived from them — reports the session's *total* demand under
+that ceiling rather than the increment that tripped it, because nothing else
+draws on that ceiling and waiting can never admit the request. Weaver should map
+`PeerContention` to "waiting for memory" and both `ExceedsLimit` and
+`Unmeasured` to "does not fit".
+
+### Stage working sets
+
+Each stage of a repair holds a bounded set, and a stage releases what its
+consumer no longer needs before the next one charges its own. Measured on a
+16,384-block single-file set with a 128 MiB budget and a 64 MiB retained
+ceiling, sampling `MemoryBudget::ledger()` at each stage boundary:
+
+| stage | category | retained bytes | bytes per block | coexists with the previous stage |
+| --- | --- | ---: | ---: | --- |
+| scan and merge | carrier and packet storage | 398,673 | 24.3 | — |
+| metadata and layout | resolved metadata | 460,559 | 28.1 | yes, carriers stay for regeneration |
+| metadata and layout | layout and evidence | 4,337 | 0.3 | yes |
+| verify and assess | layout and evidence | 12,609 | 0.8 | yes, evidence extends the layout entry |
+| verify and assess | assessment state | 6,228 | 0.4 | no, the scratch is released at the handover |
+| after repair | all categories | 878,069 | 53.6 | codec banks are released with the codec |
+| session dropped | all categories | 0 | 0 | — |
+
+Retained bytes and peak working memory are different answers and are reported
+separately: the table above is what each stage leaves resident, and the budget's
+high-water mark over the same run is 1,794,446 bytes (109.5 per block), reached
+while metadata resolution holds both the carriers and the set it is building.
+
+Two properties hold across block, file, carrier and damage counts, and are
+regression-tested at a fixed budget:
+
+- **Assessment retains a result, not a working set.** `assess` takes a scratch
+  reservation for the coverage and per-cohort deficit accumulation, releases it
+  at the handover, and retains only what the result's own containers measure. At
+  sixteen times the blocks that retained figure does not move: it follows files
+  and losses. The scratch and the result never coexist at full size.
+- **The layout charges what it built.** Runs, tails, inline bytes, paths and the
+  block index are charged from their container capacities and trued up to the
+  built layout's measurement, rather than a flat per-extent estimate.
+- **The layout does not follow the block count.** A contiguous protected chunk
+  is one run whatever it maps, and the checksums its extents report are the
+  set's, shared rather than copied. At sixteen times the blocks the layout entry
+  does not move.
+
+### Layout and evidence representation
+
+A protected chunk that covers whole blocks maps a contiguous span of file bytes
+onto a contiguous span of block indices. The layout stores that as a **run** —
+file, first block, block count, byte offset — and expands a `FileExtent` only
+when one is asked for. What a run cannot express is stored and charged
+individually:
+
+| exception | stored as | charged |
+| --- | --- | --- |
+| described chunk tail | its own block, offset, fingerprint and CRC64 | one entry per tail |
+| inline tail | the authenticated bytes themselves | one entry plus the bytes |
+| unprotected range | one run of one extent | one entry |
+| a block named by more than one extent (aliases, shared and packed blocks) | an ordered-map entry with every location | one map entry and its list per aliased block |
+
+`FileLayout::extents` is a `FileExtents` container rather than a `Vec`: `len`,
+`iter` and indexed access answer what they always answered, but `FileExtent` is
+yielded **by value**, because no such value is stored. `ExtentKind` and
+`FileExtent` are unchanged, in the same order, with the same meanings.
+
+Whole-block extents take `fingerprint` and `rolling_hash` from the set's
+authenticated checksum storage instead of copying them. The layout holds that
+storage through shared ownership, so it can never dangle and never needs a
+second copy; the bytes are charged once, by the `Par3Set` that owns them, under
+`resolved metadata`. Those checksums are themselves run-compact: External Data
+packets describe consecutive blocks, so a set's checksums are stored as sorted
+disjoint runs of `BlockChecksum` values rather than one ordered-map node per
+block. `Par3Set::block_checksums` returns a `BlockChecksums` view over that;
+`block_checksum(index)` is unchanged.
+
+Cohort membership stays a property of the recovery index, not of the layout: the
+block index says which extents name a block and nothing about which cohort it
+falls in. Cohort deficits and lost-index lists are produced by walking blocks in
+ascending order, so the same inputs in any arrival order yield byte-identical
+`RecoveryRequirement` lists.
+
+Verdicts are stored two bits per extent. All four states `ExtentVerdict` names —
+unknown, intact, damaged, unprotected — survive, as do per-extent fingerprints
+where the metadata records them, partial verification, source generations and
+whole-file results. `FileEvidence::verdicts` returns an `ExtentVerdicts` view
+with `len`, `get` and `iter`. Sealing, invalidation, `checkpoint_file` and
+`replay_evidence` mean exactly what they meant.
+
+### Checkpoint versioning
+
+The evidence checkpoint format is **unchanged** by the compact representation:
+the same `P3EV\x01\0\0\0` magic, the same 73-byte header, and one state byte
+per extent in layout order, anchored by the same host-trusted digest. A
+checkpoint written before this representation change replays against a layout
+built after it, because the bytes are the same bytes and the layout identity is
+computed from the same authenticated inputs in the same order. A blob whose
+magic or version differs is refused with `EngineError::Unsupported("evidence
+checkpoint version")`; a blob that does not describe this layout is refused with
+`EngineError::InvalidState`. Nothing is ever misread as a different version.
+
+Carrier bytes survive the metadata they were parsed into, deliberately: carrier
+regeneration and re-resolution need them, and dropping them would trade memory
+for source rereads. Verification evidence likewise survives sealing, because
+assessment reads it and re-deriving it means reading sources again. Both are
+reported rather than removed; `ExecutionDiagnostics::amplification()` exists so
+that a future change here cannot hide the I/O it would cost.
+
+### Continuations
+
+A refusal or a recovery deficit leaves a continuation rather than requiring the
+work to start over. `RecoveryRequirement` adds `in_flight`, `outstanding` and
+`next_indices` to its existing fields, which keep their names and meanings.
+`Par3RepairSession::note_recovery_in_flight` declares the indices a host is
+acquiring for a matrix, and `forget_recovery_in_flight` retracts them. The next
+assessment then counts those as `in_flight`, subtracts them from `outstanding`,
+and offers exactly `outstanding` further admissible indices in `next_indices` —
+lowest first, in the right cohort, and never one already available or already
+declared. A reassessment after a recovery-only merge therefore advances the
+acquisition plan instead of restating it. The declaration is a continuation, not
+a promise: an index that never arrives keeps appearing as `in_flight` until the
+host retracts it, and one that does arrive moves to `available` by itself. The
+set is bounded and charged against the session's retained ceiling, so declaring
+more than the budget admits is refused rather than silently truncated.
+
+### Behaviour under pressure
+
+When a stage's configured working set does not fit, the engine narrows before it
+refuses: repair and verification stripes are computed from the headroom that is
+actually there, worker pools fall back to serial execution, and verification
+batches are cut to what admission allows. Each narrowing is recorded in
+`ExecutionDiagnostics::waits()`. Widths are never searched by halving a request
+until something fits — that charges the budget once per failed step and reports
+only the last failure. A stripe admission measures the headroom, charges it, and
+on losing a race to a peer measures once more and then stops.
+
+When even the minimum useful set does not fit, the stage returns a single
+`ResourceLimit` with honest `need`, `limit` and `available` and the `cause()`
+rules above. There is no allocate-fail-wake loop and no internal retry spin. The
+refusal is counted once, by cause, in `ExecutionDiagnostics::refusals()`, at the
+session boundary the host sees — `merge`, `layout`, `assess` or `repair` — so a
+request refused deep inside a stage is reported once rather than at every frame
+it passes through.
+
+### Output tiling
+
+Cauchy repair keeps its syndrome bank for the whole solve but produces recovered
+rows in tiles: it materialises `t` output rows at a time and scatters them before
+producing the next tile, so the row-bank payload is `(m + t)` stripes rather than
+`2m`. `t` comes from the admitted worker capacity, bounded by the number of rows
+there are to recover. Column order and the one-scatter-per-column write pattern
+are unchanged, so a narrower tile costs no extra seeks and produces byte-identical
+output; `ExecutionDiagnostics::admission().output_tile` reports the width in force.
+
 `max_cauchy_lost_blocks` separately caps each Cauchy solve at 4,096 losses by
 default. The limit is checked before staging or building the quadratic
 coefficient matrix; callers may explicitly raise it. FFT selection and carrier
@@ -152,12 +341,20 @@ with unprotected ranges that require explicit self-repair. Dry-run consumers sho
 it instead of treating `Ready` as an unconditional execution guarantee. Sources
 can still change and later allocations or output I/O can fail.
 
-Packet admission charges parsed structures as well as wire bytes. Resolving
-shared directory/file descriptions has a separate reservation and expansion
-limits derived from remaining memory and retained-state headroom. Sessions keep
-that reservation for the resolved set's lifetime. The `IncrementalSet::metadata`
-convenience method budgets construction but transfers the returned legacy set
-to the caller; use a session for retained accounting. Assessment charges include
+Packet admission charges parsed structures as well as wire bytes: an
+authenticated packet is charged its parsed container capacity, not a multiple of
+its wire length. Resolving shared directory/file descriptions has a separate
+reservation, and expansion limits are still derived from remaining memory and
+retained-state headroom. Resolution now takes its bytes as it allocates them —
+one working charge for decoding and indexing the packets, then a per-entry
+charge as the directory walk materialises paths, descriptions and frames — and
+resizes to the resolved set's measured container capacity when it finishes.
+`Par3Set::retained_capacity_bytes()` reports that measurement. A failed charge
+part-way through releases everything the resolution took, and a graph that
+expands past its headroom fails as a named `ResourceLimit` rather than by
+exhaustion. Sessions keep that reservation for the resolved set's lifetime. The
+`IncrementalSet::metadata` convenience method budgets construction but transfers
+the returned legacy set to the caller; use a session for retained accounting. Assessment charges include
 cohort candidates, recovery references, file paths, damage ranges, and temporary
 coverage unions. Incomplete streaming hashes are boxed so one pending extent
 does not multiply large hasher storage across unused tree-node slots.
@@ -186,6 +383,22 @@ Cancellation is cooperative between work units and uses a shared token.
 
 `ExecutionOptions::diagnostics` shares cumulative source read counters, engine
 file read/write counters, and `stage(Stage)` timings. It retains no event log.
+It also reports what admission decided and what that cost: `memory()` returns
+the ledger of the budget the diagnostics were first used with, so retained and
+scratch bytes per category are read from the ledger itself rather than a second
+copy kept in step with it; `admission()` gives the effective stripe, stripe
+buffer count, output tile, verification batch, worker count and sequential read
+window; `waits()` gives the narrowings; `refusals()` counts refused admissions
+by `LimitCause`; `caches()` gives current cache occupancy; and `amplification()`
+gives the source bytes genuinely fetched twice, the stripe passes a bounded
+working set forced over the source and the bytes the codec reconstructed, so a
+memory reduction that only moved cost onto the I/O layer is visible next to it.
+Successive stripe passes read disjoint slices of each block, so they are counted
+as passes and not as rereads; the bytes in `reread_bytes` are the ones a block
+named by more than one extent is fetched again for, so each copy can be compared
+with the bytes already assembled. Every write is one relaxed atomic operation
+per event and every read allocates nothing, so a host may sample these at
+work-unit handback from another thread.
 `file_sync()` measures file synchronization attempts, successes, and storage
 wait time; this time is already included in enclosing operation stages.
 Read requests include short reads and failures; byte counts measure successful
@@ -225,6 +438,139 @@ Never derive the trusted digest from an untrusted replay blob. If trusted job
 metadata or stable source generations cannot be established, verify again.
 Checkpoint creation and decoding reserve memory and honor cancellation; the
 host owns the persisted bytes and their storage policy.
+
+### CPU work and the gates on it
+
+Verification hashes a source in parallel only when the work is worth a private
+pool, and every gate is a number in the code rather than a heuristic:
+
+* at least 1 MiB in one `update` call before BLAKE3's Rayon path is used at all
+  (`hash::PARALLEL_HASH_BYTES`), with adjacent protected extents combined into
+  runs first so a set of small archive blocks is still hashed in long updates;
+* at least 8 MiB of source before a private pool is started for it
+  (`hash::PARALLEL_SOURCE_BYTES`);
+* at most four workers in that pool (`hash::PARALLEL_HASH_WORKERS`), because
+  wider pools cost CPU out of proportion to the wall time they save;
+* the verification buffer grows from 64 KiB to 1 MiB only when the shared budget
+  admits it, charged to `SourceScratch`, and falls back to 64 KiB when it does
+  not. Session verification reuses the pool it was already admitted; under
+  pressure it falls back to serial hashing without reacquiring workers.
+
+Measured on this host (Apple silicon, 18 cores, release profile, 64 KiB blocks,
+`tests/verification_timing.rs`), verifying one 512 MiB source against the serial
+path: two workers 1.31x wall, four workers 1.51x wall for 1.09x the CPU, eight
+1.57x for 1.33x, and all eighteen 1.23x for 4.0x. Four is what is in the code.
+End to end with that setting, and with every core configured so the cap is what
+bounds the pool: 64 MiB in one file 1.49x, 512 MiB in one file 1.49x, 512 MiB
+across 64 files 1.43x, and two sessions sharing one budget 1.21x to 1.53x, all
+at about 1.06x the CPU of the serial run. A 64 MiB set spread over 64 files is
+1 MiB a file, below the 8 MiB gate, so no pool is started for it and the numbers
+are the serial ones (1.00x). These are measurements on one host, not a promise
+about any other.
+
+An FFT decode ends with a forward transform over the whole domain and then reads
+only the lost rows. Stages of stride `2^j` or wider never join rows whose low `j`
+bits differ, so those stages are `2^j` independent transforms over the rows that
+share their low bits, and every narrower stage stays inside one aligned block of
+`2^j` rows. Only the blocks holding a lost row need those narrow stages. The
+decoder therefore builds a per-cohort plan — the block width and the list of
+blocks to keep — charges it to `CodecScratch` (the lost-row list, a domain bitmap
+for the transposes, and a small fixed margin), and skips the rest. The rows the
+caller reads are byte-identical to the unpruned transform's, which is the oracle
+the tests use.
+
+The plan is chosen on total work, not on butterflies alone: a split replaces one
+transform call with `2^j + blocks` of them, and each call has a setup the
+butterflies do not pay for (`fft::PLAN_CALL_SYMBOLS`, 8192 symbol operations).
+Where a cohort's rows are too narrow for that to pay — the pinned `fft16`
+reference geometry is 32 symbols a row — the plan stands aside and the full
+transform runs. Measured on this host (`tests/codec_measurements.rs`), with the
+plan in force a 256-row GF8 cohort of 4096-symbol rows skips 19% of the decode's
+butterflies and runs in 2.0–2.3 ms against 2.5–3.5 ms unpruned, and a 512-row
+GF16 cohort of 8192-symbol rows skips 17% and runs in 4.1–4.9 ms against
+4.9–8.6 ms. The input inverse transform is *not* pruned: its zero-tail saving
+lives in the narrow ascending stages, which are exactly the ones inside a block,
+and the derivative between the two transforms makes every row of the workspace a
+dependency of the forward pass. Expressing the remaining cross-block stages
+would need a single-stage transform primitive, which is a change to
+`reedsolomon-rs` rather than to this crate.
+
+Cauchy repair recomputes one code-matrix element per surviving block per
+recovery row on every stripe pass; `ExecutionDiagnostics::codec()` counts them.
+Measured on this host across the eight corpus sets, that is 0.15%–0.46% of
+repair wall time, and under a forced 4 KiB stripe — sixteen passes over 64 KiB
+blocks — 31,872 recomputations are 1.6 ms of a 478 ms repair, 0.34%. One element
+is an exclusive-or and a table lookup, about 51 ns, against about 3.8 us for the
+64 KiB multiply-accumulate that follows it. Caching a source's factors is
+therefore not worth its charge at these geometries, and nothing caches them.
+
+### Names the engine will write
+
+A set names its protected files with relative paths carried in the set itself,
+which makes those bytes attacker-controlled. `paths::validate_relative_path` is
+the engine's only decision about such a name, and both ends call it: creation
+before a byte of the set is produced, repair before a byte of output is written
+and before the first parent directory is created. It reads no filesystem and
+consults no platform, so the verdict for a given sequence of bytes is the same
+everywhere; a hostile set refused on Linux is refused identically on Windows
+and macOS. The refusal is `EngineError::UnsafePath(PathViolation)`, which names
+the rule and the offending component rather than a prose string.
+
+The whole path is refused when it is empty, exceeds `paths::MAX_PATH_BYTES`
+(4096, the traditional `PATH_MAX`), or is absolute — a leading `/` or `\`, or a
+`X:` drive prefix, which is reported as `Absolute` rather than as a colon
+because `c:file` is drive-relative, not a stream name. A `/`-separated
+component is refused when it is empty, `.`, `..`, exceeds
+`paths::MAX_COMPONENT_BYTES` (255, the per-entry ceiling of ext4, APFS and
+NTFS), contains `\`, `:`, one of the six characters Win32 forbids outright
+(`?`, `*`, `"`, `<`, `>`, `|`, reported as `ForbiddenCharacter`) or an ASCII
+control byte (NUL and DEL included), names a Windows character device with or
+without an extension (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`
+and the superscript ports `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, matched
+case-insensitively against the stem before the first dot, trailing spaces
+trimmed, so `con.txt` and `CON   .txt` are both refused), or ends in a space or
+a dot, which Windows silently trims onto an existing name. Bytes, not
+characters, throughout. The rules are applied in that order and the first one
+broken is the one reported, so `a:b` is `Absolute` and `ab:c` is `Colon`
+rather than either being folded into the forbidden-character rule.
+
+Packet parsing is deliberately narrower and unchanged: `check_name` asks only
+whether a name field is a usable single component, because one unwritable name
+must not make a whole set unreadable. A set that carries `CON` still parses and
+still verifies; only creating that file is refused.
+
+The rules are stricter than the draft, which is silent on all of this, and
+stricter than the reference, which rewrites an unusable name in place and
+warns. `README.md` records the deviation.
+
+### What a host can read back from a session
+
+Three tallies a consumer would otherwise reconstruct beside the engine:
+
+- `Par3RepairSession::set` lends the session's resolved `Par3Set` rather than
+  handing back a clone. File paths and lengths, the directory tree, the block
+  layout and `Par3Set::option_packet_count` — the extension packets this crate
+  retains and never interprets — are all readable through the borrow, which
+  ends at the next `&mut self` call. Resolution is lazy and budgeted, so this
+  reports what the session already resolved: call `layout` or `assess` after
+  merging metadata, then read it. `None` means no set is resolved yet, never
+  that the set is malformed.
+- `failed_hash_bytes` is the complete packet bytes of every reauthentication
+  the engine performed on this set's payloads and lost. A payload is
+  reauthenticated before it is consumed — a stat fingerprint is not
+  cryptographic evidence — so a carrier that changed under the reader, or never
+  held what its header claimed, is caught there and charged here. Non-zero
+  means carrier bytes were hashed and thrown away; it is the price of trusting
+  that carrier, in bytes, and a host can use it to stop re-reading a source.
+  Scanner candidates rejected before a packet reached a set are not counted:
+  they never belonged to one.
+- `rejected_packets` counts every packet a merge refused, by any cause — a
+  packet naming another input set, a retained-metadata ceiling, a memory
+  refusal, a cancellation, a failed reauthentication — including refusals the
+  session makes before the set itself sees the packet, so one refusal is
+  exactly one rejection. A replay is not a refusal.
+
+Both tallies are monotonic and per set, and neither is ever reset.
 
 ## Read-only Weaver reference
 

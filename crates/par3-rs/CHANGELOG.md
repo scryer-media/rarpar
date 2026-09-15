@@ -1,6 +1,339 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.4.0 (unreleased)
+
+- Version: this release is `0.4.0`, not `0.3.2`. The entries below change public
+  types, and under Cargo's 0.x rules a `par3-rs = "0.3.1"` requirement resolves
+  to `0.3.2`, which would have handed those changes to callers that never asked
+  for them.
+- A transform plan sorts the lost rows it is given before it prices or prunes
+  anything. `decode` checks that they are in range and distinct but not that
+  they are ordered, and the pruned transform finds its blocks by binary search,
+  so an unordered list from a public caller used to misprice every split and
+  then prune blocks the decode still needed. The plan a caller gets no longer
+  depends on the order it names its losses in.
+- The layout's alias charge counts one location per (extent, block) pair rather
+  than a fixed two per block, and reserves it before the locations are built
+  instead of only comparing it with the ceiling. A carrier whose files alias the
+  same blocks deeply is now refused by name rather than admitted and
+  materialised. `build_index` also takes a scoped reservation for its own sweep
+  workspace, and checks cancellation inside the per-block loop.
+- Building a Galois field is charged what it really peaks at during creation and
+  carrier regeneration, as repair already did; GF(2^16) costs about 896 KiB, not
+  the 512 KiB that was reserved.
+- A metadata packet is admitted for its wire bytes and its parsed body together,
+  before it is parsed, rather than after the parsed body already exists.
+- A Cauchy repair's output tile comes from the worker pool that was admitted,
+  not the worker count that was configured, so a repair squeezed onto one thread
+  banks one output row instead of reserving rows no worker will fill.
+- Every repair destination is resolved before any file is staged, so a set
+  carrying a name this platform cannot write is refused with a plain
+  `EngineError::UnsafePath` and leaves no temporary behind.
+- `note_recovery_in_flight` charges what the in-flight set actually stores, so a
+  declaration naming the same index twice can be fully retracted; an index at or
+  past a matrix's capacity ceiling no longer cancels a requirement it could
+  never fill.
+- **Breaking:** `AmplificationSnapshot` gained `stripe_passes`, and
+  `reread_bytes` now means what it says. Successive stripe passes read disjoint
+  slices of a block, so they are counted as passes; `reread_bytes` counts only
+  bytes genuinely fetched twice, which is what a block named by more than one
+  extent costs.
+- Data-cache occupancy is reported as a per-session delta, so sessions sharing
+  one `ExecutionDiagnostics` sum instead of overwriting each other and a
+  finished session leaves no phantom cache behind.
+- `COM0`, `LPT0` and the superscript aliases `COM¹ COM² COM³ LPT¹ LPT² LPT³` are
+  refused as reserved device names.
+- Checksum runs are allocated at exactly the size they will hold, instead of
+  growing by doubling and then copying into an exact vector while the oversized
+  buffer is still live, and the run descriptors are charged in the resolution
+  budget. The transient name set a Directory's duplicate-name check builds is
+  charged too.
+- `Par3RepairSession::layout` documents that the returned layout must not
+  outlive the session: it shares the set's block checksums, which are charged to
+  the session's resolved-set reservation and not to the layout's.
+- A layout allocates a file's extent runs at exactly the count its charge paid
+  for. The allocation assumed two runs for every protected chunk while the
+  charge counted one for a chunk that is a whole number of blocks, so a set of
+  full-block files held capacity the budget never saw and then bought an exact
+  copy of it back.
+- The block-checksum builder is allocated for every described block before the
+  first one is pushed, instead of doubling into as much as twice the slots the
+  set's resolution charge covers while the values and runs are laid out beside
+  it.
+- **Breaking:** `PathRule` gained `ForbiddenCharacter`. The six characters Win32
+  forbids in a name — `?`, `*`, `"`, `<`, `>`, `|` — are refused at both ends
+  like the separators and the colon already were, so par3-rs no longer creates a
+  set naming a file Windows could never write. The enum is `#[non_exhaustive]`,
+  and the more specific rules still win: `a:b` is `Absolute` and `ab:c` is
+  `Colon`.
+- Opening a stage against a second, different `MemoryBudget` with the same
+  `ExecutionDiagnostics` is refused with
+  `EngineError::InvalidState("diagnostics already bound to another memory
+  budget")` rather than silently ignored. One handle aggregates work counters
+  across everything sharing it but reports the ledger of one budget, so the two
+  must be the same budget; clones of one budget are fine.
+- Additive-transform work is counted after the backend has performed it, not
+  before, so a cancelled or failed transform no longer inflates the codec
+  counters with butterflies it never executed. The pruned path already counted
+  afterwards; the two now agree.
+- `ResourceLimit::cause` classifies a refusal as `Unmeasured` only when it
+  carries neither a need nor a ceiling, which is what the structural constructor
+  produces. A positive need against a ceiling of zero — the refusal a
+  `MemoryBudget::new(0)` raises for everything — is `ExceedsLimit` with its
+  figures intact, and `Display` still prints them.
+- `MemoryBudget::is_same` reports whether two handles are clones of one budget.
+- `FileExtents::all_unprotected` answers `true` for an empty interval wherever
+  it sits, instead of `false` when the two offsets fall inside one protected
+  extent. Whole-file verification asks it about the gap between two consecutive
+  reads, so any read narrower than a block — a stripe smaller than the block
+  size, or a block wider than the 64 KiB serial read — used to look like a skip
+  over protected bytes and the whole-file hash came back as `None` on an
+  undamaged file.
+- Metadata expansion grows its reservation before the entries it covers are
+  allocated, not after. The charge still batches in 64 KiB granules, but it now
+  reserves a granule ahead and hands the slack back at the end, so heap use
+  never runs ahead of the budget and a set that will not fit is refused before
+  the allocation it would have needed.
+- A Cauchy repair's pool headroom includes the row headers a serial stripe bank
+  needs, and if stripe admission is still refused while a pool is held, the pool
+  is dropped and the admission is retried once serially (noted through the
+  existing worker-narrowing diagnostic). A budget that admitted a pool could
+  otherwise take the memory the stripe headers needed and refuse a repair that
+  fits serially, so a larger budget could fail where a smaller one succeeded.
+- A Root packet is charged for the duplicate-name check the tree walk runs on
+  its children. The walk checks the root's children before it checks anything
+  else, and that set is as large as the one a directory of the same width
+  builds, but only `Directory` was charged for it.
+- Resolving a set moves each parsed body out of the packet that carried it
+  instead of cloning it. Every File, Directory, External Data, Root, matrix and
+  option packet used to exist twice for the length of the resolution — once in
+  the packet list and once in the set being built — while the budget was told
+  about one copy, so a set resolved close to its ceiling peaked above what it
+  had reserved.
+- A repair is refused before anything is staged when two of the set's paths
+  differ only by letter case *and* the destination filesystem folds case.
+  `Readme` and `README` are two names a case-sensitive producer may legitimately
+  put in one set, and repairing them onto a case-sensitive filesystem still
+  writes two files; on macOS's default filesystem and on Windows they are one
+  file, where the second output written would take the first one's place. The
+  destination is asked only when the set actually carries such a pair, with a
+  uniquely named probe that is always removed.
+- A recovery index whose payloads conflict is never offered again. Two
+  different payloads claiming one index leave that index unusable for the rest
+  of the session, but it used to look unclaimed to the next-index search, which
+  handed the host an index it could never satisfy while a usable one went
+  unasked for.
+- A packet a budget refuses is offered again rather than skipped. The scanner
+  counted the packet and stepped its offset past it before asking for the
+  memory its parsed body needs; a refusal a peer caused is retryable by
+  contract, so the host parked and polled again, and the packet it had already
+  stepped over was never yielded. Nothing moves now until the packet exists.
+- `note_recovery_in_flight` reserves an upper bound for the set it builds
+  before building it, rather than after. A declaration of many indices no
+  longer allocates ahead of the budget; one large enough to exceed the ceiling
+  is refused before the allocation instead of after it.
+- `AmplificationSnapshot::stripe_passes` counts one pass per extra walk over
+  the source, as documented. A Cauchy repair took the count inside its loop
+  over surviving blocks, so one extra pass over a set of 100 blocks reported
+  100.
+- `IncrementalSet::failed_hash_bytes` includes a reauthentication lost to a
+  carrier rewritten under the reader, which is what its documentation always
+  said it counted. Only a hash mismatch was counted before, so the most
+  expensive way to lose a packet — read and hashed in full, then thrown away —
+  reported nothing. `rejected_packets` still counts only packets this set
+  refused, and a carrier that moved is not one.
+- A Creator or Comment body's text moves into the `String` the set keeps
+  instead of being copied out beside it, and the resolution charge covers a
+  lossy decode of a body that is not valid UTF-8, which can reach three bytes
+  per byte and was charged as nothing.
+
+- Store a contiguous protected chunk mapping as a run (file, first block, block
+  count, byte offset) instead of one materialised extent per block, and expand a
+  `FileExtent` only when one is asked for. Described tails, inline tail bytes,
+  unprotected ranges and blocks named by more than one extent are the charged
+  exceptions. Cohort membership remains a property of the recovery index, not of
+  the layout.
+- **Breaking:** `FileLayout::extents` is now a `FileExtents` container rather
+  than `Vec<FileExtent>`. `len`, `is_empty`, `iter` and `get` answer what they
+  answered before, but `iter` and `get` yield `FileExtent` *by value*, because
+  no such value is stored; `range`, `block_at`, `is_unprotected`,
+  `inline_bytes`, `first_after` and `all_unprotected` read one extent's
+  properties without materialising it. `ExtentKind` and `FileExtent` are
+  unchanged.
+- **Breaking:** `BlockLayout::blocks` returns an iterator of
+  `(u64, BlockLocations)` in ascending block order instead of
+  `&BTreeMap<u64, Vec<ExtentLocation>>`. `BlockLayout::locations(block)` answers
+  one block; `BlockLocations` dereferences to `&[ExtentLocation]`.
+  `BlockLayout::referenced_blocks`, `aliased_blocks`, `widest_block` and
+  `checksums` are new.
+- Share authenticated checksum ownership between a set and the layouts resolved
+  from it. Whole-block extents report `fingerprint` and `rolling_hash` from the
+  set's storage instead of copying them, and the layout holds that storage
+  through shared ownership, so it can never dangle and the bytes are charged
+  once, by the set, under `resolved metadata`.
+- **Breaking:** `Par3Set::block_checksums` returns `&BlockChecksums` instead of
+  `&BTreeMap<u64, BlockChecksum>`. The new type stores checksums as sorted
+  disjoint runs — External Data packets describe consecutive blocks — and offers
+  `len`, `is_empty`, `runs`, `get`, `contains` and `iter`.
+  `Par3Set::block_checksum` is unchanged; `Par3Set::shared_block_checksums` is
+  new.
+- **Breaking:** `FileEvidence::verdicts` returns `&ExtentVerdicts` instead of
+  `&[ExtentVerdict]`. Verdicts are packed two bits per extent and keep all four
+  states `ExtentVerdict` names, along with per-extent fingerprints, partial
+  verification, source generations and whole-file results. Sealing, invalidation
+  and `replay_evidence` are unchanged.
+- The evidence checkpoint format is unchanged: the same magic, the same 73-byte
+  header, and one state byte per extent, anchored by the same host-trusted
+  digest. A checkpoint written before this representation change replays against
+  a layout built after it; a blob with a different version is refused with
+  `EngineError::Unsupported("evidence checkpoint version")` rather than misread.
+- Retained metadata and peak working memory are now reported separately, per
+  stage and per block, by the stage inventory and the geometry probe. On the
+  16,384-block single-file set the retained total falls from 365.3 to 53.6 bytes
+  per block and the budget's high-water mark from 21,126,190 to 1,794,446 bytes;
+  on the 131,072-block probe the peak falls from 53,694,630 to 13,706,159 bytes
+  and the retained total to 48.9 bytes per block.
+- Add a categorised allocation ledger to `MemoryBudget`. `MemoryBudget::ledger`
+  returns a `MemoryLedger` giving each `MemoryCategory` its current and peak
+  reserved bytes and its reservation count. Reading it allocates nothing and
+  takes no lock. Every reservation the engine takes names a category; anything
+  that does not is reported as `MemoryCategory::Uncategorized`.
+- **Breaking:** `EngineError::ResourceLimit` now carries a `ResourceLimit`
+  struct (`what`, `need`, `limit`, `available`) instead of a `&'static str`.
+  `ResourceLimit::cause` distinguishes a request that would still be refused
+  with this session alone on the budget (`LimitCause::ExceedsLimit`) from one
+  that the same options admit once other reservations release
+  (`LimitCause::PeerContention`), so a host can queue the second and refuse the
+  first. The holder in the contended case may be a peer session or this
+  session's own earlier reservations; the engine cannot tell them apart and says
+  so. Refusals measure against the ceiling the session would have alone, and
+  refusals against a per-session ceiling report the session's total demand
+  rather than the increment that tripped them, so neither reads as retryable
+  when waiting cannot help. Patterns of the form `EngineError::ResourceLimit(_)`
+  are unaffected; patterns naming the string need
+  `ResourceLimit { what: "...", .. }`.
+- Charge metadata resolution for the allocations it makes instead of reserving
+  the whole retained ceiling up front. Packet decode, description resolution and
+  directory expansion are charged as they happen, and the charge that survives
+  resolution is the resolved set's measured container capacity
+  (`Par3Set::retained_capacity_bytes`) rather than a flat multiple of the packet
+  bytes it was built from. Sets with many blocks now resolve under ceilings that
+  previously refused them; hostile directory graphs are still refused as
+  `ResourceLimit` naming the limit they hit.
+- Charge retained packets their parsed capacity rather than sixteen times their
+  wire length, and resize a scanner's carrier reservation to the packet it
+  authenticated.
+- Charge GF(2^16) field construction for the `u32` working tables it holds while
+  narrowing, which were previously understated by about 400 KiB, and charge the
+  Cauchy stripe banks for their per-row vector headers.
+- Bound each repair stage's resident working set. `assess` now takes a scratch
+  reservation for coverage and per-cohort deficit accumulation, releases it at
+  the handover, and retains only what the result's own containers measure, so
+  what survives assessment follows files and losses rather than the block count.
+  On a 16,384-block set the retained assessment state falls from 10,493,485
+  bytes to 6,228, and stays flat from 2,048 to 16,384 blocks.
+- Charge the block layout from its containers' capacities — extents, inline
+  bytes, paths and the block index — and true the charge up to the built
+  layout's measurement, instead of a flat 512 bytes per extent. The same
+  16,384-block set falls from 512.0 to 232.3 bytes per block. Together with the
+  assessment change, the budget's peak for that repair falls from 21,126,190
+  bytes to 6,901,926.
+- Produce Cauchy recovery rows in tiles. The syndrome bank is unchanged, but
+  recovered rows are materialised and scattered `t` at a time, moving the output
+  row bank from `2m` stripes toward `(m + t)`. `t` comes from admitted worker
+  capacity. Column order, write count and output bytes are unchanged.
+- Add a resumable acquisition continuation. `RecoveryRequirement` gains
+  `in_flight`, `outstanding` and `next_indices`; existing fields are unchanged.
+  `Par3RepairSession::note_recovery_in_flight` declares indices a host is
+  fetching and `forget_recovery_in_flight` retracts them, so reassessment after
+  a recovery-only merge advances the plan instead of requesting the same indices
+  again. The declared set is bounded and charged against the retained ceiling.
+- Report admission on `ExecutionDiagnostics`: `memory()` delegates to the
+  budget's ledger, `admission()` gives the effective stripe, stripe buffers,
+  output tile, verification batch, workers and read window, `waits()` gives the
+  narrowings, `refusals()` counts refused admissions by `LimitCause`, `caches()`
+  gives cache occupancy, and `amplification()` gives reread and reconstructed
+  bytes so a memory saving cannot hide I/O amplification. Writes are one relaxed
+  atomic operation per event; reads allocate nothing.
+- Narrow before refusing, and refuse once. Stripe admission computes the width
+  from real headroom instead of halving a request until something fits, and
+  remeasures at most once after losing a race to a peer. A refusal that reaches
+  a host through `merge`, `layout`, `assess` or `repair` is counted exactly once,
+  by cause.
+- Hash a large source in parallel during verification, under gates rather than
+  unconditionally: BLAKE3's Rayon path is used only for updates of at least
+  1 MiB, only for sources of at least 8 MiB, and only inside a private pool of
+  at most four workers admitted from the shared budget. Adjacent protected
+  extents are combined into runs so a file of small archive blocks is still fed
+  to the hash in long updates, and a verification buffer grows from 64 KiB to
+  1 MiB only when the budget admits the charge. Session verification reuses the
+  pool it was already admitted and falls back to serial hashing under pressure
+  without reacquiring workers. Serial, parallel and constrained-memory
+  verification produce identical evidence, asserted with the checkpoint digest.
+  Measured on an 18-core host, four workers verify a 512 MiB source at 1.51x the
+  serial wall time for 1.09x the CPU, where eighteen workers reach only 1.23x
+  for 4.0x; the numbers and the reasoning are in ENGINE.md.
+- Prune an FFT decode's final forward transform to the rows the caller reads.
+  The decoder computes a per-cohort plan — a block width and the blocks holding
+  a lost row — charges it to `MemoryCategory::CodecScratch`, and skips the
+  stages that would only produce rows nobody reads. Output is byte-identical to
+  the unpruned transform, which is the oracle the tests use, over both fields,
+  light, heavy and spread damage, zero padding, arbitrary recovery selections
+  and widths either side of the SIMD and pool thresholds. The plan is chosen on
+  total work including each transform call's own setup, so cohorts with rows too
+  narrow to pay for the split run the full transform instead. The input inverse
+  transform is not pruned; ENGINE.md says why.
+- `ExecutionDiagnostics::codec` is new: transform calls, butterflies performed
+  and skipped, multiply-accumulates, and Cauchy code-matrix factors computed and
+  reused. Counters are relaxed atomics written once per transform call, never
+  per symbol.
+- Two `#[ignore]`d measurement probes, `tests/verification_timing.rs` and
+  `tests/codec_measurements.rs`, print the tables the gates above were chosen
+  from: parallel against serial verification at several widths, the FFT work per
+  cohort with and without the plan, and what Cauchy factor recomputation costs
+  against the multiply-accumulate it precedes. They measure the host they run
+  on; the numbers recorded in ENGINE.md are this host's.
+- One name-safety rule table, in the new `paths` module, is now the engine's
+  only decision about a relative path it is asked to write. `contained_destination`
+  (repair) and `creation::validate_name` (set creation) both call
+  `paths::validate_relative_path`, so par3-rs never produces a set it would
+  refuse to repair, and a hostile set is refused identically on every platform,
+  before any output byte is written and before any parent directory is created.
+  A component is refused when it is empty, `.`, `..`, longer than
+  `paths::MAX_COMPONENT_BYTES` (255), contains `\\`, `:` or an ASCII control
+  byte (NUL and DEL included), names a Windows character device (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, case-insensitive, with or without
+  an extension, so `con.txt` too) or ends in a space or a dot. A path is
+  refused when it exceeds `paths::MAX_PATH_BYTES` (4096) or is absolute — by a
+  leading `/` or `\\`, or a `X:` drive prefix, which is reported as absolute
+  rather than as a colon. Names that were already accepted are unaffected.
+- **Breaking:** `EngineError::UnsafePath(PathViolation)` is new, and replaces
+  `InvalidState("invalid output path component")` and
+  `InvalidState("invalid creation path")`. It names the rule and the offending
+  component: `PathViolation { path, component, rule }` with `rule: PathRule`.
+  Both text fields are truncated to 255 bytes on a character boundary, so a
+  hostile name cannot make the refusal unbounded. `PathRule`, `PathViolation`,
+  `MAX_PATH_BYTES` and `MAX_COMPONENT_BYTES` are re-exported at the crate root.
+  Packet parsing is unchanged: a set that carries such a name still parses and
+  still verifies, because one unwritable name must not make a set unreadable.
+- `IncrementalSet::failed_hash_bytes` and `IncrementalSet::rejected_packets`
+  are new, with `Par3RepairSession::failed_hash_bytes` and
+  `Par3RepairSession::rejected_packets` beside them. Both are monotonic, per
+  set, and never reset. `failed_hash_bytes` counts the complete packet bytes of
+  every reauthentication the engine performed on this set's payloads and lost —
+  a carrier that changed under the reader, or never held what its header
+  claimed. `rejected_packets` counts every packet a merge refused, by any
+  cause; a replay is not a refusal. A host no longer has to keep these tallies
+  beside the engine's.
+- `Par3RepairSession::set` lends the session's resolved `Par3Set` instead of
+  making a host clone it: file paths and lengths, the directory tree, the block
+  layout and the new `Par3Set::option_packet_count` are all readable through
+  the borrow. Resolution stays lazy and budgeted, so `set` reports what the
+  session has already resolved rather than resolving on demand.
+- `PayloadRef::packet_length` reports the complete on-carrier packet length,
+  which is the work a reauthentication costs and what a failed one is charged.
+
+## 0.3.1 (2026-09-13)
 
 - Add `Par3RepairSession::set_execution_limits` to adjust worker and stripe
   limits between operations without discarding authenticated session evidence.

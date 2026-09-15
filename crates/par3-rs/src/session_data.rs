@@ -6,7 +6,7 @@ use super::Par3RepairSession;
 use crate::FingerprintHasher;
 use crate::ingest::{PayloadKind, PayloadRef};
 use crate::layout::{BlockLayout, ExtentKind};
-use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
+use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
 pub(super) const ADMISSION_BYTES: usize = 1024;
 
@@ -52,8 +52,11 @@ impl Par3RepairSession {
                 ));
             }
             self.admit_retained(ADMISSION_BYTES)?;
-            let reservation = self.options.memory.reserve(ADMISSION_BYTES)?;
-            if !validate_extents(layout, index, payload, &self.options)? {
+            let reservation = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::Caches, ADMISSION_BYTES)?;
+            if !validate_extents(&self.input, layout, index, payload, &self.options)? {
                 // Keep the payload pending until checksum metadata arrives.
                 continue;
             }
@@ -72,19 +75,21 @@ impl Par3RepairSession {
             );
             self.diagnostics.data_validations += 1;
         }
+        self.report_cache(self.data_checked.len());
         self.data_dirty = false;
         Ok(())
     }
 }
 
 fn validate_extents(
+    set: &crate::ingest::IncrementalSet,
     layout: &BlockLayout,
     index: u64,
     payload: &PayloadRef,
     options: &ExecutionOptions,
 ) -> EngineResult<bool> {
-    payload.validate(options)?;
-    let Some(locations) = layout.blocks.get(&index) else {
+    set.validate_payload(payload, options)?;
+    let Some(locations) = layout.locations(index) else {
         return Err(EngineError::InvalidState(
             "Data packet has no protected extents",
         ));
@@ -94,11 +99,16 @@ fn validate_extents(
         .len()
         .checked_mul(256)
         .and_then(|n| n.checked_add(size))
-        .ok_or(EngineError::ResourceLimit("Data extent validation"))?;
-    let _memory = options.memory.reserve(bookkeeping)?;
+        .ok_or(EngineError::resource_limit("Data extent validation"))?;
+    let _memory = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, bookkeeping)?;
     let mut expected = BTreeMap::new();
-    for location in locations {
-        let extent = &layout.files[location.file].extents[location.extent];
+    for location in locations.iter() {
+        let extent = layout.files[location.file]
+            .extents
+            .get(location.extent)
+            .ok_or(EngineError::InvalidState("unknown Data extent"))?;
         if let ExtentKind::Block {
             offset,
             fingerprint: Some(hash),
@@ -122,10 +132,13 @@ fn validate_extents(
             .map(|&(offset, length)| offset..offset + length)
             .collect(),
     );
-    for location in locations {
-        let extent = &layout.files[location.file].extents[location.extent];
-        if let ExtentKind::Block { offset, .. } = extent.kind {
-            let end = offset + extent.range.end - extent.range.start;
+    for location in locations.iter() {
+        let extents = &layout.files[location.file].extents;
+        let Some(extent) = extents.range(location.extent) else {
+            continue;
+        };
+        if let Some((_, offset)) = extents.block_at(location.extent) {
+            let end = offset + extent.end - extent.start;
             if !authenticated
                 .iter()
                 .any(|range| range.start <= offset && range.end >= end)
@@ -164,7 +177,9 @@ fn compare_aliases(
     options: &ExecutionOptions,
 ) -> EngineResult<()> {
     let size = options.stripe_bytes.min(64 << 10);
-    let _memory = options.memory.reserve(size * 2)?;
+    let _memory = options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut a = vec![0; size];
     let mut b = vec![0; size];
     let mut at = 0;
