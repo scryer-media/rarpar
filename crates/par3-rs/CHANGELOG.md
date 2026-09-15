@@ -1,25 +1,28 @@
 # Changelog
 
 ## 0.4.1 (unreleased)
+
 - An assessment charges the vectors its matrix selection builds — the winning
   matrix's requirement list, each cohort's availability and next-index lists,
   and the payload references it selects — before it builds them, from the
   cohort, recovery and loss counts. They used to grow against a budget that had
   never been told about them; a budget that cannot hold them now refuses with
   `EngineError::ResourceLimit` instead of allocating them.
-
 - A session alone on a budget, whose own admitted packets leave no room to
   resolve them, is refused with `LimitCause::ExceedsLimit` rather than
   `PeerContention`. There is no peer to wait for, so the refusal is terminal,
   and a host told it was contention parked and retried forever. A refusal a
   peer really is causing still reports `PeerContention`.
-
 - **Behaviour change:** `create` now holds every name it is asked to protect
   against `paths::validate_relative_path`, the same table the session creator
   uses, and refuses an unsafe one with the new `Par3Error::UnsafePath`. A set
   naming a reserved device (`con.txt`) or a trailing-dot file could be created
   here and then refused by this crate's own repair on the platform that cannot
   write it.
+- The copy path counts one stripe pass per extra pass over the blocks it
+  copies, rather than one per block per window, which is what the
+  reconstruction path already did. Copying four blocks in sixteen windows
+  reported sixty passes where there were fifteen.
 
 ## 0.4.0 (unreleased)
 
