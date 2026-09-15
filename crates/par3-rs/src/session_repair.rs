@@ -148,7 +148,7 @@ fn repair_inner(
             .filter(|file| !file.complete)
             .count(),
     );
-    refuse_case_folded_destinations(&assessment.files)?;
+    refuse_case_folded_destinations(output, &assessment.files)?;
     for (index, file) in assessment.files.iter().enumerate() {
         if file.complete {
             continue;
@@ -833,6 +833,84 @@ fn verify_staged(
     Ok(())
 }
 
+/// Find the first pair of destinations a case-insensitive filesystem would
+/// merge, or `None` if no two paths fold together.
+///
+/// Every file is considered, complete or not: one already whole on disk is
+/// just as lost if another file's output lands on its name. A pair where
+/// neither file would be written collides with nothing and is not reported.
+/// This answer is pure — it reads the assessment and nothing else — so the
+/// filesystem is only consulted when there is something to consult it about.
+fn case_folded_collisions(files: &[crate::session::AssessedFile]) -> Option<(usize, usize)> {
+    let mut folded: HashMap<String, usize> = HashMap::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        if let Some(first) = folded.insert(crate::paths::case_folded(&file.path), index)
+            && (!files[first].complete || !file.complete)
+        {
+            return Some((first, index));
+        }
+    }
+    None
+}
+
+/// Ask `base` whether it folds letter case, by writing one file and looking
+/// for it under a different spelling.
+///
+/// There is no portable way to be told this: the answer belongs to the mounted
+/// filesystem, not to the platform, and one machine can carry both kinds at
+/// once. So a uniquely named probe carrying uppercase letters is created and
+/// the same name in lowercase is looked up; if that resolves, the two spellings
+/// are one file here. The probe is removed either way, including when the
+/// lookup fails.
+///
+/// A probe that cannot be created is reported as folding. The caller only asks
+/// when a set would otherwise be written in a way that could silently destroy
+/// one of its own files, and a set is not installed on a guess.
+fn destination_folds_case(base: &Path) -> bool {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    );
+    let probe = base.join(format!(".par3-CASE-PROBE-{unique}"));
+    let folded = base.join(format!(".par3-case-probe-{unique}"));
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_err()
+    {
+        return true;
+    }
+    let folds = std::fs::symlink_metadata(&folded).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    folds
+}
+
+/// Refuse a set whose paths the destination filesystem cannot tell apart.
+///
+/// A PAR3 set naming both `Readme` and `README` is legitimate — a case-
+/// sensitive producer makes one — and repairing it onto a case-sensitive
+/// filesystem writes two files, as it should. On macOS and Windows those two
+/// names are one file, and the second output written would take the first
+/// one's place, so the repair is refused there instead. The collisions are
+/// found first and the filesystem is asked only if there are any; like every
+/// other destination rule this is settled before anything is staged, so the
+/// host sees a bare refusal rather than a half-finished repair.
+fn refuse_case_folded_destinations(
+    base: &Path,
+    files: &[crate::session::AssessedFile],
+) -> EngineResult<()> {
+    if case_folded_collisions(files).is_some() && destination_folds_case(base) {
+        return Err(EngineError::InvalidState(
+            "repair destinations differ only by letter case",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve one set-carried relative path inside `base`, creating parents.
 ///
 /// The name-safety rules in [`crate::paths`] are applied to the whole path
@@ -842,29 +920,6 @@ fn verify_staged(
 /// ones set creation applies, and the same on every platform; what remains
 /// here is the part that must consult the filesystem, which is the refusal to
 /// follow a symbolic link out of `base`.
-/// Refuse a set whose paths a case-insensitive filesystem cannot tell apart.
-///
-/// macOS and Windows fold case by default, so `Readme` and `README` in one
-/// directory are one file there and the second output written takes the first
-/// one's place. Every file is checked, complete or not: one already whole on
-/// disk is just as lost if another file's output lands on its name. Only a pair
-/// that would actually be written is refused, and like every other destination
-/// rule this is settled before anything is staged, so the host sees a bare
-/// refusal rather than a half-finished repair.
-fn refuse_case_folded_destinations(files: &[crate::session::AssessedFile]) -> EngineResult<()> {
-    let mut folded: HashMap<String, usize> = HashMap::with_capacity(files.len());
-    for (index, file) in files.iter().enumerate() {
-        if let Some(first) = folded.insert(crate::paths::case_folded(&file.path), index)
-            && (!files[first].complete || !file.complete)
-        {
-            return Err(EngineError::InvalidState(
-                "repair destinations differ only by letter case",
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult<PathBuf> {
     crate::paths::validate_relative_path(relative)?;
     let mut path = base.to_path_buf();
@@ -1296,14 +1351,13 @@ mod charge_tests {
             assert_eq!(options.memory.ledger().current(), 0);
         }
     }
-    /// PR #73 round 4, finding D. Repair resolves every destination before it
-    /// stages anything, and a pair of set paths a case-insensitive filesystem
-    /// cannot tell apart is refused there: the second output written would take
-    /// the first one's place. No official set names such a pair and this
-    /// crate's own creation now refuses to write one, so the rule is exercised
-    /// on the assessment the preflight reads.
+    /// PR #73 round 4, finding D. A set naming two paths one filesystem would
+    /// merge is found before anything is staged. The finder is pure — it reads
+    /// the assessment only — so it is asked here directly; what the repair
+    /// then does about a collision depends on the destination, and is the
+    /// subject of the test below.
     #[test]
-    fn destinations_that_differ_only_by_letter_case_are_refused() {
+    fn destinations_that_differ_only_by_letter_case_are_found() {
         let assessed = |path: &str, complete: bool| crate::session::AssessedFile {
             path: path.to_owned(),
             source: None,
@@ -1312,32 +1366,102 @@ mod charge_tests {
             unresolved: Vec::new(),
         };
 
-        refuse_case_folded_destinations(&[assessed("a/Readme", false), assessed("a/notes", false)])
-            .expect("two names that share nothing");
-        refuse_case_folded_destinations(&[
-            assessed("one/Readme", false),
-            assessed("two/README", false),
-        ])
-        .expect("one spelling in two directories is two paths");
-
-        let error = refuse_case_folded_destinations(&[
-            assessed("a/Readme", false),
-            assessed("a/README", false),
-        ])
-        .expect_err("two outputs would be written to one file");
-        assert!(
-            matches!(error, EngineError::InvalidState(reason) if reason.contains("letter case")),
-            "refused for the wrong reason: {error}"
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/notes", false)]),
+            None,
+            "two names that share nothing"
+        );
+        assert_eq!(
+            case_folded_collisions(&[assessed("one/Readme", false), assessed("two/README", false)]),
+            None,
+            "one spelling in two directories is two paths"
+        );
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/README", false)]),
+            Some((0, 1)),
+            "two outputs would be written to one file"
         );
 
         // A file already whole on disk is just as lost if another file's output
         // lands on its name.
-        refuse_case_folded_destinations(&[assessed("a/Readme", true), assessed("a/README", false)])
-            .expect_err("an output would land on a file that is already whole");
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", false)]),
+            Some((0, 1)),
+            "an output would land on a file that is already whole"
+        );
 
         // Two files that are both complete are written nowhere, so nothing is
         // at risk and the repair is not refused for a collision it never makes.
-        refuse_case_folded_destinations(&[assessed("a/Readme", true), assessed("a/README", true)])
-            .expect("nothing is staged, so nothing collides");
+        assert_eq!(
+            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", true)]),
+            None,
+            "nothing is staged, so nothing collides"
+        );
+    }
+
+    /// PR #73 round 4, finding D, and the CI fix that followed it. A set naming
+    /// `Readme` and `README` is legitimate — a case-sensitive producer makes
+    /// one — so the refusal belongs to the destination, not to the set. The
+    /// preflight asks the directory it is about to write into, and must leave
+    /// no probe behind either way. The expected answer is whatever this
+    /// machine's temporary directory actually does, which the test discovers
+    /// the same way the preflight does.
+    #[test]
+    fn a_case_folded_pair_is_refused_only_where_the_destination_folds_case() {
+        let tree = crate::test_reference::TempTree::new("case-folded-destinations");
+        let assessed = |path: &str| crate::session::AssessedFile {
+            path: path.to_owned(),
+            source: None,
+            complete: false,
+            verified_prefix: 0,
+            unresolved: Vec::new(),
+        };
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(tree.path())
+                .expect("the destination is readable")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Nothing collides, so the filesystem is never consulted and the
+        // directory is not touched.
+        refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("notes")])
+            .expect("two names that share nothing");
+        assert!(
+            entries().is_empty(),
+            "a set with no collision probed the destination anyway: {:?}",
+            entries()
+        );
+
+        // Discover this directory's own answer exactly as the preflight does.
+        let probe = tree.path().join("CaseProbe");
+        std::fs::write(&probe, b"probe").expect("a writable destination");
+        let folds = std::fs::symlink_metadata(tree.path().join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("the discovery probe is removed");
+
+        let outcome =
+            refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("README")]);
+        if folds {
+            let error = outcome.expect_err("two outputs would be written to one file here");
+            assert!(
+                matches!(error, EngineError::InvalidState(reason) if reason.contains("letter case")),
+                "refused for the wrong reason: {error}"
+            );
+        } else {
+            outcome.expect("two distinct files on a case-sensitive destination");
+        }
+        assert!(
+            entries().is_empty(),
+            "the case probe was left behind: {:?}",
+            entries()
+        );
     }
 }

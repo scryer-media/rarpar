@@ -6,7 +6,7 @@
 //! [`super::create`] read each input file exactly once.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::cauchy::default_field;
@@ -329,28 +329,15 @@ pub(crate) fn collect_files(
     }
 
     let mut budget = PathBudget::new(limits);
-    // Keyed by the name a case-insensitive filesystem would see, holding the
-    // name it was given. Two inputs that differ only by letter case are one
-    // path on macOS and Windows, where the second file written takes the first
-    // one's place, so a set naming both could never be repaired back onto the
-    // filesystem it came from. It is refused before the set is written rather
-    // than after.
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut files = Vec::with_capacity(inputs.files.len());
     for given in inputs.files {
         let name = relative_name(given)?;
         budget.spend(&name)?;
-        if let Some(existing) = seen.insert(crate::paths::case_folded(&name), name.clone()) {
+        if !seen.insert(name.clone()) {
             return Err(Par3Error::CreateInput {
-                reason: if existing == name {
-                    "is named twice; a set stores each name once".to_owned()
-                } else {
-                    format!(
-                        "differs from {existing} only by letter case, and a case-insensitive \
-                         filesystem cannot hold both"
-                    )
-                },
                 path: name,
+                reason: "is named twice; a set stores each name once".to_owned(),
             });
         }
         let path = inputs.base.join(given);

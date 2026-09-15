@@ -318,9 +318,10 @@ pub fn validate_component(component: &str) -> Result<(), PathViolation> {
 ///
 /// macOS and Windows both fold case by default, so `Readme` and `README` in one
 /// directory are one file there and the second thing written takes the first
-/// one's place. par3-rs refuses that pair everywhere rather than producing a set
-/// that installs correctly on one filesystem and silently loses a file on
-/// another.
+/// one's place. A set may legitimately name both — a case-sensitive producer
+/// makes one — so this answers which paths *could* collide; whether they
+/// actually do belongs to the filesystem being written to, and the repair
+/// preflight asks it directly.
 ///
 /// The fold is Unicode lowercase, not the full case folding of UAX #44: it
 /// catches every ASCII collision and the common Unicode ones, and it never

@@ -110,14 +110,14 @@
   the packet list and once in the set being built — while the budget was told
   about one copy, so a set resolved close to its ceiling peaked above what it
   had reserved.
-- Creation and repair refuse two paths in one set that differ only by letter
-  case. `Readme` and `README` are distinct names in a PAR3 set but one file on
-  macOS's default filesystem and on Windows, where the second would silently
-  clobber the first; both are now refused up front, on every platform, so a set
-  created here is installable everywhere. Creation reports it as a
-  `Par3Error::CreateInput` (or `EngineError::InvalidState` through
-  `CreationPlan`) naming the case collision, and a repair is refused before any
-  destination is staged.
+- A repair is refused before anything is staged when two of the set's paths
+  differ only by letter case *and* the destination filesystem folds case.
+  `Readme` and `README` are two names a case-sensitive producer may legitimately
+  put in one set, and repairing them onto a case-sensitive filesystem still
+  writes two files; on macOS's default filesystem and on Windows they are one
+  file, where the second output written would take the first one's place. The
+  destination is asked only when the set actually carries such a pair, with a
+  uniquely named probe that is always removed.
 - A recovery index whose payloads conflict is never offered again. Two
   different payloads claiming one index leave that index unusable for the rest
   of the session, but it used to look unclaimed to the next-index search, which
