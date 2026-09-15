@@ -635,4 +635,16 @@ fn stripe_passes_over_a_block_are_passes_and_not_rereads() {
         "disjoint stripe passes were counted as rereads"
     );
     assert!(amplification.reconstructed_bytes > 0);
+
+    // PR #73 round 5, finding D. A pass is one extra walk over the source, so
+    // the count follows the block and the stripe and nothing else. It used to
+    // be taken inside the loop over surviving blocks, which multiplied every
+    // pass by however many blocks the set happened to have and made the number
+    // unreadable — here, 31 times too large.
+    let expected = (64u64 << 10).div_ceil(admission.stripe_bytes) - 1;
+    assert_eq!(
+        amplification.stripe_passes, expected,
+        "a {} byte stripe over a 65536 byte block is {expected} extra passes, whatever the block count",
+        admission.stripe_bytes
+    );
 }

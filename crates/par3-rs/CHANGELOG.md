@@ -123,6 +123,29 @@
   of the session, but it used to look unclaimed to the next-index search, which
   handed the host an index it could never satisfy while a usable one went
   unasked for.
+- A packet a budget refuses is offered again rather than skipped. The scanner
+  counted the packet and stepped its offset past it before asking for the
+  memory its parsed body needs; a refusal a peer caused is retryable by
+  contract, so the host parked and polled again, and the packet it had already
+  stepped over was never yielded. Nothing moves now until the packet exists.
+- `note_recovery_in_flight` reserves an upper bound for the set it builds
+  before building it, rather than after. A declaration of many indices no
+  longer allocates ahead of the budget; one large enough to exceed the ceiling
+  is refused before the allocation instead of after it.
+- `AmplificationSnapshot::stripe_passes` counts one pass per extra walk over
+  the source, as documented. A Cauchy repair took the count inside its loop
+  over surviving blocks, so one extra pass over a set of 100 blocks reported
+  100.
+- `IncrementalSet::failed_hash_bytes` includes a reauthentication lost to a
+  carrier rewritten under the reader, which is what its documentation always
+  said it counted. Only a hash mismatch was counted before, so the most
+  expensive way to lose a packet — read and hashed in full, then thrown away —
+  reported nothing. `rejected_packets` still counts only packets this set
+  refused, and a carrier that moved is not one.
+- A Creator or Comment body's text moves into the `String` the set keeps
+  instead of being copied out beside it, and the resolution charge covers a
+  lossy decode of a body that is not valid UTF-8, which can reach three bytes
+  per byte and was charged as nothing.
 
 - Store a contiguous protected chunk mapping as a run (file, first block, block
   count, byte offset) instead of one materialised extent per block, and expand a

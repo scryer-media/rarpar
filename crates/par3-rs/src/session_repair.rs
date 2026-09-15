@@ -515,6 +515,14 @@ where
     while offset < layout.block_size {
         session.options.cancel.check()?;
         let take = (layout.block_size - offset).min(stripe as u64) as usize;
+        if offset != 0 {
+            // A stripe narrower than the block means every surviving block is
+            // read once more, for the next slice of it. That is one extra walk
+            // over the source however many blocks it covers, so it is counted
+            // here, once, and not once per block. The passes read disjoint
+            // slices, so this is an extra walk and not a byte fetched twice.
+            session.options.diagnostics.note_stripe_pass();
+        }
         for syndrome in &mut syndromes {
             syndrome[..take].fill(0);
         }
@@ -524,13 +532,6 @@ where
                 continue;
             }
             session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
-            if offset != 0 {
-                // A stripe narrower than the block means the surviving blocks
-                // are walked once per pass. The passes read disjoint slices, so
-                // this is an extra walk over the source and not a byte fetched
-                // twice; it is reported as a pass rather than as amplification.
-                session.options.diagnostics.note_stripe_pass();
-            }
             scatter(
                 &session.options,
                 layout,

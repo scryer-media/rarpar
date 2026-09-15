@@ -304,6 +304,23 @@ impl Par3RepairSession {
         indices: &[u64],
     ) -> EngineResult<()> {
         self.options.cancel.check()?;
+        // The set that works out what is new is itself an allocation, and it
+        // is built from a host-supplied slice of any length. Its upper bound —
+        // every index named being new — is admitted and reserved before it is
+        // built, and given back below once what was really added is known. The
+        // allocation used to run ahead of the budget by exactly this much.
+        let bound = indices
+            .len()
+            .checked_mul(IN_FLIGHT_INDEX_BYTES)
+            .ok_or(EngineError::resource_limit("recovery acquisition state"))?;
+        if bound == 0 {
+            return Ok(());
+        }
+        self.admit_retained(bound)?;
+        let scratch = self
+            .options
+            .memory
+            .reserve_as(MemoryCategory::Assessment, bound)?;
         let entry = self.recovery_in_flight.entry(matrix).or_default();
         // What the set will really gain. `indices` is host-supplied and may
         // name the same index twice; counting occurrences charges for entries
@@ -336,6 +353,9 @@ impl Par3RepairSession {
         }
         let entry = self.recovery_in_flight.entry(matrix).or_default();
         entry.extend(fresh);
+        // Both copies were live until here, which is what the two reservations
+        // said; only the stored one survives.
+        drop(scratch);
         self.assessment = None;
         Ok(())
     }

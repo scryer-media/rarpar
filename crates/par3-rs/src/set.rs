@@ -364,6 +364,15 @@ pub(crate) fn resolution_cost(packet: &Packet) -> usize {
                     * btree_entry_bytes::<(Fingerprint, u64), BlockChecksum>()
         }
         PacketBody::Opaque { .. } => hash_entry_bytes::<Fingerprint, Packet>(),
+        // The set keeps these two as text, and nothing guarantees a producer
+        // wrote valid UTF-8. Valid text moves into its `String` and costs
+        // nothing beyond the body already counted below; text that is not
+        // valid is decoded into a second buffer where every byte the
+        // replacement character stands in for costs three, beside the body it
+        // is decoded from. These packets are small, so the worst case is what
+        // is charged rather than a guess at the encoding.
+        PacketBody::Creator(this) => this.byte_len().saturating_mul(3),
+        PacketBody::Comment(this) => this.byte_len().saturating_mul(3),
         _ => 0,
     };
     packet
@@ -371,6 +380,20 @@ pub(crate) fn resolution_cost(packet: &Packet) -> usize {
         .saturating_add(indexed)
         .saturating_add(hash_entry_bytes::<(u64, Fingerprint), ()>())
         .saturating_add(size_of::<Packet>())
+}
+
+/// Decode a Creator or Comment body into the text a set carries.
+///
+/// Valid UTF-8 moves into the `String` without a copy, which is the whole
+/// point of taking the bytes by value: the wire copy and the text used to be
+/// live at once for every one of these packets. Text that is not valid is
+/// decoded lossily as before — a mis-encoded creator string must not cost a
+/// caller the rest of the set — and [`resolution_cost`] charges that case.
+fn text_of(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
 }
 
 /// One PAR3 input set: everything that shares an InputSetID.
@@ -658,8 +681,10 @@ impl Par3Set {
                 PacketBody::RecoveryData(this) => recovery_packets.push(this),
                 PacketBody::RecoveryExternalData(this) => recovery_external_data.push(this),
                 PacketBody::Data(this) => data_packets.push(this),
-                PacketBody::Creator(this) => creator_texts.push(this.text().into_owned()),
-                PacketBody::Comment(this) => comments.push(this.text().into_owned()),
+                PacketBody::Creator(this) => {
+                    creator_texts.push(text_of(this.into_body_bytes()));
+                }
+                PacketBody::Comment(this) => comments.push(text_of(this.into_body_bytes())),
                 PacketBody::Opaque { packet_type, .. } => {
                     match packet_type {
                         PacketType::Link
@@ -1456,6 +1481,52 @@ mod tests {
             count * hash_entry_bytes::<&str, ()>(),
             "the per-child name-set term is not what separates them"
         );
+    }
+
+    /// PR #73 round 5, finding F. A Creator or Comment body is bytes on the
+    /// wire and text in the set, and nothing says a producer wrote valid UTF-8.
+    /// The decode used to run beside the body it decoded, charged as nothing by
+    /// the catch-all arm. Valid text now moves into its `String`; the lossy
+    /// path still builds a second buffer, and the charge covers the worst that
+    /// buffer can be.
+    #[test]
+    fn a_creator_charge_covers_the_text_the_set_keeps() {
+        let packets = crate::test_reference::gf8_packets();
+        for want in [PacketType::Creator, PacketType::Comment] {
+            let Some(packet) = packets
+                .iter()
+                .find(|packet| packet.packet_type() == want)
+                .cloned()
+            else {
+                continue;
+            };
+            let body = match packet.body() {
+                PacketBody::Creator(this) => this.as_bytes().to_vec(),
+                PacketBody::Comment(this) => this.as_bytes().to_vec(),
+                other => panic!("a {want:?} packet parsed as {other:?}"),
+            };
+            assert!(!body.is_empty(), "the official {want:?} packet is empty");
+            let charge = resolution_cost(&packet);
+            assert!(
+                charge >= packet.owned_bytes() + body.len() * 3,
+                "a {want:?} body of {} bytes is charged {charge}, less than the {} a lossy \
+                 decode of it can reach beside the body it reads",
+                body.len(),
+                packet.owned_bytes() + body.len() * 3
+            );
+        }
+
+        // And the text itself is unchanged by moving the bytes into it.
+        let set = crate::test_reference::gf8_set();
+        let creator = set.creator_texts().first().expect("an official creator");
+        let wire = packets
+            .iter()
+            .find_map(|packet| match packet.body() {
+                PacketBody::Creator(this) => Some(this.as_bytes().to_vec()),
+                _ => None,
+            })
+            .expect("the official archive names its creator");
+        assert_eq!(*creator, String::from_utf8_lossy(&wire));
     }
 
     /// PR #73 round 4, finding A. `TreeWalk::run` checks the Root's children

@@ -134,17 +134,35 @@ impl PayloadRef {
     /// Reauthenticate the entire packet immediately before consuming it for a
     /// repair. A stat fingerprint alone is not cryptographic evidence.
     pub fn validate(&self, options: &ExecutionOptions) -> EngineResult<()> {
-        options.validate()?;
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+        self.reauthenticate(options).map_err(|(error, _)| error)
+    }
+
+    /// [`Self::validate`], saying also whether a whole hashing pass was spent
+    /// before the failure.
+    ///
+    /// The two are not the same cost. A generation that has already changed
+    /// when the check starts costs one `snapshot` call; a carrier rewritten
+    /// *under* the read costs the whole packet, read and hashed and thrown
+    /// away, which is exactly the work [`IncrementalSet::failed_hash_bytes`]
+    /// exists to report. Only the caller holds that counter, so the
+    /// distinction is carried out to it rather than decided here.
+    pub(crate) fn reauthenticate(
+        &self,
+        options: &ExecutionOptions,
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
         let size = options.stripe_bytes.min(64 << 10);
         let _buffer_reservation = options
             .memory
-            .reserve_as(MemoryCategory::CarrierPackets, size)?;
+            .reserve_as(MemoryCategory::CarrierPackets, size)
+            .map_err(spent)?;
         let mut buffer = vec![0; size];
         let mut hash = FingerprintHasher::new();
         let mut offset = 24;
         while offset < self.header.length {
-            options.cancel.check()?;
+            options.cancel.check().map_err(spent)?;
             let take = (self.header.length - offset).min(size as u64) as usize;
             read_exact_at(
                 &options.diagnostics,
@@ -152,16 +170,22 @@ impl PayloadRef {
                 self.source,
                 self.packet_offset + offset,
                 &mut buffer[..take],
-            )?;
+            )
+            .map_err(spent)?;
             hash.update(&buffer[..take]);
             offset += take as u64;
         }
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+        // Everything from here on has cost a full pass over the packet.
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
+            .map_err(|error| (error, true))?;
         if hash.finalize() != self.header.hash {
-            return Err(Par3Error::PacketHashMismatch {
-                offset: self.packet_offset,
-            }
-            .into());
+            return Err((
+                Par3Error::PacketHashMismatch {
+                    offset: self.packet_offset,
+                }
+                .into(),
+                true,
+            ));
         }
         Ok(())
     }
@@ -469,6 +493,35 @@ struct Candidate {
     reservation: Reservation,
 }
 
+/// A packet whose bytes are read and whose hash has been checked, waiting to
+/// be admitted to a budget.
+///
+/// Authentication and admission are two steps, and only the second can be
+/// refused by something that may relent: a budget a peer is holding answers
+/// `PeerContention`, which the host is expected to park on and retry. The
+/// hasher is gone by then — the bytes are proven — so what is kept here is
+/// everything the admission still needs, and the scanner's position is not
+/// moved until it succeeds.
+struct Authenticated {
+    header: PacketHeader,
+    offset: u64,
+    retained: Vec<u8>,
+    prefix: [u8; 40],
+    prefix_len: usize,
+    reservation: Reservation,
+}
+
+/// Why an authenticated packet was not admitted.
+enum Admission {
+    /// A budget refused it. Nothing about the packet has changed, so it is
+    /// handed back to be offered again when the budget relents.
+    Refused(EngineError, Box<Authenticated>),
+    /// The packet is authenticated but cannot be made into one — a body the
+    /// parser rejects. Offering it again would fail the same way, so the scan
+    /// counts it and moves past it, as it did before it could retry anything.
+    Unusable(EngineError),
+}
+
 /// A resumable scanner for one carrier and immutable content generation.
 ///
 /// Repeated `poll` calls preserve the packet hash frontier across partial
@@ -485,6 +538,9 @@ pub struct PacketScanner {
     snapshot: SourceSnapshot,
     offset: u64,
     candidate: Option<Candidate>,
+    /// A packet already proven and waiting on a budget. It holds its wire
+    /// bytes and its reservation, so a retry costs nothing but the admission.
+    authenticated: Option<Authenticated>,
     at_packet_boundary: bool,
     options: ExecutionOptions,
     limits: ScanLimits,
@@ -520,6 +576,7 @@ impl PacketScanner {
             snapshot,
             offset: 0,
             candidate: None,
+            authenticated: None,
             at_packet_boundary: false,
             options,
             limits,
@@ -543,6 +600,7 @@ impl PacketScanner {
         }
         self.offset = offset;
         self.candidate = None;
+        self.authenticated = None;
         self.at_packet_boundary = false;
         self.read_ahead.len = 0;
         Ok(())
@@ -560,6 +618,12 @@ impl PacketScanner {
         loop {
             self.options.cancel.check()?;
             ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+            // A packet refused by a budget on the last poll is offered again
+            // before anything new is read. Its bytes are already proven, so
+            // this costs only the admission that failed.
+            if let Some(authenticated) = self.authenticated.take() {
+                return self.admit(authenticated);
+            }
             if self.candidate.is_none() {
                 if self.offset >= self.snapshot.len {
                     return Ok(ScanEvent::End);
@@ -753,83 +817,162 @@ impl PacketScanner {
                 self.offset = candidate.offset + 8;
                 continue;
             }
-            if self.packets >= self.limits.max_packets {
-                return Err(EngineError::resource_limit("packet count"));
+            return self.admit(Authenticated {
+                header: candidate.header,
+                offset: candidate.offset,
+                retained: candidate.retained,
+                prefix: candidate.prefix,
+                prefix_len: candidate.prefix_len,
+                reservation: candidate.reservation,
+            });
+        }
+    }
+
+    /// Offer one authenticated packet to the budget, and move the scan past it
+    /// only if the budget takes it.
+    ///
+    /// The count and the offset used to be advanced first, which is fine for
+    /// the errors that end a scan but wrong for the one that does not: a
+    /// budget a peer is holding answers `PeerContention`, the host parks and
+    /// polls again, and the packet the scanner had already stepped over was
+    /// never yielded — a set quietly short one packet. Nothing here is
+    /// committed until the packet exists.
+    fn admit(&mut self, authenticated: Authenticated) -> EngineResult<ScanEvent> {
+        if self.packets >= self.limits.max_packets {
+            return Err(EngineError::resource_limit("packet count"));
+        }
+        let offset = authenticated.offset;
+        let length = authenticated.header.length;
+        let contents = match self.contents_of(authenticated) {
+            Ok(contents) => contents,
+            Err(Admission::Refused(error, authenticated)) => {
+                self.authenticated = Some(*authenticated);
+                return Err(error);
             }
-            self.packets += 1;
-            self.offset = candidate.offset + candidate.header.length;
-            self.at_packet_boundary = true;
-            let mut reservation = candidate.reservation;
-            let retained = candidate.retained;
-            let contents = if candidate.prefix_len == 0 {
-                // The carrier copy and the parsed body are live at the same
-                // time: `parse` builds the body's owned containers while
-                // `retained` still holds the bytes they are read from. Cover
-                // both *before* parsing, so a budget that cannot hold the pair
-                // refuses at admission rather than after the allocation has
-                // already happened.
-                //
-                // The wire length is a sound bound for the parsed body of every
-                // metadata type: each owned field is a copy of a wire range or
-                // a fixed-size value taken from one, so no body owns more bytes
-                // than the packet it came from. `reservation` already covers
-                // the wire copy plus one packet's overhead, so growing it by
-                // itself covers the pair. A tighter bound would have to be per
-                // type and computed from the same wire bytes, which is what
-                // parsing does; there is nothing cheaper to read first.
-                reservation.grow_by(reservation.bytes())?;
-                let packet = Packet::parse(&retained, candidate.offset, &ParseContext::new())?;
-                let owned = packet
-                    .owned_bytes()
-                    .saturating_add(PACKET_OVERHEAD_BYTES)
-                    .min(isize::MAX as usize);
-                drop(retained);
-                if let Some(growth) = owned.checked_sub(reservation.bytes()) {
-                    reservation.grow_by(growth)?;
-                } else {
-                    reservation.shrink_to(owned);
-                }
-                IngestedContents::Metadata(Arc::new(packet), Arc::new(reservation))
-            } else {
-                let kind = if candidate.prefix_len == 8 {
-                    PayloadKind::Data {
-                        index: u64::from_le_bytes(
-                            candidate.prefix[..8].try_into().expect("eight bytes"),
-                        ),
-                    }
-                } else {
-                    PayloadKind::Recovery {
-                        root: candidate.prefix[..16].try_into().expect("fingerprint"),
-                        matrix: candidate.prefix[16..32].try_into().expect("fingerprint"),
-                        index: u64::from_le_bytes(
-                            candidate.prefix[32..40].try_into().expect("eight bytes"),
-                        ),
-                    }
-                };
-                IngestedContents::Payload(Arc::new(PayloadRef {
-                    diagnostics: self.options.diagnostics.clone(),
-                    access: Arc::clone(&self.access),
-                    source: self.source,
-                    snapshot: self.snapshot,
-                    packet_offset: candidate.offset,
-                    data_offset: candidate.offset
-                        + HEADER_SIZE as u64
-                        + candidate.prefix_len as u64,
-                    header: candidate.header,
-                    kind,
-                    reservation: Arc::new(reservation),
-                }))
+            Err(Admission::Unusable(error)) => {
+                self.packets += 1;
+                self.offset = offset + length;
+                self.at_packet_boundary = true;
+                return Err(error);
+            }
+        };
+        self.packets += 1;
+        self.offset = offset + length;
+        self.at_packet_boundary = true;
+        Ok(ScanEvent::Packet(IngestedPacket {
+            contents,
+            origin: PacketOrigin {
+                provider: ProviderIdentity(self.access.clone()),
+                source: self.source,
+                snapshot: self.snapshot,
+                offset,
+                length,
+            },
+        }))
+    }
+
+    /// Turn an authenticated packet into what the set will hold, reserving what
+    /// that costs.
+    ///
+    /// Every failure hands the packet back intact unless the packet itself is
+    /// the problem, so the caller can decide between retrying and stepping
+    /// over it.
+    fn contents_of(&mut self, authenticated: Authenticated) -> Result<IngestedContents, Admission> {
+        let Authenticated {
+            header,
+            offset,
+            retained,
+            prefix,
+            prefix_len,
+            mut reservation,
+        } = authenticated;
+        if prefix_len == 0 {
+            // The carrier copy and the parsed body are live at the same
+            // time: `parse` builds the body's owned containers while
+            // `retained` still holds the bytes they are read from. Cover
+            // both *before* parsing, so a budget that cannot hold the pair
+            // refuses at admission rather than after the allocation has
+            // already happened.
+            //
+            // The wire length is a sound bound for the parsed body of every
+            // metadata type: each owned field is a copy of a wire range or
+            // a fixed-size value taken from one, so no body owns more bytes
+            // than the packet it came from. `reservation` already covers
+            // the wire copy plus one packet's overhead, so growing it by
+            // itself covers the pair. A tighter bound would have to be per
+            // type and computed from the same wire bytes, which is what
+            // parsing does; there is nothing cheaper to read first.
+            if let Err(error) = reservation.grow_by(reservation.bytes()) {
+                return Err(Admission::Refused(
+                    error,
+                    Box::new(Authenticated {
+                        header,
+                        offset,
+                        retained,
+                        prefix,
+                        prefix_len,
+                        reservation,
+                    }),
+                ));
+            }
+            let packet = match Packet::parse(&retained, offset, &ParseContext::new()) {
+                Ok(packet) => packet,
+                Err(error) => return Err(Admission::Unusable(error.into())),
             };
-            return Ok(ScanEvent::Packet(IngestedPacket {
-                contents,
-                origin: PacketOrigin {
-                    provider: ProviderIdentity(self.access.clone()),
-                    source: self.source,
-                    snapshot: self.snapshot,
-                    offset: candidate.offset,
-                    length: self.offset - candidate.offset,
-                },
-            }));
+            let owned = packet
+                .owned_bytes()
+                .saturating_add(PACKET_OVERHEAD_BYTES)
+                .min(isize::MAX as usize);
+            if let Some(growth) = owned.checked_sub(reservation.bytes()) {
+                // The doubled reservation is a bound on this, so it is not
+                // expected to be reached; the wire bytes are still held and
+                // still charged while it is asked for, so a refusal here can
+                // be retried like any other.
+                if let Err(error) = reservation.grow_by(growth) {
+                    return Err(Admission::Refused(
+                        error,
+                        Box::new(Authenticated {
+                            header,
+                            offset,
+                            retained,
+                            prefix,
+                            prefix_len,
+                            reservation,
+                        }),
+                    ));
+                }
+                drop(retained);
+            } else {
+                drop(retained);
+                reservation.shrink_to(owned);
+            }
+            Ok(IngestedContents::Metadata(
+                Arc::new(packet),
+                Arc::new(reservation),
+            ))
+        } else {
+            let kind = if prefix_len == 8 {
+                PayloadKind::Data {
+                    index: u64::from_le_bytes(prefix[..8].try_into().expect("eight bytes")),
+                }
+            } else {
+                PayloadKind::Recovery {
+                    root: prefix[..16].try_into().expect("fingerprint"),
+                    matrix: prefix[16..32].try_into().expect("fingerprint"),
+                    index: u64::from_le_bytes(prefix[32..40].try_into().expect("eight bytes")),
+                }
+            };
+            Ok(IngestedContents::Payload(Arc::new(PayloadRef {
+                diagnostics: self.options.diagnostics.clone(),
+                access: Arc::clone(&self.access),
+                source: self.source,
+                snapshot: self.snapshot,
+                packet_offset: offset,
+                data_offset: offset + HEADER_SIZE as u64 + prefix_len as u64,
+                header,
+                kind,
+                reservation: Arc::new(reservation),
+            })))
         }
     }
 }
@@ -973,15 +1116,22 @@ impl IncrementalSet {
         payload: &PayloadRef,
         options: &ExecutionOptions,
     ) -> EngineResult<()> {
-        match payload.validate(options) {
+        match payload.reauthenticate(options) {
             Ok(()) => Ok(()),
-            Err(error) => {
+            Err((error, spent)) => {
+                // A pass was spent whenever the packet was read and hashed
+                // before the refusal, whether the hash disagreed or the carrier
+                // was rewritten under the reader. Both are bytes this set paid
+                // for and threw away, which is what the counter reports; only
+                // a hash that disagreed is a packet this set refused.
+                if spent {
+                    self.failed_hash_bytes
+                        .fetch_add(payload.packet_length(), Ordering::Relaxed);
+                }
                 if matches!(
                     error,
                     EngineError::Format(crate::Par3Error::PacketHashMismatch { .. })
                 ) {
-                    self.failed_hash_bytes
-                        .fetch_add(payload.packet_length(), Ordering::Relaxed);
                     self.rejected_packets.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error)
@@ -1364,6 +1514,270 @@ mod charge_classification_tests {
             limit.cause(),
             LimitCause::ExceedsLimit,
             "no release can grow the uncontended ceiling: {limit}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    //! Reading a packet and being allowed to keep it are two different things,
+    //! and only the second can fail in a way the host is told to retry. These
+    //! drive a scanner across an official archive with a peer holding the
+    //! budget, which is the only way to reach that path.
+    use super::{IngestedContents, PacketScanner, ScanEvent};
+    use crate::ScanLimits;
+    use crate::runtime::{EngineError, ExecutionOptions, MemoryBudget, MemoryCategory};
+    use crate::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    /// Where each packet of `archive` sits, and whether it is metadata.
+    fn scanned(archive: &[u8], options: &ExecutionOptions) -> Vec<(u64, u64, bool)> {
+        let mut scanner = scanner_over(archive, options);
+        let mut seen = Vec::new();
+        loop {
+            match scanner.poll().expect("an ample budget scans the archive") {
+                ScanEvent::Packet(packet) => seen.push((
+                    packet.origin.offset,
+                    packet.origin.length,
+                    matches!(packet.contents, IngestedContents::Metadata(..)),
+                )),
+                ScanEvent::End => break,
+                other => panic!("the whole archive is present: {other:?}"),
+            }
+        }
+        seen
+    }
+
+    fn scanner_over(archive: &[u8], options: &ExecutionOptions) -> PacketScanner {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, archive.to_vec().into());
+        PacketScanner::new(
+            Arc::new(access),
+            SourceId(1),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .expect("a scanner over the archive")
+    }
+
+    /// A provider that reports the generation it was given until it is armed,
+    /// and a different one from its second answer after that.
+    ///
+    /// A carrier rewritten between a payload's opening generation check and
+    /// its closing one cannot be staged from a fixed byte string, and it is
+    /// the only way to reach the path where a whole hash pass is spent and
+    /// then discarded. The bytes it serves are the official archive's.
+    struct RewrittenUnderTheReader {
+        inner: MemorySourceAccess,
+        armed: std::sync::atomic::AtomicBool,
+        answers: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::source::SourceAccess for RewrittenUnderTheReader {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            let snapshot = self.inner.snapshot(source)?;
+            if !self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(snapshot);
+            }
+            if self
+                .answers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                return Ok(snapshot);
+            }
+            Ok(snapshot.map(|snapshot| crate::source::SourceSnapshot {
+                generation: snapshot.generation + 1,
+                ..snapshot
+            }))
+        }
+
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read_at(source, offset, out)
+        }
+
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    /// PR #73 round 5, finding E. `failed_hash_bytes` is what a host reads to
+    /// decide a carrier is not worth re-reading, and its own documentation says
+    /// it counts carrier bytes that changed under the reader. Only a hash
+    /// mismatch was counted, so a packet read and hashed in full and then
+    /// thrown away because the carrier had been rewritten was free, and the
+    /// most expensive way to lose a packet was the one that showed nothing.
+    #[test]
+    fn a_carrier_rewritten_under_a_reauthentication_charges_the_pass_it_wasted() {
+        let archive = crate::test_reference::set_vol0_par3();
+        let options = ExecutionOptions::default();
+        let mut inner = MemorySourceAccess::default();
+        inner.insert(SourceId(1), 1, archive.clone().into());
+        let access = Arc::new(RewrittenUnderTheReader {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            answers: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut scanner = PacketScanner::new(
+            Arc::clone(&access) as Arc<dyn crate::source::SourceAccess>,
+            SourceId(1),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .expect("a scanner over the archive");
+
+        let mut set = super::IncrementalSet::new(crate::test_reference::SET_ID, options.clone())
+            .expect("a set");
+        let mut payload = None;
+        loop {
+            match scanner.poll().expect("the archive scans") {
+                ScanEvent::Packet(packet) => {
+                    if let IngestedContents::Payload(reference) = &packet.contents {
+                        payload.get_or_insert_with(|| Arc::clone(reference));
+                    }
+                    set.merge(packet).expect("every packet is admitted");
+                }
+                ScanEvent::End => break,
+                other => panic!("the whole archive is present: {other:?}"),
+            }
+        }
+        let payload = payload.expect("the reference carrier holds recovery payloads");
+        assert_eq!(
+            set.failed_hash_bytes(),
+            0,
+            "nothing has been lost while the carrier stood still"
+        );
+
+        // From here the carrier answers its own generation once — which is the
+        // check that opens the reauthentication — and a different one after.
+        access
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let error = set
+            .validate_payload(&payload, &options)
+            .expect_err("the carrier changed under the reader");
+        assert!(
+            matches!(error, EngineError::SourceChanged(SourceId(1))),
+            "the reauthentication failed for the wrong reason: {error:?}"
+        );
+        assert_eq!(
+            set.failed_hash_bytes(),
+            payload.packet_length(),
+            "the whole packet was read and hashed and thrown away, uncounted"
+        );
+        assert_eq!(
+            set.rejected_packets(),
+            0,
+            "a carrier that moved is not a packet this set refused"
+        );
+    }
+
+    /// PR #73 round 5, finding A. A budget a peer is holding answers
+    /// `PeerContention`, which the contract calls retryable: the host parks and
+    /// polls again. The scanner used to count the packet and step its offset
+    /// past it *before* asking for the memory its parsed body needs, so the
+    /// retry resumed after a packet that was never yielded and the set came out
+    /// quietly short. Nothing may move until the packet exists.
+    #[test]
+    fn a_packet_a_peer_squeezed_out_is_offered_again_rather_than_skipped() {
+        let archive = crate::test_reference::set16_vol0_par3();
+        let ample = ExecutionOptions::default();
+        let expected = scanned(&archive, &ample);
+
+        // Contend on the widest metadata packet: the refusal has to land on the
+        // growth that covers the parsed body, not on the wire copy that is
+        // taken before the packet is authenticated, and the margin below only
+        // separates the two when the packet is larger than it is.
+        let (index, offset, length) = expected
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, metadata))| *metadata)
+            .map(|(index, (offset, length, _))| (index, *offset, *length))
+            .max_by_key(|(_, _, length)| *length)
+            .expect("the official archive carries metadata packets");
+        const MARGIN: usize = 2048;
+        assert!(
+            length as usize > MARGIN,
+            "the widest metadata packet is {length} bytes, too small to separate the two charges"
+        );
+
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(8 << 20),
+            ..ExecutionOptions::default()
+        };
+        let mut scanner = scanner_over(&archive, &options);
+        for (position, expect) in expected.iter().take(index).enumerate() {
+            let ScanEvent::Packet(packet) = scanner.poll().expect("an uncontended packet") else {
+                panic!("the archive is shorter than the reference scan");
+            };
+            assert_eq!(
+                (packet.origin.offset, packet.origin.length),
+                (expect.0, expect.1),
+                "packet {position} moved"
+            );
+        }
+
+        // Leave the scanner room for the wire copy of the next packet and no
+        // room to double it, which is what admitting the parsed body costs.
+        let peer = options
+            .memory
+            .reserve_as(
+                MemoryCategory::CarrierPackets,
+                options.memory.available() - (length as usize + MARGIN),
+            )
+            .expect("a peer takes the headroom");
+
+        let refusal = scanner
+            .poll()
+            .expect_err("the parsed body does not fit beside the peer");
+        let EngineError::ResourceLimit(limit) = refusal else {
+            panic!("a contended admission must be refused cleanly: {refusal:?}");
+        };
+        assert!(
+            limit.contended(),
+            "the peer is holding the memory, so this is retryable: {limit}"
+        );
+        assert_eq!(
+            scanner.position(),
+            offset,
+            "the scan stepped over a packet it never yielded"
+        );
+
+        drop(peer);
+        let ScanEvent::Packet(packet) = scanner.poll().expect("the peer is gone") else {
+            panic!("the refused packet was never offered again");
+        };
+        assert_eq!(
+            (packet.origin.offset, packet.origin.length),
+            (offset, length),
+            "the retry yielded a different packet"
+        );
+
+        // And the rest of the archive follows, once each.
+        let mut seen = vec![(packet.origin.offset, packet.origin.length)];
+        loop {
+            match scanner.poll().expect("the budget is free again") {
+                ScanEvent::Packet(packet) => {
+                    seen.push((packet.origin.offset, packet.origin.length))
+                }
+                ScanEvent::End => break,
+                other => panic!("the whole archive is present: {other:?}"),
+            }
+        }
+        let remaining: Vec<(u64, u64)> = expected[index..]
+            .iter()
+            .map(|(offset, length, _)| (*offset, *length))
+            .collect();
+        assert_eq!(
+            seen, remaining,
+            "the contended scan lost or repeated a packet"
         );
     }
 }
