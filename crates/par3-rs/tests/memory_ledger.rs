@@ -716,3 +716,176 @@ fn a_hundred_and_thirty_one_thousand_block_set_under_half_a_gigabyte() {
     }
     report.expect("the probe reports its refusal above before failing");
 }
+
+/// Cancelling a verification that has started a private hashing pool, and one
+/// whose verification buffer grew to a megabyte under the shared budget, must
+/// refund both exactly. Those are C1's new reservations on the verify path:
+/// the pool's worker stacks and the enlarged `SourceScratch` buffer.
+#[test]
+fn cancelling_a_parallel_verification_refunds_its_pool_and_its_buffer() {
+    // One source over the 8 MiB gate that starts a pool at all.
+    let mut bytes = vec![0u8; 12 << 20];
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"PAR3 parallel hash cancellation");
+    hash.finalize_xof().fill(&mut bytes);
+    let tree = common::TempTree::new("cancel-parallel-hash");
+    let set = {
+        use par3_rs::create::{CreateOptions, InputSpec, RecoveryAmount, create};
+        tree.write("in/large.bin", &bytes);
+        let options = CreateOptions::default()
+            .with_block_size(65_536)
+            .with_recovery(RecoveryAmount::Blocks(2));
+        let base = tree.path().join("in");
+        let files = [std::path::PathBuf::from("large.bin")];
+        create(
+            &InputSpec::new(&base, &files),
+            &tree.path().join("set"),
+            &options,
+        )
+        .expect("a set over the parallel gate")
+    };
+    assert!(set.files_written.len() > 1, "the set has a volume");
+
+    let index = set.files_written[0].clone();
+    let packets: Vec<_> = par3_rs::scan_packets_from_path(&index)
+        .expect("the index scans")
+        .into_iter()
+        .map(|(_, packet)| packet)
+        .collect();
+    let parsed = par3_rs::Par3Set::from_packets(packets).expect("a set");
+    let id = parsed[0].input_set_id();
+
+    for workers in [1usize, 8] {
+        let mut options = cancel_at(Stage::Verify);
+        options.workers = workers;
+        let before = options.memory.available();
+        let mut protected = MemorySourceAccess::default();
+        protected.insert(SourceId(1), 1, bytes.clone().into());
+        let mut session = Par3RepairSession::new(id, Arc::new(protected), options.clone()).unwrap();
+        session.bind_file("large.bin", SourceId(1)).unwrap();
+        for packet in packets_from(&index, &options) {
+            session.merge(packet).unwrap();
+        }
+        assert!(
+            matches!(session.assess(), Err(EngineError::Cancelled)),
+            "{workers} workers: verification was not cancelled"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "{workers} workers leaked bytes");
+        assert_eq!(options.memory.available(), before);
+        for (category, entry) in options.memory.ledger().iter() {
+            assert_eq!(
+                entry.current,
+                0,
+                "{} leaked after a cancelled parallel verification",
+                category.name()
+            );
+        }
+    }
+}
+
+/// Scan one carrier file's packets with `options`.
+fn packets_from(
+    path: &std::path::Path,
+    options: &ExecutionOptions,
+) -> Vec<par3_rs::ingest::IngestedPacket> {
+    packets(std::fs::read(path).expect("a carrier"), options)
+}
+
+/// Cancelling an FFT decode refunds the transform plan as exactly as everything
+/// else, whether the cancellation lands before the plan is built or after it.
+#[test]
+fn cancelling_an_fft_decode_refunds_the_transform_plan() {
+    use par3_rs::fft::{FftCodec, FftGeometry, FftInput};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let inputs = 900usize;
+    let block = 8192u64;
+    let geometry = FftGeometry::new(inputs as u64, 7).unwrap();
+    let mut all = vec![0u8; inputs * block as usize];
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"PAR3 plan cancellation");
+    hash.finalize_xof().fill(&mut all);
+    let data: Vec<&[u8]> = all.chunks_exact(block as usize).collect();
+
+    let mut options = ExecutionOptions::default();
+    options.memory = MemoryBudget::new(256 << 20);
+    let codec = FftCodec::new(geometry, options.clone()).unwrap();
+    let mut parity = vec![vec![0u8; block as usize]; 4];
+    codec
+        .encode(
+            block,
+            0,
+            4,
+            |index, offset, out| {
+                out.copy_from_slice(&data[index][offset as usize..offset as usize + out.len()]);
+                Ok(())
+            },
+            |index, offset, out| {
+                parity[index][offset as usize..offset as usize + out.len()].copy_from_slice(out);
+                Ok(())
+            },
+        )
+        .unwrap();
+    drop(codec);
+    assert_eq!(options.memory.used(), 0);
+
+    // `None` cancels as the decode stage opens, before the plan is built;
+    // `Some(1)` and `Some(inputs)` cancel at the first and the last row the
+    // workspace takes, with the plan built and its charge held. Cancellation
+    // inside the pruned transform itself is covered by the unit test
+    // `fft::plan_tests::a_cancelled_pruned_transform_gives_back_everything_the_plan_held`,
+    // which is the only place the token can be set between the two.
+    for after in [None, Some(1), Some(inputs)] {
+        let mut options = ExecutionOptions::default();
+        options.memory = MemoryBudget::new(256 << 20);
+        if after.is_none() {
+            let cancel = options.cancel.clone();
+            options.progress = Some(ProgressCallback::new(move |event| {
+                if event.stage == Stage::Decode && event.phase == ProgressPhase::Begin {
+                    cancel.cancel();
+                }
+            }));
+        }
+        let before = options.memory.available();
+        let codec = FftCodec::new(geometry, options.clone()).unwrap();
+        let reads = AtomicUsize::new(0);
+        let cancel = options.cancel.clone();
+        let error = codec
+            .decode(
+                block,
+                &[5],
+                &[0],
+                |row, offset, out| {
+                    if let Some(limit) = after
+                        && reads.fetch_add(1, Ordering::Relaxed) + 1 >= limit
+                    {
+                        cancel.cancel();
+                    }
+                    let from = match row {
+                        FftInput::Original(index) => data[index],
+                        FftInput::Recovery(index) => &parity[index],
+                    };
+                    out.copy_from_slice(&from[offset as usize..offset as usize + out.len()]);
+                    Ok(())
+                },
+                |_, _, _| Ok(()),
+            )
+            .expect_err("a cancelled decode");
+        assert!(
+            matches!(error, EngineError::Cancelled),
+            "{after:?}: {error:?}"
+        );
+        drop(codec);
+        assert_eq!(options.memory.used(), 0, "{after:?} leaked bytes");
+        assert_eq!(options.memory.available(), before);
+        for (category, entry) in options.memory.ledger().iter() {
+            assert_eq!(
+                entry.current,
+                0,
+                "{} leaked after a cancelled decode at {after:?}",
+                category.name()
+            );
+        }
+    }
+}

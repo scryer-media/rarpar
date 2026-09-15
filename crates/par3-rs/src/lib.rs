@@ -199,6 +199,7 @@ mod test_reference;
 
 pub use session::Par3RepairSession;
 pub mod packet;
+pub mod paths;
 pub mod repair;
 pub mod scan;
 pub mod set;
@@ -222,6 +223,7 @@ pub use packet::{
     Packet, PacketBody, PacketHeader, PacketType, ParseContext, RecoveryDataPacket,
     RecoveryExternalDataPacket, RootPacket, StartPacket,
 };
+pub use paths::{MAX_COMPONENT_BYTES, MAX_PATH_BYTES, PathRule, PathViolation};
 pub use repair::{
     RepairLimits, RepairOptions, RepairPlan, RepairReport, RepairedFile, plan_repair, repair_set,
 };

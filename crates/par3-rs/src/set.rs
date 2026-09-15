@@ -945,6 +945,17 @@ impl Par3Set {
         self.option_packets.get(hash)
     }
 
+    /// How many option packets the set retained verbatim.
+    ///
+    /// Option packets are the extension point of the format: this crate keeps
+    /// them, hashes them and hands them back, but interprets none of them. The
+    /// tally lets a host see that a set carries semantics this engine ignores
+    /// — permissions, ownership, links — without walking the packets itself.
+    #[must_use]
+    pub fn option_packet_count(&self) -> usize {
+        self.option_packets.len()
+    }
+
     /// How many packets were exact copies of one already seen.
     #[must_use]
     pub fn duplicate_packet_count(&self) -> usize {

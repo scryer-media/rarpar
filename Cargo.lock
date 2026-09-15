@@ -239,6 +239,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -1980,6 +1981,7 @@ version = "0.3.2"
 dependencies = [
  "blake3",
  "crc-fast",
+ "libc",
  "rayon",
  "reedsolomon-rs",
  "thiserror 2.0.20",

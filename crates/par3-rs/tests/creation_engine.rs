@@ -1,10 +1,12 @@
 //! Advanced creation through public APIs, preserving the legacy creation tests.
 mod common;
 
+use par3_rs::PathRule;
 use par3_rs::creation::{
     CreationCodec, CreationOptions, CreationPlan, CreationSource, Deduplication, VolumeLayout,
 };
 use par3_rs::ingest::{PacketScanner, ScanEvent};
+use par3_rs::runtime::EngineError;
 use par3_rs::source::{DiskSourceAccess, MemorySourceAccess, SourceId};
 use std::sync::Arc;
 
@@ -521,4 +523,62 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
             bytes
         );
     }
+}
+
+#[test]
+fn creation_refuses_a_name_repair_would_refuse_to_write() {
+    // par3-rs must never produce a set it would later decline to repair, so
+    // creation runs the same rule table the repair destination runs. Each of
+    // these names is legal on the filesystem this test runs on; the refusal is
+    // the engine's own, and it names the rule and the offending component.
+    let access = Arc::new({
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(0), 1, vec![7u8; 4096].into());
+        access
+    });
+    for (name, rule) in [
+        ("CON", PathRule::ReservedDevice),
+        ("con.txt", PathRule::ReservedDevice),
+        ("a:b", PathRule::Absolute),
+        ("ab:c", PathRule::Colon),
+        ("../escape.bin", PathRule::ParentDirectory),
+        ("/absolute.bin", PathRule::Absolute),
+        ("trailing.", PathRule::TrailingSpaceOrDot),
+        ("nul\u{0}byte.bin", PathRule::Control),
+    ] {
+        let sources = vec![CreationSource {
+            name: name.to_owned(),
+            source: SourceId(0),
+        }];
+        let options = CreationOptions {
+            block_size: 1024,
+            recovery_count: 1,
+            ..CreationOptions::default()
+        };
+        match CreationPlan::build(access.clone(), &sources, options) {
+            Err(EngineError::UnsafePath(violation)) => {
+                assert_eq!(violation.rule, rule, "{name:?}");
+                assert!(
+                    name.starts_with(&violation.path),
+                    "the refusal names the path it refused"
+                );
+            }
+            Err(other) => panic!("{name:?} should be refused as unsafe, got {other:?}"),
+            Ok(_) => panic!("{name:?} should be refused as unsafe, but was accepted"),
+        }
+    }
+
+    // The ordinary name beside them is still accepted.
+    let sources = vec![CreationSource {
+        name: "ordinary.bin".to_owned(),
+        source: SourceId(0),
+    }];
+    let options = CreationOptions {
+        block_size: 1024,
+        recovery_count: 1,
+        ..CreationOptions::default()
+    };
+    CreationPlan::build(access, &sources, options)
+        .map(|_| ())
+        .unwrap();
 }

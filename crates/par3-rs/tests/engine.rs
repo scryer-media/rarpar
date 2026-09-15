@@ -757,3 +757,41 @@ fn retained_virtual_repair_reuses_analysis_when_recovery_arrives() {
     assert!(!directory.path().join("b.txt").exists());
     assert!(!directory.path().join("sub/c.bin").exists());
 }
+
+/// A provider that answers every read with a handful of bytes still delivers
+/// whole verification: the reader accumulates into its buffer before hashing,
+/// so no byte is lost and no read is made past what was asked for.
+#[test]
+fn short_reads_are_accumulated_without_losing_verified_bytes() {
+    struct ShortSource {
+        bytes: Vec<u8>,
+    }
+    impl SourceAccess for ShortSource {
+        fn snapshot(&self, _: SourceId) -> io::Result<Option<SourceSnapshot>> {
+            Ok(Some(SourceSnapshot {
+                len: self.bytes.len() as u64,
+                generation: 1,
+            }))
+        }
+        fn next_available(&self, _: SourceId, offset: u64) -> io::Result<Option<Range<u64>>> {
+            Ok((offset < self.bytes.len() as u64).then_some(offset..self.bytes.len() as u64))
+        }
+        fn read_at(&self, _: SourceId, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+            let count = 17.min(out.len()).min(self.bytes.len() - offset as usize);
+            out[..count].copy_from_slice(&self.bytes[offset as usize..offset as usize + count]);
+            Ok(count)
+        }
+    }
+    let options = ExecutionOptions::default();
+    let layout = Arc::new(BlockLayout::new(&common::gf8_set(), &options).unwrap());
+    let source = ShortSource {
+        bytes: common::a_bin(),
+    };
+    let proof = verify_source(layout, 0, &source, SourceId(1), &options).unwrap();
+    assert!(proof.protected_complete());
+    assert_eq!(options.diagnostics.source_io().read_bytes, 5000);
+    assert_eq!(
+        options.diagnostics.source_io().read_calls,
+        5000u64.div_ceil(17)
+    );
+}

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::packet::{HEADER_SIZE, PacketHeader, PacketType, ParseContext, btree_entry_bytes};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
@@ -95,6 +96,15 @@ impl PayloadRef {
     #[must_use]
     pub fn len(&self) -> u64 {
         self.packet_offset + self.header.length - self.data_offset
+    }
+
+    /// Complete on-carrier packet length, header included.
+    ///
+    /// This is the work a reauthentication costs, and what a failed one is
+    /// charged against [`IncrementalSet::failed_hash_bytes`].
+    #[must_use]
+    pub fn packet_length(&self) -> u64 {
+        self.header.length
     }
 
     /// Whether the packet represents only implicit zero padding.
@@ -785,6 +795,10 @@ pub struct IncrementalSet {
     packets: BTreeMap<Fingerprint, IngestedPacket>,
     retained: usize,
     options: ExecutionOptions,
+    /// Monotonic tallies of the work this set threw away. Atomic because a
+    /// failed reauthentication is discovered while the set is only borrowed.
+    failed_hash_bytes: AtomicU64,
+    rejected_packets: AtomicU64,
 }
 
 impl IncrementalSet {
@@ -796,11 +810,24 @@ impl IncrementalSet {
             packets: BTreeMap::new(),
             retained: 0,
             options,
+            failed_hash_bytes: AtomicU64::new(0),
+            rejected_packets: AtomicU64::new(0),
         })
     }
 
     /// Admit one authenticated packet, deduplicating by fingerprint.
-    pub fn merge(&mut self, mut packet: IngestedPacket) -> EngineResult<MergeEffect> {
+    ///
+    /// Every refusal is counted once on [`Self::rejected_packets`], whatever
+    /// its cause, so a host does not have to keep that tally itself.
+    pub fn merge(&mut self, packet: IngestedPacket) -> EngineResult<MergeEffect> {
+        let outcome = self.merge_admitted(packet);
+        if outcome.is_err() {
+            self.rejected_packets.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    fn merge_admitted(&mut self, mut packet: IngestedPacket) -> EngineResult<MergeEffect> {
         self.options.cancel.check()?;
         if packet.input_set_id() != self.id {
             return Err(EngineError::InvalidState(
@@ -845,6 +872,65 @@ impl IncrementalSet {
         self.packets.insert(packet.hash(), packet);
         self.retained = retained;
         Ok(effect)
+    }
+
+    /// Packet bytes this set hashed and then threw away, because the content
+    /// under an authenticated header did not match its fingerprint.
+    ///
+    /// Monotonic and per set: it counts every reauthentication the engine
+    /// performed on this set's payloads and lost, including the same packet
+    /// failing again on a later pass, and it is never reset. A non-zero value
+    /// means carrier bytes changed or were never what the header claimed; it
+    /// is the cost of trusting a carrier, expressed in bytes, and a host can
+    /// use it to decide that a source is not worth re-reading.
+    ///
+    /// Candidates a [`PacketScanner`] rejected before a packet ever reached
+    /// this set are not counted here: they never belonged to a set.
+    #[must_use]
+    pub fn failed_hash_bytes(&self) -> u64 {
+        self.failed_hash_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Packets this set refused, by any cause: a packet naming another input
+    /// set, a retained-metadata ceiling, a memory refusal, a cancellation, or
+    /// a failed reauthentication. Monotonic and per set, never reset.
+    ///
+    /// A replay is not a refusal: admitting the same packet twice succeeds.
+    #[must_use]
+    pub fn rejected_packets(&self) -> u64 {
+        self.rejected_packets.load(Ordering::Relaxed)
+    }
+
+    /// Count a packet the session refused before it reached [`Self::merge`],
+    /// so one refusal is one rejection however early it happened.
+    pub(crate) fn note_rejected(&self) {
+        self.rejected_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reauthenticate a payload drawn from this set, charging a failure to the
+    /// set's own tallies. The error itself is returned unchanged.
+    ///
+    /// Every reauthentication inside the engine goes through here, so the two
+    /// counters describe the whole set rather than one call site.
+    pub(crate) fn validate_payload(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+    ) -> EngineResult<()> {
+        match payload.validate(options) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(
+                    error,
+                    EngineError::Format(crate::Par3Error::PacketHashMismatch { .. })
+                ) {
+                    self.failed_hash_bytes
+                        .fetch_add(payload.packet_length(), Ordering::Relaxed);
+                    self.rejected_packets.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn contains(&self, hash: &Fingerprint) -> bool {

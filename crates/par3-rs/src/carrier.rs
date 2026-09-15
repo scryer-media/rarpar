@@ -360,7 +360,7 @@ impl CarrierPlan {
                 .find(|packet| packet.hash() == *hash)
                 .and_then(|packet| packet.payload())
             {
-                match payload.validate(&session.options) {
+                match session.input.validate_payload(payload, &session.options) {
                     Ok(()) => {
                         reusable.insert(*hash, payload);
                     }

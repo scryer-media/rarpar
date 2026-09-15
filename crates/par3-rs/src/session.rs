@@ -236,8 +236,13 @@ impl Par3RepairSession {
         let is_data = packet
             .payload()
             .is_some_and(|payload| matches!(payload.kind(), PayloadKind::Data { .. }));
-        if !self.input.contains(&packet.hash()) {
-            self.admit_retained(packet.retained_bytes())?;
+        if !self.input.contains(&packet.hash())
+            && let Err(error) = self.admit_retained(packet.retained_bytes())
+        {
+            // A refusal this early never reaches the set's own merge, so it
+            // would otherwise go uncounted: one refusal is one rejection.
+            self.input.note_rejected();
+            return Err(error);
         }
         let effect = self.input.merge(packet)?;
         match effect {
@@ -1017,13 +1022,26 @@ impl Par3RepairSession {
                 }
                 if !pool_initialized {
                     pool_initialized = true;
-                    let maximum = layout.files[index..]
+                    let remaining = layout.files[index..]
                         .iter()
                         .filter(|file| {
                             !self.evidence.contains_key(&file.path)
                                 && self.bindings.contains_key(&file.path)
                         })
                         .count();
+                    // A source large enough to hash in parallel earns workers a
+                    // narrow batch would otherwise leave idle — but only up to
+                    // the hash's own measured width, never the whole pool.
+                    let large = layout.files[index..].iter().any(|file| {
+                        file.len >= crate::hash::PARALLEL_SOURCE_BYTES
+                            && !self.evidence.contains_key(&file.path)
+                            && self.bindings.contains_key(&file.path)
+                    });
+                    let maximum = if large {
+                        remaining.max(crate::hash::PARALLEL_HASH_WORKERS)
+                    } else {
+                        remaining
+                    };
                     match crate::runtime::WorkerPool::for_work_with_scratch(
                         &self.options,
                         maximum,
@@ -1064,13 +1082,20 @@ impl Par3RepairSession {
                 .saturating_sub(self.retained_bytes())
                 .saturating_sub(cost)
                 / batch.len();
+            // The batch already runs inside the session's admitted pool, so
+            // hashing reuses it instead of nesting a second one. It forks only
+            // when this batch is one file: with several files in flight the
+            // pool is already busy, and splitting each hash on top of that
+            // measured slower than leaving it serial.
+            let parallel = pool.is_some() && batch.len() == 1;
             let verify = |&(index, source, _): &(usize, SourceId, Reservation)| {
-                verify_source(
+                crate::evidence::verify_source_in_pool(
                     Arc::clone(layout),
                     index,
                     self.access.as_ref(),
                     source,
                     &options,
+                    parallel,
                 )
             };
             let results: Vec<_> = match &pool {
@@ -1103,6 +1128,11 @@ impl Par3RepairSession {
                     let (evidence, needs_acceptance_check) = match result {
                         Err(EngineError::ResourceLimit(_)) => {
                             let mut options = self.options.clone();
+                            // The serial fallback must not reacquire workers:
+                            // the parallel attempt was already refused, and a
+                            // retry that starts its own pool would reserve the
+                            // stacks the retry itself needs.
+                            options.workers = 1;
                             options.retained_bytes = options
                                 .retained_bytes
                                 .saturating_sub(self.retained_bytes())
@@ -1197,6 +1227,41 @@ impl Par3RepairSession {
     #[must_use]
     pub fn reserved_bytes(&self) -> usize {
         self.options.memory.used()
+    }
+
+    /// The resolved input set, once enough metadata has been merged.
+    ///
+    /// A borrow of the session's own resolved tree, not a copy: file paths and
+    /// lengths ([`Par3Set::files`]), the directory tree, the block layout and
+    /// the option-packet tally ([`Par3Set::option_packet_count`]) are readable
+    /// without cloning the set or paying its resolution again.
+    ///
+    /// Resolution is lazy and budgeted, so this reports what the session has
+    /// already resolved rather than resolving on demand: call [`Self::layout`]
+    /// or [`Self::assess`] after merging metadata, then read this. `None`
+    /// means the session has not resolved a set — because the Start packet,
+    /// the Root packet or a referenced child is still missing, or because
+    /// nothing has asked it to yet. It never means the set is malformed.
+    ///
+    /// The borrow ends at the next `&mut self` call, which is also when the
+    /// session may resolve a different set from newly merged metadata.
+    #[must_use]
+    pub fn set(&self) -> Option<&Par3Set> {
+        self.set.as_ref()
+    }
+
+    /// Packet bytes this session hashed and threw away, and the packets it
+    /// refused. See [`IncrementalSet::failed_hash_bytes`] and
+    /// [`IncrementalSet::rejected_packets`]; both are monotonic and per set.
+    #[must_use]
+    pub fn failed_hash_bytes(&self) -> u64 {
+        self.input.failed_hash_bytes()
+    }
+
+    /// Packets this session refused, by any cause. Monotonic and per set.
+    #[must_use]
+    pub fn rejected_packets(&self) -> u64 {
+        self.input.rejected_packets()
     }
 
     /// Conservative retained state across packets, layouts, evidence, bindings,

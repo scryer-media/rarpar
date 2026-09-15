@@ -14,9 +14,9 @@ pub use handles::{HandleBudget, HandleLease};
 mod diagnostics;
 pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
-    AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, ExecutionDiagnostics, IoSnapshot,
-    ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage, StageSnapshot,
-    WaitSnapshot,
+    AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, CodecSnapshot, ExecutionDiagnostics,
+    IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage,
+    StageSnapshot, WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -52,6 +52,13 @@ pub enum EngineError {
     /// A session operation cannot run in its current state.
     #[error("invalid PAR3 engine state: {0}")]
     InvalidState(&'static str),
+    /// A relative path carried by a set broke a name-safety rule.
+    ///
+    /// Raised by set creation before any set byte is produced, and by repair
+    /// before any output byte is written. The verdict depends only on the
+    /// bytes of the path, so it is the same on every platform.
+    #[error("unsafe PAR3 path: {0}")]
+    UnsafePath(#[from] crate::paths::PathViolation),
     /// Creation stopped after installing some independently authenticated carriers.
     #[error("PAR3 output installation stopped: {cause}")]
     OutputInterrupted {

@@ -429,6 +429,134 @@ metadata or stable source generations cannot be established, verify again.
 Checkpoint creation and decoding reserve memory and honor cancellation; the
 host owns the persisted bytes and their storage policy.
 
+### CPU work and the gates on it
+
+Verification hashes a source in parallel only when the work is worth a private
+pool, and every gate is a number in the code rather than a heuristic:
+
+* at least 1 MiB in one `update` call before BLAKE3's Rayon path is used at all
+  (`hash::PARALLEL_HASH_BYTES`), with adjacent protected extents combined into
+  runs first so a set of small archive blocks is still hashed in long updates;
+* at least 8 MiB of source before a private pool is started for it
+  (`hash::PARALLEL_SOURCE_BYTES`);
+* at most four workers in that pool (`hash::PARALLEL_HASH_WORKERS`), because
+  wider pools cost CPU out of proportion to the wall time they save;
+* the verification buffer grows from 64 KiB to 1 MiB only when the shared budget
+  admits it, charged to `SourceScratch`, and falls back to 64 KiB when it does
+  not. Session verification reuses the pool it was already admitted; under
+  pressure it falls back to serial hashing without reacquiring workers.
+
+Measured on this host (Apple silicon, 18 cores, release profile, 64 KiB blocks,
+`tests/verification_timing.rs`), verifying one 512 MiB source against the serial
+path: two workers 1.31x wall, four workers 1.51x wall for 1.09x the CPU, eight
+1.57x for 1.33x, and all eighteen 1.23x for 4.0x. Four is what is in the code.
+End to end with that setting, and with every core configured so the cap is what
+bounds the pool: 64 MiB in one file 1.49x, 512 MiB in one file 1.49x, 512 MiB
+across 64 files 1.43x, and two sessions sharing one budget 1.21x to 1.53x, all
+at about 1.06x the CPU of the serial run. A 64 MiB set spread over 64 files is
+1 MiB a file, below the 8 MiB gate, so no pool is started for it and the numbers
+are the serial ones (1.00x). These are measurements on one host, not a promise
+about any other.
+
+An FFT decode ends with a forward transform over the whole domain and then reads
+only the lost rows. Stages of stride `2^j` or wider never join rows whose low `j`
+bits differ, so those stages are `2^j` independent transforms over the rows that
+share their low bits, and every narrower stage stays inside one aligned block of
+`2^j` rows. Only the blocks holding a lost row need those narrow stages. The
+decoder therefore builds a per-cohort plan — the block width and the list of
+blocks to keep — charges it to `CodecScratch` (the lost-row list, a domain bitmap
+for the transposes, and a small fixed margin), and skips the rest. The rows the
+caller reads are byte-identical to the unpruned transform's, which is the oracle
+the tests use.
+
+The plan is chosen on total work, not on butterflies alone: a split replaces one
+transform call with `2^j + blocks` of them, and each call has a setup the
+butterflies do not pay for (`fft::PLAN_CALL_SYMBOLS`, 8192 symbol operations).
+Where a cohort's rows are too narrow for that to pay — the pinned `fft16`
+reference geometry is 32 symbols a row — the plan stands aside and the full
+transform runs. Measured on this host (`tests/codec_measurements.rs`), with the
+plan in force a 256-row GF8 cohort of 4096-symbol rows skips 19% of the decode's
+butterflies and runs in 2.0–2.3 ms against 2.5–3.5 ms unpruned, and a 512-row
+GF16 cohort of 8192-symbol rows skips 17% and runs in 4.1–4.9 ms against
+4.9–8.6 ms. The input inverse transform is *not* pruned: its zero-tail saving
+lives in the narrow ascending stages, which are exactly the ones inside a block,
+and the derivative between the two transforms makes every row of the workspace a
+dependency of the forward pass. Expressing the remaining cross-block stages
+would need a single-stage transform primitive, which is a change to
+`reedsolomon-rs` rather than to this crate.
+
+Cauchy repair recomputes one code-matrix element per surviving block per
+recovery row on every stripe pass; `ExecutionDiagnostics::codec()` counts them.
+Measured on this host across the eight corpus sets, that is 0.15%–0.46% of
+repair wall time, and under a forced 4 KiB stripe — sixteen passes over 64 KiB
+blocks — 31,872 recomputations are 1.6 ms of a 478 ms repair, 0.34%. One element
+is an exclusive-or and a table lookup, about 51 ns, against about 3.8 us for the
+64 KiB multiply-accumulate that follows it. Caching a source's factors is
+therefore not worth its charge at these geometries, and nothing caches them.
+
+### Names the engine will write
+
+A set names its protected files with relative paths carried in the set itself,
+which makes those bytes attacker-controlled. `paths::validate_relative_path` is
+the engine's only decision about such a name, and both ends call it: creation
+before a byte of the set is produced, repair before a byte of output is written
+and before the first parent directory is created. It reads no filesystem and
+consults no platform, so the verdict for a given sequence of bytes is the same
+everywhere; a hostile set refused on Linux is refused identically on Windows
+and macOS. The refusal is `EngineError::UnsafePath(PathViolation)`, which names
+the rule and the offending component rather than a prose string.
+
+The whole path is refused when it is empty, exceeds `paths::MAX_PATH_BYTES`
+(4096, the traditional `PATH_MAX`), or is absolute — a leading `/` or `\`, or a
+`X:` drive prefix, which is reported as `Absolute` rather than as a colon
+because `c:file` is drive-relative, not a stream name. A `/`-separated
+component is refused when it is empty, `.`, `..`, exceeds
+`paths::MAX_COMPONENT_BYTES` (255, the per-entry ceiling of ext4, APFS and
+NTFS), contains `\`, `:` or an ASCII control byte (NUL and DEL included),
+names a Windows character device with or without an extension (`CON`, `PRN`,
+`AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, matched case-insensitively against
+the stem before the first dot, trailing spaces trimmed, so `con.txt` and
+`CON   .txt` are both refused), or ends in a space or a dot, which Windows
+silently trims onto an existing name. Bytes, not characters, throughout.
+
+Packet parsing is deliberately narrower and unchanged: `check_name` asks only
+whether a name field is a usable single component, because one unwritable name
+must not make a whole set unreadable. A set that carries `CON` still parses and
+still verifies; only creating that file is refused.
+
+The rules are stricter than the draft, which is silent on all of this, and
+stricter than the reference, which rewrites an unusable name in place and
+warns. `README.md` records the deviation.
+
+### What a host can read back from a session
+
+Three tallies a consumer would otherwise reconstruct beside the engine:
+
+- `Par3RepairSession::set` lends the session's resolved `Par3Set` rather than
+  handing back a clone. File paths and lengths, the directory tree, the block
+  layout and `Par3Set::option_packet_count` — the extension packets this crate
+  retains and never interprets — are all readable through the borrow, which
+  ends at the next `&mut self` call. Resolution is lazy and budgeted, so this
+  reports what the session already resolved: call `layout` or `assess` after
+  merging metadata, then read it. `None` means no set is resolved yet, never
+  that the set is malformed.
+- `failed_hash_bytes` is the complete packet bytes of every reauthentication
+  the engine performed on this set's payloads and lost. A payload is
+  reauthenticated before it is consumed — a stat fingerprint is not
+  cryptographic evidence — so a carrier that changed under the reader, or never
+  held what its header claimed, is caught there and charged here. Non-zero
+  means carrier bytes were hashed and thrown away; it is the price of trusting
+  that carrier, in bytes, and a host can use it to stop re-reading a source.
+  Scanner candidates rejected before a packet reached a set are not counted:
+  they never belonged to one.
+- `rejected_packets` counts every packet a merge refused, by any cause — a
+  packet naming another input set, a retained-metadata ceiling, a memory
+  refusal, a cancellation, a failed reauthentication — including refusals the
+  session makes before the set itself sees the packet, so one refusal is
+  exactly one rejection. A replay is not a refusal.
+
+Both tallies are monotonic and per set, and neither is ever reset.
+
 ## Read-only Weaver reference
 
 The current Weaver seams motivating this contract are:

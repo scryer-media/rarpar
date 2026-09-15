@@ -111,7 +111,7 @@ fn repair_inner(
         .iter()
         .chain(session.data_payloads().values())
     {
-        payload.validate(&session.options)?;
+        session.input.validate_payload(payload, &session.options)?;
     }
     let path_cost = assessment
         .files
@@ -243,7 +243,7 @@ pub(crate) fn stage_embedded(
         .iter()
         .chain(session.data_payloads().values())
     {
-        payload.validate(&session.options)?;
+        session.input.validate_payload(payload, &session.options)?;
     }
     let targets = [StagedFile {
         index: 0,
@@ -484,6 +484,13 @@ where
                     field.mul_acc(&mut syndrome[..take], &input[..take], factor);
                     Ok(())
                 };
+                // One code-matrix element per surviving block per recovery row,
+                // recomputed on every stripe pass. Counted here so the report
+                // can say what that costs before anything caches it.
+                session
+                    .options
+                    .diagnostics
+                    .note_factors(rows.len() as u64, 0);
                 if let Some(pool) = &pool {
                     pool.pool().install(|| {
                         syndromes
@@ -764,13 +771,20 @@ fn verify_staged(
     Ok(())
 }
 
+/// Resolve one set-carried relative path inside `base`, creating parents.
+///
+/// The name-safety rules in [`crate::paths`] are applied to the whole path
+/// before the first directory is created, so a path that breaks a rule in a
+/// late component never leaves a partial tree behind, and no output byte is
+/// ever written under a name the engine would refuse. The rules are the same
+/// ones set creation applies, and the same on every platform; what remains
+/// here is the part that must consult the filesystem, which is the refusal to
+/// follow a symbolic link out of `base`.
 pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult<PathBuf> {
+    crate::paths::validate_relative_path(relative)?;
     let mut path = base.to_path_buf();
     let parts: Vec<_> = relative.split('/').collect();
     for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() || *part == "." || *part == ".." || part.contains(['\\', ':']) {
-            return Err(EngineError::InvalidState("invalid output path component"));
-        }
         path.push(part);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -976,6 +990,116 @@ mod tests {
     #[test]
     fn install_replaces_an_existing_file_without_a_backup() {
         replacement_keeps_expected_bytes(false);
+    }
+
+    fn scratch(name: &str) -> TestDirectory {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "par3-{name}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        directory
+    }
+
+    fn refused(base: &Path, relative: &str) -> crate::paths::PathRule {
+        match contained_destination(base, relative) {
+            Err(EngineError::UnsafePath(violation)) => {
+                assert!(
+                    relative.starts_with(&violation.path),
+                    "the refusal names the path it refused, truncated at most"
+                );
+                violation.rule
+            }
+            other => panic!("{relative:?} should be refused as unsafe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_destination_is_still_resolved_and_its_parents_created() {
+        let directory = scratch("destination");
+        let base = &directory.0;
+        let resolved = contained_destination(base, "season 1/ep 01.mkv").unwrap();
+        assert_eq!(resolved, base.join("season 1").join("ep 01.mkv"));
+        assert!(base.join("season 1").is_dir());
+        // The leaf itself is never created here, only its parents.
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn every_unsafe_destination_class_is_refused_by_the_shared_rule_table() {
+        use crate::paths::PathRule;
+        let directory = scratch("unsafe-destination");
+        let base = &directory.0;
+        for (relative, rule) in [
+            ("", PathRule::Empty),
+            ("a//b", PathRule::Empty),
+            ("out/", PathRule::Empty),
+            ("/etc/passwd", PathRule::Absolute),
+            ("C:/Windows/System32", PathRule::Absolute),
+            ("c:hosts", PathRule::Absolute),
+            ("./file", PathRule::CurrentDirectory),
+            ("../escape", PathRule::ParentDirectory),
+            ("a/../../escape", PathRule::ParentDirectory),
+            ("a\\b", PathRule::Backslash),
+            ("a:b", PathRule::Absolute),
+            ("ab:c", PathRule::Colon),
+            ("dir/stream:$DATA", PathRule::Colon),
+            ("nul\u{0}byte", PathRule::Control),
+            ("bell\u{7}", PathRule::Control),
+            ("CON", PathRule::ReservedDevice),
+            ("con.txt", PathRule::ReservedDevice),
+            ("deep/dir/LPT9.tar.gz", PathRule::ReservedDevice),
+            ("trailing ", PathRule::TrailingSpaceOrDot),
+            ("trailing.", PathRule::TrailingSpaceOrDot),
+            ("dir./file", PathRule::TrailingSpaceOrDot),
+        ] {
+            assert_eq!(refused(base, relative), rule, "{relative:?}");
+        }
+        assert_eq!(
+            refused(base, &"n".repeat(crate::paths::MAX_COMPONENT_BYTES + 1)),
+            PathRule::ComponentTooLong
+        );
+        assert_eq!(
+            refused(base, &"a/".repeat(crate::paths::MAX_PATH_BYTES)),
+            PathRule::PathTooLong
+        );
+        // Nothing was created on the way to any of those refusals.
+        assert_eq!(std::fs::read_dir(base).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_this_filesystem_would_have_accepted_is_still_refused() {
+        // Every one of these is a legal file name on unix, so the refusal is
+        // the engine's alone: it must not depend on the host noticing.
+        let directory = scratch("hostile-but-legal");
+        let base = &directory.0;
+        for legal in ["con.txt", "COM1", "a\\b", "a:b", "trailing.", "trailing "] {
+            let native = base.join(legal);
+            std::fs::write(&native, b"proof this name is legal here").unwrap();
+            assert!(native.exists(), "{legal:?} should be a legal unix name");
+            std::fs::remove_file(&native).unwrap();
+            assert!(
+                matches!(
+                    contained_destination(base, legal),
+                    Err(EngineError::UnsafePath(_))
+                ),
+                "{legal:?} should still be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_unsafe_component_creates_no_directories_at_all() {
+        let directory = scratch("no-partial-tree");
+        let base = &directory.0;
+        assert!(matches!(
+            contained_destination(base, "keep/these/../escape"),
+            Err(EngineError::UnsafePath(_))
+        ));
+        assert!(!base.join("keep").exists());
+        assert_eq!(std::fs::read_dir(base).unwrap().count(), 0);
     }
 }
 

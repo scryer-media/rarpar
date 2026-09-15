@@ -115,6 +115,78 @@
   remeasures at most once after losing a race to a peer. A refusal that reaches
   a host through `merge`, `layout`, `assess` or `repair` is counted exactly once,
   by cause.
+- Hash a large source in parallel during verification, under gates rather than
+  unconditionally: BLAKE3's Rayon path is used only for updates of at least
+  1 MiB, only for sources of at least 8 MiB, and only inside a private pool of
+  at most four workers admitted from the shared budget. Adjacent protected
+  extents are combined into runs so a file of small archive blocks is still fed
+  to the hash in long updates, and a verification buffer grows from 64 KiB to
+  1 MiB only when the budget admits the charge. Session verification reuses the
+  pool it was already admitted and falls back to serial hashing under pressure
+  without reacquiring workers. Serial, parallel and constrained-memory
+  verification produce identical evidence, asserted with the checkpoint digest.
+  Measured on an 18-core host, four workers verify a 512 MiB source at 1.51x the
+  serial wall time for 1.09x the CPU, where eighteen workers reach only 1.23x
+  for 4.0x; the numbers and the reasoning are in ENGINE.md.
+- Prune an FFT decode's final forward transform to the rows the caller reads.
+  The decoder computes a per-cohort plan — a block width and the blocks holding
+  a lost row — charges it to `MemoryCategory::CodecScratch`, and skips the
+  stages that would only produce rows nobody reads. Output is byte-identical to
+  the unpruned transform, which is the oracle the tests use, over both fields,
+  light, heavy and spread damage, zero padding, arbitrary recovery selections
+  and widths either side of the SIMD and pool thresholds. The plan is chosen on
+  total work including each transform call's own setup, so cohorts with rows too
+  narrow to pay for the split run the full transform instead. The input inverse
+  transform is not pruned; ENGINE.md says why.
+- `ExecutionDiagnostics::codec` is new: transform calls, butterflies performed
+  and skipped, multiply-accumulates, and Cauchy code-matrix factors computed and
+  reused. Counters are relaxed atomics written once per transform call, never
+  per symbol.
+- Two `#[ignore]`d measurement probes, `tests/verification_timing.rs` and
+  `tests/codec_measurements.rs`, print the tables the gates above were chosen
+  from: parallel against serial verification at several widths, the FFT work per
+  cohort with and without the plan, and what Cauchy factor recomputation costs
+  against the multiply-accumulate it precedes. They measure the host they run
+  on; the numbers recorded in ENGINE.md are this host's.
+- One name-safety rule table, in the new `paths` module, is now the engine's
+  only decision about a relative path it is asked to write. `contained_destination`
+  (repair) and `creation::validate_name` (set creation) both call
+  `paths::validate_relative_path`, so par3-rs never produces a set it would
+  refuse to repair, and a hostile set is refused identically on every platform,
+  before any output byte is written and before any parent directory is created.
+  A component is refused when it is empty, `.`, `..`, longer than
+  `paths::MAX_COMPONENT_BYTES` (255), contains `\\`, `:` or an ASCII control
+  byte (NUL and DEL included), names a Windows character device (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, case-insensitive, with or without
+  an extension, so `con.txt` too) or ends in a space or a dot. A path is
+  refused when it exceeds `paths::MAX_PATH_BYTES` (4096) or is absolute — by a
+  leading `/` or `\\`, or a `X:` drive prefix, which is reported as absolute
+  rather than as a colon. Names that were already accepted are unaffected.
+- **Breaking:** `EngineError::UnsafePath(PathViolation)` is new, and replaces
+  `InvalidState("invalid output path component")` and
+  `InvalidState("invalid creation path")`. It names the rule and the offending
+  component: `PathViolation { path, component, rule }` with `rule: PathRule`.
+  Both text fields are truncated to 255 bytes on a character boundary, so a
+  hostile name cannot make the refusal unbounded. `PathRule`, `PathViolation`,
+  `MAX_PATH_BYTES` and `MAX_COMPONENT_BYTES` are re-exported at the crate root.
+  Packet parsing is unchanged: a set that carries such a name still parses and
+  still verifies, because one unwritable name must not make a set unreadable.
+- `IncrementalSet::failed_hash_bytes` and `IncrementalSet::rejected_packets`
+  are new, with `Par3RepairSession::failed_hash_bytes` and
+  `Par3RepairSession::rejected_packets` beside them. Both are monotonic, per
+  set, and never reset. `failed_hash_bytes` counts the complete packet bytes of
+  every reauthentication the engine performed on this set's payloads and lost —
+  a carrier that changed under the reader, or never held what its header
+  claimed. `rejected_packets` counts every packet a merge refused, by any
+  cause; a replay is not a refusal. A host no longer has to keep these tallies
+  beside the engine's.
+- `Par3RepairSession::set` lends the session's resolved `Par3Set` instead of
+  making a host clone it: file paths and lengths, the directory tree, the block
+  layout and the new `Par3Set::option_packet_count` are all readable through
+  the borrow. Resolution stays lazy and budgeted, so `set` reports what the
+  session has already resolved rather than resolving on demand.
+- `PayloadRef::packet_length` reports the complete on-carrier packet length,
+  which is the work a reauthentication costs and what a failed one is charged.
 
 ## 0.3.1 (2026-09-13)
 

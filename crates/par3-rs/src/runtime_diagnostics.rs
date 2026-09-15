@@ -214,6 +214,30 @@ pub struct AmplificationSnapshot {
     pub reconstructed_bytes: u64,
 }
 
+/// Transform and coefficient work the codecs actually performed.
+///
+/// These are counted once per call with the call's own totals, never once per
+/// symbol: a butterfly touches a whole row, and a counter on that inner loop
+/// would cost more than the arithmetic it measures. `skipped` is what a
+/// pruning plan decided not to compute, so `butterflies + skipped` is what the
+/// same decode would have cost without the plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodecSnapshot {
+    /// Additive-transform invocations, including the ones a plan split.
+    pub transform_calls: u64,
+    /// Butterflies executed across those calls.
+    pub butterflies: u64,
+    /// Butterflies a transform plan established were not needed.
+    pub butterflies_skipped: u64,
+    /// Symbol-wide multiply-accumulates those butterflies performed: one per
+    /// butterfly per symbol in the rows it joined.
+    pub multiply_accumulates: u64,
+    /// Cauchy code-matrix elements computed.
+    pub factors_computed: u64,
+    /// Code-matrix elements answered from an admitted table instead.
+    pub factors_reused: u64,
+}
+
 /// What the admission and deduplication caches are holding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheSnapshot {
@@ -239,6 +263,12 @@ struct AdmissionCounters {
     reconstructed_bytes: AtomicU64,
     cache_entries: AtomicU64,
     cache_bytes: AtomicU64,
+    transform_calls: AtomicU64,
+    butterflies: AtomicU64,
+    butterflies_skipped: AtomicU64,
+    multiply_accumulates: AtomicU64,
+    factors_computed: AtomicU64,
+    factors_reused: AtomicU64,
 }
 
 /// Cumulative wall-time and work totals for ended stage scopes.
@@ -375,6 +405,49 @@ impl ExecutionDiagnostics {
             reread_bytes: get(&counters.reread_bytes),
             reconstructed_bytes: get(&counters.reconstructed_bytes),
         }
+    }
+
+    /// Transform and coefficient work the codecs performed.
+    #[must_use]
+    pub fn codec(&self) -> CodecSnapshot {
+        let get = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let counters = &self.0.admission;
+        CodecSnapshot {
+            transform_calls: get(&counters.transform_calls),
+            butterflies: get(&counters.butterflies),
+            butterflies_skipped: get(&counters.butterflies_skipped),
+            multiply_accumulates: get(&counters.multiply_accumulates),
+            factors_computed: get(&counters.factors_computed),
+            factors_reused: get(&counters.factors_reused),
+        }
+    }
+
+    /// Record additive-transform work: `calls` invocations performing
+    /// `butterflies` butterflies over rows of `symbols` symbols, with
+    /// `skipped` butterflies a plan established were not needed.
+    pub(crate) fn note_transform(
+        &self,
+        calls: u64,
+        butterflies: u64,
+        symbols: usize,
+        skipped: u64,
+    ) {
+        let counters = &self.0.admission;
+        add(&counters.transform_calls, calls);
+        add(&counters.butterflies, butterflies);
+        add(&counters.butterflies_skipped, skipped);
+        add(
+            &counters.multiply_accumulates,
+            butterflies.saturating_mul(symbols as u64),
+        );
+    }
+
+    /// Record Cauchy code-matrix elements: those computed, and those an
+    /// admitted table answered without recomputing.
+    pub(crate) fn note_factors(&self, computed: u64, reused: u64) {
+        let counters = &self.0.admission;
+        add(&counters.factors_computed, computed);
+        add(&counters.factors_reused, reused);
     }
 
     /// What the admission caches are currently holding.

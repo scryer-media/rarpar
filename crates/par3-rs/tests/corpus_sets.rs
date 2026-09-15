@@ -704,3 +704,65 @@ fn an_index_only_set_cannot_repair_and_writes_nothing() {
     entries.sort();
     assert_eq!(entries, ["one.bin", "three.bin", "two.bin"]);
 }
+
+/// The same 16 MiB reference source, verified serially, verified with an
+/// admitted pool, and verified under a budget too small for either — three
+/// paths that must produce the same authenticated evidence, byte for byte,
+/// and read the source exactly once.
+#[test]
+fn a_large_source_verifies_identically_serial_parallel_and_under_pressure() {
+    use par3_rs::layout::BlockLayout;
+    use par3_rs::runtime::{ExecutionOptions, MemoryBudget};
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    use std::sync::Arc;
+
+    let case = CASES
+        .iter()
+        .find(|case| case.name == "large_stream")
+        .expect("the large_stream case");
+    if !case.dir().join("set.par3").exists() {
+        eprintln!("large_stream: reference corpus unavailable, skipping");
+        return;
+    }
+    let set = case.load();
+    let data = case.input(case.inputs[0]);
+    assert!(data.len() >= 8 << 20, "the parallel gate needs 8 MiB");
+
+    let mut expected: Option<([u8; 32], Vec<u8>)> = None;
+    for (workers, memory, read_size) in [
+        (1, 64 << 20, 64 << 10),
+        (8, 64 << 20, 1 << 20),
+        (8, 1 << 20, 64 << 10),
+    ] {
+        let mut options = ExecutionOptions::default();
+        options.workers = workers;
+        options.memory = MemoryBudget::new(memory);
+        let mut source = MemorySourceAccess::default();
+        source.insert(SourceId(1), 1, data.clone().into());
+        let layout = Arc::new(BlockLayout::new(&set, &options).expect("a layout"));
+        let proof =
+            par3_rs::evidence::verify_source(layout.clone(), 0, &source, SourceId(1), &options)
+                .expect("verification");
+        assert!(proof.protected_complete());
+        assert_eq!(proof.whole_matches(), Some(true));
+
+        // The checkpoint digest is the strongest statement of "same evidence"
+        // the engine makes: it covers the layout identity, the generation and
+        // every extent verdict.
+        let checkpoint = proof.checkpoint(&options).expect("a checkpoint");
+        let actual = (checkpoint.digest(), checkpoint.as_bytes().to_vec());
+        match &expected {
+            Some(expected) => assert_eq!(&actual, expected, "workers={workers} memory={memory}"),
+            None => expected = Some(actual),
+        }
+
+        let io = options.diagnostics.source_io();
+        assert_eq!(io.read_bytes, data.len() as u64);
+        assert_eq!(io.read_calls, data.len().div_ceil(read_size) as u64);
+
+        drop(checkpoint);
+        drop(proof);
+        drop(layout);
+        assert_eq!(options.memory.used(), 0);
+    }
+}

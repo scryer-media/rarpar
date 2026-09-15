@@ -1265,18 +1265,13 @@ impl CreationPlan {
     }
 }
 
+/// Refuse a source name the engine would later refuse to repair.
+///
+/// This is the same rule table the repair destination applies, run before a
+/// byte of the set is produced, so par3-rs never writes a set it would have to
+/// refuse on the way back out.
 fn validate_name(name: &str) -> EngineResult<()> {
-    if name.is_empty()
-        || name.split('/').any(|part| {
-            part.is_empty()
-                || part == "."
-                || part == ".."
-                || part.contains(['\\', ':', '\0'])
-                || part.len() > u16::MAX as usize
-        })
-    {
-        return Err(EngineError::InvalidState("invalid creation path"));
-    }
+    crate::paths::validate_relative_path(name)?;
     Ok(())
 }
 fn suffix(stem: &Path, suffix: &str) -> PathBuf {

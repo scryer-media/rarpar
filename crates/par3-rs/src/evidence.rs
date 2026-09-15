@@ -264,6 +264,9 @@ pub struct StreamingVerifier {
     verdicts: ExtentVerdicts,
     partial: BTreeMap<usize, Box<PartialExtent>>,
     whole: FingerprintHasher,
+    /// Whether whole-file hashing may fork onto the caller's admitted pool.
+    /// Only a caller that is already inside one may set it.
+    parallel_hash: bool,
     whole_next: u64,
     whole_ordered: bool,
     dropped: u64,
@@ -312,6 +315,7 @@ impl StreamingVerifier {
             verdicts,
             partial: BTreeMap::new(),
             whole: FingerprintHasher::new(),
+            parallel_hash: false,
             whole_next: 0,
             whole_ordered: true,
             dropped: 0,
@@ -334,6 +338,10 @@ impl StreamingVerifier {
             self.whole_ordered = false;
         }
         let mut index = file.extents.first_after(offset);
+        // Adjacent protected extents are hashed as one update. A PAR3 block is
+        // often far smaller than a read, and splitting the read at every block
+        // boundary would keep every update under the parallel gate.
+        let mut run: Option<Range<u64>> = None;
         while index < self.layout.files[self.file].extents.len() {
             self.options.cancel.check()?;
             let extents = &self.layout.files[self.file].extents;
@@ -345,8 +353,21 @@ impl StreamingVerifier {
             let start = range.start.max(offset);
             let stop = range.end.min(end);
             let data = &bytes[(start - offset) as usize..(stop - offset) as usize];
-            if self.whole_ordered && !unprotected {
-                self.whole.update(data);
+            if self.whole_ordered {
+                match (&mut run, unprotected) {
+                    (Some(open), false) if open.end == start => open.end = stop,
+                    (open, false) => {
+                        if let Some(closed) = open.take() {
+                            self.hash_run(&closed, offset, bytes);
+                        }
+                        *open = Some(start..stop);
+                    }
+                    (open, true) => {
+                        if let Some(closed) = open.take() {
+                            self.hash_run(&closed, offset, bytes);
+                        }
+                    }
+                }
             }
             if self.verdicts.get(index) == Some(ExtentVerdict::Unknown) {
                 let relative = start - range.start;
@@ -360,11 +381,21 @@ impl StreamingVerifier {
             }
             index += 1;
         }
+        if let Some(closed) = run {
+            self.hash_run(&closed, offset, bytes);
+        }
         if self.whole_ordered {
             self.whole_next = end;
         }
         progress.advance(bytes.len() as u64);
         self.options.cancel.check()
+    }
+
+    /// Feed one coalesced protected run of the current read into the
+    /// whole-file hash.
+    fn hash_run(&mut self, run: &Range<u64>, offset: u64, bytes: &[u8]) {
+        let data = &bytes[(run.start - offset) as usize..(run.end - offset) as usize];
+        self.whole.update_admitted(data, self.parallel_hash);
     }
 
     fn feed_extent(&mut self, index: usize, offset: u64, bytes: &[u8]) -> EngineResult<()> {
@@ -413,7 +444,9 @@ impl StreamingVerifier {
             return Ok(());
         }
         let skip = (partial.next - offset).min(bytes.len() as u64) as usize;
-        partial.hasher.update(&bytes[skip..]);
+        partial
+            .hasher
+            .update_admitted(&bytes[skip..], self.parallel_hash);
         partial.next += (bytes.len() - skip) as u64;
         while let Some((&at, _)) = partial.pending.first_key_value() {
             if at > partial.next {
@@ -421,7 +454,9 @@ impl StreamingVerifier {
             }
             let fragment = partial.pending.pop_first().expect("pending fragment").1;
             let skip = (partial.next - at).min(fragment.bytes.len() as u64) as usize;
-            partial.hasher.update(&fragment.bytes[skip..]);
+            partial
+                .hasher
+                .update_admitted(&fragment.bytes[skip..], self.parallel_hash);
             partial.next += (fragment.bytes.len() - skip) as u64;
         }
         let extents = &self.layout.files[self.file].extents;
@@ -564,8 +599,42 @@ pub fn verify_arrivals(
     Ok(result)
 }
 
+/// The verification read buffer, grown to the parallel-hash size only when a
+/// pool is admitted, the source is large enough to use it, and the shared
+/// budget still leaves working room afterwards.
+///
+/// A refused growth is not a refused verification: the small buffer is the
+/// documented fallback, and it never reacquires workers.
+fn verification_buffer(
+    options: &ExecutionOptions,
+    len: u64,
+    parallel: bool,
+) -> EngineResult<Reservation> {
+    let small = options.stripe_bytes.min(64 << 10);
+    let large = crate::hash::PARALLEL_HASH_BYTES;
+    if parallel && len >= large as u64 {
+        match options
+            .memory
+            .reserve_as(MemoryCategory::SourceScratch, large)
+        {
+            Ok(reservation) if options.memory.available() >= 128 << 10 => return Ok(reservation),
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    options
+        .memory
+        .reserve_as(MemoryCategory::SourceScratch, small)
+}
+
 /// Verify through a source provider, using a forward reader when it is offered.
 /// Real I/O errors propagate; holes leave extents unknown.
+///
+/// A source of at least [`crate::hash::PARALLEL_SOURCE_BYTES`] may start a
+/// private worker pool solely to hash it; a smaller one never does, because the
+/// pool's own startup would cost more than the hash. A caller that already
+/// holds an admitted pool must call [`verify_source_in_pool`] instead, so that
+/// pools are never nested.
 pub fn verify_source(
     layout: Arc<BlockLayout>,
     file: usize,
@@ -574,24 +643,74 @@ pub fn verify_source(
     options: &ExecutionOptions,
 ) -> EngineResult<FileEvidence> {
     options.validate()?;
+    let large = layout
+        .files
+        .get(file)
+        .is_some_and(|file| file.len >= crate::hash::PARALLEL_SOURCE_BYTES);
+    let pool = if large {
+        match crate::runtime::WorkerPool::for_work(
+            options,
+            crate::hash::PARALLEL_HASH_WORKERS,
+            crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+        ) {
+            Ok(pool) => pool,
+            Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    match &pool {
+        Some(pool) => pool
+            .pool()
+            .install(|| verify_source_in_pool(layout, file, access, source, options, true)),
+        None => verify_source_in_pool(layout, file, access, source, options, false),
+    }
+}
+
+/// [`verify_source`] for a caller that is already inside an admitted worker
+/// pool. `parallel` must be true only from inside such a pool.
+pub(crate) fn verify_source_in_pool(
+    layout: Arc<BlockLayout>,
+    file: usize,
+    access: &dyn SourceAccess,
+    source: SourceId,
+    options: &ExecutionOptions,
+    parallel: bool,
+) -> EngineResult<FileEvidence> {
+    options.validate()?;
     let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
         source_id: source,
         offset: 0,
     })?;
     let mut verifier = StreamingVerifier::new(layout, file, source, snapshot, options.clone())?;
-    let size = options.stripe_bytes.min(64 << 10);
-    let _reservation = options
-        .memory
-        .reserve_as(MemoryCategory::SourceScratch, size)?;
+    let reservation = verification_buffer(options, snapshot.len, parallel)?;
+    let size = reservation.bytes();
+    verifier.parallel_hash = parallel && size >= crate::hash::PARALLEL_HASH_BYTES;
+    let _reservation = reservation;
     let mut buffer = vec![0; size];
     let mut offset = 0;
     if let Some(mut reader) = access.open_sequential(source)? {
         while offset < snapshot.len {
             options.cancel.check()?;
             let take = (snapshot.len - offset).min(buffer.len() as u64) as usize;
-            let read = options
-                .diagnostics
-                .read(reader.as_mut(), &mut buffer[..take])?;
+            // Fill the buffer before hashing it. A provider is free to return
+            // short reads, and a megabyte buffer fed 17 bytes at a time would
+            // never reach the parallel gate.
+            let mut read = 0;
+            while read < take {
+                options.cancel.check()?;
+                let count = options
+                    .diagnostics
+                    .read(reader.as_mut(), &mut buffer[read..take])?;
+                if count == 0 {
+                    break;
+                }
+                if count > take - read {
+                    return Err(EngineError::InvalidState("invalid source read length"));
+                }
+                read += count;
+            }
             if read == 0 {
                 break;
             }
@@ -610,15 +729,25 @@ pub fn verify_source(
             while offset < range.end {
                 options.cancel.check()?;
                 let take = (range.end - offset).min(buffer.len() as u64) as usize;
-                let read =
-                    options
-                        .diagnostics
-                        .read_at(access, source, offset, &mut buffer[..take])?;
+                let mut read = 0;
+                while read < take {
+                    options.cancel.check()?;
+                    let count = options.diagnostics.read_at(
+                        access,
+                        source,
+                        offset + read as u64,
+                        &mut buffer[read..take],
+                    )?;
+                    if count == 0 {
+                        break;
+                    }
+                    if count > take - read {
+                        return Err(EngineError::InvalidState("invalid source read length"));
+                    }
+                    read += count;
+                }
                 if read == 0 {
                     break;
-                }
-                if read > take {
-                    return Err(EngineError::InvalidState("invalid source read length"));
                 }
                 verifier.feed(offset, &buffer[..read])?;
                 offset += read as u64;
@@ -628,4 +757,41 @@ pub fn verify_source(
     }
     ensure_snapshot(access, source, snapshot)?;
     Ok(verifier.finish())
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::hash::PARALLEL_HASH_BYTES;
+    use crate::runtime::MemoryBudget;
+
+    #[test]
+    fn a_refused_large_buffer_falls_back_without_leaking_its_reservation() {
+        for limit in [64 << 10, 1 << 20, (1 << 20) + (128 << 10), 8 << 20] {
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(limit),
+                stripe_bytes: 1 << 20,
+                ..ExecutionOptions::default()
+            };
+            for parallel in [false, true] {
+                for len in [
+                    0,
+                    (PARALLEL_HASH_BYTES - 1) as u64,
+                    PARALLEL_HASH_BYTES as u64,
+                ] {
+                    let buffer = verification_buffer(&options, len, parallel).unwrap();
+                    let large = parallel
+                        && len >= PARALLEL_HASH_BYTES as u64
+                        && limit >= PARALLEL_HASH_BYTES + (128 << 10);
+                    assert_eq!(
+                        buffer.bytes(),
+                        if large { PARALLEL_HASH_BYTES } else { 64 << 10 }
+                    );
+                    assert_eq!(buffer.category(), MemoryCategory::SourceScratch);
+                    drop(buffer);
+                    assert_eq!(options.memory.used(), 0);
+                }
+            }
+        }
+    }
 }

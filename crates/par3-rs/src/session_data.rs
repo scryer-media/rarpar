@@ -56,7 +56,7 @@ impl Par3RepairSession {
                 .options
                 .memory
                 .reserve_as(MemoryCategory::Caches, ADMISSION_BYTES)?;
-            if !validate_extents(layout, index, payload, &self.options)? {
+            if !validate_extents(&self.input, layout, index, payload, &self.options)? {
                 // Keep the payload pending until checksum metadata arrives.
                 continue;
             }
@@ -85,12 +85,13 @@ impl Par3RepairSession {
 }
 
 fn validate_extents(
+    set: &crate::ingest::IncrementalSet,
     layout: &BlockLayout,
     index: u64,
     payload: &PayloadRef,
     options: &ExecutionOptions,
 ) -> EngineResult<bool> {
-    payload.validate(options)?;
+    set.validate_payload(payload, options)?;
     let Some(locations) = layout.locations(index) else {
         return Err(EngineError::InvalidState(
             "Data packet has no protected extents",

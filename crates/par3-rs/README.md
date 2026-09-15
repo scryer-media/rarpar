@@ -235,6 +235,25 @@ because carrier regeneration and reassessment read them and dropping them would
 buy memory with source rereads; `ExecutionDiagnostics::amplification()` reports
 reread and reconstructed bytes so that trade can never be made invisibly.
 
+Parallel work is admitted, not assumed. Verification hashes one source across a
+private pool only when the source is at least 8 MiB, feeds that hash in updates
+of at least 1 MiB (combining adjacent protected extents into runs first), and
+holds the pool to at most four workers — measured on an 18-core host, four
+workers verify a 512 MiB source at 1.51x the serial wall time for 1.09x the CPU,
+while eighteen reach 1.23x for 4.0x. The verification buffer grows from 64 KiB
+to 1 MiB only when the budget admits the charge, under `SourceScratch`, and
+falls back rather than failing. Serial, parallel and constrained-memory
+verification produce identical evidence.
+
+An FFT decode charges a transform plan to `CodecScratch` and skips the stages of
+its final forward transform that would produce only rows nobody reads; the rows
+the caller reads are byte-identical either way. The plan is taken only where the
+cohort's rows are wide enough to pay for splitting one transform call into many.
+`ExecutionDiagnostics::codec()` reports transform calls, butterflies performed
+and skipped, multiply-accumulates, and the Cauchy code-matrix factors a repair
+computes — which measure at under half a percent of repair wall time on the
+corpus, so nothing caches them.
+
 Under pressure the engine narrows before it refuses — stripes, worker pools and
 verification batches are admitted at the width the budget actually has, and each
 narrowing is recorded in `ExecutionDiagnostics::waits()`. Widths are never found
@@ -335,6 +354,19 @@ reference. The deviations affecting interpretation are:
 - **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
   fields too; member count alone is insufficient. Corpus recipes normalize
   those original ZIP fields before official insertion.
+- **Name rules (stricter than both):** the draft says nothing about reserved
+  device names, trailing spaces or dots, control bytes or a path length bound,
+  and the reference rewrites an unusable name in place and warns. This crate
+  refuses instead, at both ends. A name is refused if any `/`-separated
+  component is empty, `.`, `..`, longer than 255 bytes, contains `\\`, `:` or
+  an ASCII control byte, names a Windows character device (`CON`, `PRN`,
+  `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, with or
+  without an extension) or ends in a space or a dot; if the whole path exceeds
+  4096 bytes; or if it is absolute, by a leading separator or a `X:` drive
+  prefix. Creation refuses such a name before producing the set, and repair
+  refuses such a destination before writing an output byte, with the same
+  verdict on every platform. A set produced elsewhere that carries such a name
+  still parses and still verifies; only writing it is refused.
 
 The [interoperability record](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/INTEROPERABILITY.md)
 documents reference verification and repair, including both fields, uneven
