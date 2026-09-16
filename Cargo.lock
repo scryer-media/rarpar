@@ -1937,25 +1937,6 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b12ba7c7fe4afe720eeb9157b48cc14b0ae71eba0a2173524fafb54d21eb51bc"
-dependencies = [
- "aws-lc-sys",
- "bytes",
- "cap-std",
- "crc-fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "reedsolomon-rs",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "par2-rs"
 version = "0.10.2"
 dependencies = [
  "aws-lc-sys",
@@ -1967,12 +1948,31 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
  "unrar-rs 0.10.5",
+]
+
+[[package]]
+name = "par2-rs"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b37a1deb44b18a5ae7dffc595d342e4558ffb395441540a1e14b0946b7b22f"
+dependencies = [
+ "aws-lc-sys",
+ "bytes",
+ "cap-std",
+ "crc-fast",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -1983,7 +1983,21 @@ dependencies = [
  "crc-fast",
  "libc",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "par3-rs"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc8770cb6e4bd3cda46b36213e60e4196585e3c3aaea82967b43f3305f3c3155"
+dependencies = [
+ "blake3",
+ "crc-fast",
+ "rayon",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -2197,15 +2211,15 @@ version = "0.5.0"
 dependencies = [
  "clap",
  "mimalloc",
- "par2-rs 0.9.1",
- "par3-rs",
+ "par2-rs 0.10.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "par3-rs 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
- "unrar-rs 0.9.2",
+ "unrar-rs 0.10.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2278,6 +2292,16 @@ dependencies = [
  "pollster",
  "rayon",
  "wgpu",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04bd2b18265c8b055ea65a86fe8c0e95a91ad2cbe8fb845b0ba8ffc214931084"
+dependencies = [
+ "memmap2",
+ "rayon",
 ]
 
 [[package]]
@@ -2912,33 +2936,6 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unrar-rs"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f6ffb90d0e69ea2ef133efe575e853a61dc4bdfd629506e4ffb8eb4aa1f6a00"
-dependencies = [
- "aws-lc-rs",
- "aws-lc-sys",
- "blake2s_simd",
- "crc-fast",
- "filetime",
- "libc",
- "memchr",
- "rayon",
- "reedsolomon-rs",
- "rmp-serde",
- "serde",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "unicode-normalization",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "unrar-rs"
 version = "0.10.5"
 dependencies = [
  "aes",
@@ -2953,7 +2950,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -2965,6 +2962,33 @@ dependencies = [
  "unicode-normalization",
  "wasmtime",
  "wasmtime-wasi",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "unrar-rs"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcf5a0ba5a6c1afdac0d595af74cdb31195b7a4aaed3de0352b519b3b5dc92bb"
+dependencies = [
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "blake2s_simd",
+ "crc-fast",
+ "filetime",
+ "libc",
+ "memchr",
+ "rayon",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rmp-serde",
+ "serde",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "unicode-normalization",
  "windows-sys 0.61.2",
  "zeroize",
 ]

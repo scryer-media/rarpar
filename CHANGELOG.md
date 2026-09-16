@@ -3,15 +3,20 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.5.0 (unreleased)
+## rarpar 0.5.0
 
-- Require `par3-rs` 0.4.2, whose interleaved recovery carriers are cut and
-  named by row. `par3 create` completes a recovery count or percentage to the
-  whole rows that hold it when `--interleave` is set, so a request that is not
-  a multiple of the cohort count no longer fails.
-- Require `par3-rs` 0.4.0 for bounded parallel source verification and adaptive
-  aligned repair stripes. The CLI remains at its existing prospective 0.5.0;
-  this change introduces no CLI options or third-party dependency changes.
+### CLI Changes
+
+- `par3 create` completes a recovery count or percentage to the whole rows that
+  hold it when `--interleave` is set, so a request that is not a multiple of the
+  cohort count no longer fails. `--first-recovery` names a row rather than a
+  global recovery index for the same reason: an interleaved set takes a multiple
+  of the cohort count, and anything else is refused as a command-line error
+  naming that count instead of as an engine-state failure.
+- A PAR3 operation refused because a name in the set breaks a name-safety rule
+  now exits 3 (unsafe operation rejected) rather than 1. Creation raises it
+  before it writes a byte of the set and repair before it writes a byte of any
+  output, so nothing on disk has changed when it does.
 - Keep repair dry runs read-only and reject layouts requiring explicit
   self-repair. Size CLI handle budgets for retained carrier collections, count
   only admitted carrier siblings, and expand inferred RAR cleanup members to
@@ -23,7 +28,7 @@ documented in each crate's own changelog so those notes ship with the crate.
   destinations that alias on the target filesystem. Apply Cauchy loss limits
   to repair dry runs and resolve cleanup membership against `-C`.
 - Add `par3 create`, `par3 verify`, and `par3 repair`, using the bounded engine
-  in `par3-rs` 0.4.0. Support FFT/interleaving, deduplication, Data packets,
+  in `par3-rs` 0.4. Support FFT/interleaving, deduplication, Data packets,
   content placement, configurable volumes, dry-run creation plans, and explicit
   memory, worker, and repair-loss limits.
 - Discover and repair PAR3 sets in `auto` before archive extraction. Handle
@@ -34,9 +39,51 @@ documented in each crate's own changelog so those notes ship with the crate.
 - Keep creation durable by default, with an explicit buffered-write option.
   Embedded-container self-repair remains a library API.
 
-The binary requires the new PAR3 and `reedsolomon-rs` 0.4.5 packages. Workspace
-patches support validation before publication; packaged consumers require those
-versions in the registry.
+### Libraries
+
+- `unrar-rs` moves from 0.9.2 to 0.10.5. `rev` restores of a RAR3/RAR4 set no
+  longer fail with `Bad file descriptor` when the missing volume is the set's
+  last data volume, and they cost a fraction of the CPU they did: restoring a
+  missing 1 MiB volume of the recovery fixture falls from about 3.0 s to 0.26 s
+  on one core, byte-identical. A volume whose reader cannot report its length
+  parses again, which 0.9.2's scan guard had broken for RAR4. Extraction gains
+  BLAKE2sp hashing through the upstream `blake2s_simd` streaming state with
+  runtime SSE4.1/AVX2 detection, cheaper RAR5 parallel-decoder literal replay,
+  and a literal-run fix that keeps bounded progress when a pending filter holds
+  the flush border. The parse-provenance flag, the incremental header prefixes,
+  the shared KDF cache and the `Adaptive`/`Serial` decode modes are library APIs
+  for streaming embedders; the binary keeps the unchanged `Auto` default and
+  exposes no new option for them. See its
+  [changelog](crates/unrar-rs/CHANGELOG.md).
+- `par2-rs` moves from 0.9.1 to 0.10.2. The deferred short-block relocation
+  sweep now reads only the bytes the scan cannot account for instead of
+  byte-stepping the whole candidate once per open short length, so a damaged
+  volume tail costs its own length rather than seconds; and the ordered
+  canonical scan sizes its rolling buffer against the repair memory limit, so a
+  set declaring a multi-gigabyte slice is scanned through a mapped window
+  instead of aborting the process on an allocation it never reserved. `verify`
+  and `repair` can also be cancelled while a very large candidate is being
+  scanned. The extra-scan controls added in 0.10.0 are for the repairer API the
+  CLI does not use. No API or option change reaches the binary. See its
+  [changelog](crates/par2-rs/CHANGELOG.md).
+- `par3-rs` is required at 0.4.2, the version the new `par3` commands are built
+  against. It cuts and names an interleaved set's recovery carriers by row,
+  bounds every repair stage's resident working set against an explicit memory
+  budget, verifies large sources in a small admitted worker pool, prunes an FFT
+  decode to the rows the caller reads, and refuses a set naming a path this
+  platform could never write with `UnsafePath` rather than a generic
+  engine-state error. See its [changelog](crates/par3-rs/CHANGELOG.md).
+- `reedsolomon-rs` moves from 0.4.3 to 0.4.5. It carries the GF(2^8) region
+  arithmetic and Cantor-field FFT primitives the PAR3 engine runs on, and a RAR3
+  decoder that no longer clears and reallocates its syndrome and error-evaluator
+  scratch on every call — the order-of-magnitude part of the `rev` restore
+  saving above. See its [changelog](crates/reedsolomon-rs/CHANGELOG.md).
+
+Every library the binary needs is now on crates.io at the version the workspace
+carries, so the `[patch.crates-io]` block that stood in for the unpublished PAR3
+engine and its arithmetic is gone: a packaged `rarpar` build made outside the
+workspace resolves `unrar-rs` 0.10.5, `par2-rs` 0.10.2, `par3-rs` 0.4.2 and
+`reedsolomon-rs` 0.4.5 from the registry with no local substitution.
 
 ## rarpar 0.4.1
 
