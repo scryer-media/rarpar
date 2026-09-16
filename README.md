@@ -255,8 +255,11 @@ The defaults are Cauchy, one recovery packet, 1 MiB blocks, no deduplication,
 and power-of-two recovery volumes. Opt into `--dedup aligned|sliding`,
 `--data-packets`, `--volume-blocks`, or `--volume-bytes` as needed. FFT requires
 `--capacity-log2`; `--interleave` counts extra cohorts and `--first-recovery`
-selects the first global recovery index. Percentage sizing uses the block count
-after deduplication and requires a second planning pass over sources.
+selects the first recovery index. An interleaved set is cut and named by row —
+one recovery index in each cohort — so `--first-recovery` takes a multiple of
+the cohort count and a recovery count or percentage is completed to the whole
+rows that hold it. Percentage sizing uses the block count after deduplication
+and requires a second planning pass over sources.
 
 Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
 and scratch requirements without writing. Existing carriers require `--overwrite`;

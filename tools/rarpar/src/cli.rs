@@ -204,7 +204,7 @@ pub struct Par3CreateArgs {
     /// Extra FFT cohorts; zero means one cohort.
     #[arg(long, default_value_t = 0)]
     pub interleave: u64,
-    /// First global recovery index.
+    /// First global recovery index; an interleaved set requires a multiple of the cohort count.
     #[arg(short = 'f', long, default_value_t = 0)]
     pub first_recovery: u64,
     #[arg(long, value_enum, default_value_t = Par3Dedup::None)]

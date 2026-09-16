@@ -62,6 +62,12 @@ fn par3_exit_code(error: &par3_rs::runtime::EngineError) -> u8 {
     match error {
         EngineError::ResourceLimit(_) => EXIT_RESOURCE,
         EngineError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => EXIT_UNSAFE,
+        // A name-safety refusal is a rejected unsafe operation, not damaged
+        // data: creation refuses before it writes a byte of the set and repair
+        // before it writes a byte of any output.
+        EngineError::UnsafePath(_) | EngineError::Format(par3_rs::Par3Error::UnsafePath(_)) => {
+            EXIT_UNSAFE
+        }
         EngineError::RepairInterrupted { cause, .. }
         | EngineError::OutputInterrupted { cause, .. } => par3_exit_code(cause),
         _ => EXIT_DATA_FAILURE,
