@@ -1202,13 +1202,14 @@ fn test_streaming_split_after_pack_crc_mismatch_fails() {
     ));
 }
 
-/// A two-volume stored member whose first header names no checksum at all and
-/// whose final header names only a BLAKE2sp digest: volumes that disagree on
-/// the hash type, which one archive never produces.
+/// A two-volume stored member whose final header names only a BLAKE2sp digest
+/// while the first header names a CRC, or nothing at all: volumes that disagree
+/// on the hash type, which one archive never produces.
 fn build_two_volume_stored_archive_with_final_blake2_only(
     filename: &str,
     content: &[u8],
     split_at: usize,
+    first_packed_crc: Option<u32>,
     final_blake2: [u8; 32],
 ) -> (Vec<u8>, Vec<u8>) {
     let part1 = &content[..split_at];
@@ -1222,7 +1223,7 @@ fn build_two_volume_stored_archive_with_final_blake2_only(
         0x0010, // SPLIT_AFTER
         part1.len() as u64,
         content.len() as u64,
-        None,
+        first_packed_crc,
         0,
     ));
     vol0.extend_from_slice(part1);
@@ -1251,56 +1252,64 @@ fn build_two_volume_stored_archive_with_final_blake2_only(
     (vol0, vol1)
 }
 
-/// A streaming member is hashed with BLAKE2sp only when its first header names
-/// a digest. A final volume that names one anyway therefore has nothing to be
-/// compared against; with `verify` on it must be rejected, not passed, even
-/// when the digest it names is the right one.
+fn stream_two_volumes(vol0: &[u8], vol1: &[u8], verify: bool) -> unrar_rs::RarResult<Vec<u8>> {
+    let (_temp_dir, paths) = write_two_temp_volumes(vol0, vol1);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0.to_vec())).unwrap();
+    let mut out = Vec::new();
+    archive.extract_member_streaming(
+        0,
+        &unrar_rs::ExtractOptions {
+            verify,
+            ..Default::default()
+        },
+        &provider,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// The running hash is typed by the first header. A first header typed as CRC
+/// and a final header typed as BLAKE2sp cannot be compared, and that is a
+/// checksum failure even when the digest the final header names is the right
+/// one, because nothing was ever hashed with it.
 #[test]
-fn test_streaming_continuation_rejects_a_blake2_digest_only_the_final_header_names() {
+fn test_streaming_continuation_fails_the_checksum_when_the_hash_type_changes() {
     let content = b"the final volume alone names a hash type the first never did";
-    let correct_blake2 = unrar_rs::crypto::blake2sp_hash(content);
+    let split_at = 23;
     let (vol0, vol1) = build_two_volume_stored_archive_with_final_blake2_only(
         "late-hash.bin",
         content,
-        23,
-        correct_blake2,
+        split_at,
+        Some(crc32fast::hash(&content[..split_at])),
+        unrar_rs::crypto::blake2sp_hash(content),
     );
-    let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
-    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
-    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0.clone())).unwrap();
-    let mut out = Vec::new();
 
-    let err = archive
-        .extract_member_streaming(
-            0,
-            &unrar_rs::ExtractOptions {
-                verify: true,
-                ..Default::default()
-            },
-            &provider,
-            &mut out,
-        )
-        .unwrap_err();
+    let err = stream_two_volumes(&vol0, &vol1, true).unwrap_err();
     assert!(
-        matches!(err, unrar_rs::RarError::CorruptArchive { ref detail } if detail.contains("late-hash.bin")),
+        matches!(err, unrar_rs::RarError::Blake2Mismatch { ref member } if member == "late-hash.bin"),
         "unexpected error: {err:?}"
     );
 
     // Without verification the same chain copies through untouched.
-    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
-    let mut out = Vec::new();
-    archive
-        .extract_member_streaming(
-            0,
-            &unrar_rs::ExtractOptions {
-                verify: false,
-                ..Default::default()
-            },
-            &provider,
-            &mut out,
-        )
-        .unwrap();
-    assert_eq!(out, content);
+    assert_eq!(stream_two_volumes(&vol0, &vol1, false).unwrap(), content);
+}
+
+/// A first header that names no hash at all types nothing, so a final header's
+/// BLAKE2sp digest has nothing to disagree with: the member is accepted
+/// unchecked, even when that digest is wrong.
+#[test]
+fn test_streaming_continuation_accepts_a_final_blake2_when_the_first_header_names_no_hash() {
+    let content = b"the first header names no hash and the last names a digest";
+    let (vol0, vol1) = build_two_volume_stored_archive_with_final_blake2_only(
+        "untyped.bin",
+        content,
+        21,
+        None,
+        [0xAB; 32],
+    );
+
+    assert_eq!(stream_two_volumes(&vol0, &vol1, true).unwrap(), content);
 }
 
 #[test]

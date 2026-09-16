@@ -5934,6 +5934,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -6071,6 +6072,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -6220,6 +6222,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -6508,6 +6511,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -6684,6 +6688,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -6869,6 +6874,7 @@ impl RarArchive {
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
+            expected_crc,
             expected_blake,
             final_meta.blake2_hash,
             hash_plan,
@@ -7014,31 +7020,39 @@ fn streaming_hash_plan(
 /// The BLAKE2sp digest a streaming member is checked against once its final
 /// volume has been read.
 ///
-/// The final volume's header wins over the first, as it does for the CRC. But
-/// the hash plan computed BLAKE2sp only when the first header named a digest,
-/// so a final header that names one where the first header did not is a chain
-/// of volumes that disagree on the hash type — something one RAR archive never
-/// produces. Nothing was computed to compare against, and letting that pass
-/// would hand back bytes the caller asked to have verified; the chain is
-/// rejected instead.
+/// The running hash is typed once, from the first volume's header, and the
+/// final volume's header is what it is compared with. Three cases follow for a
+/// final header that names a BLAKE2sp digest:
+///
+/// - the first header named one too: the final digest wins, as for the CRC;
+/// - the first header named a CRC instead: the two volumes disagree on the
+///   hash type, and a compare between different types is a checksum failure;
+/// - the first header named no hash at all: nothing was typed, so there is
+///   nothing to disagree with and the member is accepted unchecked.
+///
+/// This is the reference decoder's contract, so every archive it unpacks is
+/// unpacked here and every chain it refuses is refused here.
 fn continuation_blake2_expectation(
     member_name: &str,
-    first_header: Option<[u8; 32]>,
-    final_header: Option<[u8; 32]>,
+    first_header_crc: Option<u32>,
+    first_header_blake: Option<[u8; 32]>,
+    final_header_blake: Option<[u8; 32]>,
     plan: StreamingHashPlan,
     verify: bool,
 ) -> RarResult<Option<[u8; 32]>> {
     if !verify {
         return Ok(None);
     }
-    if final_header.is_some() && !plan.blake2sp {
-        return Err(RarError::CorruptArchive {
-            detail: format!(
-                "member {member_name} continues into a volume whose header names a BLAKE2sp digest its first header did not"
-            ),
-        });
+    if final_header_blake.is_some() && !plan.blake2sp {
+        return if first_header_crc.is_some() {
+            Err(RarError::Blake2Mismatch {
+                member: member_name.to_string(),
+            })
+        } else {
+            Ok(None)
+        };
     }
-    Ok(final_header.or(first_header))
+    Ok(final_header_blake.or(first_header_blake))
 }
 
 /// Finalize an optional shared hash stream into (crc32, blake2sp) actuals.
@@ -7806,22 +7820,44 @@ mod tests {
         .expect("an expected digest with no computed digest is not a mismatch");
     }
 
-    /// A final volume that names a BLAKE2sp digest the first header did not is
-    /// a chain the plan never hashed; under `verify` it is rejected rather than
-    /// passed on a comparison that never happened.
+    /// A first header typed as CRC and a final header typed as BLAKE2sp
+    /// disagree on the hash type: a checksum failure, as the reference decoder
+    /// reports it.
     #[test]
-    fn continuation_blake2_rejects_a_digest_the_first_header_did_not_name() {
+    fn continuation_blake2_fails_the_checksum_when_the_hash_type_changes() {
         let plan = streaming_hash_plan(Some(0x1234_5678), None, true, true);
         assert!(!plan.blake2sp);
         let err = continuation_blake2_expectation(
             "sample-member.bin",
+            Some(0x1234_5678),
             None,
             Some(SAMPLE_BLAKE2),
             plan,
             true,
         )
         .unwrap_err();
-        assert!(matches!(err, RarError::CorruptArchive { .. }));
+        assert!(
+            matches!(err, RarError::Blake2Mismatch { ref member } if member == "sample-member.bin")
+        );
+    }
+
+    /// A first header that names no hash at all types nothing, so a final
+    /// header's digest has nothing to disagree with and the member is
+    /// accepted unchecked, as the reference decoder accepts it.
+    #[test]
+    fn continuation_blake2_accepts_a_digest_when_the_first_header_names_no_hash() {
+        let plan = streaming_hash_plan(None, None, true, true);
+        assert!(!plan.blake2sp);
+        let expected = continuation_blake2_expectation(
+            "sample-member.bin",
+            None,
+            None,
+            Some(SAMPLE_BLAKE2),
+            plan,
+            true,
+        )
+        .unwrap();
+        assert_eq!(expected, None);
     }
 
     /// When both headers name a digest the final volume's wins, as for the CRC.
@@ -7830,6 +7866,7 @@ mod tests {
         let plan = streaming_hash_plan(None, Some([0x11; 32]), true, true);
         let expected = continuation_blake2_expectation(
             "sample-member.bin",
+            None,
             Some([0x11; 32]),
             Some(SAMPLE_BLAKE2),
             plan,
@@ -7846,6 +7883,7 @@ mod tests {
         let plan = streaming_hash_plan(None, Some(SAMPLE_BLAKE2), true, true);
         let expected = continuation_blake2_expectation(
             "sample-member.bin",
+            None,
             Some(SAMPLE_BLAKE2),
             None,
             plan,
@@ -7861,6 +7899,7 @@ mod tests {
         let plan = streaming_hash_plan(None, None, false, true);
         let expected = continuation_blake2_expectation(
             "sample-member.bin",
+            Some(0x1234_5678),
             None,
             Some(SAMPLE_BLAKE2),
             plan,
