@@ -5932,7 +5932,13 @@ impl RarArchive {
 
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6063,7 +6069,13 @@ impl RarArchive {
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6206,7 +6218,13 @@ impl RarArchive {
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6488,7 +6506,13 @@ impl RarArchive {
         // Verify CRC32.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6658,7 +6682,13 @@ impl RarArchive {
 
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6837,7 +6867,13 @@ impl RarArchive {
         // Verify CRC32.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
-        let effective_blake = final_meta.blake2_hash.or(expected_blake);
+        let effective_blake = continuation_blake2_expectation(
+            &fh.name,
+            expected_blake,
+            final_meta.blake2_hash,
+            hash_plan,
+            options.verify,
+        )?;
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -6973,6 +7009,36 @@ fn streaming_hash_plan(
         crc32: expected_crc.is_some() || (verify && split_after),
         blake2sp: expected_blake.is_some(),
     }
+}
+
+/// The BLAKE2sp digest a streaming member is checked against once its final
+/// volume has been read.
+///
+/// The final volume's header wins over the first, as it does for the CRC. But
+/// the hash plan computed BLAKE2sp only when the first header named a digest,
+/// so a final header that names one where the first header did not is a chain
+/// of volumes that disagree on the hash type — something one RAR archive never
+/// produces. Nothing was computed to compare against, and letting that pass
+/// would hand back bytes the caller asked to have verified; the chain is
+/// rejected instead.
+fn continuation_blake2_expectation(
+    member_name: &str,
+    first_header: Option<[u8; 32]>,
+    final_header: Option<[u8; 32]>,
+    plan: StreamingHashPlan,
+    verify: bool,
+) -> RarResult<Option<[u8; 32]>> {
+    if !verify {
+        return Ok(None);
+    }
+    if final_header.is_some() && !plan.blake2sp {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "member {member_name} continues into a volume whose header names a BLAKE2sp digest its first header did not"
+            ),
+        });
+    }
+    Ok(final_header.or(first_header))
 }
 
 /// Finalize an optional shared hash stream into (crc32, blake2sp) actuals.
@@ -7738,6 +7804,70 @@ mod tests {
             None,
         )
         .expect("an expected digest with no computed digest is not a mismatch");
+    }
+
+    /// A final volume that names a BLAKE2sp digest the first header did not is
+    /// a chain the plan never hashed; under `verify` it is rejected rather than
+    /// passed on a comparison that never happened.
+    #[test]
+    fn continuation_blake2_rejects_a_digest_the_first_header_did_not_name() {
+        let plan = streaming_hash_plan(Some(0x1234_5678), None, true, true);
+        assert!(!plan.blake2sp);
+        let err = continuation_blake2_expectation(
+            "sample-member.bin",
+            None,
+            Some(SAMPLE_BLAKE2),
+            plan,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RarError::CorruptArchive { .. }));
+    }
+
+    /// When both headers name a digest the final volume's wins, as for the CRC.
+    #[test]
+    fn continuation_blake2_prefers_the_final_header() {
+        let plan = streaming_hash_plan(None, Some([0x11; 32]), true, true);
+        let expected = continuation_blake2_expectation(
+            "sample-member.bin",
+            Some([0x11; 32]),
+            Some(SAMPLE_BLAKE2),
+            plan,
+            true,
+        )
+        .unwrap();
+        assert_eq!(expected, Some(SAMPLE_BLAKE2));
+    }
+
+    /// A first header that names a digest keeps it when the final volume adds
+    /// nothing.
+    #[test]
+    fn continuation_blake2_keeps_the_first_header_digest() {
+        let plan = streaming_hash_plan(None, Some(SAMPLE_BLAKE2), true, true);
+        let expected = continuation_blake2_expectation(
+            "sample-member.bin",
+            Some(SAMPLE_BLAKE2),
+            None,
+            plan,
+            true,
+        )
+        .unwrap();
+        assert_eq!(expected, Some(SAMPLE_BLAKE2));
+    }
+
+    /// With verification off nothing is compared and nothing is rejected.
+    #[test]
+    fn continuation_blake2_is_inert_without_verify() {
+        let plan = streaming_hash_plan(None, None, false, true);
+        let expected = continuation_blake2_expectation(
+            "sample-member.bin",
+            None,
+            Some(SAMPLE_BLAKE2),
+            plan,
+            false,
+        )
+        .unwrap();
+        assert_eq!(expected, None);
     }
 
     struct TestVolumeProvider {

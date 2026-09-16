@@ -1202,6 +1202,107 @@ fn test_streaming_split_after_pack_crc_mismatch_fails() {
     ));
 }
 
+/// A two-volume stored member whose first header names no checksum at all and
+/// whose final header names only a BLAKE2sp digest: volumes that disagree on
+/// the hash type, which one archive never produces.
+fn build_two_volume_stored_archive_with_final_blake2_only(
+    filename: &str,
+    content: &[u8],
+    split_at: usize,
+    final_blake2: [u8; 32],
+) -> (Vec<u8>, Vec<u8>) {
+    let part1 = &content[..split_at];
+    let part2 = &content[split_at..];
+
+    let mut vol0 = Vec::new();
+    vol0.extend_from_slice(&RAR5_SIG);
+    vol0.extend_from_slice(&build_main_archive_header(0x0001, None));
+    vol0.extend_from_slice(&build_file_header_ex(
+        filename,
+        0x0010, // SPLIT_AFTER
+        part1.len() as u64,
+        content.len() as u64,
+        None,
+        0,
+    ));
+    vol0.extend_from_slice(part1);
+    vol0.extend_from_slice(&build_end_header(true));
+
+    let mut hash_body = Vec::new();
+    hash_body.extend_from_slice(&encode_vint(0)); // BLAKE2sp
+    hash_body.extend_from_slice(&final_blake2);
+    let extra = build_extra_record(0x02, &hash_body);
+
+    let mut vol1 = Vec::new();
+    vol1.extend_from_slice(&RAR5_SIG);
+    vol1.extend_from_slice(&build_main_archive_header(0x0001 | 0x0002, Some(1)));
+    vol1.extend_from_slice(&build_file_header_ex_with_extra(
+        filename,
+        0x0008, // SPLIT_BEFORE
+        part2.len() as u64,
+        content.len() as u64,
+        None,
+        0,
+        &extra,
+    ));
+    vol1.extend_from_slice(part2);
+    vol1.extend_from_slice(&build_end_header(false));
+
+    (vol0, vol1)
+}
+
+/// A streaming member is hashed with BLAKE2sp only when its first header names
+/// a digest. A final volume that names one anyway therefore has nothing to be
+/// compared against; with `verify` on it must be rejected, not passed, even
+/// when the digest it names is the right one.
+#[test]
+fn test_streaming_continuation_rejects_a_blake2_digest_only_the_final_header_names() {
+    let content = b"the final volume alone names a hash type the first never did";
+    let correct_blake2 = unrar_rs::crypto::blake2sp_hash(content);
+    let (vol0, vol1) = build_two_volume_stored_archive_with_final_blake2_only(
+        "late-hash.bin",
+        content,
+        23,
+        correct_blake2,
+    );
+    let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0.clone())).unwrap();
+    let mut out = Vec::new();
+
+    let err = archive
+        .extract_member_streaming(
+            0,
+            &unrar_rs::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            &provider,
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, unrar_rs::RarError::CorruptArchive { ref detail } if detail.contains("late-hash.bin")),
+        "unexpected error: {err:?}"
+    );
+
+    // Without verification the same chain copies through untouched.
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let mut out = Vec::new();
+    archive
+        .extract_member_streaming(
+            0,
+            &unrar_rs::ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
+            &provider,
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(out, content);
+}
+
 #[test]
 fn test_streaming_continuation_final_crc_is_verified_when_first_header_has_none() {
     let content = b"streaming continuation final crc should be authoritative";

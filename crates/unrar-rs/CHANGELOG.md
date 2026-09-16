@@ -15,6 +15,8 @@
   behind it. Checksum coverage is unchanged: the whole-file CRC still arrives
   with the final volume's header and is still verified, and a header that does
   name a BLAKE2sp digest is still hashed and compared.
+  A chain whose final volume names a BLAKE2sp digest the first header did not
+  is rejected under verification as corrupt rather than passed unhashed.
 
 ## 0.10.6
 
