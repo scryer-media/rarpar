@@ -20,15 +20,14 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 # only backend there. Enabling neither backend on a native target is a compile
 # error (see `lib.rs`).
 #
-# `crypto-rust` carries no `dep:` entry: `md-5` stays an unconditional
-# dependency, because the default AWS-LC build still instantiates the
-# RustCrypto backend — `Par2Md5Backend::RustCrypto` and the differential test
-# that proves the two agree. Making it optional would delete an arm from the
-# default build's MD5 seam, which this change deliberately leaves untouched.
+# `md-5` is reachable only through `crypto-rust`, so a default build links
+# neither the RustCrypto backend nor its crate. The test suite still needs an
+# independent MD5 to check the AWS-LC binding against, which is why `md-5`
+# also appears under `[dev-dependencies]`: consumers never see that edge.
 [features]
 default = ["crypto-aws-lc"]
 crypto-aws-lc = ["dep:aws-lc-sys"]
-crypto-rust = []
+crypto-rust = ["dep:md-5"]
 # Back-compat alias for dependency declarations written before the backends
 # were named; selects the AWS-LC backend.
 native-crypto = ["crypto-aws-lc"]
@@ -52,7 +51,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 crc-fast = { workspace = true }
-md-5 = { workspace = true }
+md-5 = { workspace = true, optional = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
 
@@ -78,6 +77,10 @@ cap-std = "4.0.3"
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
+# The reference MD5 the checksum tests compare the active backend against,
+# and the digest helper the other test modules use; independent of which
+# backend the build selected.
+md-5 = { workspace = true }
 
 # Native-only dev-dependencies.
 #

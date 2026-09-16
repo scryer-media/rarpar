@@ -406,11 +406,13 @@ jobs:
           cargo test --locked -p par2-rs --lib --no-default-features --features crypto-rust checksum::
           cargo test --locked -p par2-rs --test checksum --no-default-features --features crypto-rust
           cargo test --locked -p par2-rs --test stateful_session --no-default-features --features crypto-rust
-      - name: Test unrar-rs with both backends enabled
+      - name: Test the libraries with both backends enabled
         # Enabling both must keep AWS-LC active and compile the pure-Rust
         # backend beside it, which is what the differential tests compare.
         run: |
+          set -euo pipefail
           cargo test --locked -p unrar-rs --lib --features crypto-rust crypto::
+          cargo test --locked -p par2-rs --lib --features crypto-rust checksum::
       - name: Check rarpar on the RustCrypto backend
         run: cargo check --locked -p rarpar --no-default-features --features runtime,crypto-rust
       - name: Run clippy on the RustCrypto backend
