@@ -16,9 +16,11 @@
   features, rather than a silent fall back to the RustCrypto backend. On
   `wasm`, where the AWS-LC dependency is target-gated away, `crypto-rust`
   stays the only backend and is still selected without being asked.
-- `md-5` is now reachable only through `crypto-rust`. A default build links
-  the AWS-LC backend alone; the RustCrypto backend and its crate are compiled
-  only when that feature is on. The test suite keeps `md-5` as a
+- On native targets `md-5` is now reachable only through `crypto-rust`. A
+  default build links the AWS-LC backend alone; the RustCrypto backend and
+  its crate are compiled only when that feature is on. On `wasm` nothing
+  changes: `md-5` stays unconditional there, so a wasm build that names no
+  feature keeps the backend it always had. The test suite keeps `md-5` as a
   dev-dependency so the AWS-LC binding is still checked against an
   independent MD5 on every build.
 

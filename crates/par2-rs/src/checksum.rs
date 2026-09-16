@@ -2,7 +2,7 @@ use crate::crc_simd;
 #[cfg(feature = "crypto-aws-lc")]
 use aws_lc_sys::{MD5_CTX, MD5_Final, MD5_Init, MD5_Update};
 use crc_fast::{CrcAlgorithm, Digest as FastCrcDigest};
-#[cfg(feature = "crypto-rust")]
+#[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
 use md5::{Digest as Md5Digest, Md5 as RustCryptoMd5};
 #[cfg(feature = "crypto-aws-lc")]
 use std::mem::MaybeUninit;
@@ -85,7 +85,7 @@ impl Crc32Hasher {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Par2Md5Backend {
-    #[cfg(feature = "crypto-rust")]
+    #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
     RustCrypto,
     #[cfg(feature = "crypto-aws-lc")]
     NativeAwsLc,
@@ -134,7 +134,7 @@ impl AwsLcMd5State {
 
 #[derive(Clone)]
 enum Md5StateInner {
-    #[cfg(feature = "crypto-rust")]
+    #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
     RustCrypto(RustCryptoMd5),
     #[cfg(feature = "crypto-aws-lc")]
     NativeAwsLc(AwsLcMd5State),
@@ -152,7 +152,7 @@ impl Md5State {
 
     fn new_with_backend(backend: Par2Md5Backend) -> Self {
         let inner = match backend {
-            #[cfg(feature = "crypto-rust")]
+            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
             Par2Md5Backend::RustCrypto => Md5StateInner::RustCrypto(RustCryptoMd5::new()),
             #[cfg(feature = "crypto-aws-lc")]
             Par2Md5Backend::NativeAwsLc => Md5StateInner::NativeAwsLc(AwsLcMd5State::new()),
@@ -162,7 +162,7 @@ impl Md5State {
 
     pub(crate) fn update(&mut self, data: &[u8]) {
         match &mut self.inner {
-            #[cfg(feature = "crypto-rust")]
+            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
             Md5StateInner::RustCrypto(state) => state.update(data),
             #[cfg(feature = "crypto-aws-lc")]
             Md5StateInner::NativeAwsLc(state) => state.update(data),
@@ -171,7 +171,7 @@ impl Md5State {
 
     pub(crate) fn finalize(self) -> [u8; 16] {
         match self.inner {
-            #[cfg(feature = "crypto-rust")]
+            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
             Md5StateInner::RustCrypto(state) => state.finalize().into(),
             #[cfg(feature = "crypto-aws-lc")]
             Md5StateInner::NativeAwsLc(state) => state.finalize(),

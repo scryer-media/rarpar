@@ -39,7 +39,12 @@ and PAR2 workflows.
 
 - `unrar-rs` is read/extract/recovery-only.
 - Do not add archive writer, archive builder, compressor, or modify-RAR APIs.
-- Standard crypto must use `aws-lc-rs` or `aws-lc-sys` directly.
+- Standard crypto must use `aws-lc-rs` or `aws-lc-sys` directly in the
+  default feature set of every crate and in every shipped `rarpar` artifact.
+  The `crypto-rust` feature is the supported opt-out for library consumers
+  that cannot carry a C or assembly dependency; it must never be the default,
+  never be selected by the release matrix, and never change the AWS-LC code
+  path.
 - Local crypto ports are allowed only for UnRAR-specific legacy algorithms that
   AWS-LC does not provide.
 - `rarpar` must not claim to be official RAR, UnRAR, or PAR2 tooling.

@@ -352,6 +352,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
+          targets: wasm32-wasip1
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -381,6 +382,10 @@ jobs:
           set -euo pipefail
           cargo build --locked -p unrar-rs --no-default-features --features crypto-rust
           cargo build --locked -p par2-rs --no-default-features --features crypto-rust
+      - name: Build par2-rs for wasm with no feature named
+        # RustCrypto is the only backend wasm can have, so a wasm consumer
+        # that names no feature must keep compiling.
+        run: cargo build --locked -p par2-rs --no-default-features --target wasm32-wasip1 --example wasm_par2_check
       - name: Confirm the RustCrypto build links no AWS-LC
         run: |
           set -euo pipefail

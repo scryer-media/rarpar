@@ -11,7 +11,7 @@
   `crypto-aws-lc`. No feature, dependency, backend precedence or code path
   changed; a default build is byte-for-byte the build it was.
 
-## 0.10.5 (unreleased)
+## 0.10.5
 
 ### Added
 

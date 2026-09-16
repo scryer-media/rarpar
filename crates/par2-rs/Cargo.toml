@@ -20,8 +20,11 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 # only backend there. Enabling neither backend on a native target is a compile
 # error (see `lib.rs`).
 #
-# `md-5` is reachable only through `crypto-rust`, so a default build links
-# neither the RustCrypto backend nor its crate. The test suite still needs an
+# On native targets `md-5` is reachable only through `crypto-rust`, so a
+# default build links neither the RustCrypto backend nor its crate. On `wasm`
+# it is unconditional (see the wasm dependency table): RustCrypto is the only
+# backend that exists there, and a featureless wasm build keeps selecting it
+# without being asked, as it always has. The test suite still needs an
 # independent MD5 to check the AWS-LC binding against, which is why `md-5`
 # also appears under `[dev-dependencies]`: consumers never see that edge.
 [features]
@@ -51,7 +54,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 crc-fast = { workspace = true }
-md-5 = { workspace = true, optional = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
 
@@ -68,6 +70,12 @@ libc = { workspace = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 memmap2 = { workspace = true, default-features = false }
 aws-lc-sys = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
+
+# The RustCrypto MD5 is the only backend wasm can have, so it is not optional
+# there: a wasm consumer that names no feature still gets a working crate.
+[target.'cfg(target_family = "wasm")'.dependencies]
+md-5 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Capability-relative path resolution prevents repair destinations from
