@@ -435,7 +435,10 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
             recovery_count: 6,
             first_recovery: 3,
             codec,
-            volumes: VolumeLayout::Uniform(2),
+            // Three packets per carrier is one whole row of the interleaved
+            // case and two carriers of the Cauchy one, so both codecs write
+            // more than one carrier under the same limit.
+            volumes: VolumeLayout::Uniform(3),
             ..CreationOptions::default()
         };
         options.execution.workers = 1;
@@ -588,4 +591,162 @@ fn creation_refuses_a_name_repair_would_refuse_to_write() {
     CreationPlan::build(access, &sources, options)
         .map(|_| ())
         .unwrap();
+}
+
+/// The recovery indices each written carrier carries, keyed by file name.
+fn carried_indices(paths: &[std::path::PathBuf]) -> Vec<(String, Vec<u64>)> {
+    paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).unwrap();
+            let indices = common::packets_of(&bytes)
+                .into_iter()
+                .filter_map(|packet| match packet.body() {
+                    par3_rs::packet::PacketBody::RecoveryData(row) => {
+                        Some(row.recovery_block_index)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                indices,
+            )
+        })
+        .collect()
+}
+
+fn created_indices(
+    name: &str,
+    codec: CreationCodec,
+    recovery_count: u64,
+) -> Vec<(String, Vec<u64>)> {
+    let bytes = data();
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.into());
+    let inputs = [CreationSource {
+        name: "notes.bin".into(),
+        source: SourceId(1),
+    }];
+    let mut options = CreationOptions {
+        block_size: 256,
+        codec,
+        recovery_count,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    let plan = CreationPlan::build(Arc::new(access), &inputs, options).unwrap();
+    let tree = common::TempTree::new(name);
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+    for (path, size) in paths.iter().zip(&plan.requirements().output_sizes) {
+        assert_eq!(std::fs::metadata(path).unwrap().len(), *size);
+    }
+    carried_indices(&paths)
+}
+
+#[test]
+fn interleaved_carriers_are_named_and_filled_by_row() {
+    // Three cohorts, nine recovery blocks: three rows, split one and then two.
+    // Each name counts rows, and each carrier holds every cohort's share of the
+    // rows it names, so the first carries indices 0..3 and the second 3..9.
+    let carriers = created_indices(
+        "interleaved-row-names",
+        CreationCodec::Fft {
+            capacity_log2: 3,
+            interleave: 2,
+        },
+        9,
+    );
+    let carried: Vec<(&str, &[u64])> = carriers
+        .iter()
+        .map(|(name, indices)| (name.as_str(), indices.as_slice()))
+        .collect();
+    assert_eq!(
+        carried,
+        [
+            ("set.par3", &[][..]),
+            ("set.vol0+1.par3", &[0, 1, 2][..]),
+            ("set.vol1+2.par3", &[3, 4, 5, 6, 7, 8][..]),
+        ]
+    );
+}
+
+#[test]
+fn interleaved_carrier_numbers_are_padded_to_the_widest_row_they_reach() {
+    // Two cohorts and forty recovery blocks: twenty rows, split 1, 2, 4, 8, 5,
+    // so the row starts reach two digits and every name is padded to match.
+    let carriers = created_indices(
+        "interleaved-row-padding",
+        CreationCodec::Fft {
+            capacity_log2: 5,
+            interleave: 1,
+        },
+        40,
+    );
+    let names: Vec<&str> = carriers.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "set.par3",
+            "set.vol00+1.par3",
+            "set.vol01+2.par3",
+            "set.vol03+4.par3",
+            "set.vol07+8.par3",
+            "set.vol15+5.par3",
+        ]
+    );
+    // The last carrier still holds both cohorts' shares of its five rows.
+    assert_eq!(
+        carriers.last().unwrap().1,
+        (30..40).collect::<Vec<u64>>(),
+        "rows 15..20 of two cohorts"
+    );
+}
+
+#[test]
+fn a_single_cohort_set_is_named_and_filled_as_before() {
+    let carriers = created_indices("cauchy-row-names", CreationCodec::Cauchy, 3);
+    let carried: Vec<(&str, &[u64])> = carriers
+        .iter()
+        .map(|(name, indices)| (name.as_str(), indices.as_slice()))
+        .collect();
+    assert_eq!(
+        carried,
+        [
+            ("set.par3", &[][..]),
+            ("set.vol0+1.par3", &[0][..]),
+            ("set.vol1+2.par3", &[1, 2][..]),
+        ]
+    );
+}
+
+#[test]
+fn a_recovery_range_that_is_not_whole_rows_is_refused() {
+    let inputs = [CreationSource {
+        name: "notes.bin".into(),
+        source: SourceId(1),
+    }];
+    for (first_recovery, recovery_count) in [(0, 8), (1, 9)] {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, data().into());
+        let options = CreationOptions {
+            block_size: 256,
+            codec: CreationCodec::Fft {
+                capacity_log2: 3,
+                interleave: 2,
+            },
+            first_recovery,
+            recovery_count,
+            ..CreationOptions::default()
+        };
+        assert!(
+            matches!(
+                CreationPlan::build(Arc::new(access), &inputs, options),
+                Err(EngineError::InvalidState(
+                    "interleaved recovery range is not a whole number of rows"
+                ))
+            ),
+            "{first_recovery}+{recovery_count} is not a whole number of rows"
+        );
+    }
 }

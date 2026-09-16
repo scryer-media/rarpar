@@ -15,25 +15,29 @@ use crate::cauchy::RecoveryRow;
 use crate::error::{Par3Error, Result};
 use crate::packet::{Packet, PacketBody, RecoveryDataPacket};
 
-/// One recovery volume: the recovery blocks it carries, and what it is called.
+/// One recovery volume: the recovery rows it carries, and what it is called.
+///
+/// A row is one recovery index in each of the set's cohorts, so a volume holds
+/// `count * cohorts` recovery blocks. Sets built here have a single cohort,
+/// where a row is a recovery index and the two counts agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Volume {
-    /// Index of its first recovery block.
+    /// Index of its first recovery row.
     pub start: u64,
-    /// How many recovery blocks it holds.
+    /// How many recovery rows it holds.
     pub count: u64,
     /// Its file name, `<stem>.vol<start>+<count>.par3`.
     pub path: PathBuf,
 }
 
-/// Split the recovery blocks across volumes: 1, 2, 4, 8, … with the last volume
+/// Split the recovery rows across volumes: 1, 2, 4, 8, … with the last volume
 /// taking whatever is left.
 ///
 /// A reader that has lost a few blocks then only has to fetch a small volume,
 /// while a reader that has lost many can fetch one large one.
-pub(crate) fn split_volumes(recovery_count: u64) -> Vec<(u64, u64)> {
+pub(crate) fn split_volumes(rows: u64) -> Vec<(u64, u64)> {
     let mut splits = Vec::new();
-    let mut remaining = recovery_count;
+    let mut remaining = rows;
     let mut start = 0u64;
     let mut size = 1u64;
     while remaining > 0 {
@@ -59,9 +63,15 @@ fn digit_widths(splits: &[(u64, u64)]) -> (usize, usize) {
 ///
 /// A stem that already ends in `.par3` keeps that name for the index rather than
 /// gaining a second one, and the volumes sit next to it.
+///
+/// Volumes are cut and named by row, so `cohorts` recovery blocks share each
+/// number in a name. A row is indivisible: a recovery count that is not a whole
+/// number of rows is refused rather than split across a name that could not
+/// describe it.
 pub(crate) fn plan_paths(
     output_stem: &Path,
     recovery_count: u64,
+    cohorts: u64,
 ) -> Result<(PathBuf, Vec<Volume>)> {
     let refuse = |reason: &str| Par3Error::CreateInput {
         path: output_stem.display().to_string(),
@@ -78,7 +88,12 @@ pub(crate) fn plan_paths(
     }
     let directory = output_stem.parent().unwrap_or(Path::new(""));
 
-    let splits = split_volumes(recovery_count);
+    if cohorts == 0 || !recovery_count.is_multiple_of(cohorts) {
+        return Err(refuse(
+            "asks for a recovery count that is not a whole number of interleaved rows",
+        ));
+    }
+    let splits = split_volumes(recovery_count / cohorts);
     let (start_width, count_width) = digit_widths(&splits);
     let volumes = splits
         .into_iter()
@@ -103,6 +118,7 @@ pub(crate) fn write_set(
     packets: &BuiltPackets,
     recovery: &[RecoveryRow],
     block_size: u64,
+    cohorts: u64,
     overwrite: bool,
 ) -> Result<Vec<PathBuf>> {
     if !overwrite {
@@ -131,7 +147,7 @@ pub(crate) fn write_set(
 
     for volume in volumes {
         write_file(&volume.path, overwrite, |out| {
-            write_volume(out, volume, packets, recovery, block_size)
+            write_volume(out, volume, packets, recovery, block_size, cohorts)
         })?;
         written.push(volume.path.clone());
     }
@@ -145,18 +161,24 @@ fn write_volume(
     packets: &BuiltPackets,
     recovery: &[RecoveryRow],
     block_size: u64,
+    cohorts: u64,
 ) -> std::io::Result<()> {
     out.write_all(&packets.creator)?;
     for packet in &packets.common {
         out.write_all(packet)?;
     }
 
+    // The volume's rows expand into one contiguous run of recovery indices,
+    // because a row's indices — one per cohort — are adjacent.
+    let first_index = volume.start * cohorts;
+    let payload_packets = volume.count * cohorts;
+
     // One further copy of the common packets per doubling of this volume's block
     // count, spread evenly between the recovery packets and cycling through the
     // list so that consecutive volumes do not all repeat the same few packets.
     let mut repeats = 0u64;
     let mut step = 2u64;
-    while step <= volume.count {
+    while step <= payload_packets {
         repeats += 1;
         step *= 2;
     }
@@ -166,7 +188,7 @@ fn write_volume(
 
     for (position, row) in recovery
         .iter()
-        .filter(|row| row.index() >= volume.start && row.index() < volume.start + volume.count)
+        .filter(|row| row.index() >= first_index && row.index() < first_index + payload_packets)
         .enumerate()
     {
         let mut data = row.data().to_vec();
@@ -184,7 +206,7 @@ fn write_volume(
         );
         out.write_all(&packet.to_bytes())?;
 
-        let target = total_repeats * (position as u64 + 1) / volume.count;
+        let target = total_repeats * (position as u64 + 1) / payload_packets;
         while emitted < target {
             out.write_all(&packets.common[cursor])?;
             cursor = (cursor + 1) % packets.common.len();
@@ -254,7 +276,7 @@ mod tests {
     fn names_are_padded_to_the_widest_number_either_field_reaches() {
         // Compared as paths, not as text: the directory is joined with the
         // platform's separator, which is a backslash on Windows.
-        let (index, volumes) = plan_paths(Path::new("out/set.par3"), 3).expect("paths");
+        let (index, volumes) = plan_paths(Path::new("out/set.par3"), 3, 1).expect("paths");
         assert_eq!(index, Path::new("out/set.par3"));
         let paths: Vec<&Path> = volumes.iter().map(|volume| volume.path.as_path()).collect();
         assert_eq!(
@@ -266,7 +288,7 @@ mod tests {
         );
 
         // 20 blocks split 1, 2, 4, 8, 5 with the last starting at 15.
-        let (_, volumes) = plan_paths(Path::new("set"), 20).expect("paths");
+        let (_, volumes) = plan_paths(Path::new("set"), 20, 1).expect("paths");
         let names: Vec<String> = volumes
             .iter()
             .map(|volume| volume.path.display().to_string())
@@ -284,14 +306,43 @@ mod tests {
     }
 
     #[test]
+    fn cohorts_are_counted_by_row_in_both_the_name_and_the_span() {
+        // Twelve recovery blocks over three cohorts are four rows, split 1, 2,
+        // 1, and each name counts rows rather than blocks.
+        let (_, volumes) = plan_paths(Path::new("set"), 12, 3).expect("paths");
+        let named: Vec<(u64, u64, String)> = volumes
+            .iter()
+            .map(|volume| {
+                (
+                    volume.start,
+                    volume.count,
+                    volume.path.display().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (0, 1, "set.vol0+1.par3".to_owned()),
+                (1, 2, "set.vol1+2.par3".to_owned()),
+                (3, 1, "set.vol3+1.par3".to_owned()),
+            ]
+        );
+
+        // A recovery count that does not fill whole rows has no such name.
+        assert!(plan_paths(Path::new("set"), 5, 2).is_err());
+        assert!(plan_paths(Path::new("set"), 1, 0).is_err());
+    }
+
+    #[test]
     fn a_stem_without_the_suffix_gains_one() {
-        let (index, _) = plan_paths(Path::new("set"), 0).expect("paths");
+        let (index, _) = plan_paths(Path::new("set"), 0, 1).expect("paths");
         assert_eq!(index, Path::new("set.par3"));
     }
 
     #[test]
     fn an_empty_stem_is_refused() {
-        assert!(plan_paths(Path::new(".par3"), 0).is_err());
-        assert!(plan_paths(Path::new("/"), 0).is_err());
+        assert!(plan_paths(Path::new(".par3"), 0, 1).is_err());
+        assert!(plan_paths(Path::new("/"), 0, 1).is_err());
     }
 }

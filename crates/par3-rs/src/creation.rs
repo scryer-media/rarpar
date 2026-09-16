@@ -49,7 +49,9 @@ pub enum Deduplication {
 pub enum VolumeLayout {
     /// Volumes grow by powers of two.
     Variable,
-    /// Every volume contains at most this many recovery packets.
+    /// Every volume contains at most this many recovery packets. An
+    /// interleaved volume holds whole rows, so this is rounded down to a
+    /// multiple of the cohort count, and a limit below one row is refused.
     Uniform(u64),
     /// Bound each recovery carrier's bytes, including its metadata copy.
     SizeLimited(u64),
@@ -75,9 +77,12 @@ pub struct CreationOptions {
     pub block_size: u64,
     /// Matrix family and geometry.
     pub codec: CreationCodec,
-    /// First global recovery index to create.
+    /// First global recovery index to create. An interleaved set is cut into
+    /// rows of one index per cohort, so this must start a row: a value that is
+    /// not a multiple of the cohort count is refused.
     pub first_recovery: u64,
-    /// Number of recovery packets to create.
+    /// Number of recovery packets to create. An interleaved set can only be
+    /// asked for whole rows, so this must be a multiple of the cohort count.
     pub recovery_count: u64,
     /// Repeated-data treatment.
     pub deduplication: Deduplication,
@@ -167,7 +172,13 @@ pub struct CreationPlan {
     id: InputSetId,
     root: Fingerprint,
     matrix: Fingerprint,
+    /// Recovery carriers as `(first row, rows)`, never as global recovery
+    /// indices: one row is one recovery index in every cohort, so a carrier
+    /// holds `rows * cohorts` Recovery Data packets and its name counts rows.
+    /// With one cohort a row is a recovery index and the two agree.
     volumes: Vec<(u64, u64)>,
+    /// Data carriers as `(first block, blocks)`. Blocks are not interleaved, so
+    /// these stay in block terms whatever the codec is.
     data_volumes: Vec<(u64, u64)>,
     requirements: CreationRequirements,
     _reservation: Reservation,
@@ -518,18 +529,29 @@ impl CreationPlan {
 
     /// Planned destination names in the same order as `requirements().output_sizes`.
     /// Each yielded path is caller-owned; no files or directories are created.
+    ///
+    /// A recovery carrier is named for the rows it holds, not for the global
+    /// recovery indices those rows expand to: `vol<first row>+<rows>`. An
+    /// interleaved set therefore names its carriers the same way a
+    /// non-interleaved one does, and a carrier of a set with `C` cohorts holds
+    /// `rows * C` Recovery Data packets. Both numbers are zero padded to the
+    /// width the largest of each reaches, so a set's names sort as text.
     pub fn output_paths<'a>(&'a self, stem: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+        let (recovery_start, recovery_count) = number_widths(&self.volumes);
+        let (data_start, data_count) = number_widths(&self.data_volumes);
         std::iter::once(suffix(stem, ".par3"))
-            .chain(
-                self.volumes
-                    .iter()
-                    .map(move |(first, count)| suffix(stem, &format!(".vol{first}+{count}.par3"))),
-            )
-            .chain(
-                self.data_volumes
-                    .iter()
-                    .map(move |(first, count)| suffix(stem, &format!(".part{first}+{count}.par3"))),
-            )
+            .chain(self.volumes.iter().map(move |(first, count)| {
+                suffix(
+                    stem,
+                    &format!(".vol{first:0recovery_start$}+{count:0recovery_count$}.par3"),
+                )
+            }))
+            .chain(self.data_volumes.iter().map(move |(first, count)| {
+                suffix(
+                    stem,
+                    &format!(".part{first:0data_start$}+{count:0data_count$}.par3"),
+                )
+            }))
     }
 
     /// Opaque identifier shared by every packet the plan will emit.
@@ -813,7 +835,13 @@ impl CreationPlan {
                 out.write_all(packet)?;
             }
             if number > 0 && number <= self.volumes.len() {
-                let (first, count) = self.volumes[number - 1];
+                // The carrier holds whole rows: every cohort's recovery index
+                // for each of its rows, which is one contiguous run of global
+                // indices because a row's indices are adjacent.
+                let (first_row, rows) = self.volumes[number - 1];
+                let cohorts = self.requirements.cohorts;
+                let first = first_row * cohorts;
+                let count = rows * cohorts;
                 for index in first..first + count {
                     let mut prefix = Vec::with_capacity(40);
                     prefix.extend_from_slice(&self.root);
@@ -1190,6 +1218,19 @@ impl CreationPlan {
         Ok(())
     }
 
+    /// Lay the payload packets out into carriers.
+    ///
+    /// Recovery carriers are cut by row, not by global recovery index: a row is
+    /// one recovery index in each of the set's cohorts, so a carrier of `rows`
+    /// rows holds `rows * cohorts` Recovery Data packets and is named for its
+    /// rows. A row is indivisible — a cohort's share of a row cannot be
+    /// recovered without the others being addressable under the same name — so
+    /// the requested recovery range has to be a whole number of rows, and a
+    /// carrier size limit that cannot fit one whole row is refused rather than
+    /// quietly rounded down to a partial one. With a single cohort a row is a
+    /// recovery index and the arithmetic collapses to the plain case.
+    ///
+    /// Data carriers are cut by block; blocks are never interleaved.
     fn plan_volumes(&mut self) -> EngineResult<()> {
         if let VolumeLayout::SizeLimited(bytes) = self.options.volumes
             && bytes < self.requirements.metadata_bytes
@@ -1198,18 +1239,28 @@ impl CreationPlan {
                 "volume limit is smaller than metadata",
             ));
         }
+        let cohorts = self.requirements.cohorts;
+        if !self.options.first_recovery.is_multiple_of(cohorts)
+            || !self.options.recovery_count.is_multiple_of(cohorts)
+        {
+            return Err(EngineError::InvalidState(
+                "interleaved recovery range is not a whole number of rows",
+            ));
+        }
         self.requirements
             .output_sizes
             .push(self.requirements.metadata_bytes);
-        for (extra, mut first, mut remaining, volumes) in [
+        for (extra, per_unit, mut first, mut remaining, volumes) in [
             (
                 88,
-                self.options.first_recovery,
-                self.options.recovery_count,
+                cohorts,
+                self.options.first_recovery / cohorts,
+                self.options.recovery_count / cohorts,
                 &mut self.volumes,
             ),
             (
                 56,
+                1,
                 0,
                 if self.options.store_data {
                     self.blocks.len() as u64
@@ -1224,11 +1275,13 @@ impl CreationPlan {
                 .block_size
                 .checked_add(extra)
                 .ok_or(EngineError::resource_limit("payload packet size"))?;
+            // Both layout limits are stated in payload packets, so they are
+            // divided down into whole units before anything is cut.
             let cap = match self.options.volumes {
                 VolumeLayout::Variable => u64::MAX,
-                VolumeLayout::Uniform(count) => count,
+                VolumeLayout::Uniform(count) => count / per_unit,
                 VolumeLayout::SizeLimited(bytes) => {
-                    bytes.saturating_sub(self.requirements.metadata_bytes) / packet
+                    bytes.saturating_sub(self.requirements.metadata_bytes) / packet / per_unit
                 }
             };
             if cap == 0 && remaining != 0 {
@@ -1251,6 +1304,7 @@ impl CreationPlan {
                         .checked_add(
                             packet
                                 .checked_mul(count)
+                                .and_then(|bytes| bytes.checked_mul(per_unit))
                                 .ok_or(EngineError::resource_limit("volume size"))?,
                         )
                         .ok_or(EngineError::resource_limit("volume size"))?,
@@ -1273,6 +1327,16 @@ fn validate_name(name: &str) -> EngineResult<()> {
     crate::paths::validate_relative_path(name)?;
     Ok(())
 }
+/// How wide the two numbers in a carrier name are written, zero padded: the
+/// width of the last carrier's starting number and the width of the largest
+/// count any carrier reaches.
+fn number_widths(volumes: &[(u64, u64)]) -> (usize, usize) {
+    let decimal = |value: u64| value.to_string().len();
+    let start = volumes.last().map_or(0, |(first, _)| *first);
+    let count = volumes.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    (decimal(start), decimal(count))
+}
+
 fn suffix(stem: &Path, suffix: &str) -> PathBuf {
     let mut name = stem.as_os_str().to_os_string();
     name.push(suffix);

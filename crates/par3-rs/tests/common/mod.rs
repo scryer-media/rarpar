@@ -1531,8 +1531,9 @@ pub fn many_block_set(
     let mut options = CreationOptions {
         block_size: 64,
         recovery_count: recovery,
-        // One recovery block per carrier, so carrier count scales with recovery.
-        volumes: VolumeLayout::Uniform(1),
+        // One recovery row per carrier — every cohort's share of one index —
+        // so carrier count scales with the recovery the set was asked for.
+        volumes: VolumeLayout::Uniform(interleave + 1),
         codec: CreationCodec::Fft {
             capacity_log2,
             interleave,
