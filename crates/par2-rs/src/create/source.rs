@@ -1215,7 +1215,7 @@ impl ForwardSourceObserver for FusedSourceHasher<'_> {
 ///
 /// Both are single serial MD5 streams over the entire file, so neither can be
 /// laned: multi-buffer widens a batch of independent messages, not one message.
-/// They stay scalar (the aws-lc backend when built with `native-crypto`) while
+/// They stay scalar (the aws-lc backend when built with `crypto-aws-lc`) while
 /// the per-slice digests beside them go through the SIMD kernel.
 fn absorb_file_stream(
     full_hash: &mut FileHashState,

@@ -808,7 +808,13 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
 
 fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
-    require_feature(metadata, "par2-rs", "native-crypto")?;
+    // The libraries resolve a crypto backend from the feature list the build
+    // actually carries. A shipped artifact must resolve AWS-LC on both of
+    // them, and must say so explicitly: `runtime` no longer implies it, so a
+    // matrix entry that drops `crypto-aws-lc` would otherwise fall back to the
+    // RustCrypto backend without a word.
+    require_feature(metadata, "rarpar", "crypto-aws-lc")?;
+    require_feature(metadata, "par2-rs", "crypto-aws-lc")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
 
     let aws_lc_versions = resolved_package_versions(metadata, "aws-lc-sys");
@@ -1576,6 +1582,32 @@ mod tests {
     }
 
     #[test]
+    fn feature_audit_rejects_a_build_that_resolved_the_rustcrypto_backend() {
+        // A matrix entry that forgets `crypto-aws-lc` still builds and still
+        // passes its tests -- it just ships the portable backend. The audit is
+        // the only thing standing between that mistake and a release.
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime".to_owned(),
+        };
+        let mut metadata = feature_metadata(&["0.42.0"]);
+        for package in ["rarpar", "par2-rs", "unrar-rs"] {
+            metadata
+                .resolve
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == package)
+                .expect("test package node")
+                .features
+                .retain(|feature| feature != "crypto-aws-lc");
+        }
+        let error = audit_feature_metadata(&metadata, &options)
+            .expect_err("a build without the AWS-LC backend must fail the audit");
+        assert!(error.to_string().contains("crypto-aws-lc"));
+    }
+
+    #[test]
     fn feature_audit_rejects_metal_on_apple_silicon() {
         let options = FeatureAuditOptions {
             manifest: PathBuf::from("Cargo.toml"),
@@ -1789,12 +1821,12 @@ mod tests {
         let mut nodes = vec![
             CargoNode {
                 id: "rarpar".to_owned(),
-                features: vec!["runtime".to_owned()],
+                features: vec!["runtime".to_owned(), "crypto-aws-lc".to_owned()],
                 deps: deps(&["par2-rs", "unrar-rs", "reedsolomon-rs"]),
             },
             CargoNode {
                 id: "par2-rs".to_owned(),
-                features: vec!["native-crypto".to_owned()],
+                features: vec!["crypto-aws-lc".to_owned()],
                 deps: deps(&["reedsolomon-rs"]),
             },
             CargoNode {

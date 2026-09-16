@@ -139,11 +139,33 @@ verification.
 - Path sanitisation against traversal, and header-declared limits that bound
   allocation.
 
+## Crypto backend
+
+The AES-CBC / HMAC-SHA256 seam has two interchangeable backends, chosen at
+compile time.
+
+- `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing. Building it
+  compiles `aws-lc-rs` and `aws-lc-sys`, which need a C toolchain, and it is
+  the configuration the performance figures below were measured with.
+- `crypto-rust`: the pure-Rust `aes`, `cbc`, `sha2` and `hmac` backend. No C or
+  assembly dependency, and the backend for targets where AWS-LC does not build,
+  `wasm` among them. Expect slower decryption; extraction results are
+  unchanged.
+
+To opt out of AWS-LC:
+
+```toml
+unrar-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
+```
+
+`native-crypto` stays as an alias for `crypto-aws-lc`, so dependency
+declarations written against the old name keep resolving to the same backend.
+On a native target, enabling neither backend is a compile error rather than a
+silent choice; enabling both keeps AWS-LC active and compiles the pure-Rust
+backend beside it for the differential tests.
+
 ## Feature flags
 
-- `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
-- `crypto-rust`: pure-Rust AES, CBC, SHA-2, and HMAC backend for targets where
-  AWS-LC does not build.
 - `crypto-host`: on `wasm32`, delegates bulk AES-CBC decryption to an
   embedder-installed hook; it implies `crypto-rust` for key derivation.
 - `crc-host`: on `wasm32`, delegates bulk member CRC-32 to an

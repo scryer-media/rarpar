@@ -23,8 +23,8 @@ appropriate unreleased version instead of incrementing it for every follow-up.
 Version preparation does not publish packages or authorize tags or deployment.
 
 For the advanced PAR3 engine, the current versions are `reedsolomon-rs` 0.4.5,
-`par3-rs` 0.4.2, and binary `rarpar` 0.5.0, against `unrar-rs` 0.10.5 and
-`par2-rs` 0.10.2. PAR3 requires arithmetic 0.4.5 and the CLI requires PAR3
+`par3-rs` 0.4.2, and binary `rarpar` 0.5.1, against `unrar-rs` 0.10.6 and
+`par2-rs` 0.10.3. PAR3 requires arithmetic 0.4.5 and the CLI requires PAR3
 0.4.2. The CLI names each sibling library by workspace path together with
 that version floor, so the binary is always built from the tree being tagged
 while the floor still records the published release it corresponds to. Keep

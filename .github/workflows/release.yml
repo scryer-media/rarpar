@@ -231,49 +231,49 @@ jobs:
             runs_on: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: true
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: true
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             archive_ext: zip
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
             archive_ext: zip
-            features: runtime
+            features: runtime,crypto-aws-lc
             package_root: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -465,6 +465,39 @@ jobs:
             --target ${{ matrix.target }} `
             --target-dir $env:RARPAR_RELEASE_TARGET_DIR 2>&1 `
             | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
+      - name: Confirm the built artifact links AWS-LC (Unix)
+        # The feature audit reads the resolver's feature sets; this reads the
+        # dependency graph of the exact feature list that was just built. Both
+        # have to agree that `aws-lc-sys` is in it before the binary ships: a
+        # matrix entry that lost `crypto-aws-lc` would otherwise build, test
+        # and release a RustCrypto binary without a word.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="logs/rarpar-${{ matrix.platform }}-tree.log"
+          cargo tree --locked -e normal \
+            --manifest-path "$RARPAR_RELEASE_SOURCE/Cargo.toml" \
+            --no-default-features --features "${{ matrix.features }}" \
+            --target "${{ matrix.target }}" > "$log"
+          if ! grep -q aws-lc-sys "$log"; then
+            echo "::error::release build resolved no aws-lc-sys; the crypto backend regressed to RustCrypto"
+            exit 1
+          fi
+      - name: Confirm the built artifact links AWS-LC (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
+          $log = "logs\rarpar-${{ matrix.platform }}-tree.log"
+          cargo tree --locked -e normal `
+            --manifest-path $manifest `
+            --no-default-features --features ${{ matrix.features }} `
+            --target ${{ matrix.target }} | Out-File -Encoding utf8 $log
+          if (-not (Select-String -Path $log -Pattern "aws-lc-sys" -Quiet)) {
+            throw "release build resolved no aws-lc-sys; the crypto backend regressed to RustCrypto"
+          }
       - name: Generate manpage and completions
         shell: bash
         run: cargo run --locked -p xtask -- docs --out target/dist/docs

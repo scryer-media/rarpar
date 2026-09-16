@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.3 (unreleased)
+
+### Changed
+
+- The MD5 backend is now named by a pair of features instead of one. The
+  AWS-LC backend is `crypto-aws-lc` and stays on by default; `crypto-rust`
+  selects the portable RustCrypto (`md-5`) backend for builds that must carry
+  no C or assembly dependency, and is the backend `wasm` has always used.
+  `native-crypto` remains as an alias for `crypto-aws-lc`, so existing
+  dependency declarations resolve to exactly the same backend they did before.
+  A default build is unchanged: the same `aws-lc-sys` MD5 calls, reached the
+  same way, with only the `cfg` attribute renamed.
+- A native build that names neither backend is now a compile error naming both
+  features, rather than a silent fall back to the RustCrypto backend. On
+  `wasm`, where the AWS-LC dependency is target-gated away, `crypto-rust`
+  stays the only backend and is still selected without being asked.
+- On native targets `md-5` is now reachable only through `crypto-rust`. A
+  default build links the AWS-LC backend alone; the RustCrypto backend and
+  its crate are compiled only when that feature is on. On `wasm` nothing
+  changes: `md-5` stays unconditional there, so a wasm build that names no
+  feature keeps the backend it always had. The test suite keeps `md-5` as a
+  dev-dependency so the AWS-LC binding is still checked against an
+  independent MD5 on every build.
+
 ## 0.10.2
 
 The short-block relocation sweep now costs what a damaged candidate is worth,

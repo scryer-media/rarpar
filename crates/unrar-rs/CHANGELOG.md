@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.10.5 (unreleased)
+## 0.10.6 (unreleased)
+
+### Changed
+
+- The crypto backend features are documented as the supported way to opt out
+  of AWS-LC: `crypto-aws-lc` stays on by default, `crypto-rust` selects the
+  pure-Rust AES/CBC/SHA-2/HMAC backend for builds that must carry no C or
+  assembly dependency, and `native-crypto` remains an alias for
+  `crypto-aws-lc`. No feature, dependency, backend precedence or code path
+  changed; a default build is byte-for-byte the build it was.
+
+## 0.10.5
 
 ### Added
 

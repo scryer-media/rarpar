@@ -78,7 +78,18 @@
 //!
 //! # Feature flags
 //!
-//! - `native-crypto` *(default)*: AWS-LC-backed MD5.
+//! - `crypto-aws-lc` *(default)*: AWS-LC-backed MD5. Needs a C toolchain to
+//!   build `aws-lc-sys`, and is the configuration the published performance
+//!   figures were measured with.
+//! - `crypto-rust`: the portable RustCrypto (`md-5`) MD5 backend, for builds
+//!   that must not carry a C/assembly dependency and for `wasm`, where AWS-LC
+//!   is unavailable. Select it with
+//!   `default-features = false, features = ["crypto-rust"]`. Expect slower
+//!   hashing; nothing else changes.
+//! - `native-crypto`: back-compat alias for `crypto-aws-lc`.
+//!
+//!   Exactly one backend is active: on a native target AWS-LC wins whenever
+//!   `crypto-aws-lc` is on, and enabling neither backend is a compile error.
 //! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], with
 //!   repair fallback to CPU when no suitable device or driver is present. The
 //!   `metal` feature also enables policy-driven creation on native Apple
@@ -117,7 +128,7 @@
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
 #[cfg(all(
-    feature = "native-crypto",
+    feature = "crypto-aws-lc",
     not(any(
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "aarch64", target_os = "macos"),
@@ -130,7 +141,20 @@
     ))
 ))]
 compile_error!(
-    "par2-rs native-crypto only supports x86_64/aarch64 on macOS, Linux GNU/musl, and Windows MSVC"
+    "par2-rs crypto-aws-lc only supports x86_64/aarch64 on macOS, Linux GNU/musl, and Windows MSVC"
+);
+
+// A native build must name a backend rather than silently taking one. On wasm
+// the AWS-LC dependency is target-gated away, so `crypto-rust` is the only
+// possibility and the crate selects it without being asked.
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "crypto-aws-lc"),
+    not(feature = "crypto-rust")
+))]
+compile_error!(
+    "par2-rs needs a crypto backend: enable feature `crypto-aws-lc` (default) \
+     or `crypto-rust` (portable, no C toolchain)."
 );
 
 pub mod checksum;
