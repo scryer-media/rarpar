@@ -25,13 +25,14 @@ Version preparation does not publish packages or authorize tags or deployment.
 For the advanced PAR3 engine, the current versions are `reedsolomon-rs` 0.4.5,
 `par3-rs` 0.4.2, and binary `rarpar` 0.5.0, against `unrar-rs` 0.10.5 and
 `par2-rs` 0.10.2. PAR3 requires arithmetic 0.4.5 and the CLI requires PAR3
-0.4.2. All four libraries are published at those versions, so no `[patch]`
-entry stands in for one and a packaged CLI build outside the workspace
-resolves them from the registry unchanged. Cargo can still verify sibling
+0.4.2. The CLI names each sibling library by workspace path together with
+that version floor, so the binary is always built from the tree being tagged
+while the floor still records the published release it corresponds to. Keep
+the two in step: raising a floor without publishing that version leaves a
+manifest that only the workspace can satisfy. Cargo verifies the sibling
 library archives with `cargo package --locked -p reedsolomon-rs -p par3-rs`;
 that validates the packages together, not their availability in the public
-registry. Reinstate a workspace patch only while a library the CLI requires is
-again prospective, and remove it once that version is published.
+registry.
 
 Patch releases may publish a single library crate when only that crate changed.
 Use the dependency order above for coordinated multi-crate releases.

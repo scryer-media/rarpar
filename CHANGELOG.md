@@ -81,9 +81,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 Every library the binary needs is now on crates.io at the version the workspace
 carries, so the `[patch.crates-io]` block that stood in for the unpublished PAR3
-engine and its arithmetic is gone: a packaged `rarpar` build made outside the
-workspace resolves `unrar-rs` 0.10.5, `par2-rs` 0.10.2, `par3-rs` 0.4.2 and
-`reedsolomon-rs` 0.4.5 from the registry with no local substitution.
+engine and its arithmetic is gone. The CLI now names `unrar-rs`, `par2-rs` and
+`par3-rs` by workspace path alongside the 0.10.5, 0.10.2 and 0.4.2 floors, so a
+tagged binary is built from the tree it was cut from and the floors can no
+longer drift silently behind the libraries beside them.
 
 ## rarpar 0.4.1
 

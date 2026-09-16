@@ -839,6 +839,7 @@ fn interleaved_first_recovery_inside_a_row_is_a_usage_error() {
 }
 
 #[test]
+#[cfg(not(windows))] // the host itself refuses to create the reserved name
 fn an_unsafe_protected_name_is_refused_as_an_unsafe_operation() {
     // A reserved device name is one this platform's repair could never write,
     // so creation refuses it before it writes a byte of the set, and that is a
