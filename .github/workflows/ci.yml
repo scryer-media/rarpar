@@ -384,7 +384,10 @@ jobs:
           cargo build --locked -p par2-rs --no-default-features --features crypto-rust
       - name: Build par2-rs for wasm with no feature named
         # RustCrypto is the only backend wasm can have, so a wasm consumer
-        # that names no feature must keep compiling.
+        # that names no feature must keep compiling. The wasm linker is
+        # rust-lld, which does not take the mold flag the native steps use.
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
         run: cargo build --locked -p par2-rs --no-default-features --target wasm32-wasip1 --example wasm_par2_check
       - name: Confirm the RustCrypto build links no AWS-LC
         run: |
