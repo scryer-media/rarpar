@@ -33,6 +33,31 @@ fn input(root: &Path, name: &str) -> Vec<u8> {
     bytes
 }
 
+/// Zero the payload of every Recovery Data packet in `path` whose recovery
+/// block index `select`s, leaving the other packets and the file's shape alone.
+fn damage_recovery_blocks(path: &Path, select: impl Fn(u64) -> bool) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let mut damaged = 0;
+    for (offset, packet) in par3_rs::scan_packets_from_path(path).unwrap() {
+        let par3_rs::PacketBody::RecoveryData(recovery) = packet.body() else {
+            continue;
+        };
+        if !select(recovery.recovery_block_index) {
+            continue;
+        }
+        let start = offset as usize + par3_rs::HEADER_SIZE;
+        let end = offset as usize + packet.len() as usize;
+        bytes[start..end].fill(0);
+        damaged += 1;
+    }
+    assert!(
+        damaged > 0,
+        "no selected recovery blocks in {}",
+        path.display()
+    );
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[test]
 fn many_carriers_keep_handle_headroom_for_verify_and_repair() {
     let temp = tempfile::tempdir().unwrap();
@@ -450,7 +475,7 @@ fn fft_auto_repairs_missing_input_with_interleaved_recovery() {
             "--interleave",
             "1",
             "--volume-blocks",
-            "1",
+            "2",
         ],
         0,
     );
@@ -746,12 +771,15 @@ fn fft_surplus_in_one_cohort_cannot_cover_the_other() {
             "--interleave",
             "1",
             "--volume-blocks",
-            "1",
+            "2",
         ],
         0,
     );
-    std::fs::remove_file(root.join("set.vol1+1.par3")).unwrap();
-    std::fs::remove_file(root.join("set.vol3+1.par3")).unwrap();
+    // A carrier holds one whole row, one recovery block per cohort, so a
+    // cohort's recovery can only be lost inside the carriers, not with them.
+    for name in ["set.vol0+1.par3", "set.vol1+1.par3"] {
+        damage_recovery_blocks(&root.join(name), |index| index % 2 == 1);
+    }
     std::fs::remove_file(root.join("data.bin")).unwrap();
     let report = run(
         root,
