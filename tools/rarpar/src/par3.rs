@@ -827,6 +827,14 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         Par3Codec::Cauchy => Some(1),
     }
     .ok_or_else(|| RarparError::Usage("--interleave is too large".into()))?;
+    // No carrier name can describe a partial row, so the engine refuses a
+    // first index that starts inside one. Say which numbers are allowed
+    // instead of letting that refusal surface as an engine-state failure.
+    if !args.first_recovery.is_multiple_of(cohorts.max(1)) {
+        return Err(RarparError::Usage(format!(
+            "--first-recovery must be a multiple of the cohort count ({cohorts})"
+        )));
+    }
     let mut config = CreationOptions {
         execution: execution.clone(),
         block_size: args.block_size,

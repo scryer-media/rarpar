@@ -802,6 +802,66 @@ fn interleaved_recovery_counts_are_completed_to_whole_rows() {
 }
 
 #[test]
+fn interleaved_first_recovery_inside_a_row_is_a_usage_error() {
+    // No carrier name describes a partial row, so a first index that starts
+    // inside one is refused as a command-line error naming the cohort count,
+    // not as an engine-state failure.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    input(root, "data.bin");
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .args([
+            "par3",
+            "create",
+            "set",
+            "data.bin",
+            "-s",
+            "256",
+            "--codec",
+            "fft",
+            "--capacity-log2",
+            "2",
+            "--interleave",
+            "1",
+            "--first-recovery",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("--first-recovery must be a multiple of the cohort count (2)"),
+        "stderr={stderr}"
+    );
+    assert!(!root.join("set.par3").exists());
+}
+
+#[test]
+fn an_unsafe_protected_name_is_refused_as_an_unsafe_operation() {
+    // A reserved device name is one this platform's repair could never write,
+    // so creation refuses it before it writes a byte of the set, and that is a
+    // rejected unsafe operation rather than a data failure.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    input(root, "con.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .args(["par3", "create", "set", "con.txt", "-s", "256"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join("set.par3").exists());
+}
+
+#[test]
 fn fft_surplus_in_one_cohort_cannot_cover_the_other() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
