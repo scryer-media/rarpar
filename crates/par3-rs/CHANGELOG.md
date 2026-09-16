@@ -1,6 +1,28 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.2 (unreleased)
+
+- **Behaviour change:** an interleaved set's recovery carriers are cut and
+  named by row, not by global recovery index. A row is one recovery index in
+  each cohort, so `vol<first row>+<rows>` of a set with `C` cohorts holds
+  `rows * C` Recovery Data packets, whose indices run from `first row * C` to
+  `(first row + rows) * C`. Carriers used to be cut on the global index, which
+  both named them in units no other implementation writes and split a single
+  row across two of them. A non-interleaved set is unchanged, since there a row
+  is a recovery index.
+- **Behaviour change:** `CreationOptions::first_recovery` and
+  `recovery_count` must now name whole rows — each a multiple of the cohort
+  count — and a range that does not is refused with
+  `EngineError::InvalidState`, since no carrier name can describe a partial
+  row. `VolumeLayout::Uniform` and `SizeLimited` are likewise rounded down to
+  whole rows, and a limit too small for one row is refused rather than silently
+  producing a carrier that splits one.
+- The advanced creation API pads both numbers in a carrier name to the width
+  the largest of each reaches, as `create` already did and as the format's
+  other producers do, so a set's carriers sort as text. A set with fewer than
+  ten carriers, and fewer than ten payload packets in each, is unaffected.
+
+## 0.4.1 (2026-09-15)
 
 - An assessment charges the vectors its matrix selection builds — the winning
   matrix's requirement list, each cohort's availability and next-index lists,

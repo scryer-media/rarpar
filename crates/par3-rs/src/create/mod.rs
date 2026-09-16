@@ -375,7 +375,9 @@ pub fn create(
     let directories = plan::directories_of(&files, &extra_directories);
     let (recovery_count, field) = plan::settle_recovery(options.recovery, map.block_count())?;
 
-    let (index_path, volumes) = write::plan_paths(output_stem, recovery_count)?;
+    // `create` builds Cauchy sets only, which have a single cohort: one
+    // recovery row is one recovery block, and volume names count both alike.
+    let (index_path, volumes) = write::plan_paths(output_stem, recovery_count, 1)?;
 
     let outcome = encode::read_inputs(&files, &map, block_size, field, recovery_count, limits)?;
     let built = packets::build(
@@ -398,6 +400,7 @@ pub fn create(
         &built,
         &outcome.recovery,
         block_size,
+        1,
         options.overwrite,
     )?;
 

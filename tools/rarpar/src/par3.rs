@@ -449,6 +449,15 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
     }
 }
 
+/// The smallest whole number of rows holding `count` recovery blocks across
+/// `cohorts`, in blocks.
+fn whole_rows(count: u64, cohorts: u64) -> Result<u64, RarparError> {
+    count
+        .div_ceil(cohorts.max(1))
+        .checked_mul(cohorts.max(1))
+        .ok_or_else(|| RarparError::Resource("recovery count overflow".into()))
+}
+
 fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(report)?);
@@ -810,6 +819,14 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         input_paths.insert(path);
         sources.push(CreationSource { name, source: id });
     }
+    // An interleaved set is cut into rows, one recovery block per cohort, so
+    // a count the operator states in blocks is taken as "at least this many"
+    // and completed to the row that holds it.
+    let cohorts = match args.codec {
+        Par3Codec::Fft => args.interleave.checked_add(1),
+        Par3Codec::Cauchy => Some(1),
+    }
+    .ok_or_else(|| RarparError::Usage("--interleave is too large".into()))?;
     let mut config = CreationOptions {
         execution: execution.clone(),
         block_size: args.block_size,
@@ -833,7 +850,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         recovery_count: if args.recovery_percent.is_some() {
             0
         } else {
-            args.recovery_count.unwrap_or(1)
+            whole_rows(args.recovery_count.unwrap_or(1), cohorts)?
         },
         deduplication: match args.dedup {
             Par3Dedup::None => Deduplication::None,
@@ -853,12 +870,14 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
     let access: Arc<dyn SourceAccess> = Arc::new(disk);
     let mut plan = CreationPlan::build(access.clone(), &sources, config.clone())?;
     if let Some(percent) = args.recovery_percent {
-        config.recovery_count = plan
-            .requirements()
-            .blocks
-            .checked_mul(u64::from(percent))
-            .ok_or_else(|| RarparError::Resource("recovery percentage overflow".into()))?
-            .div_ceil(100);
+        config.recovery_count = whole_rows(
+            plan.requirements()
+                .blocks
+                .checked_mul(u64::from(percent))
+                .ok_or_else(|| RarparError::Resource("recovery percentage overflow".into()))?
+                .div_ceil(100),
+            plan.requirements().cohorts,
+        )?;
         drop(plan);
         plan = CreationPlan::build(access, &sources, config)?;
     }
