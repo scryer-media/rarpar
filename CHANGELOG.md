@@ -22,7 +22,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library Versions
 
-- `unrar-rs` 0.10.6 and `par2-rs` 0.10.3, for the backend feature scheme above.
+- `unrar-rs` 0.10.7 and `par2-rs` 0.10.3, for the backend feature scheme above;
+  `unrar-rs` 0.10.7 also stops hashing a split streaming member with BLAKE2sp
+  when no header names one.
   `par3-rs` and `reedsolomon-rs` are unchanged; `par3-rs` has no AWS-LC code
   path at all and gains no crypto feature.
 
