@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.2 (unreleased)
 
 - **Behaviour change:** an interleaved set's recovery carriers are cut and
   named by row, not by global recovery index. A row is one recovery index in
@@ -21,6 +21,8 @@
   the largest of each reaches, as `create` already did and as the format's
   other producers do, so a set's carriers sort as text. A set with fewer than
   ten carriers, and fewer than ten payload packets in each, is unaffected.
+
+## 0.4.1 (2026-09-15)
 
 - An assessment charges the vectors its matrix selection builds — the winning
   matrix's requirement list, each cohort's availability and next-index lists,
