@@ -8,8 +8,9 @@
   AWS-LC backend is `crypto-aws-lc` and stays on by default; `crypto-rust`
   selects the portable RustCrypto (`md-5`) backend for builds that must carry
   no C or assembly dependency, and is the backend `wasm` has always used.
-  `native-crypto` remains as an alias for `crypto-aws-lc`, so existing
-  dependency declarations resolve to exactly the same backend they did before.
+  `native-crypto` remains as an alias for `crypto-aws-lc` and stays in the
+  default feature list, so existing dependency declarations and default builds
+  resolve to exactly the same backend they did before.
   A default build is unchanged: the same `aws-lc-sys` MD5 calls, reached the
   same way, with only the `cfg` attribute renamed.
 - A native build that names neither backend is now a compile error naming both
