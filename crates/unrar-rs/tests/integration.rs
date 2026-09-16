@@ -1202,6 +1202,116 @@ fn test_streaming_split_after_pack_crc_mismatch_fails() {
     ));
 }
 
+/// A two-volume stored member whose final header names only a BLAKE2sp digest
+/// while the first header names a CRC, or nothing at all: volumes that disagree
+/// on the hash type, which one archive never produces.
+fn build_two_volume_stored_archive_with_final_blake2_only(
+    filename: &str,
+    content: &[u8],
+    split_at: usize,
+    first_packed_crc: Option<u32>,
+    final_blake2: [u8; 32],
+) -> (Vec<u8>, Vec<u8>) {
+    let part1 = &content[..split_at];
+    let part2 = &content[split_at..];
+
+    let mut vol0 = Vec::new();
+    vol0.extend_from_slice(&RAR5_SIG);
+    vol0.extend_from_slice(&build_main_archive_header(0x0001, None));
+    vol0.extend_from_slice(&build_file_header_ex(
+        filename,
+        0x0010, // SPLIT_AFTER
+        part1.len() as u64,
+        content.len() as u64,
+        first_packed_crc,
+        0,
+    ));
+    vol0.extend_from_slice(part1);
+    vol0.extend_from_slice(&build_end_header(true));
+
+    let mut hash_body = Vec::new();
+    hash_body.extend_from_slice(&encode_vint(0)); // BLAKE2sp
+    hash_body.extend_from_slice(&final_blake2);
+    let extra = build_extra_record(0x02, &hash_body);
+
+    let mut vol1 = Vec::new();
+    vol1.extend_from_slice(&RAR5_SIG);
+    vol1.extend_from_slice(&build_main_archive_header(0x0001 | 0x0002, Some(1)));
+    vol1.extend_from_slice(&build_file_header_ex_with_extra(
+        filename,
+        0x0008, // SPLIT_BEFORE
+        part2.len() as u64,
+        content.len() as u64,
+        None,
+        0,
+        &extra,
+    ));
+    vol1.extend_from_slice(part2);
+    vol1.extend_from_slice(&build_end_header(false));
+
+    (vol0, vol1)
+}
+
+fn stream_two_volumes(vol0: &[u8], vol1: &[u8], verify: bool) -> unrar_rs::RarResult<Vec<u8>> {
+    let (_temp_dir, paths) = write_two_temp_volumes(vol0, vol1);
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0.to_vec())).unwrap();
+    let mut out = Vec::new();
+    archive.extract_member_streaming(
+        0,
+        &unrar_rs::ExtractOptions {
+            verify,
+            ..Default::default()
+        },
+        &provider,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// The running hash is typed by the first header. A first header typed as CRC
+/// and a final header typed as BLAKE2sp cannot be compared, and that is a
+/// checksum failure even when the digest the final header names is the right
+/// one, because nothing was ever hashed with it.
+#[test]
+fn test_streaming_continuation_fails_the_checksum_when_the_hash_type_changes() {
+    let content = b"the final volume alone names a hash type the first never did";
+    let split_at = 23;
+    let (vol0, vol1) = build_two_volume_stored_archive_with_final_blake2_only(
+        "late-hash.bin",
+        content,
+        split_at,
+        Some(crc32fast::hash(&content[..split_at])),
+        unrar_rs::crypto::blake2sp_hash(content),
+    );
+
+    let err = stream_two_volumes(&vol0, &vol1, true).unwrap_err();
+    assert!(
+        matches!(err, unrar_rs::RarError::Blake2Mismatch { ref member } if member == "late-hash.bin"),
+        "unexpected error: {err:?}"
+    );
+
+    // Without verification the same chain copies through untouched.
+    assert_eq!(stream_two_volumes(&vol0, &vol1, false).unwrap(), content);
+}
+
+/// A first header that names no hash at all types nothing, so a final header's
+/// BLAKE2sp digest has nothing to disagree with: the member is accepted
+/// unchecked, even when that digest is wrong.
+#[test]
+fn test_streaming_continuation_accepts_a_final_blake2_when_the_first_header_names_no_hash() {
+    let content = b"the first header names no hash and the last names a digest";
+    let (vol0, vol1) = build_two_volume_stored_archive_with_final_blake2_only(
+        "untyped.bin",
+        content,
+        21,
+        None,
+        [0xAB; 32],
+    );
+
+    assert_eq!(stream_two_volumes(&vol0, &vol1, true).unwrap(), content);
+}
+
 #[test]
 fn test_streaming_continuation_final_crc_is_verified_when_first_header_has_none() {
     let content = b"streaming continuation final crc should be authoritative";

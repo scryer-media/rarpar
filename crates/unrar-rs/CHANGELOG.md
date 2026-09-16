@@ -1,6 +1,26 @@
 # Changelog
 
-## 0.10.6 (unreleased)
+## 0.10.7 (unreleased)
+
+### Changed
+
+- A streaming member's BLAKE2sp digest is computed only when its first header
+  names one. Until now a member that continued into another volume was hashed
+  with BLAKE2sp on the chance that a later volume's header would introduce a
+  digest the first did not carry; a RAR archive commits to one hash type for
+  the whole file and repeats it in every volume's header of a split member, so
+  no later header can. Extracting a split, CRC-only member no longer pays a
+  second full pass over its bytes — one whose eight BLAKE2s leaves share a
+  single vector state, so it runs at one worker's rate and the copy stalls
+  behind it. Checksum coverage is unchanged: the whole-file CRC still arrives
+  with the final volume's header and is still verified, and a header that does
+  name a BLAKE2sp digest is still hashed and compared.
+  A chain whose final volume names a BLAKE2sp digest while the first header
+  named a CRC fails verification as a BLAKE2sp mismatch, the two volumes
+  having disagreed on the hash type; a first header that named no hash at all
+  accepts the member unchecked. Both follow the reference decoder.
+
+## 0.10.6
 
 ### Changed
 
