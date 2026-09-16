@@ -28,7 +28,10 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 # independent MD5 to check the AWS-LC binding against, which is why `md-5`
 # also appears under `[dev-dependencies]`: consumers never see that edge.
 [features]
-default = ["crypto-aws-lc"]
+# `native-crypto` stays in the default list: it was the default feature before
+# the backends were named, and a consumer that reached the AWS-LC backend
+# through the defaults must keep seeing it enabled.
+default = ["crypto-aws-lc", "native-crypto"]
 crypto-aws-lc = ["dep:aws-lc-sys"]
 crypto-rust = ["dep:md-5"]
 # Back-compat alias for dependency declarations written before the backends
