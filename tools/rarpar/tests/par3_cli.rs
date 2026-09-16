@@ -749,6 +749,59 @@ fn auto_restores_rar_before_extraction_and_cleans_only_consumed_carriers() {
 }
 
 #[test]
+fn interleaved_recovery_counts_are_completed_to_whole_rows() {
+    // Four blocks over two cohorts: 25% asks for one block, which is half a
+    // row, and an explicit three is one and a half.
+    for (flag, value) in [("-r", "25"), ("-c", "3"), ("-c", "1")] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let bytes = input(root, "data.bin");
+        let created = run(
+            root,
+            &[
+                "par3",
+                "create",
+                "set",
+                "data.bin",
+                "-s",
+                "256",
+                flag,
+                value,
+                "--codec",
+                "fft",
+                "--capacity-log2",
+                "2",
+                "--interleave",
+                "1",
+            ],
+            0,
+        );
+        assert_eq!(created["cohorts"], 2, "{flag} {value}");
+        let outputs: Vec<_> = created["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_string())
+            .collect();
+        let rows = if value == "3" { 2 } else { 1 };
+        let carried: u64 = outputs
+            .iter()
+            .filter_map(|path| path.rsplit_once('+'))
+            .map(|(_, tail)| tail.trim_end_matches(".par3").parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(carried, rows, "{flag} {value}: {outputs:?}");
+        // Two rows hold a whole cohort's two blocks; one row does not.
+        std::fs::remove_file(root.join("data.bin")).unwrap();
+        let report = run(root, &["par3", "repair", "set.par3"], i32::from(rows == 1));
+        if rows == 2 {
+            assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
+        } else {
+            assert_eq!(report["status"], "NeedRecovery", "{flag} {value}");
+        }
+    }
+}
+
+#[test]
 fn fft_surplus_in_one_cohort_cannot_cover_the_other() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

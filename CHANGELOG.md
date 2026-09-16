@@ -5,6 +5,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.0 (unreleased)
 
+- Require `par3-rs` 0.4.2, whose interleaved recovery carriers are cut and
+  named by row. `par3 create` completes a recovery count or percentage to the
+  whole rows that hold it when `--interleave` is set, so a request that is not
+  a multiple of the cohort count no longer fails.
 - Require `par3-rs` 0.4.0 for bounded parallel source verification and adaptive
   aligned repair stripes. The CLI remains at its existing prospective 0.5.0;
   this change introduces no CLI options or third-party dependency changes.

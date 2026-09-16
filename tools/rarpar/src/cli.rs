@@ -190,10 +190,10 @@ pub struct Par3CreateArgs {
     /// Logical block size in bytes.
     #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..))]
     pub block_size: u64,
-    /// Exact number of global recovery packets (defaults to one).
+    /// Number of global recovery packets (defaults to one); an interleaved set rounds up to whole rows.
     #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
     pub recovery_count: Option<u64>,
-    /// Recovery percentage of logical blocks after deduplication; planning requires a second source pass.
+    /// Recovery percentage of logical blocks after deduplication, rounded up to whole rows when interleaved; planning requires a second source pass.
     #[arg(short = 'r', long, conflicts_with = "recovery_count")]
     pub recovery_percent: Option<u32>,
     #[arg(long, value_enum, default_value_t = Par3Codec::Cauchy)]
