@@ -948,3 +948,77 @@ fn archive_decode_modes_match_across_families_and_providers() {
         }
     }
 }
+
+/// A split store member whose headers carry a CRC and no BLAKE2sp digest, read
+/// the way a caller with only the first volume in hand reads it: the archive is
+/// opened from volume one alone, so the member is `split_after`, and every
+/// later volume arrives through the provider.
+///
+/// Verification has to come out clean. The whole-file CRC only arrives with the
+/// final volume's header, so it is folded as the copy runs; BLAKE2sp is never
+/// named by any of these headers and so must never be computed, and the final
+/// header must not be able to fail a member on a digest nobody asked for.
+const CRC_ONLY_SPLIT_STORE: &[&str] = &[
+    "generated_matrix_rar5_store_plain.part1.rar",
+    "generated_matrix_rar5_store_plain.part2.rar",
+    "generated_matrix_rar5_store_plain.part3.rar",
+    "generated_matrix_rar5_store_plain.part4.rar",
+    "generated_matrix_rar5_store_plain.part5.rar",
+    "generated_matrix_rar5_store_plain.part6.rar",
+    "generated_matrix_rar5_store_plain.part7.rar",
+];
+
+#[test]
+fn crc_only_split_store_verifies_when_opened_from_the_first_volume() {
+    let paths: Vec<PathBuf> = CRC_ONLY_SPLIT_STORE
+        .iter()
+        .map(|name| fixture_root().join("rar5").join(name))
+        .collect();
+    if paths.iter().any(|path| !path.exists()) {
+        eprintln!("skipping test: crc-only split store fixtures not present");
+        return;
+    }
+
+    // The reference: the same member read with every volume attached.
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
+        .iter()
+        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
+        .collect();
+    let mut attached = RarArchive::open_volumes(readers).unwrap();
+    let expected = attached
+        .extract_member(
+            0,
+            &ExtractOptions {
+                verify: true,
+                password: None,
+                restore_owners: false,
+            },
+            None,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    // Opened from the first volume only.
+    let mut archive = RarArchive::open(File::open(&paths[0]).unwrap()).unwrap();
+    let info = archive.entries().next().expect("one member");
+    assert!(
+        info.crc32.is_some(),
+        "the fixture's first header must carry a CRC"
+    );
+    assert!(
+        info.hash.is_none(),
+        "the fixture must carry no BLAKE2sp digest"
+    );
+
+    let provider = StaticVolumeProvider::from_ordered(paths.clone());
+    let mut actual = Vec::new();
+    let written = archive
+        .by_index_via(0, &provider)
+        .unwrap()
+        .copy_to(&mut actual)
+        .expect("a crc-only split store member verifies clean");
+
+    assert_eq!(written as usize, expected.len());
+    assert_eq!(actual, expected);
+}

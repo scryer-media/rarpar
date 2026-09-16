@@ -5846,9 +5846,8 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
 
         self.advance_solid_cursor_to_streaming(index, fh, provider, options.password.as_deref())?;
 
@@ -5869,8 +5868,9 @@ impl RarArchive {
         let unpacked_size = self.target_unpacked_size(fh);
 
         // Hashing runs off-thread for large members (see hash_pipeline).
-        let stream_hash = (compute_crc || compute_blake2)
-            .then(|| SharedHashStream::new(compute_crc, false, compute_blake2, unpacked_size));
+        let stream_hash = hash_plan.any().then(|| {
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, unpacked_size)
+        });
         let (written, actual_crc, actual_blake) = {
             let mut hash_writer = HashTrackingWriter {
                 inner: writer,
@@ -6001,13 +6001,13 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
 
         // Wrap in DecryptingReader if encrypted, otherwise read directly.
         // Hashing runs off-thread for large members (see hash_pipeline).
-        let stream_hash = SharedHashStream::new(compute_crc, false, compute_blake2, _unpacked_size);
+        let stream_hash =
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, _unpacked_size);
         let mut written = 0u64;
 
         // For declared Store members, use the unpacked size to avoid copying
@@ -6168,12 +6168,12 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
         // Hashing runs off-thread for large members (see hash_pipeline).
-        let stream_hash = (compute_crc || compute_blake2)
-            .then(|| SharedHashStream::new(compute_crc, false, compute_blake2, unpacked_size));
+        let stream_hash = hash_plan.any().then(|| {
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, unpacked_size)
+        });
         let mut hash_writer = HashTrackingWriter {
             inner: writer,
             hash: stream_hash.clone(),
@@ -6409,11 +6409,11 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
         // Hashing runs off-thread for large members (see hash_pipeline).
-        let stream_hash = SharedHashStream::new(compute_crc, false, compute_blake2, _unpacked_size);
+        let stream_hash =
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, _unpacked_size);
 
         let store_limit = self.store_copy_limit(fh);
 
@@ -6589,11 +6589,11 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
-        let shared_hash = (compute_crc || compute_blake2)
-            .then(|| SharedHashStream::new(compute_crc, false, compute_blake2, unpacked_size));
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
+        let shared_hash = hash_plan.any().then(|| {
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, unpacked_size)
+        });
 
         let chunks = if let Some(pwd) = password {
             if self.format.is_rar4_family() {
@@ -6765,11 +6765,11 @@ impl RarArchive {
         } else {
             None
         };
-        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
-        let compute_blake2 = expected_blake.is_some()
-            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
-        let shared_hash = (compute_crc || compute_blake2)
-            .then(|| SharedHashStream::new(compute_crc, false, compute_blake2, unpacked_size));
+        let hash_plan =
+            streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
+        let shared_hash = hash_plan.any().then(|| {
+            SharedHashStream::new(hash_plan.crc32, false, hash_plan.blake2sp, unpacked_size)
+        });
 
         let chunks = if self.format == ArchiveFormat::Rar5 {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6926,6 +6926,52 @@ impl<W: Write> Write for HashTrackingWriter<W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// Which whole-file hashes a streaming extraction has to compute as it copies
+/// or decodes a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingHashPlan {
+    crc32: bool,
+    blake2sp: bool,
+}
+
+impl StreamingHashPlan {
+    /// True when at least one hash is wanted, so a caller can skip building a
+    /// hash stream at all.
+    fn any(self) -> bool {
+        self.crc32 || self.blake2sp
+    }
+}
+
+/// Decide which whole-file hashes to compute for a streaming member.
+///
+/// `expected_crc` and `expected_blake` are what the member's *first* header
+/// carries, already reduced to `None` when verification is off.
+///
+/// The CRC is computed even when the first header carries none, as long as the
+/// member continues into another volume: for a split member the first header's
+/// checksum covers only that volume's packed data, and the whole-file CRC
+/// arrives with the final volume's header, so it has to be folded as the data
+/// goes past.
+///
+/// BLAKE2sp has no such rule. A RAR archive commits to one hash type for the
+/// whole file and repeats that hash in every volume's header of a split member
+/// — which is what the per-volume packed verification already relies on — so a
+/// final header cannot introduce a BLAKE2sp digest the first header did not
+/// carry. Computing it on the chance that it might costs a second full pass
+/// over every byte, and BLAKE2sp's eight leaves share one vector state, so that
+/// pass runs at a single worker's rate and the copy stalls behind it.
+fn streaming_hash_plan(
+    expected_crc: Option<u32>,
+    expected_blake: Option<[u8; 32]>,
+    verify: bool,
+    split_after: bool,
+) -> StreamingHashPlan {
+    StreamingHashPlan {
+        crc32: expected_crc.is_some() || (verify && split_after),
+        blake2sp: expected_blake.is_some(),
     }
 }
 
@@ -7583,6 +7629,116 @@ mod tests {
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
     use std::io::{Cursor, Read};
     use std::sync::Arc;
+
+    const SAMPLE_BLAKE2: [u8; 32] = [0x5a; 32];
+
+    /// A split member whose header carries only a CRC keeps folding the CRC —
+    /// the first header's value covers that volume's packed data, the
+    /// whole-file value arrives with the final header — and computes no
+    /// BLAKE2sp, because a header that names no BLAKE2sp digest never gains one
+    /// in a later volume.
+    #[test]
+    fn streaming_hash_plan_crc_only_split_skips_blake2() {
+        let plan = streaming_hash_plan(Some(0x1234_5678), None, true, true);
+        assert_eq!(
+            plan,
+            StreamingHashPlan {
+                crc32: true,
+                blake2sp: false,
+            }
+        );
+        assert!(plan.any());
+    }
+
+    /// A split member with no checksum at all in its first header still needs
+    /// the CRC folded, so the final volume's whole-file value has something to
+    /// compare against.
+    #[test]
+    fn streaming_hash_plan_split_without_first_header_checksum_still_folds_crc() {
+        assert_eq!(
+            streaming_hash_plan(None, None, true, true),
+            StreamingHashPlan {
+                crc32: true,
+                blake2sp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_hash_plan_crc_only_unsplit_computes_crc_alone() {
+        assert_eq!(
+            streaming_hash_plan(Some(0x1234_5678), None, true, false),
+            StreamingHashPlan {
+                crc32: true,
+                blake2sp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_hash_plan_blake2_split_computes_both() {
+        assert_eq!(
+            streaming_hash_plan(Some(0x1234_5678), Some(SAMPLE_BLAKE2), true, true),
+            StreamingHashPlan {
+                crc32: true,
+                blake2sp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_hash_plan_blake2_unsplit_computes_blake2_alone() {
+        assert_eq!(
+            streaming_hash_plan(None, Some(SAMPLE_BLAKE2), true, false),
+            StreamingHashPlan {
+                crc32: false,
+                blake2sp: true,
+            }
+        );
+    }
+
+    /// With verification off the caller hands down no expected values, and a
+    /// split member is no reason to hash anything.
+    #[test]
+    fn streaming_hash_plan_without_verify_computes_nothing() {
+        let plan = streaming_hash_plan(None, None, false, true);
+        assert_eq!(
+            plan,
+            StreamingHashPlan {
+                crc32: false,
+                blake2sp: false,
+            }
+        );
+        assert!(!plan.any());
+    }
+
+    /// RAR4 has no BLAKE2sp record at all, so its split members read exactly
+    /// like a CRC-only RAR5 one.
+    #[test]
+    fn streaming_hash_plan_rar4_split_computes_crc_alone() {
+        assert_eq!(
+            streaming_hash_plan(Some(0xdead_beef), None, true, true),
+            StreamingHashPlan {
+                crc32: true,
+                blake2sp: false,
+            }
+        );
+    }
+
+    /// Nothing computed means nothing to compare: a final volume's header that
+    /// does name a BLAKE2sp digest must not fail a member whose data was never
+    /// run through BLAKE2sp, because the whole-file CRC already verified it.
+    #[test]
+    fn verify_member_blake2_accepts_an_uncomputed_digest() {
+        RarArchive::verify_member_blake2(
+            "sample-member.bin",
+            Some(SAMPLE_BLAKE2),
+            None,
+            false,
+            None,
+        )
+        .expect("an expected digest with no computed digest is not a mismatch");
+    }
 
     struct TestVolumeProvider {
         data: Vec<u8>,
