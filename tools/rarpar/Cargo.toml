@@ -1,7 +1,7 @@
 [package]
 name = "rarpar"
 description = "Intelligent RAR/PAR2/PAR3 repair and extraction CLI"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # feature's own comment), and on the musl channel — the only distribution
 # for true-portable and docker — mimalloc erases the mallocng fault-storm
 # tax (measured: channel gap +5.2% -> -2.1% wall geomean).
-default = ["runtime", "musl-allocator"]
+default = ["runtime", "crypto-aws-lc", "musl-allocator"]
 runtime = [
     "dep:serde",
     "dep:serde_json",
@@ -26,10 +26,18 @@ runtime = [
     "dep:tracing-subscriber",
     "dep:par2-rs",
     "dep:par3-rs",
-    "par2-rs/native-crypto",
     "dep:unrar-rs",
-    "unrar-rs/native-crypto",
 ]
+# Crypto backend selection, forwarded to the libraries. `runtime` deliberately
+# forwards neither: a build that asks for the runtime without naming a backend
+# must fail in `par2-rs`/`unrar-rs` rather than quietly resolve to one. Every
+# shipped artifact is built with `crypto-aws-lc`, which the release feature
+# audit enforces.
+#
+# The `dep?/feature` form keeps these features inert when the libraries are not
+# linked at all, so naming a backend never drags the runtime in by itself.
+crypto-aws-lc = ["par2-rs?/crypto-aws-lc", "unrar-rs?/crypto-aws-lc"]
+crypto-rust = ["par2-rs?/crypto-rust", "unrar-rs?/crypto-rust"]
 # musl-only global allocator. The dependency is declared under a
 # `cfg(target_env = "musl")` target table, so enabling this feature is a
 # provable no-op for every non-musl target: glibc, macOS and Windows builds
@@ -37,9 +45,9 @@ runtime = [
 musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
-par2-rs = { path = "../../crates/par2-rs", version = "0.10.2", default-features = false, optional = true }
+par2-rs = { path = "../../crates/par2-rs", version = "0.10.3", default-features = false, optional = true }
 par3-rs = { path = "../../crates/par3-rs", version = "0.4.2", default-features = false, optional = true }
-unrar-rs = { path = "../../crates/unrar-rs", version = "0.10.5", default-features = false, optional = true }
+unrar-rs = { path = "../../crates/unrar-rs", version = "0.10.6", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

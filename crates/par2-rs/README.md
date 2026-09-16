@@ -69,9 +69,30 @@ ordinary implementation, but supplying your own allows verification against
 bytes that are still arriving over a network, or that are assembled from a
 source with no file paths at all.
 
+## Crypto backend
+
+MD5 has two interchangeable backends, chosen at compile time.
+
+- `crypto-aws-lc` *(default)*: AWS-LC's MD5. Building it compiles `aws-lc-sys`,
+  which needs a C toolchain, and it is the configuration the performance
+  figures below were measured with.
+- `crypto-rust`: the portable RustCrypto `md-5` implementation. No C or
+  assembly dependency, and the only backend available on `wasm`. Expect slower
+  hashing; the digests are of course identical.
+
+To opt out of AWS-LC:
+
+```toml
+par2-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
+```
+
+`native-crypto` stays as an alias for `crypto-aws-lc`, so dependency
+declarations written against the old name keep resolving to the same backend.
+On a native target, enabling neither backend is a compile error rather than a
+silent choice.
+
 ## Feature flags
 
-- `native-crypto` *(default)*: AWS-LC-backed MD5.
 - `metal` / `wgpu`: GPU-accelerated repair through `reedsolomon-rs`, with CPU
   fallback when no suitable device or driver is present. On native Apple
   Silicon, `metal` also enables policy-driven creation through

@@ -2,16 +2,36 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.10.2"
+version = "0.10.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
+# Crypto backend selection.
+#
+# The MD5 seam in `crate::checksum` has two backends. `crypto-aws-lc` (default)
+# binds AWS-LC's MD5 directly; `crypto-rust` selects the portable RustCrypto
+# `md-5` implementation. On native targets the AWS-LC backend wins whenever
+# `crypto-aws-lc` is enabled, even when `crypto-rust` is also on — both stay
+# compiled so the backend differential test can compare them. On `wasm` the
+# AWS-LC dependency vanishes through a target gate, so `crypto-rust` is the
+# only backend there. Enabling neither backend on a native target is a compile
+# error (see `lib.rs`).
+#
+# `crypto-rust` carries no `dep:` entry: `md-5` stays an unconditional
+# dependency, because the default AWS-LC build still instantiates the
+# RustCrypto backend — `Par2Md5Backend::RustCrypto` and the differential test
+# that proves the two agree. Making it optional would delete an arm from the
+# default build's MD5 seam, which this change deliberately leaves untouched.
 [features]
-default = ["native-crypto"]
-native-crypto = ["dep:aws-lc-sys"]
+default = ["crypto-aws-lc"]
+crypto-aws-lc = ["dep:aws-lc-sys"]
+crypto-rust = []
+# Back-compat alias for dependency declarations written before the backends
+# were named; selects the AWS-LC backend.
+native-crypto = ["crypto-aws-lc"]
 slow-tests = []
 # Opt-in Apple-GPU (Metal) acceleration for repair and creation. Off by
 # default: repair may fall back to CPU, while creation follows its explicit
@@ -41,10 +61,11 @@ libc = { workspace = true }
 # `memmap2` backs the mmap scanner in `repairer.rs`; wasip1 has no `mmap`, so
 # the scanner takes a compile-time buffered `std::fs` fallback there (see
 # `MappedFile` in `repairer.rs`) and the crate must not even link memmap2 on
-# wasm. `aws-lc-sys` (the native-crypto MD5 backend) is unavailable on wasm and
-# is only reachable through the `native-crypto` feature, which is off for wasm
-# builds (`--no-default-features` selects the RustCrypto `md-5` fallback); the
-# target gate keeps it out even if the feature is force-enabled on a wasm build.
+# wasm. `aws-lc-sys` (the `crypto-aws-lc` MD5 backend) is unavailable on wasm
+# and is only reachable through that feature, which is off for wasm builds
+# (`--no-default-features --features crypto-rust` selects the RustCrypto `md-5`
+# backend); the target gate keeps it out even if the feature is force-enabled
+# on a wasm build.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 memmap2 = { workspace = true, default-features = false }
 aws-lc-sys = { workspace = true, optional = true }
@@ -70,7 +91,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # carries no unrar-rs (and no UnRAR license-restriction) reference.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 unrar-rs = { path = "../unrar-rs", default-features = false, features = [
-    "native-crypto",
+    "crypto-aws-lc",
 ] }
 criterion = "0.8"
 # Lets the bench surface the crate's own tier logs under `RUST_LOG` — the only

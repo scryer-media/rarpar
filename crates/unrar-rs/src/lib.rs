@@ -180,9 +180,14 @@
 //!
 //! # Feature flags
 //!
-//! - `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing.
+//! - `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing. Needs a C
+//!   toolchain to build `aws-lc-sys`.
 //! - `crypto-rust`: pure-Rust backend (`aes`, `cbc`, `sha2`, `hmac`), for
-//!   targets where AWS-LC will not build.
+//!   targets where AWS-LC will not build and for builds that must carry no C
+//!   dependency. Select it with
+//!   `default-features = false, features = ["crypto-rust"]`; expect slower
+//!   decryption and identical results.
+//! - `native-crypto`: back-compat alias for `crypto-aws-lc`.
 //! - `crypto-host`: on `wasm32`, delegate the bulk AES-CBC decrypt to an
 //!   embedder-installed hook (see `hooks`); implies `crypto-rust` for the
 //!   in-guest key derivation. Accepted but inert on native targets.

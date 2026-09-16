@@ -327,6 +327,107 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
+  # The RustCrypto backend is what a consumer who does not want a C dependency
+  # builds. Nothing else in CI compiles it on a native target: the default
+  # lanes take AWS-LC and the wasm harnesses only prove it works under wasip1.
+  crypto-rust-backend:
+    name: crypto-rust-backend
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
+      CC: sccache cc
+      CXX: sccache c++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold nasm
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-crypto-rust-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-crypto-rust-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Hydrate the test corpus (unrar, par2)
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- test-corpus hydrate --profile unrar
+          cargo run --locked -p xtask -- test-corpus hydrate --profile par2
+      - name: Build the libraries on the RustCrypto backend
+        run: |
+          set -euo pipefail
+          cargo build --locked -p unrar-rs --no-default-features --features crypto-rust
+          cargo build --locked -p par2-rs --no-default-features --features crypto-rust
+      - name: Confirm the RustCrypto build links no AWS-LC
+        run: |
+          set -euo pipefail
+          for crate in unrar-rs par2-rs; do
+            cargo tree --locked -p "$crate" -e normal \
+              --no-default-features --features crypto-rust > "$crate-tree.txt"
+            if grep -q aws-lc "$crate-tree.txt"; then
+              echo "::error::$crate still resolves aws-lc on the crypto-rust backend"
+              exit 1
+            fi
+          done
+      - name: Test unrar-rs on the RustCrypto backend
+        # The crypto module (KDF, AES-CBC seam, BLAKE2sp) and the encrypted
+        # archives that run through it end to end.
+        run: |
+          set -euo pipefail
+          cargo test --locked -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
+          cargo test --locked -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
+      - name: Test par2-rs on the RustCrypto backend
+        # The MD5/CRC seam, and a verify/repair pass that runs on top of it.
+        run: |
+          set -euo pipefail
+          cargo test --locked -p par2-rs --lib --no-default-features --features crypto-rust checksum::
+          cargo test --locked -p par2-rs --test checksum --no-default-features --features crypto-rust
+          cargo test --locked -p par2-rs --test stateful_session --no-default-features --features crypto-rust
+      - name: Test unrar-rs with both backends enabled
+        # Enabling both must keep AWS-LC active and compile the pure-Rust
+        # backend beside it, which is what the differential tests compare.
+        run: |
+          cargo test --locked -p unrar-rs --lib --features crypto-rust crypto::
+      - name: Check rarpar on the RustCrypto backend
+        run: cargo check --locked -p rarpar --no-default-features --features runtime,crypto-rust
+      - name: Run clippy on the RustCrypto backend
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p unrar-rs --all-targets --no-default-features --features crypto-rust -- -D warnings
+          cargo clippy --locked -p par2-rs --all-targets --no-default-features --features crypto-rust -- -D warnings
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
   # The aarch64-only cfg surface (NEON kernels, the blake2 leaf-group API) is
   # invisible to the x86 clippy lane; -D warnings only gates what it compiles.
   clippy-aarch64:
@@ -885,35 +986,35 @@ jobs:
           - platform: linux-x86_64-gnu-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: darwin-arm64
             runs_on: macos-26
             target: aarch64-apple-darwin
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: darwin-x86_64
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
-            features: runtime
+            features: runtime,crypto-aws-lc
           - platform: windows-arm64
             runs_on: windows-11-arm
             target: aarch64-pc-windows-msvc
-            features: runtime
+            features: runtime,crypto-aws-lc
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1014,6 +1115,20 @@ jobs:
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
+      - name: Confirm the release feature list links AWS-LC
+        # Same guard the release workflow runs after its build, at PR time: the
+        # dependency graph of the exact matrix feature list must contain
+        # `aws-lc-sys`, so an entry that lost `crypto-aws-lc` fails here rather
+        # than shipping the RustCrypto backend.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p rarpar -e normal --no-default-features \
+            --features "${{ matrix.features }}" --target "${{ matrix.target }}" > rarpar-tree.txt
+          if ! grep -q aws-lc-sys rarpar-tree.txt; then
+            echo "::error::rarpar resolved no aws-lc-sys for ${{ matrix.features }}; the crypto backend regressed to RustCrypto"
+            exit 1
+          fi
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
@@ -1504,12 +1619,16 @@ jobs:
             echo "::group::build $lane (${target:-native}) RUSTFLAGS=\"$flags\""
             CARGO_TARGET_DIR="$WASM_LANES/$lane" RUSTFLAGS="$flags" \
               cargo build --release --locked -p par2-rs --no-default-features \
+                --features crypto-rust \
                 ${target_arg[@]+"${target_arg[@]}"} --example wasm_par2_check
             echo "::endgroup::"
           }
           # --no-default-features throughout: it drops the aws-lc-sys MD5
           # backend, which cannot build for wasm at all, and keeps the native
           # reference feature-identical to the lanes it is the control for.
+          # `crypto-rust` names the RustCrypto MD5 backend these lanes always
+          # took; the native reference needs it spelled out, because a native
+          # build that names no backend is a compile error.
           build_lane native           ""                    ""
           build_lane wasip1-portable  wasm32-wasip1         ""
           build_lane wasip1-simd128   wasm32-wasip1         "-C target-feature=+simd128"
@@ -1749,6 +1868,7 @@ jobs:
       - fmt
       - clippy
       - unit-tests
+      - crypto-rust-backend
       - fixture-tests
       - par2-tests
       - par3-tests

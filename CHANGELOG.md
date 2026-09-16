@@ -3,6 +3,29 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.5.1 (unreleased)
+
+### Build Changes
+
+- The crypto backend is now selected by an explicit feature rather than riding
+  along with `runtime`. `crypto-aws-lc` forwards the AWS-LC backend to
+  `par2-rs` and `unrar-rs` and is on by default; `crypto-rust` forwards the
+  portable RustCrypto backends instead, for a build that must carry no C or
+  assembly dependency. `runtime` forwards neither, so
+  `--no-default-features --features runtime` now fails to compile — naming
+  both features — instead of quietly resolving a backend.
+- Every shipped artifact is still built with AWS-LC. The release and CI
+  feature matrices name `crypto-aws-lc` explicitly, the release feature audit
+  now requires all three packages to resolve it, and a new step reads the
+  dependency graph of the exact feature list that was built and fails if
+  `aws-lc-sys` is not in it.
+
+### Library Versions
+
+- `unrar-rs` 0.10.6 and `par2-rs` 0.10.3, for the backend feature scheme above.
+  `par3-rs` and `reedsolomon-rs` are unchanged; `par3-rs` has no AWS-LC code
+  path at all and gains no crypto feature.
+
 ## rarpar 0.5.0
 
 ### CLI Changes
