@@ -7845,7 +7845,10 @@ pub(crate) mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn xorjit_capacity_shortfall_selects_the_non_jit_kernel() {
-        let mut selection = xorjit_selection_for_test(4096, DEFAULT_REPAIR_MEMORY_LIMIT);
+        // Past 5462 outputs the arena bound saturates at one body per distinct
+        // factor, about 80 MiB an arena; two of them cannot fit 128 MiB.
+        let mut selection = xorjit_selection_for_test(8192, DEFAULT_REPAIR_MEMORY_LIMIT);
+        assert!(active_arena_reservation_for_test(selection) > selection.budget);
         // Capacity is what this test exercises; the strict-W^X precondition is
         // a host capability `JitMemo::new` checks first, so pin it on.
         selection.jit_method.strict_wx_available = true;

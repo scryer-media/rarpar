@@ -10,20 +10,19 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `par repair` no longer slows to a crawl, or fails outright, on an AVX2 x86
   machine without GFNI when a large number of blocks is missing. The JIT
   arithmetic tier kept per-output state that grew with the missing-block count
-  and was paid for out of the same `--memory-mib` budget as the data buffers,
+  and was paid for out of the same repair memory budget as the data buffers,
   so past about a thousand missing blocks the repair read the source files over
   and over: at 2048 missing blocks in a 2 GiB set a 36 s repair took 22
   minutes, and past about 2100 missing blocks the repair aborted with an
   XOR-JIT capacity error. The tier is now chosen only when its state costs the
   data chunk nothing, and a shortfall picks the other kernel and logs why
   instead of failing.
-- `par repair` also uses the whole of `--memory-mib` for its data chunk. It
+- `par repair` also uses the whole of its memory budget for its data chunk. It
   previously halved the chunk until it fit, leaving up to half the budget
   unspent and reading the sources more times than the limit required.
-- `par repair` now defaults to a 128 MiB workspace budget instead of 64 MiB
-  when `--memory-mib` is not given. The budget sets how much of a slice the
-  repair holds at once, so on a badly damaged set the old default was itself a
-  large part of the runtime. `--memory-mib` overrides it as before.
+- `par repair` now works in a 128 MiB budget instead of 64 MiB. The budget
+  sets how much of a slice the repair holds at once, so on a badly damaged set
+  the old figure was itself a large part of the runtime.
 - `RARPAR_PAR2_XORJIT=0` pins the non-JIT repair kernel on x86, for comparing
   the two.
 
