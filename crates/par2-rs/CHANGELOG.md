@@ -4,6 +4,32 @@
 
 The placement scan no longer reads a set that is already in place.
 
+### Added
+
+- PAR2 creation can now compute its recovery slices with an output-pruned
+  multiplicative GF(2^16) transform instead of folding every source into every
+  recovery row. The arm is chosen automatically, only when the plan it builds
+  performs at least twice fewer region folds than the dense schedule would, and
+  it produces byte-identical output: the dense path remains the unconditional
+  fallback and is still used for every shape the transform cannot win. On an
+  eight-file 4 GiB set at a 768000-byte slice size, creation went from 8.8 s to
+  4.5 s at 5% recovery, 10.3 s to 7.5 s at 15%, and 23.1 s to 9.0 s at 30%.
+- The transform arm runs inside the existing `Par2CreatorOptions::memory_limit`
+  with no new default and no raised one. Every arena it needs — the staged
+  source band, the recovery rows, per-worker transform scratch, and the plan
+  tables — is summed and checked against the limit before anything is
+  allocated, and the band size is chosen as the largest that fits; a limit that
+  cannot buy a 4 KiB band, or that would need more than 256 passes over the
+  payload, takes the dense path instead. Measured peak RSS is below the dense
+  arm's at the same limit on every shape tried, at the default limit and at a
+  256 MiB one.
+- Every band is checked before it is emitted: one recovery row is recomputed
+  with the dense kernels over the same staged bytes and compared against the
+  transform's. A mismatch abandons the transform for that creation, logs a
+  warning, and recreates every volume densely from scratch.
+- `RARPAR_PAR2_TRANSFORM` forces the decision: `0` always takes the dense path,
+  `1` takes the transform wherever it is admissible.
+
 ### Fixed
 
 - `scan_placement` confirmed every 16 KB match with a full-file MD5, one file

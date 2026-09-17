@@ -7,6 +7,15 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- `par create` computes recovery slices with an output-pruned GF(2^16)
+  transform when that beats folding every source into every recovery row. The
+  choice is automatic and the `.par2` output is byte-identical either way; the
+  existing `--memory-mib` limit still bounds the whole creation, and a job the
+  transform cannot win, or cannot fit, takes the previous path unchanged. An
+  eight-file 4 GiB set at `-s 768000` went from 8.8 s to 4.5 s at `-r 5`,
+  10.3 s to 7.5 s at `-r 15`, and 23.1 s to 9.0 s at `-r 30`, using less peak
+  memory than before at both the default limit and `--memory-mib 256`. Set
+  `RARPAR_PAR2_TRANSFORM=0` to force the old path.
 - `par verify` and `par repair` under the default smart placement no longer
   read a set that is already in place twice. The placement scan hashed every
   matching file in full, serially, before verification read it all again; a
