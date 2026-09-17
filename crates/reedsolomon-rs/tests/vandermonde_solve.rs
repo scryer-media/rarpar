@@ -184,12 +184,17 @@ fn check(scenario: &Scenario, strategy: SolveStrategy, against_matrix: bool) {
     }
 }
 
-/// Run one shape through both stage-2 forms.
-fn both_strategies(missing: usize, first_exponent: u32, stripe_len: usize, against_matrix: bool) {
+/// Run one shape through every pinned form of the two stages.
+fn every_strategy(missing: usize, first_exponent: u32, stripe_len: usize, against_matrix: bool) {
     let seed = 0x5eed_0000 ^ (missing as u64) << 8 ^ first_exponent as u64;
     let scenario = Scenario::build(missing, 5, first_exponent, stripe_len, seed);
-    check(&scenario, SolveStrategy::Baseline, against_matrix);
-    check(&scenario, SolveStrategy::Grouped, against_matrix);
+    for strategy in [
+        SolveStrategy::Direct,
+        SolveStrategy::GroupedEvaluation,
+        SolveStrategy::Transformed,
+    ] {
+        check(&scenario, strategy, against_matrix);
+    }
 }
 
 #[test]
@@ -199,7 +204,7 @@ fn matches_gauss_jordan_across_row_counts_and_first_exponents() {
     // meets the row count.
     for missing in [1usize, 2, 3, 127, 128, 129, 255, 256, 257] {
         for first_exponent in [0u32, 1, 5000] {
-            both_strategies(missing, first_exponent, 64, true);
+            every_strategy(missing, first_exponent, 64, true);
         }
     }
 }
@@ -209,7 +214,7 @@ fn handles_odd_stripe_tails() {
     // 2 bytes is one word; 66 and 126 leave tails the SIMD kernels finish with
     // their scalar epilogue.
     for stripe_len in [2usize, 66, 126, 1022] {
-        both_strategies(37, 3, stripe_len, true);
+        every_strategy(37, 3, stripe_len, true);
     }
 }
 
@@ -258,8 +263,9 @@ fn auto_and_pinned_strategies_agree() {
     let mut results = Vec::new();
     for strategy in [
         SolveStrategy::Auto,
-        SolveStrategy::Baseline,
-        SolveStrategy::Grouped,
+        SolveStrategy::Direct,
+        SolveStrategy::GroupedEvaluation,
+        SolveStrategy::Transformed,
     ] {
         let plan = ConsecutiveSolvePlan::build_with_strategy(&logs, 9, strategy).unwrap();
         let mut rows = scenario.syndromes();
@@ -293,7 +299,7 @@ fn non_consecutive_selections_are_rejected() {
 fn matches_gauss_jordan_at_large_row_counts() {
     for missing in [255usize, 256, 257, 1000] {
         for first_exponent in [0u32, 5000] {
-            both_strategies(missing, first_exponent, 64, true);
+            every_strategy(missing, first_exponent, 64, true);
         }
     }
 }

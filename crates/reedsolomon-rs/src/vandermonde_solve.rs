@@ -54,13 +54,44 @@
 //! ```
 //!
 //! `p[j] = 0` for `j > m`, so stage 1 is triangular: row `t` folds `m - t`
-//! syndromes. Stage 1 is a correlation of the block sequence `S` with the
-//! scalar sequence `p`; stage 2 evaluates the block polynomial `T` at each
-//! constant. Neither stage needs the inverse matrix, and both are ordinary
-//! multiply-accumulate passes over a stripe, so they run on the crate's SIMD
-//! region kernels.
+//! syndromes. Written out, stage 1 is a Hankel product of the block sequence
+//! `S` with the scalar sequence `p` and stage 2 evaluates the block polynomial
+//! `T` at each constant — both `O(m^2)` block folds, both *structured*, and
+//! both ordinary multiply-accumulate passes over a stripe that run on the
+//! crate's SIMD region kernels.
 //!
-//! # Fast stage 2
+//! # Stage 1 as a blocked convolution
+//!
+//! A Hankel product is a correlation, and a correlation is a convolution with
+//! one side reversed. Cut both index ranges into segments of [`BLOCK`] = 128:
+//! with `r = j*128 + r'` and `t = i*128 + t'`, the coefficient `p[r + t + 1]`
+//! depends on the segments only through `i + j`, so each segment pair is one
+//! convolution of a 128-tap block sequence with the reversed locator window
+//! `R_s[w] = p[s*128 + 255 - w]`, read out at `v = 254 - t'`. Those indices
+//! never wrap modulo 255, so a *cyclic* convolution of length
+//! [`CONV`] = `2*128 - 1` carries it exactly — and 255 divides 65535, so
+//! GF(2^16) has a root of unity of exactly that order and the cyclic
+//! convolution is a length-255 transform, a pointwise product, and an inverse.
+//!
+//! Each input segment is transformed once, the spectra are accumulated into one
+//! output spectrum at a time (triangularly: the locator runs out of windows
+//! past `s = ceil(m/128)`), and each output segment is transformed back once.
+//! The quadratic term survives only in the spectral accumulate, at
+//! `255 / (2 * 128^2)` per `m^2` — 128 times under the direct form's
+//! coefficient.
+//!
+//! The length-255 transform itself factors. `255 = 3 * 5 * 17` with pairwise
+//! coprime radices, so the Good-Thomas (prime-factor) map re-indexes it as
+//! three independent short transforms with **no twiddle factors** between them:
+//! writing both indices through the CRT idempotents 85, 51 and 120 of `Z/255`
+//! makes the cross terms vanish, because each idempotent is one modulo its own
+//! radix and zero modulo the other two. Ordering the radices puts the prunable
+//! work where it is cheapest: radix 17 runs *first* going forward, so the 127
+//! zero rows padding a 128-row segment out to 255 are never folded, and *last*
+//! coming back, so the 127 outputs the Hankel product does not read are never
+//! computed.
+//!
+//! # Stage 2 as a two-level evaluation
 //!
 //! Stage 2 evaluates `m` points of an `m`-term polynomial: `m^2` folds written
 //! out. Because every constant is a power of two, the exponent arithmetic
@@ -81,7 +112,8 @@
 //! coprime to 65535, so at most `phi(255) = 128` distinct residues exist and the
 //! whole stage costs `(groups + 257) * m` folds instead of `m^2`. It wins once
 //! `m` is comfortably past 257 and loses below that, which is what
-//! [`SolveStrategy::Auto`] arbitrates.
+//! [`SolveStrategy::Auto`] arbitrates — for both stages, each against its own
+//! row-count threshold.
 //!
 //! # Shape
 //!
@@ -112,20 +144,81 @@ const LARGE: u32 = 257;
 /// and `-2 * 128 = -256 = 1 (mod 257)`.
 const CRT_INVERSE: u32 = 128;
 
+/// Segment length of the blocked stage-1 convolution.
+///
+/// Paired with [`CONV`] = `2 * BLOCK - 1`: the linear convolution of two
+/// length-`BLOCK` sequences is exactly that long, so a cyclic convolution of
+/// that length carries it with nothing wrapping. 128 is the largest such
+/// pairing whose length divides 65535 — 255 does, 511 and 1023 do not — and the
+/// quadratic spectral-accumulate term wants `BLOCK` as large as the field
+/// allows.
+const BLOCK: usize = 128;
+
+/// Length of the stage-1 cyclic convolution, `2 * BLOCK - 1 == 255`.
+const CONV: usize = 2 * BLOCK - 1;
+
+/// The pairwise coprime radices [`CONV`] factors into.
+const RADICES: [usize; 3] = [3, 5, 17];
+
+/// Most rows of one segment that can share a `(n mod 3, n mod 5)` class: a
+/// class is one residue modulo 15, so `ceil(128 / 15) = 9`.
+const RADIX17_GROUP: usize = BLOCK.div_ceil(15);
+
+/// The re-indexing weight for one radix of [`CONV`]: the element of `Z/255`
+/// that is one modulo that radix and zero modulo the other two.
+///
+/// Sending both the input and the output index of the transform through these
+/// weights is what makes the prime-factor split twiddle-free — every cross
+/// term picks up a factor that is zero modulo 255.
+fn radix_weight(radix: usize) -> usize {
+    let cofactor = CONV / radix;
+    // The cofactor is invertible modulo its own radix, and 255 is small enough
+    // that searching for the multiplier beats writing out an extended GCD.
+    let multiplier = (1..radix)
+        .find(|step| cofactor * step % radix == 1)
+        .expect("each radix is coprime to its cofactor");
+    cofactor * multiplier
+}
+
 /// Live source streams per destination pass. The grouped-input kernels read
 /// their destination once per batch and stream the sources past it, so a batch
 /// wants to be as wide as the line-fill buffers of the smallest supported core
 /// allow — the same bound `gf_simd`'s own source blocking uses.
 const BATCH_SOURCES: usize = 8;
 
-/// Row count at or above which [`SolveStrategy::Auto`] selects the grouped
-/// stage-2 evaluation. Below it the 257 buckets cost more than they save.
+/// Row count at or above which [`SolveStrategy::Auto`] moves stage 2 to the
+/// grouped evaluation, and stage 1 to the transformed correlation. Below it
+/// the 257 bucket rows and the fixed per-segment transform cost more than the
+/// `m^2` and `m^2 / 2` folds they replace.
 ///
-/// Measured on this crate's `vandermonde_solve` bench; the two forms cross
-/// between 512 and 1024 rows on Apple Silicon and the shape of the estimate
-/// (`groups + 257` folds per row against `m`) puts the crossover in the same
-/// place on any host, because both forms are bound by passes over memory.
-const FAST_MIN_ROWS: usize = 768;
+/// One threshold serves both because the measurement never favoured splitting
+/// them: at every row count where either transform paid for itself, both did.
+/// Solve times in milliseconds for one 64 KiB stripe on an Apple M-series core,
+/// from this crate's `vandermonde_solve_bench` example — `inverse` is the
+/// explicit inverse's `m x m` block product, the others are this module's three
+/// forms:
+///
+/// ```text
+///     m    inverse    direct   grouped   transformed
+///   256      118.5     173.3     296.4         277.8
+///   512      468.8     694.4     651.7         498.5
+///  1024     1887.2    2925.6    1666.6         907.4
+///  2048     7799.4   11816.3    5403.1        1802.7
+///  4096    32746.2   61083.2   18723.5        4741.6
+///  8192   137721.7  188012.8   67527.4        7880.3
+/// ```
+///
+/// Both stages are bound by passes over memory rather than by multiplies, so
+/// the crossover sits in much the same place on any host: the transformed form
+/// is already the cheapest of the three at 512 rows, and by 8192 it is 8.6x
+/// the grouped form and 17.5x the inverse's block product — which the inverse
+/// has to spend an `O(m^3)` Gauss-Jordan on before it can run at all.
+const GROUPED_MIN_ROWS: usize = 512;
+
+/// Row count at or above which [`SolveStrategy::Auto`] moves stage 1 to the
+/// transformed correlation. Equal to [`GROUPED_MIN_ROWS`]: see the table
+/// there.
+const TRANSFORM_MIN_ROWS: usize = GROUPED_MIN_ROWS;
 
 /// A solve plan rejected its inputs, its buffers, or observed cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,17 +247,21 @@ impl std::fmt::Display for SolveError {
 }
 impl std::error::Error for SolveError {}
 
-/// Which stage-2 evaluation a plan carries.
+/// Which form each of the two stages takes. The variants are a ladder: each
+/// adds one transform to the one before it, and all of them produce identical
+/// bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolveStrategy {
-    /// Evaluate the block polynomial at each constant directly: `m^2` folds,
-    /// no extra scratch beyond the stage-1 rows.
-    Baseline,
-    /// Group the constants by their exponent residue modulo 255 and share 257
-    /// bucket rows per group. Cheaper for large `m`, 257 extra scratch rows.
-    Grouped,
-    /// [`Self::Grouped`] from [`FAST_MIN_ROWS`] rows up, [`Self::Baseline`]
-    /// below it.
+    /// Both stages written out: `1.5 * m^2` folds, scratch for `m` rows only.
+    Direct,
+    /// Direct stage 1; stage 2 groups the constants by their exponent residue
+    /// modulo 255 and shares 257 bucket rows per group. 257 extra scratch rows.
+    GroupedEvaluation,
+    /// Stage 1 as blocked length-255 convolutions as well. Adds the input
+    /// spectra, which are the largest arena the solve holds.
+    Transformed,
+    /// Per-stage thresholds: [`GROUPED_MIN_ROWS`] for stage 2,
+    /// [`TRANSFORM_MIN_ROWS`] for stage 1.
     Auto,
 }
 
@@ -188,6 +285,22 @@ struct GroupedEval {
     groups: Vec<EvalGroup>,
 }
 
+/// Tables for the blocked stage-1 correlation.
+#[derive(Debug)]
+struct ConvolutionPlan {
+    /// `ceil(m / BLOCK)`: segments of the index range, and of the locator.
+    segments: usize,
+    /// Spectrum of each reversed locator window, `[segment * CONV + point]`.
+    /// Window `s` is empty for `s >= segments`, which is the triangularity the
+    /// spectral accumulate exploits.
+    kernel: Vec<u16>,
+    /// Forward radix-3, radix-5 and radix-17 matrices, row-major by output.
+    forward: [Vec<u16>; 3],
+    /// The same three transforms with the root exponent negated. The missing
+    /// `1/255` scale is one in characteristic two, so nothing else changes.
+    inverse: [Vec<u16>; 3],
+}
+
 /// A prepared solve for one set of missing inputs and one consecutive exponent
 /// run. Build it once per repair; reuse it for every stripe.
 #[derive(Debug)]
@@ -199,8 +312,10 @@ pub struct ConsecutiveSolvePlan {
     /// `g_c^(-e0) / P'(g_c)`, one per unknown: the whole scalar tail of the
     /// Forney value, folded into stage 2's factors.
     scale: Vec<u16>,
-    /// `g_c` per unknown, for the baseline stage-2 power ladder.
+    /// `g_c` per unknown, for the direct stage-2 power ladder.
     constants: Vec<u16>,
+    /// Present when stage 1 runs as blocked convolutions.
+    convolution: Option<ConvolutionPlan>,
     /// Present when the plan evaluates stage 2 by residue groups.
     grouped: Option<GroupedEval>,
 }
@@ -258,19 +373,20 @@ impl ConsecutiveSolvePlan {
             ));
         }
 
-        let grouped = match strategy {
-            SolveStrategy::Baseline => None,
-            SolveStrategy::Grouped => Some(GroupedEval::build(missing_logs)),
-            SolveStrategy::Auto if rows >= FAST_MIN_ROWS => Some(GroupedEval::build(missing_logs)),
-            SolveStrategy::Auto => None,
+        let (blocked, grouped) = match strategy {
+            SolveStrategy::Direct => (false, false),
+            SolveStrategy::GroupedEvaluation => (false, true),
+            SolveStrategy::Transformed => (true, true),
+            SolveStrategy::Auto => (rows >= TRANSFORM_MIN_ROWS, rows >= GROUPED_MIN_ROWS),
         };
 
         Ok(Self {
+            convolution: blocked.then(|| ConvolutionPlan::build(&locator, rows)),
+            grouped: grouped.then(|| GroupedEval::build(missing_logs)),
             rows,
             locator,
             scale,
             constants,
-            grouped,
         })
     }
 
@@ -302,20 +418,38 @@ impl ConsecutiveSolvePlan {
         self.rows
     }
 
+    /// Whether stage 1 runs as blocked convolutions.
+    pub fn uses_blocked_correlation(&self) -> bool {
+        self.convolution.is_some()
+    }
+
     /// Whether stage 2 runs the grouped evaluation.
     pub fn uses_grouped_evaluation(&self) -> bool {
         self.grouped.is_some()
     }
 
-    /// Scratch bytes [`Self::solve_stripe`] needs for a stripe of `stripe_len`
-    /// bytes. Linear in the row count, never in the slice length.
-    pub fn scratch_bytes(&self, stripe_len: usize) -> usize {
-        let bucket_rows = if self.grouped.is_some() {
+    /// Scratch rows of one stripe each, in the order [`Self::solve_stripe`]
+    /// slices them: the correlation output, then stage 1's arenas, then stage
+    /// 2's buckets.
+    fn scratch_rows(&self) -> usize {
+        // Stage 1 holds one spectrum per input segment, one resident output
+        // spectrum, and the two arenas the three-radix network bounces through.
+        let stage1 = self
+            .convolution
+            .as_ref()
+            .map_or(0, |plan| (plan.segments + 3) * CONV);
+        let buckets = if self.grouped.is_some() {
             LARGE as usize
         } else {
             0
         };
-        (self.rows + bucket_rows) * stripe_len
+        self.rows + stage1 + buckets
+    }
+
+    /// Scratch bytes [`Self::solve_stripe`] needs for a stripe of `stripe_len`
+    /// bytes. Linear in the row count, never in the slice length.
+    pub fn scratch_bytes(&self, stripe_len: usize) -> usize {
+        self.scratch_rows() * stripe_len
     }
 
     /// Solve one stripe in place.
@@ -347,8 +481,18 @@ impl ConsecutiveSolvePlan {
             return Ok(());
         }
 
-        let (correlation, buckets) = scratch.split_at_mut(self.rows * stripe_len);
-        self.correlate(rows, stripe_len, correlation, cancelled)?;
+        let (correlation, rest) = scratch.split_at_mut(self.rows * stripe_len);
+        let buckets = match &self.convolution {
+            Some(plan) => {
+                let (arenas, rest) = rest.split_at_mut((plan.segments + 3) * CONV * stripe_len);
+                plan.correlate(self.rows, rows, stripe_len, correlation, arenas, cancelled)?;
+                rest
+            }
+            None => {
+                self.correlate(rows, stripe_len, correlation, cancelled)?;
+                rest
+            }
+        };
         match &self.grouped {
             Some(grouped) => {
                 self.evaluate_grouped(grouped, rows, stripe_len, correlation, buckets, cancelled)
@@ -551,10 +695,304 @@ impl GroupedEval {
     }
 }
 
+impl ConvolutionPlan {
+    /// Spectra of the reversed locator windows, plus the six radix matrices.
+    fn build(locator: &[u16], rows: usize) -> Self {
+        let segments = rows.div_ceil(BLOCK);
+        // omega = 2^257 has order 65535 / 257 = 255 = CONV.
+        let root: Vec<u16> = (0..CONV as u32).map(|i| gf::pow(2, LARGE * i)).collect();
+
+        // R_s[w] = p[s * BLOCK + 2 * BLOCK - 1 - w]: the locator window of
+        // segment pair sum `s`, reversed so the correlation reads the
+        // convolution at v = 2 * BLOCK - 2 - t.
+        let mut kernel = vec![0u16; segments * CONV];
+        for (s, spectrum) in kernel.chunks_exact_mut(CONV).enumerate() {
+            for w in 0..CONV {
+                let at = s * BLOCK + 2 * BLOCK - 1 - w;
+                let coefficient = if at < locator.len() { locator[at] } else { 0 };
+                if coefficient == 0 {
+                    continue;
+                }
+                for (point, slot) in spectrum.iter_mut().enumerate() {
+                    *slot ^= gf::mul(coefficient, root[point * w % CONV]);
+                }
+            }
+        }
+
+        let matrices =
+            |inverse: bool| std::array::from_fn(|axis| radix_matrix(&root, RADICES[axis], inverse));
+        Self {
+            segments,
+            kernel,
+            forward: matrices(false),
+            inverse: matrices(true),
+        }
+    }
+
+    /// Stage 1 as `segments` forward transforms, a triangular accumulate in the
+    /// spectral domain, and `segments` inverse transforms.
+    fn correlate(
+        &self,
+        rows: usize,
+        syndromes: &[u8],
+        stripe_len: usize,
+        out: &mut [u8],
+        arenas: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), SolveError> {
+        let (spectra, rest) = arenas.split_at_mut(self.segments * CONV * stripe_len);
+        let (accumulator, rest) = rest.split_at_mut(CONV * stripe_len);
+        let (first_arena, second_arena) = rest.split_at_mut(CONV * stripe_len);
+
+        for segment in 0..self.segments {
+            if cancelled() {
+                return Err(SolveError::Cancelled);
+            }
+            let start = segment * BLOCK;
+            let live = BLOCK.min(rows - start);
+            radix17_forward(
+                syndromes,
+                start,
+                live,
+                stripe_len,
+                first_arena,
+                &self.forward[2],
+            );
+            radix5(first_arena, second_arena, stripe_len, &self.forward[1]);
+            radix3_to_natural(
+                second_arena,
+                &mut spectra[segment * CONV * stripe_len..(segment + 1) * CONV * stripe_len],
+                stripe_len,
+                &self.forward[0],
+            );
+        }
+
+        for segment in 0..self.segments {
+            if cancelled() {
+                return Err(SolveError::Cancelled);
+            }
+            // The locator runs out of windows past `segments`, so an output
+            // segment pairs only with the input segments before its complement.
+            let pairs = self.segments - segment;
+            for (point, dst) in accumulator
+                .chunks_exact_mut(stripe_len)
+                .take(CONV)
+                .enumerate()
+            {
+                dst.fill(0);
+                let mut first = 0usize;
+                while first < pairs {
+                    let width = BATCH_SOURCES.min(pairs - first);
+                    let mut factors = [0u16; BATCH_SOURCES];
+                    let mut sources = [EMPTY; BATCH_SOURCES];
+                    for (lane, factor) in factors.iter_mut().take(width).enumerate() {
+                        let input = first + lane;
+                        *factor = self.kernel[(segment + input) * CONV + point];
+                        sources[lane] = stripe(spectra, input * CONV + point, stripe_len);
+                    }
+                    fold(dst, &sources[..width], &factors[..width]);
+                    first += width;
+                }
+            }
+
+            radix3_from_natural(accumulator, first_arena, stripe_len, &self.inverse[0]);
+            radix5(first_arena, second_arena, stripe_len, &self.inverse[1]);
+            let start = segment * BLOCK;
+            let live = BLOCK.min(rows - start);
+            radix17_inverse(
+                second_arena,
+                &mut out[start * stripe_len..(start + live) * stripe_len],
+                stripe_len,
+                &self.inverse[2],
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Re-indexed coordinates `(n mod 3, n mod 5, n mod 17)`, laid out so the
+/// radix-17 axis is contiguous: the arenas the three stages bounce through are
+/// indexed this way.
+#[inline]
+fn split_index(three: usize, five: usize, seventeen: usize) -> usize {
+    (three * 5 + five) * 17 + seventeen
+}
+
+/// The natural index in `0..255` those coordinates stand for, reassembled
+/// through the radix weights.
+#[inline]
+fn natural_index(three: usize, five: usize, seventeen: usize) -> usize {
+    (radix_weight(3) * three + radix_weight(5) * five + radix_weight(17) * seventeen) % CONV
+}
+
+/// One radix's dense transform matrix, row-major by output then input.
+///
+/// The radix weight is what makes `omega^(weight * k * n)` depend on nothing
+/// but this axis. The inverse negates the exponent; its missing `1/radix`
+/// scale is one in characteristic two because every radix here is odd.
+fn radix_matrix(root: &[u16], radix: usize, inverse: bool) -> Vec<u16> {
+    let weight = radix_weight(radix);
+    let mut out = vec![0u16; radix * radix];
+    for k in 0..radix {
+        for n in 0..radix {
+            let mut exponent = weight * k * n % CONV;
+            if inverse && exponent != 0 {
+                exponent = CONV - exponent;
+            }
+            out[k * radix + n] = root[exponent];
+        }
+    }
+    out
+}
+
+/// The forward transform's radix-17 stage, pruned at the source.
+///
+/// Only the segment's `live <= 128` rows exist; the rows that pad the segment
+/// out to 255 are zero and are never folded. A `(n mod 3, n mod 5)` class is
+/// one residue modulo 15, so each of the fifteen classes holds at most
+/// [`RADIX17_GROUP`] rows and each of a class's seventeen outputs folds only
+/// those.
+fn radix17_forward(
+    syndromes: &[u8],
+    first_row: usize,
+    live: usize,
+    stripe_len: usize,
+    dst: &mut [u8],
+    matrix: &[u16],
+) {
+    debug_assert!(live <= BLOCK, "one segment at a time");
+    let mut sources = [EMPTY; RADIX17_GROUP];
+    let mut residues = [0usize; RADIX17_GROUP];
+    for three in 0..3 {
+        for five in 0..5 {
+            let mut count = 0usize;
+            for row in 0..live {
+                if row % 3 == three && row % 5 == five {
+                    sources[count] = stripe(syndromes, first_row + row, stripe_len);
+                    residues[count] = row % 17;
+                    count += 1;
+                }
+            }
+            for k in 0..17 {
+                let mut factors = [0u16; RADIX17_GROUP];
+                for (factor, &residue) in factors.iter_mut().zip(&residues[..count]) {
+                    *factor = matrix[k * 17 + residue];
+                }
+                let out = stripe_mut(dst, split_index(three, five, k), stripe_len);
+                out.fill(0);
+                fold(out, &sources[..count], &factors[..count]);
+            }
+        }
+    }
+}
+
+/// The radix-5 stage, both arenas in re-indexed coordinate order. Forward and
+/// inverse differ only in the matrix handed in.
+fn radix5(src: &[u8], dst: &mut [u8], stripe_len: usize, matrix: &[u16]) {
+    for three in 0..3 {
+        for seventeen in 0..17 {
+            let mut sources = [EMPTY; 5];
+            for (five, source) in sources.iter_mut().enumerate() {
+                *source = stripe(src, split_index(three, five, seventeen), stripe_len);
+            }
+            for k in 0..5 {
+                let out = stripe_mut(dst, split_index(three, k, seventeen), stripe_len);
+                out.fill(0);
+                fold(out, &sources, &matrix[k * 5..k * 5 + 5]);
+            }
+        }
+    }
+}
+
+/// The forward transform's last stage: radix 3, writing natural spectral order
+/// so the spectral accumulate reads one point's spectrum contiguously.
+fn radix3_to_natural(src: &[u8], dst: &mut [u8], stripe_len: usize, matrix: &[u16]) {
+    for five in 0..5 {
+        for seventeen in 0..17 {
+            let mut sources = [EMPTY; 3];
+            for (three, source) in sources.iter_mut().enumerate() {
+                *source = stripe(src, split_index(three, five, seventeen), stripe_len);
+            }
+            for k in 0..3 {
+                let out = stripe_mut(dst, natural_index(k, five, seventeen), stripe_len);
+                out.fill(0);
+                fold(out, &sources, &matrix[k * 3..k * 3 + 3]);
+            }
+        }
+    }
+}
+
+/// The inverse transform's first stage: natural spectral order back into
+/// re-indexed coordinates.
+fn radix3_from_natural(src: &[u8], dst: &mut [u8], stripe_len: usize, matrix: &[u16]) {
+    for five in 0..5 {
+        for seventeen in 0..17 {
+            let mut sources = [EMPTY; 3];
+            for (three, source) in sources.iter_mut().enumerate() {
+                *source = stripe(src, natural_index(three, five, seventeen), stripe_len);
+            }
+            for k in 0..3 {
+                let out = stripe_mut(dst, split_index(k, five, seventeen), stripe_len);
+                out.fill(0);
+                fold(out, &sources, &matrix[k * 3..k * 3 + 3]);
+            }
+        }
+    }
+}
+
+/// The inverse transform's radix-17 stage, pruned at the destination.
+///
+/// The correlation reads the convolution at `v = 2 * BLOCK - 2 - t` for this
+/// output segment's `live <= 128` rows, so the other outputs are never
+/// computed.
+fn radix17_inverse(src: &[u8], dst: &mut [u8], stripe_len: usize, matrix: &[u16]) {
+    for (t, out) in dst.chunks_exact_mut(stripe_len).enumerate() {
+        let natural = CONV - 1 - t;
+        let (three, five, seventeen) = (natural % 3, natural % 5, natural % 17);
+        let mut sources = [EMPTY; 17];
+        for (n, source) in sources.iter_mut().enumerate() {
+            *source = stripe(src, split_index(three, five, n), stripe_len);
+        }
+        out.fill(0);
+        fold(out, &sources, &matrix[seventeen * 17..seventeen * 17 + 17]);
+    }
+}
+
 /// Row `index` of a stripe-major buffer.
 #[inline]
 fn stripe(buffer: &[u8], index: usize, stripe_len: usize) -> &[u8] {
     &buffer[index * stripe_len..(index + 1) * stripe_len]
+}
+
+/// Row `index` of a stripe-major buffer, for writing.
+#[inline]
+fn stripe_mut(buffer: &mut [u8], index: usize, stripe_len: usize) -> &mut [u8] {
+    &mut buffer[index * stripe_len..(index + 1) * stripe_len]
+}
+
+/// The empty slice a fixed-size source array starts life filled with.
+const EMPTY: &[u8] = &[];
+
+/// `dst ^= sum_i coeffs[i] * sources[i]`, in batches of [`BATCH_SOURCES`].
+///
+/// Lanes past a batch's width repeat its last source with a zero factor; the
+/// grouped-input kernels skip those without touching the stream.
+fn fold(dst: &mut [u8], sources: &[&[u8]], coeffs: &[u16]) {
+    debug_assert_eq!(sources.len(), coeffs.len());
+    let mut first = 0usize;
+    while first < sources.len() {
+        let width = BATCH_SOURCES.min(sources.len() - first);
+        let batch: [FactorSrc<'_>; BATCH_SOURCES] = std::array::from_fn(|lane| FactorSrc {
+            factor: if lane < width {
+                coeffs[first + lane]
+            } else {
+                0
+            },
+            src: sources[first + lane.min(width - 1)],
+        });
+        gf_simd::mul_acc_input_batch(dst, &batch[..width]);
+        first += width;
+    }
 }
 
 /// `P(z) = product over c of (z + g_c)`, returned as `p[0 ..= roots.len()]`.
@@ -631,6 +1069,13 @@ mod tests {
             .collect()
     }
 
+    /// Every pinned form, so a unit test never silently covers just one.
+    const EVERY_STRATEGY: [SolveStrategy; 3] = [
+        SolveStrategy::Direct,
+        SolveStrategy::GroupedEvaluation,
+        SolveStrategy::Transformed,
+    ];
+
     #[test]
     fn locator_is_monic_with_the_expected_roots() {
         let roots = [2u16, 4, 16, 0x89ab];
@@ -662,11 +1107,11 @@ mod tests {
     }
 
     #[test]
-    fn solves_small_systems_both_ways() {
+    fn solves_small_systems_every_way() {
         let logs: Vec<u16> = (1..=6u16).collect();
         let values: Vec<u16> = vec![0x0001, 0xbeef, 0x1234, 0xffff, 0x0002, 0x8000];
         for first_exponent in [0u32, 1, 5000] {
-            for strategy in [SolveStrategy::Baseline, SolveStrategy::Grouped] {
+            for strategy in EVERY_STRATEGY {
                 assert_eq!(
                     solve(&logs, &values, first_exponent, strategy),
                     values,
@@ -678,11 +1123,55 @@ mod tests {
 
     #[test]
     fn solves_a_single_unknown() {
-        assert_eq!(
-            solve(&[7], &[0xabcd], 12, SolveStrategy::Baseline),
-            [0xabcd]
-        );
-        assert_eq!(solve(&[7], &[0xabcd], 12, SolveStrategy::Grouped), [0xabcd]);
+        for strategy in EVERY_STRATEGY {
+            assert_eq!(
+                solve(&[7], &[0xabcd], 12, strategy),
+                [0xabcd],
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinate_split_is_a_bijection() {
+        // The whole transform rests on this: the radix weights reassemble every
+        // natural index exactly once, and each coordinate is that index's own
+        // residue.
+        let mut seen = vec![false; CONV];
+        for three in 0..3 {
+            for five in 0..5 {
+                for seventeen in 0..17 {
+                    let natural = natural_index(three, five, seventeen);
+                    assert_eq!(
+                        (natural % 3, natural % 5, natural % 17),
+                        (three, five, seventeen)
+                    );
+                    assert!(!std::mem::replace(&mut seen[natural], true));
+                    assert!(split_index(three, five, seventeen) < CONV);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn radix_matrices_invert_each_other() {
+        let root: Vec<u16> = (0..CONV as u32).map(|i| gf::pow(2, LARGE * i)).collect();
+        assert_eq!(gf::pow(root[1], CONV as u32), 1, "omega has order 255");
+        for radix in RADICES {
+            let forward = radix_matrix(&root, radix, false);
+            let inverse = radix_matrix(&root, radix, true);
+            for i in 0..radix {
+                for j in 0..radix {
+                    let mut acc = 0u16;
+                    for k in 0..radix {
+                        acc ^= gf::mul(inverse[i * radix + k], forward[k * radix + j]);
+                    }
+                    // The missing 1/radix is one in characteristic two only for
+                    // an odd radix, which 3, 5 and 17 all are.
+                    assert_eq!(acc, u16::from(i == j), "radix {radix} at ({i},{j})");
+                }
+            }
+        }
     }
 
     #[test]
@@ -733,28 +1222,39 @@ mod tests {
 
     #[test]
     fn reports_cancellation() {
-        let plan = ConsecutiveSolvePlan::build(&[1, 2], 0).unwrap();
-        let mut scratch = vec![0u8; plan.scratch_bytes(4)];
-        assert_eq!(
-            plan.solve_stripe(&mut [0u8; 8], 4, &mut scratch, &|| true)
-                .unwrap_err(),
-            SolveError::Cancelled
-        );
+        for strategy in EVERY_STRATEGY {
+            let plan = ConsecutiveSolvePlan::build_with_strategy(&[1, 2], 0, strategy).unwrap();
+            let mut scratch = vec![0u8; plan.scratch_bytes(4)];
+            assert_eq!(
+                plan.solve_stripe(&mut [0u8; 8], 4, &mut scratch, &|| true)
+                    .unwrap_err(),
+                SolveError::Cancelled,
+                "{strategy:?}"
+            );
+        }
     }
 
     #[test]
-    fn auto_picks_the_grouped_evaluation_only_for_large_sets() {
+    fn auto_picks_each_transform_only_for_large_sets() {
         let few: Vec<u16> = (1..=8u16).collect();
-        assert!(
-            !ConsecutiveSolvePlan::build(&few, 0)
-                .unwrap()
-                .uses_grouped_evaluation()
+        let plan = ConsecutiveSolvePlan::build(&few, 0).unwrap();
+        assert!(!plan.uses_grouped_evaluation());
+        assert!(!plan.uses_blocked_correlation());
+
+        let below: Vec<u16> = (1..GROUPED_MIN_ROWS.max(TRANSFORM_MIN_ROWS) as u16).collect();
+        let plan = ConsecutiveSolvePlan::build(&below, 0).unwrap();
+        assert_eq!(
+            plan.uses_grouped_evaluation(),
+            below.len() >= GROUPED_MIN_ROWS
         );
-        let many: Vec<u16> = (1..=FAST_MIN_ROWS as u16).collect();
-        assert!(
-            ConsecutiveSolvePlan::build(&many, 0)
-                .unwrap()
-                .uses_grouped_evaluation()
+        assert_eq!(
+            plan.uses_blocked_correlation(),
+            below.len() >= TRANSFORM_MIN_ROWS
         );
+
+        let many: Vec<u16> = (1..=GROUPED_MIN_ROWS.max(TRANSFORM_MIN_ROWS) as u16).collect();
+        let plan = ConsecutiveSolvePlan::build(&many, 0).unwrap();
+        assert!(plan.uses_blocked_correlation());
+        assert!(plan.uses_grouped_evaluation());
     }
 }
