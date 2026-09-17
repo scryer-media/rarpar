@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.6 (unreleased)
+## 0.4.6
 
 - Add `gf16_dft`: PAR2 recovery and syndrome rows computed as an
   output-pruned multiplicative DFT over GF(2^16) instead of the dense

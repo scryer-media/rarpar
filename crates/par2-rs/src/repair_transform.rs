@@ -114,8 +114,9 @@ use crate::verify::FileAccess;
 ///
 /// 2 KiB rather than a rounder 4 KiB because the staging arena is
 /// `n_present * band`: on a 16k-block set (16320 present slices, 64 KiB
-/// slices) the default 64 MiB limit buys a band of 3840 bytes, and a 4 KiB
-/// floor would have refused every repair on that set at the default limit. At
+/// slices) a 64 MiB limit — the default when this floor was measured — buys a
+/// band of 3840 bytes, and a 4 KiB floor would have refused every repair on
+/// that set at that limit. At
 /// 2 KiB the same set repairs in 1.8 s (m=512), 3.0 s (m=2048) and 5.9 s
 /// (m=4096) against the dense path's 2.2 s, 7.9 s and 20.3 s, with a peak RSS
 /// of 95, 190 and 246 MB against dense's 86, 149 and 264 MB.
@@ -143,10 +144,12 @@ pub(crate) const MIN_MISSING: usize = 256;
 /// A fold is not a constant-cost unit across the two arms: the dense executor
 /// folds long contiguous source rows with prepared factors and a tuned
 /// controller, while the transform's folds are short stripe passes over
-/// scratch rows, several of them dependent. Requiring a 2x paper margin is the
+/// scratch rows, several of them dependent. Requiring a 4x paper margin is the
 /// cheapest way to keep the arm out of the region where its better fold count
-/// does not survive contact with the memory system.
-const FOLD_MARGIN: u64 = 2;
+/// does not survive contact with the memory system: measured on an AVX2
+/// desktop, a 2.6x paper advantage ran 1.8x slower than the dense path, while
+/// every shape at 12x or better won.
+const FOLD_MARGIN: u64 = 4;
 
 /// Hard cap on how far the covering exponent range may exceed `m`.
 ///
