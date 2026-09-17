@@ -406,7 +406,11 @@ impl ConsecutiveSolvePlan {
             return Self::build(missing_logs, 0);
         };
         for (step, &exponent) in exponents.iter().enumerate() {
-            if u32::try_from(step).ok().and_then(|step| first.checked_add(step)) != Some(exponent) {
+            if u32::try_from(step)
+                .ok()
+                .and_then(|step| first.checked_add(step))
+                != Some(exponent)
+            {
                 return Err(SolveError::NonConsecutive);
             }
         }
@@ -1024,7 +1028,7 @@ fn evaluate_derivative(locator: &[u16], at: u16) -> u16 {
     let mut index = locator.len() - 1;
     // Walk the odd indices downward. `locator.len() - 1` is the degree, so the
     // highest odd index is it or one below.
-    if index % 2 == 0 {
+    if index.is_multiple_of(2) {
         index = index.wrapping_sub(1);
     }
     while index != usize::MAX {

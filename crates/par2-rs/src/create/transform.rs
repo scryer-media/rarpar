@@ -333,6 +333,12 @@ pub(crate) fn admit(
     if policy == TransformPolicy::Auto && source_count < MIN_SOURCE_SLICES {
         return None;
     }
+    // The arm's bands run on spawned workers. A target that cannot spawn
+    // (plain single-threaded wasm) keeps the serial dense encoder, forced or
+    // not.
+    if !reedsolomon_rs::threading::parallel_enabled() {
+        return None;
+    }
     let outputs = contiguous_range(exponents)?;
     if slice_size == 0 || !slice_size.is_multiple_of(2) {
         return None;
@@ -674,7 +680,11 @@ fn run_band(
     let mismatched = AtomicBool::new(false);
     let stopped = &stopped;
     let mismatched = &mismatched;
-    let cancelled = move || stopped.load(Ordering::Relaxed);
+    // Polled inside a stripe's transform as well as between stripes: at a
+    // large shape one stripe is most of a band's work.
+    let cancelled = move || {
+        stopped.load(Ordering::Relaxed) || cancel.is_some_and(CancellationToken::is_cancelled)
+    };
 
     let mut results: Vec<Result<()>> = Vec::with_capacity(shape.workers);
     let mut spawn_failure: Option<Par2Error> = None;

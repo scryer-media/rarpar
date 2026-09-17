@@ -328,8 +328,8 @@ impl DftPlan {
         // the scatter must produce. Everything else is never computed.
         let mut need_g17 = Vec::new();
         let mut g17_rank = [u8::MAX; 17];
-        for p in 0..P_ORDER {
-            if !wanted_p[p] {
+        for (p, &wanted) in wanted_p.iter().enumerate().take(P_ORDER) {
+            if !wanted {
                 continue;
             }
             let g17 = g17_of(p);

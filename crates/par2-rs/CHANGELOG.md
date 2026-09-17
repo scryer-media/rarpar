@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.4
+## 0.10.4 (unreleased)
 
 The placement scan no longer reads a set that is already in place.
 
@@ -87,7 +87,7 @@ The placement scan no longer reads a set that is already in place.
   spans without hashing them, so a block with a damaged payload stays counted
   until repair validates its packet hash. No behavior change.
 
-## 0.10.3 (unreleased)
+## 0.10.3
 
 ### Changed
 

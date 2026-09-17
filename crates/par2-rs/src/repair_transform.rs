@@ -568,10 +568,16 @@ fn choose_solver<'a>(
             range_len,
             workers,
             dft.plan_bytes(),
-            // A worker holds the transform's scratch and the solver's at once.
+            // A worker holds the transform's scratch and the solver's at once,
+            // plus one slice descriptor per present source and per output row.
             &|stripe| {
                 dft.scratch_bytes(stripe)
                     .saturating_add(solver.scratch_bytes(stripe))
+                    .saturating_add(
+                        present
+                            .saturating_add(rows)
+                            .saturating_mul(std::mem::size_of::<&[u8]>()),
+                    )
             },
             budget,
         )
@@ -629,6 +635,14 @@ pub(crate) fn try_execute(
     }
     if GPU_ARM_POSSIBLE {
         return Ok(TransformOutcome::Declined("GPU arm is compiled in"));
+    }
+    // The arm's stripes run on rayon workers. Where workers cannot be spawned
+    // (plain single-threaded wasm) the dense controller already runs inline;
+    // decline before anything here touches the pool.
+    if !reedsolomon_rs::threading::parallel_enabled() {
+        return Ok(TransformOutcome::Declined(
+            "no worker threads on this target",
+        ));
     }
 
     let rows = plan.missing_slices.len();
@@ -883,7 +897,13 @@ fn run(
             .iter()
             .map(|&global| gf::pow(plan.constants[global], plan.recovery_exponents[probe]))
             .collect();
-        dense_row(&output, band, band_len, &factors, &mut probe_seen[..band_len]);
+        dense_row(
+            &output,
+            band,
+            band_len,
+            &factors,
+            &mut probe_seen[..band_len],
+        );
         if probe_seen[..band_len].iter().any(|&byte| byte != 0) {
             warn!(
                 band = band_index,
@@ -1336,8 +1356,14 @@ mod tests {
         let data = noise(64 * 16, 0xBADC0DE);
         let damaged = [0usize, 5, 11];
         SOLVE_FAULT.with(|cell| cell.set(true));
-        let (restored, stats) =
-            repair_once(Some(TransformArm::On), &data, slice_size, 6, &damaged, false);
+        let (restored, stats) = repair_once(
+            Some(TransformArm::On),
+            &data,
+            slice_size,
+            6,
+            &damaged,
+            false,
+        );
         SOLVE_FAULT.with(|cell| cell.set(false));
         assert_eq!(stats.diverged, 1, "the corrupted solve must be caught");
         assert_eq!(stats.executed, 0);
@@ -1445,9 +1471,12 @@ mod tests {
         let verification = crate::verify::verify_all(&set, &access);
         let plan = crate::repair::plan_repair(&set, &verification).expect("plan");
 
+        // Ask the arm directly: what the dense path makes of so small a limit
+        // is its own business and differs by kernel tier.
         set_transform_arm_override(Some(TransformArm::On));
         let before = transform_arm_stats();
-        crate::repair::execute_repair_with_options(
+        let broken_before = crate::verify::FileAccess::read_file(&access, &file_id).unwrap();
+        let outcome = try_execute(
             &plan,
             &set,
             &mut access,
@@ -1456,14 +1485,25 @@ mod tests {
                 progress: None,
                 memory_limit: Some(16 * 1024),
             },
+            16 * 1024,
         )
-        .expect("repair");
+        .expect("declining is not an error");
         let after = transform_arm_stats();
         set_transform_arm_override(None);
-        assert_eq!(
-            after.executed, before.executed,
-            "the arm must have declined"
+        assert!(
+            matches!(outcome, TransformOutcome::Declined(_)),
+            "{outcome:?}"
         );
+        assert_eq!(after, before, "a declined arm must not count as a run");
+        assert_eq!(
+            crate::verify::FileAccess::read_file(&access, &file_id).unwrap(),
+            broken_before,
+            "a declined arm must not have written anything"
+        );
+
+        set_transform_arm_override(Some(TransformArm::Off));
+        crate::repair::execute_repair(&plan, &set, &mut access).expect("dense repair");
+        set_transform_arm_override(None);
         assert_eq!(
             crate::verify::FileAccess::read_file(&access, &file_id).unwrap(),
             data
