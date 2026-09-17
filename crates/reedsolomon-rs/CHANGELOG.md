@@ -7,6 +7,15 @@
   fallbacks. PAR3 packet layouts and recovery geometry remain in `par3-rs`.
 - Add FFT transform benchmarks and native parity coverage. Existing PAR2 and
   RAR arithmetic APIs remain compatible; GPU features remain opt-in.
+- Add `vandermonde_solve`: a closed-form PAR2 erasure solve for consecutive
+  recovery exponents. `ConsecutiveSolvePlan` reconstructs the missing slices
+  from the syndrome rows with a Forney-style locator and a two-stage fold —
+  a correlation against the locator coefficients, then an evaluation at each
+  missing input's constant — so no `m x m` matrix is built, stored, or
+  inverted. The solve is stripe-wise and in place, allocates nothing, and
+  overwrites the caller's syndrome rows with the answers. Non-consecutive
+  exponent selections are rejected so callers fall back to `matrix`, which is
+  unchanged.
 
 ## 0.4.4
 
