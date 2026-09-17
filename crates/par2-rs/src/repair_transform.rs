@@ -109,7 +109,15 @@ use crate::verify::FileAccess;
 
 /// Smallest band the arm will accept. Below this the strided read of every
 /// present slice degenerates into one syscall per few kilobytes per slice.
-pub(crate) const MIN_BAND: usize = 4 * 1024;
+///
+/// 2 KiB rather than a rounder 4 KiB because the staging arena is
+/// `n_present * band`: on a 16k-block set (16320 present slices, 64 KiB
+/// slices) the default 64 MiB limit buys a band of 3840 bytes, and a 4 KiB
+/// floor would have refused every repair on that set at the default limit. At
+/// 2 KiB the same set repairs in 1.8 s (m=512), 3.0 s (m=2048) and 5.9 s
+/// (m=4096) against the dense path's 2.2 s, 7.9 s and 20.3 s, with a peak RSS
+/// of 95, 190 and 246 MB against dense's 86, 149 and 264 MB.
+pub(crate) const MIN_BAND: usize = 2 * 1024;
 
 /// Most bands the arm will split a slice into. A pass re-walks every present
 /// file's descriptor set; past a couple of hundred that bookkeeping, not the
@@ -1388,7 +1396,7 @@ mod tests {
             &RepairOptions {
                 cancel: None,
                 progress: None,
-                memory_limit: Some(64 * 1024),
+                memory_limit: Some(16 * 1024),
             },
         )
         .expect("repair");

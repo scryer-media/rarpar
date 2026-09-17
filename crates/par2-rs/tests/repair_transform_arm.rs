@@ -175,7 +175,7 @@ fn a_limit_that_cannot_buy_a_band_takes_the_dense_path() {
     both_ways(
         "no admissible band",
         &synthetic,
-        Some(32 * 1024),
+        Some(8 * 1024),
         false,
         &|access, set| {
             let file = &set.files[0];
