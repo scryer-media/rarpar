@@ -102,21 +102,23 @@ const MAX_PASSES: usize = 256;
 /// The transform's fold is the same `dst ^= c * src` region fold the dense arm
 /// performs, but the arm around it is not free: it reads every source slice
 /// once per pass instead of once per create, and it spends `n` folds per stripe
-/// on the safety row. Measured on aarch64 at the 4 GiB / 768000 / `-r 30`
-/// shape (n = 5592, r = 1678) the fold ratio is 21x and the arm wins outright;
-/// at `-r 5` (r = 280) it is 6.3x and it still wins; at r = 32 it is 1.9x and
-/// the extra payload read costs more than the arithmetic saves. Two is the
-/// smallest integer margin above the shape that loses.
+/// on the safety row. Measured fold ratios (dense folds over plan folds) on the
+/// 4 GiB / 768000 fixture, n = 5600: 0.97 at r = 32, 3.33 at r = 280 (`-r 5`),
+/// 7.65 at r = 840 (`-r 15`), 11.33 at r = 1678 (`-r 30`). The three ratios at
+/// or above 3.3 all beat the dense arm on wall time by 1.4x to 2.6x; the r = 32
+/// shape, where the plan performs MORE folds than the dense arm, must not be
+/// taken. Two is the smallest integer margin that keeps the whole measured
+/// losing region out while admitting every measured winner.
 const FOLD_MARGIN: u64 = 2;
 
 /// Source slices below which the automatic policy never takes the transform.
 ///
 /// The schedule's fixed cost is the 257-dimension accumulation, `256 * r`
 /// folds, against the dense `n * r`: the transform cannot win until `n` is
-/// comfortably past 256. Measured, the crossover sits near 500 sources and the
-/// win is under 2x until roughly 2000, so the fold margin above would reject
-/// these shapes anyway — this is the cheap test that avoids building a plan for
-/// them at all.
+/// comfortably past 256. Measured, a 512-source set never reaches the fold
+/// margin above at any recovery amount tried — its ratio tops out at 1.47 at
+/// r = 1678 — so the margin would reject these shapes anyway. This is the
+/// cheap test that avoids building a plan for them at all.
 const MIN_SOURCE_SLICES: usize = 512;
 
 /// Stripe lengths tried, widest first. See the module docs for why these are
@@ -138,6 +140,27 @@ const PER_SOURCE_BOOKKEEPING_BYTES: usize = std::mem::size_of::<usize>() + 2;
 
 /// Consecutive slices handed to the fused source hasher in one run.
 const OBSERVE_RUN: usize = 16;
+
+/// Stack given to each stripe worker, and charged for it.
+///
+/// The workers hold a slice-descriptor table on the heap and a few fixed arrays
+/// on the stack; nothing here recurses. Rust's default two megabytes per thread
+/// would be the arm's largest uncounted allocation at a wide worker count —
+/// measured, it was the whole of a 3% overshoot against the dense arm's peak —
+/// so the arm asks for a stack it can account for instead of the default one it
+/// cannot.
+const WORKER_STACK_BYTES: usize = 512 * 1024;
+
+/// Share of the budget held back for what an arena plan cannot name: the
+/// allocator's own rounding on a handful of multi-hundred-megabyte blocks, the
+/// aligned buffers' 64-byte cells, thread guard pages and thread-local storage.
+///
+/// Measured against the dense arm's peak on the 4 GiB / 768000 fixture, the
+/// unnamed remainder after the worker stacks are charged runs to 2.5% of the
+/// budget at the tightest shape tried (a 256 MiB limit at 30% recovery, where
+/// the arm's arenas are nearly the whole budget); a 1/32 reserve covers that
+/// with room, and costs the band about one part in thirty.
+const BUDGET_SLACK_SHIFT: u32 = 5;
 
 /// Whether a create may use the transform arm.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -399,12 +422,15 @@ fn fit(
     let per_worker = plan
         .scratch_bytes(stripe)
         .checked_add(stripe)?
-        .checked_add(source_count.checked_mul(VIEW_BYTES)?)?;
+        .checked_add(source_count.checked_mul(VIEW_BYTES)?)?
+        .checked_add(WORKER_STACK_BYTES)?;
     let fixed = workers
         .checked_mul(per_worker)?
         .checked_add(plan.plan_bytes())?
         .checked_add(source_count.checked_mul(PER_SOURCE_BOOKKEEPING_BYTES)?)?;
-    let available = budget.checked_sub(fixed)?;
+    let available = budget
+        .checked_sub(budget >> BUDGET_SLACK_SHIFT)?
+        .checked_sub(fixed)?;
     let per_band_byte = source_count.checked_add(output_count)?;
 
     let span = slice_size.div_ceil(stripe).checked_mul(stripe)?;
@@ -642,6 +668,7 @@ fn run_band(
     let cancelled = move || stopped.load(Ordering::Relaxed);
 
     let mut results: Vec<Result<()>> = Vec::with_capacity(shape.workers);
+    let mut spawn_failure: Option<Par2Error> = None;
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(shape.workers);
         for ((lane, scratch), probe) in lanes
@@ -650,7 +677,10 @@ fn run_band(
             .zip(probes.iter_mut())
         {
             let cancelled = &cancelled;
-            handles.push(scope.spawn(move || {
+            let worker = std::thread::Builder::new()
+                .name("par2-transform".to_string())
+                .stack_size(WORKER_STACK_BYTES);
+            let spawned = worker.spawn_scoped(scope, move || {
                 let mut views: Vec<&[u8]> = Vec::with_capacity(source_count);
                 for (chunk_index, chunk) in lane {
                     if stopped.load(Ordering::Relaxed)
@@ -689,7 +719,16 @@ fn run_band(
                     }
                 }
                 Ok(())
-            }));
+            });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    // Whatever has already started must stop; this band's work
+                    // cannot be completed without every lane.
+                    stopped.store(true, Ordering::Relaxed);
+                    spawn_failure = Some(Par2Error::Io(error));
+                }
+            }
         }
         results.extend(handles.into_iter().map(|handle| {
             handle
@@ -698,6 +737,9 @@ fn run_band(
         }));
     });
 
+    if let Some(error) = spawn_failure {
+        return Err(error);
+    }
     if mismatched.load(Ordering::Relaxed) {
         // The safety row is the first thing the caller must hear about: the
         // other workers stopped because of it, not on their own account.
