@@ -1,6 +1,66 @@
 # Changelog
 
-## 0.10.4 (unreleased)
+## 0.10.5
+
+The XOR-JIT repair tier is chosen by budget instead of by capability.
+
+### Fixed
+
+- On x86_64 hosts with AVX2 but no GFNI, repair selected the XOR-JIT kernel
+  whenever the CPU could run it, then charged its persistent state — an
+  immutable repair codebook, or two active JIT arenas whose size grows with the
+  missing-slice count — against the same `RepairOptions::memory_limit` that
+  pays for the controller's data buffers. Past roughly a thousand missing
+  slices the arenas ate the limit: the data chunk collapsed, the pass count
+  over the sources exploded, and every pass rebuilt the JIT code for each
+  (output, source batch) pair at a fixed cost the smaller chunk could not
+  amortize. At 2048 missing slices and a 64 KiB slice size under the default
+  limit this turned a 36 s repair into a 22 minute one, and past about 2100
+  missing slices the reservation no longer fit at all and the repair failed
+  outright with "XOR-JIT controller capacity setup failed".
+  The tier was tuned under a 512 MiB limit, where its compile-once repair
+  codebook fits and the JIT code is generated once for the whole repair. Below
+  that the codebook does not fit and the fallback — two per-batch active
+  arenas, with the code regenerated on every pass — is what was selected, and
+  it loses to the non-JIT controller at every damage level measured on a Zen2
+  host at 64 MiB: 12.7 s against 14.6 s at 512 missing slices, 24 s against
+  36 s at 1024, 59 s against 1330 s at 2048, and 80 s against an outright
+  failure at 3000.
+- The tier is now selected up front from the budget, for both storage modes:
+  the chunk the XOR-JIT controller would get after its reservation is compared
+  against the chunk the non-JIT method (folded where the host supports the
+  split layout, plain otherwise) would get from the whole limit, and the JIT is
+  taken only when it costs no chunk — never an extra pass over the sources. In
+  practice that admits the codebook, which is only ever built inside the
+  headroom left by a full-slice chunk, and declines the active arenas wherever
+  they would shrink it. A reservation that does not fit the limit at all is now
+  a selection outcome that logs why and takes the non-JIT kernel, not a failed
+  repair. Genuine JIT construction and W^X faults (`InvalidInput`, `Io`, and
+  per-batch sealing) remain hard errors: those are controller defects, not a
+  reason to run different arithmetic.
+- The repair controller now takes the largest data chunk its budget holds
+  rather than halving the slice until one fits, which left up to half the limit
+  unspent — at 3000 missing slices and the default limit a 16 KiB chunk where
+  roughly 21 KiB fits. Fewer passes over the sources at the same memory.
+
+### Changed
+
+- The default repair workspace budget used when `RepairOptions::memory_limit`
+  is `None` is now 128 MiB, up from 64 MiB. The limit pays for the controller's
+  streamed chunk as well as any persistent kernel state, so on a large damaged
+  set the old default was what forced the chunk down to a few kilobytes and the
+  pass count up. Callers that set an explicit limit are unaffected.
+
+### Added
+
+- `RARPAR_PAR2_XORJIT=0` pins the non-JIT repair kernel on x86_64, for A/B
+  against the budget-based selection. Any other value, or an unset variable,
+  leaves the selection to the budget rule.
+- The selection is logged at `INFO` with the tier, which dispatch storage it
+  would use (`codebook` or `active-arenas`), the reserved bytes, and both
+  candidate chunk sizes.
+
+## 0.10.4
 
 The placement scan no longer reads a set that is already in place.
 

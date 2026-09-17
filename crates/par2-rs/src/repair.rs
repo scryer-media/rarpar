@@ -36,7 +36,14 @@ use crate::types::{
 };
 use crate::verify::{FileAccess, FileRangeReader, Repairability, VerificationResult};
 
-pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// Default repair workspace budget. It pays for the controller's streamed
+/// data chunk and for whatever persistent state the selected arithmetic
+/// method keeps, so it also sets how many passes a heavily damaged set costs:
+/// at 64 MiB a 32768-slice set missing thousands of slices was down to a chunk
+/// of a few kilobytes, and the XOR-JIT tier's compile-once codebook — the
+/// shape that tier was tuned for — could not fit beside the data buffers at
+/// all.
+pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 /// The decode matrix is a transient planning workspace whose size is set by
 /// the damage (missing^2 + missing*total words), not by streaming buffer
 /// tuning. Give it its own budget floor so tight slice-buffer limits do not
@@ -516,6 +523,58 @@ fn cpu_controller_plan(
     )
 }
 
+/// Largest chunk, in 16-bit words, whose controller allocation for `method`
+/// fits `controller_budget`, capped at the slice's `word_count`. `None` when
+/// even a single word does not fit.
+///
+/// `ControllerBufferAccounting` is one physical row length times a fixed row
+/// count, and that row length only ever grows with the chunk, so the fit
+/// predicate is monotone and a binary search lands on the exact largest
+/// chunk. Halving instead leaves up to half the limit unspent, and the chunk
+/// is what sets the pass count over the sources.
+fn largest_fitting_chunk_words(
+    word_count: usize,
+    output_count: usize,
+    workers: usize,
+    method: CpuMethodContract,
+    allocated_staging_width: usize,
+    controller_budget: usize,
+) -> Option<usize> {
+    let fits = |chunk_words: usize| {
+        cpu_controller_plan(
+            chunk_words.saturating_mul(2),
+            output_count,
+            workers,
+            method,
+            allocated_staging_width,
+        )
+        .buffer_accounting()
+        .total_bytes
+            <= controller_budget
+    };
+    let word_count = word_count.max(1);
+    if !fits(1) {
+        return None;
+    }
+    if fits(word_count) {
+        return Some(word_count);
+    }
+    // `low` always fits, `high` never does. The layout rounds the surviving
+    // chunk up to the method's stride itself, so the answer needs no further
+    // granule rounding for `CpuControllerPlan` to hold its alignment
+    // invariants.
+    let (mut low, mut high) = (1usize, word_count);
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some(low)
+}
+
 fn controller_execution_parameters(
     plan: &RepairPlan,
     options: &RepairOptions,
@@ -526,6 +585,7 @@ fn controller_execution_parameters(
 ) -> Result<(usize, usize, CpuControllerPlan)> {
     let word_count = (plan.slice_size as usize / 2).max(1);
     let limit = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
+    let output_count = plan.missing_slices.len();
     let controller_budget = limit.checked_sub(persistent_bytes).ok_or_else(|| {
         Par2Error::ResourceLimitExceeded {
             reason: format!(
@@ -533,29 +593,33 @@ fn controller_execution_parameters(
             ),
         }
     })?;
-    let mut chunk_words = word_count;
-    loop {
-        let controller = cpu_controller_plan(
-            chunk_words.saturating_mul(2),
-            plan.missing_slices.len(),
-            workers,
-            method,
-            allocated_staging_width,
-        );
-        if controller.buffer_accounting().total_bytes <= controller_budget {
-            return Ok((chunk_words, limit, controller));
+    let chunk_words = largest_fitting_chunk_words(
+        word_count,
+        output_count,
+        workers,
+        method,
+        allocated_staging_width,
+        controller_budget,
+    )
+    .ok_or_else(|| {
+        let minimum_bytes =
+            cpu_controller_plan(2, output_count, workers, method, allocated_staging_width)
+                .buffer_accounting()
+                .total_bytes;
+        Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "CPU repair controller needs at least {minimum_bytes} bytes, leaving {controller_budget} bytes after persistent state"
+            ),
         }
-        if chunk_words == 1 {
-            return Err(Par2Error::ResourceLimitExceeded {
-                reason: format!(
-                    "CPU repair controller needs at least {} bytes, leaving {} bytes after persistent state",
-                    controller.buffer_accounting().total_bytes,
-                    controller_budget
-                ),
-            });
-        }
-        chunk_words = chunk_words.div_ceil(2);
-    }
+    })?;
+    let controller = cpu_controller_plan(
+        chunk_words.saturating_mul(2),
+        output_count,
+        workers,
+        method,
+        allocated_staging_width,
+    );
+    Ok((chunk_words, limit, controller))
 }
 
 pub(crate) fn build_write_targets(
@@ -883,6 +947,184 @@ impl JitMemo {
     #[inline]
     fn reserved_bytes(&self) -> usize {
         self.reserved_bytes
+    }
+
+    /// Which dispatch storage the reservation bought. The two differ in cost
+    /// by orders of magnitude: the codebook compiles every factor body once
+    /// for the whole repair, while the active arenas regenerate code for every
+    /// (output, source batch) pair on every pass over the slice.
+    fn storage_kind(&self) -> &'static str {
+        match self.storage {
+            JitDispatchStorage::RepairCodebook(_) => "codebook",
+            JitDispatchStorage::ActiveArenas { .. } => "active-arenas",
+        }
+    }
+}
+
+/// The one repair shape the XOR-JIT selection rule reads: how much memory the
+/// repair may use, and how large the controller it has to fill is.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct XorJitSelection {
+    width: reedsolomon_rs::xor_jit::JitWidth,
+    jit_method: CpuMethodContract,
+    /// The non-JIT method this host would otherwise run.
+    baseline_method: CpuMethodContract,
+    output_count: usize,
+    word_count: usize,
+    workers: usize,
+    budget: usize,
+}
+
+/// What each kernel's data chunk would be under the repair's memory limit.
+///
+/// The XOR-JIT reservation — a codebook, or the two active arenas, whose size
+/// grows with the output count — is charged against the same limit as the
+/// controller's data buffers, so it is paid for in passes over the sources.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct XorJitBudgetDecision {
+    baseline_chunk_words: Option<usize>,
+    jit_chunk_words: Option<usize>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl XorJitBudgetDecision {
+    /// The JIT tier is worth its reservation only when it costs no chunk: a
+    /// faster kernel over a smaller chunk still reads the sources more times.
+    fn accepted(self) -> bool {
+        match (self.jit_chunk_words, self.baseline_chunk_words) {
+            (Some(jit), Some(baseline)) => jit >= baseline,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl XorJitSelection {
+    /// Compares the chunk an XOR-JIT controller would get after reserving
+    /// `jit_reserved_bytes` against the chunk the non-JIT method would get
+    /// from the whole limit.
+    ///
+    /// Pure size arithmetic: it allocates no data buffers and maps no W^X
+    /// pages, so the selection rule is testable on its own.
+    fn budget_decision(self, jit_reserved_bytes: usize) -> XorJitBudgetDecision {
+        XorJitBudgetDecision {
+            baseline_chunk_words: largest_fitting_chunk_words(
+                self.word_count,
+                self.output_count,
+                self.workers,
+                self.baseline_method,
+                self.baseline_method.staging_width(),
+                self.budget,
+            ),
+            jit_chunk_words: largest_fitting_chunk_words(
+                self.word_count,
+                self.output_count,
+                self.workers,
+                self.jit_method,
+                self.jit_method.staging_width(),
+                self.budget.saturating_sub(jit_reserved_bytes),
+            ),
+        }
+    }
+
+    /// Builds the XOR-JIT memo when the tier earns its reservation under this
+    /// repair's memory limit, and returns `None` when it does not.
+    ///
+    /// Two outcomes are selection, not failure, and take the non-JIT kernel: a
+    /// reservation that does not fit the limit at all
+    /// (`PackedBuildError::Resource`, or a controller base already over the
+    /// limit), and one that fits but would shrink the data chunk below what
+    /// the non-JIT method gets. Every other construction failure —
+    /// `InvalidInput`, `Io`, and the per-batch sealing at run time — stays a
+    /// hard error: a W^X fault is a controller defect, never a silent
+    /// downgrade to a different arithmetic method.
+    fn select_memo(self, repair_factors: &[u16]) -> Result<Option<JitMemo>> {
+        let Self {
+            width,
+            jit_method,
+            output_count,
+            word_count,
+            workers,
+            budget,
+            ..
+        } = self;
+        let jit_staging_width = jit_method.staging_width();
+        let minimum_controller_bytes =
+            cpu_controller_plan(2, output_count, workers, jit_method, jit_staging_width)
+                .buffer_accounting()
+                .total_bytes;
+        let Some(available_jit_bytes) = budget.checked_sub(minimum_controller_bytes) else {
+            info!(
+                ?width,
+                minimum_controller_bytes,
+                budget,
+                "XOR-JIT controller base does not fit the repair memory limit; selecting the non-JIT kernel"
+            );
+            return Ok(None);
+        };
+        let full_controller_bytes = cpu_controller_plan(
+            word_count.saturating_mul(2),
+            output_count,
+            workers,
+            jit_method,
+            jit_staging_width,
+        )
+        .buffer_accounting()
+        .total_bytes;
+        let codebook_limit = budget.saturating_sub(full_controller_bytes);
+        let memo = match JitMemo::new(
+            width,
+            jit_method,
+            output_count,
+            repair_factors,
+            codebook_limit,
+            available_jit_bytes,
+        ) {
+            Ok(memo) => memo,
+            Err(reedsolomon_rs::xor_jit::packed::PackedBuildError::Resource {
+                requested_bytes,
+                limit_bytes,
+            }) => {
+                info!(
+                    ?width,
+                    requested_bytes,
+                    limit_bytes,
+                    "XOR-JIT reservation does not fit the repair memory limit; selecting the non-JIT kernel"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(Par2Error::ReedSolomonError {
+                    reason: format!("XOR-JIT controller capacity setup failed: {error}"),
+                });
+            }
+        };
+        let reserved_bytes = memo.reserved_bytes();
+        let storage = memo.storage_kind();
+        let decision = self.budget_decision(reserved_bytes);
+        if !decision.accepted() {
+            info!(
+                ?width,
+                storage,
+                reserved_bytes,
+                jit_chunk_words = ?decision.jit_chunk_words,
+                baseline_chunk_words = ?decision.baseline_chunk_words,
+                "XOR-JIT reservation would shrink the repair chunk; selecting the non-JIT kernel"
+            );
+            return Ok(None);
+        }
+        info!(
+            ?width,
+            storage,
+            reserved_bytes,
+            jit_chunk_words = ?decision.jit_chunk_words,
+            baseline_chunk_words = ?decision.baseline_chunk_words,
+            "XOR-JIT reservation costs no repair chunk; selecting the XOR-JIT kernel"
+        );
+        Ok(Some(memo))
     }
 }
 
@@ -4526,61 +4768,42 @@ fn execute_repair_streaming_with_trace(
     #[cfg(not(feature = "wgpu"))]
     let gpu_discrete_auto = false;
     let gpu_preferred = gpu_forced || gpu_discrete_auto;
-    // Select AVX2 XOR-JIT only on tuned CPU families; other machines retain
-    // the folded controller. A W^X/JIT construction failure is a controller
-    // error, never a hidden downgrade to a different arithmetic method.
+    // Select AVX2 XOR-JIT only on tuned CPU families, and only when its
+    // persistent reservation leaves the controller a data chunk at least as
+    // large as the non-JIT method would get; other machines, and every shape
+    // where the reservation would cost a pass over the sources, retain the
+    // non-JIT controller. `RARPAR_PAR2_XORJIT=0` pins the non-JIT kernel.
     #[cfg(target_arch = "x86_64")]
-    let jit_width = reedsolomon_rs::xor_jit::JitWidth::detect();
+    let jit_width = reedsolomon_rs::xor_jit::JitWidth::detect()
+        .filter(|_| std::env::var_os("RARPAR_PAR2_XORJIT").is_none_or(|v| v != "0"));
     let workers = rayon::current_num_threads().max(1);
+    // The non-JIT kernel this host would otherwise run, and the chunk the
+    // XOR-JIT tier has to match to be selected.
+    #[cfg(target_arch = "x86_64")]
+    let baseline_method = if crate::gf_simd::altmap_supported() {
+        CpuKernelKind::Folded.method()
+    } else {
+        CpuKernelKind::Plain.method()
+    };
     // Shape the JIT controller from its selected method contract. The cached
     // strict-W^X capability was established by the Reed-Solomon supported()
     // gate; sealing each active batch remains fallible.
     #[cfg(target_arch = "x86_64")]
     let jit_setup_started = Instant::now();
     #[cfg(target_arch = "x86_64")]
-    let jit_memo = jit_width.map(|width| {
-        let jit_kernel = CpuKernelKind::XorJit(width);
-        let jit_method = jit_kernel.method();
-        let jit_staging_width = jit_method.staging_width();
-        let minimum_controller = cpu_controller_plan(
-            2,
-            n,
-            workers,
-            jit_method,
-            jit_staging_width,
-        );
-        let minimum_controller_bytes = minimum_controller.buffer_accounting().total_bytes;
-        let available_jit_bytes = budget.checked_sub(minimum_controller_bytes).ok_or_else(|| {
-            Par2Error::ResourceLimitExceeded {
-                reason: format!(
-                    "XOR-JIT controller base needs {minimum_controller_bytes} bytes, exceeding the {budget} byte memory limit"
-                ),
-            }
-        })?;
-        let full_controller_bytes = cpu_controller_plan(
-            slice_size,
-            n,
-            workers,
-            jit_method,
-            jit_staging_width,
-        )
-        .buffer_accounting()
-        .total_bytes;
-        let codebook_limit = budget.saturating_sub(full_controller_bytes);
-        JitMemo::new(
+    let jit_memo = match jit_width {
+        Some(width) => XorJitSelection {
             width,
-            jit_method,
-            n,
-            &plan.input_factors.data,
-            codebook_limit,
-            available_jit_bytes,
-        )
-        .map_err(|error| {
-            Par2Error::ReedSolomonError {
-                reason: format!("XOR-JIT controller capacity setup failed: {error}"),
-            }
-        })
-    }).transpose()?;
+            jit_method: CpuKernelKind::XorJit(width).method(),
+            baseline_method,
+            output_count: n,
+            word_count,
+            workers,
+            budget,
+        }
+        .select_memo(&plan.input_factors.data)?,
+        None => None,
+    };
     #[cfg(target_arch = "x86_64")]
     let jit_setup = jit_setup_started.elapsed();
     #[cfg(not(target_arch = "x86_64"))]
@@ -7513,6 +7736,159 @@ pub(crate) mod tests {
         let set = StreamBatchSet::new(256, 6, 6, 2, false, true, true);
         assert_eq!(set.bufs.len(), 6);
         assert!(!set.packed.is_empty());
+    }
+
+    fn controller_bytes_for_test(
+        chunk_words: usize,
+        output_count: usize,
+        workers: usize,
+        method: CpuMethodContract,
+    ) -> usize {
+        cpu_controller_plan(
+            chunk_words.saturating_mul(2),
+            output_count,
+            workers,
+            method,
+            method.staging_width(),
+        )
+        .buffer_accounting()
+        .total_bytes
+    }
+
+    #[test]
+    fn chunk_sizing_takes_the_largest_chunk_the_budget_holds() {
+        let method = CpuKernelKind::Plain.method();
+        let word_count = 64 * 1024 / 2;
+        let workers = 12;
+        let budget = 64 * 1024 * 1024;
+        for output_count in [1usize, 512, 3000] {
+            let chunk = largest_fitting_chunk_words(
+                word_count,
+                output_count,
+                workers,
+                method,
+                method.staging_width(),
+                budget,
+            )
+            .expect("a 64 MiB budget holds at least one word");
+            assert!(controller_bytes_for_test(chunk, output_count, workers, method) <= budget);
+            assert!(
+                chunk == word_count
+                    || controller_bytes_for_test(chunk + 1, output_count, workers, method) > budget,
+                "chunk {chunk} for {output_count} outputs is not the largest fit"
+            );
+            // The old sizing halved the slice until it fit; that answer can
+            // never beat the exact one.
+            let mut halved = word_count;
+            while controller_bytes_for_test(halved, output_count, workers, method) > budget {
+                halved = halved.div_ceil(2);
+            }
+            assert!(
+                halved <= chunk,
+                "halving beat the exact fit at {output_count}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn xorjit_selection_for_test(output_count: usize, budget: usize) -> XorJitSelection {
+        let width = reedsolomon_rs::xor_jit::JitWidth::Avx2;
+        XorJitSelection {
+            width,
+            jit_method: CpuKernelKind::XorJit(width).method(),
+            baseline_method: CpuKernelKind::Folded.method(),
+            output_count,
+            word_count: 64 * 1024 / 2,
+            workers: 12,
+            budget,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn active_arena_reservation_for_test(selection: XorJitSelection) -> usize {
+        reedsolomon_rs::xor_jit::packed::PackedJitBatch::active_arena_upper_bound(
+            selection.width,
+            selection.output_count,
+            selection.jit_method.input_grouping(),
+        )
+        .expect("the AVX2 arena bound is finite")
+            * 2
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_declines_when_its_active_arenas_cost_a_repair_chunk() {
+        // The arena mode regenerates code every pass, so a chunk it shrinks is
+        // paid for twice over. 64 MiB is the old default, 128 MiB the current
+        // one; neither buys these shapes their chunk back.
+        for budget in [64 * 1024 * 1024, DEFAULT_REPAIR_MEMORY_LIMIT] {
+            for output_count in [2048usize, 3000] {
+                let selection = xorjit_selection_for_test(output_count, budget);
+                let decision =
+                    selection.budget_decision(active_arena_reservation_for_test(selection));
+                assert!(
+                    !decision.accepted(),
+                    "{output_count} missing slices at {budget} bytes: {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_is_selected_when_its_reservation_costs_no_chunk() {
+        let selection = xorjit_selection_for_test(4, DEFAULT_REPAIR_MEMORY_LIMIT);
+        let decision = selection.budget_decision(active_arena_reservation_for_test(selection));
+        assert!(decision.accepted(), "{decision:?}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_capacity_shortfall_selects_the_non_jit_kernel() {
+        let mut selection = xorjit_selection_for_test(4096, DEFAULT_REPAIR_MEMORY_LIMIT);
+        // Capacity is what this test exercises; the strict-W^X precondition is
+        // a host capability `JitMemo::new` checks first, so pin it on.
+        selection.jit_method.strict_wx_available = true;
+        let selected = selection
+            .select_memo(&[1u16, 2, 3])
+            .expect("a capacity shortfall is a selection outcome, not an error");
+        assert!(selected.is_none());
+    }
+
+    /// The codebook mode is admitted only within `budget - full_controller`,
+    /// so wherever it fits it leaves the whole slice as the chunk. The same
+    /// rule accepts it that declines the arenas above.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_codebook_sized_reservation_keeps_the_whole_slice() {
+        let selection = xorjit_selection_for_test(3000, 512 * 1024 * 1024);
+        let full_controller_bytes = controller_bytes_for_test(
+            selection.word_count,
+            selection.output_count,
+            selection.workers,
+            selection.jit_method,
+        );
+        let decision =
+            selection.budget_decision(selection.budget.saturating_sub(full_controller_bytes));
+        assert_eq!(decision.jit_chunk_words, Some(selection.word_count));
+        assert!(decision.accepted(), "{decision:?}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_selects_the_codebook_at_a_large_limit() {
+        if !reedsolomon_rs::xor_jit::strict_wx_available() {
+            // No strict W^X here (a translated process, for one): the codebook
+            // cannot be compiled, and its selection is not what fails.
+            return;
+        }
+        let selection = xorjit_selection_for_test(3000, 512 * 1024 * 1024);
+        let factors = (1u16..=3000).collect::<Vec<_>>();
+        let memo = selection
+            .select_memo(&factors)
+            .expect("a codebook that fits is not a failure")
+            .expect("512 MiB holds the codebook beside a full-slice chunk");
+        assert_eq!(memo.storage_kind(), "codebook");
     }
 
     #[cfg(target_arch = "x86_64")]

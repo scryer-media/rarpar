@@ -114,8 +114,9 @@ use crate::verify::FileAccess;
 ///
 /// 2 KiB rather than a rounder 4 KiB because the staging arena is
 /// `n_present * band`: on a 16k-block set (16320 present slices, 64 KiB
-/// slices) the default 64 MiB limit buys a band of 3840 bytes, and a 4 KiB
-/// floor would have refused every repair on that set at the default limit. At
+/// slices) a 64 MiB limit — the default when this floor was measured — buys a
+/// band of 3840 bytes, and a 4 KiB floor would have refused every repair on
+/// that set at that limit. At
 /// 2 KiB the same set repairs in 1.8 s (m=512), 3.0 s (m=2048) and 5.9 s
 /// (m=4096) against the dense path's 2.2 s, 7.9 s and 20.3 s, with a peak RSS
 /// of 95, 190 and 246 MB against dense's 86, 149 and 264 MB.
