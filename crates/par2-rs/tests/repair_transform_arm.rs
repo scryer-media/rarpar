@@ -171,16 +171,20 @@ fn a_tiny_memory_limit_forces_many_bands_and_still_matches() {
 
 #[test]
 fn a_limit_that_cannot_buy_a_band_takes_the_dense_path() {
-    let synthetic = fixture(&[65536 * 4], 65536, 8, 0x1DEA);
+    // The limit has to be one the dense path accepts on every kernel tier (an
+    // x86 controller refuses a few KiB outright) and the arm still cannot
+    // use: 1200 present slices need 2 KiB of staging each before anything
+    // else is charged, which 1 MiB cannot buy.
+    let synthetic = fixture(&[4096 * 1200], 4096, 8, 0x1DEA);
     both_ways(
         "no admissible band",
         &synthetic,
-        Some(8 * 1024),
+        Some(1024 * 1024),
         false,
         &|access, set| {
             let file = &set.files[0];
             let mut data = file.data.clone();
-            data[..65536].fill(0x33);
+            data[..4096].fill(0x33);
             access.add_file(file.file_id, data);
         },
     );
