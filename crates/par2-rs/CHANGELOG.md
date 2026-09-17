@@ -29,6 +29,28 @@ The placement scan no longer reads a set that is already in place.
   warning, and recreates every volume densely from scratch.
 - `RARPAR_PAR2_TRANSFORM` forces the decision: `0` always takes the dense path,
   `1` takes the transform wherever it is admissible.
+- A transform arm for the repair arithmetic. The dense executor folds every
+  available source into every missing output — `missing * available` region
+  folds, which at a large damaged set is the whole runtime. Repair can instead
+  remove the present slices' contribution from each selected recovery block
+  with one multiplicative GF(2^16) DFT over the present slices
+  (`reedsolomon_rs::gf16_dft`), leaving the parity of the missing slices alone,
+  and then solve for the missing slices. The solve sits behind a seam: a run
+  of consecutive recovery exponents at 512 or more missing slices takes
+  `reedsolomon_rs::vandermonde_solve`'s closed-form solve, whose scratch is
+  charged against the same memory limit; anything else applies the
+  `missing x missing` inverse the repair plan already built.
+  GF addition is XOR and multiplication is exact, so the reassociated sum is
+  bit-identical to the dense product, and the arm is chosen only when its fold
+  count beats the dense one by a margin. It runs under the existing
+  `RepairOptions::memory_limit`: a DFT row needs the same byte range of every
+  present slice resident, so the slice is walked in bands sized from that
+  limit, and the arm declines to the dense path whenever the limit cannot buy
+  one. Every band also computes one syndrome row the dense way and compares;
+  a disagreement abandons the arm and reruns the repair densely.
+  `set_transform_arm_override` (thread-local) and `RARPAR_PAR2_TRANSFORM=0|1`
+  force the decision, and `transform_arm_stats` reports what the arm did and which solve it chose. Small
+  repairs, GPU-capable builds, and every caller-visible API are unchanged.
 
 ### Fixed
 

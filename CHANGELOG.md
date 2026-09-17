@@ -16,6 +16,17 @@ documented in each crate's own changelog so those notes ship with the crate.
   10.3 s to 7.5 s at `-r 15`, and 23.1 s to 9.0 s at `-r 30`, using less peak
   memory than before at both the default limit and `--memory-mib 256`. Set
   `RARPAR_PAR2_TRANSFORM=0` to force the old path.
+
+- `par repair` can now reconstruct a heavily damaged set through a syndrome
+  transform instead of the dense Reed-Solomon product. On a set where thousands
+  of blocks are missing the dense arithmetic folds every surviving block into
+  every missing one; the transform reaches the same bytes in far fewer passes
+  over memory. It is chosen automatically, only when it wins and only when it
+  fits inside the repair memory budget already in force, and it checks itself
+  against the dense arithmetic on every pass, so an ordinary repair of a few
+  blocks behaves exactly as before. `RARPAR_PAR2_TRANSFORM=0` pins the old
+  path; `=1` forces the new one wherever it is admissible.
+
 - `par verify` and `par repair` under the default smart placement no longer
   read a set that is already in place twice. The placement scan hashed every
   matching file in full, serially, before verification read it all again; a

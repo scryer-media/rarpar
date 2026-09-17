@@ -403,14 +403,14 @@ struct FactorIndex {
 }
 
 #[derive(Clone, Debug)]
-struct RepairWriteTarget {
-    file_id: FileId,
-    filename: String,
-    offset: u64,
-    file_end: u64,
+pub(crate) struct RepairWriteTarget {
+    pub(crate) file_id: FileId,
+    pub(crate) filename: String,
+    pub(crate) offset: u64,
+    pub(crate) file_end: u64,
 }
 
-fn check_cancel(options: &RepairOptions) -> Result<()> {
+pub(crate) fn check_cancel(options: &RepairOptions) -> Result<()> {
     if let Some(ref cancel) = options.cancel
         && cancel.is_cancelled()
     {
@@ -558,7 +558,7 @@ fn controller_execution_parameters(
     }
 }
 
-fn build_write_targets(
+pub(crate) fn build_write_targets(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
 ) -> Result<Vec<RepairWriteTarget>> {
@@ -1077,13 +1077,13 @@ impl StreamBatchSet {
 
 /// Read one streamed source chunk (a present input slice range or a recovery
 /// block range) into `dst`, zero-padding any short tail.
-struct StreamSourceReader {
+pub(crate) struct StreamSourceReader {
     file_id: FileId,
     reader: Box<dyn FileRangeReader>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_stream_source_chunk(
+pub(crate) fn read_stream_source_chunk(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
     file_access: &mut dyn FileAccess,
@@ -5681,11 +5681,28 @@ pub fn execute_repair_with_options(
     );
 
     let budget = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
+
+    // The transform arm is an alternative to the same CPU arithmetic the
+    // streamed controller runs, under the same memory limit and the same write
+    // path. It declines - writing nothing - whenever it is not admissible or
+    // does not beat the dense fold count by a margin. `Diverged` means its own
+    // per-band probe caught a disagreement: the dense executor then reruns the
+    // whole plan, rewriting every band from sources the arm never wrote to.
+    match crate::repair_transform::try_execute(plan, par2_set, file_access, options, budget)? {
+        crate::repair_transform::TransformOutcome::Executed => return Ok(()),
+        crate::repair_transform::TransformOutcome::Declined(reason) => {
+            debug!(reason, "repair transform arm declined");
+        }
+        crate::repair_transform::TransformOutcome::Diverged => {
+            warn!("repair transform arm diverged; rerunning the repair on the dense path");
+        }
+    }
+
     execute_repair_streaming(plan, par2_set, file_access, options, budget)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::checksum::{self, SliceChecksumState};
     use crate::packet::header;
@@ -5899,7 +5916,7 @@ mod tests {
     /// Create a PAR2 file set with known data and recovery blocks.
     ///
     /// Returns (par2_set, original_file_data, file_id).
-    fn setup_repairable_set(
+    pub(crate) fn setup_repairable_set(
         file_data: &[u8],
         slice_size: u64,
         num_recovery: usize,
