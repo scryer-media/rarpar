@@ -10,6 +10,7 @@ mod encode;
 mod metal;
 mod output;
 mod plan;
+mod transform;
 
 pub use encode::ForwardKernel;
 /// The process-stable worker width, under a name that says why the repairer
