@@ -51,12 +51,14 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library Versions
 
-- `unrar-rs` 0.10.7 and `par2-rs` 0.10.4, for the backend feature scheme above
-  and the placement scan fix;
+- `unrar-rs` 0.10.7 and `par2-rs` 0.10.4, for the backend feature scheme above,
+  the placement scan fix, and the transform arms for create and repair;
   `unrar-rs` 0.10.7 also stops hashing a split streaming member with BLAKE2sp
   when no header names one.
-  `par3-rs` and `reedsolomon-rs` are unchanged; `par3-rs` has no AWS-LC code
-  path at all and gains no crypto feature.
+  `reedsolomon-rs` 0.4.6 adds the GF(2^16) transform and the closed-form
+  consecutive-exponent solve those arms run on.
+  `par3-rs` is unchanged; it has no AWS-LC code path at all and gains no crypto
+  feature.
 
 ## rarpar 0.5.0
 

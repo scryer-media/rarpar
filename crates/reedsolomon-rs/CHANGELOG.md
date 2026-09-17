@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.5 (unreleased)
+## 0.4.6 (unreleased)
 
 - Add `gf16_dft`: PAR2 recovery and syndrome rows computed as an
   output-pruned multiplicative DFT over GF(2^16) instead of the dense
@@ -14,13 +14,7 @@
   recovery blocks) it performs 2,539,264 region folds where the dense product
   performs 214,728,704, measured at 96x less wall time on aarch64; it falls
   back to the dense fold count for very small output counts and never exceeds
-  it. `DftPlan` is `Send + Sync` and allocation-free per stripe; no PAR2 code
-  path calls it yet.
-- Add reusable GF(2^8) region arithmetic and clean-room Cantor-field FFT
-  primitives for the PAR3 engine, with runtime SIMD dispatch and scalar
-  fallbacks. PAR3 packet layouts and recovery geometry remain in `par3-rs`.
-- Add FFT transform benchmarks and native parity coverage. Existing PAR2 and
-  RAR arithmetic APIs remain compatible; GPU features remain opt-in.
+  it. `DftPlan` is `Send + Sync` and allocation-free per stripe.
 - Add `vandermonde_solve`: a closed-form PAR2 erasure solve for consecutive
   recovery exponents. `ConsecutiveSolvePlan` reconstructs the missing slices
   from the syndrome rows with a Forney-style locator and a two-stage fold —
@@ -40,6 +34,14 @@
   against the written-out form and against `matrix`; at 8192 rows and a 64 KiB
   stripe the transformed solve is 17x cheaper than applying an explicit
   inverse, before that inverse is even built.
+
+## 0.4.5
+
+- Add reusable GF(2^8) region arithmetic and clean-room Cantor-field FFT
+  primitives for the PAR3 engine, with runtime SIMD dispatch and scalar
+  fallbacks. PAR3 packet layouts and recovery geometry remain in `par3-rs`.
+- Add FFT transform benchmarks and native parity coverage. Existing PAR2 and
+  RAR arithmetic APIs remain compatible; GPU features remain opt-in.
 
 ## 0.4.4
 
