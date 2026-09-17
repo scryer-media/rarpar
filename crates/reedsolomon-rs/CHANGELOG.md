@@ -21,6 +21,25 @@
   fallbacks. PAR3 packet layouts and recovery geometry remain in `par3-rs`.
 - Add FFT transform benchmarks and native parity coverage. Existing PAR2 and
   RAR arithmetic APIs remain compatible; GPU features remain opt-in.
+- Add `vandermonde_solve`: a closed-form PAR2 erasure solve for consecutive
+  recovery exponents. `ConsecutiveSolvePlan` reconstructs the missing slices
+  from the syndrome rows with a Forney-style locator and a two-stage fold —
+  a correlation against the locator coefficients, then an evaluation at each
+  missing input's constant — so no `m x m` matrix is built, stored, or
+  inverted. The solve is stripe-wise and in place, allocates nothing, and
+  overwrites the caller's syndrome rows with the answers. Non-consecutive
+  exponent selections are rejected so callers fall back to `matrix`, which is
+  unchanged.
+- `vandermonde_solve` carries two transformed forms of the same arithmetic,
+  selected by row count and pinnable through `SolveStrategy`. Stage 1 becomes
+  blocked cyclic correlations of length 255 evaluated by a twiddle-free
+  Good-Thomas 3x5x17 transform, with the padded inputs and unread outputs of
+  its radix-17 passes pruned. Stage 2 splits the evaluation across the two
+  coprime factors of the group order, `65535 = 255 * 257`, so the constants
+  sharing a residue share one set of 257 partial rows. Both are bit-exact
+  against the written-out form and against `matrix`; at 8192 rows and a 64 KiB
+  stripe the transformed solve is 17x cheaper than applying an explicit
+  inverse, before that inverse is even built.
 
 ## 0.4.4
 
