@@ -23,9 +23,9 @@ The placement scan no longer reads a set that is already in place.
   payload, takes the dense path instead. Measured peak RSS is below the dense
   arm's at the same limit on every shape tried, at the default limit and at a
   256 MiB one.
-- Every band is checked before it is emitted: one recovery row is recomputed
-  with the dense kernels over the same staged bytes and compared against the
-  transform's. A mismatch abandons the transform for that creation, logs a
+- Every band is checked before it is emitted: one recovery row, a different
+  one each band, is recomputed with the dense kernels over the same staged
+  bytes and compared against the transform's. A mismatch abandons the transform for that creation, logs a
   warning, and recreates every volume densely from scratch.
 - `RARPAR_PAR2_TRANSFORM` forces the decision: `0` always takes the dense path,
   `1` takes the transform wherever it is admissible.
@@ -46,8 +46,11 @@ The placement scan no longer reads a set that is already in place.
   `RepairOptions::memory_limit`: a DFT row needs the same byte range of every
   present slice resident, so the slice is walked in bands sized from that
   limit, and the arm declines to the dense path whenever the limit cannot buy
-  one. Every band also computes one syndrome row the dense way and compares;
-  a disagreement abandons the arm and reruns the repair densely.
+  one. Every band also computes one syndrome row the dense way and compares,
+  then re-encodes the solved slices at that exponent and compares again, so
+  the transform and the solve are each checked independently; a disagreement
+  abandons the arm and reruns the repair densely. Each worker's transform
+  scratch is part of the sum charged against the limit.
   `set_transform_arm_override` (thread-local) and `RARPAR_PAR2_TRANSFORM=0|1`
   force the decision, and `transform_arm_stats` reports what the arm did and which solve it chose. Small
   repairs, GPU-capable builds, and every caller-visible API are unchanged.

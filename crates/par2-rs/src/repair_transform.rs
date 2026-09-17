@@ -78,7 +78,9 @@
 //! # Safety
 //!
 //! Per band, one syndrome row is also computed the dense way over the staged
-//! bytes and compared with the transform's. A mismatch abandons the arm and
+//! bytes and compared with the transform's, and the solved rows are re-encoded
+//! at that exponent and compared with the same syndrome, so neither half of the
+//! arm is trusted on its own word. A mismatch abandons the arm and
 //! the caller reruns the whole repair on the dense path. Nothing is written
 //! until the probe for that band has passed, and the dense rerun recomputes
 //! and rewrites every missing byte from sources the arm never touches, so a
@@ -268,6 +270,17 @@ thread_local! {
 #[cfg(test)]
 fn take_probe_fault() -> bool {
     PROBE_FAULT.with(|cell| cell.replace(false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOLVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Corrupt the next band's solved output, once.
+#[cfg(test)]
+fn take_solve_fault() -> bool {
+    SOLVE_FAULT.with(|cell| cell.replace(false))
 }
 
 /// The current thread's transform-arm override, if any.
@@ -555,7 +568,11 @@ fn choose_solver<'a>(
             range_len,
             workers,
             dft.plan_bytes(),
-            &|stripe| solver.scratch_bytes(stripe),
+            // A worker holds the transform's scratch and the solver's at once.
+            &|stripe| {
+                dft.scratch_bytes(stripe)
+                    .saturating_add(solver.scratch_bytes(stripe))
+            },
             budget,
         )
     };
@@ -847,6 +864,31 @@ fn run(
                 band = band_index,
                 probe_exponent = plan.recovery_exponents[probe],
                 "repair transform arm diverged from its dense probe; falling back"
+            );
+            record_diverged();
+            return Ok(TransformOutcome::Diverged);
+        }
+
+        // The probe above vouches for the transform only. The solve gets its
+        // own: re-encoding the repaired rows at the probe exponent must give
+        // the dense syndrome back, so XORing that re-encoding over a row equal
+        // to it has to leave zeros. `m` folds per band, and no solver shares
+        // any of it.
+        #[cfg(test)]
+        if take_solve_fault() {
+            output[0] ^= 0xFF;
+        }
+        let factors: Vec<u16> = plan
+            .missing_global_indices
+            .iter()
+            .map(|&global| gf::pow(plan.constants[global], plan.recovery_exponents[probe]))
+            .collect();
+        dense_row(&output, band, band_len, &factors, &mut probe_seen[..band_len]);
+        if probe_seen[..band_len].iter().any(|&byte| byte != 0) {
+            warn!(
+                band = band_index,
+                probe_exponent = plan.recovery_exponents[probe],
+                "repair transform arm's solve does not re-encode to its syndrome; falling back"
             );
             record_diverged();
             return Ok(TransformOutcome::Diverged);
@@ -1284,6 +1326,22 @@ mod tests {
             restored, data,
             "the dense rerun must still restore the file"
         );
+    }
+
+    #[test]
+    fn a_wrong_solve_abandons_the_arm_and_the_dense_path_finishes_the_repair() {
+        // The syndrome probe cannot see a solver that turns right syndromes
+        // into wrong slices; the re-encode check has to.
+        let slice_size = 64u64;
+        let data = noise(64 * 16, 0xBADC0DE);
+        let damaged = [0usize, 5, 11];
+        SOLVE_FAULT.with(|cell| cell.set(true));
+        let (restored, stats) =
+            repair_once(Some(TransformArm::On), &data, slice_size, 6, &damaged, false);
+        SOLVE_FAULT.with(|cell| cell.set(false));
+        assert_eq!(stats.diverged, 1, "the corrupted solve must be caught");
+        assert_eq!(stats.executed, 0);
+        assert_eq!(restored, data);
     }
 
     #[test]

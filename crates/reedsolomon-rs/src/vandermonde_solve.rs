@@ -406,7 +406,7 @@ impl ConsecutiveSolvePlan {
             return Self::build(missing_logs, 0);
         };
         for (step, &exponent) in exponents.iter().enumerate() {
-            if exponent != first + step as u32 {
+            if u32::try_from(step).ok().and_then(|step| first.checked_add(step)) != Some(exponent) {
                 return Err(SolveError::NonConsecutive);
             }
         }

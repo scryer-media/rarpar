@@ -67,9 +67,9 @@
 //!
 //! The transform and the dense definition are the same sum, but the transform
 //! is a different program, and a wrong recovery volume is not detectable by
-//! anything downstream of creation. Every stripe therefore also computes its
-//! *first* recovery row the dense way — `n` folds, `1/r` of the dense arm's
-//! total work — and compares. A mismatch abandons the arm for the whole create
+//! anything downstream of creation. Every stripe therefore also computes one
+//! recovery row the dense way — `n` folds, `1/r` of the dense arm's total work
+//! — and compares; which row rotates from band to band. A mismatch abandons the arm for the whole create
 //! and the caller recreates every volume from the dense path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -511,13 +511,15 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
         .collect();
     let mut band_lens = vec![0usize; source_count];
 
-    // The safety row's factors: `c_i^e0` for the first recovery exponent,
-    // taken once for the whole create rather than once per stripe.
-    let first_exponent = exponents[0];
-    let probe_factors: Vec<u16> = gf::input_slice_constants(source_count)
+    // The safety row rotates through the recovery rows band by band, so a
+    // fault confined to some rows cannot sit behind one that is always right
+    // (the first row of a set starting at exponent 0 is a plain XOR). Its
+    // factors are retaken per band from these logs: `n` table lookups.
+    let source_logs: Vec<u16> = gf::input_slice_constants(source_count)
         .into_iter()
-        .map(|constant| gf::pow_from_log(gf::log(constant), first_exponent))
+        .map(gf::log)
         .collect();
+    let mut probe_factors: Vec<u16> = vec![0; source_count];
 
     let total_bytes = (output_count as u64).saturating_mul(slice_size as u64);
     let passes_u32 = u32::try_from(shape.passes)
@@ -542,6 +544,11 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
             observe_band(&mut **observer, sources.as_bytes(), &band_lens, shape.band)?;
         }
 
+        let probe_row = pass % output_count;
+        for (factor, &log) in probe_factors.iter_mut().zip(&source_logs) {
+            *factor = gf::pow_from_log(log, exponents[probe_row]);
+        }
+
         #[cfg(test)]
         test_probe::record_pass();
         let mismatch = run_band(
@@ -551,6 +558,7 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
             &mut scratches,
             &mut probes,
             &probe_factors,
+            probe_row,
             source_count,
             output_count,
             shape,
@@ -643,6 +651,7 @@ fn run_band(
     scratches: &mut [DftScratch],
     probes: &mut [Vec<u8>],
     probe_factors: &[u16],
+    probe_row: usize,
     source_count: usize,
     output_count: usize,
     shape: TransformShape,
@@ -707,12 +716,12 @@ fn run_band(
                         stopped.store(true, Ordering::Relaxed);
                         return Err(transform_error(error));
                     }
-                    dense_first_row(probe, &views, probe_factors);
+                    dense_probe_row(probe, &views, probe_factors);
                     #[cfg(test)]
                     if inject_fault {
                         probe[0] ^= 0xff;
                     }
-                    if probe[..] != chunk[..shape.stripe] {
+                    if probe[..] != chunk[probe_row * shape.stripe..][..shape.stripe] {
                         mismatched.store(true, Ordering::Relaxed);
                         stopped.store(true, Ordering::Relaxed);
                         return Ok(());
@@ -754,9 +763,9 @@ fn run_band(
     Ok(false)
 }
 
-/// The first recovery row, straight from the PAR2 definition: `n` region folds
-/// over the same staged stripe the transform just consumed.
-fn dense_first_row(probe: &mut [u8], views: &[&[u8]], factors: &[u16]) {
+/// One recovery row, straight from the PAR2 definition: `n` region folds over
+/// the same staged stripe the transform just consumed.
+fn dense_probe_row(probe: &mut [u8], views: &[&[u8]], factors: &[u16]) {
     probe.fill(0);
     let mut batch: [FactorSrc<'_>; OBSERVE_RUN] = std::array::from_fn(|_| FactorSrc {
         factor: 0,
