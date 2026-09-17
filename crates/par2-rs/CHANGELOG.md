@@ -28,6 +28,14 @@ The placement scan no longer reads a set that is already in place.
   first 16 KB at its own name used to land in `unresolved` and now lands in
   `exact`. `PlacementFileAccess::from_plan` treats the two the same.
 
+### Documentation
+
+- `Par2FileSet::recovery_block_count` and `VerificationResult`'s
+  `recovery_blocks_available` now say that they are an upper bound for a set
+  loaded from disk: the path scanner records recovery payloads as file-backed
+  spans without hashing them, so a block with a damaged payload stays counted
+  until repair validates its packet hash. No behavior change.
+
 ## 0.10.3 (unreleased)
 
 ### Changed

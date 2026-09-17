@@ -243,6 +243,11 @@ impl Par2FileSet {
     }
 
     /// Number of recovery blocks available.
+    ///
+    /// An upper bound for a set loaded from disk: the path scanner records
+    /// recovery payloads as file-backed spans without hashing them, so a block
+    /// whose payload is damaged is still counted here. It drops out only when
+    /// something validates its packet hash, which repair does before using it.
     pub fn recovery_block_count(&self) -> u32 {
         self.recovery_slices.len() as u32
     }
