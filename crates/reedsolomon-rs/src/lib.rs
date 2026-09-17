@@ -57,6 +57,8 @@
 /// codec geometry belongs to callers.
 pub mod fft;
 pub mod gf;
+/// Output-pruned multiplicative GF(2^16) DFT for PAR2 recovery and syndrome rows.
+pub mod gf16_dft;
 pub mod gf8;
 pub mod gf_pmul;
 pub mod gf_simd;
