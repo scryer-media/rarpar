@@ -50,6 +50,12 @@ The XOR-JIT repair tier is chosen by budget instead of by capability.
   streamed chunk as well as any persistent kernel state, so on a large damaged
   set the old default was what forced the chunk down to a few kilobytes and the
   pass count up. Callers that set an explicit limit are unaffected.
+- The repair transform arm now needs a 4x fold-count advantage over the dense
+  path before it engages, up from 2x. With the larger default limit the arm
+  began to admit a 407-missing, 1 MiB-slice repair on a 2.6x paper advantage
+  and ran it in 35 s against 19 s dense on an AVX2 desktop; every shape
+  measured at 12x or better still engages and wins (2048 missing 64 KiB
+  slices: 15 s against 50 s).
 
 ### Added
 

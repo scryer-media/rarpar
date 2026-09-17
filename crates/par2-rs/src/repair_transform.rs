@@ -144,10 +144,12 @@ pub(crate) const MIN_MISSING: usize = 256;
 /// A fold is not a constant-cost unit across the two arms: the dense executor
 /// folds long contiguous source rows with prepared factors and a tuned
 /// controller, while the transform's folds are short stripe passes over
-/// scratch rows, several of them dependent. Requiring a 2x paper margin is the
+/// scratch rows, several of them dependent. Requiring a 4x paper margin is the
 /// cheapest way to keep the arm out of the region where its better fold count
-/// does not survive contact with the memory system.
-const FOLD_MARGIN: u64 = 2;
+/// does not survive contact with the memory system: measured on an AVX2
+/// desktop, a 2.6x paper advantage ran 1.8x slower than the dense path, while
+/// every shape at 12x or better won.
+const FOLD_MARGIN: u64 = 4;
 
 /// Hard cap on how far the covering exponent range may exceed `m`.
 ///
