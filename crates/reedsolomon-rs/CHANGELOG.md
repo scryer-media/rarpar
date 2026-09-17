@@ -1,6 +1,41 @@
 # Changelog
 
-## 0.4.5 (unreleased)
+## 0.4.6 (unreleased)
+
+- Add `gf16_dft`: PAR2 recovery and syndrome rows computed as an
+  output-pruned multiplicative DFT over GF(2^16) instead of the dense
+  slices x recovery-blocks product. PAR2's per-slice constants are powers of a
+  primitive element, so the weighted sum is a 65535-point cyclic transform;
+  65535 = 3 * 5 * 17 * 257 factors it the Good-Thomas way into short stages
+  with no twiddle factors. The schedule prunes to the exponents a caller
+  actually asked for and streams the length-257 dimension, so per-worker
+  scratch follows the transform's row count and the stripe length, never the
+  slice count or the slice size. At PAR2's ceiling (32768 slices, 6553
+  recovery blocks) it performs 2,539,264 region folds where the dense product
+  performs 214,728,704, measured at 96x less wall time on aarch64; it falls
+  back to the dense fold count for very small output counts and never exceeds
+  it. `DftPlan` is `Send + Sync` and allocation-free per stripe.
+- Add `vandermonde_solve`: a closed-form PAR2 erasure solve for consecutive
+  recovery exponents. `ConsecutiveSolvePlan` reconstructs the missing slices
+  from the syndrome rows with a Forney-style locator and a two-stage fold —
+  a correlation against the locator coefficients, then an evaluation at each
+  missing input's constant — so no `m x m` matrix is built, stored, or
+  inverted. The solve is stripe-wise and in place, allocates nothing, and
+  overwrites the caller's syndrome rows with the answers. Non-consecutive
+  exponent selections are rejected so callers fall back to `matrix`, which is
+  unchanged.
+- `vandermonde_solve` carries two transformed forms of the same arithmetic,
+  selected by row count and pinnable through `SolveStrategy`. Stage 1 becomes
+  blocked cyclic correlations of length 255 evaluated by a twiddle-free
+  Good-Thomas 3x5x17 transform, with the padded inputs and unread outputs of
+  its radix-17 passes pruned. Stage 2 splits the evaluation across the two
+  coprime factors of the group order, `65535 = 255 * 257`, so the constants
+  sharing a residue share one set of 257 partial rows. Both are bit-exact
+  against the written-out form and against `matrix`; at 8192 rows and a 64 KiB
+  stripe the transformed solve is 17x cheaper than applying an explicit
+  inverse, before that inverse is even built.
+
+## 0.4.5
 
 - Add reusable GF(2^8) region arithmetic and clean-room Cantor-field FFT
   primitives for the PAR3 engine, with runtime SIMD dispatch and scalar

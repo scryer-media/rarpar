@@ -21,6 +21,9 @@ use crate::types::{
 use reedsolomon_rs::gf_simd::{self, PreparedFactorSrc};
 
 use super::plan::default_memory_limit;
+use super::transform::{self, TransformPolicy};
+
+pub(crate) use super::transform::EncodeAttempt;
 
 /// Sources per input batch for the families whose kernels take one slice per
 /// source in fixed-size groups on x86 (the folded pair kernels take two groups
@@ -287,6 +290,10 @@ pub struct ForwardEncoderOptions {
     pub progress: Option<ProgressCallback>,
     /// Arithmetic path to use.
     pub kernel: ForwardKernel,
+    /// Whether this pass may take the transform arm (see
+    /// [`super::transform`]). Creation resolves it from the environment once
+    /// per process; tests set it directly so they never race a global.
+    pub(crate) transform: TransformPolicy,
 }
 
 impl Default for ForwardEncoderOptions {
@@ -296,6 +303,7 @@ impl Default for ForwardEncoderOptions {
             cancel: None,
             progress: None,
             kernel: ForwardKernel::Auto,
+            transform: TransformPolicy::default(),
         }
     }
 }
@@ -481,6 +489,7 @@ impl ForwardEncoder {
     }
 
     /// Encode provider-backed source slices through an ordered, bounded sink.
+    #[cfg(test)]
     pub fn encode_to<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
         &self,
         provider: &mut P,
@@ -493,6 +502,7 @@ impl ForwardEncoder {
     /// Encode as [`Self::encode_to`], driving `observer` from the same source
     /// bytes the arithmetic reads. See [`ForwardSourceObserver`] for what the
     /// feed order does and does not allow an observer to compute.
+    #[cfg(test)]
     pub(crate) fn encode_to_observed<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
         &self,
         provider: &mut P,
@@ -500,13 +510,31 @@ impl ForwardEncoder {
         sink: &mut S,
         observer: Option<&mut dyn ForwardSourceObserver>,
     ) -> Result<()> {
+        match self.encode_attempt(provider, options, sink, observer)? {
+            EncodeAttempt::Complete => Ok(()),
+            EncodeAttempt::TransformProbeMismatch => Err(resource_limit(
+                "transform recovery arithmetic disagreed with the dense definition",
+            )),
+        }
+    }
+
+    /// [`Self::encode_to_observed`], reporting a transform-arm safety-row
+    /// mismatch to the caller instead of turning it into an error: the create
+    /// path answers that by recreating every volume from the dense arm.
+    pub(crate) fn encode_attempt<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
+        &self,
+        provider: &mut P,
+        options: &ForwardEncoderOptions,
+        sink: &mut S,
+        observer: Option<&mut dyn ForwardSourceObserver>,
+    ) -> Result<EncodeAttempt> {
         let mut observer = observer;
         let observer = &mut observer;
         validate_provider(provider, self.slice_size)?;
         check_cancel(options)?;
 
         if self.recovery_exponents.is_empty() {
-            return Ok(());
+            return Ok(EncodeAttempt::Complete);
         }
 
         let memory_limit = options.memory_limit.unwrap_or_else(default_memory_limit);
@@ -517,6 +545,32 @@ impl ForwardEncoder {
             memory_limit,
             options.kernel,
         )?;
+
+        // The transform arm is admitted against the smaller of the caller's
+        // budget and what the dense arm just reserved, so taking it can only
+        // lower this pass's residency, never raise it.
+        if let Some(arm) = transform::admit(
+            self.slice_size,
+            provider.source_count(),
+            &self.recovery_exponents,
+            memory_limit.min(buffers.memory_bytes),
+            options.transform,
+        ) && (observer.is_none() || arm.shape().passes == 1)
+        {
+            return transform::encode(
+                &arm,
+                self.slice_size,
+                &self.recovery_exponents,
+                provider,
+                options,
+                sink,
+                match observer.as_mut() {
+                    Some(observer) => Some(&mut **observer),
+                    None => None,
+                },
+            );
+        }
+
         let contract = KernelContract::for_kernel(kernel);
 
         let factors = FactorSource::new(provider.source_count());
@@ -731,7 +785,8 @@ impl ForwardEncoder {
                 .ok_or_else(|| resource_limit("stripe offset overflow"))?;
         }
 
-        check_cancel(options)
+        check_cancel(options)?;
+        Ok(EncodeAttempt::Complete)
     }
 }
 
@@ -2155,10 +2210,12 @@ impl RowFactors {
 pub(crate) fn forward_stripe_count(
     slice_size: u64,
     source_count: usize,
-    output_count: usize,
+    exponents: &[RecoveryExponent],
     memory_limit: usize,
     requested_kernel: ForwardKernel,
+    transform_policy: TransformPolicy,
 ) -> Result<usize> {
+    let output_count = exponents.len();
     if output_count == 0 {
         return Ok(0);
     }
@@ -2171,6 +2228,18 @@ pub(crate) fn forward_stripe_count(
         memory_limit,
         requested_kernel,
     )?;
+    // The arm that will run is the one whose pass count decides whether the
+    // feed is in file order, so the transform's admission is resolved with the
+    // same inputs the pass itself will use.
+    if let Some(arm) = transform::admit(
+        slice_size,
+        source_count,
+        exponents,
+        memory_limit.min(buffers.memory_bytes),
+        transform_policy,
+    ) {
+        return Ok(arm.shape().passes);
+    }
     Ok(slice_size.div_ceil(buffers.chunk_len))
 }
 
@@ -2222,20 +2291,20 @@ impl AlignedCell {
     }
 }
 
-struct AlignedBuffer {
+pub(super) struct AlignedBuffer {
     cells: Vec<AlignedCell>,
     len: usize,
 }
 
 impl AlignedBuffer {
-    fn new(len: usize) -> Self {
+    pub(super) fn new(len: usize) -> Self {
         Self {
             cells: vec![AlignedCell([0; 64]); len.div_ceil(64)],
             len,
         }
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub(super) fn as_bytes(&self) -> &[u8] {
         let ptr = self
             .cells
             .first()
@@ -2243,7 +2312,7 @@ impl AlignedBuffer {
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
-    fn as_bytes_mut(&mut self) -> &mut [u8] {
+    pub(super) fn as_bytes_mut(&mut self) -> &mut [u8] {
         let ptr = if self.cells.is_empty() {
             self.cells.as_mut_ptr().cast::<u8>()
         } else {

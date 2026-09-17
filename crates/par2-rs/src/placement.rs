@@ -36,7 +36,10 @@ pub struct PlacementEntry {
 /// Result of scanning on-disk files against PAR2 file descriptions.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
-    /// Files already at the correct path (hash confirmed).
+    /// Files already at the correct path: name, length and 16 KB hash agree.
+    /// A file at a wrong or contested name is only ever matched by full-file
+    /// MD5; one already in place is not re-hashed, so its whole content is
+    /// for verification to settle.
     pub exact: Vec<FileId>,
     /// Pairs that need swapping (both exist, each has the other's data).
     pub swaps: Vec<(PlacementEntry, PlacementEntry)>,
@@ -48,11 +51,23 @@ pub struct PlacementPlan {
     pub conflicts: Vec<FileId>,
 }
 
+/// A disk file whose 16k hash and length match at least one description.
+struct DiskCandidate {
+    path: std::path::PathBuf,
+    file_name: String,
+    /// `(file_id, correct_name, hash_full)` of each description it could be.
+    targets: Vec<(FileId, String, [u8; 16])>,
+}
+
 /// Scan a directory and match files to PAR2 file descriptions by content hash.
 ///
 /// For each candidate file (non-PAR2, non-directory):
 /// 1. Read first 16KB and compute MD5; match against PAR2 `hash_16k` values.
-/// 2. If a 16KB match is found, confirm with full-file MD5 against `hash_full`.
+/// 2. If a 16KB match is found, confirm with full-file MD5 against `hash_full`
+///    — unless the file already sits at the matched description's name and no
+///    other disk file competes for that description. Such a file is reported
+///    in place without being read further: confirmed or not it is read at
+///    that path, and verification settles its content.
 /// 3. Classify results into exact matches, swaps, renames, unresolved, and conflicts.
 ///
 /// Only files present in the PAR2 recovery set are considered as match targets.
@@ -81,11 +96,11 @@ pub fn scan_placement(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Placemen
         }
     }
 
-    // Scan directory: for each candidate file, match by 16k hash + full MD5.
-    // Result: disk_name → (file_id, correct_name) for confirmed matches.
-    let mut matches: HashMap<String, (FileId, String)> = HashMap::new();
-    // Track file_ids with multiple disk matches (conflicts).
-    let mut match_counts: HashMap<FileId, u32> = HashMap::new();
+    // Pass 1 (cheap): every candidate file's 16k hash and length, matched
+    // against the descriptions. No file is read past its first 16 KB here.
+    let mut candidates: Vec<DiskCandidate> = Vec::new();
+    // How many disk files could be each file ID, by 16k hash and length.
+    let mut claimants: HashMap<FileId, u32> = HashMap::new();
 
     let entries = fs::read_dir(dir)?;
     for entry in entries {
@@ -118,20 +133,16 @@ pub fn scan_placement(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Placemen
         let hash_16k = checksum::md5(&data_16k);
 
         // Check for 16k hash match.
-        let candidates = match hash_lookup.get(&hash_16k) {
-            Some(c) => c,
-            None => continue,
+        let Some(described) = hash_lookup.get(&hash_16k) else {
+            continue;
         };
 
-        // Try each candidate (usually exactly one).
-        for (file_id, correct_name) in candidates {
-            let desc = match par2_set.file_description(file_id) {
-                Some(d) => d,
-                None => continue,
+        let actual_len = fs::metadata(&path)?.len();
+        let mut targets = Vec::new();
+        for (file_id, correct_name) in described {
+            let Some(desc) = par2_set.file_description(file_id) else {
+                continue;
             };
-
-            // Confirm with full-file MD5.
-            let actual_len = fs::metadata(&path)?.len();
             if actual_len != desc.length {
                 debug!(
                     file = %file_name,
@@ -141,26 +152,82 @@ pub fn scan_placement(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Placemen
                 );
                 continue;
             }
+            *claimants.entry(*file_id).or_default() += 1;
+            targets.push((*file_id, correct_name.clone(), desc.hash_full));
+        }
+        if !targets.is_empty() {
+            candidates.push(DiskCandidate {
+                path,
+                file_name,
+                targets,
+            });
+        }
+    }
 
-            let full_hash = hash_file(&path)?;
-            if full_hash != desc.hash_full {
-                debug!(
-                    file = %file_name,
-                    target = %correct_name,
-                    "16k hash matched but full MD5 differs — skipping"
-                );
-                continue;
-            }
+    // Pass 2: settle each candidate. A file that already sits at the name of
+    // the one description it could be, with no other disk file competing for
+    // that description, is in place whatever its full hash says: a confirmed
+    // match and a failed one both leave it read at that path, and the
+    // verification that follows reads every byte of it anyway. Hashing it here
+    // would read the whole set twice for nothing. Every other candidate — a
+    // wrong name, a contested description — is confirmed by full-file MD5,
+    // and those confirmations are independent, so they run file-parallel.
+    let confirmed: Vec<io::Result<Option<(String, FileId, String)>>> = {
+        use rayon::prelude::*;
+        candidates
+            .par_iter()
+            .map(|candidate| {
+                if let [(file_id, correct_name, _)] = candidate.targets.as_slice()
+                    && *correct_name == candidate.file_name
+                    && claimants.get(file_id) == Some(&1)
+                {
+                    debug!(
+                        file = %candidate.file_name,
+                        "in place by name, length and 16k hash — content left to verification"
+                    );
+                    return Ok(Some((
+                        candidate.file_name.clone(),
+                        *file_id,
+                        correct_name.clone(),
+                    )));
+                }
 
-            // Confirmed match.
-            debug!(
-                file = %file_name,
-                target = %correct_name,
-                "confirmed placement match (16k + full MD5)"
-            );
-            matches.insert(file_name.clone(), (*file_id, correct_name.clone()));
-            *match_counts.entry(*file_id).or_default() += 1;
-            break; // One match per disk file is enough.
+                let full_hash = hash_file(&candidate.path)?;
+                // Try each target (usually exactly one).
+                for (file_id, correct_name, hash_full) in &candidate.targets {
+                    if full_hash != *hash_full {
+                        debug!(
+                            file = %candidate.file_name,
+                            target = %correct_name,
+                            "16k hash matched but full MD5 differs — skipping"
+                        );
+                        continue;
+                    }
+                    debug!(
+                        file = %candidate.file_name,
+                        target = %correct_name,
+                        "confirmed placement match (16k + full MD5)"
+                    );
+                    // One match per disk file is enough.
+                    return Ok(Some((
+                        candidate.file_name.clone(),
+                        *file_id,
+                        correct_name.clone(),
+                    )));
+                }
+                Ok(None)
+            })
+            .collect()
+    };
+
+    // Result: disk_name → (file_id, correct_name) for settled matches.
+    let mut matches: HashMap<String, (FileId, String)> = HashMap::new();
+    // Track file_ids with multiple disk matches (conflicts).
+    let mut match_counts: HashMap<FileId, u32> = HashMap::new();
+    for settled in confirmed {
+        if let Some((file_name, file_id, correct_name)) = settled? {
+            matches.insert(file_name, (file_id, correct_name));
+            *match_counts.entry(file_id).or_default() += 1;
         }
     }
 
@@ -646,13 +713,54 @@ mod tests {
 
         let (par2_set, _ids) = setup_par2_set_multi(&[(&data_real, "target.rar")], 1024);
 
-        // Write the fake file at the correct name.
-        fs::write(dir.path().join("target.rar"), &data_fake).unwrap();
+        // Write the fake file at a wrong name: only a full MD5 can claim it.
+        fs::write(dir.path().join("obfuscated.bin"), &data_fake).unwrap();
 
         let plan = scan_placement(dir.path(), &par2_set).unwrap();
         // Should NOT match because full MD5 differs.
+        assert!(plan.renames.is_empty());
         assert!(plan.exact.is_empty());
         assert_eq!(plan.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn in_place_file_is_not_rehashed() {
+        let dir = TempDir::new().unwrap();
+        let data_real = vec![0xABu8; 32768];
+        let mut data_damaged = data_real.clone();
+        data_damaged[16384] = 0xFF; // damage past the 16k prefix
+
+        let (par2_set, ids) = setup_par2_set_multi(&[(&data_real, "target.rar")], 1024);
+
+        // Uncontested at its own name: reported in place without a full read,
+        // damage and all. It is read at that path either way, and verification
+        // is what settles its content.
+        fs::write(dir.path().join("target.rar"), &data_damaged).unwrap();
+        let plan = scan_placement(dir.path(), &par2_set).unwrap();
+        assert_eq!(plan.exact, vec![ids[0]]);
+        assert!(plan.unresolved.is_empty());
+    }
+
+    #[test]
+    fn contested_in_place_file_is_settled_by_full_md5() {
+        let dir = TempDir::new().unwrap();
+        let data_real = vec![0xABu8; 32768];
+        let mut data_damaged = data_real.clone();
+        data_damaged[16384] = 0xFF;
+
+        let (par2_set, ids) = setup_par2_set_multi(&[(&data_real, "target.rar")], 1024);
+
+        // A damaged file holds the name while the real bytes sit elsewhere:
+        // the name no longer earns the shortcut, and the full hash picks the
+        // intact copy.
+        fs::write(dir.path().join("target.rar"), &data_damaged).unwrap();
+        fs::write(dir.path().join("obfuscated.bin"), &data_real).unwrap();
+        let plan = scan_placement(dir.path(), &par2_set).unwrap();
+        assert!(plan.exact.is_empty());
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.renames.len(), 1);
+        assert_eq!(plan.renames[0].file_id, ids[0]);
+        assert_eq!(plan.renames[0].current_name, "obfuscated.bin");
     }
 
     #[test]

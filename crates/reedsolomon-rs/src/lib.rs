@@ -57,6 +57,8 @@
 /// codec geometry belongs to callers.
 pub mod fft;
 pub mod gf;
+/// Output-pruned multiplicative GF(2^16) DFT for PAR2 recovery and syndrome rows.
+pub mod gf16_dft;
 pub mod gf8;
 pub mod gf_pmul;
 pub mod gf_simd;
@@ -67,6 +69,8 @@ pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;
 pub mod threading;
+/// Closed-form erasure solve for consecutive PAR2 recovery exponents.
+pub mod vandermonde_solve;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_gf16;
 /// JIT-generated bit-plane XOR GF(2^16) multiply for pre-GFNI x86.

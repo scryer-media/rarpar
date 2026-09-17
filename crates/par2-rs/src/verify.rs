@@ -205,6 +205,9 @@ pub enum Repairability {
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
     pub files: Vec<FileVerification>,
+    /// Recovery blocks the set describes. Verification never reads a recovery
+    /// payload, so this is [`Par2FileSet::recovery_block_count`]'s upper bound:
+    /// a block with a damaged payload is counted until repair validates it.
     pub recovery_blocks_available: u32,
     pub total_missing_blocks: u32,
     pub repairable: Repairability,

@@ -45,7 +45,7 @@ crypto-rust = ["par2-rs?/crypto-rust", "unrar-rs?/crypto-rust"]
 musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
-par2-rs = { path = "../../crates/par2-rs", version = "0.10.3", default-features = false, optional = true }
+par2-rs = { path = "../../crates/par2-rs", version = "0.10.4", default-features = false, optional = true }
 par3-rs = { path = "../../crates/par3-rs", version = "0.4.2", default-features = false, optional = true }
 unrar-rs = { path = "../../crates/unrar-rs", version = "0.10.7", default-features = false, optional = true }
 clap = { workspace = true }

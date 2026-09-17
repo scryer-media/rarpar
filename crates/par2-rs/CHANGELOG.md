@@ -1,6 +1,93 @@
 # Changelog
 
-## 0.10.3 (unreleased)
+## 0.10.4 (unreleased)
+
+The placement scan no longer reads a set that is already in place.
+
+### Added
+
+- PAR2 creation can now compute its recovery slices with an output-pruned
+  multiplicative GF(2^16) transform instead of folding every source into every
+  recovery row. The arm is chosen automatically, only when the plan it builds
+  performs at least twice fewer region folds than the dense schedule would, and
+  it produces byte-identical output: the dense path remains the unconditional
+  fallback and is still used for every shape the transform cannot win. On an
+  eight-file 4 GiB set at a 768000-byte slice size, creation went from 8.8 s to
+  4.5 s at 5% recovery, 10.3 s to 7.5 s at 15%, and 23.1 s to 9.0 s at 30%.
+- The transform arm runs inside the existing `Par2CreatorOptions::memory_limit`
+  with no new default and no raised one. Every arena it needs — the staged
+  source band, the recovery rows, per-worker transform scratch, and the plan
+  tables — is summed and checked against the limit before anything is
+  allocated, and the band size is chosen as the largest that fits; a limit that
+  cannot buy a 4 KiB band, or that would need more than 256 passes over the
+  payload, takes the dense path instead. Measured peak RSS is below the dense
+  arm's at the same limit on every shape tried, at the default limit and at a
+  256 MiB one.
+- Every band is checked before it is emitted: one recovery row, a different
+  one each band, is recomputed with the dense kernels over the same staged
+  bytes and compared against the transform's. A mismatch abandons the transform for that creation, logs a
+  warning, and recreates every volume densely from scratch.
+- `RARPAR_PAR2_TRANSFORM` forces the decision: `0` always takes the dense path,
+  `1` takes the transform wherever it is admissible.
+- A transform arm for the repair arithmetic. The dense executor folds every
+  available source into every missing output — `missing * available` region
+  folds, which at a large damaged set is the whole runtime. Repair can instead
+  remove the present slices' contribution from each selected recovery block
+  with one multiplicative GF(2^16) DFT over the present slices
+  (`reedsolomon_rs::gf16_dft`), leaving the parity of the missing slices alone,
+  and then solve for the missing slices. The solve sits behind a seam: a run
+  of consecutive recovery exponents at 512 or more missing slices takes
+  `reedsolomon_rs::vandermonde_solve`'s closed-form solve, whose scratch is
+  charged against the same memory limit; anything else applies the
+  `missing x missing` inverse the repair plan already built.
+  GF addition is XOR and multiplication is exact, so the reassociated sum is
+  bit-identical to the dense product, and the arm is chosen only when its fold
+  count beats the dense one by a margin. It runs under the existing
+  `RepairOptions::memory_limit`: a DFT row needs the same byte range of every
+  present slice resident, so the slice is walked in bands sized from that
+  limit, and the arm declines to the dense path whenever the limit cannot buy
+  one. Every band also computes one syndrome row the dense way and compares,
+  then re-encodes the solved slices at that exponent and compares again, so
+  the transform and the solve are each checked independently; a disagreement
+  abandons the arm and reruns the repair densely. Each worker's transform
+  scratch is part of the sum charged against the limit.
+  `set_transform_arm_override` (thread-local) and `RARPAR_PAR2_TRANSFORM=0|1`
+  force the decision, and `transform_arm_stats` reports what the arm did and which solve it chose. Small
+  repairs, GPU-capable builds, and every caller-visible API are unchanged.
+
+### Fixed
+
+- `scan_placement` confirmed every 16 KB match with a full-file MD5, one file
+  at a time, on the calling thread — including files already sitting at the
+  name their description records. A caller that scans and then verifies (the
+  ordinary sequence) therefore read the whole set twice, the first time
+  serially: on an eight-file 4 GiB set, a clean smart-placement verify took
+  5.6 s against 0.6 s with the scan off. A file that matches exactly one
+  description by 16 KB hash and length, already carries that description's
+  name, and has no other disk file competing for it is now reported in place
+  without being read further. Confirmed or not, such a file is read at that
+  path, so the plan routes it identically, and the verification that follows
+  is what settles its content. Every other candidate — a wrong name, a
+  description more than one file could be — is still matched only by full-file
+  MD5, and those confirmations now run file-parallel. The same set now
+  verifies in 0.6 s in either placement mode.
+
+### Changed
+
+- `PlacementPlan::exact` lists files in place by name, length and 16 KB hash.
+  It previously implied a full-hash confirmation; a file damaged past its
+  first 16 KB at its own name used to land in `unresolved` and now lands in
+  `exact`. `PlacementFileAccess::from_plan` treats the two the same.
+
+### Documentation
+
+- `Par2FileSet::recovery_block_count` and `VerificationResult`'s
+  `recovery_blocks_available` now say that they are an upper bound for a set
+  loaded from disk: the path scanner records recovery payloads as file-backed
+  spans without hashing them, so a block with a damaged payload stays counted
+  until repair validates its packet hash. No behavior change.
+
+## 0.10.3
 
 ### Changed
 

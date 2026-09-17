@@ -174,6 +174,7 @@ pub mod placement;
 pub mod rename;
 pub mod repair;
 pub mod repair_session;
+pub mod repair_transform;
 pub mod repairer;
 pub mod session;
 pub mod types;
@@ -220,6 +221,10 @@ pub use repair::{
 pub use repair_session::{
     DEFAULT_RETAINED_STATE_LIMIT, Par2RepairSession, Par2RepairSessionDiagnostics,
     Par2RepairSessionOptions, Par2SessionError,
+};
+pub use repair_transform::{
+    TransformArm, TransformArmStats, set_transform_arm_override, transform_arm_override,
+    transform_arm_stats,
 };
 pub use repairer::{
     BlockLocation, BlockLocationKind, CarryDiagnostics, CarryRetryReason, ExternalCarryError,

@@ -17,7 +17,7 @@ use crate::packet::header::{HEADER_SIZE, PacketHeader, TYPE_CREATOR};
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids_cancellable};
 use crate::types::{CancellationToken, FileId, RecoveryExponent, RecoverySetId};
 
-use super::encode::{ForwardEncoder, ForwardEncoderOptions, ForwardRecoverySink};
+use super::encode::{EncodeAttempt, ForwardEncoder, ForwardEncoderOptions, ForwardRecoverySink};
 use super::metal::{SelectedBackend, selected_policy};
 use super::options::{CreationBackend, Par2CreatorOptions};
 use super::plan::Par2CreatePlan;
@@ -1638,90 +1638,134 @@ pub(crate) fn write_outputs(
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
     }
-    // The plan's sources carry their identity but not their content hashes
-    // (see `CreationSource`). The encoder's own feed can produce those for
-    // free — it is about to read exactly these bytes — but only when it is the
-    // CPU encoder, only when there are recovery blocks for it to compute, and
-    // only when the pass is single-stripe, because a stripe-major feed does
-    // not deliver a file's bytes in file order. Anything else reads them here.
-    let fuse_source_hashing = plan.recovery_count > 0
-        && matches!(backend, SelectedBackend::Cpu)
-        && super::encode::forward_stripe_count(
-            plan.slice_size,
-            plan.source_slice_count as usize,
-            plan.recovery_count as usize,
-            options
-                .memory_limit
-                .unwrap_or_else(super::plan::default_memory_limit),
-            options.forward_kernel,
-        )? == 1;
-    if !fuse_source_hashing {
-        super::source::hydrate_source_hashes(&mut sources, plan.slice_size, &options.cancellation)?;
-    }
-    let critical = build_critical_packets(plan, &sources)?;
-    let creator = encode_creator_packet(plan.recovery_set_id)?;
-    let mut staged = StagedOutputs::create(plan, &critical, &creator, &options.cancellation)?;
+    // The transform arm checks its own arithmetic against the dense definition
+    // once per band (see `super::transform`). A disagreement is not something
+    // the staged volumes can be repaired from — the bytes already written are
+    // the suspect ones — so the whole staging is discarded and the create runs
+    // again with the arm switched off. It can happen at most once.
+    let mut transform_policy = super::transform::policy_from_env();
+    let mut hydrated = false;
+    let mut staged = loop {
+        // The plan's sources carry their identity but not their content hashes
+        // (see `CreationSource`). The encoder's own feed can produce those for
+        // free — it is about to read exactly these bytes — but only when it is
+        // the CPU encoder, only when there are recovery blocks for it to
+        // compute, and only when the pass is single-stripe, because a
+        // stripe-major feed does not deliver a file's bytes in file order.
+        // Anything else reads them here.
+        let fuse_source_hashing = plan.recovery_count > 0
+            && matches!(backend, SelectedBackend::Cpu)
+            && super::encode::forward_stripe_count(
+                plan.slice_size,
+                plan.source_slice_count as usize,
+                &plan.recovery_exponents,
+                options
+                    .memory_limit
+                    .unwrap_or_else(super::plan::default_memory_limit),
+                options.forward_kernel,
+                transform_policy,
+            )? == 1;
+        if !fuse_source_hashing && !hydrated {
+            super::source::hydrate_source_hashes(
+                &mut sources,
+                plan.slice_size,
+                &options.cancellation,
+            )?;
+            hydrated = true;
+        }
+        let critical = build_critical_packets(plan, &sources)?;
+        let creator = encode_creator_packet(plan.recovery_set_id)?;
+        let mut staged = StagedOutputs::create(plan, &critical, &creator, &options.cancellation)?;
 
-    if plan.recovery_count > 0 {
-        let slice_size =
-            usize::try_from(plan.slice_size).map_err(|_| Par2Error::ResourceLimitExceeded {
-                reason: "slice size exceeds addressable memory".to_string(),
-            })?;
-        let mut provider = DiskSourceProvider::open(&sources, slice_size, &options.cancellation)?;
-        let fused = {
-            let mut sink = RecoveryWriter {
-                outputs: &mut staged,
-                cancellation: &options.cancellation,
-                slice_size,
-            };
-            match &mut backend {
-                SelectedBackend::Cpu => {
-                    let encoder = ForwardEncoder::new(slice_size, plan.recovery_exponents.clone())?;
-                    let encoder_options = ForwardEncoderOptions {
-                        memory_limit: options.memory_limit,
-                        cancel: Some(options.cancellation.clone()),
-                        progress: options.progress.clone(),
-                        kernel: options.forward_kernel,
-                    };
-                    if fuse_source_hashing {
-                        let mut hasher =
-                            super::source::FusedSourceHasher::new(&sources, plan.slice_size)?;
-                        encoder.encode_to_observed(
+        if plan.recovery_count > 0 {
+            let slice_size =
+                usize::try_from(plan.slice_size).map_err(|_| Par2Error::ResourceLimitExceeded {
+                    reason: "slice size exceeds addressable memory".to_string(),
+                })?;
+            let mut provider =
+                DiskSourceProvider::open(&sources, slice_size, &options.cancellation)?;
+            let attempt = {
+                let mut sink = RecoveryWriter {
+                    outputs: &mut staged,
+                    cancellation: &options.cancellation,
+                    slice_size,
+                };
+                match &mut backend {
+                    SelectedBackend::Cpu => {
+                        let encoder =
+                            ForwardEncoder::new(slice_size, plan.recovery_exponents.clone())?;
+                        let encoder_options = ForwardEncoderOptions {
+                            memory_limit: options.memory_limit,
+                            cancel: Some(options.cancellation.clone()),
+                            progress: options.progress.clone(),
+                            kernel: options.forward_kernel,
+                            transform: transform_policy,
+                        };
+                        if fuse_source_hashing {
+                            let mut hasher =
+                                super::source::FusedSourceHasher::new(&sources, plan.slice_size)?;
+                            let attempt = encoder.encode_attempt(
+                                &mut provider,
+                                &encoder_options,
+                                &mut sink,
+                                Some(&mut hasher),
+                            )?;
+                            match attempt {
+                                EncodeAttempt::Complete => (attempt, Some(hasher.finish()?)),
+                                EncodeAttempt::TransformProbeMismatch => (attempt, None),
+                            }
+                        } else {
+                            let attempt = encoder.encode_attempt(
+                                &mut provider,
+                                &encoder_options,
+                                &mut sink,
+                                None,
+                            )?;
+                            (attempt, None)
+                        }
+                    }
+                    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+                    SelectedBackend::Metal(state) => {
+                        state.encode(
                             &mut provider,
-                            &encoder_options,
+                            &plan.recovery_exponents,
+                            slice_size,
+                            &options.cancellation,
+                            options.progress.clone(),
                             &mut sink,
-                            Some(&mut hasher),
                         )?;
-                        Some(hasher.finish()?)
-                    } else {
-                        encoder.encode_to(&mut provider, &encoder_options, &mut sink)?;
-                        None
+                        (EncodeAttempt::Complete, None)
                     }
                 }
-                #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-                SelectedBackend::Metal(state) => {
-                    state.encode(
-                        &mut provider,
-                        &plan.recovery_exponents,
-                        slice_size,
-                        &options.cancellation,
-                        options.progress.clone(),
-                        &mut sink,
-                    )?;
-                    None
-                }
+            };
+            let (attempt, fused) = attempt;
+            if attempt == EncodeAttempt::TransformProbeMismatch {
+                drop(provider);
+                drop(staged);
+                tracing::warn!(
+                    "PAR2 transform recovery arithmetic disagreed with the dense definition; \
+                     recreating the recovery volumes from the dense encoder"
+                );
+                transform_policy = super::transform::TransformPolicy::Never;
+                continue;
             }
-        };
-        provider.verify_unchanged()?;
-        if let Some(fused) = fused {
-            fused.apply(&mut sources)?;
-            // Same packets at the same offsets, now with the hashes the encode
-            // produced; the staged layout never depended on their values.
-            let critical = build_critical_packets(plan, &sources)?;
-            staged.rewrite_critical_packets(&critical, &options.cancellation)?;
+            provider.verify_unchanged()?;
+            if let Some(fused) = fused {
+                fused.apply(&mut sources)?;
+                // Same packets at the same offsets, now with the hashes the
+                // encode produced; the staged layout never depended on their
+                // values.
+                let critical = build_critical_packets(plan, &sources)?;
+                staged.rewrite_critical_packets(&critical, &options.cancellation)?;
+            }
+            staged.finish_recovery_headers(
+                slice_size,
+                plan.recovery_set_id,
+                &options.cancellation,
+            )?;
         }
-        staged.finish_recovery_headers(slice_size, plan.recovery_set_id, &options.cancellation)?;
-    }
+        break staged;
+    };
 
     staged.validate(plan, &sources, &options.cancellation)?;
     let bytes_written = staged.bytes_written()?;
