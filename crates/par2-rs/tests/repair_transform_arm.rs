@@ -218,3 +218,96 @@ fn small_everyday_repairs_never_reach_the_arm() {
         synthetic.files[0].data
     );
 }
+
+/// Repair `synthetic` after `damage` and report the arm counters it moved.
+///
+/// Unlike [`repair_with`] this keeps the whole `TransformArmStats` delta, so a
+/// caller can tell which solver ran behind the seam.
+fn repair_counting(
+    synthetic: &SyntheticPar2,
+    arm: TransformArm,
+    damage: &dyn Fn(&mut MemoryFileAccess, &SyntheticPar2),
+) -> (Vec<Vec<u8>>, u64, u64) {
+    let mut access = MemoryFileAccess::new();
+    for file in &synthetic.files {
+        access.add_file(file.file_id, file.data.clone());
+    }
+    damage(&mut access, synthetic);
+
+    let verification = verify_all(&synthetic.par2_set, &access);
+    let plan = plan_repair(&synthetic.par2_set, &verification).expect("the set must be repairable");
+
+    set_transform_arm_override(Some(arm));
+    let before = transform_arm_stats();
+    let outcome = execute_repair_with_options(
+        &plan,
+        &synthetic.par2_set,
+        &mut access,
+        &RepairOptions::default(),
+    );
+    let after = transform_arm_stats();
+    set_transform_arm_override(None);
+    outcome.expect("repair must succeed");
+
+    let restored = synthetic
+        .files
+        .iter()
+        .map(|file| access.read_file(&file.file_id).expect("read back"))
+        .collect();
+    (
+        restored,
+        after.executed - before.executed,
+        after.consecutive_solves - before.consecutive_solves,
+    )
+}
+
+/// A shape big enough to cross `CONSECUTIVE_SOLVE_MIN_ROWS`: 600 slices in one
+/// file, 520 of them destroyed.
+fn large_m_fixture() -> SyntheticPar2 {
+    fixture(&[600 * 64], 64, 560, 0x5017E)
+}
+
+fn damage_first_520(access: &mut MemoryFileAccess, set: &SyntheticPar2) {
+    let file = &set.files[0];
+    let mut data = file.data.clone();
+    data[..520 * 64].fill(0x9B);
+    access.add_file(file.file_id, data);
+}
+
+#[test]
+fn the_closed_form_solver_matches_the_dense_path_at_five_hundred_rows() {
+    let synthetic = large_m_fixture();
+    let (dense, dense_ran, _) = repair_counting(&synthetic, TransformArm::Off, &damage_first_520);
+    let (transform, transform_ran, consecutive) =
+        repair_counting(&synthetic, TransformArm::On, &damage_first_520);
+
+    assert_eq!(dense_ran, 0, "the forced-off run must take the dense path");
+    assert_eq!(transform_ran, 1, "the arm must run");
+    assert_eq!(
+        consecutive, 1,
+        "520 consecutive exponents must pick the closed-form solve"
+    );
+    assert_eq!(dense[0], synthetic.files[0].data);
+    assert_eq!(transform[0], synthetic.files[0].data);
+}
+
+#[test]
+fn the_explicit_inverse_still_serves_a_wide_selection_at_five_hundred_rows() {
+    // Same damage, but a hole punched in the recovery set makes the selected
+    // exponents non-consecutive, so the seam must fall back to the inverse.
+    let mut synthetic = large_m_fixture();
+    synthetic.par2_set.recovery_slices.remove(&7);
+
+    let (dense, dense_ran, _) = repair_counting(&synthetic, TransformArm::Off, &damage_first_520);
+    let (transform, transform_ran, consecutive) =
+        repair_counting(&synthetic, TransformArm::On, &damage_first_520);
+
+    assert_eq!(dense_ran, 0, "the forced-off run must take the dense path");
+    assert_eq!(transform_ran, 1, "the arm must run");
+    assert_eq!(
+        consecutive, 0,
+        "a gapped selection must not reach the closed-form solve"
+    );
+    assert_eq!(dense[0], synthetic.files[0].data);
+    assert_eq!(transform[0], synthetic.files[0].data);
+}

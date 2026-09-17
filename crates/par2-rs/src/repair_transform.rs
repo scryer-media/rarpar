@@ -92,6 +92,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use reedsolomon_rs::fft::TransformError;
 use reedsolomon_rs::gf16_dft::{DftPlan, DftScratch};
+use reedsolomon_rs::vandermonde_solve::{ConsecutiveSolvePlan, SolveError};
 use tracing::{debug, info, warn};
 
 use crate::error::{Par2Error, Result};
@@ -146,6 +147,15 @@ const FOLD_MARGIN: u64 = 2;
 /// here as well as by the fold gate.
 const MAX_RANGE_MULTIPLE: usize = 4;
 
+/// Rows at or above which the closed-form consecutive solve beats the m×m
+/// product enough to be worth its scratch.
+///
+/// Measured in `reedsolomon-rs`: the crossover against the explicit inverse is
+/// around 600 rows (2.1x at 1024, 17x at 8192), and its setup is ~500x cheaper
+/// than the Gauss-Jordan at 1024. Below this the product wins and needs no
+/// scratch at all.
+const CONSECUTIVE_SOLVE_MIN_ROWS: usize = 512;
+
 /// Stripe length the arm aims for before memory forces it smaller.
 const STRIPE_TARGET: usize = 16 * 1024;
 
@@ -184,7 +194,13 @@ pub fn set_transform_arm_override(value: Option<TransformArm>) {
 
 thread_local! {
     static ARM_STATS: std::cell::Cell<TransformArmStats> =
-        const { std::cell::Cell::new(TransformArmStats { executed: 0, diverged: 0 }) };
+        const {
+            std::cell::Cell::new(TransformArmStats {
+                executed: 0,
+                diverged: 0,
+                consecutive_solves: 0,
+            })
+        };
 }
 
 /// What the transform arm did on this thread, since the process started.
@@ -199,11 +215,23 @@ pub struct TransformArmStats {
     pub executed: u64,
     /// Repairs the arm abandoned after its probe diverged.
     pub diverged: u64,
+    /// Repairs the arm chose the closed-form consecutive solve for, rather
+    /// than the explicit inverse. Counted when the solver is picked, so it
+    /// covers diverged runs too.
+    pub consecutive_solves: u64,
 }
 
 /// This thread's [`TransformArmStats`].
 pub fn transform_arm_stats() -> TransformArmStats {
     ARM_STATS.with(|cell| cell.get())
+}
+
+fn record_consecutive_solve() {
+    ARM_STATS.with(|cell| {
+        let mut stats = cell.get();
+        stats.consecutive_solves += 1;
+        cell.set(stats);
+    });
 }
 
 fn record_executed() {
@@ -287,22 +315,59 @@ pub(crate) enum TransformOutcome {
 /// assume every region has the same, even length and that the destinations are
 /// pairwise disjoint and uninitialised.
 pub(crate) trait StripeSolver: Send + Sync {
-    /// `syndromes[r]` is `S` for the `r`-th selected recovery exponent.
-    fn solve_stripe(&self, syndromes: &[&[u8]], outputs: &mut [&mut [u8]]);
+    /// Working bytes one worker needs at this stripe length.
+    fn scratch_bytes(&self, stripe_len: usize) -> usize;
+
+    /// Turn one stripe of syndromes into one stripe of every missing slice.
+    ///
+    /// `syndromes` is the transform's whole output buffer for the stripe —
+    /// `range_len` rows of `stripe_len` bytes — and `row_offsets[r]` is where
+    /// the `r`-th selected recovery exponent's row sits in it. The buffer may
+    /// be overwritten. `outputs[c]` receives missing slice `c`, in
+    /// `missing_global_indices` order.
+    fn solve_stripe(
+        &self,
+        syndromes: &mut [u8],
+        row_offsets: &[usize],
+        stripe_len: usize,
+        scratch: &mut [u8],
+        outputs: &mut [&mut [u8]],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()>;
 }
 
-/// The solver this phase ships: apply `A^-1` as an m×m stripe-wise product.
+/// Apply `A^-1` as an explicit m×m stripe-wise product.
+///
+/// `m^2` folds, no scratch, and no requirement on the exponents at all. This
+/// is the arm's fallback solver and the oracle its faster sibling is checked
+/// against.
 struct DenseInverseSolver<'a> {
     /// `A^-1`, `m` rows by `m` columns — `RepairPlan::decode_matrix`.
     inverse: &'a matrix::Matrix,
 }
 
 impl StripeSolver for DenseInverseSolver<'_> {
-    fn solve_stripe(&self, syndromes: &[&[u8]], outputs: &mut [&mut [u8]]) {
+    fn scratch_bytes(&self, _stripe_len: usize) -> usize {
+        0
+    }
+
+    fn solve_stripe(
+        &self,
+        syndromes: &mut [u8],
+        row_offsets: &[usize],
+        stripe_len: usize,
+        _scratch: &mut [u8],
+        outputs: &mut [&mut [u8]],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         debug_assert_eq!(outputs.len(), self.inverse.rows);
-        debug_assert_eq!(syndromes.len(), self.inverse.cols);
+        debug_assert_eq!(row_offsets.len(), self.inverse.cols);
+        let syndromes: &[u8] = syndromes;
         let mut batch: Vec<FactorSrc<'_>> = Vec::with_capacity(SOLVE_BATCH);
         for (row, out) in outputs.iter_mut().enumerate() {
+            if row.is_multiple_of(64) && cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
             out.fill(0);
             let factors = self.inverse.row(row);
             batch.clear();
@@ -312,7 +377,7 @@ impl StripeSolver for DenseInverseSolver<'_> {
                 }
                 batch.push(FactorSrc {
                     factor,
-                    src: syndromes[column],
+                    src: &syndromes[row_offsets[column] * stripe_len..][..stripe_len],
                 });
                 if batch.len() == SOLVE_BATCH {
                     crate::gf_simd::mul_acc_input_batch(out, &batch);
@@ -324,6 +389,60 @@ impl StripeSolver for DenseInverseSolver<'_> {
                 batch.clear();
             }
         }
+        Ok(())
+    }
+}
+
+/// The closed-form solve for a consecutive exponent run.
+///
+/// [`ConsecutiveSolvePlan`] replaces the m×m product with a locator
+/// correlation and a Forney evaluation — `O(m)` folds per unknown instead of
+/// `m`, and a setup that costs a fraction of the Gauss-Jordan the inverse
+/// needs. It only exists for `e0, e0+1, ...`, and it buys that speed with a
+/// large per-stripe scratch, so both the exponent shape and the memory
+/// contract have to admit it before the arm picks it up.
+struct ConsecutiveSolver {
+    plan: ConsecutiveSolvePlan,
+}
+
+impl StripeSolver for ConsecutiveSolver {
+    fn scratch_bytes(&self, stripe_len: usize) -> usize {
+        self.plan.scratch_bytes(stripe_len)
+    }
+
+    fn solve_stripe(
+        &self,
+        syndromes: &mut [u8],
+        row_offsets: &[usize],
+        stripe_len: usize,
+        scratch: &mut [u8],
+        outputs: &mut [&mut [u8]],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let rows = self.plan.rows();
+        debug_assert_eq!(outputs.len(), rows);
+        // A consecutive selection lands on the first `rows` rows of the
+        // transform's range in order, which is exactly the contiguous buffer
+        // the solve wants; the arm only builds this solver in that case.
+        debug_assert!(row_offsets.iter().copied().eq(0..rows));
+        self.plan
+            .solve_stripe(
+                &mut syndromes[..rows * stripe_len],
+                stripe_len,
+                scratch,
+                cancelled,
+            )
+            .map_err(|error| match error {
+                SolveError::Cancelled => Par2Error::Cancelled,
+                other => Par2Error::ReedSolomonError {
+                    reason: format!("repair transform solve failed: {other}"),
+                },
+            })?;
+        let solved: &[u8] = syndromes;
+        for (row, out) in outputs.iter_mut().enumerate() {
+            out.copy_from_slice(&solved[row * stripe_len..][..stripe_len]);
+        }
+        Ok(())
     }
 }
 
@@ -337,62 +456,132 @@ pub(crate) struct BandGeometry {
     pub(crate) arena_bytes: usize,
 }
 
-/// Solve the memory contract: the largest band, at the largest stripe, that
-/// fits `budget` once every arena is summed.
+/// Solve the memory contract: the most workers, at the largest stripe and the
+/// largest band, that fit `budget` once every arena is summed.
 ///
-/// Returns `None` when no admissible geometry exists — the caller then takes
-/// the dense path. `range_len` is the covering exponent range, `rows` the
-/// missing count, `present` the available source count.
+/// Returns `None` when no admissible geometry exists — the caller then either
+/// tries a solver with a smaller scratch or takes the dense path. `range_len`
+/// is the covering exponent range, `rows` the missing count, `present` the
+/// available source count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_geometry(
     slice_size: usize,
     present: usize,
     rows: usize,
     range_len: usize,
-    workers: usize,
+    max_workers: usize,
     plan_bytes: usize,
-    scratch_bytes: &dyn Fn(usize) -> usize,
+    per_worker_bytes: &dyn Fn(usize) -> usize,
     budget: usize,
 ) -> Option<BandGeometry> {
-    let workers = workers.max(1);
     let free = budget.checked_sub(plan_bytes)?;
     // Per band, every present slice, every output row, and the two probe rows
     // hold one band's bytes.
     let per_band_byte = present.checked_add(rows)?.checked_add(2)?;
 
-    let mut stripe = STRIPE_TARGET.min(slice_size.next_multiple_of(ALIGN));
-    stripe = (stripe / ALIGN).max(1) * ALIGN;
+    let mut workers = max_workers.max(1);
     loop {
-        // One spare scratch covers the single short tail stripe a slice length
-        // that is not a multiple of the stripe leaves behind.
-        let per_worker = range_len
-            .checked_mul(stripe)
-            .and_then(|syndrome| syndrome.checked_add(scratch_bytes(stripe)))?;
-        let worker_total = per_worker
-            .checked_mul(workers)
-            .and_then(|total| total.checked_add(scratch_bytes(stripe)))?;
-        if let Some(band_budget) = free.checked_sub(worker_total) {
-            let raw_band = band_budget / per_band_byte;
-            let band = (raw_band / stripe) * stripe;
-            let band = band.min(slice_size.next_multiple_of(stripe));
-            if band >= stripe && band >= MIN_BAND.min(slice_size) {
-                let passes = slice_size.div_ceil(band);
-                if passes <= MAX_PASSES {
-                    return Some(BandGeometry {
-                        band,
-                        stripe,
-                        passes,
-                        workers,
-                        arena_bytes: plan_bytes + worker_total + band * per_band_byte,
-                    });
+        let mut stripe = STRIPE_TARGET.min(slice_size.next_multiple_of(ALIGN));
+        stripe = (stripe / ALIGN).max(1) * ALIGN;
+        loop {
+            // One spare per-worker arena covers the single short tail stripe a
+            // slice length that is not a multiple of the stripe leaves behind.
+            let per_worker = range_len
+                .checked_mul(stripe)
+                .and_then(|syndrome| syndrome.checked_add(per_worker_bytes(stripe)));
+            if let Some(per_worker) = per_worker
+                && let Some(worker_total) = per_worker
+                    .checked_mul(workers)
+                    .and_then(|total| total.checked_add(per_worker))
+                && let Some(band_budget) = free.checked_sub(worker_total)
+            {
+                let band = ((band_budget / per_band_byte) / stripe) * stripe;
+                let band = band.min(slice_size.next_multiple_of(stripe));
+                if band >= stripe && band >= MIN_BAND.min(slice_size) {
+                    let passes = slice_size.div_ceil(band);
+                    if passes <= MAX_PASSES {
+                        return Some(BandGeometry {
+                            band,
+                            stripe,
+                            passes,
+                            workers,
+                            arena_bytes: plan_bytes + worker_total + band * per_band_byte,
+                        });
+                    }
                 }
             }
+            if stripe <= STRIPE_FLOOR {
+                break;
+            }
+            stripe = (stripe / 2).next_multiple_of(ALIGN).max(STRIPE_FLOOR);
         }
-        if stripe <= STRIPE_FLOOR {
+        if workers == 1 {
             return None;
         }
-        stripe = (stripe / 2).next_multiple_of(ALIGN).max(STRIPE_FLOOR);
+        workers = (workers / 2).max(1);
     }
+}
+
+/// Pick the solver and the geometry together: the two are one decision,
+/// because a solver's per-stripe scratch is part of the memory contract.
+///
+/// The closed-form solve is tried first when the exponents are consecutive and
+/// the row count is past its crossover against the m×m product; if its scratch
+/// cannot be afforded, the explicit inverse — which needs none — is tried at
+/// the same budget before the arm gives up.
+fn choose_solver<'a>(
+    plan: &'a RepairPlan,
+    dft: &DftPlan,
+    range_len: usize,
+    budget: usize,
+    workers: usize,
+) -> Option<(Box<dyn StripeSolver + 'a>, BandGeometry, &'static str)> {
+    let rows = plan.missing_slices.len();
+    let present = plan.available_input_global_indices.len();
+    let slice_size = plan.slice_size as usize;
+    let geometry_for = |solver: &dyn StripeSolver| {
+        plan_geometry(
+            slice_size,
+            present,
+            rows,
+            range_len,
+            workers,
+            dft.plan_bytes(),
+            &|stripe| solver.scratch_bytes(stripe),
+            budget,
+        )
+    };
+
+    if rows >= CONSECUTIVE_SOLVE_MIN_ROWS && range_len == rows {
+        let missing_logs: Vec<u16> = plan
+            .missing_global_indices
+            .iter()
+            .map(|&global| gf::log(plan.constants[global]))
+            .collect();
+        match ConsecutiveSolvePlan::build_for_exponents(&missing_logs, &plan.recovery_exponents) {
+            Ok(consecutive) => {
+                let solver = ConsecutiveSolver { plan: consecutive };
+                if let Some(geometry) = geometry_for(&solver) {
+                    record_consecutive_solve();
+                    return Some((Box::new(solver), geometry, "consecutive"));
+                }
+                debug!(
+                    budget,
+                    "the consecutive solve does not fit the memory limit; trying the inverse"
+                );
+            }
+            Err(SolveError::NonConsecutive) => {}
+            Err(error) => {
+                debug!(%error, "the consecutive solve refused the selection");
+            }
+        }
+    }
+
+    let solver = DenseInverseSolver {
+        inverse: &plan.decode_matrix,
+    };
+    let geometry = geometry_for(&solver)?;
+    Some((Box::new(solver), geometry, "inverse"))
 }
 
 /// Try to run the repair on the transform arm.
@@ -481,16 +670,9 @@ pub(crate) fn try_execute(
     }
 
     let workers = rayon::current_num_threads().max(1);
-    let Some(geometry) = plan_geometry(
-        slice_size,
-        present,
-        rows,
-        range_len,
-        workers,
-        dft.plan_bytes(),
-        &|stripe| dft.scratch_bytes(stripe),
-        budget,
-    ) else {
+    let Some((solver, geometry, solver_name)) =
+        choose_solver(plan, &dft, range_len, budget, workers)
+    else {
         info!(
             budget,
             present,
@@ -503,6 +685,7 @@ pub(crate) fn try_execute(
     info!(
         missing_slices = rows,
         present_slices = present,
+        solver = solver_name,
         band_bytes = geometry.band,
         stripe_bytes = geometry.stripe,
         passes = geometry.passes,
@@ -514,16 +697,13 @@ pub(crate) fn try_execute(
         "repairing with the transform arm"
     );
 
-    let solver = DenseInverseSolver {
-        inverse: &plan.decode_matrix,
-    };
     run(
         plan,
         par2_set,
         file_access,
         options,
         &dft,
-        &solver,
+        solver.as_ref(),
         geometry,
         lowest,
     )
@@ -534,6 +714,7 @@ pub(crate) fn try_execute(
 struct Worker {
     syndromes: Vec<u8>,
     scratch: DftScratch,
+    solve_scratch: Vec<u8>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,6 +934,7 @@ fn transform_band(
                 let mut worker = Worker {
                     syndromes: vec![0u8; shape.range_len * shape.stripe],
                     scratch: DftScratch::new(dft, shape.stripe),
+                    solve_scratch: vec![0u8; solver.scratch_bytes(shape.stripe)],
                 };
                 let mut sources: Vec<&[u8]> = Vec::with_capacity(shape.present);
                 loop {
@@ -767,6 +949,7 @@ fn transform_band(
                     let len = shape.stripe.min(shape.band_len - offset);
                     if worker.scratch.stripe_len() != len {
                         worker.scratch = DftScratch::new(dft, len);
+                        worker.solve_scratch = vec![0u8; solver.scratch_bytes(len)];
                     }
 
                     let syndromes = &mut worker.syndromes[..shape.range_len * len];
@@ -809,10 +992,6 @@ fn transform_band(
                         &syndromes[probe_position * len..probe_position * len + len],
                     );
 
-                    let mut syndrome_refs: Vec<&[u8]> = Vec::with_capacity(shape.rows);
-                    for &position in syndrome_row.iter() {
-                        syndrome_refs.push(&syndromes[position * len..position * len + len]);
-                    }
                     let mut output_refs: Vec<&mut [u8]> = Vec::with_capacity(shape.rows);
                     for row in 0..shape.rows {
                         // SAFETY: as above — disjoint stripe of a distinct row.
@@ -823,7 +1002,17 @@ fn transform_band(
                             )
                         });
                     }
-                    solver.solve_stripe(&syndrome_refs, &mut output_refs);
+                    if let Err(error) = solver.solve_stripe(
+                        syndromes,
+                        syndrome_row,
+                        len,
+                        &mut worker.solve_scratch,
+                        &mut output_refs,
+                        cancelled,
+                    ) {
+                        *failure.lock().expect("stripe failure lock") = Some(error);
+                        return;
+                    }
                 }
             });
         }
@@ -972,6 +1161,7 @@ mod tests {
             TransformArmStats {
                 executed: after.executed - before.executed,
                 diverged: after.diverged - before.diverged,
+                consecutive_solves: after.consecutive_solves - before.consecutive_solves,
             },
         )
     }
