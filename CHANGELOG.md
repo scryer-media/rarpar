@@ -3,7 +3,7 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.5.1 (unreleased)
+## rarpar 0.5.1
 
 ### CLI Changes
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.4 (unreleased)
+## 0.10.4
 
 The placement scan no longer reads a set that is already in place.
 
