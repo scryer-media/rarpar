@@ -5,6 +5,15 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.5.1 (unreleased)
 
+### CLI Changes
+
+- `par verify` and `par repair` under the default smart placement no longer
+  read a set that is already in place twice. The placement scan hashed every
+  matching file in full, serially, before verification read it all again; a
+  file already at its recorded name is now left to verification, and the
+  remaining confirmations run in parallel. A clean eight-file 4 GiB verify
+  went from 5.6 s to 0.6 s, the same as `--par-placement canonical`.
+
 ### Build Changes
 
 - The crypto backend is now selected by an explicit feature rather than riding
@@ -22,7 +31,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library Versions
 
-- `unrar-rs` 0.10.7 and `par2-rs` 0.10.3, for the backend feature scheme above;
+- `unrar-rs` 0.10.7 and `par2-rs` 0.10.4, for the backend feature scheme above
+  and the placement scan fix;
   `unrar-rs` 0.10.7 also stops hashing a split streaming member with BLAKE2sp
   when no header names one.
   `par3-rs` and `reedsolomon-rs` are unchanged; `par3-rs` has no AWS-LC code

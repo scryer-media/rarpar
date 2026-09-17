@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "aws-lc-sys",
  "bytes",

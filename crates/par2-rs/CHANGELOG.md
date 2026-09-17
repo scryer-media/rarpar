@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.10.4
+
+The placement scan no longer reads a set that is already in place.
+
+### Fixed
+
+- `scan_placement` confirmed every 16 KB match with a full-file MD5, one file
+  at a time, on the calling thread — including files already sitting at the
+  name their description records. A caller that scans and then verifies (the
+  ordinary sequence) therefore read the whole set twice, the first time
+  serially: on an eight-file 4 GiB set, a clean smart-placement verify took
+  5.6 s against 0.6 s with the scan off. A file that matches exactly one
+  description by 16 KB hash and length, already carries that description's
+  name, and has no other disk file competing for it is now reported in place
+  without being read further. Confirmed or not, such a file is read at that
+  path, so the plan routes it identically, and the verification that follows
+  is what settles its content. Every other candidate — a wrong name, a
+  description more than one file could be — is still matched only by full-file
+  MD5, and those confirmations now run file-parallel. The same set now
+  verifies in 0.6 s in either placement mode.
+
+### Changed
+
+- `PlacementPlan::exact` lists files in place by name, length and 16 KB hash.
+  It previously implied a full-hash confirmation; a file damaged past its
+  first 16 KB at its own name used to land in `unresolved` and now lands in
+  `exact`. `PlacementFileAccess::from_plan` treats the two the same.
+
 ## 0.10.3 (unreleased)
 
 ### Changed
