@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.2 (unreleased)
+## 0.4.2
 
 - **Behaviour change:** an interleaved set's recovery carriers are cut and
   named by row, not by global recovery index. A row is one recovery index in
@@ -46,7 +46,7 @@
   reconstruction path already did. Copying four blocks in sixteen windows
   reported sixty passes where there were fifteen.
 
-## 0.4.0 (unreleased)
+## 0.4.0
 
 - Version: this release is `0.4.0`, not `0.3.2`. The entries below change public
   types, and under Cargo's 0.x rules a `par3-rs = "0.3.1"` requirement resolves
