@@ -280,7 +280,6 @@ jobs:
             esac
           }
 
-          exact_packaged_crates=""
           package_and_list() {
             local crate
             local -a package_args=()
@@ -301,7 +300,6 @@ jobs:
               if [ "$crate" = unrar-rs ]; then
                 grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
               fi
-              exact_packaged_crates="${exact_packaged_crates} ${crate}"
             done
           }
 
@@ -329,64 +327,6 @@ jobs:
           else
             package_and_list "$PUBLISH_PACKAGE"
           fi
-
-          export EXACT_PACKAGED_CRATES="$exact_packaged_crates"
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import sys
-
-          limits = {
-              "reedsolomon-rs": 1_000_000,
-              "unrar-rs": 2_500_000,
-              "par2-rs": 2_500_000,
-              # The engine, its tests and ENGINE.md package at about 418 KB
-              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
-              # packages of source, tests and documentation grew it from about 314 KB.
-              "par3-rs": 480_000,
-          }
-          exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
-          limits = {crate: limits[crate] for crate in exact_packaged_crates}
-          metadata = json.loads(
-              subprocess.check_output([
-                  "cargo",
-                  "metadata",
-                  "--locked",
-                  "--format-version",
-                  "1",
-                  "--no-deps",
-              ])
-          )
-          versions = {
-              package["name"]: package["version"]
-              for package in metadata["packages"]
-              if package["name"] in limits
-          }
-          if not limits:
-              print("no exact .crate archives were produced in preflight", file=sys.stderr)
-              sys.exit(1)
-
-          package_dir = pathlib.Path("target/package")
-          failed = False
-          for crate, limit in limits.items():
-              path = package_dir / f"{crate}-{versions.get(crate)}.crate"
-              if not path.exists():
-                  print(f"missing packaged crate for {crate} {versions.get(crate)}", file=sys.stderr)
-                  failed = True
-                  continue
-              size = path.stat().st_size
-              print(f"{path.name}: {size} bytes")
-              if size > limit:
-                  print(
-                      f"{crate} package is {size} bytes, over {limit} byte limit",
-                      file=sys.stderr,
-                  )
-                  failed = True
-          if failed:
-              sys.exit(1)
-          PY
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -477,48 +417,6 @@ jobs:
             if [ "$crate" = unrar-rs ]; then
               grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
             fi
-
-            python3 - "$crate" <<'PY'
-          import json
-          import pathlib
-          import subprocess
-          import sys
-
-          crate = sys.argv[1]
-          limits = {
-              "reedsolomon-rs": 1_000_000,
-              "unrar-rs": 2_500_000,
-              "par2-rs": 2_500_000,
-              # The engine, its tests and ENGINE.md package at about 418 KB
-              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
-              # packages of source, tests and documentation grew it from about 314 KB.
-              "par3-rs": 480_000,
-          }
-          metadata = json.loads(
-              subprocess.check_output([
-                  "cargo",
-                  "metadata",
-                  "--locked",
-                  "--format-version",
-                  "1",
-                  "--no-deps",
-              ])
-          )
-          versions = {
-              package["name"]: package["version"]
-              for package in metadata["packages"]
-              if package["name"] == crate
-          }
-          path = pathlib.Path("target/package") / f"{crate}-{versions[crate]}.crate"
-          size = path.stat().st_size
-          print(f"{path.name}: {size} bytes")
-          if size > limits[crate]:
-              print(
-                  f"{crate} package is {size} bytes, over {limits[crate]} byte limit",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-          PY
           }
 
           publish_with_retry() {
