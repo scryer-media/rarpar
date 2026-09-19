@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.10.8
+
+### Fixed
+
+- The in-crate NEON BLAKE2sp loaded message words with `vld1q_u32`, which
+  stdarch lowers to an LLVM load carrying `align 4`, while the seam that calls
+  it always passes a byte-aligned `&[u8; 16]`. The instruction itself is
+  alignment-agnostic, so nothing ever misbehaved, but the load was undefined
+  behaviour as written and Miri and a sanitizer build are both entitled to say
+  so. It now goes through `vld1q_u8` plus a reinterpret, which carries
+  `align 1`, costs no instruction, and yields the same lanes on these
+  little-endian targets.
+
+### Changed
+
+- Streaming BLAKE2sp on NEON drains before it buffers. `Blake2spState::update_with`
+  appended the whole input to its buffer and then compressed super-blocks out
+  of it, so every streamed byte was copied in and copied out again on top of
+  the compression itself; it now retires the buffered tail one super-block at
+  a time while refilling it from the head of the input, then compresses
+  straight out of the caller's slice for as long as a full super-block plus
+  the non-final tail remains. This is the shape the leaf-group path already
+  used. Measured on a 64 MiB streaming hash in 4 MiB chunks:
+  38.380 ms to 37.579 ms, about 2%, on an aarch64 host too busy for a tighter
+  figure; the number is indicative, and the reason for the change is the two
+  removed passes rather than the measurement.
+
+### Added
+
+- `archive_hotspots` gained `blake2sp_streaming_4mib_chunks`,
+  `blake2sp_streaming_64kib_chunks` and `blake2sp_oneshot_64mib`, so the
+  hashing path has a microbench of its own rather than being measured through
+  an extraction workload that spends its time elsewhere.
+
+### Internal
+
+- The PPMd symbol-search differential test now covers 31/32/33, 47/48/49 and
+  63/64/65 states as well as 1..=24, so the shipped SSSE3 kernel's batch
+  boundaries are checked past the first three batches.
+
 ## 0.10.7
 
 ### Changed

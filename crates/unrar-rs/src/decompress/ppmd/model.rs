@@ -2457,7 +2457,14 @@ mod tests {
         let stats = model.span_ctx_stats(context_span);
         let mut seed = 0x2545_f491_4f6c_dd1du64;
 
-        for ns in 1..=24usize {
+        // 1..=24 walks both batch boundaries of the eight-wide kernels; the
+        // explicit tail adds the 15/16/17, 31/32/33 and 63/64/65 edge lengths,
+        // where several full-width passes and a scalar straggler have to agree
+        // with the scan.
+        let state_counts = (1..=24usize)
+            .chain([31, 32, 33, 47, 48, 49, 63, 64, 65])
+            .collect::<Vec<_>>();
+        for ns in state_counts {
             let span = model
                 .alloc
                 .validated_tail_span(stats, ns * STATE_SIZE)

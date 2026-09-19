@@ -241,38 +241,53 @@ impl Blake2spState {
     /// leaf's last block is ever compressed as non-final. Whatever remains
     /// (which can span up to two blocks per leaf) is buffered for
     /// [`finalize_with`](Self::finalize_with).
+    ///
+    /// The buffer is drained *before* the bulk is touched, taking only as much
+    /// of `input` as each buffered super-block needs — the same shape
+    /// `Blake2spLeafGroup::update_with` uses, and for the same reason. A
+    /// streaming hasher is fed multi-megabyte chunks back to back, and the
+    /// retained tail is never empty after the first call (it is at least
+    /// `NEEDED_TAIL` = 449 bytes whenever any super-block was compressed), so
+    /// appending the whole chunk first would push the entire stream through
+    /// `buf` and then through the `sb` stack copy: two extra passes over every
+    /// byte. Draining first gets back to the zero-copy path — compressing
+    /// straight out of the caller's slice — within at most one super-block.
     #[inline(always)]
     unsafe fn update_with<S: Simd>(&mut self, mut input: &[u8]) {
-        // Fast path: an empty buffer means `input` is aligned to a super-block
-        // (leaf-0) boundary, so complete super-blocks can be compressed straight
-        // from it while at least `NEEDED_TAIL` bytes remain afterward. This
-        // avoids buffering the bulk of large inputs.
-        if self.buf.is_empty() {
-            while input.len() >= SUPERBLOCK + NEEDED_TAIL {
-                // SAFETY: backend gated by the caller; see `Simd` safety note.
-                unsafe { self.compress_superblock::<S>(input) };
-                input = &input[SUPERBLOCK..];
+        // Phase 1: retire the buffered tail, refilling it from the head of
+        // `input` one super-block at a time.
+        while !self.buf.is_empty() {
+            if self.buf.len() < SUPERBLOCK {
+                let take = (SUPERBLOCK - self.buf.len()).min(input.len());
+                self.buf.extend_from_slice(&input[..take]);
+                input = &input[take..];
+                if self.buf.len() < SUPERBLOCK {
+                    // `input` is exhausted and the buffer is still short.
+                    return;
+                }
             }
-            self.buf.extend_from_slice(input);
-            return;
-        }
-
-        // General path: append to the buffer, then compress leading super-blocks
-        // while at least `NEEDED_TAIL` bytes still follow each (so it is
-        // non-final for every leaf). The retained tail (< `SUPERBLOCK +
-        // NEEDED_TAIL`) always starts on a super-block boundary.
-        self.buf.extend_from_slice(input);
-        let mut off = 0;
-        while self.buf.len() - off >= SUPERBLOCK + NEEDED_TAIL {
+            // A whole super-block is buffered. It may only be compressed if
+            // enough bytes follow it — in the buffer or still in `input` — for
+            // it to be non-final for every leaf.
+            if (self.buf.len() - SUPERBLOCK) + input.len() < NEEDED_TAIL {
+                self.buf.extend_from_slice(input);
+                return;
+            }
             let mut sb = [0u8; SUPERBLOCK];
-            sb.copy_from_slice(&self.buf[off..off + SUPERBLOCK]);
+            sb.copy_from_slice(&self.buf[..SUPERBLOCK]);
             // SAFETY: backend gated by the caller; see `Simd` safety note.
             unsafe { self.compress_superblock::<S>(&sb) };
-            off += SUPERBLOCK;
+            self.buf.drain(..SUPERBLOCK);
         }
-        if off > 0 {
-            self.buf.drain(..off);
+
+        // Phase 2: the buffer is empty, so `input` now starts on a super-block
+        // (leaf-0) boundary and can be compressed in place.
+        while input.len() >= SUPERBLOCK + NEEDED_TAIL {
+            // SAFETY: backend gated by the caller; see `Simd` safety note.
+            unsafe { self.compress_superblock::<S>(input) };
+            input = &input[SUPERBLOCK..];
         }
+        self.buf.extend_from_slice(input);
     }
 
     /// Finalize the leaves over a copy of the state and return the root digest.
@@ -416,26 +431,24 @@ pub fn hash(data: &[u8]) -> [u8; OUT] {
     state.finalize()
 }
 
-// The group API's only production wiring is the `LEAVES_PER_WORKER > 1`
-// arrangement, pinned off in `hash_pipeline` (wall-clock regression); until
-// that flips, the sole consumer is the differential test there.
+// The group API is production wiring on aarch64: `hash_pipeline` sets
+// `LEAVES_PER_WORKER = GROUP_LEAVES` there and its `BlakeWorkerState` *is*
+// `Blake2spLeafGroup`, so every aarch64 member hash runs through this API. The
+// differential test in `hash_pipeline` checks it rather than being its only
+// consumer.
 /// Number of leaves one vector group covers — the kernel is 4-wide.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const GROUP_LEAVES: usize = 4;
 /// Number of vector groups a whole BLAKE2sp tree splits into.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 const GROUPS: usize = DEGREE / GROUP_LEAVES; // 2
 /// One group super-block feeds each of the group's leaves one 64-byte block, so
 /// it is a *contiguous* 256-byte half of the tree's 512-byte super-block.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 const GROUP_SUPERBLOCK: usize = GROUP_LEAVES * BLOCK; // 256
 /// Group twin of [`NEEDED_TAIL`]: bytes that must follow a group super-block
 /// for it to be non-final for all four of the group's leaves.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 const GROUP_NEEDED_TAIL: usize = (GROUP_LEAVES - 1) * BLOCK + 1; // 193
 
 /// One half of a BLAKE2sp tree: the four leaves `4*group .. 4*group+4`, driven
@@ -460,7 +473,6 @@ const GROUP_NEEDED_TAIL: usize = (GROUP_LEAVES - 1) * BLOCK + 1; // 193
 /// per stream over 256 bytes, and cheap enough that the caller can keep using
 /// whatever root BLAKE2s it already has.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct Blake2spLeafGroup {
     /// This group's leaf state, transposed: `h[j]` lane `i` is leaf
@@ -476,7 +488,6 @@ pub(crate) struct Blake2spLeafGroup {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(test), allow(dead_code))]
 impl Blake2spLeafGroup {
     /// Create the state for leaves `4*group .. 4*group+4`.
     pub(crate) fn new(group: usize) -> Self {
