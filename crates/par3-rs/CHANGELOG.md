@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.3
+
+- New `wasm-simd` feature. It forwards blake3's `wasm32_simd`, which is what
+  puts blake3's wasm SIMD kernels into a wasm build; without it a `+simd128`
+  artifact hashes with the portable ones. Cargo cannot key a feature on a
+  `target_feature`, so a wasm build compiled with `-C target-feature=+simd128`
+  has to name the feature as well, and a wasm build without simd128 must leave
+  it off — blake3's kernels compile in unconditionally once the feature is on,
+  and a module that promises no SIMD must not carry v128 instructions. The
+  crate fails the build of a `+simd128` wasm artifact that did not forward it,
+  by asserting blake3's own reported SIMD degree at compile time, so the
+  pairing cannot be lost quietly. Native builds are unaffected: blake3's build
+  script only acts on the feature for `wasm32`. PAR3 verification is dominated
+  by fingerprinting — 88% of a 16 MiB verify under wasmtime 47 is BLAKE3 — and
+  forwarding the feature makes that verify 1.84x faster, the fingerprint itself
+  1.96x, and the harness's whole run 1.49x.
+- New `wasm_par3_check` example: an end-to-end create, verify, damage and
+  repair pass over the published PAR3 corpus, printing a fingerprint for every
+  repaired file and every created carrier. It runs natively and under a wasm
+  runtime, and CI now diffs each wasm lane's canonical report against the
+  native run in the same job, so a lane that computes different parity bytes
+  fails rather than merely reporting `PASS`.
+- Requires `reedsolomon-rs` 0.4.7, for its wasm GF(2^8) tier.
+
 ## 0.4.2
 
 - **Behaviour change:** an interleaved set's recovery carriers are cut and

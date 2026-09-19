@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.4.2"
+version = "0.4.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,12 +11,26 @@ keywords = ["par3", "parchive", "parity", "erasure", "verification"]
 categories = ["parser-implementations", "filesystem"]
 exclude = ["tests/fixtures/**", "benchmarks/**"]
 
+# blake3's wasm SIMD kernels.
+#
+# Cargo cannot key a feature on a `target_feature`, and blake3's `wasm32_simd`
+# does not compile without `-C target-feature=+simd128`, so a wasm artifact
+# built with simd128 has to name this feature as well; a wasm build without
+# simd128 stays supported and must leave it off. `lib.rs` turns the pairing
+# into a compile-time assertion on blake3's own reported SIMD degree, so a
+# simd128 build that forgets the feature fails instead of quietly hashing at
+# the portable rate. On native targets the feature is inert — blake3's build
+# script only acts on it for `wasm32` — and rayon is irrelevant either way:
+# there are no threads to fork onto under wasip1.
+[features]
+wasm-simd = ["blake3/wasm32_simd"]
+
 [dependencies]
 blake3 = { workspace = true, features = ["rayon"] }
 crc-fast = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.5", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.7", default-features = false }
 rayon = { workspace = true, default-features = false }
 
 # Process CPU time for the verification timing probe, so its table reports a

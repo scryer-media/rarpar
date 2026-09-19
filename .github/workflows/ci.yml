@@ -1735,6 +1735,172 @@ jobs:
             ${{ github.workspace }}/target-wasm/threads-simd128
           key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
 
+  # The PAR3 wasm correctness harness. Same shape as the PAR2 one above: the
+  # native run in this job is the reference, and every wasm lane's canonical
+  # report has to be byte-identical to it, so no digest is hardcoded here.
+  #
+  # Four lanes rather than three, because GF(2^8) and GF(2^16) both have a
+  # relaxed-simd flavour: `i8x16.relaxed_swizzle` is the same permutation with
+  # the x86 lane clamp dropped, so it must agree with the plain form exactly.
+  # The portable lane is what keeps a wasm build without simd128 supported.
+  #
+  # The `wasm-simd` feature rides along with `+simd128`: it forwards blake3's
+  # `wasm32_simd`, without which a SIMD artifact hashes with the portable
+  # kernels. `wasm-harness-check.sh` asserts the tier each lane reports, so a
+  # lane that lost the forwarding fails here rather than quietly slowing down.
+  wasm-par3-harness:
+    name: wasm-par3-harness
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.par3 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # One CARGO_TARGET_DIR per (target, RUSTFLAGS) pair: cargo fingerprints
+      # do not separate builds by RUSTFLAGS, so sharing a directory between
+      # lanes would rebuild the world on every switch.
+      WASM_LANES: ${{ github.workspace }}/target-wasm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+      - name: Hydrate the test corpus (par3)
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
+      - name: Restore wasm lane target directories
+        id: wasm-cache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          # Only the wasm lanes are cached; the native reference build shares
+          # nothing with them.
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+            ${{ github.workspace }}/target-wasm/wasip1-relaxed-simd
+          key: gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par3-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par3-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}-
+            gha-wasm-${{ env.WASM_CACHE_VERSION }}-rarpar-par3-${{ env.RUST_TOOLCHAIN }}-
+      - name: Set up wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Build the PAR3 harness for every lane
+        run: |
+          set -euo pipefail
+          build_lane() {
+            local lane="$1" target="$2" flags="$3" feature="$4"
+            local -a target_arg=()
+            local -a feature_arg=()
+            if [ -n "$target" ]; then
+              target_arg=(--target "$target")
+            fi
+            if [ -n "$feature" ]; then
+              feature_arg=(--features "$feature")
+            fi
+            echo "::group::build $lane (${target:-native}) RUSTFLAGS=\"$flags\" features=\"$feature\""
+            CARGO_TARGET_DIR="$WASM_LANES/$lane" RUSTFLAGS="$flags" \
+              cargo build --release --locked -p par3-rs \
+                ${feature_arg[@]+"${feature_arg[@]}"} \
+                ${target_arg[@]+"${target_arg[@]}"} --example wasm_par3_check
+            echo "::endgroup::"
+          }
+          # `wasm-simd` only rides with `+simd128`: blake3's wasm32_simd
+          # kernels compile into the module unconditionally once the feature is
+          # on, and a lane that promises no SIMD must not carry them. The
+          # native reference takes no feature at all -- blake3's build script
+          # ignores it off wasm32, so naming it there would say nothing.
+          build_lane native             ""            ""                                ""
+          build_lane wasip1-portable    wasm32-wasip1 ""                                ""
+          build_lane wasip1-simd128     wasm32-wasip1 "-C target-feature=+simd128"      wasm-simd
+          build_lane wasip1-relaxed-simd wasm32-wasip1 "-C target-feature=+relaxed-simd" wasm-simd
+      - name: Run the PAR3 harness natively, then on every wasm lane
+        run: |
+          set -euo pipefail
+          fixtures="$PWD/crates/par3-rs/tests/fixtures"
+          check="$PWD/.github/scripts/wasm-harness-check.sh"
+          reports="$RUNNER_TEMP/par3-reports"
+          mkdir -p "$reports"
+
+          # The native reference. The check script fails the job here if the
+          # report is missing a case, if a damaged set verified clean, if the
+          # created set is not the GF(2^8) set the kernel lane needs, or if a
+          # fingerprint is malformed -- so a vacuous reference can never become
+          # the standard the wasm lanes are then trivially equal to.
+          echo "::group::lane native (reference)"
+          rm -rf "$RUNNER_TEMP/scratch-native"
+          mkdir -p "$RUNNER_TEMP/scratch-native"
+          "$WASM_LANES/native/release/examples/wasm_par3_check" \
+            "$fixtures" "$RUNNER_TEMP/scratch-native" | tee "$reports/native.txt"
+          "$check" par3 "$reports/native.txt" "$reports/native.canon"
+          rm -rf "$RUNNER_TEMP/scratch-native"
+          echo "::endgroup::"
+
+          results=()
+          failures=0
+          run_lane() {
+            local name="$1" wasm="$2"
+            local scratch="$RUNNER_TEMP/scratch-$name"
+            rm -rf "$scratch"
+            mkdir -p "$scratch"
+            echo "::group::lane $name"
+            local status=PASS
+            if wasmtime run \
+                 --dir "$fixtures::/fixtures" --dir "$scratch::/scratch" \
+                 "$wasm" /fixtures /scratch | tee "$reports/$name.txt" \
+               && "$check" par3 "$reports/$name.txt" "$reports/$name.canon" \
+               && diff -u "$reports/native.canon" "$reports/$name.canon"; then
+              echo "lane $name: canonical report is identical to native"
+            else
+              status=FAIL
+              failures=$((failures + 1))
+              echo "::error::wasm lane $name diverged from the native reference run"
+            fi
+            # Each lane's scratch peaks at around 100 MiB of fixture copies.
+            rm -rf "$scratch"
+            results+=("$name|$status")
+            echo "::endgroup::"
+          }
+
+          base="$WASM_LANES"
+          tail="wasm32-wasip1/release/examples/wasm_par3_check.wasm"
+          run_lane wasip1-portable     "$base/wasip1-portable/$tail"
+          run_lane wasip1-simd128      "$base/wasip1-simd128/$tail"
+          run_lane wasip1-relaxed-simd "$base/wasip1-relaxed-simd/$tail"
+
+          {
+            echo "### wasm PAR3 harness"
+            echo
+            echo "wasmtime $WASMTIME_VERSION; digests compared against the native run in this job."
+            echo
+            echo "| lane | result |"
+            echo "| --- | --- |"
+            for entry in "${results[@]}"; do
+              echo "| ${entry%%|*} | ${entry##*|} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures wasm PAR3 lane(s) failed"
+            exit 1
+          fi
+      - name: Save wasm lane target directories
+        if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ${{ github.workspace }}/target-wasm/wasip1-portable
+            ${{ github.workspace }}/target-wasm/wasip1-simd128
+            ${{ github.workspace }}/target-wasm/wasip1-relaxed-simd
+          key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
+
   wasm-unrar-harness:
     name: wasm-unrar-harness
     needs: [changes, fmt, clippy, unit-tests]
@@ -1889,6 +2055,7 @@ jobs:
       - docs-package
       - cli-smoke
       - wasm-par2-harness
+      - wasm-par3-harness
       - wasm-unrar-harness
     steps:
       - name: Check CI result

@@ -2,7 +2,7 @@
 #
 # Non-vacuous gate + canonicaliser for the rarpar wasm correctness harnesses.
 #
-#   usage: wasm-harness-check.sh <par2|unrar> <report-file> <canon-out-file>
+#   usage: wasm-harness-check.sh <par2|par3|unrar> <report-file> <canon-out-file>
 #
 # The harnesses (`crates/par2-rs/examples/wasm_par2_check.rs`,
 # `crates/unrar-rs/examples/wasm_extract_check.rs`) already exit non-zero
@@ -41,7 +41,7 @@ die() {
 	exit 1
 }
 
-[ "$#" -eq 3 ] || die "usage: $0 <par2|unrar> <report-file> <canon-out-file>"
+[ "$#" -eq 3 ] || die "usage: $0 <par2|par3|unrar> <report-file> <canon-out-file>"
 
 harness="$1"
 report="$2"
@@ -162,6 +162,109 @@ par2)
 	done
 	;;
 
+par3)
+	# One row group per corpus case, in the harness's own order. `index_only`
+	# carries no recovery, so it is verified and never repaired; every other
+	# case must lose blocks and get them back.
+	verify_cases=(
+		gf8_packed tiny_inline auto_block tree index_only
+		gf16_blocks gf16_by_recovery large_stream
+	)
+	repair_cases=(
+		gf8_packed tiny_inline auto_block tree
+		gf16_blocks gf16_by_recovery large_stream
+	)
+	# Eight corpus cases, the created set, and the hash probe.
+	require_tail "cases=10 failed=0"
+	canon_totals="cases=10 failed=0"
+
+	# blake3's tier is a property of the artifact, not of the run, and the
+	# whole point of forwarding blake3's `wasm32_simd` feature is that a
+	# `+simd128` lane reaches the SIMD kernels. A lane that silently fell back
+	# to the portable ones still passes every digest check -- it just hashes at
+	# a third of the rate -- so the tier is asserted here, from outside the
+	# artifact, against the lane header the artifact declared.
+	tier_row="$(require_row "blake3 tier=")"
+	degree="$(printf '%s\n' "$tier_row" | sed -n 's/.*degree=\([0-9][0-9]*\).*/\1/p')"
+	[ -n "$degree" ] || die "$harness: blake3 row carries no degree=: $tier_row"
+	case "$lane_line" in
+	"lane=wasm32 portable")
+		[ "$degree" = "1" ] ||
+			die "$harness: a portable wasm lane reports blake3 degree=$degree; it was built with SIMD blake3"
+		;;
+	"lane=wasm32 "*)
+		[ "$degree" -gt 1 ] ||
+			die "$harness: lane '$lane_line' reports blake3 degree=$degree, i.e. portable blake3 in a SIMD build; par3-rs's 'wasm-simd' feature was not forwarded"
+		;;
+	esac
+
+	for label in "${verify_cases[@]}"; do
+		set_row="$(require_row "set $label ")"
+		printf '%s\n' "$set_row" |
+			grep -qE '^set [a-z0-9_]+ blocks=[1-9][0-9]* block_bytes=[1-9][0-9]* field=[0-2] recovery=[0-9]+$' ||
+			die "$harness: case '$label' has no well-formed set row: $set_row"
+		emit "$set_row"
+
+		row="$(require_row "verify-healthy $label ")"
+		printf '%s\n' "$row" | grep -qE ' damaged=0 missing=0 files=[1-9][0-9]*$' ||
+			die "$harness: case '$label' did not verify clean before damage: $row"
+		emit "$row"
+	done
+
+	for label in "${repair_cases[@]}"; do
+		# Damage has to have been *seen*. A case whose damaged verify still
+		# reports everything complete repairs nothing, and its repair row
+		# would then be a tautology.
+		row="$(require_row "verify-damaged $label ")"
+		damaged="$(printf '%s\n' "$row" | sed -n 's/.* damaged=\([0-9][0-9]*\).*/\1/p')"
+		missing="$(printf '%s\n' "$row" | sed -n 's/.* missing=\([0-9][0-9]*\)$/\1/p')"
+		[ -n "$damaged" ] && [ -n "$missing" ] ||
+			die "$harness: case '$label' has no damaged/missing counts: $row"
+		[ $((damaged + missing)) -gt 0 ] ||
+			die "$harness: case '$label' reports no damage after being damaged: $row"
+		emit "$row"
+
+		row="$(require_row "repair $label ")"
+		printf '%s\n' "$row" | grep -qE '^repair [a-z0-9_]+ rebuilt=[1-9][0-9]* fingerprint=[0-9a-f]{32}$' ||
+			die "$harness: case '$label' is not a rebuilt row with a 32-hex fingerprint: $row"
+		emit "$row"
+	done
+
+	# The created set is the GF(2^8) lane: its block and recovery counts are
+	# chosen to keep the field there, and `field=1` is what says the GF(2^8)
+	# kernel under test ran at all. A change that moved the set to GF(2^16)
+	# would leave every digest correct and the coverage gone.
+	row="$(require_row "create blocks=")"
+	printf '%s\n' "$row" |
+		grep -qE '^create blocks=[1-9][0-9]* block_bytes=[1-9][0-9]* field=1 recovery=[1-9][0-9]* files=[1-9][0-9]*$' ||
+		die "$harness: the created set is not a GF(2^8) set with recovery: $row"
+	emit "$row"
+
+	created_files="$(printf '%s\n' "$normalized" | grep -c '^create-file ' || true)"
+	[ "$created_files" -ge 2 ] ||
+		die "$harness: the create phase wrote $created_files files; an index and at least one volume were expected"
+	printf '%s\n' "$normalized" | grep '^create-file ' | while read -r line; do
+		printf '%s\n' "$line" | grep -qE '^create-file [^ ]+ fingerprint=[0-9a-f]{32}$' ||
+			die "$harness: create-file row has no 32-hex fingerprint: $line"
+	done
+	while read -r line; do emit "$line"; done < <(printf '%s\n' "$normalized" | grep '^create-file ')
+
+	# The decoder counterpart: the created set rebuilding its own source, from
+	# enough lost blocks that the solve is not a special case.
+	row="$(require_row "rebuild ")"
+	printf '%s\n' "$row" | grep -qE '^rebuild damaged=[0-9]+ fingerprint=[0-9a-f]{32}$' ||
+		die "$harness: rebuild row is malformed: $row"
+	rebuilt_blocks="$(printf '%s\n' "$row" | sed -n 's/^rebuild damaged=\([0-9][0-9]*\).*/\1/p')"
+	[ "$rebuilt_blocks" -ge 2 ] ||
+		die "$harness: the created set lost only $rebuilt_blocks block(s); the decoder was barely exercised"
+	emit "$row"
+
+	row="$(require_row "hash bytes=")"
+	printf '%s\n' "$row" | grep -qE '^hash bytes=[1-9][0-9]* fingerprint=[0-9a-f]{32}$' ||
+		die "$harness: hash probe row is malformed: $row"
+	emit "$row"
+	;;
+
 unrar)
 	# One row per fixture, in the harness's own order; the labels are its
 	# literal `Case::label` strings with their alignment padding collapsed.
@@ -233,7 +336,7 @@ unrar)
 	;;
 
 *)
-	die "unknown harness '$harness' (expected 'par2' or 'unrar')"
+	die "unknown harness '$harness' (expected 'par2', 'par3' or 'unrar')"
 	;;
 esac
 
