@@ -2401,6 +2401,7 @@ impl LzDecoder {
         {
             note_controller_dispatch();
             note_pipelined_dispatch();
+            self.pipelined_dispatches += 1;
         }
 
         let BatchScratch {
@@ -2915,12 +2916,16 @@ mod tests {
         (input, blocks, expected)
     }
 
+    /// Drive one controller run on a decoder of its own.
+    ///
+    /// The fourth element is that decoder's pipelined-dispatch count, so a
+    /// caller asserting on overlaps reads a number only this run produced.
     fn run_controller(
         input: &[u8],
         blocks: &[BlockInfo],
         unpacked_size: u64,
         pipelined: bool,
-    ) -> (RarResult<()>, u64, Vec<u8>) {
+    ) -> (RarResult<()>, u64, Vec<u8>, usize) {
         let mut decoder = LzDecoder::new(128 * 1024, 1);
         decoder.install_inline_tables(&rar7_tables());
         let mut output_size = 0u64;
@@ -2934,7 +2939,7 @@ mod tests {
             pipelined,
         );
         decoder.flush_filters_and_write(&mut output).unwrap();
-        (result, output_size, output)
+        (result, output_size, output, decoder.pipelined_dispatches)
     }
 
     fn plan_assignments(
@@ -4003,7 +4008,9 @@ mod tests {
             );
             let parallel = feedback.use_parallel(bytes);
             assert_eq!(parallel, round % 2 == 1);
-            let before = global_pipelined_dispatches();
+            // This decoder's own count, not the process-wide one: the exact
+            // comparison below has to read state no other test can move.
+            let before = decoder.pipelined_dispatches;
             {
                 let _inline = (!parallel).then(|| crate::DecodeMode::Serial.enter());
                 decoder
@@ -4018,9 +4025,9 @@ mod tests {
                     .unwrap();
             }
             if !parallel {
-                assert_eq!(global_pipelined_dispatches(), before);
+                assert_eq!(decoder.pipelined_dispatches, before);
             } else if rar_decode_worker_count() > 1 {
-                assert!(global_pipelined_dispatches() > before);
+                assert!(decoder.pipelined_dispatches > before);
             }
         }
         decoder.flush_filters_and_write(&mut output).unwrap();
@@ -4040,11 +4047,9 @@ mod tests {
             literal_block_stream(batch_plan::capacity(MAX_PARALLEL_THREADS) * 4);
         let unpacked_size = expected.len() as u64;
 
-        let overlaps_before = global_pipelined_dispatches();
-        let (pipelined_result, pipelined_size, pipelined_output) =
+        let (pipelined_result, pipelined_size, pipelined_output, overlaps) =
             run_controller(&input, &blocks, unpacked_size, true);
-        let overlaps = global_pipelined_dispatches() - overlaps_before;
-        let (sequential_result, sequential_size, sequential_output) =
+        let (sequential_result, sequential_size, sequential_output, _) =
             run_controller(&input, &blocks, unpacked_size, false);
 
         pipelined_result.unwrap();
@@ -4073,11 +4078,10 @@ mod tests {
         blocks[failing_index].payload_bit_offset = (input.len() + 1) * 8;
         let applied = failing_index * 8;
 
-        let overlaps_before = global_pipelined_dispatches();
-        let (pipelined_result, pipelined_size, pipelined_output) =
+        let (pipelined_result, pipelined_size, pipelined_output, overlaps) =
             run_controller(&input, &blocks, expected.len() as u64, true);
-        assert!(global_pipelined_dispatches() > overlaps_before);
-        let (sequential_result, sequential_size, sequential_output) =
+        assert!(overlaps > 0);
+        let (sequential_result, sequential_size, sequential_output, _) =
             run_controller(&input, &blocks, expected.len() as u64, false);
 
         assert!(matches!(
