@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.7
+
+- `gf8::MulPlan` has a wasm tier. The GF(2^8) multiply-accumulate carried NEON,
+  AVX2 and SSSE3 kernels and fell to the scalar loop on wasm, which is the
+  kernel PAR3's Cauchy codec dispatches every region multiply through. The new
+  tier takes the same split-nibble shape as the NEON one: the two precomputed
+  16-byte product tables are the swizzle operands, so one `i8x16.swizzle` per
+  nibble replaces sixteen table indexings. wasm has no runtime feature
+  detection, so the tier is chosen at compile time from the artifact's
+  `target_feature` set — `+relaxed-simd` takes `i8x16.relaxed_swizzle`, which
+  is the same permutation without the lane clamp the plain form must emit on
+  x86 hosts, plain `+simd128` takes `i8x16.swizzle`, and a wasm build with
+  neither keeps the scalar path it always had. The scalar tail is unchanged and
+  no native target is touched: the `__text` of a native build is byte-identical
+  either way, on aarch64 and on x86-64.
+
+  Under wasmtime 47 on aarch64, against the same build with the tier removed,
+  a PAR3 create of a GF(2^8) set over a 16 MiB source is 3.96x faster and the
+  repair that rebuilds twenty of its blocks is 4.72x; end to end the wasm
+  harness's whole run is 2.79x. A set in GF(2^16), which does not reach this
+  kernel, is unchanged.
+
 ## 0.4.6
 
 - Add `gf16_dft`: PAR2 recovery and syndrome rows computed as an

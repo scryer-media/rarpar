@@ -171,6 +171,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+// A wasm artifact built with `+simd128` must reach blake3's wasm SIMD kernels.
+// They live behind blake3's own `wasm32_simd` feature, which this crate's
+// `wasm-simd` feature forwards, because Cargo cannot key a feature on a
+// `target_feature`. Checking the outcome rather than the spelling is the point:
+// blake3 publishes its active tier as `MAX_SIMD_DEGREE`, which is four with the
+// wasm SIMD kernels compiled in and one without, so this fails the build of a
+// simd128 artifact that would otherwise hash at the portable rate — the exact
+// regression it exists to catch. A wasm build without simd128 is untouched.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+const _: () = assert!(
+    blake3::platform::MAX_SIMD_DEGREE > 1,
+    "a wasm build with -C target-feature=+simd128 must also enable par3-rs's \
+     `wasm-simd` feature, which forwards blake3's `wasm32_simd`"
+);
+
 pub mod carrier;
 pub mod cauchy;
 pub mod checksums;
