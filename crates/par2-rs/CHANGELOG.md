@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.6
+
+### Internal
+
+- `crc_simd` says what it is waiting for. The 256-bit VPCLMULQDQ CRC-32 fold is
+  a stopgap for `crc-fast` gating that tier on AVX-512VL; the module now names
+  the upstream change that lifts the gate (awesomized/crc-fast-rust#56, open
+  as of 2026-09-18) and what to check before deleting the module once a
+  release carries it. No code changed.
+
 ## 0.10.5
 
 The XOR-JIT repair tier is chosen by budget instead of by capability.

@@ -156,6 +156,14 @@ pub struct LzDecoder {
     /// multi-member archive pays for the staging area once rather than once
     /// per file.
     staged_input: Option<StagedInput>,
+    /// Batches this decoder dispatched while the previous batch's apply ran.
+    ///
+    /// Per instance, so a test that owns its decoder observes only the
+    /// overlaps it caused; the process-wide counter in `parallel` stays for
+    /// tests that drive extraction through the public API and never hold a
+    /// decoder to ask.
+    #[cfg(test)]
+    pipelined_dispatches: usize,
 }
 
 impl LzDecoder {
@@ -207,6 +215,8 @@ impl LzDecoder {
             parallel_batch_scratch: Vec::new(),
             parallel_mode_exhausted: false,
             staged_input: None,
+            #[cfg(test)]
+            pipelined_dispatches: 0,
         };
         decoder.recompute_flush_border();
         Ok(decoder)
