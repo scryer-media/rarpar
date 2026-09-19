@@ -3,6 +3,25 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.5.3
+
+### CLI Changes
+
+- `rar extract` decodes RAR5 LZ members about 3.5% faster on x86-64 machines
+  with AVX2 and BMI2 (any Intel Haswell or AMD Zen part onward). The symbol
+  decoder is now compiled a second time for that feature level and chosen at
+  runtime; the output is byte-identical and `RARPAR_LZ_DECODE_V3=0` pins the
+  baseline loop. Other machines are unchanged.
+
+### Library versions
+
+- unrar-rs 0.10.8: the x86-64-v3 symbol decoder above; a NEON BLAKE2sp load
+  that was undefined behaviour as written (it never misbehaved); streaming
+  BLAKE2sp on NEON no longer copies every byte twice; a test-isolation fix in
+  the LZ decoder's adaptive-engine test.
+- par2-rs 0.10.6: documentation only, naming the upstream `crc-fast` change
+  the VPCLMULQDQ CRC stopgap is waiting on.
+
 ## rarpar 0.5.2
 
 ### CLI Changes

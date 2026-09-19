@@ -47,6 +47,10 @@
 
 ### Internal
 
+- `crc_simd` says what it is waiting for: the upstream `crc-fast` change that
+  lifts the AVX-512VL gate on its VPCLMULQDQ tier (awesomized/crc-fast-rust#56,
+  open as of 2026-09-18), and what to check before deleting the stopgap once a
+  release carries it.
 - The PPMd symbol-search differential test now covers 31/32/33, 47/48/49 and
   63/64/65 states as well as 1..=24, so the shipped SSSE3 kernel's batch
   boundaries are checked past the first three batches.
