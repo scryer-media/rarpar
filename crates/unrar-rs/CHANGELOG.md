@@ -54,6 +54,16 @@
 - The PPMd symbol-search differential test now covers 31/32/33, 47/48/49 and
   63/64/65 states as well as 1..=24, so the shipped SSSE3 kernel's batch
   boundaries are checked past the first three batches.
+- The RAR5 pipelined controller counts its dispatches on the decoder itself,
+  and the tests that own their decoder assert on that per-instance count
+  rather than the process-wide counter.
+  `adaptive_rounds_switch_engines_without_restarting_the_window` asserts the
+  count is unchanged across an inline round; under the default multi-threaded
+  test runner another test dispatching its own pipelined batches moved the
+  process-wide counter between the two reads, and the assertion failed for a
+  reason that had nothing to do with the decoder under test. The process-wide
+  counter stays for the tests that drive extraction through the public API
+  and never hold a decoder to ask.
 
 ## 0.10.7
 
