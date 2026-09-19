@@ -813,7 +813,117 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
 ///   built over this block `has_bits()` *is* that compare;
 /// * literals append to a byte-native tape; only run boundaries emit operations,
 ///   avoiding packed-item expansion and a replay dispatch per eight bytes.
+///
+/// On x86-64 the loop body is compiled twice from the same source: once at the
+/// crate's shipped baseline and once as the [`x86_v3`] clone, selected here on
+/// a cached CPU probe. The body is bit-field extraction over a register-resident
+/// cursor, which is what `shrx`/`bzhi`/`lzcnt` exist for, and the baseline
+/// build cannot emit them.
 fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
+    reader: &mut BlockReader<'a>,
+    block_end_bits: usize,
+    tables: &TableSet,
+    extra_dist: bool,
+    items: &mut DecodedItems,
+    counters: &mut WorkerCounters,
+) -> RarResult<()> {
+    #[cfg(target_arch = "x86_64")]
+    if x86_v3::available() {
+        // SAFETY: `available` proved every feature the clone is compiled with.
+        return unsafe {
+            x86_v3::decode_block_symbols_fast::<DIAGNOSTICS>(
+                reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        };
+    }
+    decode_block_symbols_fast_body::<DIAGNOSTICS>(
+        reader,
+        block_end_bits,
+        tables,
+        extra_dist,
+        items,
+        counters,
+    )
+}
+
+/// x86-64-v3 clone of the fast symbol loop.
+///
+/// Nothing here is a new algorithm: the clone is [`decode_block_symbols_fast_body`]
+/// compiled under the v3 feature set, so the differential question against the
+/// baseline is answered by the source being the same. What changes is
+/// instruction selection inside the bit reader — `shrx`/`bzhi` for the
+/// variable-width extracts — which the shipped baseline cannot use because it
+/// must run on any x86-64. (`lzcnt` is in the set for completeness; the
+/// Huffman fast path is table-driven and the built loop emits none.)
+///
+/// Measured interleaved against the baseline on an Alder Lake-P host, medians
+/// of six rounds: 3.85% faster on the solid LZ extraction whose profile is
+/// 80% this loop, 2.7% on the streaming shape, and no bench slower. The PPMd
+/// decode loop was cloned the same way and *regressed* 3.2% on one workload,
+/// so it deliberately is not.
+#[cfg(target_arch = "x86_64")]
+mod x86_v3 {
+    use super::{BlockReader, DecodedItems, RarResult, TableSet, WorkerCounters};
+    use std::sync::OnceLock;
+
+    /// Set to `0` to pin the baseline loop on a capable CPU, so the two can be
+    /// A/B'd on one binary without a rebuild. There is no `1`: the clone has
+    /// no policy above the capability probe, and forcing it onto a CPU that
+    /// lacks the features would execute an undefined opcode. Same `OnceLock` +
+    /// escape-hatch shape as `RARPAR_CRC32_VPCLMUL`.
+    const FORCE_ENV: &str = "RARPAR_LZ_DECODE_V3";
+
+    pub(super) fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            if std::env::var_os(FORCE_ENV).is_some_and(|value| value == "0") {
+                return false;
+            }
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2")
+                && is_x86_feature_detected!("lzcnt")
+                && is_x86_feature_detected!("popcnt")
+        })
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support every feature named in the attribute; [`available`]
+    /// is the only caller and proves exactly that set.
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
+        reader: &mut BlockReader<'a>,
+        block_end_bits: usize,
+        tables: &TableSet,
+        extra_dist: bool,
+        items: &mut DecodedItems,
+        counters: &mut WorkerCounters,
+    ) -> RarResult<()> {
+        super::decode_block_symbols_fast_body::<DIAGNOSTICS>(
+            reader,
+            block_end_bits,
+            tables,
+            extra_dist,
+            items,
+            counters,
+        )
+    }
+}
+
+/// The fast symbol loop itself; see [`decode_block_symbols_fast`].
+///
+/// `inline(always)` is load-bearing: each entry point above must absorb this
+/// body so the loop is compiled under that entry point's feature set. Left to
+/// the inliner's size heuristics, the clone would call one baseline copy and
+/// the tier would exist in name only.
+#[inline(always)]
+fn decode_block_symbols_fast_body<'a, const DIAGNOSTICS: bool>(
     reader: &mut BlockReader<'a>,
     block_end_bits: usize,
     tables: &TableSet,
@@ -3271,6 +3381,59 @@ mod tests {
                 "block {index} never reached the fast reader"
             );
             assert_eq!(padded_reader_selection_count(), 0);
+
+            // Both x86-64 entry points over the same block: the shipped baseline
+            // body and the v3 clone, bypassing the runtime probe so the pair is
+            // compared on every capable host regardless of the override knob.
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2")
+                && is_x86_feature_detected!("lzcnt")
+                && is_x86_feature_detected!("popcnt")
+            {
+                let slice = &stream[payload_bit_offset / 8..];
+                let block_end_bits = bit_remainder + payload_bits;
+                let mut counters = WorkerCounters::new();
+
+                let mut reader = BlockReader::new(slice, bit_remainder, block_end_bits).unwrap();
+                let mut baseline = DecodedItems::new();
+                decode_block_symbols_fast_body::<false>(
+                    &mut reader,
+                    block_end_bits,
+                    &tables,
+                    true,
+                    &mut baseline,
+                    &mut counters,
+                )
+                .unwrap();
+
+                let mut reader = BlockReader::new(slice, bit_remainder, block_end_bits).unwrap();
+                let mut v3 = DecodedItems::new();
+                // SAFETY: the feature set was detected just above.
+                unsafe {
+                    x86_v3::decode_block_symbols_fast::<false>(
+                        &mut reader,
+                        block_end_bits,
+                        &tables,
+                        true,
+                        &mut v3,
+                        &mut counters,
+                    )
+                }
+                .unwrap();
+
+                assert_eq!(
+                    v3.iter()
+                        .map(|item| item_shape(item, &v3))
+                        .collect::<Vec<ItemShape>>(),
+                    baseline
+                        .iter()
+                        .map(|item| item_shape(item, &baseline))
+                        .collect::<Vec<ItemShape>>(),
+                    "block {index}: v3 clone diverged from the baseline body"
+                );
+            }
 
             // One byte short of the fast reader's lookahead contract, so its
             // constructor refuses the block; `is_large` then suppresses the

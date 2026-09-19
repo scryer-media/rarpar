@@ -15,6 +15,17 @@
 
 ### Changed
 
+- The RAR5 fast symbol loop is compiled twice on x86-64: once at the shipped
+  baseline and once as an x86-64-v3 clone (`avx2,bmi1,bmi2,lzcnt,popcnt`)
+  selected on a cached CPU probe. The source is the same; only instruction
+  selection inside the bit reader changes (`shrx`/`bzhi` for the
+  variable-width extracts), which the baseline cannot emit because it must run
+  on any x86-64. Measured interleaved
+  on an Alder Lake-P host, medians of six rounds: 3.85% faster on the solid LZ
+  extraction whose profile is 80% this loop, 2.7% on the streaming shape, no
+  bench slower. `RARPAR_LZ_DECODE_V3=0` pins the baseline for A/B on one
+  binary. The PPMd decode loop was cloned the same way, regressed 3.2% on one
+  workload, and is not.
 - Streaming BLAKE2sp on NEON drains before it buffers. `Blake2spState::update_with`
   appended the whole input to its buffer and then compressed super-blocks out
   of it, so every streamed byte was copied in and copied out again on top of

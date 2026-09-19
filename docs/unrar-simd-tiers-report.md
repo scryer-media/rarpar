@@ -14,7 +14,7 @@ goes, which is not where instruction-level width helps.
 | Host | CPU | ISA ceiling | Role |
 | --- | --- | --- | --- |
 | Mac (local) | Apple silicon, aarch64 | NEON (no SVE) | profiling, differential tests, noisy |
-| codex-x86 | Arrow Lake-H, x86-64 | AVX2 / x86-64-v3, no AVX-512 | all decisive A/B, quiet (load ~1.3) |
+| codex-x86 | Alder Lake-P (i5-1240P), x86-64 | AVX2 / x86-64-v3, no AVX-512 | all decisive A/B, quiet (load ~1.3) |
 | SYLIX (Windows) | — | — | unused this arc |
 | AWS fleet | — | — | not launched; see "AWS" below |
 
@@ -198,7 +198,8 @@ second clone really is a different loop.
 | rar4_ppmd_restart | 371.56 ms | 371.67 ms | +0.03% |
 | rar4_ppmd_solid_multi_member | 494.62 ms | 510.47 ms | **+3.20% (slower)** |
 
-**Verdict: DROPPED, both halves.** The PPMd half fails outright: a 3.2%
+**Verdict: PPMd half DROPPED; LZ half KEPT by operator decision (see the
+note after this section).** The PPMd half fails outright: a 3.2%
 regression on a workload where the tier engages is three times the gate's 1%
 regression budget, and the plausible cause is that a `target_feature` clone of
 a function this large changes inlining and register allocation in ways that
@@ -212,6 +213,16 @@ deliberately, so it is dropped and the number is recorded here rather than
 quietly reinterpreted. If the bar is meant to be "faster everywhere, no
 regressions", this item passes and the diff is three thin wrappers around an
 unchanged body; that is the operator's call, not mine.
+
+**Operator decision (2026-09-18): keep the LZ half.** The clone was
+re-implemented as `x86_v3` in `decompress/lz/parallel.rs` — the loop body
+became `decode_block_symbols_fast_body` with `#[inline(always)]`, absorbed by
+the baseline entry point and by a `#[target_feature(enable =
+"avx2,bmi1,bmi2,lzcnt,popcnt")]` clone, dispatched on a cached probe with
+`RARPAR_LZ_DECODE_V3=0` as the A/B pin. The differential test in the same file
+runs both entry points over every block of the fast-vs-checked fixture on any
+capable host. Confirmation run on codex-x86 after the re-implementation is
+recorded under "Confirmation" at the end of this document.
 
 ### (f) ARM executable filter — NOT MEASURED
 
@@ -303,7 +314,7 @@ scan stops early); the PPMd escape path (same call site, same ceiling); the LZ
 pattern copy and its AVX-512 variant (0.29% of the profile); x86-64-v3
 multiversioning of the PPMd decode loop (+3.2% regression); x86-64-v3
 multiversioning of the LZ symbol decoder (−3.85%, below the 5% bar — the near
-miss); AVX-512 VBMI/VBMI2 PPMd tiers (declined on the PPMd ceiling); SVE2 and
+miss, subsequently KEPT by operator decision); AVX-512 VBMI/VBMI2 PPMd tiers (declined on the PPMd ceiling); SVE2 and
 AVX-512VL BLAKE2sp (declined on a ceiling of ≤3.7% for removing hashing
 entirely).
 
@@ -326,3 +337,32 @@ is not an option. Nothing was reset, stashed or reverted; the tree is the
 finished state and needs only `git commit` once signing works again. The
 prepared commit message and the raw interleaved A/B logs for every table above
 were kept alongside the session scratchpad.
+
+## Confirmation: the re-implemented v3 LZ symbol loop
+
+After the operator chose to keep the LZ half of (e), the clone was rewritten
+(`x86_v3` in `decompress/lz/parallel.rs`) and confirmed on codex-x86 with the
+same protocol — one binary, `RARPAR_LZ_DECODE_V3=0` as the base arm, interleaved
+rounds, `taskset -c 0-5`, medians of five. The release bench binary carries 52
+`shrx`/`bzhi` instructions (the baseline build cannot emit any) and no `lzcnt`;
+`lzcnt` stays in the feature set for completeness but the Huffman fast path is
+table-driven and never counts bits.
+
+| Bench | base (v3 off) | v3 on | delta |
+| --- | --- | --- | --- |
+| rar_solid_lz_chunked_extract | 160.830 ms | 155.080 ms | **−3.58%** |
+| weaver_solid_chunked_shape | 159.820 ms | 155.650 ms | −2.61% |
+| rar5_solid_extract_all_members | 196.120 ms | 189.230 ms | −3.51% |
+| rar_non_solid_lz_chunked_extract | 0.755 ms | 0.730 ms | −3.37% |
+
+Noise floor, measured by accident: a first run benched a stale binary that did
+not know the toggle, so both arms were identical code — the four benches came
+out at +0.94%, −0.24%, −0.58% and +2.13%. Every delta in the table above is
+outside that band and in the same direction as the original measurement.
+
+The v3-vs-baseline differential test in `parallel.rs` ran on codex-x86 and
+passed. One unrelated test in the same module,
+`adaptive_rounds_switch_engines_without_restarting_the_window`, failed 1/8 runs
+there and 1/17 on the Mac: it asserts on a process-global pipelined-dispatch
+counter that other tests in the module bump concurrently. It is untouched by
+this branch and is a test-isolation defect, not a decoder one.
