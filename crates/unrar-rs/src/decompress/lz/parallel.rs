@@ -813,7 +813,117 @@ fn decode_block_symbols_inner<R: DecodeBits, const DIAGNOSTICS: bool>(
 ///   built over this block `has_bits()` *is* that compare;
 /// * literals append to a byte-native tape; only run boundaries emit operations,
 ///   avoiding packed-item expansion and a replay dispatch per eight bytes.
+///
+/// On x86-64 the loop body is compiled twice from the same source: once at the
+/// crate's shipped baseline and once as the [`x86_v3`] clone, selected here on
+/// a cached CPU probe. The body is bit-field extraction over a register-resident
+/// cursor, which is what `shrx`/`bzhi`/`lzcnt` exist for, and the baseline
+/// build cannot emit them.
 fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
+    reader: &mut BlockReader<'a>,
+    block_end_bits: usize,
+    tables: &TableSet,
+    extra_dist: bool,
+    items: &mut DecodedItems,
+    counters: &mut WorkerCounters,
+) -> RarResult<()> {
+    #[cfg(target_arch = "x86_64")]
+    if x86_v3::available() {
+        // SAFETY: `available` proved every feature the clone is compiled with.
+        return unsafe {
+            x86_v3::decode_block_symbols_fast::<DIAGNOSTICS>(
+                reader,
+                block_end_bits,
+                tables,
+                extra_dist,
+                items,
+                counters,
+            )
+        };
+    }
+    decode_block_symbols_fast_body::<DIAGNOSTICS>(
+        reader,
+        block_end_bits,
+        tables,
+        extra_dist,
+        items,
+        counters,
+    )
+}
+
+/// x86-64-v3 clone of the fast symbol loop.
+///
+/// Nothing here is a new algorithm: the clone is [`decode_block_symbols_fast_body`]
+/// compiled under the v3 feature set, so the differential question against the
+/// baseline is answered by the source being the same. What changes is
+/// instruction selection inside the bit reader — `shrx`/`bzhi` for the
+/// variable-width extracts — which the shipped baseline cannot use because it
+/// must run on any x86-64. (`lzcnt` is in the set for completeness; the
+/// Huffman fast path is table-driven and the built loop emits none.)
+///
+/// Measured interleaved against the baseline on an Alder Lake-P host, medians
+/// of six rounds: 3.85% faster on the solid LZ extraction whose profile is
+/// 80% this loop, 2.7% on the streaming shape, and no bench slower. The PPMd
+/// decode loop was cloned the same way and *regressed* 3.2% on one workload,
+/// so it deliberately is not.
+#[cfg(target_arch = "x86_64")]
+mod x86_v3 {
+    use super::{BlockReader, DecodedItems, RarResult, TableSet, WorkerCounters};
+    use std::sync::OnceLock;
+
+    /// Set to `0` to pin the baseline loop on a capable CPU, so the two can be
+    /// A/B'd on one binary without a rebuild. There is no `1`: the clone has
+    /// no policy above the capability probe, and forcing it onto a CPU that
+    /// lacks the features would execute an undefined opcode. Same `OnceLock` +
+    /// escape-hatch shape as `RARPAR_CRC32_VPCLMUL`.
+    const FORCE_ENV: &str = "RARPAR_LZ_DECODE_V3";
+
+    pub(super) fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            if std::env::var_os(FORCE_ENV).is_some_and(|value| value == "0") {
+                return false;
+            }
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2")
+                && is_x86_feature_detected!("lzcnt")
+                && is_x86_feature_detected!("popcnt")
+        })
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support every feature named in the attribute; [`available`]
+    /// is the only caller and proves exactly that set.
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(super) unsafe fn decode_block_symbols_fast<'a, const DIAGNOSTICS: bool>(
+        reader: &mut BlockReader<'a>,
+        block_end_bits: usize,
+        tables: &TableSet,
+        extra_dist: bool,
+        items: &mut DecodedItems,
+        counters: &mut WorkerCounters,
+    ) -> RarResult<()> {
+        super::decode_block_symbols_fast_body::<DIAGNOSTICS>(
+            reader,
+            block_end_bits,
+            tables,
+            extra_dist,
+            items,
+            counters,
+        )
+    }
+}
+
+/// The fast symbol loop itself; see [`decode_block_symbols_fast`].
+///
+/// `inline(always)` is load-bearing: each entry point above must absorb this
+/// body so the loop is compiled under that entry point's feature set. Left to
+/// the inliner's size heuristics, the clone would call one baseline copy and
+/// the tier would exist in name only.
+#[inline(always)]
+fn decode_block_symbols_fast_body<'a, const DIAGNOSTICS: bool>(
     reader: &mut BlockReader<'a>,
     block_end_bits: usize,
     tables: &TableSet,
@@ -2291,6 +2401,7 @@ impl LzDecoder {
         {
             note_controller_dispatch();
             note_pipelined_dispatch();
+            self.pipelined_dispatches += 1;
         }
 
         let BatchScratch {
@@ -2805,12 +2916,16 @@ mod tests {
         (input, blocks, expected)
     }
 
+    /// Drive one controller run on a decoder of its own.
+    ///
+    /// The fourth element is that decoder's pipelined-dispatch count, so a
+    /// caller asserting on overlaps reads a number only this run produced.
     fn run_controller(
         input: &[u8],
         blocks: &[BlockInfo],
         unpacked_size: u64,
         pipelined: bool,
-    ) -> (RarResult<()>, u64, Vec<u8>) {
+    ) -> (RarResult<()>, u64, Vec<u8>, usize) {
         let mut decoder = LzDecoder::new(128 * 1024, 1);
         decoder.install_inline_tables(&rar7_tables());
         let mut output_size = 0u64;
@@ -2824,7 +2939,7 @@ mod tests {
             pipelined,
         );
         decoder.flush_filters_and_write(&mut output).unwrap();
-        (result, output_size, output)
+        (result, output_size, output, decoder.pipelined_dispatches)
     }
 
     fn plan_assignments(
@@ -3271,6 +3386,59 @@ mod tests {
                 "block {index} never reached the fast reader"
             );
             assert_eq!(padded_reader_selection_count(), 0);
+
+            // Both x86-64 entry points over the same block: the shipped baseline
+            // body and the v3 clone, bypassing the runtime probe so the pair is
+            // compared on every capable host regardless of the override knob.
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("bmi1")
+                && is_x86_feature_detected!("bmi2")
+                && is_x86_feature_detected!("lzcnt")
+                && is_x86_feature_detected!("popcnt")
+            {
+                let slice = &stream[payload_bit_offset / 8..];
+                let block_end_bits = bit_remainder + payload_bits;
+                let mut counters = WorkerCounters::new();
+
+                let mut reader = BlockReader::new(slice, bit_remainder, block_end_bits).unwrap();
+                let mut baseline = DecodedItems::new();
+                decode_block_symbols_fast_body::<false>(
+                    &mut reader,
+                    block_end_bits,
+                    &tables,
+                    true,
+                    &mut baseline,
+                    &mut counters,
+                )
+                .unwrap();
+
+                let mut reader = BlockReader::new(slice, bit_remainder, block_end_bits).unwrap();
+                let mut v3 = DecodedItems::new();
+                // SAFETY: the feature set was detected just above.
+                unsafe {
+                    x86_v3::decode_block_symbols_fast::<false>(
+                        &mut reader,
+                        block_end_bits,
+                        &tables,
+                        true,
+                        &mut v3,
+                        &mut counters,
+                    )
+                }
+                .unwrap();
+
+                assert_eq!(
+                    v3.iter()
+                        .map(|item| item_shape(item, &v3))
+                        .collect::<Vec<ItemShape>>(),
+                    baseline
+                        .iter()
+                        .map(|item| item_shape(item, &baseline))
+                        .collect::<Vec<ItemShape>>(),
+                    "block {index}: v3 clone diverged from the baseline body"
+                );
+            }
 
             // One byte short of the fast reader's lookahead contract, so its
             // constructor refuses the block; `is_large` then suppresses the
@@ -3840,7 +4008,9 @@ mod tests {
             );
             let parallel = feedback.use_parallel(bytes);
             assert_eq!(parallel, round % 2 == 1);
-            let before = global_pipelined_dispatches();
+            // This decoder's own count, not the process-wide one: the exact
+            // comparison below has to read state no other test can move.
+            let before = decoder.pipelined_dispatches;
             {
                 let _inline = (!parallel).then(|| crate::DecodeMode::Serial.enter());
                 decoder
@@ -3855,9 +4025,9 @@ mod tests {
                     .unwrap();
             }
             if !parallel {
-                assert_eq!(global_pipelined_dispatches(), before);
+                assert_eq!(decoder.pipelined_dispatches, before);
             } else if rar_decode_worker_count() > 1 {
-                assert!(global_pipelined_dispatches() > before);
+                assert!(decoder.pipelined_dispatches > before);
             }
         }
         decoder.flush_filters_and_write(&mut output).unwrap();
@@ -3877,11 +4047,9 @@ mod tests {
             literal_block_stream(batch_plan::capacity(MAX_PARALLEL_THREADS) * 4);
         let unpacked_size = expected.len() as u64;
 
-        let overlaps_before = global_pipelined_dispatches();
-        let (pipelined_result, pipelined_size, pipelined_output) =
+        let (pipelined_result, pipelined_size, pipelined_output, overlaps) =
             run_controller(&input, &blocks, unpacked_size, true);
-        let overlaps = global_pipelined_dispatches() - overlaps_before;
-        let (sequential_result, sequential_size, sequential_output) =
+        let (sequential_result, sequential_size, sequential_output, _) =
             run_controller(&input, &blocks, unpacked_size, false);
 
         pipelined_result.unwrap();
@@ -3910,11 +4078,10 @@ mod tests {
         blocks[failing_index].payload_bit_offset = (input.len() + 1) * 8;
         let applied = failing_index * 8;
 
-        let overlaps_before = global_pipelined_dispatches();
-        let (pipelined_result, pipelined_size, pipelined_output) =
+        let (pipelined_result, pipelined_size, pipelined_output, overlaps) =
             run_controller(&input, &blocks, expected.len() as u64, true);
-        assert!(global_pipelined_dispatches() > overlaps_before);
-        let (sequential_result, sequential_size, sequential_output) =
+        assert!(overlaps > 0);
+        let (sequential_result, sequential_size, sequential_output, _) =
             run_controller(&input, &blocks, expected.len() as u64, false);
 
         assert!(matches!(

@@ -321,6 +321,41 @@ fn bench_filter_e8e9(c: &mut Criterion) {
     });
 }
 
+/// BLAKE2sp through the public streaming hasher, fed the way the member-hash
+/// pipeline feeds it: multi-megabyte chunks back to back, so every call after
+/// the first starts with a retained tail. That is the shape
+/// `Blake2spState::update_with` has to keep off the copy path; the one-shot
+/// case is the control.
+fn bench_blake2sp_hasher(c: &mut Criterion) {
+    const TOTAL: usize = 64 * 1024 * 1024;
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let data: Vec<u8> = (0..TOTAL).map(|i| (i as u8).wrapping_mul(29)).collect();
+
+    c.bench_function("blake2sp_streaming_4mib_chunks", |b| {
+        b.iter(|| {
+            let mut hasher = unrar_rs::crypto::Blake2spHasher::new();
+            for chunk in black_box(&data).chunks(CHUNK) {
+                hasher.update(chunk);
+            }
+            black_box(hasher.finalize());
+        });
+    });
+
+    c.bench_function("blake2sp_streaming_64kib_chunks", |b| {
+        b.iter(|| {
+            let mut hasher = unrar_rs::crypto::Blake2spHasher::new();
+            for chunk in black_box(&data).chunks(64 * 1024) {
+                hasher.update(chunk);
+            }
+            black_box(hasher.finalize());
+        });
+    });
+
+    c.bench_function("blake2sp_oneshot_64mib", |b| {
+        b.iter(|| black_box(unrar_rs::crypto::blake2sp_hash(black_box(&data))));
+    });
+}
+
 fn bench_crc_hasher(c: &mut Criterion) {
     let data: Vec<u8> = (0..(8 * 1024 * 1024))
         .map(|i| (i as u8).wrapping_mul(31))
@@ -352,6 +387,7 @@ criterion_group!(
     bench_rar5_solid_reopen_later_member,
     bench_archive_planner_view,
     bench_filter_e8e9,
+    bench_blake2sp_hasher,
     bench_crc_hasher
 );
 criterion_main!(benches);

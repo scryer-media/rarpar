@@ -20,6 +20,16 @@
 //! the AVX-512 tier to `X86_64SsePclmulqdq`, a 128-bit SSE fold. That is the
 //! measured 1.51x gap this module closes with a 256-bit YMM fold.
 //!
+//! # Waiting on upstream
+//!
+//! This module is a stopgap. awesomized/crc-fast-rust#56 ("Add AVX2 +
+//! VPCLMULQDQ tier for 256-bit folding",
+//! <https://github.com/awesomized/crc-fast-rust/pull/56>) tests VPCLMULQDQ
+//! independently of AVX-512VL and adds the same 256-bit YMM fold upstream; as
+//! of 2026-09-18 it is open and not yet merged. Once a `crc-fast` release
+//! carries it, bump the dependency, confirm that release selects its AVX2
+//! VPCLMULQDQ tier on a part without AVX-512VL, and delete this module.
+//!
 //! # Tier policy
 //!
 //! * **VPCLMULQDQ and no AVX-512VL** — this module's kernel runs. It is the

@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.10.8
+
+### Fixed
+
+- The in-crate NEON BLAKE2sp loaded message words with `vld1q_u32`, which
+  stdarch lowers to an LLVM load carrying `align 4`, while the seam that calls
+  it always passes a byte-aligned `&[u8; 16]`. The instruction itself is
+  alignment-agnostic, so nothing ever misbehaved, but the load was undefined
+  behaviour as written and Miri and a sanitizer build are both entitled to say
+  so. It now goes through `vld1q_u8` plus a reinterpret, which carries
+  `align 1`, costs no instruction, and yields the same lanes on these
+  little-endian targets.
+
+### Changed
+
+- The RAR5 fast symbol loop is compiled twice on x86-64: once at the shipped
+  baseline and once as an x86-64-v3 clone (`avx2,bmi1,bmi2,lzcnt,popcnt`)
+  selected on a cached CPU probe. The source is the same; only instruction
+  selection inside the bit reader changes (`shrx`/`bzhi` for the
+  variable-width extracts), which the baseline cannot emit because it must run
+  on any x86-64. Measured interleaved
+  on an Alder Lake-P host, medians of six rounds: 3.85% faster on the solid LZ
+  extraction whose profile is 80% this loop, 2.7% on the streaming shape, no
+  bench slower. `RARPAR_LZ_DECODE_V3=0` pins the baseline for A/B on one
+  binary. The PPMd decode loop was cloned the same way, regressed 3.2% on one
+  workload, and is not.
+- Streaming BLAKE2sp on NEON drains before it buffers. `Blake2spState::update_with`
+  appended the whole input to its buffer and then compressed super-blocks out
+  of it, so every streamed byte was copied in and copied out again on top of
+  the compression itself; it now retires the buffered tail one super-block at
+  a time while refilling it from the head of the input, then compresses
+  straight out of the caller's slice for as long as a full super-block plus
+  the non-final tail remains. This is the shape the leaf-group path already
+  used. Measured on a 64 MiB streaming hash in 4 MiB chunks:
+  38.380 ms to 37.579 ms, about 2%, on an aarch64 host too busy for a tighter
+  figure; the number is indicative, and the reason for the change is the two
+  removed passes rather than the measurement.
+
+### Added
+
+- `archive_hotspots` gained `blake2sp_streaming_4mib_chunks`,
+  `blake2sp_streaming_64kib_chunks` and `blake2sp_oneshot_64mib`, so the
+  hashing path has a microbench of its own rather than being measured through
+  an extraction workload that spends its time elsewhere.
+
+### Internal
+
+- `crc_simd` says what it is waiting for: the upstream `crc-fast` change that
+  lifts the AVX-512VL gate on its VPCLMULQDQ tier (awesomized/crc-fast-rust#56,
+  open as of 2026-09-18), and what to check before deleting the stopgap once a
+  release carries it.
+- The PPMd symbol-search differential test now covers 31/32/33, 47/48/49 and
+  63/64/65 states as well as 1..=24, so the shipped SSSE3 kernel's batch
+  boundaries are checked past the first three batches.
+- The RAR5 pipelined controller counts its dispatches on the decoder itself,
+  and the tests that own their decoder assert on that per-instance count
+  rather than the process-wide counter.
+  `adaptive_rounds_switch_engines_without_restarting_the_window` asserts the
+  count is unchanged across an inline round; under the default multi-threaded
+  test runner another test dispatching its own pipelined batches moved the
+  process-wide counter between the two reads, and the assertion failed for a
+  reason that had nothing to do with the decoder under test. The process-wide
+  counter stays for the tests that drive extraction through the public API
+  and never hold a decoder to ask.
+
 ## 0.10.7
 
 ### Changed

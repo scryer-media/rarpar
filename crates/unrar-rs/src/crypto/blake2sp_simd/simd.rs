@@ -493,11 +493,18 @@ mod neon {
             unsafe { vld1q_u32(lanes.as_ptr()) }
         }
 
-        /// Unaligned load of four LE `u32`. `vld1q_u32` needs no alignment and
-        /// the targets are little-endian, so lanes come out `[w0,w1,w2,w3]`.
+        /// Unaligned load of four LE `u32`.
+        ///
+        /// The load goes through `vld1q_u8`, not `vld1q_u32`: stdarch lowers
+        /// `vld1q_u32` to an LLVM load carrying `align 4`, so handing it the
+        /// byte-aligned `&[u8; 16]` this seam always receives is undefined
+        /// behaviour even though the hardware instruction itself is
+        /// alignment-agnostic. `vld1q_u8` carries `align 1`; the reinterpret
+        /// costs no instruction and, on these little-endian targets, still
+        /// yields lanes `[w0, w1, w2, w3]`.
         #[inline(always)]
         unsafe fn load(bytes: &[u8; 16]) -> Self::Vec {
-            unsafe { vld1q_u32(bytes.as_ptr() as *const u32) }
+            unsafe { vreinterpretq_u32_u8(vld1q_u8(bytes.as_ptr())) }
         }
 
         /// 4x4 `u32` transpose. Two `vtrnq_u32` passes interleave the even/odd
