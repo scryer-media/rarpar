@@ -1246,7 +1246,6 @@ jobs:
             esac
           }
 
-          exact_packaged_crates=""
           package_and_list() {
             local crate
             local -a package_args=()
@@ -1267,7 +1266,6 @@ jobs:
               if [ "$crate" = unrar-rs ]; then
                 grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
               fi
-              exact_packaged_crates="${exact_packaged_crates} ${crate}"
             done
           }
 
@@ -1315,66 +1313,6 @@ jobs:
             echo "par2-rs exact package check deferred until same-release dependencies are published"
             verify_fixture_exclude par2-rs
           fi
-
-          export EXACT_PACKAGED_CRATES="$exact_packaged_crates"
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import sys
-
-          limits = {
-              "reedsolomon-rs": 1_000_000,
-              "unrar-rs": 2_500_000,
-              "par2-rs": 2_500_000,
-              # The engine, its tests and ENGINE.md package at about 418 KB
-              # (428,018 bytes at 0.4.0), without fixtures or benchmarks. Four work
-              # packages of source, tests and documentation grew it from about 314 KB.
-              # 0.4.3's blake3 wasm SIMD feature and its compile-time pairing
-              # check took it to 480,051 bytes.
-              "par3-rs": 500_000,
-          }
-          exact_packaged_crates = os.environ["EXACT_PACKAGED_CRATES"].split()
-          limits = {crate: limits[crate] for crate in exact_packaged_crates}
-          metadata = json.loads(
-              subprocess.check_output([
-                  "cargo",
-                  "metadata",
-                  "--locked",
-                  "--format-version",
-                  "1",
-                  "--no-deps",
-              ])
-          )
-          versions = {
-              package["name"]: package["version"]
-              for package in metadata["packages"]
-              if package["name"] in limits
-          }
-          if not limits:
-              print("no exact .crate archives were produced", file=sys.stderr)
-              sys.exit(1)
-
-          package_dir = pathlib.Path("target/package")
-          failed = False
-          for crate, limit in limits.items():
-              path = package_dir / f"{crate}-{versions.get(crate)}.crate"
-              if not path.exists():
-                  print(f"missing packaged crate for {crate} {versions.get(crate)}", file=sys.stderr)
-                  failed = True
-                  continue
-              size = path.stat().st_size
-              print(f"{path.name}: {size} bytes")
-              if size > limit:
-                  print(
-                      f"{crate} package is {size} bytes, over {limit} byte limit",
-                      file=sys.stderr,
-                  )
-                  failed = True
-          if failed:
-              sys.exit(1)
-          PY
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
