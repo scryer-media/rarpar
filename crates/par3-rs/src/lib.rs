@@ -200,6 +200,11 @@ pub mod ingest;
 pub mod inside;
 pub mod layout;
 pub mod placement;
+#[cfg(not(target_os = "wasi"))]
+mod repair_tree;
+#[cfg(target_os = "wasi")]
+#[path = "repair_tree_wasi.rs"]
+mod repair_tree;
 pub mod runtime;
 pub mod session;
 pub mod session_repair;

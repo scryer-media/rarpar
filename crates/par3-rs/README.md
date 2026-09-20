@@ -103,6 +103,19 @@ installation; backups are enabled by default. Inspect the report for incomplete
 repairs. `plan_repair` is available for a separate assessment, but
 `repair_set` performs its own analysis. Use a retained session to reuse evidence.
 
+On native targets, repair holds the output root open and performs rebuild reads
+and installs relative to that directory capability. It refuses symbolic links
+in destination paths and names that the destination filesystem merges by case
+or Unicode normalization. Verification retains normal host filesystem-link
+behavior, so existing source links continue to work. WASI relies on the
+runtime's preopened directories as its outer capability boundary.
+
+An interrupted repair reports unfinished files beneath a private
+`.par3-stage-<pid>-<sequence>` directory in `EngineError::RepairInterrupted`.
+After inspecting or removing every reported temporary, callers may remove its
+now-empty staging parent. Successful repairs clean up the empty staging
+directory automatically.
+
 The convenience scanner reads each carrier into memory, and the legacy codec
 retains whole recovery rows. Use the incremental engine for large carriers or
 strict allocation budgets.

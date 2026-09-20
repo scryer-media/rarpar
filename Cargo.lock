@@ -1958,15 +1958,17 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "blake3",
+ "cap-std",
  "crc-fast",
  "libc",
  "rayon",
  "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
