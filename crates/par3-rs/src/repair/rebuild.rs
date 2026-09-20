@@ -7,10 +7,10 @@
 //! original file where that piece survived and from a rebuilt block where it did
 //! not. Neither pass holds a file: they hold one input block.
 
-use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use super::layout::{Layout, Region};
 use super::{RepairLimits, RepairOptions, RepairPlan, RepairedFile, geometry_for, resolve};
@@ -18,8 +18,9 @@ use crate::cauchy::{CodecLimits, Decoder, Geometry, RecoveredBlock};
 use crate::error::{Par3Error, Result};
 use crate::gf::{AnyField, Gf8, Gf16, for_set};
 use crate::packet::{ChunkDescription, ChunkTail, GaloisField};
+use crate::repair_tree::{Destination, RepairTree};
 use crate::set::Par3Set;
-use crate::verify::{FileVerdict, verify_file_at_path};
+use crate::verify::{FileVerdict, verify_file_handle};
 
 /// Rebuild every lost input block, keyed by index.
 ///
@@ -111,10 +112,10 @@ pub(super) fn solve_lost_blocks(
 
 /// Write back every file that was missing or damaged.
 ///
-/// Each is built under a temporary name beside the set, checked there against
-/// its File packet, and only then moved into place. A rebuild that does not
-/// check out stays under its temporary name and the file it was to replace is
-/// left where it is.
+/// Each is built under a private staging directory, checked there through its
+/// held file handle, and only then moved into place through the held root
+/// capability. A rebuild that does not check out stays under its temporary name
+/// and the file it was to replace is left where it is.
 pub(super) fn write_files(
     set: &Par3Set,
     base: &Path,
@@ -126,34 +127,44 @@ pub(super) fn write_files(
     let block_len = block_len(layout.block_size, &options.limits)?;
     let mut buffer = vec![0u8; block_len];
     let mut repaired = Vec::with_capacity(plan.files_to_rewrite().len());
-    let prefix = temp_prefix(set);
+    let tree = RepairTree::new(base, set.files().iter().map(|file| file.path()))
+        .map_err(|source| io_error(base, source))?;
+    refuse_aliased_destinations(&tree, set, plan, base)?;
 
     for (index, report) in plan.verify().files().iter().enumerate() {
         if report.verdict().is_complete() {
             continue;
         }
         let file = &set.files()[index];
-        let target = resolve(base, file.path());
-        let temporary = base.join(format!("{prefix}{index}.tmp"));
-
-        // Settled before a byte is written: a directory of the set that is a
-        // link would carry the rename somewhere the set never named.
-        refuse_linked_directories(base, file.path())?;
-        build(file, &target, &temporary, layout, recovered, &mut buffer)?;
+        let target = tree
+            .unresolved_destination(file.path())
+            .map_err(|source| io_error(&resolve(base, file.path()), source))?;
+        tree.check_existing_destination(&target)
+            .map_err(|source| io_error(&target.display, source))?;
+        let (stage_name, temporary, output) = tree
+            .create_stage_file(index)
+            .map_err(|source| io_error(base, source))?;
+        build(
+            file,
+            &tree,
+            &target,
+            output,
+            &temporary,
+            layout,
+            recovered,
+            &mut buffer,
+        )?;
 
         // Checking the rebuild before anything is moved is what makes a failed
         // repair cost nothing: the damaged file is still there, and the bytes
         // that did not add up are still there to be looked at.
-        let verified = verify_file_at_path(set, file, &temporary)? == FileVerdict::Complete;
+        let staged = tree
+            .open_stage_file(&stage_name, true, false)
+            .map_err(|source| io_error(&temporary, source))?;
+        let verified = verify_file_handle(set, file, staged)? == FileVerdict::Complete;
         let backup = if verified {
-            create_parents(&target)?;
-            let backup = if options.backup {
-                backup_existing(&target)?
-            } else {
-                None
-            };
-            rename(&temporary, &target)?;
-            backup
+            tree.install_with_moved_backup(&stage_name, &target, options.backup)
+                .map_err(|source| io_error(&target.display, source))?
         } else {
             None
         };
@@ -167,11 +178,80 @@ pub(super) fn write_files(
     Ok(repaired)
 }
 
+fn destination_collision(
+    set: &Par3Set,
+    plan: &RepairPlan,
+    key: fn(&str) -> String,
+) -> Option<(usize, usize)> {
+    let mut seen = HashMap::with_capacity(set.files().len());
+    for (index, file) in set.files().iter().enumerate() {
+        if let Some(first) = seen.insert(key(file.path()), index)
+            && (!plan.verify().files()[first].verdict().is_complete()
+                || !plan.verify().files()[index].verdict().is_complete())
+        {
+            return Some((first, index));
+        }
+    }
+    None
+}
+
+fn collision_aliases(
+    tree: &RepairTree,
+    set: &Par3Set,
+    collision: Option<(usize, usize)>,
+    base: &Path,
+) -> Result<bool> {
+    let Some((first, second)) = collision else {
+        return Ok(false);
+    };
+    tree.paths_alias(set.files()[first].path(), set.files()[second].path())
+        .map_err(|source| io_error(base, source))
+}
+
+fn refuse_aliased_destinations(
+    tree: &RepairTree,
+    set: &Par3Set,
+    plan: &RepairPlan,
+    base: &Path,
+) -> Result<()> {
+    if destination_collision(set, plan, str::to_owned).is_some()
+        || collision_aliases(
+            tree,
+            set,
+            destination_collision(set, plan, crate::paths::case_folded),
+            base,
+        )?
+        || collision_aliases(
+            tree,
+            set,
+            destination_collision(set, plan, crate::repair_tree::normalization_key),
+            base,
+        )?
+        || collision_aliases(
+            tree,
+            set,
+            destination_collision(set, plan, crate::repair_tree::case_normalization_key),
+            base,
+        )?
+    {
+        return Err(Par3Error::UnrepairableSet {
+            reason: "repair destinations resolve to the same filesystem path".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Write one file's bytes under `temporary`, from whatever survives and whatever
 /// was rebuilt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the staging handles and rebuild inputs remain distinct security boundaries"
+)]
 fn build(
     file: &crate::set::Par3File,
-    target: &Path,
+    tree: &RepairTree,
+    target: &Destination,
+    output: File,
     temporary: &Path,
     layout: &Layout,
     recovered: &BTreeMap<u64, Vec<u8>>,
@@ -179,7 +259,7 @@ fn build(
 ) -> Result<()> {
     let block_size = layout.block_size;
     let mut source: Option<File> = None;
-    let mut out = BufWriter::new(create(temporary)?);
+    let mut out = BufWriter::new(output);
     let mut offset: u64 = 0;
 
     for chunk in file.chunks() {
@@ -201,6 +281,7 @@ fn build(
             let at = offset.saturating_add(step * block_size);
             let bytes = piece(
                 &mut source,
+                tree,
                 target,
                 recovered,
                 index,
@@ -224,6 +305,7 @@ fn build(
             } => {
                 let bytes = piece(
                     &mut source,
+                    tree,
                     target,
                     recovered,
                     *block_index,
@@ -257,7 +339,8 @@ fn build(
 )]
 fn piece<'a>(
     source: &mut Option<File>,
-    target: &Path,
+    tree: &RepairTree,
+    target: &Destination,
     recovered: &'a BTreeMap<u64, Vec<u8>>,
     block_index: u64,
     block_offset: u64,
@@ -280,9 +363,12 @@ fn piece<'a>(
     }
     let handle = match source {
         Some(handle) => handle,
-        none => none.insert(open(target)?),
+        none => none.insert(
+            tree.open_destination(target)
+                .map_err(|source| io_error(&target.display, source))?,
+        ),
     };
-    read_at(handle, target, file_offset, &mut buffer[..length])?;
+    read_at(handle, &target.display, file_offset, &mut buffer[..length])?;
     Ok(&buffer[..length])
 }
 
@@ -401,17 +487,6 @@ impl AnyDecoder {
     }
 }
 
-/// `par3_<InputSetID in upper-case hex>_`, the reference implementation's name
-/// for the file a repair builds before it is moved into place.
-fn temp_prefix(set: &Par3Set) -> String {
-    let mut prefix = String::from("par3_");
-    for byte in set.input_set_id().as_bytes() {
-        prefix.push_str(&format!("{byte:02X}"));
-    }
-    prefix.push('_');
-    prefix
-}
-
 /// One block's worth of buffer, refused rather than allocated when the set's
 /// block size is beyond what the codec is allowed to hold anyway.
 fn block_len(block_size: u64, limits: &RepairLimits) -> Result<usize> {
@@ -439,79 +514,11 @@ fn open(path: &Path) -> Result<File> {
     })
 }
 
-/// Create the temporary exclusively: the name must not be taken, in any form.
-///
-/// `File::create` would follow a link planted under the temporary's name and
-/// truncate whatever it points at, and the rebuild would then be written,
-/// checked and moved into place through that link. Exclusive creation refuses
-/// an existing entry of any kind instead. A regular file an interrupted repair
-/// left under the name is removed first, once; anything else under the name is
-/// an error, and the file it was to replace is left alone.
-fn create(path: &Path) -> Result<File> {
-    let exclusive = || OpenOptions::new().write(true).create_new(true).open(path);
-    match exclusive() {
-        Ok(file) => return Ok(file),
-        Err(source) if source.kind() == ErrorKind::AlreadyExists => {}
-        Err(source) => return Err(io_error(path, source)),
-    }
-    let existing = std::fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
-    if !existing.file_type().is_file() {
-        return Err(io_error(
-            path,
-            std::io::Error::new(
-                ErrorKind::AlreadyExists,
-                "the temporary name is taken by something that is not a regular file",
-            ),
-        ));
-    }
-    std::fs::remove_file(path).map_err(|source| io_error(path, source))?;
-    exclusive().map_err(|source| io_error(path, source))
-}
-
-/// Refuse a directory of the set, between `base` and the file, that is a link.
-///
-/// A file's own name is resolved by the rename, which replaces a link rather
-/// than following one; the directories above it are followed, so a link among
-/// them would carry the rebuilt file wherever the link points. Only directories
-/// the set names are looked at — `base` is the caller's.
-fn refuse_linked_directories(base: &Path, path: &str) -> Result<()> {
-    let mut directory = PathBuf::from(base);
-    let mut components = path.split('/').peekable();
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            break;
-        }
-        directory.push(component);
-        match std::fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(io_error(
-                    &directory,
-                    std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "a directory of the set is a link, which a repair will not follow",
-                    ),
-                ));
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(io_error(&directory, source)),
-        }
-    }
-    Ok(())
-}
-
 fn io_error(path: &Path, source: std::io::Error) -> Par3Error {
     Par3Error::FileIo {
         path: path.display().to_string(),
         source,
     }
-}
-
-/// Whether anything at all — file, directory, or a link to anywhere, dangling
-/// or not — sits under `path`. `Path::exists` follows links and calls a
-/// dangling one absent.
-fn entry_exists(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn read_at(handle: &mut File, path: &Path, at: u64, into: &mut [u8]) -> Result<()> {
@@ -528,51 +535,5 @@ fn write_all(out: &mut BufWriter<File>, path: &Path, bytes: &[u8]) -> Result<()>
     out.write_all(bytes).map_err(|source| Par3Error::FileIo {
         path: path.display().to_string(),
         source,
-    })
-}
-
-fn create_parents(target: &Path) -> Result<()> {
-    let Some(parent) = target.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(parent).map_err(|source| Par3Error::FileIo {
-        path: parent.display().to_string(),
-        source,
-    })
-}
-
-fn rename(from: &Path, to: &Path) -> Result<()> {
-    std::fs::rename(from, to).map_err(|source| Par3Error::FileIo {
-        path: to.display().to_string(),
-        source,
-    })
-}
-
-/// Move the damaged file aside, to `<name>.1`, `.2`, and so on.
-///
-/// Returns `None` when there was nothing there to keep.
-fn backup_existing(target: &Path) -> Result<Option<PathBuf>> {
-    if !entry_exists(target) {
-        return Ok(None);
-    }
-    for number in 1..10_000u32 {
-        let mut name = target.as_os_str().to_owned();
-        name.push(format!(".{number}"));
-        let candidate = PathBuf::from(name);
-        if entry_exists(&candidate) {
-            continue;
-        }
-        rename(target, &candidate)?;
-        return Ok(Some(candidate));
-    }
-    Err(Par3Error::FileIo {
-        path: target.display().to_string(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "every backup name from .1 to .9999 is taken",
-        ),
     })
 }

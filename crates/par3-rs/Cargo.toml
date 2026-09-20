@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.4.3"
+version = "0.4.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -32,6 +32,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.7", default-features = false }
 rayon = { workspace = true, default-features = false }
+unicode-normalization = { workspace = true }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+cap-std = "4.0.3"
 
 # Process CPU time for the verification timing probe, so its table reports a
 # measured number rather than wall time multiplied by a worker count. The probe

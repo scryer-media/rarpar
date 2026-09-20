@@ -253,14 +253,21 @@ pub fn verify_file(set: &Par3Set, file: &Par3File, data: &[u8]) -> FileVerdict {
 ///
 /// The verdicts are the ones [`verify_file`] gives for the same bytes.
 pub fn verify_file_at_path(set: &Par3Set, file: &Par3File, path: &Path) -> Result<FileVerdict> {
-    let mut handle = match File::open(path) {
+    let handle = match File::open(path) {
         Ok(handle) => handle,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FileVerdict::Missing);
         }
         Err(error) => return Err(error.into()),
     };
+    verify_file_handle(set, file, handle)
+}
 
+pub(crate) fn verify_file_handle(
+    set: &Par3Set,
+    file: &Par3File,
+    mut handle: File,
+) -> Result<FileVerdict> {
     if file.packet().has_unprotected_data() {
         return Ok(FileVerdict::Unverifiable {
             reason: "the file has unprotected chunks, which this crate does not verify",
@@ -313,10 +320,10 @@ pub fn verify_file_at_path(set: &Par3Set, file: &Par3File, path: &Path) -> Resul
 
 /// Check every file in a set against a base directory.
 ///
-/// Paths are built by joining `base` with each path component in turn. The
-/// components come from File and Directory packet names, which were refused at
-/// parse time if they were empty, `.`, `..`, or contained a separator, so a set
-/// cannot direct a read outside `base`.
+/// Paths are built by joining `base` with each path component in turn. Packet
+/// names were refused at parse time if a component was empty, `.`, `..`, or
+/// contained a separator. Filesystem links retain their normal host behavior,
+/// including links to files outside `base`.
 ///
 /// A set whose Root packet claims an absolute path is still resolved relative to
 /// `base`; this crate never reads from a location a packet chose.
@@ -327,9 +334,10 @@ pub fn verify_set(set: &Par3Set, base: &Path) -> Result<VerifyReport> {
         for component in file.path().split('/') {
             path.push(component);
         }
+        let verdict = verify_file_at_path(set, file, &path)?;
         files.push(FileReport {
             path: file.path().to_owned(),
-            verdict: verify_file_at_path(set, file, &path)?,
+            verdict,
         });
     }
     Ok(VerifyReport {
