@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.7 (Unreleased)
+
+### Fixed
+
+- Authenticate file-backed recovery packets before accepting their boundaries
+  or handing them to the inventory. A corrupt length could skip the next valid
+  packet, and a corrupt first copy could occupy a recovery exponent ahead of a
+  valid duplicate. Failed hashes now resume the scan one byte after the rejected
+  header. Payloads remain file-backed; authentication uses a 64 KiB buffer and
+  polls cancellation between chunks. Scanning now reads recovery bodies instead
+  of seeking over them; repair still revalidates them against later file changes.
+- Retain overlapping magic prefixes during resynchronization, including a
+  truncated `PAR2` marker immediately followed by a complete packet.
+- Exercise every bit flip and truncation of a recovery packet on either side of
+  a valid copy, including corruption of its length, exponent, hash, and payload.
+
 ## 0.10.6
 
 ### Internal

@@ -359,6 +359,12 @@ fn find_next_magic_in_reader(
 
             while consumed < buf.len() {
                 let byte = buf[consumed];
+                // PAR2's magic contains a second P. Retain that overlapping
+                // prefix when a partial marker precedes the next real one.
+                const PREFIX: [usize; MAGIC.len()] = [0, 0, 0, 0, 0, 1, 0, 0];
+                while matched > 0 && byte != MAGIC[matched] {
+                    matched = PREFIX[matched - 1];
+                }
                 if byte == MAGIC[matched] {
                     matched += 1;
                     if matched == MAGIC.len() {
@@ -366,8 +372,6 @@ fn find_next_magic_in_reader(
                         consumed += 1;
                         break;
                     }
-                } else {
-                    matched = if byte == MAGIC[0] { 1 } else { 0 };
                 }
                 consumed += 1;
             }
@@ -409,7 +413,21 @@ fn validate_streamed_packet_from_reader(
     let mut hasher = Md5State::new();
     hasher.update(&header_bytes[32..HEADER_SIZE]);
 
-    let mut remaining = body_len;
+    hash_reader_body(reader, &mut hasher, body_len, budget)?;
+
+    let computed = hasher.finalize();
+    if computed != header.packet_hash {
+        return Err(Par2Error::PacketHashMismatch { offset });
+    }
+    Ok(())
+}
+
+fn hash_reader_body(
+    reader: &mut impl Read,
+    hasher: &mut Md5State,
+    mut remaining: usize,
+    budget: &PacketScanBudget,
+) -> Result<()> {
     let mut buf = [0u8; 64 * 1024];
     while remaining > 0 {
         budget.check_cancelled()?;
@@ -417,11 +435,6 @@ fn validate_streamed_packet_from_reader(
         reader.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
         hasher.update(&buf[..take]);
         remaining -= take;
-    }
-
-    let computed = hasher.finalize();
-    if computed != header.packet_hash {
-        return Err(Par2Error::PacketHashMismatch { offset });
     }
     Ok(())
 }
@@ -499,6 +512,7 @@ fn parse_non_recovery_packet_from_reader(
 fn parse_recovery_packet_from_reader(
     reader: &mut BufReader<File>,
     header: &PacketHeader,
+    header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
     path: &Arc<Path>,
     budget: &PacketScanBudget,
@@ -521,15 +535,20 @@ fn parse_recovery_packet_from_reader(
     let exponent = u32::from_le_bytes(exponent_bytes);
     let payload_len = body_len - 4;
     let payload_offset = offset + HEADER_SIZE as u64 + 4;
-    reader
-        .seek(SeekFrom::Start(payload_offset + payload_len as u64))
-        .map_err(Par2Error::Io)?;
+    // A damaged length can overlap the next valid packet. Authenticate before
+    // accepting that boundary so the scanner can resynchronize from offset + 1.
+    let mut hasher = Md5State::new();
+    hasher.update(&header_bytes[32..HEADER_SIZE]);
+    hasher.update(&exponent_bytes);
+    hash_reader_body(reader, &mut hasher, payload_len, budget)?;
+    if hasher.finalize() != header.packet_hash {
+        return Err(Par2Error::PacketHashMismatch { offset });
+    }
 
     Ok(Packet::RecoverySlice(RecoverySlicePacket {
         exponent,
-        // The streaming scanner seeks past recovery payloads without hashing
-        // them, so keep the packet hash around for lazy validation at repair
-        // time (damaged .vol files are routine on Usenet).
+        // Keep the hash for repair-time revalidation: the file may change
+        // after this authenticated scan without changing its retained span.
         data: RecoverySliceData::file_backed_shared(
             Arc::clone(path),
             payload_offset,
@@ -575,9 +594,9 @@ fn collect_packets_from_path(path: &Path, budget: &PacketScanBudget) -> Result<V
 
 /// Stream the packets of an on-disk PAR2 file into `sink` under `budget`.
 ///
-/// The scanner holds one packet at a time. Recovery payloads are never read:
-/// each recovery packet is recorded as a file-backed span into `path`, and all
-/// of them share a single interned `Arc<Path>` so a file holding tens of
+/// The scanner holds one packet at a time. Recovery payloads are authenticated
+/// with a fixed-size streaming buffer, then recorded as file-backed spans into
+/// `path`. All of them share a single interned `Arc<Path>` so a file holding tens of
 /// thousands of recovery packets costs one path allocation rather than one per
 /// packet. Oversized known packets and unknown packets are hash-validated and
 /// discarded without being buffered.
@@ -635,6 +654,7 @@ pub fn scan_packets_from_path_bounded(
             PacketType::RecoverySlice => parse_recovery_packet_from_reader(
                 &mut reader,
                 &header,
+                &header_bytes,
                 packet_offset,
                 &shared_path,
                 budget,
@@ -719,6 +739,74 @@ mod tests {
     use md5::{Digest, Md5};
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn recovery_hash_observes_cancellation_between_bounded_reads() {
+        struct CancelAfterRead {
+            token: CancellationToken,
+            reads: usize,
+        }
+        impl Read for CancelAfterRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= 64 * 1024);
+                bytes.fill(0x5a);
+                self.reads += 1;
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+        }
+        let token = CancellationToken::new();
+        let budget =
+            PacketScanBudget::with_cancellation(PacketScanLimits::default(), Some(token.clone()));
+        let mut reader = CancelAfterRead { token, reads: 0 };
+        assert!(matches!(
+            hash_reader_body(&mut reader, &mut Md5State::new(), 128 * 1024, &budget),
+            Err(Par2Error::Cancelled)
+        ));
+        assert_eq!(reader.reads, 1);
+    }
+
+    #[test]
+    fn every_recovery_bit_flip_and_truncation_resynchronizes_before_the_next_packet() {
+        let rsid = [0x8b; 16];
+        let valid = make_recovery_packet(7, &[0xc3; 64], rsid);
+        let file = NamedTempFile::new().unwrap();
+        for mutation in 0..valid.len() * 9 {
+            let mut bad = valid.clone();
+            if mutation < valid.len() * 8 {
+                bad[mutation / 8] ^= 1 << (mutation % 8);
+            } else {
+                bad.truncate(mutation - valid.len() * 8);
+            }
+            for bad_first in [false, true] {
+                let mut stream = make_main_packet_bytes(64, rsid);
+                for packet in if bad_first {
+                    [&bad, &valid]
+                } else {
+                    [&valid, &bad]
+                } {
+                    stream.extend_from_slice(packet);
+                }
+                std::fs::write(file.path(), stream).unwrap();
+                let packets = scan_packets_from_path(file.path()).unwrap();
+                let recovery = packets
+                    .iter()
+                    .filter_map(|(packet, _)| match packet {
+                        Packet::RecoverySlice(slice) => Some(slice),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    recovery.len(),
+                    1,
+                    "mutation={mutation} bad_first={bad_first}"
+                );
+                assert_eq!(recovery[0].exponent, 7);
+                assert!(recovery[0].data.as_bytes().is_none());
+                assert_eq!(recovery[0].data.to_vec().unwrap(), vec![0xc3; 64]);
+            }
+        }
+    }
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -1185,9 +1273,7 @@ mod tests {
         }
     }
 
-    /// The streaming scanner never hashes recovery payloads, so it records the
-    /// packet hash for later. That deferred validation has to still work
-    /// against the interned path.
+    /// An authenticated file-backed span must still detect later mutations.
     #[test]
     fn file_backed_recovery_payloads_still_validate_their_packet_hash() {
         let rsid = [0x8B; 16];
