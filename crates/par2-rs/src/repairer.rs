@@ -4971,6 +4971,8 @@ impl VerificationHashTable {
 struct RollingBlockScanner<'a> {
     table: &'a VerificationHashTable,
     window_table: [u32; 256],
+    #[cfg(test)]
+    after_ordered_facts: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct PendingMd5Check<'a> {
@@ -5203,6 +5205,7 @@ enum ResyncOutcome {
 
 /// Shared read-only inputs for the gap resync loop.
 struct OrderedResync<'a> {
+    file_len: usize,
     facts: &'a [AlignedWindowFacts],
     ordered_full_blocks: &'a [usize],
     path: &'a Path,
@@ -5721,6 +5724,8 @@ impl<'a> RollingBlockScanner<'a> {
         Self {
             table,
             window_table: generate_window_table(slice_size),
+            #[cfg(test)]
+            after_ordered_facts: std::sync::Mutex::new(None),
         }
     }
 
@@ -5940,6 +5945,9 @@ impl<'a> RollingBlockScanner<'a> {
         ) {
             Ok(stats) => Ok(stats),
             Err(Par2Error::Cancelled) => Err(Par2Error::Cancelled),
+            // A changed source invalidates selections already made from the
+            // facts. Let the caller restart the analysis with fresh state.
+            Err(error) if is_source_changed_error(&error) => Err(error),
             // mmap or I/O setup failure: the serial scanner owns the error
             // story (and will surface the same error if it persists).
             Err(_) => self.scan_file_ordered_canonical_serial(
@@ -6433,7 +6441,13 @@ impl<'a> RollingBlockScanner<'a> {
             .map(|local| target_file.first_block + local)
             .filter(|block_index| blocks.block(*block_index).expected_len == self.table.slice_size)
             .collect();
+        #[cfg(test)]
+        if let Some(after_facts) = self.after_ordered_facts.lock().unwrap().take() {
+            after_facts();
+        }
+
         let resync = OrderedResync {
+            file_len: len,
             facts: &facts,
             ordered_full_blocks: &ordered_full_blocks,
             path,
@@ -6609,6 +6623,11 @@ impl<'a> RollingBlockScanner<'a> {
         let mut preferred_next: Option<usize> = None;
         let mut cursor =
             OrderedWindowCursor::new_at(resync.path, slice_size, &self.window_table, start)?;
+        // The reopened cursor and precomputed windows must describe the same
+        // extent. A growing source could otherwise index beyond the facts.
+        if cursor.len != resync.file_len {
+            return Err(source_changed_io(resync.path).into());
+        }
 
         loop {
             let expected_block = preferred_next
@@ -11134,6 +11153,129 @@ mod tests {
             scan_stat_counters(refused_stats),
             scan_stat_counters(serial_stats)
         );
+    }
+
+    fn assert_ordered_resync_rejects_changed_extent(initial_len: usize, changed_len: usize) {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let target: Vec<_> = (0..4u8)
+            .flat_map(|seed| seeded_block(seed, slice_size))
+            .collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, vec![0xEE; initial_len]).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let baseline = state.blocks.clone();
+        let mut scan_state = ScanBlockState::new(&baseline);
+        let mut facts: Vec<_> = (0..initial_len / slice_size)
+            .map(|_| AlignedWindowFacts::default())
+            .collect();
+        let file = File::open(&candidate).unwrap();
+        scanner
+            .compute_aligned_window_facts(
+                &file,
+                &baseline,
+                &mut facts,
+                0,
+                2,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &OrderedScanMatchBudget::new(DEFAULT_REPAIR_MEMORY_LIMIT),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("precompute the original file's windows"));
+        drop(file);
+
+        // Force the exact boundary: Phase A saw the original extent; Phase C
+        // opens the changed file. No background scheduling is involved.
+        fs::write(&candidate, vec![0xEE; changed_len]).unwrap();
+        let ordered_full_blocks: Vec<_> = (0..state.blocks.len()).collect();
+        let resync = OrderedResync {
+            file_len: initial_len,
+            facts: &facts,
+            ordered_full_blocks: &ordered_full_blocks,
+            path: &candidate,
+            kind: BlockLocationKind::Canonical,
+            target_file_id: &state.files[0].file_id,
+        };
+        let mut stats =
+            FileScanStats::new(FileScanMode::OrderedCanonicalParallel, initial_len as u64);
+        let error = scanner
+            .rolling_resync_ordered(&resync, 1, &mut scan_state, &mut stats, &mut 0)
+            .err()
+            .expect("changed source must return an error before consuming stale window facts");
+        assert!(is_source_changed_error(&error), "{error}");
+        let mut after = baseline.clone();
+        scan_state.apply_to_blocks(&mut after);
+        assert_eq!(
+            block_location_summary(&after),
+            block_location_summary(&baseline)
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_resync_rejects_grown_source() {
+        // Cross the next aligned window first: the old scanner panicked here.
+        for initial_windows in [1, 2] {
+            let initial_len = initial_windows * 64 + 1;
+            for growth in [64, 1, 128] {
+                assert_ordered_resync_rejects_changed_extent(initial_len, initial_len + growth);
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_parallel_resync_rejects_shrunken_source() {
+        for changed_len in [0, 1, 32, 64, 65, 128] {
+            assert_ordered_resync_rejects_changed_extent(129, changed_len);
+        }
+    }
+
+    #[test]
+    fn ordered_parallel_scan_propagates_source_change_before_serial_fallback() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for changed_len in [0, 32, 128, 130, 193, 257] {
+                let dir = tempdir().unwrap();
+                let target: Vec<_> = (0..4u8).flat_map(|seed| seeded_block(seed, 64)).collect();
+                let set = synthetic_set(&[("target.bin", &target)], 64);
+                let candidate = dir.path().join("target.bin");
+                // Select a valid first block before reaching the damaged gap.
+                let mut original = target[..64].to_vec();
+                original.resize(129, 0xEE);
+                fs::write(&candidate, original).unwrap();
+                let state = RepairState::from_set(dir.path(), set).unwrap();
+                let scanner = RollingBlockScanner::new(&state.hash_table, 64);
+                let changed_path = candidate.clone();
+                *scanner.after_ordered_facts.lock().unwrap() = Some(Box::new(move || {
+                    fs::write(changed_path, vec![0xEE; changed_len]).unwrap();
+                }));
+                let mut scan_state = ScanBlockState::new(&state.blocks);
+                let error = scanner
+                    .scan_file_ordered_canonical_state(
+                        &candidate,
+                        BlockLocationKind::Canonical,
+                        SourceFileScanLookup {
+                            files: &state.files,
+                            file_index_by_id: &state.file_index_by_id,
+                        },
+                        &state.files[0],
+                        &mut scan_state,
+                        ScanSkipOptions::disabled(),
+                        true,
+                        DEFAULT_REPAIR_MEMORY_LIMIT,
+                        None,
+                        &[],
+                    )
+                    .expect_err("changed source must not become a successful serial fallback");
+                assert!(is_source_changed_error(&error), "{error}");
+                assert!(scanner.after_ordered_facts.lock().unwrap().is_none());
+            }
+        });
     }
 
     #[test]
