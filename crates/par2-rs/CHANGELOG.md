@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Reject source files that grow or shrink between the parallel ordered scan
+  phases with the existing source-changed error. This prevents indexing beyond
+  precomputed windows and prevents serial fallback from accepting stale scan
+  selections. Deterministic tests cover growth, truncation, and propagation.
 - Authenticate file-backed recovery packets before accepting their boundaries
   or handing them to the inventory. A corrupt length could skip the next valid
   packet, and a corrupt first copy could occupy a recovery exponent ahead of a
