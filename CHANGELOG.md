@@ -9,6 +9,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 - PAR2 inspection and repair retain valid recovery packets following a corrupt
   packet length and prefer valid copies over corrupt duplicate exponents.
+- PAR2 repair analysis reports a source-changed error instead of panicking when
+  a source file grows between parallel scan phases; shrinking files also reject
+  the stale scan.
 
 ### Library versions
 
