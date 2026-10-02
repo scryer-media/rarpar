@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.4
+
+- **Behaviour change:** repair output on native targets is now confined to an
+  opened directory capability. Replacing the output-root path or swapping a
+  destination parent during repair cannot redirect rebuild reads or installs
+  outside that opened tree. Existing symbolic links in destination paths are
+  refused before staging, and output names that the destination filesystem
+  merges by case or Unicode normalization are refused before any output is
+  created. Normal verification retains its existing host filesystem-link
+  behavior.
+- **Behaviour change:** repair temporaries now live in an exclusively created
+  `.par3-stage-<pid>-<sequence>` directory under the requested output root.
+  Successful repair removes its empty staging directory. After an interrupted
+  repair, callers should remove the reported temporary files and then their
+  now-empty staging parent.
+- Repair no longer reuses or removes entries in the deterministic temporary
+  namespace used by earlier releases. This prevents a pre-existing file or
+  symbolic link from redirecting or being overwritten by a repair.
+- Native builds add `cap-std` for capability-relative filesystem operations;
+  WASI continues to use the runtime's preopened directories as its outer
+  capability boundary.
+
 ## 0.4.3
 
 - New `wasm-simd` feature. It forwards blake3's `wasm32_simd`, which is what

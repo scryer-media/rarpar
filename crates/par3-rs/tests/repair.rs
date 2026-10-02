@@ -631,46 +631,41 @@ fn temporary_name(set: &Par3Set, name: &str) -> String {
 
 #[cfg(unix)]
 #[test]
-fn a_link_planted_under_the_temporary_name_is_refused_and_its_target_is_untouched() {
+fn a_link_in_the_legacy_temporary_namespace_is_untouched() {
     let (tree, set) = gf8_tree("repair-planted-link");
     flip(&tree, "a.bin", 10);
-    // Somewhere the set never named, reachable through a link under the name
-    // the repair is about to use.
+    // Somewhere the set never named, reachable through the deterministic name
+    // older repairs used.
     let victim = tree.write("elsewhere/victim.bin", b"not part of the set");
-    std::os::unix::fs::symlink(&victim, tree.path().join(temporary_name(&set, "a.bin")))
-        .expect("a link");
-    let before = snapshot(tree.path());
+    let planted = tree.path().join(temporary_name(&set, "a.bin"));
+    std::os::unix::fs::symlink(&victim, &planted).expect("a link");
 
-    let error = repair_set(&set, tree.path(), &RepairOptions::default())
-        .expect_err("the temporary name is taken by a link");
-    assert!(
-        matches!(&error, Par3Error::FileIo { path, .. } if path.ends_with(".tmp")),
-        "unexpected error: {error}"
-    );
+    let report = repair_set(&set, tree.path(), &RepairOptions::default()).expect("repair succeeds");
+    assert!(report.is_complete());
     assert_eq!(
         std::fs::read(&victim).expect("the victim is still there"),
         b"not part of the set",
         "the link was followed"
     );
-    assert_eq!(snapshot(tree.path()), before, "the tree was written to");
     assert!(
-        matches!(
-            verify_file(&set, &set.files()[0], &tree.read("a.bin")),
-            FileVerdict::Damaged { .. }
-        ),
-        "the damaged file was replaced"
+        std::fs::symlink_metadata(planted)
+            .expect("the planted link remains")
+            .file_type()
+            .is_symlink()
     );
+    assert_eq!(tree.read("a.bin"), a_bin());
 }
 
 #[test]
-fn a_plain_file_left_under_the_temporary_name_by_an_interrupted_repair_is_replaced() {
+fn a_plain_file_in_the_legacy_temporary_namespace_is_untouched() {
     let (tree, set) = gf8_tree("repair-stale-temporary");
     flip(&tree, "a.bin", 10);
-    tree.write(
-        &temporary_name(&set, "a.bin"),
-        b"half of an earlier rebuild",
-    );
-    repair_and_check(&tree, &set, &gf8_contents(), &RepairOptions::default());
+    let stale_name = temporary_name(&set, "a.bin");
+    tree.write(&stale_name, b"half of an earlier rebuild");
+    let report = repair_set(&set, tree.path(), &RepairOptions::default()).expect("repair succeeds");
+    assert!(report.is_complete());
+    assert_eq!(tree.read("a.bin"), a_bin());
+    assert_eq!(tree.read(&stale_name), b"half of an earlier rebuild");
 }
 
 #[cfg(unix)]
@@ -690,7 +685,7 @@ fn a_directory_of_the_set_that_is_a_link_is_refused_before_its_file_is_rebuilt()
     let error = repair_set(&set, tree.path(), &RepairOptions::default())
         .expect_err("a linked directory is refused");
     assert!(
-        matches!(&error, Par3Error::FileIo { path, .. } if path.ends_with("sub")),
+        matches!(&error, Par3Error::FileIo { path, .. } if path.ends_with("sub/c.bin")),
         "unexpected error: {error}"
     );
     assert_eq!(snapshot(tree.path()), before, "the tree was written to");

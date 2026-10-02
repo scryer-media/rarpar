@@ -45,19 +45,7 @@ pub(crate) trait OpenBudgeted {
 }
 impl OpenBudgeted for OpenOptions {
     fn open_budgeted(&self, path: &Path, options: &ExecutionOptions) -> EngineResult<EngineFile> {
-        options.validate()?;
-        let lease = options.handles.acquire()?;
-        // The shared atomic reservation also makes the per-operation cap safe
-        // when callers clone options and concurrently open files.
-        if options.handles.used() > options.open_handles {
-            return Err(EngineError::resource_limit("open handles"));
-        }
-        let file = self.open(path)?;
-        Ok(EngineFile {
-            file,
-            _lease: lease,
-            diagnostics: options.diagnostics.clone(),
-        })
+        EngineFile::open_with(options, || self.open(path))
     }
 }
 
@@ -68,6 +56,24 @@ pub(crate) struct EngineFile {
     diagnostics: super::ExecutionDiagnostics,
 }
 impl EngineFile {
+    pub(crate) fn open_with(
+        options: &ExecutionOptions,
+        open: impl FnOnce() -> io::Result<File>,
+    ) -> EngineResult<Self> {
+        options.validate()?;
+        let lease = options.handles.acquire()?;
+        // The shared atomic reservation also makes the per-operation cap safe
+        // when callers clone options and concurrently open files.
+        if options.handles.used() > options.open_handles {
+            return Err(EngineError::resource_limit("open handles"));
+        }
+        Ok(Self {
+            file: open()?,
+            _lease: lease,
+            diagnostics: options.diagnostics.clone(),
+        })
+    }
+
     pub(crate) fn open(path: &Path, options: &ExecutionOptions) -> EngineResult<Self> {
         OpenOptions::new().read(true).open_budgeted(path, options)
     }
