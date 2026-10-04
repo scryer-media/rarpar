@@ -990,7 +990,26 @@ mod tests {
         let root = TestRoot::new("directory-identity");
         let tree = RepairTree::new(root.path(), ["file.bin"]).unwrap();
         let clone = tree.stage().try_clone().unwrap();
+        let reopened =
+            Dir::open_ambient_dir(tree.base.join(&tree.stage_component), ambient_authority())
+                .unwrap();
         assert!(same_directory(&tree.stage().dir, &clone.dir).unwrap());
+        assert!(same_directory(&tree.stage().dir, &reopened).unwrap());
         assert!(!same_directory(&tree.stage().dir, &tree.root.dir).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_staging_capability_prevents_directory_rename() {
+        let root = TestRoot::new("stage-rename");
+        let tree = RepairTree::new(root.path(), ["file.bin"]).unwrap();
+        let stage = tree.base.join(&tree.stage_component);
+        let renamed = root.path().join("renamed-stage");
+        let error = std::fs::rename(&stage, &renamed).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32)); // ERROR_SHARING_VIOLATION
+        assert!(stage.is_dir());
+        assert!(!renamed.exists());
+        drop(tree);
+        assert!(!stage.exists());
     }
 }

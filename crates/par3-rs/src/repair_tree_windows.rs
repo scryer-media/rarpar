@@ -126,19 +126,21 @@ pub(super) fn create_private_dir(parent: &Dir, name: &OsStr) -> io::Result<Dir> 
         information: 0,
     };
     let mut handle = null_mut();
-    // FILE_CREATE is exclusive. FILE_DIRECTORY_FILE and synchronous I/O
-    // return an owned directory handle without reopening an ambient path.
+    // FILE_CREATE is exclusive. Match cap-std's readable directory handles:
+    // FILE_GENERIC_READ excludes DELETE, and sharing permits reads/writes but
+    // not deletion. This allows identity reopens while preventing renames of
+    // a live capability, as Dir::from_std_file requires on Windows.
     // SAFETY: every buffer/descriptor lives through this synchronous call;
     // the borrowed root stays open and the output handle is adopted below.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
-            0x001f_01ff,
+            0x0012_0089,
             &mut attributes,
             &mut status,
             null_mut(),
             0x80,
-            7,
+            3,
             2,
             0x21,
             null_mut(),
