@@ -154,91 +154,103 @@ fn repair_inner(
     for file in &assessment.files {
         crate::paths::validate_relative_path(&file.path)?;
     }
-    let tree = RepairTree::new(
+    let tree = RepairTree::new_budgeted(
         output,
         assessment.files.iter().map(|file| file.path.as_str()),
+        &session.options,
     )?;
-    refuse_aliased_destinations(&tree, &assessment.files)?;
-    for (index, file) in assessment.files.iter().enumerate() {
-        if file.complete {
-            continue;
-        }
-        session.options.cancel.check()?;
-        destinations.push((index, repair_destination(&tree, &file.path)?));
-    }
-    let mut staged = Vec::with_capacity(destinations.len());
-    for (index, destination) in destinations {
-        session.options.cancel.check()?;
-        let (stage_name, temporary) =
-            tree.create_stage(index, layout.files[index].len, &session.options)?;
-        temporary_outputs.push(temporary.clone());
-        staged.push(StagedFile {
-            index,
-            destination: Some(destination),
-            stage_name: Some(stage_name),
-            temporary,
-        });
-    }
-    if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, Some(&tree), &staged)?;
-    } else if let Some(PacketBody::FftMatrix(matrix)) =
-        assessment.matrix.as_ref().map(|packet| packet.body())
-    {
-        reconstruct_fft(session, layout, Some(&tree), &staged, matrix)?;
-    } else {
-        let field_bytes =
-            crate::gf::construction_cost(&session.set.as_ref().expect("ready set").galois_field());
-        let _field_reservation = session
-            .options
-            .memory
-            .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
-        let field = crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
-        match field {
-            crate::gf::AnyField::Gf8(field) => {
-                reconstruct(session, layout, Some(&tree), &staged, field)?
+    let result = (|| {
+        refuse_aliased_destinations(&tree, &assessment.files)?;
+        for (index, file) in assessment.files.iter().enumerate() {
+            if file.complete {
+                continue;
             }
-            crate::gf::AnyField::Gf16(field) => {
-                reconstruct(session, layout, Some(&tree), &staged, field)?
-            }
+            session.options.cancel.check()?;
+            destinations.push((index, repair_destination(&tree, &file.path)?));
         }
-    }
-    // Inline tails need no source and no recovery equation.
-    for target in &staged {
-        let mut file = open_staged(Some(&tree), target, false, true, &session.options)?;
-        let extents = &layout.files[target.index].extents;
-        for index in 0..extents.len() {
-            if let Some(bytes) = extents.inline_bytes(index) {
-                let range = extents.range(index).expect("bounded extent");
-                file.seek(SeekFrom::Start(range.start))?;
-                file.write_all(bytes)?;
+        let mut staged = Vec::with_capacity(destinations.len());
+        for (index, destination) in destinations {
+            session.options.cancel.check()?;
+            let (stage_name, temporary) = tree.create_stage_registered(
+                index,
+                layout.files[index].len,
+                &session.options,
+                temporary_outputs,
+            )?;
+            staged.push(StagedFile {
+                index,
+                destination: Some(destination),
+                stage_name: Some(stage_name),
+                temporary,
+            });
+        }
+        if assessment.lost_blocks.is_empty() {
+            copy_available(session, layout, Some(&tree), &staged)?;
+        } else if let Some(PacketBody::FftMatrix(matrix)) =
+            assessment.matrix.as_ref().map(|packet| packet.body())
+        {
+            reconstruct_fft(session, layout, Some(&tree), &staged, matrix)?;
+        } else {
+            let field_bytes = crate::gf::construction_cost(
+                &session.set.as_ref().expect("ready set").galois_field(),
+            );
+            let _field_reservation = session
+                .options
+                .memory
+                .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
+            let field =
+                crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
+            match field {
+                crate::gf::AnyField::Gf8(field) => {
+                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                }
+                crate::gf::AnyField::Gf16(field) => {
+                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                }
             }
         }
-        file.sync_all()?;
+        // Inline tails need no source and no recovery equation.
+        for target in &staged {
+            let mut file = open_staged(Some(&tree), target, false, true, &session.options)?;
+            let extents = &layout.files[target.index].extents;
+            for index in 0..extents.len() {
+                if let Some(bytes) = extents.inline_bytes(index) {
+                    let range = extents.range(index).expect("bounded extent");
+                    file.seek(SeekFrom::Start(range.start))?;
+                    file.write_all(bytes)?;
+                }
+            }
+            file.sync_all()?;
+        }
+        for target in &staged {
+            verify_staged(session, layout, Some(&tree), target)?;
+        }
+        for evidence in session.evidence.values() {
+            crate::source::ensure_snapshot(
+                session.access.as_ref(),
+                evidence.source,
+                evidence.snapshot,
+            )?;
+        }
+        for target in staged {
+            session.options.cancel.check()?;
+            let saved = tree.install(
+                target.stage_name.as_deref().expect("tree staging name"),
+                target.destination.as_ref().expect("tree destination"),
+                backup,
+            )?;
+            temporary_outputs.retain(|path| path != &target.temporary);
+            installed.push(InstalledFile {
+                path: target.destination.expect("tree destination").display,
+                backup: saved,
+            });
+        }
+        Ok(assessment.lost_blocks.len() as u64)
+    })();
+    if result.is_err() {
+        tree.sanitize_temporary_outputs(temporary_outputs)?;
     }
-    for target in &staged {
-        verify_staged(session, layout, Some(&tree), target)?;
-    }
-    for evidence in session.evidence.values() {
-        crate::source::ensure_snapshot(
-            session.access.as_ref(),
-            evidence.source,
-            evidence.snapshot,
-        )?;
-    }
-    for target in staged {
-        session.options.cancel.check()?;
-        let saved = tree.install(
-            target.stage_name.as_deref().expect("tree staging name"),
-            target.destination.as_ref().expect("tree destination"),
-            backup,
-        )?;
-        temporary_outputs.retain(|path| path != &target.temporary);
-        installed.push(InstalledFile {
-            path: target.destination.expect("tree destination").display,
-            backup: saved,
-        });
-    }
-    Ok(assessment.lost_blocks.len() as u64)
+    result
 }
 
 /// Private scratch operation for self-repair. The unprotected gap remains
@@ -900,40 +912,45 @@ fn destination_collision(
 fn collision_aliases(
     tree: &RepairTree,
     files: &[crate::session::AssessedFile],
-    collision: Option<(usize, usize)>,
+    key: impl Fn(&str) -> String,
 ) -> EngineResult<bool> {
-    let Some((first, second)) = collision else {
-        return Ok(false);
-    };
-    Ok(tree.paths_alias(&files[first].path, &files[second].path)?)
+    collision_aliases_by(files, key, |first, second| {
+        Ok(tree.paths_alias(first, second)?)
+    })
+}
+
+fn collision_aliases_by(
+    files: &[crate::session::AssessedFile],
+    key: impl Fn(&str) -> String,
+    mut probe: impl FnMut(&str, &str) -> EngineResult<bool>,
+) -> EngineResult<bool> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        let previous = groups.entry(key(&file.path)).or_default();
+        for &first in previous.iter() {
+            if (!files[first].complete || !file.complete) && probe(&files[first].path, &file.path)?
+            {
+                return Ok(true);
+            }
+        }
+        previous.push(index);
+    }
+    Ok(false)
 }
 
 /// Refuse a set whose paths the destination filesystem cannot tell apart.
 ///
 /// Case and Unicode-normalization collisions belong to the mounted filesystem,
-/// not the operating system. Candidate pairs are found in memory, then mirrored
-/// under the private staging directory to ask this destination how it resolves
-/// the exact spellings before any output is created.
+/// not the operating system. Candidate pairs are found in memory, then probed
+/// in their actual destination parents before any output is created.
 fn refuse_aliased_destinations(
     tree: &RepairTree,
     files: &[crate::session::AssessedFile],
 ) -> EngineResult<()> {
     if destination_collision(files, str::to_owned).is_some()
-        || collision_aliases(
-            tree,
-            files,
-            destination_collision(files, crate::paths::case_folded),
-        )?
-        || collision_aliases(
-            tree,
-            files,
-            destination_collision(files, crate::repair_tree::normalization_key),
-        )?
-        || collision_aliases(
-            tree,
-            files,
-            destination_collision(files, crate::repair_tree::case_normalization_key),
-        )?
+        || collision_aliases(tree, files, crate::paths::case_folded)?
+        || collision_aliases(tree, files, crate::repair_tree::normalization_key)?
+        || collision_aliases(tree, files, crate::repair_tree::case_normalization_key)?
     {
         return Err(EngineError::InvalidState(
             "repair destinations resolve to the same filesystem path",
@@ -972,10 +989,7 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
         .ok_or(EngineError::InvalidState("output has no parent"))?;
     for _ in 0..128 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".par3-repair-{}-{sequence}.tmp",
-            std::process::id()
-        ));
+        let temporary = parent.join(format!(".par3-repair-{sequence}.tmp"));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1492,5 +1506,34 @@ mod charge_tests {
         let outcome =
             refuse_aliased_destinations(&repair_tree, &[assessed(composed), assessed(decomposed)]);
         assert_eq!(outcome.is_err(), aliases);
+    }
+
+    #[test]
+    fn every_collision_group_and_pair_is_probed_until_an_alias_is_found() {
+        let files: Vec<_> = ["a/Readme", "a/README", "b/File", "b/FILE", "b/file"]
+            .into_iter()
+            .map(|path| crate::session::AssessedFile {
+                path: path.to_owned(),
+                source: None,
+                complete: false,
+                verified_prefix: 0,
+                unresolved: Vec::new(),
+            })
+            .collect();
+        let mut probed = Vec::new();
+        let aliases = collision_aliases_by(&files, crate::paths::case_folded, |first, second| {
+            probed.push((first.to_owned(), second.to_owned()));
+            Ok(first == "b/File" && second == "b/file")
+        })
+        .unwrap();
+        assert!(aliases);
+        assert_eq!(
+            probed,
+            vec![
+                ("a/Readme".into(), "a/README".into()),
+                ("b/File".into(), "b/FILE".into()),
+                ("b/File".into(), "b/file".into()),
+            ]
+        );
     }
 }

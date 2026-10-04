@@ -398,8 +398,10 @@ construction bounds directory expansion and rejects cycles. These checks do
 not replace control of the destination tree: callers must handle filesystem
 links and concurrent changes according to the selected API's contract.
 
-The crate forbids unsafe Rust; shared arithmetic dependencies use CPU-specific
-kernels. It is a clean-room implementation of the
+Unsafe Rust is confined to one Windows filesystem-security module, which
+creates owner-only staging directories through held handles and compares their
+identities. All other targets forbid unsafe Rust. Shared arithmetic dependencies
+use CPU-specific kernels. It is a clean-room implementation of the
 [PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
 and format facts established by
 [par3cmdline](https://github.com/Parchive/par3cmdline). No reference code was

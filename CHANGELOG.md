@@ -3,21 +3,6 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.5.4 (Unreleased)
-
-### CLI Changes
-
-- PAR2 inspection and repair retain valid recovery packets following a corrupt
-  packet length and prefer valid copies over corrupt duplicate exponents.
-- PAR2 repair analysis reports a source-changed error instead of panicking when
-  a source file grows between parallel scan phases; shrinking files also reject
-  the stale scan.
-
-### Library versions
-
-- par2-rs 0.10.7: authenticate recovery packets during the bounded file scan.
-  Other library versions are unchanged.
-
 ## rarpar 0.5.3
 
 ### CLI Changes

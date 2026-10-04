@@ -35,7 +35,7 @@ impl RepairTree {
             .collect();
         for _ in 0..128 {
             let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = format!(".par3-stage-{}-{sequence}", std::process::id());
+            let candidate = format!(".par3-stage-{sequence}");
             if reserved.contains(&canonical_key(&candidate)) {
                 continue;
             }
@@ -58,6 +58,19 @@ impl RepairTree {
         ))
     }
 
+    pub(crate) fn new_budgeted<'a>(
+        base: &Path,
+        protected_paths: impl IntoIterator<Item = &'a str>,
+        _options: &ExecutionOptions,
+    ) -> io::Result<Self> {
+        Self::new(base, protected_paths)
+    }
+
+    pub(crate) fn sanitize_temporary_outputs(&self, _outputs: &mut Vec<PathBuf>) -> io::Result<()> {
+        // WASI paths are resolved within the runtime's preopened capability.
+        Ok(())
+    }
+
     pub(crate) fn destination(&self, relative: &str) -> io::Result<Destination> {
         let destination = self.unresolved_destination(relative)?;
         let _ = relative_parent(&self.base, &destination.relative, true)?;
@@ -78,11 +91,22 @@ impl RepairTree {
         check_existing_destination(&self.base, &destination.relative)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_stage(
         &self,
         index: usize,
         len: u64,
         options: &ExecutionOptions,
+    ) -> EngineResult<(OsString, PathBuf)> {
+        self.create_stage_registered(index, len, options, &mut Vec::new())
+    }
+
+    pub(crate) fn create_stage_registered(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
     ) -> EngineResult<(OsString, PathBuf)> {
         let name = format!(".par3-repair-{index}.tmp");
         let display = self.stage.join(&name);
@@ -92,7 +116,14 @@ impl RepairTree {
                 .create_new(true)
                 .open(&display)
         })?;
-        file.set_len(len)?;
+        outputs.push(display.clone());
+        if let Err(error) = file.set_len(len) {
+            drop(file);
+            if std::fs::remove_file(&display).is_ok() {
+                outputs.retain(|path| path != &display);
+            }
+            return Err(error.into());
+        }
         Ok((name.into(), display))
     }
 
@@ -221,25 +252,27 @@ impl RepairTree {
     }
 
     pub(crate) fn paths_alias(&self, first: &str, second: &str) -> io::Result<bool> {
+        let (first_parent, mut first_name) = relative_parent(&self.base, Path::new(first), true)?;
+        let (second_parent, mut second_name) =
+            relative_parent(&self.base, Path::new(second), true)?;
         let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let probe = self.stage.join(format!("alias-probe-{sequence}"));
-        std::fs::create_dir(&probe)?;
-        let result = (|| {
-            let first = Path::new(first);
-            let (parent, filename) = relative_parent(&probe, first, true)?;
-            drop(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(parent.join(filename))?,
-            );
-            match std::fs::symlink_metadata(probe.join(second)) {
-                Ok(_) => Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error),
-            }
-        })();
-        let cleanup = std::fs::remove_dir_all(&probe);
+        let suffix = format!(".par3-alias-{sequence}");
+        first_name.push(&suffix);
+        second_name.push(&suffix);
+        // Probe the actual parent directories: directory-local case folding
+        // need not match a freshly created child of the repair root.
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(first_parent.join(&first_name))?,
+        );
+        let result = match std::fs::symlink_metadata(second_parent.join(&second_name)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        };
+        let cleanup = std::fs::remove_file(first_parent.join(&first_name));
         match (result, cleanup) {
             (Ok(aliases), Ok(())) => Ok(aliases),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -252,6 +285,8 @@ impl Drop for RepairTree {
         let _ = std::fs::remove_dir(self.base.join(&self.stage_component));
     }
 }
+
+pub(crate) const MIN_REPAIR_HANDLES: usize = 2;
 
 pub(crate) fn normalization_key(path: &str) -> String {
     path.nfc().collect()

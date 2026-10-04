@@ -198,14 +198,26 @@ fn destination_collision(
 fn collision_aliases(
     tree: &RepairTree,
     set: &Par3Set,
-    collision: Option<(usize, usize)>,
+    plan: &RepairPlan,
+    key: fn(&str) -> String,
     base: &Path,
 ) -> Result<bool> {
-    let Some((first, second)) = collision else {
-        return Ok(false);
-    };
-    tree.paths_alias(set.files()[first].path(), set.files()[second].path())
-        .map_err(|source| io_error(base, source))
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, file) in set.files().iter().enumerate() {
+        let previous = groups.entry(key(file.path())).or_default();
+        for &first in previous.iter() {
+            if (!plan.verify().files()[first].verdict().is_complete()
+                || !plan.verify().files()[index].verdict().is_complete())
+                && tree
+                    .paths_alias(set.files()[first].path(), file.path())
+                    .map_err(|source| io_error(base, source))?
+            {
+                return Ok(true);
+            }
+        }
+        previous.push(index);
+    }
+    Ok(false)
 }
 
 fn refuse_aliased_destinations(
@@ -215,22 +227,13 @@ fn refuse_aliased_destinations(
     base: &Path,
 ) -> Result<()> {
     if destination_collision(set, plan, str::to_owned).is_some()
+        || collision_aliases(tree, set, plan, crate::paths::case_folded, base)?
+        || collision_aliases(tree, set, plan, crate::repair_tree::normalization_key, base)?
         || collision_aliases(
             tree,
             set,
-            destination_collision(set, plan, crate::paths::case_folded),
-            base,
-        )?
-        || collision_aliases(
-            tree,
-            set,
-            destination_collision(set, plan, crate::repair_tree::normalization_key),
-            base,
-        )?
-        || collision_aliases(
-            tree,
-            set,
-            destination_collision(set, plan, crate::repair_tree::case_normalization_key),
+            plan,
+            crate::repair_tree::case_normalization_key,
             base,
         )?
     {
