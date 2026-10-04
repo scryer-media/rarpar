@@ -103,6 +103,19 @@ installation; backups are enabled by default. Inspect the report for incomplete
 repairs. `plan_repair` is available for a separate assessment, but
 `repair_set` performs its own analysis. Use a retained session to reuse evidence.
 
+On native targets, repair holds the output root open and performs rebuild reads
+and installs relative to that directory capability. It refuses symbolic links
+in destination paths and names that the destination filesystem merges by case
+or Unicode normalization. Verification retains normal host filesystem-link
+behavior, so existing source links continue to work. WASI relies on the
+runtime's preopened directories as its outer capability boundary.
+
+An interrupted repair reports unfinished files beneath a private
+`.par3-stage-<pid>-<sequence>` directory in `EngineError::RepairInterrupted`.
+After inspecting or removing every reported temporary, callers may remove its
+now-empty staging parent. Successful repairs clean up the empty staging
+directory automatically.
+
 The convenience scanner reads each carrier into memory, and the legacy codec
 retains whole recovery rows. Use the incremental engine for large carriers or
 strict allocation budgets.
@@ -385,8 +398,10 @@ construction bounds directory expansion and rejects cycles. These checks do
 not replace control of the destination tree: callers must handle filesystem
 links and concurrent changes according to the selected API's contract.
 
-The crate forbids unsafe Rust; shared arithmetic dependencies use CPU-specific
-kernels. It is a clean-room implementation of the
+Unsafe Rust is confined to one Windows filesystem-security module, which
+creates owner-only staging directories through held handles and compares their
+identities. All other targets forbid unsafe Rust. Shared arithmetic dependencies
+use CPU-specific kernels. It is a clean-room implementation of the
 [PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
 and format facts established by
 [par3cmdline](https://github.com/Parchive/par3cmdline). No reference code was

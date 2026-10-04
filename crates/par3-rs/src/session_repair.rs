@@ -2,6 +2,7 @@
 
 use crate::runtime::{EngineFile as File, ExecutionOptions, MemoryCategory, OpenBudgeted};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use rayon::prelude::*;
 use crate::gf::{Field, Gf8, Gf16};
 use crate::layout::BlockLayout;
 use crate::packet::PacketBody;
+use crate::repair_tree::{Destination, RepairTree};
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::{Par3RepairSession, RepairStatus, block_range};
 
@@ -36,7 +38,8 @@ pub struct SessionRepairReport {
 
 struct StagedFile {
     index: usize,
-    destination: PathBuf,
+    destination: Option<Destination>,
+    stage_name: Option<OsString>,
     temporary: PathBuf,
 }
 
@@ -148,83 +151,106 @@ fn repair_inner(
             .filter(|file| !file.complete)
             .count(),
     );
-    refuse_case_folded_destinations(output, &assessment.files)?;
-    for (index, file) in assessment.files.iter().enumerate() {
-        if file.complete {
-            continue;
+    for file in &assessment.files {
+        crate::paths::validate_relative_path(&file.path)?;
+    }
+    let tree = RepairTree::new_budgeted(
+        output,
+        assessment.files.iter().map(|file| file.path.as_str()),
+        &session.options,
+    )?;
+    let result = (|| {
+        refuse_aliased_destinations(&tree, &assessment.files)?;
+        for (index, file) in assessment.files.iter().enumerate() {
+            if file.complete {
+                continue;
+            }
+            session.options.cancel.check()?;
+            destinations.push((index, repair_destination(&tree, &file.path)?));
         }
-        session.options.cancel.check()?;
-        destinations.push((index, contained_destination(output, &file.path)?));
-    }
-    let mut staged = Vec::with_capacity(destinations.len());
-    for (index, destination) in destinations {
-        session.options.cancel.check()?;
-        let temporary = stage_path(&destination, &session.options)?;
-        temporary_outputs.push(temporary.clone());
-        OpenOptions::new()
-            .write(true)
-            .open_budgeted(&temporary, &session.options)?
-            .set_len(layout.files[index].len)?;
-        staged.push(StagedFile {
-            index,
-            destination,
-            temporary,
-        });
-    }
-    if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, &staged)?;
-    } else if let Some(PacketBody::FftMatrix(matrix)) =
-        assessment.matrix.as_ref().map(|packet| packet.body())
-    {
-        reconstruct_fft(session, layout, &staged, matrix)?;
-    } else {
-        let field_bytes =
-            crate::gf::construction_cost(&session.set.as_ref().expect("ready set").galois_field());
-        let _field_reservation = session
-            .options
-            .memory
-            .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
-        let field = crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
-        match field {
-            crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &staged, field)?,
-            crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &staged, field)?,
+        let mut staged = Vec::with_capacity(destinations.len());
+        for (index, destination) in destinations {
+            session.options.cancel.check()?;
+            let (stage_name, temporary) = tree.create_stage_registered(
+                index,
+                layout.files[index].len,
+                &session.options,
+                temporary_outputs,
+            )?;
+            staged.push(StagedFile {
+                index,
+                destination: Some(destination),
+                stage_name: Some(stage_name),
+                temporary,
+            });
         }
-    }
-    // Inline tails need no source and no recovery equation.
-    for target in &staged {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open_budgeted(&target.temporary, &session.options)?;
-        let extents = &layout.files[target.index].extents;
-        for index in 0..extents.len() {
-            if let Some(bytes) = extents.inline_bytes(index) {
-                let range = extents.range(index).expect("bounded extent");
-                file.seek(SeekFrom::Start(range.start))?;
-                file.write_all(bytes)?;
+        if assessment.lost_blocks.is_empty() {
+            copy_available(session, layout, Some(&tree), &staged)?;
+        } else if let Some(PacketBody::FftMatrix(matrix)) =
+            assessment.matrix.as_ref().map(|packet| packet.body())
+        {
+            reconstruct_fft(session, layout, Some(&tree), &staged, matrix)?;
+        } else {
+            let field_bytes = crate::gf::construction_cost(
+                &session.set.as_ref().expect("ready set").galois_field(),
+            );
+            let _field_reservation = session
+                .options
+                .memory
+                .reserve_as(MemoryCategory::CodecTables, field_bytes)?;
+            let field =
+                crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
+            match field {
+                crate::gf::AnyField::Gf8(field) => {
+                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                }
+                crate::gf::AnyField::Gf16(field) => {
+                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                }
             }
         }
-        file.sync_all()?;
+        // Inline tails need no source and no recovery equation.
+        for target in &staged {
+            let mut file = open_staged(Some(&tree), target, false, true, &session.options)?;
+            let extents = &layout.files[target.index].extents;
+            for index in 0..extents.len() {
+                if let Some(bytes) = extents.inline_bytes(index) {
+                    let range = extents.range(index).expect("bounded extent");
+                    file.seek(SeekFrom::Start(range.start))?;
+                    file.write_all(bytes)?;
+                }
+            }
+            file.sync_all()?;
+        }
+        for target in &staged {
+            verify_staged(session, layout, Some(&tree), target)?;
+        }
+        for evidence in session.evidence.values() {
+            crate::source::ensure_snapshot(
+                session.access.as_ref(),
+                evidence.source,
+                evidence.snapshot,
+            )?;
+        }
+        for target in staged {
+            session.options.cancel.check()?;
+            let saved = tree.install(
+                target.stage_name.as_deref().expect("tree staging name"),
+                target.destination.as_ref().expect("tree destination"),
+                backup,
+            )?;
+            temporary_outputs.retain(|path| path != &target.temporary);
+            installed.push(InstalledFile {
+                path: target.destination.expect("tree destination").display,
+                backup: saved,
+            });
+        }
+        Ok(assessment.lost_blocks.len() as u64)
+    })();
+    if result.is_err() {
+        tree.sanitize_temporary_outputs(temporary_outputs)?;
     }
-    for target in &staged {
-        verify_staged(session, layout, target)?;
-    }
-    for evidence in session.evidence.values() {
-        crate::source::ensure_snapshot(
-            session.access.as_ref(),
-            evidence.source,
-            evidence.snapshot,
-        )?;
-    }
-    for target in staged {
-        session.options.cancel.check()?;
-        let saved = install(&target.temporary, &target.destination, backup)?;
-        temporary_outputs.retain(|path| path != &target.temporary);
-        installed.push(InstalledFile {
-            path: target.destination,
-            backup: saved,
-        });
-    }
-    Ok(assessment.lost_blocks.len() as u64)
+    result
 }
 
 /// Private scratch operation for self-repair. The unprotected gap remains
@@ -268,7 +294,8 @@ pub(crate) fn stage_embedded(
     }
     let targets = [StagedFile {
         index: 0,
-        destination: temporary.to_owned(),
+        destination: None,
+        stage_name: None,
         temporary: temporary.to_owned(),
     }];
     OpenOptions::new()
@@ -276,7 +303,7 @@ pub(crate) fn stage_embedded(
         .open_budgeted(temporary, &session.options)?
         .set_len(layout.files[0].len)?;
     if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, &targets)?;
+        copy_available(session, layout, None, &targets)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
         let _field = session.options.memory.reserve_as(
@@ -284,8 +311,10 @@ pub(crate) fn stage_embedded(
             crate::gf::construction_cost(&set.galois_field()),
         )?;
         match crate::gf::for_set(&set.galois_field())? {
-            crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, &targets, field)?,
-            crate::gf::AnyField::Gf16(field) => reconstruct(session, layout, &targets, field)?,
+            crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, None, &targets, field)?,
+            crate::gf::AnyField::Gf16(field) => {
+                reconstruct(session, layout, None, &targets, field)?
+            }
         }
     }
     let mut output = OpenOptions::new()
@@ -301,7 +330,7 @@ pub(crate) fn stage_embedded(
     }
     output.sync_all()?;
     drop(output);
-    verify_staged(session, layout, &targets[0])?;
+    verify_staged(session, layout, None, &targets[0])?;
     for evidence in session.evidence.values() {
         crate::source::ensure_snapshot(
             session.access.as_ref(),
@@ -315,6 +344,7 @@ pub(crate) fn stage_embedded(
 fn copy_available(
     session: &Par3RepairSession,
     layout: &BlockLayout,
+    tree: Option<&RepairTree>,
     outputs: &[StagedFile],
 ) -> EngineResult<()> {
     let mut progress = session.options.stage(crate::runtime::Stage::Repair)?;
@@ -342,6 +372,7 @@ fn copy_available(
             let take = (layout.block_size - offset).min(size as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
             scatter(
+                tree,
                 &session.options,
                 layout,
                 outputs,
@@ -382,6 +413,7 @@ fn cauchy_coefficient_bytes<F: Field>(n: usize) -> Option<usize> {
 fn reconstruct<F>(
     session: &Par3RepairSession,
     layout: &BlockLayout,
+    tree: Option<&RepairTree>,
     outputs: &[StagedFile],
     field: F,
 ) -> EngineResult<()>
@@ -538,6 +570,7 @@ where
             }
             session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
             scatter(
+                tree,
                 &session.options,
                 layout,
                 outputs,
@@ -613,6 +646,7 @@ where
             }
             for (index, bytes) in lost[base..base + width].iter().zip(&recovered[..width]) {
                 scatter(
+                    tree,
                     &session.options,
                     layout,
                     outputs,
@@ -645,6 +679,7 @@ fn fft_codec_with_source_stripes(
 fn reconstruct_fft(
     session: &Par3RepairSession,
     layout: &BlockLayout,
+    tree: Option<&RepairTree>,
     outputs: &[StagedFile],
     matrix: &crate::packet::FftMatrixPacket,
 ) -> EngineResult<()> {
@@ -692,6 +727,7 @@ fn reconstruct_fft(
             let take = (layout.block_size - offset).min(stripe as u64) as usize;
             session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
             scatter(
+                tree,
                 &session.options,
                 layout,
                 outputs,
@@ -736,7 +772,7 @@ fn reconstruct_fft(
                             out.fill(0);
                         } else {
                             session.read_block(block, offset, out, &mut covered[..out.len()])?;
-                            scatter(&session.options, layout, outputs, block, offset, out)?;
+                            scatter(tree, &session.options, layout, outputs, block, offset, out)?;
                         }
                     }
                     FftInput::Recovery(index) => {
@@ -748,6 +784,7 @@ fn reconstruct_fft(
             },
             |local, offset, bytes| {
                 scatter(
+                    tree,
                     &session.options,
                     layout,
                     outputs,
@@ -761,7 +798,25 @@ fn reconstruct_fft(
     Ok(())
 }
 
+fn open_staged(
+    tree: Option<&RepairTree>,
+    target: &StagedFile,
+    read: bool,
+    write: bool,
+    options: &ExecutionOptions,
+) -> EngineResult<File> {
+    match (tree, target.stage_name.as_deref()) {
+        (Some(tree), Some(name)) => tree.open_stage(name, read, write, options),
+        (None, None) => OpenOptions::new()
+            .read(read)
+            .write(write)
+            .open_budgeted(&target.temporary, options),
+        _ => Err(EngineError::InvalidState("inconsistent repair staging")),
+    }
+}
+
 fn scatter(
+    tree: Option<&RepairTree>,
     options: &ExecutionOptions,
     layout: &BlockLayout,
     outputs: &[StagedFile],
@@ -788,9 +843,7 @@ fn scatter(
         if start >= end {
             continue;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open_budgeted(&target.temporary, options)?;
+        let mut file = open_staged(tree, target, false, true, options)?;
         file.seek(SeekFrom::Start(extent.start + start - block_offset))?;
         file.write_all(&bytes[(start - offset) as usize..(end - offset) as usize])?;
     }
@@ -800,6 +853,7 @@ fn scatter(
 fn verify_staged(
     session: &Par3RepairSession,
     layout: &BlockLayout,
+    tree: Option<&RepairTree>,
     target: &StagedFile,
 ) -> EngineResult<()> {
     let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
@@ -810,7 +864,7 @@ fn verify_staged(
         .memory
         .reserve_as(MemoryCategory::SourceScratch, size)?;
     let mut buffer = vec![0u8; size];
-    let mut file = File::open(&target.temporary, &session.options)?;
+    let mut file = open_staged(tree, target, true, false, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
     for index in 0..expected.extents.len() {
         if expected.extents.is_unprotected(index) {
@@ -839,18 +893,14 @@ fn verify_staged(
     Ok(())
 }
 
-/// Find the first pair of destinations a case-insensitive filesystem would
-/// merge, or `None` if no two paths fold together.
-///
-/// Every file is considered, complete or not: one already whole on disk is
-/// just as lost if another file's output lands on its name. A pair where
-/// neither file would be written collides with nothing and is not reported.
-/// This answer is pure — it reads the assessment and nothing else — so the
-/// filesystem is only consulted when there is something to consult it about.
-fn case_folded_collisions(files: &[crate::session::AssessedFile]) -> Option<(usize, usize)> {
+/// Find the first pair of destinations a filesystem may merge under `key`.
+fn destination_collision(
+    files: &[crate::session::AssessedFile],
+    key: impl Fn(&str) -> String,
+) -> Option<(usize, usize)> {
     let mut folded: HashMap<String, usize> = HashMap::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
-        if let Some(first) = folded.insert(crate::paths::case_folded(&file.path), index)
+        if let Some(first) = folded.insert(key(&file.path), index)
             && (!files[first].complete || !file.complete)
         {
             return Some((first, index));
@@ -859,62 +909,62 @@ fn case_folded_collisions(files: &[crate::session::AssessedFile]) -> Option<(usi
     None
 }
 
-/// Ask `base` whether it folds letter case, by writing one file and looking
-/// for it under a different spelling.
-///
-/// There is no portable way to be told this: the answer belongs to the mounted
-/// filesystem, not to the platform, and one machine can carry both kinds at
-/// once. So a uniquely named probe carrying uppercase letters is created and
-/// the same name in lowercase is looked up; if that resolves, the two spellings
-/// are one file here. The probe is removed either way, including when the
-/// lookup fails.
-///
-/// A probe that cannot be created is reported as folding. The caller only asks
-/// when a set would otherwise be written in a way that could silently destroy
-/// one of its own files, and a set is not installed on a guess.
-fn destination_folds_case(base: &Path) -> bool {
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos())
-    );
-    let probe = base.join(format!(".par3-CASE-PROBE-{unique}"));
-    let folded = base.join(format!(".par3-case-probe-{unique}"));
-    if OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .is_err()
-    {
-        return true;
+fn collision_aliases(
+    tree: &RepairTree,
+    files: &[crate::session::AssessedFile],
+    key: impl Fn(&str) -> String,
+) -> EngineResult<bool> {
+    collision_aliases_by(files, key, |first, second| {
+        Ok(tree.paths_alias(first, second)?)
+    })
+}
+
+fn collision_aliases_by(
+    files: &[crate::session::AssessedFile],
+    key: impl Fn(&str) -> String,
+    mut probe: impl FnMut(&str, &str) -> EngineResult<bool>,
+) -> EngineResult<bool> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        let previous = groups.entry(key(&file.path)).or_default();
+        for &first in previous.iter() {
+            if (!files[first].complete || !file.complete) && probe(&files[first].path, &file.path)?
+            {
+                return Ok(true);
+            }
+        }
+        previous.push(index);
     }
-    let folds = std::fs::symlink_metadata(&folded).is_ok();
-    let _ = std::fs::remove_file(&probe);
-    folds
+    Ok(false)
 }
 
 /// Refuse a set whose paths the destination filesystem cannot tell apart.
 ///
-/// A PAR3 set naming both `Readme` and `README` is legitimate — a case-
-/// sensitive producer makes one — and repairing it onto a case-sensitive
-/// filesystem writes two files, as it should. On macOS and Windows those two
-/// names are one file, and the second output written would take the first
-/// one's place, so the repair is refused there instead. The collisions are
-/// found first and the filesystem is asked only if there are any; like every
-/// other destination rule this is settled before anything is staged, so the
-/// host sees a bare refusal rather than a half-finished repair.
-fn refuse_case_folded_destinations(
-    base: &Path,
+/// Case and Unicode-normalization collisions belong to the mounted filesystem,
+/// not the operating system. Candidate pairs are found in memory, then probed
+/// in their actual destination parents before any output is created.
+fn refuse_aliased_destinations(
+    tree: &RepairTree,
     files: &[crate::session::AssessedFile],
 ) -> EngineResult<()> {
-    if case_folded_collisions(files).is_some() && destination_folds_case(base) {
+    if destination_collision(files, str::to_owned).is_some()
+        || collision_aliases(tree, files, crate::paths::case_folded)?
+        || collision_aliases(tree, files, crate::repair_tree::normalization_key)?
+        || collision_aliases(tree, files, crate::repair_tree::case_normalization_key)?
+    {
         return Err(EngineError::InvalidState(
-            "repair destinations differ only by letter case",
+            "repair destinations resolve to the same filesystem path",
         ));
     }
     Ok(())
+}
+
+/// Resolve a destination and refuse any existing symbolic-link leaf before
+/// reconstruction creates a temporary output.
+fn repair_destination(tree: &RepairTree, relative: &str) -> EngineResult<Destination> {
+    let destination = tree.destination(relative)?;
+    tree.check_existing_destination(&destination)?;
+    Ok(destination)
 }
 
 /// Resolve one set-carried relative path inside `base`, creating parents.
@@ -926,33 +976,11 @@ fn refuse_case_folded_destinations(
 /// ones set creation applies, and the same on every platform; what remains
 /// here is the part that must consult the filesystem, which is the refusal to
 /// follow a symbolic link out of `base`.
+#[cfg(test)]
 pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult<PathBuf> {
     crate::paths::validate_relative_path(relative)?;
-    let mut path = base.to_path_buf();
-    let parts: Vec<_> = relative.split('/').collect();
-    for (index, part) in parts.iter().enumerate() {
-        path.push(part);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(EngineError::InvalidState(
-                    "output path contains a symbolic link",
-                ));
-            }
-            Ok(metadata) if index + 1 < parts.len() && !metadata.is_dir() => {
-                return Err(EngineError::InvalidState(
-                    "output parent is not a directory",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if index + 1 < parts.len() {
-                    std::fs::create_dir(&path)?;
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(path)
+    let tree = RepairTree::new(base, std::iter::once(relative))?;
+    Ok(repair_destination(&tree, relative)?.display)
 }
 
 pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> EngineResult<PathBuf> {
@@ -961,10 +989,7 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
         .ok_or(EngineError::InvalidState("output has no parent"))?;
     for _ in 0..128 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".par3-repair-{}-{sequence}.tmp",
-            std::process::id()
-        ));
+        let temporary = parent.join(format!(".par3-repair-{sequence}.tmp"));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -978,46 +1003,6 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
         }
     }
     Err(EngineError::resource_limit("temporary output names"))
-}
-
-pub(crate) fn install(
-    temporary: &Path,
-    destination: &Path,
-    backup: bool,
-) -> EngineResult<Option<PathBuf>> {
-    let mut saved = None;
-    match std::fs::symlink_metadata(destination) {
-        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-            return Err(EngineError::InvalidState(
-                "destination is not a regular file",
-            ));
-        }
-        Ok(_) if backup => {
-            for index in 1..=100_000 {
-                let mut name = destination.as_os_str().to_os_string();
-                name.push(format!(".{index}"));
-                let path = PathBuf::from(name);
-                match std::fs::hard_link(destination, &path) {
-                    Ok(()) => {
-                        saved = Some(path);
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if saved.is_none() {
-                return Err(EngineError::resource_limit("backup names"));
-            }
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    // Rust replaces an existing regular file on Windows as well as Unix.
-    // Keep the destination in place until the verified stage is installed.
-    std::fs::rename(temporary, destination)?;
-    Ok(saved)
 }
 
 // Keep the two supported scalar field representations checked by this module's
@@ -1104,13 +1089,18 @@ mod tests {
         )));
         std::fs::create_dir(&directory.0).unwrap();
         let destination = directory.0.join("damaged.bin");
-        let temporary = directory.0.join("verified.tmp");
         let existing_backup = directory.0.join("damaged.bin.1");
         std::fs::write(&destination, b"damaged bytes").unwrap();
-        std::fs::write(&temporary, b"verified repaired bytes").unwrap();
         std::fs::write(&existing_backup, b"earlier backup").unwrap();
+        let options = ExecutionOptions::default();
+        let tree = RepairTree::new(&directory.0, ["damaged.bin"]).unwrap();
+        let resolved = tree.destination("damaged.bin").unwrap();
+        let (stage_name, temporary) = tree
+            .create_stage(0, b"verified repaired bytes".len() as u64, &options)
+            .unwrap();
+        std::fs::write(&temporary, b"verified repaired bytes").unwrap();
 
-        let saved = install(&temporary, &destination, backup).unwrap();
+        let saved = tree.install(&stage_name, &resolved, backup).unwrap();
 
         assert_eq!(
             std::fs::read(&destination).unwrap(),
@@ -1170,6 +1160,30 @@ mod tests {
         assert!(base.join("season 1").is_dir());
         // The leaf itself is never created here, only its parents.
         assert!(!resolved.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_leaf_is_refused_before_staging() {
+        let directory = scratch("destination-leaf-link");
+        let base = &directory.0;
+        let victim = base.join("victim.bin");
+        std::fs::write(&victim, b"outside bytes").unwrap();
+        std::os::unix::fs::symlink(&victim, base.join("damaged.bin")).unwrap();
+
+        let error = contained_destination(base, "damaged.bin").unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside bytes");
+        assert!(std::fs::read_dir(base).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".par3-stage-")
+        }));
     }
 
     #[test]
@@ -1373,17 +1387,26 @@ mod charge_tests {
         };
 
         assert_eq!(
-            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/notes", false)]),
+            destination_collision(
+                &[assessed("a/Readme", false), assessed("a/notes", false)],
+                crate::paths::case_folded,
+            ),
             None,
             "two names that share nothing"
         );
         assert_eq!(
-            case_folded_collisions(&[assessed("one/Readme", false), assessed("two/README", false)]),
+            destination_collision(
+                &[assessed("one/Readme", false), assessed("two/README", false),],
+                crate::paths::case_folded,
+            ),
             None,
             "one spelling in two directories is two paths"
         );
         assert_eq!(
-            case_folded_collisions(&[assessed("a/Readme", false), assessed("a/README", false)]),
+            destination_collision(
+                &[assessed("a/Readme", false), assessed("a/README", false),],
+                crate::paths::case_folded,
+            ),
             Some((0, 1)),
             "two outputs would be written to one file"
         );
@@ -1391,7 +1414,10 @@ mod charge_tests {
         // A file already whole on disk is just as lost if another file's output
         // lands on its name.
         assert_eq!(
-            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", false)]),
+            destination_collision(
+                &[assessed("a/Readme", true), assessed("a/README", false)],
+                crate::paths::case_folded,
+            ),
             Some((0, 1)),
             "an output would land on a file that is already whole"
         );
@@ -1399,7 +1425,10 @@ mod charge_tests {
         // Two files that are both complete are written nowhere, so nothing is
         // at risk and the repair is not refused for a collision it never makes.
         assert_eq!(
-            case_folded_collisions(&[assessed("a/Readme", true), assessed("a/README", true)]),
+            destination_collision(
+                &[assessed("a/Readme", true), assessed("a/README", true)],
+                crate::paths::case_folded,
+            ),
             None,
             "nothing is staged, so nothing collides"
         );
@@ -1437,37 +1466,74 @@ mod charge_tests {
             names
         };
 
-        // Nothing collides, so the filesystem is never consulted and the
-        // directory is not touched.
-        refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("notes")])
+        let repair_tree = RepairTree::new(tree.path(), ["Readme", "README"]).unwrap();
+        refuse_aliased_destinations(&repair_tree, &[assessed("Readme"), assessed("notes")])
             .expect("two names that share nothing");
-        assert!(
-            entries().is_empty(),
-            "a set with no collision probed the destination anyway: {:?}",
-            entries()
-        );
-
-        // Discover this directory's own answer exactly as the preflight does.
-        let probe = tree.path().join("CaseProbe");
-        std::fs::write(&probe, b"probe").expect("a writable destination");
-        let folds = std::fs::symlink_metadata(tree.path().join("caseprobe")).is_ok();
-        std::fs::remove_file(&probe).expect("the discovery probe is removed");
-
+        let folds = repair_tree.paths_alias("Readme", "README").unwrap();
         let outcome =
-            refuse_case_folded_destinations(tree.path(), &[assessed("Readme"), assessed("README")]);
+            refuse_aliased_destinations(&repair_tree, &[assessed("Readme"), assessed("README")]);
         if folds {
             let error = outcome.expect_err("two outputs would be written to one file here");
             assert!(
-                matches!(error, EngineError::InvalidState(reason) if reason.contains("letter case")),
+                matches!(error, EngineError::InvalidState(reason) if reason.contains("same filesystem path")),
                 "refused for the wrong reason: {error}"
             );
         } else {
             outcome.expect("two distinct files on a case-sensitive destination");
         }
+        drop(repair_tree);
         assert!(
             entries().is_empty(),
             "the case probe was left behind: {:?}",
             entries()
+        );
+    }
+
+    #[test]
+    fn canonically_equivalent_unicode_names_follow_destination_semantics() {
+        let tree = crate::test_reference::TempTree::new("normalized-destinations");
+        let composed = "caf\u{e9}.bin";
+        let decomposed = "cafe\u{301}.bin";
+        let assessed = |path: &str| crate::session::AssessedFile {
+            path: path.to_owned(),
+            source: None,
+            complete: false,
+            verified_prefix: 0,
+            unresolved: Vec::new(),
+        };
+        let repair_tree = RepairTree::new(tree.path(), [composed, decomposed]).unwrap();
+        let aliases = repair_tree.paths_alias(composed, decomposed).unwrap();
+        let outcome =
+            refuse_aliased_destinations(&repair_tree, &[assessed(composed), assessed(decomposed)]);
+        assert_eq!(outcome.is_err(), aliases);
+    }
+
+    #[test]
+    fn every_collision_group_and_pair_is_probed_until_an_alias_is_found() {
+        let files: Vec<_> = ["a/Readme", "a/README", "b/File", "b/FILE", "b/file"]
+            .into_iter()
+            .map(|path| crate::session::AssessedFile {
+                path: path.to_owned(),
+                source: None,
+                complete: false,
+                verified_prefix: 0,
+                unresolved: Vec::new(),
+            })
+            .collect();
+        let mut probed = Vec::new();
+        let aliases = collision_aliases_by(&files, crate::paths::case_folded, |first, second| {
+            probed.push((first.to_owned(), second.to_owned()));
+            Ok(first == "b/File" && second == "b/file")
+        })
+        .unwrap();
+        assert!(aliases);
+        assert_eq!(
+            probed,
+            vec![
+                ("a/Readme".into(), "a/README".into()),
+                ("b/File".into(), "b/FILE".into()),
+                ("b/File".into(), "b/file".into()),
+            ]
         );
     }
 }

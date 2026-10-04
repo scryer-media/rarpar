@@ -330,19 +330,21 @@ pub fn plan_repair(set: &Par3Set, base: &Path, limits: &RepairLimits) -> Result<
 ///
 /// Verifies, rebuilds the lost input blocks from the recovery blocks the set
 /// carries, and writes back every file that was missing or damaged. Each is
-/// built under a temporary name beside the set, checked against its File packet
-/// there, and only then moved into place — over a backup of the damaged file
-/// unless [`RepairOptions::backup`] is off. A rebuild that does not check out is
-/// left under its temporary name and reported, and the file it was to replace is
-/// left alone.
+/// built inside a private staging directory under `base`, checked against its
+/// File packet through the staging handle, and only then moved into place — over
+/// a backup of the damaged file unless [`RepairOptions::backup`] is off. A
+/// rebuild that does not check out is left under its temporary name and
+/// reported, and the file it was to replace is left alone.
 ///
-/// The temporary is created exclusively: a link planted under its name before
-/// the repair is refused rather than followed and truncated, while a plain file
-/// an interrupted repair left there is replaced. A directory of the set that has
-/// been replaced by a link is refused before the file under it is rebuilt. Both
-/// guard against what was put in place before the repair started; `base` itself
-/// is trusted as far as the caller trusts it, and a tree that changes under a
-/// running repair is not defended against.
+/// The staging directory and every temporary are created exclusively; an
+/// existing staging entry is never reused or deleted. On native targets repair
+/// holds an opened capability for `base` and resolves every rebuild-source read
+/// and install relative to it, so replacing that path or swapping a destination
+/// parent cannot redirect an install outside the opened tree. Initial
+/// verification retains normal host filesystem-link behavior. WASI retains the
+/// runtime's preopened directories as its outer capability boundary. Symbolic
+/// links in destination paths are refused on every target, as are destinations
+/// the actual filesystem merges by letter case or Unicode normalization.
 ///
 /// A set whose files are all complete is not touched at all: no temporary file
 /// is created, nothing is renamed, and the report carries the verification that

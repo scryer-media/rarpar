@@ -103,8 +103,9 @@ fn late_metadata_streamed_proofs_restart_selective_download_and_materialization(
     let mut options = ExecutionOptions::default();
     options.memory = MemoryBudget::new(2 << 20);
     options.retained_bytes = 512 << 10;
-    options.handles = HandleBudget::new(2);
-    options.open_handles = 2;
+    // Native repair includes the root, staging and traversal capabilities.
+    options.handles = HandleBudget::new(5);
+    options.open_handles = 5;
     options.workers = 1;
     options.stripe_bytes = 127;
     let source = Arc::new(VirtualJob::new());
@@ -282,7 +283,7 @@ fn late_metadata_streamed_proofs_restart_selective_download_and_materialization(
     );
     assert!(session.retained_bytes() <= options.retained_bytes);
     assert!(options.memory.peak() <= options.memory.limit());
-    assert!(options.handles.peak() <= 2);
+    assert!(options.handles.peak() <= 5);
     assert_eq!(options.handles.used(), 0);
     drop(session);
     drop(downloaded);

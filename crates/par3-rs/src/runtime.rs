@@ -70,11 +70,20 @@ pub enum EngineError {
     },
     /// Repair stopped after creating outputs. Installed files remain valid;
     /// temporary paths are reported so the caller can inspect or remove them.
+    ///
+    /// Temporaries live beneath an exclusively created `.par3-stage-*`
+    /// directory in the requested output root. After removing every reported
+    /// temporary, callers may remove its now-empty staging parent. A successful
+    /// repair removes its empty staging directory automatically. Native repair
+    /// checks the staging identity before reporting cleanup paths; if its
+    /// ambient path was replaced, it removes owned temporaries through the
+    /// original directory capability instead of reporting stale paths.
     #[error("PAR3 repair stopped: {cause}")]
     RepairInterrupted {
         /// Verified files already installed before the failure.
         installed: Vec<crate::session_repair::InstalledFile>,
         /// Engine-created temporary files which have not been installed.
+        /// Each is inside the private staging directory described above.
         temporary: Vec<std::path::PathBuf>,
         /// Original failure, including its underlying I/O error when applicable.
         #[source]

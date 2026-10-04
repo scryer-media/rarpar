@@ -1066,9 +1066,11 @@ impl Par3RepairSession {
         {
             return Err(EngineError::resource_limit("Cauchy lost blocks"));
         }
-        if self.options.open_handles < 2 {
+        if self.options.open_handles < crate::repair_tree::MIN_REPAIR_HANDLES
+            || self.options.handles.limit() < crate::repair_tree::MIN_REPAIR_HANDLES
+        {
             return Err(EngineError::resource_limit(
-                "repair requires two open handles",
+                "repair data and directory handles",
             ));
         }
         Ok(())
