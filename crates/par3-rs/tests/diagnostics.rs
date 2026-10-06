@@ -873,3 +873,205 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
 }
+
+// --- Planning hash pool (W2.5) ------------------------------------------------
+
+use par3_rs::source::{SourceAccess, SourceSnapshot};
+
+/// A memory source whose forward reader returns at most 7000 bytes a call and
+/// stops at half the file, so planning reads short and then positionally, and
+/// optionally fails outright at one offset.
+struct Trickle {
+    inner: MemorySourceAccess,
+    fail_at: Option<u64>,
+}
+
+struct TrickleReader {
+    inner: Box<dyn std::io::Read + Send>,
+    at: u64,
+    stop: u64,
+    fail_at: Option<u64>,
+}
+
+impl std::io::Read for TrickleReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self
+            .fail_at
+            .is_some_and(|fail| fail < self.at + out.len() as u64)
+        {
+            return Err(std::io::Error::other("injected source fault"));
+        }
+        let take = out.len().min(7000).min((self.stop - self.at) as usize);
+        let read = self.inner.read(&mut out[..take])?;
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
+impl SourceAccess for Trickle {
+    fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+        self.inner.snapshot(source)
+    }
+    fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read_at(source, offset, out)
+    }
+    fn next_available(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        self.inner.next_available(source, offset)
+    }
+    fn open_sequential(
+        &self,
+        source: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        let stop = self
+            .inner
+            .snapshot(source)?
+            .map_or(0, |snapshot| snapshot.len / 2);
+        Ok(self.inner.open_sequential(source)?.map(|inner| {
+            Box::new(TrickleReader {
+                inner,
+                at: 0,
+                stop,
+                fail_at: self.fail_at,
+            }) as Box<dyn std::io::Read + Send>
+        }))
+    }
+}
+
+/// A large source plans its hashes on a pool that reads ahead of the walk:
+/// the file hash and chunk hashes run on the workers while the next buffer is
+/// read. The reads must be the serial walk's, call for call and byte for byte,
+/// and the set must be the same set. Only the stacks and the two parallel-hash
+/// buffers may differ. A small source beside it keeps the serial walk.
+#[test]
+fn a_planning_pool_changes_scratch_and_nothing_else() {
+    use par3_rs::creation::{CreationDurability, CreationOptions, CreationPlan, CreationSource};
+    // The smallest source that may start a planning pool.
+    let large = 8usize << 20;
+    let small: Vec<u8> = (0..70_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    // Blocks of a buffer, of a stripe, and of neither; tails that are inline,
+    // just inline, just described, and described.
+    for (block_size, tail) in [
+        (1u64 << 20, 17usize),
+        (64 << 10, 3000),
+        (100_000, 39),
+        (100_000, 40),
+    ] {
+        let bytes: Vec<u8> = (0..large + tail)
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        let plan = |workers: usize, fail_at: Option<u64>| {
+            let mut inner = MemorySourceAccess::default();
+            inner.insert(SourceId(1), 1, bytes.clone().into());
+            inner.insert(SourceId(2), 1, small.clone().into());
+            let mut options = CreationOptions {
+                block_size,
+                recovery_count: 2,
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            let execution = options.execution.clone();
+            let plan = CreationPlan::build(
+                Arc::new(Trickle { inner, fail_at }),
+                &[
+                    CreationSource {
+                        name: "large.bin".into(),
+                        source: SourceId(1),
+                    },
+                    CreationSource {
+                        name: "small.bin".into(),
+                        source: SourceId(2),
+                    },
+                ],
+                options,
+            );
+            (plan, execution)
+        };
+        let run = |workers: usize| {
+            let (plan, execution) = plan(workers, None);
+            let plan = plan.unwrap();
+            let reads = execution.diagnostics.source_io();
+            let verify = execution.diagnostics.stage(Stage::Verify);
+            let ledger = execution.diagnostics.memory().unwrap();
+            let stacks = ledger.category(MemoryCategory::WorkerStacks).peak;
+            let scratch = ledger.category(MemoryCategory::SourceScratch).peak;
+            let tree =
+                common::TempTree::new(&format!("planning-pool-{block_size}-{tail}-{workers}"));
+            let carriers: Vec<Vec<u8>> = plan
+                .execute_with_durability(
+                    &tree.path().join("set"),
+                    tree.path(),
+                    CreationDurability::Buffered,
+                )
+                .unwrap()
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            (
+                carriers,
+                reads,
+                (verify.calls, verify.completed),
+                stacks,
+                scratch,
+            )
+        };
+        let case = format!("{block_size}-byte blocks, {tail}-byte tail");
+        let (serial, serial_reads, serial_verify, serial_stacks, serial_scratch) = run(1);
+        assert_eq!(serial_stacks, 0, "{case}");
+        let (pooled, pooled_reads, pooled_verify, pooled_stacks, pooled_scratch) = run(4);
+        assert!(pooled_stacks > 0, "{case}: planning started no pool");
+        assert_eq!(
+            pooled_scratch - serial_scratch,
+            2 << 20,
+            "{case}: not two parallel-hash buffers"
+        );
+        assert_eq!(
+            pooled_reads, serial_reads,
+            "{case}: the pool changed the reads"
+        );
+        assert_eq!(
+            pooled_verify, serial_verify,
+            "{case}: chunk hashes or progress"
+        );
+        assert!(pooled == serial, "{case}: the pool changed the set");
+        // A read that fails ahead of the walk fails the plan as the serial walk
+        // does, after the same reads, never sooner or later.
+        let fail_at = Some(large as u64 / 2 - 5000);
+        let (serial_error, serial_execution) = plan(1, fail_at);
+        let (pooled_error, pooled_execution) = plan(4, fail_at);
+        let (serial_error, pooled_error) = (
+            serial_error
+                .err()
+                .expect("the serial plan read past the fault"),
+            pooled_error
+                .err()
+                .expect("the pooled plan read past the fault"),
+        );
+        assert_eq!(pooled_error.to_string(), serial_error.to_string(), "{case}");
+        assert_eq!(
+            pooled_execution.diagnostics.source_io(),
+            serial_execution.diagnostics.source_io(),
+            "{case}: a failed read changed the reads"
+        );
+    }
+    // A set of small sources never starts a planning pool.
+    let mut inner = MemorySourceAccess::default();
+    inner.insert(SourceId(2), 1, small.clone().into());
+    let mut options = CreationOptions::default();
+    options.execution.workers = 4;
+    let execution = options.execution.clone();
+    CreationPlan::build(
+        Arc::new(inner),
+        &[CreationSource {
+            name: "small.bin".into(),
+            source: SourceId(2),
+        }],
+        options,
+    )
+    .unwrap();
+    let ledger = execution.diagnostics.memory().unwrap();
+    assert_eq!(ledger.category(MemoryCategory::WorkerStacks).peak, 0);
+}

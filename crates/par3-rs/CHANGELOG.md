@@ -82,6 +82,17 @@
   synced. Spooled rows, and source blocks copied into data carriers, are read
   once instead of twice. Every other fsync and the carrier read-back are
   unchanged.
+- Creation planning hashes a source of at least 8 MiB on a worker pool,
+  admitted as verification admits one (at most four workers, refused into the
+  serial walk under memory pressure): the file hash and the block hashes of
+  each 1 MiB buffer run side by side on the pool, blocks that start and end
+  inside the buffer hashed in parallel, while the calling thread takes the
+  CRCs and reads the next buffer. Reads keep the serial walk's order, sizes
+  and count; one worker, smaller sources and sliding deduplication keep the
+  serial walk unchanged. Planning reserves up to two 1 MiB buffers and the
+  pool's stacks beside its stripe. Output bytes and every I/O count are
+  unchanged. 1 GiB: planning 4× faster with 1 MiB blocks and 3.7× faster with
+  64 KiB blocks at four or more workers, for about 0.1–0.3 s more CPU.
 
 ## 0.4.3
 

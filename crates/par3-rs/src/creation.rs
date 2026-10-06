@@ -1,7 +1,7 @@
 //! Explicit advanced creation plans over stable source identities.
 
 use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,10 @@ use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
 use crate::source::{
     OwedChecks, SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at,
 };
-use crate::{Fingerprint, FingerprintHasher, InputSetId, Packet, RollingHasher};
+use crate::{
+    Fingerprint, FingerprintHasher, InputSetId, Packet, QUICK_HASH_LEN, RollingHasher,
+    TAIL_HASH_LEN,
+};
 
 /// Codec selection. Existing `create::create` defaults remain unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +297,45 @@ impl CreationPlan {
             .memory
             .reserve_as(MemoryCategory::SourceScratch, stripe)?;
         let mut buffer = vec![0; stripe];
+        // A source of at least `PARALLEL_SOURCE_BYTES` may start one pool for
+        // the whole plan, admitted as verification admits one; a refusal, or
+        // no room left for a parallel-hash buffer, keeps the serial walk. A
+        // second buffer, taken only from what is left, lets the next read
+        // overlap the hash. Sliding deduplication searches between chunks,
+        // so its walk is not known in advance and stays serial.
+        let large = options.deduplication != Deduplication::Sliding
+            && snapshots
+                .iter()
+                .any(|snapshot| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES);
+        let pool = if large {
+            match crate::runtime::WorkerPool::for_work(
+                &options.execution,
+                crate::hash::PARALLEL_HASH_WORKERS,
+                crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+            ) {
+                Ok(pool) => pool,
+                Err(EngineError::ResourceLimit(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut ahead_buffers = Vec::new();
+        let mut _ahead_memory = Vec::new();
+        while pool.is_some() && ahead_buffers.len() < 2 {
+            match options.execution.memory.reserve_as(
+                MemoryCategory::SourceScratch,
+                crate::hash::PARALLEL_HASH_BYTES,
+            ) {
+                Ok(reservation) if options.execution.memory.available() >= 128 << 10 => {
+                    _ahead_memory.push(reservation);
+                    ahead_buffers.push(vec![0; crate::hash::PARALLEL_HASH_BYTES]);
+                }
+                Ok(_) | Err(EngineError::ResourceLimit(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let pool = pool.filter(|_| !ahead_buffers.is_empty());
         let mut files = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut full = BTreeMap::<Fingerprint, u64>::new();
@@ -325,6 +367,12 @@ impl CreationPlan {
                 position: 0,
                 file_hash: FingerprintHasher::new(),
                 quick_crc: RollingHasher::new(),
+                ahead: pool
+                    .as_ref()
+                    .filter(|_| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES)
+                    .map(|pool| {
+                        HashAhead::new(pool.pool(), &mut ahead_buffers, options.block_size, stripe)
+                    }),
             };
             let mut chunks = Vec::new();
             let mut at = 0;
@@ -1828,6 +1876,159 @@ struct PlanningReader<'a> {
     position: u64,
     file_hash: FingerprintHasher,
     quick_crc: RollingHasher,
+    /// Set only while a pool is held; otherwise every read is the walk's own.
+    ahead: Option<HashAhead<'a>>,
+}
+
+/// Fill `out` from `start`, through the forward reader while it lasts and
+/// positionally after it. Hashes nothing.
+fn fetch(
+    access: &dyn SourceAccess,
+    source: SourceId,
+    options: &ExecutionOptions,
+    forward: &mut Option<Box<dyn Read + Send>>,
+    start: u64,
+    out: &mut [u8],
+) -> EngineResult<()> {
+    let mut done = 0;
+    while done < out.len() {
+        options.cancel.check()?;
+        let Some(reader) = forward.as_mut() else {
+            break;
+        };
+        let read = options
+            .diagnostics
+            .read(reader.as_mut(), &mut out[done..])?;
+        if read > out.len() - done {
+            return Err(EngineError::InvalidState("invalid source read length"));
+        }
+        if read == 0 {
+            *forward = None;
+            break;
+        }
+        done += read;
+    }
+    if done < out.len() {
+        read_exact_at(
+            &options.diagnostics,
+            access,
+            source,
+            start + done as u64,
+            &mut out[done..],
+        )?;
+    }
+    Ok(())
+}
+
+/// Planning with an admitted worker pool: the chunk walk is fixed in advance
+/// (every chunk is a block, the last one short), so the reader reads ahead of
+/// it, packing the very reads the serial walk makes into parallel-hash
+/// buffers. The pool hashes one buffer, file hash and chunk hashes side by
+/// side, while the calling thread computes its CRCs and reads the next one.
+/// Finished chunks wait here until the walk asks for them, at most two
+/// buffers' worth, each inside the per-block plan estimate.
+struct HashAhead<'a> {
+    pool: &'a rayon::ThreadPool,
+    /// One or two buffers; reads overlap hashing only with two.
+    buffers: &'a mut [Vec<u8>],
+    block_size: u64,
+    /// The serial walk's read size.
+    stripe: usize,
+    /// A buffer read and not yet hashed: index, file offset and length.
+    filled: Option<(usize, u64, usize)>,
+    /// File offset of the next read.
+    read: u64,
+    /// Bytes of the file hashed so far.
+    hashed: u64,
+    chunk_hash: FingerprintHasher,
+    chunk_crc: RollingHasher,
+    /// Finished chunks as `(offset, fingerprint, rolling hash)`.
+    ready: VecDeque<(u64, Fingerprint, u64)>,
+    /// The file's inline tail, once it has been read.
+    inline: Option<(u64, Vec<u8>)>,
+    /// A read that failed ahead of the walk, returned when the walk gets there.
+    failed: Option<EngineError>,
+}
+
+impl<'a> HashAhead<'a> {
+    fn new(
+        pool: &'a rayon::ThreadPool,
+        buffers: &'a mut [Vec<u8>],
+        block_size: u64,
+        stripe: usize,
+    ) -> Self {
+        Self {
+            pool,
+            buffers,
+            block_size,
+            stripe,
+            filled: None,
+            read: 0,
+            hashed: 0,
+            chunk_hash: FingerprintHasher::new(),
+            chunk_crc: RollingHasher::new(),
+            ready: VecDeque::new(),
+            inline: None,
+            failed: None,
+        }
+    }
+}
+
+/// The chunks `filled` bytes at file offset `start` cover, as `(chunk offset,
+/// chunk length, range in the buffer)`. Chunks are blocks; the last is short.
+fn ahead_segments(
+    start: u64,
+    filled: usize,
+    len: u64,
+    block_size: u64,
+) -> impl Iterator<Item = (u64, u64, std::ops::Range<usize>)> {
+    let end = start + filled as u64;
+    let mut at = start;
+    std::iter::from_fn(move || {
+        if at >= end {
+            return None;
+        }
+        let chunk = at / block_size * block_size;
+        let length = (len - chunk).min(block_size);
+        let stop = end.min(chunk + length);
+        let segment = (
+            chunk,
+            length,
+            (at - start) as usize..(stop - start) as usize,
+        );
+        at = stop;
+        Some(segment)
+    })
+}
+
+/// Read whole serial-walk reads from `*read` into `buffer` while they fit:
+/// a chunk is read a stripe at a time from its start, and an inline tail in
+/// one read, exactly as [`PlanningReader::hash_chunk`] and the walk do.
+fn fill_ahead(
+    fetch: &mut impl FnMut(u64, &mut [u8]) -> EngineResult<()>,
+    buffer: &mut [u8],
+    read: &mut u64,
+    len: u64,
+    block_size: u64,
+    stripe: usize,
+) -> EngineResult<usize> {
+    let mut filled = 0;
+    while *read < len {
+        let chunk = *read / block_size * block_size;
+        let length = (len - chunk).min(block_size);
+        let take = if length < TAIL_HASH_LEN as u64 {
+            length as usize
+        } else {
+            (chunk + length - *read).min(stripe as u64) as usize
+        };
+        if filled + take > buffer.len() {
+            break;
+        }
+        fetch(*read, &mut buffer[filled..filled + take])?;
+        filled += take;
+        *read += take as u64;
+    }
+    Ok(filled)
 }
 
 impl PlanningReader<'_> {
@@ -1837,34 +2038,17 @@ impl PlanningReader<'_> {
                 "creation hash frontier is discontinuous",
             ));
         }
-        let mut done = 0;
-        while done < out.len() {
-            self.options.cancel.check()?;
-            let Some(reader) = self.forward.as_mut() else {
-                break;
-            };
-            let read = self
-                .options
-                .diagnostics
-                .read(reader.as_mut(), &mut out[done..])?;
-            if read > out.len() - done {
-                return Err(EngineError::InvalidState("invalid source read length"));
-            }
-            if read == 0 {
-                self.forward = None;
-                break;
-            }
-            done += read;
+        if self.ahead.is_some() {
+            return self.read_inline_ahead(start, out);
         }
-        if done < out.len() {
-            read_exact_at(
-                &self.options.diagnostics,
-                self.access,
-                self.source,
-                start + done as u64,
-                &mut out[done..],
-            )?;
-        }
+        fetch(
+            self.access,
+            self.source,
+            self.options,
+            &mut self.forward,
+            start,
+            out,
+        )?;
         self.file_hash.update(out);
         let quick = (16384u64.saturating_sub(start)).min(out.len() as u64) as usize;
         self.quick_crc.update(&out[..quick]);
@@ -1883,6 +2067,9 @@ impl PlanningReader<'_> {
         // vouches for every chunk hash, and execution checks again before
         // reading. A failed read is reported as the change behind it, if any.
         let mut progress = self.options.stage(crate::runtime::Stage::Verify)?;
+        if self.ahead.is_some() {
+            return self.hash_chunk_ahead(start, length, crc_length, &mut progress);
+        }
         let mut hash = FingerprintHasher::new();
         let mut crc = RollingHasher::new();
         let mut offset = 0;
@@ -1899,5 +2086,205 @@ impl PlanningReader<'_> {
             offset += take as u64;
         }
         Ok((hash.finalize(), crc.finalize()))
+    }
+
+    /// [`Self::hash_chunk`] with a pool: step the read-ahead until the chunk
+    /// at `start` is finished. The walk must ask for the chunks it derived.
+    fn hash_chunk_ahead(
+        &mut self,
+        start: u64,
+        length: u64,
+        crc_length: u64,
+        progress: &mut crate::runtime::StageGuard,
+    ) -> EngineResult<(Fingerprint, u64)> {
+        let block_size = self.ahead.as_ref().map_or(1, |ahead| ahead.block_size);
+        let full = length == block_size;
+        if start != self.position
+            || !start.is_multiple_of(block_size)
+            || length != (self.snapshot.len - start).min(block_size)
+            || crc_length != if full { length } else { TAIL_HASH_LEN as u64 }
+        {
+            return Err(EngineError::InvalidState(
+                "creation hash frontier is discontinuous",
+            ));
+        }
+        let mut reported = start;
+        loop {
+            let ahead = self.ahead.as_mut().expect("pooled planning");
+            let done = ahead.hashed.clamp(start, start + length);
+            if done > reported {
+                progress.advance(done - reported);
+                reported = done;
+            }
+            if let Some(&(at, fingerprint, rolling)) = ahead.ready.front() {
+                if at != start {
+                    return Err(EngineError::InvalidState(
+                        "creation hash frontier is discontinuous",
+                    ));
+                }
+                ahead.ready.pop_front();
+                self.position += length;
+                return Ok((fingerprint, rolling));
+            }
+            if let Err(error) = self.step() {
+                ensure_snapshot(self.access, self.source, self.snapshot)?;
+                return Err(error);
+            }
+        }
+    }
+
+    /// [`Self::read`] with a pool, which the walk calls only for the file's
+    /// inline tail.
+    fn read_inline_ahead(&mut self, start: u64, out: &mut [u8]) -> EngineResult<()> {
+        loop {
+            let ahead = self.ahead.as_mut().expect("pooled planning");
+            if let Some((at, bytes)) = ahead.inline.take() {
+                if at != start || bytes.len() != out.len() {
+                    return Err(EngineError::InvalidState(
+                        "creation hash frontier is discontinuous",
+                    ));
+                }
+                out.copy_from_slice(&bytes);
+                self.position += out.len() as u64;
+                return Ok(());
+            }
+            self.step()?;
+        }
+    }
+
+    /// Hash the oldest buffer read ahead: the pool runs the file hash and the
+    /// chunk hashes side by side while this thread takes the CRCs and, with a
+    /// second buffer, reads the next one. Reads stay on this thread, in the
+    /// serial walk's order and sizes. BLAKE3 gives the same digest however
+    /// its input is split, so the hashes are the serial walk's.
+    fn step(&mut self) -> EngineResult<()> {
+        let (access, source, options, len) =
+            (self.access, self.source, self.options, self.snapshot.len);
+        let forward = &mut self.forward;
+        let mut read = |at: u64, out: &mut [u8]| fetch(access, source, options, forward, at, out);
+        let file_hash = &mut self.file_hash;
+        let quick_crc = &mut self.quick_crc;
+        let ahead = self.ahead.as_mut().expect("pooled planning");
+        if let Some(error) = ahead.failed.take() {
+            return Err(error);
+        }
+        let (block_size, stripe) = (ahead.block_size, ahead.stripe);
+        let (index, start, filled) = match ahead.filled.take() {
+            Some(filled) => filled,
+            None => {
+                let start = ahead.read;
+                let buffer = &mut ahead.buffers[0];
+                let filled =
+                    fill_ahead(&mut read, buffer, &mut ahead.read, len, block_size, stripe)?;
+                (0, start, filled)
+            }
+        };
+        if filled == 0 {
+            return Err(EngineError::InvalidState(
+                "creation hash frontier is discontinuous",
+            ));
+        }
+        let (low, high) = ahead.buffers.split_at_mut(1);
+        let (current, spare) = if index == 0 {
+            (&low[0], high.first_mut())
+        } else {
+            (&high[0], Some(&mut low[0]))
+        };
+        let data = &current[..filled];
+        let mut chunk_hash = std::mem::take(&mut ahead.chunk_hash);
+        let mut fingerprints = Vec::new();
+        let mut finished = Vec::new();
+        let mut next = None;
+        ahead.pool.in_place_scope(|scope| {
+            scope.spawn(|_| {
+                rayon::join(
+                    || file_hash.update_admitted(data, true),
+                    || {
+                        use rayon::prelude::*;
+                        // Only the first segment can continue a chunk begun
+                        // in an earlier buffer, and only the last can stop
+                        // short of its chunk's end; both go through the
+                        // carried hash. Every chunk between starts and ends
+                        // here, so those are hashed side by side, in order.
+                        let segments: Vec<_> =
+                            ahead_segments(start, filled, len, block_size).collect();
+                        let ends = |(chunk, length, range): &(u64, u64, std::ops::Range<usize>)| {
+                            start + range.end as u64 == chunk + length
+                        };
+                        let head = segments
+                            .first()
+                            .is_some_and(|(chunk, _, range)| start + range.start as u64 != *chunk)
+                            as usize;
+                        let tail = (segments.len() > head
+                            && segments.last().is_some_and(|segment| !ends(segment)))
+                            as usize;
+                        for segment in &segments[..head] {
+                            chunk_hash.update_admitted(&data[segment.2.clone()], true);
+                            if ends(segment) {
+                                fingerprints.push(chunk_hash.finalize());
+                                chunk_hash = FingerprintHasher::new();
+                            }
+                        }
+                        fingerprints.par_extend(
+                            segments[head..segments.len() - tail].par_iter().map(
+                                |(_, _, range)| {
+                                    let mut hash = FingerprintHasher::new();
+                                    hash.update_admitted(&data[range.clone()], true);
+                                    hash.finalize()
+                                },
+                            ),
+                        );
+                        for segment in &segments[segments.len() - tail..] {
+                            chunk_hash.update_admitted(&data[segment.2.clone()], true);
+                        }
+                    },
+                );
+            });
+            if ahead.read < len
+                && let Some(spare) = spare
+            {
+                let at = ahead.read;
+                next = Some(
+                    fill_ahead(&mut read, spare, &mut ahead.read, len, block_size, stripe)
+                        .map(|filled| (at, filled)),
+                );
+            }
+            let quick = (QUICK_HASH_LEN as u64)
+                .saturating_sub(start)
+                .min(filled as u64) as usize;
+            quick_crc.update(&data[..quick]);
+            for (chunk, length, range) in ahead_segments(start, filled, len, block_size) {
+                let crc_length = if length == block_size {
+                    length
+                } else {
+                    TAIL_HASH_LEN as u64
+                };
+                let offset = start + range.start as u64 - chunk;
+                let take = crc_length.saturating_sub(offset).min(range.len() as u64) as usize;
+                ahead
+                    .chunk_crc
+                    .update(&data[range.start..range.start + take]);
+                if start + range.end as u64 == chunk + length {
+                    if length < TAIL_HASH_LEN as u64 {
+                        ahead.inline = Some((chunk, data[range].to_vec()));
+                    }
+                    finished.push((chunk, length, ahead.chunk_crc.finalize()));
+                    ahead.chunk_crc = RollingHasher::new();
+                }
+            }
+        });
+        ahead.chunk_hash = chunk_hash;
+        for ((chunk, length, rolling), fingerprint) in finished.into_iter().zip(fingerprints) {
+            if length >= TAIL_HASH_LEN as u64 {
+                ahead.ready.push_back((chunk, fingerprint, rolling));
+            }
+        }
+        ahead.hashed = start + filled as u64;
+        match next {
+            Some(Ok((at, filled))) => ahead.filled = Some((1 - index, at, filled)),
+            Some(Err(error)) => ahead.failed = Some(error),
+            None => {}
+        }
+        Ok(())
     }
 }
