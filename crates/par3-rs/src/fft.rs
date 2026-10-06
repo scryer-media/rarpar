@@ -1111,9 +1111,10 @@ impl FftCodec {
     }
 
     /// What `encode` reserves for its stripes when memory does not narrow
-    /// them, by the same layout `buffers` and `byte_buffers` charge. A caller
-    /// holding output beside the encode leaves this much so the stripe stays
-    /// at its configured width.
+    /// them, by the same layout it charges: `byte_buffers` for a trivial
+    /// geometry, otherwise `buffers` on the lane `encode` runs (byte rows for
+    /// GF(2^8), word rows for GF(2^16)). A caller holding output beside the
+    /// encode leaves this much so the stripe stays at its configured width.
     pub(crate) fn encode_stripe_bytes(&self, block_size: u64) -> usize {
         let target = self
             .options
@@ -1124,7 +1125,12 @@ impl FftCodec {
         }
         let unit = self.geometry.field_bytes();
         let rows = self.geometry.capacity.saturating_mul(2);
-        let per_byte = rows.saturating_mul(2 / unit).saturating_add(2);
+        let per_byte = if self.geometry.bits == 8 {
+            workspace_per_byte::<u8>(rows, unit)
+        } else {
+            workspace_per_byte::<u16>(rows, unit)
+        }
+        .unwrap_or(usize::MAX);
         (target / unit * unit)
             .saturating_mul(per_byte)
             .saturating_add(rows.saturating_mul(32))
@@ -1845,13 +1851,15 @@ mod lane_tests {
     /// Byte rows are charged at one byte per stripe byte, so a budget that
     /// narrows the zero-extended rows admits the byte lane a wider stripe:
     /// twice the word lane's before each is rounded down to a whole page
-    /// granule, which takes less than one granule from either.
+    /// granule, which takes less than one granule from either. The budget
+    /// leaves both stripes many granules wide, so that rounding stays small
+    /// next to the factor of two on 4 KiB and 16 KiB granule targets alike.
     #[test]
     fn a_gf8_cohort_gets_twice_the_stripe_under_the_same_budget() {
         let granule = crate::runtime::STRIPE_GRANULES[0];
         let geometry = FftGeometry::new(150, 6).unwrap();
         let options = ExecutionOptions {
-            memory: MemoryBudget::new(8 << 20),
+            memory: MemoryBudget::new(96 << 20),
             workers: 1,
             stripe_bytes: 1 << 20,
             ..ExecutionOptions::default()
@@ -1860,10 +1868,45 @@ mod lane_tests {
         let (bytes, held) = codec.buffers::<u8>(1 << 20, geometry.domain()).unwrap();
         drop(held);
         let (words, _held) = codec.buffers::<u16>(1 << 20, geometry.domain()).unwrap();
-        assert!(words < 1 << 20, "the budget should narrow the stripe");
+        assert!(bytes < 1 << 20, "the budget should narrow the byte stripe");
         assert!(
-            bytes >= words && bytes + granule > 2 * words - 64,
-            "byte lane admitted {bytes}, word lane {words}"
+            words >= 8 * granule,
+            "word lane {words} spans fewer than 8 granules of {granule}"
         );
+        assert!(
+            bytes + 2 * granule >= 2 * words && bytes <= 2 * words + 2 * granule,
+            "byte lane admitted {bytes}, word lane {words}, granule {granule}"
+        );
+    }
+
+    /// `encode_stripe_bytes` promises what `encode` reserves for its stripes,
+    /// by the layout `buffers` charges, on both fields.
+    #[test]
+    fn encode_stripe_bytes_matches_the_encode_reservation() {
+        for (inputs, capacity_log2) in [(100u64, 7i8), (150, 6), (300, 8), (40, 4)] {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(1 << 30),
+                workers: 1,
+                stripe_bytes: 1 << 16,
+                ..ExecutionOptions::default()
+            };
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let rows = geometry.capacity * 2;
+            let before = options.memory.used();
+            let held = if geometry.bits == 8 {
+                codec.buffers::<u8>(1 << 20, rows).unwrap()
+            } else {
+                codec.buffers::<u16>(1 << 20, rows).unwrap()
+            };
+            let reserved = options.memory.used() - before;
+            drop(held);
+            assert_eq!(
+                codec.encode_stripe_bytes(1 << 20),
+                reserved,
+                "GF(2^{}) inputs {inputs} capacity 2^{capacity_log2}",
+                geometry.bits
+            );
+        }
     }
 }

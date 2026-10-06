@@ -927,6 +927,31 @@ mod tests {
         }
     }
 
+    /// Every one of the 64 bit positions of the packed matrix, from a map
+    /// with a single nonzero image bit: input bit `col` sent to output bit
+    /// `row` lands at byte `7 - row`, bit `col`, Intel's layout, and nowhere
+    /// else. Field-multiplication matrices alone cannot prove this: their
+    /// diagonals are constant before reduction, so a swap along one passes.
+    #[test]
+    fn affine_from_images_places_every_unit_bit() {
+        for col in 0..8 {
+            for row in 0..8 {
+                let mut images = [0u8; 8];
+                images[col] = 1 << row;
+                let matrix = affine_from_images(images);
+                assert_eq!(matrix, 1u64 << ((7 - row) * 8 + col), "col {col} row {row}");
+                for value in 0..=255u8 {
+                    let expected = if value & (1 << col) != 0 { 1 << row } else { 0 };
+                    assert_eq!(
+                        affine_scalar(matrix, value),
+                        expected,
+                        "col {col} row {row} value {value}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The GFNI kernels against the scalar tier for every factor, on rows
     /// that hold every byte value, at lengths either side of each vector
     /// width and an unaligned start.
@@ -936,6 +961,9 @@ mod tests {
         if !(std::arch::is_x86_feature_detected!("gfni")
             && std::arch::is_x86_feature_detected!("avx2"))
         {
+            eprintln!(
+                "SKIP gfni_kernels_match_the_scalar_tier_for_every_factor: host lacks gfni+avx2"
+            );
             return;
         }
         let source: Vec<u8> = (0..1100u32).map(|i| (i * 167 + i / 256) as u8).collect();

@@ -426,6 +426,13 @@ impl LinearMap16 {
     }
 
     fn butterfly_in<const INVERSE: bool>(&self, left: &mut [u16], right: &mut [u16]) {
+        #[cfg_attr(
+            not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_endian = "little")
+            )),
+            allow(unused_mut)
+        )]
         let mut done = 0;
         #[cfg(any(
             target_arch = "x86_64",
@@ -482,6 +489,13 @@ impl LinearMap16 {
     fn radix4_in<const INVERSE: bool>(outer: &Self, inner: [&Self; 2], rows: [&mut [u16]; 4]) {
         let [inner_a, inner_b] = inner;
         let [a, b, c, d] = rows;
+        #[cfg_attr(
+            not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_endian = "little")
+            )),
+            allow(unused_mut)
+        )]
         let mut done = 0;
         #[cfg(any(
             target_arch = "x86_64",
@@ -1301,6 +1315,9 @@ mod fused_tests {
                     kernels.push((LinearKernel::Avx2, true));
                 }
             }
+            if !kernels.contains(&(LinearKernel::Avx2, true)) {
+                eprintln!("SKIP fused_tests GFNI affine tier: host lacks gfni+avx2+ssse3");
+            }
         }
         kernels
     }
@@ -1372,6 +1389,113 @@ mod fused_tests {
                     field.mul(value, factor),
                     "16-bit factor {factor:#x}"
                 );
+            }
+        }
+    }
+
+    /// The 16-bit block placement, one bit at a time: a map whose only
+    /// nonzero image bit sends input bit `i` to output bit `j` sets exactly
+    /// one bit, in the block of `[ll, lh, hl, hh]` that pairs the input byte
+    /// of `i` with the output byte of `j`, at byte `7 - j % 8`, bit `i % 8`.
+    /// Field-multiplication matrices alone cannot prove the layout: their
+    /// diagonals are constant before reduction, so a swap along one passes.
+    #[test]
+    fn affine16_places_every_unit_bit_in_its_block() {
+        for i in 0..16 {
+            for j in 0..16 {
+                let mut cols = [0u16; 16];
+                cols[i] = 1 << j;
+                let matrices = affine_matrices_from_images(&cols);
+                // low = ll(lo) ^ lh(hi); high = hl(lo) ^ hh(hi).
+                let block = match (i >= 8, j >= 8) {
+                    (false, false) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (true, true) => 3,
+                };
+                for (at, &matrix) in matrices.iter().enumerate() {
+                    let expected = if at == block {
+                        1u64 << ((7 - j % 8) * 8 + i % 8)
+                    } else {
+                        0
+                    };
+                    assert_eq!(matrix, expected, "input {i} output {j} block {at}");
+                }
+            }
+        }
+    }
+
+    /// A radix-4 quad in which one map lacks its affine matrix takes the
+    /// shuffle kernel for the whole quad and still matches the scalar tier:
+    /// the 16-bit quad without `inner_b`'s matrix, the 8-bit one without
+    /// `inner_a`'s. Production builds every map of a process with or without
+    /// its matrix, so only a test reaches this state.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier() {
+        let (gfni, shuffle) = ((LinearKernel::Avx2, true), (LinearKernel::Avx2, false));
+        if !kernels().contains(&gfni) {
+            eprintln!(
+                "SKIP a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier: host \
+                 lacks gfni+avx2+ssse3"
+            );
+            return;
+        }
+        let scalar = (LinearKernel::Scalar, false);
+        let lengths = [
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 95, 96, 97, 127, 129, 1031,
+        ];
+        let basis16: [[u16; 16]; 3] = std::array::from_fn(|map| {
+            let seed = bytes(32, map as u64 + 101);
+            std::array::from_fn(|bit| u16::from_le_bytes([seed[bit * 2], seed[bit * 2 + 1]]))
+        });
+        let basis8: [[u8; 8]; 3] =
+            std::array::from_fn(|map| bytes(8, map as u64 + 201).try_into().unwrap());
+        let m16 = [
+            map16(basis16[0], gfni),
+            map16(basis16[1], gfni),
+            map16(basis16[2], shuffle),
+        ];
+        let m8 = [
+            map8(basis8[0], gfni),
+            map8(basis8[1], shuffle),
+            map8(basis8[2], gfni),
+        ];
+        let o16 = basis16.map(|basis| map16(basis, scalar));
+        let o8 = basis8.map(|basis| map8(basis, scalar));
+        for &length in &lengths {
+            for offset in [0usize, 1, 3] {
+                for inverse in [false, true] {
+                    let what = format!("length {length} offset {offset} inverse {inverse}");
+                    let stride = length + offset;
+                    let source = bytes(stride * 8, length as u64 * 37 + offset as u64 + 13);
+                    let words: Vec<u16> = source
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect();
+                    let rows16: [Vec<u16>; 4] = std::array::from_fn(|row| {
+                        words[row * stride + offset..(row + 1) * stride].to_vec()
+                    });
+                    let rows8: [Vec<u8>; 4] = std::array::from_fn(|row| {
+                        source[row * stride + offset..(row + 1) * stride].to_vec()
+                    });
+
+                    let mut actual = rows16.clone();
+                    let mut expected = rows16;
+                    let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                    LinearMap16::radix4(&m16[0], [&m16[1], &m16[2]], [a, b, c, d], inverse);
+                    let [a, b, c, d] = expected.each_mut().map(Vec::as_mut_slice);
+                    LinearMap16::radix4(&o16[0], [&o16[1], &o16[2]], [a, b, c, d], inverse);
+                    assert_eq!(actual, expected, "16-bit radix-4, {what}");
+
+                    let mut actual = rows8.clone();
+                    let mut expected = rows8;
+                    let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                    LinearMap8::radix4(&m8[0], [&m8[1], &m8[2]], [a, b, c, d], inverse);
+                    let [a, b, c, d] = expected.each_mut().map(Vec::as_mut_slice);
+                    LinearMap8::radix4(&o8[0], [&o8[1], &o8[2]], [a, b, c, d], inverse);
+                    assert_eq!(actual, expected, "8-bit radix-4, {what}");
+                }
             }
         }
     }
@@ -1760,7 +1884,10 @@ fn nibble_scratch() -> &'static NibbleScratch {
 /// ```
 ///
 /// Each 8×8 matrix is packed into a `u64` in the format expected by
-/// `gf2p8affineqb`: byte 7 = row 0, bit 7 of each byte = column 0.
+/// `gf2p8affineqb`: byte `7 - i` holds row `i` (output bit `i`), and bit `c`
+/// of each byte is column `c` (input bit `c`), so row 0 is the top byte and
+/// column 0 the least significant bit of each byte. This is the layout
+/// the crate's `gf8::affine_from_images` builds.
 #[derive(Clone)]
 pub struct AffineMulMatrices {
     /// Maps input low byte → output low byte.

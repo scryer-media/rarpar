@@ -229,15 +229,19 @@
   budget-narrowed GF(2^8) cohort gets twice the stripe and fewer stripe I/O
   calls. The transform uses fused radix-4 butterflies and skips butterflies
   over rows the layout knows are zero (padding past the inputs, erased rows).
-  Carriers and repaired bytes are identical.
+  Carriers and repaired bytes are identical. The recovery spool's admission
+  prices a GF(2^8) encode's stripes on the same byte-row layout, so in the
+  band of budgets where the old zero-extended estimate spilled recovery rows
+  to a scratch spool file and read them back, they now stay resident; this
+  changes I/O only, and carriers are byte-identical.
 - **Behaviour change:** `fft::FftCodec::encode` and `decode` no longer zero a
   stripe before handing it to the input callback; the callback must fill every
   byte of the slice it is given, as every in-crate caller already did. Decode
   reads, unpacks and scales each row in one pass and clears only the part of
   a row past the read; encode transforms the first chunk directly in the sum
   rows. The formal derivative stores each row once and splits its columns
-  across the worker pool. Decode codec time falls 8–22% at one to eight
-  workers on both fields; carriers and repaired bytes are identical.
+  across the worker pool. Decode codec time falls 4–7% at one worker and
+  10–22% at eight, on both fields; carriers and repaired bytes are identical.
 - On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
   transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
   0.4.8); carriers and repaired bytes are identical.

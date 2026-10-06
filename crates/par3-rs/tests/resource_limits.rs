@@ -844,5 +844,91 @@ mod windows_volumes {
         let mut out = [0; 8];
         assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
         assert_eq!(&out, b"replaced");
+/// The FFT codec on both fields ends a create whose source changes
+/// mid-operation in `SourceChanged`, with no carrier installed.
+#[test]
+fn fft_creation_rejects_a_source_changed_mid_operation() {
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
+    for (capacity_log2, recovery) in [(2i8, 4u64), (8, 256)] {
+        for (at, truncate) in [(5usize, false), (5, true), (40, false), (40, true)] {
+            let inputs = common::TempTree::new("fft-create-input");
+            let path = inputs.path().join("input.bin");
+            let mut bytes = vec![0; 32 * 4096 + 333];
+            blake3::Hasher::new()
+                .update(b"fft-create")
+                .finalize_xof()
+                .fill(&mut bytes);
+            std::fs::write(&path, bytes).unwrap();
+            let mut options = CreationOptions {
+                block_size: 4096,
+                recovery_count: recovery,
+                volumes: VolumeLayout::Uniform(1),
+                codec: CreationCodec::Fft {
+                    capacity_log2,
+                    interleave: 0,
+                },
+                ..CreationOptions::default()
+            };
+            options.execution.workers = 1;
+            options.execution.stripe_bytes = 1024;
+            let mut disk = DiskSourceAccess::with_options(options.execution.clone());
+            disk.insert(SourceId(1), path.clone());
+            let watched = Arc::new(Watched::new(disk));
+            let output = common::TempTree::new("fft-create-output");
+            let scratch = output.path().join("scratch");
+            let carriers = output.path().join("carriers");
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::create_dir(&carriers).unwrap();
+            let result = CreationPlan::build(
+                watched.clone(),
+                &[CreationSource {
+                    name: "input.bin".into(),
+                    source: SourceId(1),
+                }],
+                options.clone(),
+            )
+            .and_then(|plan| {
+                watched.arm(Some((at, path.clone(), truncate)));
+                plan.execute(&carriers.join("set"), &scratch)
+            });
+            assert!(
+                matches!(result, Err(EngineError::SourceChanged(SourceId(1)))),
+                "capacity 2^{capacity_log2}, change before read {at} (truncate {truncate}): {result:?}"
+            );
+            assert_eq!(std::fs::read_dir(&carriers).unwrap().count(), 0);
+            drop(inputs);
+        }
+    }
+}
+
+/// The FFT decode on both fields ends a repair whose source changes
+/// mid-operation in `SourceChanged`, with nothing installed.
+#[test]
+fn fft_repair_rejects_a_source_changed_mid_operation() {
+    for recovery in [4u64, 256] {
+        let tree = common::TempTree::new("fft-repair-changed");
+        let set = common::many_block_set(1, 40, 0, recovery, b"fft-repair", &tree);
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        for (at, truncate) in [(5usize, false), (5, true)] {
+            let run = repair_watched(
+                &set,
+                &[(0, 64 + 5), (0, 9 * 64 + 7), (0, 39 * 64 + 1)],
+                &options,
+                Some((0, at, truncate)),
+            );
+            match &run.result {
+                Err(EngineError::RepairInterrupted {
+                    installed, cause, ..
+                }) if installed.is_empty()
+                    && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+                result => panic!(
+                    "recovery {recovery}, change before read {at} (truncate {truncate}): {result:?}"
+                ),
+            }
+            assert!(!run.output.path().join("input0.bin").exists());
+        }
     }
 }

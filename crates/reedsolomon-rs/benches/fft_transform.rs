@@ -5,7 +5,7 @@
 //! `WEAVER_LINEAR_GFNI=0` to measure the AVX2 shuffle form on the same rows.
 #[cfg(not(target_family = "wasm"))]
 fn main() {
-    use criterion::{BenchmarkId, Criterion, Throughput};
+    use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
     use reedsolomon_rs::fft::TransformField;
     use reedsolomon_rs::gf_simd::LinearBackend;
     use std::hint::black_box;
@@ -392,7 +392,9 @@ fn main() {
         });
     }
     // A decoder's formal derivative over every row at the PAR3 stripe shapes.
-    let mut bytes: Vec<Vec<u8>> = (0..256)
+    // The derivative applied twice is zero, so every iteration starts from a
+    // fresh copy of the rows, made outside the timed routine.
+    let bytes: Vec<Vec<u8>> = (0..256)
         .map(|row| {
             (0..65536)
                 .map(|at| ((row * 7919 + at * 103) % 256) as u8)
@@ -401,13 +403,18 @@ fn main() {
         .collect();
     group.throughput(Throughput::Bytes((256 * 65536) as u64));
     group.bench_function(BenchmarkId::new("u8_derivative", "256x65536"), |b| {
-        b.iter(|| {
-            byte_field
-                .derivative_u8(black_box(&mut bytes), &|| false)
-                .unwrap()
-        });
+        b.iter_batched(
+            || bytes.clone(),
+            |mut rows| {
+                byte_field
+                    .derivative_u8(black_box(&mut rows), &|| false)
+                    .unwrap();
+                rows
+            },
+            BatchSize::LargeInput,
+        );
     });
-    let mut words: Vec<Vec<u16>> = (0..512)
+    let words: Vec<Vec<u16>> = (0..512)
         .map(|row| {
             (0..32768)
                 .map(|at| ((row * 7919 + at * 103) % 65536) as u16)
@@ -416,11 +423,16 @@ fn main() {
         .collect();
     group.throughput(Throughput::Bytes((512 * 65536) as u64));
     group.bench_function(BenchmarkId::new("u16_derivative", "512x32768"), |b| {
-        b.iter(|| {
-            word_field
-                .derivative(black_box(&mut words), &|| false)
-                .unwrap()
-        });
+        b.iter_batched(
+            || words.clone(),
+            |mut rows| {
+                word_field
+                    .derivative(black_box(&mut rows), &|| false)
+                    .unwrap();
+                rows
+            },
+            BatchSize::LargeInput,
+        );
     });
     let zero = decoder(256, 32, 150, 15);
     let factors: Vec<u16> = (0..256).map(|row| (row * 37 % 255 + 1) as u16).collect();
