@@ -1443,3 +1443,194 @@ fn the_streaming_engine_writes_the_reference_data_volumes_byte_for_byte() {
         }
     }
 }
+
+/// The reference's FFT input: 14000 bytes, fourteen 1024-byte blocks.
+fn fft_input() -> Vec<u8> {
+    (0..14000)
+        .map(|i| ((i * 73 + i / 29) % 256) as u8)
+        .collect()
+}
+
+/// Build an FFT set of one recovery block under `capacity_log2`, as the
+/// reference's `-c1 -cm<capacity>` does, and return its carriers' bytes.
+fn single_recovery_fft_set(name: &str, capacity_log2: i8, creator: &str) -> Vec<(String, Vec<u8>)> {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(0), 1, fft_input().into());
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".to_owned(),
+            source: SourceId(0),
+        }],
+        CreationOptions {
+            block_size: 1024,
+            recovery_count: 1,
+            codec: CreationCodec::Fft {
+                capacity_log2,
+                interleave: 0,
+            },
+            creator: creator.to_owned(),
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    // One recovery block is labelled with no field, whatever the capacity.
+    assert_eq!(
+        plan.requirements().field,
+        par3_rs::packet::GaloisField {
+            size: 0,
+            generator: 0
+        }
+    );
+    let tree = common::TempTree::new(&format!("single-recovery-{name}"));
+    plan.execute(&tree.path().join(name), tree.path())
+        .unwrap()
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Verify `carriers` against the intact input, then against the input with
+/// one block damaged, and repair that block.
+fn verify_and_repair_one_block(name: &str, carriers: &[Vec<u8>]) {
+    let original = fft_input();
+    let id = common::scan(&carriers[0])[0].1.input_set_id();
+    for damaged_block in [None, Some(6usize)] {
+        let mut input = original.clone();
+        if let Some(block) = damaged_block {
+            input[block * 1024 + 17] ^= 0x40;
+        }
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, input.into());
+        let options = par3_rs::runtime::ExecutionOptions::default();
+        let mut session =
+            par3_rs::Par3RepairSession::new(id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for carrier in carriers {
+            let mut source = MemorySourceAccess::default();
+            source.insert(SourceId(99), 1, carrier.clone().into());
+            let mut scanner = PacketScanner::new(
+                Arc::new(source),
+                SourceId(99),
+                options.clone(),
+                par3_rs::ScanLimits::default(),
+            )
+            .unwrap();
+            loop {
+                match scanner.poll().unwrap() {
+                    ScanEvent::Packet(packet) => {
+                        session.merge(packet).unwrap();
+                    }
+                    ScanEvent::End => break,
+                    ScanEvent::NeedData { .. } => panic!("complete carrier"),
+                }
+            }
+        }
+        let assessment = session.assess().unwrap();
+        let Some(block) = damaged_block else {
+            assert_eq!(
+                assessment.status,
+                par3_rs::session::RepairStatus::Complete,
+                "{name}"
+            );
+            continue;
+        };
+        assert_eq!(
+            assessment.status,
+            par3_rs::session::RepairStatus::Ready,
+            "{name}"
+        );
+        assert_eq!(assessment.lost_blocks, [block as u64], "{name}");
+        let output = common::TempTree::new(&format!("single-recovery-repair-{name}"));
+        assert_eq!(
+            session
+                .repair(output.path(), false)
+                .unwrap()
+                .reconstructed_blocks,
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read(output.path().join("input.bin")).unwrap(),
+            original,
+            "{name}"
+        );
+    }
+}
+
+/// The reference writes a set with one recovery block under a wider FFT
+/// capacity (`-c1 -cm4`) with no field in its Start packet. The block is not
+/// the XOR of the inputs but the first transform parity of the declared
+/// capacity: here it equals recovery block 0 of the reference's capacity-16
+/// fixture made from the same input. Such a set verifies and repairs.
+#[test]
+fn a_single_recovery_block_under_a_wider_fft_capacity_records_no_field_and_repairs() {
+    let reference_parity = common::packets_of(&common::advanced_fixture("fft.vol0+1.par3"))
+        .into_iter()
+        .find_map(|packet| match packet.body() {
+            par3_rs::PacketBody::RecoveryData(body) => Some(body.data.clone()),
+            _ => None,
+        })
+        .expect("reference recovery block 0");
+    for capacity_log2 in [2, 4] {
+        let set = single_recovery_fft_set("wide", capacity_log2, "par3-rs test");
+        let names: Vec<&str> = set.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["wide.par3", "wide.vol0+1.par3"]);
+        let recovery = common::packets_of(&set[1].1)
+            .into_iter()
+            .find_map(|packet| match packet.body() {
+                par3_rs::PacketBody::RecoveryData(body) => Some(body.data.clone()),
+                _ => None,
+            })
+            .expect("recovery block 0");
+        let xor = fft_input()
+            .chunks(1024)
+            .fold(vec![0u8; 1024], |mut sum, block| {
+                sum.iter_mut()
+                    .zip(block)
+                    .for_each(|(sum, byte)| *sum ^= byte);
+                sum
+            });
+        assert_ne!(recovery, xor);
+        if capacity_log2 == 4 {
+            assert_eq!(recovery, reference_parity);
+        }
+        let carriers: Vec<Vec<u8>> = set.into_iter().map(|(_, bytes)| bytes).collect();
+        verify_and_repair_one_block(&format!("capacity-{capacity_log2}"), &carriers);
+    }
+}
+
+/// A set the reference made with `par3 c -s1024 -e8 -c1 -cm4` over the FFT
+/// input is accepted, verified and repaired, and the streaming engine
+/// recreates it byte for byte. The carriers are not in the pinned corpus yet,
+/// so the run names the directory holding `xor4.par3` and `xor4.vol0+1.par3`.
+#[test]
+#[ignore = "reads reference carriers from an explicitly configured pinned-reference run"]
+fn a_reference_single_recovery_set_under_a_wider_capacity_is_accepted() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("PAR3_REFERENCE_XOR4_DIR").expect("explicit reference directory"),
+    );
+    let names = ["xor4.par3", "xor4.vol0+1.par3"];
+    let reference: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(directory.join(name)).unwrap())
+        .collect();
+    let creator = common::packets_of(&reference[0])
+        .into_iter()
+        .find_map(|packet| match packet.body() {
+            par3_rs::PacketBody::Creator(body) => Some(body.text().into_owned()),
+            _ => None,
+        })
+        .expect("a Creator packet");
+    verify_and_repair_one_block("reference-xor4", &reference);
+    let ours = single_recovery_fft_set("xor4", 2, &creator);
+    for ((name, ours), (expected, theirs)) in ours.iter().zip(names.iter().zip(&reference)) {
+        assert_eq!(name, expected);
+        common::assert_block_eq(ours, theirs, name);
+    }
+}

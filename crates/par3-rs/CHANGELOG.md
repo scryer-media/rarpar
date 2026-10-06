@@ -37,9 +37,16 @@
   a packed tail block whole, where the reference cuts its Data packet to the
   bytes in use, and an interleaved set's data volumes count blocks singly
   where the reference counts rows of cohort blocks.
-- **Behaviour change:** a streaming-engine FFT set whose capacity is one
-  recovery block now records no Galois field in its Start packet, as the
-  reference does for that XOR-only case; it previously recorded GF(2^8).
+- **Behaviour change:** a streaming-engine FFT set now records no Galois field
+  in its Start packet exactly when the reference does: when it carries a
+  single recovery block, or its matrix reserves only one. It previously
+  recorded GF(2^8) or GF(2^16). Only a capacity of one makes that block the
+  XOR of the inputs; under a wider capacity it is still the first transform
+  parity of that capacity, computed in the field the geometry implies.
+- Verification and repair now accept an FFT set that records no Galois field
+  whatever capacity its matrix reserves, such as the reference's
+  `par3 c -c1 -cm4`. They previously refused every such set but the
+  capacity-one one as an unsupported field.
 - `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
 - **Behaviour change:** repair output on native targets is now confined to an
   opened directory capability. Replacing the output-root path or swapping a

@@ -608,9 +608,20 @@ impl CreationPlan {
                         "requested recovery exceeds FFT capacity",
                     ));
                 }
-                if geometry.capacity() == 1 && cohorts == 1 {
-                    // One recovery row at most is the XOR of the inputs, which
-                    // the reference marks with no field at all.
+                if geometry.field_bytes() == 2
+                    && !geometry.is_trivial()
+                    && !options.block_size.is_multiple_of(2)
+                {
+                    return Err(EngineError::InvalidState(
+                        "creation block is not field aligned",
+                    ));
+                }
+                if last == 1 || (geometry.capacity() == 1 && cohorts == 1) {
+                    // The reference records no field when the set carries a
+                    // single recovery block or the matrix reserves only one.
+                    // The block is still the first transform parity of the
+                    // reserved capacity: the XOR of the inputs only when that
+                    // capacity is one.
                     GaloisField {
                         size: 0,
                         generator: 0,

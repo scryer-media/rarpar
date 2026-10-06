@@ -138,8 +138,10 @@
 //! - **External Data:** full-size blocks only; packed tail blocks are omitted.
 //! - **FFT:** low-rate Cantor-field semantics follow the pinned appendix.
 //!   GF16 uses `0x1002D`, distinct from Cauchy's `0x1100B`.
-//! - **Trivial FFT:** field size zero represents one-input copy recovery or
-//!   capacity-one XOR, without transform tables.
+//! - **FFT field size zero:** the reference records no field for a set with one
+//!   recovery block or a capacity of one. The field still follows from the
+//!   geometry: only one input (a copy) or a capacity of one (XOR) needs no
+//!   transform tables.
 //! - **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
 //!   fields too; member count alone is insufficient. Corpus recipes normalize
 //!   those original ZIP fields before official insertion.
