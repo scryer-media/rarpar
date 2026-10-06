@@ -138,6 +138,12 @@
   blocks, GF(2^8) create at one worker, codec seconds: Sapphire Rapids 3.62
   to 1.87, Zen 4 3.27 to 2.03, Alder Lake 3.65 to 2.33 (GFNI AVX2), Apple
   M-series 2.33 to 2.17; bytes identical.
+- GF(2^8) batches take each factor's plan from `gf8::MulPlan::cached` instead
+  of building sixteen plans per stripe, and pick up the 512-bit shuffle
+  kernels of reedsolomon-rs 0.4.8 on AVX512BW hosts without GFNI. 1 GiB,
+  100 rows, GF(2^8) Cauchy on Skylake-SP: create 8.24 to 6.21 s at one
+  worker and 4.70 to 3.75 s at four, repair 4.72 to 3.77 s and 3.15 to
+  2.78 s; Zen 4 and Sapphire Rapids within noise; bytes identical.
 - With a worker pool, Cauchy repair reads and scatters the next group of
   surviving stripes while the workers fold the previous one, and adds the
   recovery rows to their syndromes in parallel. The second set of stripes is

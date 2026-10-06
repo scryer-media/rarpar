@@ -76,6 +76,37 @@
   (`WEAVER_GF8_PF=0` pins the plain loop): create encode at one worker,
   1 GiB, 100 rows, 8 MiB blocks, Sapphire Rapids 2.07 → 1.87 s and Zen 4
   2.10 → 2.03 s on top of the grouping. Output is bit-identical.
+- x86_64 hosts with AVX512BW but no GFNI (Skylake-SP and its server
+  successors before Ice Lake) run the GF(2^8) one-source and grouped
+  multiply-accumulate kernels as `vpshufb` nibble shuffles on 512-bit
+  vectors; only whole 64-byte strips take the 512-bit form and the tail
+  runs the existing kernels. `gf8::kernel_name` reports the tier in use, and
+  `WEAVER_GF8_AVX512=0` pins the 256-bit kernels the way `WEAVER_GF8_GFNI=0`
+  pins the shuffles. Output is bit-identical. 1 GiB, 100 rows, GF(2^8)
+  Cauchy, Skylake-SP: create 8.24 → 6.21 s at one worker and 4.70 → 3.75 s
+  at four (CPU -26% and -32%), repair 4.72 → 3.77 s and 3.15 → 2.78 s;
+  one-source ceiling at 4 KiB 27.2 → 46.8 GiB/s. GFNI hosts are unchanged.
+- `MulPlan::cached` returns a plan for any factor from a table built at
+  compile time (`MulPlan::new` and `gf8::mul` are now `const fn`), so a
+  caller that folds short rows no longer rebuilds the nibble tables and
+  affine matrix per call: build-plus-accumulate at 4 KiB rises 7% on Zen 4
+  and 9% on Skylake-SP with the AVX2 GFNI and nibble kernels; at 64 KiB
+  and above it is neutral. `gf8::mul_acc_region` takes the cached plan.
+- In `MulPlan::accumulate`, factor 0 is a no-op and factor 1 a vector XOR on
+  every tier instead of a full table multiply, and the grouped kernel drops
+  zero-factor sources before it forms its groups.
+- `LinearMap8` runs its nibble-shuffle maps (multiply-accumulate, map, fused
+  butterfly and radix-4) on 512-bit vectors on AVX512BW hosts without GFNI;
+  `gf_simd::linear_uses_avx512` says whether it does and
+  `WEAVER_LINEAR_AVX512=0` pins the 256-bit kernels. On Skylake-SP the u8
+  lane transform of 256 rows of 4 KiB runs 386 → 280 µs, and a 1 GiB GF(2^8)
+  FFT create takes about 1% less wall and 1-3% less CPU. The GFNI affine
+  maps stay at 256 bits: a 512-bit form measured a wash on Zen 4 and 2-4%
+  slower end to end on Sapphire Rapids, where the 512-bit units clock lower.
+  Output is bit-identical.
+- `kernel_ceiling` names the GF(2^8) kernel and linear forms in use and
+  gains rows for `MulPlan::new` plus accumulate (the gap to the cached row
+  is the table build) and for `LinearMap8::accumulate`.
 - Pooled transforms and derivatives walk the bank in slabs. When a bank of
   three levels or more outgrows `fft::TRANSFORM_SCRATCH_BYTES` (512 KiB)
   and every pass of the walk has at least one slab per thread, each worker
