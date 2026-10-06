@@ -162,15 +162,19 @@
 //! [`scan_packets_from_path`] reads an entire carrier before applying packet
 //! limits; use [`ingest::PacketScanner`] when that allocation must be bounded.
 //!
-//! Unsafe Rust is confined to the native Windows filesystem-security wrapper;
-//! other targets forbid it. Shared arithmetic uses CPU-specific kernels.
+//! Unsafe Rust is confined to the native Windows filesystem-security wrapper
+//! and the macOS and Linux file-clone calls repair staging makes; other
+//! targets forbid it. Shared arithmetic uses CPU-specific kernels.
 //! Set construction bounds directory expansion and rejects cycles. Parsed path
 //! components reject traversal names and separators. These are lexical checks,
 //! not a filesystem sandbox: callers must control destination links and changes
 //! to the tree during verification or repair.
 
 #![deny(unsafe_code)]
-#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    forbid(unsafe_code)
+)]
 #![warn(missing_docs)]
 
 // A wasm artifact built with `+simd128` must reach blake3's wasm SIMD kernels.

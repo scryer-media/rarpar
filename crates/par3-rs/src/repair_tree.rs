@@ -4,6 +4,10 @@ use cap_std::ambient_authority;
 #[cfg(unix)]
 use cap_std::fs::DirBuilder;
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "repair_tree_clone.rs"]
+#[allow(unsafe_code)]
+pub(crate) mod clone;
 #[cfg(windows)]
 #[path = "repair_tree_windows.rs"]
 #[allow(unsafe_code)]
@@ -15,13 +19,21 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::runtime::{EngineError, EngineFile, EngineResult, ExecutionOptions};
 use crate::session_repair::RepairDurability;
+use crate::source::SourceSnapshot;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// Makes every clone attempt on this thread fail as one across devices does,
+// so the copy fallback is exercised without a second filesystem.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+thread_local! {
+    pub(crate) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // Directory capabilities consume the same budget as data files. Field order
 // closes the OS handle before its reservation is returned.
@@ -114,6 +126,8 @@ pub(crate) struct RepairTree {
     root: BudgetedDir,
     stage_component: OsString,
     stage: Option<BudgetedDir>,
+    /// The staging filesystem refused a clone outright; stop asking.
+    clones_refused: AtomicBool,
 }
 
 impl RepairTree {
@@ -156,6 +170,7 @@ impl RepairTree {
                         root,
                         stage_component: candidate.into(),
                         stage: Some(stage),
+                        clones_refused: AtomicBool::new(false),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -262,6 +277,181 @@ impl RepairTree {
             return Err(error.into());
         }
         Ok((name.into(), display))
+    }
+
+    /// Stage output `index` as [`Self::create_stage_registered`] does, or, given
+    /// `clone_from`, as a clone of the file now at that destination when it is
+    /// the regular file the snapshot describes and the filesystem can share its
+    /// extents. Returns whether the staged file is such a clone; one holds the
+    /// snapshot's bytes, cut or zero-extended to `len`.
+    ///
+    /// The file is opened read-only through the destination's parent capability
+    /// and identified from that handle, and the clone is taken from the same
+    /// handle, so a name swapped after the check is never cloned. The clone
+    /// holds the bytes as they were when it was taken, so the caller still
+    /// checks the source afterwards.
+    pub(crate) fn create_stage_from(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        clone_from: Option<(&Destination, SourceSnapshot)>,
+    ) -> EngineResult<(OsString, PathBuf, bool)> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some((destination, source)) = clone_from
+            && let Some(staged) =
+                self.clone_stage(index, len, options, outputs, destination, source)?
+        {
+            return Ok(staged);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = clone_from;
+        let (name, display) = self.create_stage_registered(index, len, options, outputs)?;
+        Ok((name, display, false))
+    }
+
+    /// The clone half of [`Self::create_stage_from`]; `None` when nothing was
+    /// staged and the caller should create the file instead.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn clone_stage(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        destination: &Destination,
+        source: SourceSnapshot,
+    ) -> EngineResult<Option<(OsString, PathBuf, bool)>> {
+        if self.clones_refused.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let Some(original) = self.open_original(destination, source, options)? else {
+            return Ok(None);
+        };
+        let name = format!(".par3-repair-{index}.tmp");
+        let display = self.base.join(&self.stage_component).join(&name);
+        #[cfg(test)]
+        let refused = REFUSE_CLONES.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let refused = false;
+        let refusal = |error: &io::Error| {
+            tracing::debug!(%error, "PAR3 repair staging copies instead of cloning");
+            if clone::never(error) {
+                self.clones_refused.store(true, Ordering::Relaxed);
+            }
+        };
+        let discard = |file: Option<EngineFile>, outputs: &mut Vec<PathBuf>| {
+            drop(file);
+            if self.stage().remove_file(&name).is_ok() {
+                outputs.retain(|path| path != &display);
+            }
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let cloned = if refused {
+                Err(io::Error::from_raw_os_error(libc::EXDEV))
+            } else {
+                clone::clone_new(&original, &self.stage().dir, OsStr::new(&name))
+            };
+            drop(original);
+            match cloned {
+                Ok(()) => {}
+                Err(error) if clone::unsupported(&error) => {
+                    refusal(&error);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            outputs.push(display.clone());
+            if source.len != len {
+                let mut open = OpenOptions::new();
+                open.write(true);
+                let resized = EngineFile::open_with(options, || {
+                    self.stage()
+                        .open_with(&name, &open)
+                        .map(cap_std::fs::File::into_std)
+                })
+                .and_then(|file| Ok(file.set_len(len)?));
+                if let Err(error) = resized {
+                    discard(None, outputs);
+                    return Err(error);
+                }
+            }
+            options.diagnostics.note_clone();
+            Ok(Some((name.into(), display, true)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut open = OpenOptions::new();
+            open.write(true).create_new(true);
+            let file = EngineFile::open_with(options, || {
+                self.stage()
+                    .open_with(&name, &open)
+                    .map(cap_std::fs::File::into_std)
+            })?;
+            outputs.push(display.clone());
+            let cloned = if refused {
+                Err(io::Error::from_raw_os_error(libc::EXDEV))
+            } else {
+                clone::clone_into(&original, &file)
+            };
+            drop(original);
+            // A refused clone leaves the file empty, exactly as a fresh stage
+            // is created, so it is kept and sized rather than made again.
+            let cloned = match cloned {
+                Ok(()) => true,
+                Err(error) if clone::unsupported(&error) => {
+                    refusal(&error);
+                    false
+                }
+                Err(error) => {
+                    discard(Some(file), outputs);
+                    return Err(error.into());
+                }
+            };
+            if (!cloned || source.len != len)
+                && let Err(error) = file.set_len(len)
+            {
+                discard(Some(file), outputs);
+                return Err(error.into());
+            }
+            if cloned {
+                options.diagnostics.note_clone();
+            }
+            Ok(Some((name.into(), display, cloned)))
+        }
+    }
+
+    /// The file at `destination`, opened read-only through its parent
+    /// capability, when it is the regular file `source` describes.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_original(
+        &self,
+        destination: &Destination,
+        source: SourceSnapshot,
+        options: &ExecutionOptions,
+    ) -> EngineResult<Option<EngineFile>> {
+        use cap_std::fs::OpenOptionsExt;
+        let Ok((parent, filename)) = self.destination_parent(&destination.relative, false) else {
+            return Ok(None);
+        };
+        let mut open = OpenOptions::new();
+        open.read(true).custom_flags(libc::O_NOFOLLOW);
+        let original = match EngineFile::open_with(options, || {
+            parent
+                .open_with(&filename, &open)
+                .map(cap_std::fs::File::into_std)
+        }) {
+            Ok(file) => file,
+            Err(EngineError::Io(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        drop(parent);
+        if !clone::is_source(&original.metadata()?, source) {
+            return Ok(None);
+        }
+        Ok(Some(original))
     }
 
     pub(crate) fn create_stage_file(

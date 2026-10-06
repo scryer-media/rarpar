@@ -196,6 +196,12 @@ impl EngineFile {
         Ok(())
     }
 }
+#[cfg(unix)]
+impl std::os::fd::AsFd for EngineFile {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
 impl Read for EngineFile {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.diagnostics

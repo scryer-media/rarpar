@@ -1,8 +1,10 @@
 //! Stage-level native benchmark driver, not a supported CLI.
 //!
 //! Arguments: OP DATA CARRIERS OUTPUT WORKERS MEMORY_MIB [CODEC BLOCK RECOVERY INTERLEAVE].
-//! OP is create, scan, verify, reassess, repair, or placement. Inputs are explicitly
-//! generated `.bin` files in DATA; carriers are `.par3` files in CARRIERS.
+//! OP is create, scan, verify, reassess, repair, placement, or inside. Inputs are
+//! explicitly generated `.bin` files in DATA; carriers are `.par3` files in CARRIERS.
+//! `inside` embeds PAR3 in the one `.zip`/`.7z` archive in DATA, with CARRIERS
+//! as its scratch directory and the result written into OUTPUT.
 //! Timing excludes directory discovery. Each invocation is one fresh process.
 //! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
 //! the default is sync-files. The selected policy is recorded in metrics.
@@ -55,6 +57,9 @@ impl SourceAccess for Counted {
         source: SourceId,
     ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
         self.0.open_sequential(source)
+    }
+    fn open_file(&self, source: SourceId) -> std::io::Result<Option<par3_rs::source::SourceFile>> {
+        self.0.open_file(source)
     }
 }
 
@@ -114,10 +119,50 @@ fn main() -> Result<()> {
         });
         access.insert(id, path);
     }
-    if sources.is_empty() {
+    if operation == "inside" {
+        // DATA holds one `.zip` or `.7z` archive; CARRIERS is the scratch
+        // directory and OUTPUT receives the archive with PAR3 inside it.
+        if args.len() != 10 || args[6] != "cauchy" {
+            return Err("inside needs cauchy BLOCK RECOVERY INTERLEAVE".into());
+        }
+        let mut archives = files(data, "zip")?;
+        archives.extend(files(data, "7z")?);
+        let [archive] = archives.as_slice() else {
+            return Err("inside needs exactly one archive".into());
+        };
+        let name = archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("non-UTF8 filename")?
+            .to_owned();
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(0), archive.clone());
+        let access = Arc::new(Counted(access, snapshots.clone()));
+        let settings = CreationOptions {
+            block_size: args[7].parse()?,
+            recovery_count: args[8].parse()?,
+            codec: CreationCodec::Cauchy,
+            execution: options.clone(),
+            ..CreationOptions::default()
+        };
+        let before = options.diagnostics.source_io();
+        let start = Instant::now();
+        let plan = par3_rs::inside::InsertionPlan::build(
+            access,
+            SourceId(0),
+            &name,
+            settings,
+            &par3_rs::inside::ContainerLimits::default(),
+        )?;
+        metric("inside_plan", start, before, &options);
+        let before = options.diagnostics.source_io();
+        let start = Instant::now();
+        plan.execute(&output.join(&name), carriers)?;
+        metric("inside", start, before, &options);
+        println!("{{\"output_bytes\":{}}}", plan.requirements().output_bytes);
+    } else if sources.is_empty() {
         return Err("no benchmark inputs".into());
-    }
-    if operation == "create" {
+    } else if operation == "create" {
         if args.len() != 10 {
             return Err("creation needs CODEC BLOCK RECOVERY INTERLEAVE".into());
         }
@@ -296,6 +341,7 @@ fn main() -> Result<()> {
         }
     }
     for stage in [
+        Stage::Container,
         Stage::Scan,
         Stage::Metadata,
         Stage::Verify,
@@ -321,13 +367,14 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"source_snapshots\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"source_snapshots\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
         io.write_calls,
         options.diagnostics.file_opens(),
         sync.completed,
+        options.diagnostics.file_clones(),
         snapshots.load(Ordering::Relaxed),
         options.memory.limit(),
         options.workers

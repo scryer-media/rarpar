@@ -128,6 +128,19 @@ impl RepairTree {
         Ok((name.into(), display))
     }
 
+    /// WASI has no file clones; every output is created and written.
+    pub(crate) fn create_stage_from(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        _clone_from: Option<(&Destination, crate::source::SourceSnapshot)>,
+    ) -> EngineResult<(OsString, PathBuf, bool)> {
+        let (name, display) = self.create_stage_registered(index, len, options, outputs)?;
+        Ok((name, display, false))
+    }
+
     pub(crate) fn create_stage_file(
         &self,
         index: usize,

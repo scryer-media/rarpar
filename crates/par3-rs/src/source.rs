@@ -26,6 +26,16 @@ pub struct SourceSnapshot {
     pub generation: u64,
 }
 
+/// The open local file behind a source, from [`SourceAccess::open_file`]. It
+/// has no public interface; only the engine uses it.
+pub struct SourceFile(pub(crate) Arc<File>);
+
+impl std::fmt::Debug for SourceFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SourceFile")
+    }
+}
+
 /// Read-only source contract for both protected files and packet carriers.
 ///
 /// A short read stops at a hole or EOF. Never synthesize zeros for missing bytes.
@@ -58,6 +68,15 @@ pub trait SourceAccess: Send + Sync {
     /// verifier resumes through `next_available` after this prefix and checks
     /// generations. Return `None` if an honest forward prefix is unavailable.
     fn open_sequential(&self, _source: SourceId) -> io::Result<Option<Box<dyn Read + Send>>> {
+        Ok(None)
+    }
+
+    /// Optionally the open local file behind `source`, so that an output
+    /// which begins with the source's bytes can be staged as a clone of it
+    /// where the filesystem shares extents. The engine uses the file only
+    /// once its metadata matches the source's snapshot. Only
+    /// [`DiskSourceAccess`] returns one; a wrapper around it forwards this.
+    fn open_file(&self, _source: SourceId) -> io::Result<Option<SourceFile>> {
         Ok(None)
     }
 }
@@ -389,14 +408,9 @@ impl SourceAccess for DiskSourceAccess {
         #[cfg(not(unix))]
         hash_disk_contents(path, source, &metadata, &self.options, &mut hash)
             .map_err(EngineError::into_io)?;
-        let generation = u64::from_le_bytes(
-            hash.finalize().as_bytes()[..8]
-                .try_into()
-                .expect("eight bytes"),
-        );
         Ok(Some(SourceSnapshot {
             len: metadata.len(),
-            generation,
+            generation: disk_generation(hash),
         }))
     }
 
@@ -436,6 +450,39 @@ impl SourceAccess for DiskSourceAccess {
         Ok(Some(Box::new(
             File::open(self.path(source)?, &self.options).map_err(EngineError::into_io)?,
         )))
+    }
+
+    /// The cached read handle when there is one, so the file is not opened
+    /// again; otherwise a fresh read-only handle.
+    fn open_file(&self, source: SourceId) -> io::Result<Option<SourceFile>> {
+        let path = self.path(source)?;
+        if self.cached_handles() != 0 {
+            self.options.validate().map_err(EngineError::into_io)?;
+            if let Ok(file) = self.handles.lookup(source) {
+                return Ok(Some(SourceFile(file)));
+            }
+        }
+        let file = File::open(path, &self.options).map_err(EngineError::into_io)?;
+        Ok(Some(SourceFile(Arc::new(file))))
+    }
+}
+
+fn disk_generation(hash: blake3::Hasher) -> u64 {
+    u64::from_le_bytes(
+        hash.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("eight bytes"),
+    )
+}
+
+/// The snapshot [`DiskSourceAccess`] reports for a file with `metadata`. On
+/// Unix it depends on the metadata alone, so a handle to a file says whether
+/// that file is the one a disk snapshot was taken of.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn disk_snapshot(metadata: &std::fs::Metadata) -> SourceSnapshot {
+    SourceSnapshot {
+        len: metadata.len(),
+        generation: disk_generation(disk_metadata_hash(metadata)),
     }
 }
 

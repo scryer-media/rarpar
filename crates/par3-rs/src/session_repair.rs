@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
 
+use crate::evidence::ExtentVerdict;
 use crate::gf::{Field, Gf8, Gf16};
 use crate::layout::BlockLayout;
 use crate::packet::PacketBody;
@@ -60,6 +61,80 @@ struct StagedFile {
     destination: Option<Destination>,
     stage_name: Option<OsString>,
     temporary: PathBuf,
+    /// When the staged file is a clone of this output's verified source, that
+    /// source's verdicts: see [`Self::holds`].
+    cloned: Option<Arc<crate::evidence::ExtentVerdicts>>,
+}
+
+impl StagedFile {
+    /// Whether the clone this output was staged from already holds extent
+    /// `extent`: a block extent with its own fingerprint, which the evidence
+    /// for the cloned file holds intact. Such an extent is never written, and
+    /// a block every output holds this way is never read to be copied.
+    fn holds(&self, extents: &crate::layout::FileExtents, extent: usize) -> bool {
+        self.cloned
+            .as_ref()
+            .is_some_and(|verdicts| held(verdicts, extents, extent))
+    }
+}
+
+fn held(
+    verdicts: &crate::evidence::ExtentVerdicts,
+    extents: &crate::layout::FileExtents,
+    extent: usize,
+) -> bool {
+    verdicts.get(extent) == Some(ExtentVerdict::Intact)
+        && extents.block_at(extent).is_some()
+        && matches!(
+            extents.get(extent).map(|item| item.kind),
+            Some(crate::layout::ExtentKind::Block {
+                fingerprint: Some(_),
+                ..
+            })
+        )
+}
+
+/// The evidence output `index` may be staged from by cloning the file at its
+/// destination, on the targets that clone. It must be this file's evidence for
+/// this layout and hold at least one extent the clone would spare writing, and
+/// the file must have no unprotected range: a fresh stage leaves those zero,
+/// where a clone would keep whatever the original had there.
+///
+/// Whether the destination is the file this evidence verified is settled by
+/// [`RepairTree::create_stage_from`] from the destination's own handle.
+fn clone_source<'a>(
+    session: &'a Par3RepairSession,
+    layout: &BlockLayout,
+    index: usize,
+) -> Option<&'a crate::evidence::FileEvidence> {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return None;
+    }
+    let file = &layout.files[index];
+    let evidence = session.evidence.get(&file.path)?;
+    if evidence.file != index || evidence.check_layout(layout).is_err() {
+        return None;
+    }
+    let extents = &file.extents;
+    if (0..extents.len()).any(|extent| extents.is_unprotected(extent)) {
+        return None;
+    }
+    (0..extents.len())
+        .any(|extent| held(&evidence.verdicts, extents, extent))
+        .then_some(evidence)
+}
+
+/// Whether some output being staged still needs bytes of `block` written:
+/// it names the block in an extent its clone does not already hold.
+fn needs_write(layout: &BlockLayout, outputs: &[StagedFile], block: u64) -> bool {
+    layout.locations(block).is_some_and(|locations| {
+        locations.iter().any(|location| {
+            outputs.iter().any(|target| {
+                target.index == location.file
+                    && !target.holds(&layout.files[location.file].extents, location.extent)
+            })
+        })
+    })
 }
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -199,17 +274,36 @@ fn repair_inner(
         let mut staged = Vec::with_capacity(destinations.len());
         for (index, destination) in destinations {
             session.options.cancel.check()?;
-            let (stage_name, temporary) = tree.create_stage_registered(
+            // An output whose destination still holds the file its evidence
+            // verified is staged as a clone of that file where the filesystem
+            // allows, and the repair writes only what the clone lacks.
+            let source = clone_source(session, layout, index);
+            let (stage_name, temporary, cloned) = tree.create_stage_from(
                 index,
                 layout.files[index].len,
                 &session.options,
                 temporary_outputs,
+                source.map(|evidence| (&destination, evidence.snapshot)),
             )?;
+            let cloned = match source {
+                Some(evidence) if cloned => {
+                    // The clone holds the file as it was when it was taken;
+                    // this ties it to the bytes the evidence verified.
+                    crate::source::ensure_snapshot(
+                        session.access.as_ref(),
+                        evidence.source,
+                        evidence.snapshot,
+                    )?;
+                    Some(Arc::clone(&evidence.verdicts))
+                }
+                _ => None,
+            };
             staged.push(StagedFile {
                 index,
                 destination: Some(destination),
                 stage_name: Some(stage_name),
                 temporary,
+                cloned,
             });
         }
         let proof = StagedProof::new(layout, &staged, &session.options);
@@ -314,6 +408,7 @@ pub(crate) fn stage_embedded(
         destination: None,
         stage_name: None,
         temporary: temporary.to_owned(),
+        cloned: None,
     }];
     OpenOptions::new()
         .write(true)
@@ -368,11 +463,9 @@ fn copy_available(
     let mut covered = vec![0; size];
     let mut copied = false;
     let writers = StageWriters::new(tree, session, proof);
-    for (block, locations) in layout.blocks() {
-        if !locations
-            .iter()
-            .any(|location| outputs.iter().any(|target| target.index == location.file))
-        {
+    for (block, _) in layout.blocks() {
+        // A block every staged clone already holds is not read at all.
+        if !needs_write(layout, outputs, block) {
             continue;
         }
         copied = true;
@@ -581,6 +674,12 @@ where
             if lost.binary_search(&block).is_ok() {
                 continue;
             }
+            // Every block the matrix covers is read for the syndromes, even
+            // where a staged clone already holds it and its scatter writes
+            // nothing; a block outside it is read only to be written.
+            if !coverage.contains(&block) && !needs_write(layout, outputs, block) {
+                continue;
+            }
             session.read_block(
                 block,
                 offset,
@@ -722,11 +821,7 @@ fn reconstruct_fft(
         {
             continue;
         }
-        if !layout.locations(block).is_some_and(|locations| {
-            locations
-                .iter()
-                .any(|location| outputs.iter().any(|output| output.index == location.file))
-        }) {
+        if !needs_write(layout, outputs, block) {
             continue;
         }
         let mut offset = 0;
@@ -978,6 +1073,9 @@ fn scatter(
         };
         let target = &outputs[slot];
         let extents = &layout.files[location.file].extents;
+        if target.holds(extents, location.extent) {
+            continue;
+        }
         let Some(extent) = extents.range(location.extent) else {
             continue;
         };
@@ -1061,6 +1159,19 @@ fn verify_staged(
 /// never written, a mismatch, a frontier the budget refuses, or a File packet
 /// with no whole-file fingerprint — falls back to that read-back, so a staged
 /// file built from wrong bytes is refused exactly as before.
+///
+/// A staged clone is the other way an extent is proven. Such an output was
+/// staged as a clone of the file at its destination, taken from a handle whose
+/// metadata matched the snapshot of the source its evidence verified, and that
+/// source was checked against the same snapshot right after the clone and is
+/// checked again before installation. A Unix snapshot is the file's identity
+/// and change time, so the clone holds the bytes the evidence verified. Every
+/// extent that evidence holds intact against the extent's own fingerprint is
+/// therefore proven without being written, sits inside both the source and
+/// the final length, so the resize to that length leaves it alone, and is never
+/// written by the repair. Every other protected extent — lost or damaged, past
+/// the source's end, inline, or without its own fingerprint — is written and
+/// proven as above, or the output reads back.
 ///
 /// The one difference is metadata that contradicts itself: per-extent
 /// fingerprints every proven byte matches, under a whole-file fingerprint those
@@ -1155,19 +1266,30 @@ impl<'a> StagedProof<'a> {
             .iter()
             .map(|target| {
                 let file = &layout.files[target.index];
-                let unproven = (0..file.extents.len())
+                let mut unproven = (0..file.extents.len())
                     .filter(|&index| !file.extents.is_unprotected(index))
                     .count();
                 let doubt = reservation.is_none() || unproven == 0 || file.fingerprint == [0; 16];
+                let mut proven = if doubt {
+                    Vec::new()
+                } else {
+                    vec![0; file.extents.len().div_ceil(64)]
+                };
+                // What a staged clone holds is proven by the evidence for the
+                // file it cloned; see `finish_staged`.
+                if !doubt && target.cloned.is_some() {
+                    for index in 0..file.extents.len() {
+                        if target.holds(&file.extents, index) {
+                            proven[index / 64] |= 1u64 << (index % 64);
+                            unproven -= 1;
+                        }
+                    }
+                }
                 OutputProof {
                     index: target.index,
                     doubt,
                     unproven,
-                    proven: if doubt {
-                        Vec::new()
-                    } else {
-                        vec![0; file.extents.len().div_ceil(64)]
-                    },
+                    proven,
                     partial: HashMap::new(),
                 }
             })
@@ -1400,6 +1522,43 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
                 continue;
             }
             Err(error) => return Err(error),
+        }
+    }
+    Err(EngineError::resource_limit("temporary output names"))
+}
+
+/// Create a staging file under a name [`stage_path`] would choose, as a clone
+/// of the open file `source`; `None` when the filesystem cannot clone it here,
+/// and the caller stages with [`stage_path`] instead.
+#[cfg(target_os = "macos")]
+pub(crate) fn clone_stage_path(
+    destination: &Path,
+    source: &impl std::os::fd::AsFd,
+) -> EngineResult<Option<PathBuf>> {
+    use crate::repair_tree::clone;
+    let parent = destination
+        .parent()
+        .ok_or(EngineError::InvalidState("output has no parent"))?;
+    for _ in 0..128 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".par3-repair-{sequence}.tmp"));
+        #[cfg(test)]
+        let refused = crate::repair_tree::REFUSE_CLONES.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let refused = false;
+        let cloned = if refused {
+            Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+        } else {
+            clone::clone_path(source, &temporary)
+        };
+        match cloned {
+            Ok(()) => return Ok(Some(temporary)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if clone::unsupported(&error) => {
+                tracing::debug!(%error, "PAR3 staging copies instead of cloning");
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     Err(EngineError::resource_limit("temporary output names"))
@@ -1976,6 +2135,7 @@ mod proof_tests {
                 destination: None,
                 stage_name: None,
                 temporary: PathBuf::new(),
+                cloned: None,
             });
             let mut protected = Vec::new();
             for extent in 0..file.extents.len() {
@@ -2131,5 +2291,71 @@ mod proof_tests {
         let bits = roomy.memory.used();
         drop(proof);
         options(bits)
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod clone_tests {
+    //! A clone the filesystem refuses stages by copying, with the same bytes.
+    use super::*;
+    use crate::repair_tree::REFUSE_CLONES;
+    use crate::source::{DiskSourceAccess, SourceId};
+    use crate::test_reference::{TempTree, cauchy_block_set, scanned_packets};
+
+    /// Repair a damaged `input.bin` in place: (clones, bytes written).
+    fn repair_in_place(refuse: bool) -> (u64, u64) {
+        let block = 64u64 << 10;
+        let tree = TempTree::new("clone-refused");
+        let set = cauchy_block_set(16, block, 2, b"PAR3 refused clone", &tree);
+        let bytes = &set.contents[0].1;
+        let mut damaged = bytes.clone();
+        damaged[5 * block as usize + 9] ^= 0x40;
+        let inputs = TempTree::new("clone-refused-inputs");
+        let options = ExecutionOptions {
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), inputs.write("input.bin", &damaged));
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let before = options.diagnostics.file_io();
+        REFUSE_CLONES.with(|refused| refused.set(refuse));
+        let report = session.repair(inputs.path(), false);
+        REFUSE_CLONES.with(|refused| refused.set(false));
+        assert_eq!(report.unwrap().installed.len(), 1);
+        let after = options.diagnostics.file_io();
+        assert_eq!(
+            &std::fs::read(inputs.path().join("input.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            after.read_bytes - before.read_bytes,
+            bytes.len() as u64 - block,
+            "the surviving blocks once, and nothing read back"
+        );
+        (
+            options.diagnostics.file_clones(),
+            after.write_bytes - before.write_bytes,
+        )
+    }
+
+    #[test]
+    fn a_refused_clone_falls_back_to_a_full_copy_with_the_same_bytes() {
+        let len = 16u64 * (64 << 10);
+        assert_eq!(repair_in_place(true), (0, len));
+        let (clones, written) = repair_in_place(false);
+        if cfg!(target_os = "macos") || clones == 1 {
+            assert_eq!((clones, written), (1, 64 << 10));
+        } else {
+            assert_eq!(written, len);
+        }
     }
 }

@@ -785,7 +785,78 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut spool = match self.options.codec {
+        let mut spool = self.encode(scratch_directory)?;
+        // The spool is scratch this process reads back and deletes; no policy
+        // makes it durable.
+        let mut staged = Vec::new();
+        for (number, destination) in destinations.iter().enumerate() {
+            self.options.execution.cancel.check()?;
+            let temporary =
+                crate::session_repair::ScratchFile::new(destination, &self.options.execution)?;
+            let buffer_size = self.options.execution.stripe_bytes.min(64 << 10);
+            let _output_buffer = self
+                .options
+                .execution
+                .memory
+                .reserve_as(MemoryCategory::OutputStaging, buffer_size)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .open_budgeted(temporary.path(), &self.options.execution)?;
+            // Packets are authenticated as the buffer hands them to the file,
+            // so the staged carrier is never read back. A streamed payload is
+            // read twice, once to hash and once to write; this is what proves
+            // the second read wrote what the first one hashed.
+            let mut out = std::io::BufWriter::with_capacity(
+                buffer_size,
+                crate::ingest::AuthenticatingWriter::new(
+                    file,
+                    self.id,
+                    self.options.execution.clone(),
+                ),
+            );
+            self.write_output(number, &mut spool, &mut out)?;
+            let out = out
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            // The temporary was created empty and written from its start, so
+            // the bytes counted are its length.
+            out.finish(self.requirements.output_sizes[number])?;
+            if durability == CreationDurability::SyncFiles {
+                out.get_ref().sync_all()?;
+            }
+            drop(out);
+            drop(_output_buffer);
+            staged.push(temporary);
+        }
+        drop(spool);
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        let mut installed = Vec::new();
+        for (temporary, destination) in staged.iter().zip(&destinations) {
+            let result = self.options.execution.cancel.check().and_then(|()| {
+                std::fs::hard_link(temporary.path(), destination).map_err(EngineError::from)
+            });
+            if let Err(cause) = result {
+                return if installed.is_empty() {
+                    Err(cause)
+                } else {
+                    Err(EngineError::OutputInterrupted {
+                        installed,
+                        cause: Box::new(cause),
+                    })
+                };
+            }
+            installed.push(destination.clone());
+            progress.advance(1);
+        }
+        Ok(destinations)
+    }
+
+    /// Encode the recovery rows into a spool: resident when they fit the
+    /// budget, otherwise a scratch file in `scratch_directory`.
+    fn encode(&self, scratch_directory: &Path) -> EngineResult<RecoverySpool> {
+        Ok(match self.options.codec {
             _ if self.options.recovery_count == 0 => RecoverySpool::Memory {
                 rows: Vec::new(),
                 _reservation: self
@@ -859,131 +930,115 @@ impl CreationPlan {
                 }
                 spool
             }
-        };
-        // The spool is scratch this process reads back and deletes; no policy
-        // makes it durable.
-        let mut staged = Vec::new();
-        for (number, destination) in destinations.iter().enumerate() {
-            self.options.execution.cancel.check()?;
-            let temporary =
-                crate::session_repair::ScratchFile::new(destination, &self.options.execution)?;
-            let buffer_size = self.options.execution.stripe_bytes.min(64 << 10);
-            let _output_buffer = self
-                .options
-                .execution
-                .memory
-                .reserve_as(MemoryCategory::OutputStaging, buffer_size)?;
-            let file = OpenOptions::new()
-                .write(true)
-                .open_budgeted(temporary.path(), &self.options.execution)?;
-            // Packets are authenticated as the buffer hands them to the file,
-            // so the staged carrier is never read back. A streamed payload is
-            // read twice, once to hash and once to write; this is what proves
-            // the second read wrote what the first one hashed.
-            let mut out = std::io::BufWriter::with_capacity(
-                buffer_size,
-                crate::ingest::AuthenticatingWriter::new(
-                    file,
-                    self.id,
-                    self.options.execution.clone(),
-                ),
-            );
-            for packet in &self.metadata {
-                out.write_all(packet)?;
-            }
-            // A payload held whole is read once, then hashed and written from
-            // the same bytes; without room for one it streams twice, as it
-            // always did. Resident recovery rows are already whole.
-            let mut whole = (number > self.volumes.len()
-                || (number > 0 && matches!(spool, RecoverySpool::File { .. })))
-            .then(|| self.whole_payload())
-            .flatten();
-            if number > 0 && number <= self.volumes.len() {
-                // The carrier holds whole rows: every cohort's recovery index
-                // for each of its rows, which is one contiguous run of global
-                // indices because a row's indices are adjacent.
-                let (first_row, rows) = self.volumes[number - 1];
-                let cohorts = self.requirements.cohorts;
-                let first = first_row * cohorts;
-                let count = rows * cohorts;
-                for index in first..first + count {
-                    let mut prefix = Vec::with_capacity(40);
-                    prefix.extend_from_slice(&self.root);
-                    prefix.extend_from_slice(&self.matrix);
-                    prefix.extend_from_slice(&index.to_le_bytes());
-                    let at = (index - self.options.first_recovery) * self.options.block_size;
-                    match &mut spool {
-                        RecoverySpool::Memory { rows, .. } => {
-                            let at = at as usize;
-                            self.write_resident(
-                                &mut out,
-                                PacketType::RecoveryData,
-                                &prefix,
-                                &rows[at..at + self.options.block_size as usize],
-                            )?;
-                        }
-                        RecoverySpool::File { file, .. } => self.write_payload(
-                            &mut out,
+        })
+    }
+
+    /// Write output `number` — the index, a recovery volume or a data volume —
+    /// to `out`, whole: its metadata and then its packets.
+    fn write_output(
+        &self,
+        number: usize,
+        spool: &mut RecoverySpool,
+        out: &mut impl Write,
+    ) -> EngineResult<()> {
+        for packet in &self.metadata {
+            out.write_all(packet)?;
+        }
+        // A payload held whole is read once, then hashed and written from
+        // the same bytes; without room for one it streams twice, as it
+        // always did. Resident recovery rows are already whole.
+        let mut whole = (number > self.volumes.len()
+            || (number > 0 && matches!(spool, RecoverySpool::File { .. })))
+        .then(|| self.whole_payload())
+        .flatten();
+        if number > 0 && number <= self.volumes.len() {
+            // The carrier holds whole rows: every cohort's recovery index
+            // for each of its rows, which is one contiguous run of global
+            // indices because a row's indices are adjacent.
+            let (first_row, rows) = self.volumes[number - 1];
+            let cohorts = self.requirements.cohorts;
+            let first = first_row * cohorts;
+            let count = rows * cohorts;
+            for index in first..first + count {
+                let mut prefix = Vec::with_capacity(40);
+                prefix.extend_from_slice(&self.root);
+                prefix.extend_from_slice(&self.matrix);
+                prefix.extend_from_slice(&index.to_le_bytes());
+                let at = (index - self.options.first_recovery) * self.options.block_size;
+                match spool {
+                    RecoverySpool::Memory { rows, .. } => {
+                        let at = at as usize;
+                        self.write_resident(
+                            out,
                             PacketType::RecoveryData,
                             &prefix,
-                            whole.as_mut().map(|(body, _)| body.as_mut_slice()),
-                            |offset, bytes| {
-                                file.seek(SeekFrom::Start(at + offset))?;
-                                file.read_exact(bytes)?;
-                                Ok(())
-                            },
-                        )?,
+                            &rows[at..at + self.options.block_size as usize],
+                        )?;
                     }
-                }
-            } else if number > self.volumes.len() {
-                let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
-                for index in first..first + count {
-                    self.write_payload(
-                        &mut out,
-                        PacketType::Data,
-                        &index.to_le_bytes(),
+                    RecoverySpool::File { file, .. } => self.write_payload(
+                        out,
+                        PacketType::RecoveryData,
+                        &prefix,
                         whole.as_mut().map(|(body, _)| body.as_mut_slice()),
-                        |offset, bytes| self.read_block(index as usize, offset, bytes, None),
-                    )?;
+                        |offset, bytes| {
+                            file.seek(SeekFrom::Start(at + offset))?;
+                            file.read_exact(bytes)?;
+                            Ok(())
+                        },
+                    )?,
                 }
             }
-            let out = out
-                .into_inner()
-                .map_err(std::io::IntoInnerError::into_error)?;
-            // The temporary was created empty and written from its start, so
-            // the bytes counted are its length.
-            out.finish(self.requirements.output_sizes[number])?;
-            if durability == CreationDurability::SyncFiles {
-                out.get_ref().sync_all()?;
+        } else if number > self.volumes.len() {
+            let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
+            for index in first..first + count {
+                self.write_payload(
+                    out,
+                    PacketType::Data,
+                    &index.to_le_bytes(),
+                    whole.as_mut().map(|(body, _)| body.as_mut_slice()),
+                    |offset, bytes| self.read_block(index as usize, offset, bytes, None),
+                )?;
             }
-            drop(out);
-            drop(whole);
-            drop(_output_buffer);
-            staged.push(temporary);
         }
+        Ok(())
+    }
+
+    /// Write the one carrier an embedded plan places inside its archive, the
+    /// metadata and every recovery packet, to `out` instead of to a file.
+    /// Sources are checked as [`Self::execute`] checks them.
+    pub(crate) fn write_embedded(
+        &self,
+        out: &mut impl Write,
+        scratch_directory: &Path,
+    ) -> EngineResult<()> {
+        let mut progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Create)?;
+        if self.volumes.len() != 1 || !self.data_volumes.is_empty() {
+            return Err(EngineError::InvalidState("embedded carrier layout"));
+        }
+        if self.options.execution.open_handles < 3 {
+            return Err(EngineError::resource_limit(
+                "creation requires three open handles",
+            ));
+        }
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        let mut spool = self.encode(scratch_directory)?;
+        self.write_output(1, &mut spool, out)?;
         drop(spool);
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
-        let mut installed = Vec::new();
-        for (temporary, destination) in staged.iter().zip(&destinations) {
-            let result = self.options.execution.cancel.check().and_then(|()| {
-                std::fs::hard_link(temporary.path(), destination).map_err(EngineError::from)
-            });
-            if let Err(cause) = result {
-                return if installed.is_empty() {
-                    Err(cause)
-                } else {
-                    Err(EngineError::OutputInterrupted {
-                        installed,
-                        cause: Box::new(cause),
-                    })
-                };
-            }
-            installed.push(destination.clone());
-            progress.advance(1);
-        }
-        Ok(destinations)
+        progress.advance(1);
+        Ok(())
+    }
+
+    /// The whole-file fingerprint of an embedded plan's protected bytes.
+    pub(crate) fn embedded_fingerprint(&self) -> [u8; 16] {
+        self.files[0].packet.fingerprint
     }
 
     /// Read one stripe of an input block. Each piece read is checked against

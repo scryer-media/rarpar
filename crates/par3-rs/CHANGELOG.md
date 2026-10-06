@@ -30,7 +30,8 @@
   its bytes, and rename it atomically. Failed installation rolls back its backup.
 - Unix staging directories are created with mode `0700`; Windows creates them
   with a protected owner-only ACL. Windows native calls are isolated in one
-  module with safe interfaces; all other targets retain `forbid(unsafe_code)`.
+  module with safe interfaces; targets other than Windows, macOS and Linux
+  retain `forbid(unsafe_code)` (see file-clone staging below).
 - Close the staging-directory handle before removing it on Windows. WASI staging
   no longer queries a process ID, which is unsupported by that runtime.
 - Native builds add `cap-std` for capability-relative filesystem operations;
@@ -92,6 +93,60 @@
   pass and before installation, not before every staged write (a 1 GiB
   repair: 16,948 snapshots → 618). A source changed mid-repair still ends in
   `SourceChanged` with nothing installed; it is noticed at the end of the pass.
+- Repair in place stages a damaged file as a clone of itself where the
+  filesystem shares extents: `fclonefileat` on APFS (macOS), the `FICLONE`
+  ioctl on Linux reflink filesystems (Btrfs, XFS with reflink, bcachefs).
+  It applies when the file at the destination is the very file the evidence
+  verified, identified from its own open handle, and the file has no
+  unprotected range. The clone is cut or extended to the protected length,
+  and the repair writes only what it lacks: the lost blocks and any inline
+  tail. Intact blocks are no longer copied into the stage. When blocks are
+  lost they are still read once to compute the syndromes; a file whose blocks
+  are all intact but which carries trailing bytes is cut back with no source
+  read and no write. What the clone holds is proven by
+  the evidence for the file it cloned, which is re-checked right after the
+  clone and again before installation, so nothing is read back.
+  A 1 GiB file with one lost 1 MiB block writes 1 MiB instead of 1 GiB.
+  The clone keeps the original's mode and extended attributes.
+  `ExecutionDiagnostics::file_clones()` counts clones.
+- Where a clone is refused because the filesystem cannot share extents, or
+  the destination is on another device (`EOPNOTSUPP`, `EXDEV`, `EINVAL`,
+  `ENOTTY`, `EPERM`), staging falls back silently to the full copy it made
+  before. The same happens when the destination is a different file, or the
+  source was found under another name. After a refusal that means the
+  filesystem has no clones, later outputs of the same repair do not try
+  again. Windows, WASI and other targets are unchanged. A clone attempt costs
+  one read-only open of the original. Repair also no longer reads surviving
+  blocks that no reconstruction and no staged output needs.
+- macOS and Linux builds take `libc` as a regular dependency, and permit
+  `unsafe` only in the two file-clone calls. Every other non-Windows target
+  keeps `forbid(unsafe_code)`.
+- PAR-inside insertion (`InsertionPlan`) stages the output as a clone of the
+  source archive on macOS and Linux reflink filesystems. It does this only
+  when the source's open handle is still the file and generation the plan
+  inspected. It then appends just the embedded carrier and the duplicated
+  footer. Where the clone is refused, or the source has no file behind it, the
+  archive is copied as before. Either way the staged output is no longer read
+  back. Instead:
+  - a clone is proven by the source generation, re-checked before
+    installation;
+  - a copy is hashed as it is written and compared with the plan's file
+    fingerprint;
+  - the carrier's packets are authenticated as they are written.
+  A mismatch still fails before anything is installed. The carrier now goes
+  straight into the staged output, so insertion writes no intermediate
+  carrier files and makes no carrier fsyncs. There is one sync of the staged
+  output, skipped under `CreationDurability::Buffered` through the new
+  `InsertionPlan::execute_with_durability`. The output bytes are unchanged.
+  For a 1 GiB stored zip with 100 × 1 MiB recovery blocks, insertion
+  reads 1 GiB instead of 3.2 GiB, writes 100 MiB instead of 1.2 GiB, and
+  makes 1 fsync instead of 3. A cloned output keeps the source's mode and extended attributes.
+  `InsertionRequirements::scratch_bytes` no longer counts the carrier, which
+  is no longer written to scratch.
+- `SourceAccess::open_file` (default `None`) lets a source registry hand the
+  engine an opaque `SourceFile` for staging by clone. `DiskSourceAccess`
+  returns its cached handle, or opens the file read-only when handles are
+  not cached. Wrapping registries should forward it.
 
 ## 0.4.3
 

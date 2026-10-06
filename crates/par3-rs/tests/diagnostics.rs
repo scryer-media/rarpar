@@ -828,3 +828,234 @@ fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
         assert_eq!(options.memory.used(), 0, "{case}: the session leaked");
     }
 }
+
+// --- Clone staging -----------------------------------------------------------
+
+/// What one disk repair alone did. Every file it reads is a source on disk;
+/// the recovery data comes from memory.
+struct DiskRepair {
+    read_bytes: u64,
+    write_bytes: u64,
+    clones: u64,
+    syncs: u64,
+}
+
+/// Write every file of `set` into `inputs`, file `damaged` holding `on_disk`
+/// under the name `stored` (its own name when that is where it belongs), bind
+/// each to its path, and repair into `output`.
+fn repair_disk_files(
+    set: &common::ManyBlockSet,
+    damaged: usize,
+    on_disk: &[u8],
+    stored: &str,
+    inputs: &common::TempTree,
+    output: &std::path::Path,
+    backup: bool,
+) -> DiskRepair {
+    use par3_rs::source::DiskSourceAccess;
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    let mut access = DiskSourceAccess::with_options(options.clone());
+    for (index, (name, bytes)) in set.contents.iter().enumerate() {
+        let path = if index == damaged {
+            inputs.write(stored, on_disk)
+        } else {
+            inputs.write(name, bytes)
+        };
+        access.insert(SourceId(index as u64 + 1), path);
+    }
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+    for (index, (name, _)) in set.contents.iter().enumerate() {
+        session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+    }
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    let before = options.diagnostics.file_io();
+    let report = session.repair(output, backup).unwrap();
+    let after = options.diagnostics.file_io();
+    assert_eq!(report.installed.len(), 1, "only the damaged file is staged");
+    let (name, bytes) = &set.contents[damaged];
+    assert_eq!(
+        &std::fs::read(output.join(name)).unwrap(),
+        bytes,
+        "the installed file differs from the input"
+    );
+    let run = DiskRepair {
+        read_bytes: after.read_bytes - before.read_bytes,
+        write_bytes: after.write_bytes - before.write_bytes,
+        clones: options.diagnostics.file_clones(),
+        syncs: options.diagnostics.file_sync().calls,
+    };
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+    assert_eq!(options.handles.used(), 0, "a handle leaked");
+    run
+}
+
+/// Whether this target clones a file repaired in place. macOS always can on
+/// APFS; a Linux filesystem without reflink falls back to the copy, which is
+/// what the tests then check instead.
+fn expect_clone(run: &DiskRepair) -> bool {
+    if cfg!(target_os = "macos") {
+        assert_eq!(run.clones, 1, "an in-place repair on APFS must clone");
+    }
+    run.clones == 1
+}
+
+/// A 64 MiB file with one damaged block, repaired in place, writes one block:
+/// the staged clone already holds the other 63, so they are read once for the
+/// syndromes and never written, and nothing is read back. The default numbered
+/// backup keeps the damaged bytes, sharing every extent but the one rewritten.
+#[test]
+fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
+    let block = 1u64 << 20;
+    let tree = common::TempTree::new("clone-in-place");
+    let set = common::cauchy_block_set(64, block, 2, b"PAR3 clone staging", &tree);
+    let bytes = &set.contents[0].1;
+    let mut damaged = bytes.clone();
+    damaged[7 * block as usize + 11] ^= 0x80;
+    for backup in [false, true] {
+        let inputs = common::TempTree::new("clone-in-place-inputs");
+        let run = repair_disk_files(
+            &set,
+            0,
+            &damaged,
+            "input.bin",
+            &inputs,
+            inputs.path(),
+            backup,
+        );
+        let len = bytes.len() as u64;
+        // The surviving blocks, read once for the syndromes; no read-back.
+        assert_eq!(run.read_bytes, len - block);
+        assert_eq!(run.syncs, 1);
+        if expect_clone(&run) {
+            assert_eq!(run.write_bytes, block, "backup {backup}");
+        } else {
+            assert_eq!(run.write_bytes, len, "backup {backup}");
+        }
+        if backup {
+            assert_eq!(
+                std::fs::read(inputs.path().join("input.bin.1")).unwrap(),
+                damaged,
+                "the backup holds the damaged file"
+            );
+        }
+    }
+}
+
+/// A file whose every block is intact but whose length is wrong stages on the
+/// copy path. Cloned and cut back, it costs no read and no write at all; one
+/// cut short inside its last block loses that block, and the clone, extended,
+/// writes that one block alone.
+#[test]
+fn a_clone_cut_or_extended_to_its_length_writes_only_what_it_lacks() {
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("clone-length");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 clone length", &tree);
+    let bytes = &set.contents[0].1;
+    let len = bytes.len() as u64;
+    let mut grown = bytes.clone();
+    grown.extend_from_slice(b"trailing bytes that are not part of the file");
+    let short = bytes[..bytes.len() - 1000].to_vec();
+    for (case, on_disk, written, read) in
+        [("grown", grown, 0, 0), ("short", short, block, len - block)]
+    {
+        let inputs = common::TempTree::new("clone-length-inputs");
+        let run = repair_disk_files(
+            &set,
+            0,
+            &on_disk,
+            "input.bin",
+            &inputs,
+            inputs.path(),
+            false,
+        );
+        assert_eq!(run.read_bytes, read, "{case}");
+        if expect_clone(&run) {
+            assert_eq!(run.write_bytes, written, "{case}");
+        } else {
+            assert_eq!(run.write_bytes, len, "{case}");
+        }
+    }
+}
+
+/// An FFT-coded set takes the same path: the damaged file of four, repaired in
+/// place, writes the one block it lost.
+#[test]
+fn an_fft_repair_in_place_writes_only_the_lost_block() {
+    let tree = common::TempTree::new("clone-fft");
+    let set = common::many_block_set(4, 16, 0, 4, b"PAR3 clone fft", &tree);
+    let mut damaged = set.contents[1].1.clone();
+    damaged[70] ^= 0x80;
+    let inputs = common::TempTree::new("clone-fft-inputs");
+    let run = repair_disk_files(
+        &set,
+        1,
+        &damaged,
+        "input1.bin",
+        &inputs,
+        inputs.path(),
+        false,
+    );
+    if expect_clone(&run) {
+        assert_eq!(run.write_bytes, 64);
+    } else {
+        assert_eq!(run.write_bytes, damaged.len() as u64);
+    }
+}
+
+/// Only the file the evidence verified is ever cloned. A source found under
+/// another name leaves nothing at the destination, and a destination holding a
+/// different file with the same bytes is not that file: both are copied.
+#[test]
+fn a_moved_source_or_another_file_at_the_destination_is_copied_not_cloned() {
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("clone-moved");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 clone moved", &tree);
+    let bytes = &set.contents[0].1;
+    let mut damaged = bytes.clone();
+    damaged[3 * block as usize] ^= 0x80;
+
+    let inputs = common::TempTree::new("clone-moved-inputs");
+    let run = repair_disk_files(
+        &set,
+        0,
+        &damaged,
+        "moved.bin",
+        &inputs,
+        inputs.path(),
+        false,
+    );
+    assert_eq!(run.clones, 0, "a moved source");
+    assert_eq!(run.write_bytes, bytes.len() as u64);
+    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    assert_eq!(
+        std::fs::read(inputs.path().join("moved.bin")).unwrap(),
+        damaged
+    );
+
+    let inputs = common::TempTree::new("clone-other-inputs");
+    let output = common::TempTree::new("clone-other-output");
+    output.write("input.bin", &damaged);
+    let run = repair_disk_files(
+        &set,
+        0,
+        &damaged,
+        "input.bin",
+        &inputs,
+        output.path(),
+        false,
+    );
+    assert_eq!(run.clones, 0, "another file at the destination");
+    assert_eq!(run.write_bytes, bytes.len() as u64);
+    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    assert_eq!(
+        std::fs::read(inputs.path().join("input.bin")).unwrap(),
+        damaged
+    );
+}
