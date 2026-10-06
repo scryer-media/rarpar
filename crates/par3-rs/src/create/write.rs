@@ -2,8 +2,8 @@
 //!
 //! The index file holds one copy of everything except the recovery data. Each
 //! volume holds the recovery blocks it was given, and around them a full copy of
-//! the common packets plus `log2(blocks in this volume)` further copies spread
-//! between the recovery packets — so a volume that survives on its own describes
+//! the common packets plus `log2(rows in this volume)` further copies spread
+//! between its rows — so a volume that survives on its own describes
 //! the whole set, and a volume damaged in one place probably still does.
 
 use std::fs::OpenOptions;
@@ -173,18 +173,10 @@ fn write_volume(
     let first_index = volume.start * cohorts;
     let payload_packets = volume.count * cohorts;
 
-    // One further copy of the common packets per doubling of this volume's block
-    // count, spread evenly between the recovery packets and cycling through the
-    // list so that consecutive volumes do not all repeat the same few packets.
-    let mut repeats = 0u64;
-    let mut step = 2u64;
-    while step <= payload_packets {
-        repeats += 1;
-        step *= 2;
-    }
-    let total_repeats = repeats * packets.common.len() as u64;
-    let mut emitted = 0u64;
-    let mut cursor = 0usize;
+    // One further copy of the common packets per doubling of this volume's row
+    // count, spread evenly between the rows and cycling through the list so
+    // that consecutive volumes do not all repeat the same few packets.
+    let mut repeats = MetadataRepeats::new(&packets.common, volume.count, true);
 
     for (position, row) in recovery
         .iter()
@@ -206,11 +198,9 @@ fn write_volume(
         );
         out.write_all(&packet.to_bytes())?;
 
-        let target = total_repeats * (position as u64 + 1) / payload_packets;
-        while emitted < target {
-            out.write_all(&packets.common[cursor])?;
-            cursor = (cursor + 1) % packets.common.len();
-            emitted += 1;
+        let done = position as u64 + 1;
+        if done.is_multiple_of(cohorts) {
+            repeats.after(done / cohorts, out)?;
         }
     }
 
@@ -218,6 +208,59 @@ fn write_volume(
         out.write_all(comment)?;
     }
     Ok(())
+}
+
+/// How many further copies of the metadata a carrier of `units` rows or blocks
+/// holds after its first: one per doubling, `floor(log2(units))`, as the
+/// reference writes them.
+pub(crate) fn metadata_repeats(units: u64) -> u64 {
+    units.checked_ilog2().map_or(0, u64::from)
+}
+
+/// The metadata copies a carrier spreads between its payload packets, shared
+/// by both creation APIs.
+///
+/// The reference writes the packets after the Creator packet `total` times
+/// over in all, one packet at a time, cycling through them: after the `k`th of
+/// `units` rows or blocks, as many as bring the running count to
+/// `total * k / units`. The last unit therefore ends on a whole number of
+/// copies, and where the counts do not divide evenly a copy is split across
+/// the gaps between units.
+pub(crate) struct MetadataRepeats<'a> {
+    common: &'a [Vec<u8>],
+    total: u64,
+    units: u64,
+    emitted: u64,
+    cursor: usize,
+}
+
+impl<'a> MetadataRepeats<'a> {
+    /// The copies for a carrier of `units` rows or blocks, or none at all
+    /// when `repeat` is false.
+    pub(crate) fn new(common: &'a [Vec<u8>], units: u64, repeat: bool) -> Self {
+        Self {
+            common,
+            total: if repeat {
+                metadata_repeats(units) * common.len() as u64
+            } else {
+                0
+            },
+            units,
+            emitted: 0,
+            cursor: 0,
+        }
+    }
+
+    /// Write what is due once `done` units have been written.
+    pub(crate) fn after(&mut self, done: u64, out: &mut impl Write) -> std::io::Result<()> {
+        let target = (u128::from(self.total) * u128::from(done) / u128::from(self.units)) as u64;
+        while self.emitted < target {
+            out.write_all(&self.common[self.cursor])?;
+            self.cursor = (self.cursor + 1) % self.common.len();
+            self.emitted += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Create a file and hand a buffered writer to `body`, naming the path in any

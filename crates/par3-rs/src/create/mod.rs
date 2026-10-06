@@ -53,9 +53,10 @@ mod map;
 mod packets;
 mod plan;
 
-pub(crate) use packets::{SetIdFile, input_set_id};
-pub(crate) use plan::compare_directory_names;
+pub(crate) use packets::{SetIdFile, input_set_id, sort_children};
+pub(crate) use plan::directory_names;
 mod write;
+pub(crate) use write::{MetadataRepeats, metadata_repeats};
 
 pub use plan::suggest_block_size;
 

@@ -257,8 +257,14 @@ fn children_of(
             children.push(*hash);
         }
     }
-    children.sort_unstable();
+    sort_children(&mut children);
     children
+}
+
+/// Put a Directory or Root packet's children in the order the format asks for
+/// and the reference writes them: by their packet hash bytes.
+pub(crate) fn sort_children(children: &mut [Fingerprint]) {
+    children.sort_unstable();
 }
 
 /// The directory a `/`-separated name sits in, or `None` for the top level.

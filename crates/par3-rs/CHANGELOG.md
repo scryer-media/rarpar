@@ -17,14 +17,30 @@
   `VolumeLayout::SizeLimited` carrier still fits its limit with them included.
   The index file and embedded (PAR-inside) carriers keep one copy. Directory
   and Root packets now list their children sorted by packet hash, and Directory
-  packets are written in the reference's order. With these, the engine
-  writes `par3cmdline`'s bytes, Cauchy and FFT alike, whenever the reference's
-  storage order (longest chunk tail, then largest file, then name) is name
-  order and no tail is packed behind an older tail block — a single file, or
-  files of one size. Other multi-file sets still differ in file order and tail
-  packing, and the engine writes no Comment packet.
+  packets are written in the reference's order.
+  The carrier authenticator proves each repeated copy by comparing it with
+  the copy of that packet it hashed first, instead of hashing and parsing it
+  again; the copies still go out through the same buffered writes.
+- **Behaviour change:** the streaming engine stores, packs and shares packets
+  as the reference does. Inputs are stored longest chunk tail first, then
+  largest file, then by name, whatever order the sources are listed in; the
+  order comes from the source sizes, so it costs no extra I/O. Embedded
+  (PAR-inside) carriers keep their listed order. A chunk tail is packed behind
+  the first earlier tail, in placement order, that is still the last in its
+  block and has room, rather than only behind the latest. File and Directory
+  packets with identical contents, such as empty files of one name in two
+  directories, are written once and listed by every parent. With these, the
+  engine writes `par3cmdline`'s bytes for the reference's default creation
+  (no `-C` comment, which is the only way the reference writes a Comment
+  packet) over single files, multi-file sets and directory trees, verified for
+  Cauchy and FFT (interleaved too) recovery volumes. Data volumes still store
+  a packed tail block whole, where the reference cuts its Data packet to the
+  bytes in use, and an interleaved set's data volumes count blocks singly
+  where the reference counts rows of cohort blocks.
+- **Behaviour change:** a streaming-engine FFT set whose capacity is one
+  recovery block now records no Galois field in its Start packet, as the
+  reference does for that XOR-only case; it previously recorded GF(2^8).
 - `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
-
 - **Behaviour change:** repair output on native targets is now confined to an
   opened directory capability. Replacing the output-root path or swapping a
   destination parent during repair cannot redirect rebuild reads or installs

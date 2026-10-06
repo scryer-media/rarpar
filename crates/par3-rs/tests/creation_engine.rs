@@ -1157,3 +1157,289 @@ fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
         }
     }
 }
+
+/// The streaming engine and `create` — which recreates every official
+/// reference set in the corpus byte for byte — write the same bytes for a
+/// tree that exercises the reference's storage order, its first-fit tail
+/// packing and its shared packets: mixed sizes whose tails only pack the
+/// reference's way when an earlier tail block is reused ahead of the latest
+/// one, an inline tail, a file of whole blocks, and empty files of one name in
+/// two directories, which share one File packet, inside subdirectories of one
+/// name that share one Directory packet. The sources are listed backwards, so
+/// the storage order has to come from the sizes and names.
+#[test]
+fn the_streaming_engine_writes_what_create_writes_for_mixed_trees() {
+    use par3_rs::create::{CreateOptions, InputSpec, RecoveryAmount, create};
+
+    const BLOCK: u64 = 1024;
+    let inputs: &[(&str, u64)] = &[
+        ("m/a.bin", 3 * BLOCK + 700),
+        ("b.bin", 500),
+        ("c.bin", 2 * BLOCK + 300),
+        ("d.bin", 200),
+        ("e.bin", 41),
+        ("f.bin", 2 * BLOCK),
+        ("g.bin", 10),
+        ("x/e.bin", 0),
+        ("y/e.bin", 0),
+        ("x/z/e.bin", 0),
+        ("y/z/e.bin", 0),
+    ];
+    let tree = common::TempTree::new("creation-two-path");
+    for (index, (name, length)) in inputs.iter().enumerate() {
+        let bytes: Vec<u8> = (0..*length)
+            .map(|i| ((i * 31 + i / 7 + index as u64 * 101) % 251) as u8)
+            .collect();
+        tree.write(&format!("in/{name}"), &bytes);
+    }
+    let base = tree.path().join("in");
+    let creator = "two-path creator";
+
+    let files: Vec<std::path::PathBuf> = inputs
+        .iter()
+        .map(|(name, _)| std::path::PathBuf::from(name))
+        .collect();
+    std::fs::create_dir_all(tree.path().join("create")).unwrap();
+    let report = create(
+        &InputSpec::new(&base, &files),
+        &tree.path().join("create/set.par3"),
+        &CreateOptions::default()
+            .with_block_size(BLOCK)
+            .with_recovery(RecoveryAmount::Blocks(6))
+            .with_creator(creator),
+    )
+    .unwrap();
+
+    let mut access = DiskSourceAccess::with_options(par3_rs::runtime::ExecutionOptions::default());
+    let mut sources = Vec::new();
+    for (index, (name, _)) in inputs.iter().enumerate().rev() {
+        let id = SourceId(index as u64);
+        access.insert(id, base.join(name));
+        sources.push(CreationSource {
+            name: (*name).to_owned(),
+            source: id,
+        });
+    }
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &sources,
+        CreationOptions {
+            block_size: BLOCK,
+            recovery_count: 6,
+            creator: creator.to_owned(),
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    let out = tree.path().join("stream");
+    std::fs::create_dir_all(&out).unwrap();
+    let written = plan.execute(&out.join("set"), tree.path()).unwrap();
+
+    let names = |paths: &[std::path::PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(names(&written), names(&report.files_written));
+    for (ours, theirs) in written.iter().zip(&report.files_written) {
+        assert!(
+            std::fs::read(ours).unwrap() == std::fs::read(theirs).unwrap(),
+            "{} differs from create's",
+            ours.display()
+        );
+    }
+    // Shared packets go out once: the four empty `e.bin` files make one File
+    // packet beside the seven others, and the two `z` directories one
+    // Directory packet beside `m`, `x` and `y`.
+    let index = common::packets_of(&std::fs::read(&written[0]).unwrap());
+    let count = |kind: fn(&par3_rs::PacketBody) -> bool| {
+        index.iter().filter(|packet| kind(packet.body())).count()
+    };
+    assert_eq!(
+        count(|body| matches!(body, par3_rs::PacketBody::File(_))),
+        8
+    );
+    assert_eq!(
+        count(|body| matches!(body, par3_rs::PacketBody::Directory(_))),
+        4
+    );
+}
+
+/// The streaming engine writes the reference's FFT sets byte for byte: the
+/// GF(2^8) and GF(2^16) single-cohort sets and the three-cohort interleaved
+/// one, each recreated from its input with the Creator text, block size and
+/// FFT parameters read back from the official index file.
+#[test]
+fn the_streaming_engine_writes_the_reference_fft_sets_byte_for_byte() {
+    let input: Vec<u8> = (0..14000)
+        .map(|i| ((i * 73 + i / 29) % 256) as u8)
+        .collect();
+    let sets: &[&[&str]] = &[
+        &[
+            "fft.par3",
+            "fft.vol0+1.par3",
+            "fft.vol1+2.par3",
+            "fft.vol3+4.par3",
+            "fft.vol7+1.par3",
+        ],
+        &[
+            "fft16.par3",
+            "fft16.vol00+1.par3",
+            "fft16.vol01+2.par3",
+            "fft16.vol03+4.par3",
+            "fft16.vol07+8.par3",
+            "fft16.vol15+1.par3",
+        ],
+        &[
+            "interleaved.par3",
+            "interleaved.vol0+1.par3",
+            "interleaved.vol1+2.par3",
+        ],
+    ];
+    for names in sets {
+        let reference: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| common::advanced_fixture(name))
+            .collect();
+        let (mut creator, mut block_size, mut fft) = (None, None, None);
+        for packet in common::packets_of(&reference[0]) {
+            match packet.body() {
+                par3_rs::PacketBody::Creator(body) => creator = Some(body.text().into_owned()),
+                par3_rs::PacketBody::Start(body) => block_size = Some(body.block_size),
+                par3_rs::PacketBody::FftMatrix(body) => {
+                    fft = Some((body.max_recovery_blocks_log2, body.interleave));
+                }
+                _ => {}
+            }
+        }
+        let (capacity_log2, interleave) = fft.expect("an FFT matrix");
+        let recovery_count = reference[1..]
+            .iter()
+            .flat_map(|carrier| common::packets_of(carrier))
+            .filter(|packet| matches!(packet.body(), par3_rs::PacketBody::RecoveryData(_)))
+            .count() as u64;
+
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(0), 1, input.clone().into());
+        let plan = CreationPlan::build(
+            Arc::new(access),
+            &[CreationSource {
+                name: "input.bin".to_owned(),
+                source: SourceId(0),
+            }],
+            CreationOptions {
+                block_size: block_size.expect("a Start packet"),
+                recovery_count,
+                codec: CreationCodec::Fft {
+                    capacity_log2,
+                    interleave,
+                },
+                creator: creator.expect("a Creator packet"),
+                ..CreationOptions::default()
+            },
+        )
+        .unwrap();
+        let tree = common::TempTree::new("creation-fft-reference");
+        let stem = names[0].trim_end_matches(".par3");
+        let written = plan.execute(&tree.path().join(stem), tree.path()).unwrap();
+        let written_names: Vec<String> = written
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(written_names, *names);
+        for ((ours, theirs), name) in written.iter().zip(&reference).zip(names.iter()) {
+            common::assert_block_eq(&std::fs::read(ours).unwrap(), theirs, name);
+        }
+    }
+}
+
+/// Data volumes as well: the reference's capacity-one FFT set with stored Data
+/// packets and aligned deduplication of two identical inputs. The index, the
+/// recovery volume and the data volumes of whole blocks are recreated byte
+/// for byte. The last data volume holds the packed tail block, whose Data
+/// packet the reference cuts to the bytes in use while the engine stores the
+/// whole block; that volume is only checked to differ by exactly that.
+#[test]
+fn the_streaming_engine_writes_the_reference_data_volumes_byte_for_byte() {
+    let names = [
+        "data-dedup.par3",
+        "data-dedup.vol0+1.par3",
+        "data-dedup.part0+1.par3",
+        "data-dedup.part1+2.par3",
+        "data-dedup.part3+1.par3",
+    ];
+    let reference: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| common::advanced_fixture(name))
+        .collect();
+    let (mut creator, mut block_size, mut fft) = (None, None, None);
+    for packet in common::packets_of(&reference[0]) {
+        match packet.body() {
+            par3_rs::PacketBody::Creator(body) => creator = Some(body.text().into_owned()),
+            par3_rs::PacketBody::Start(body) => block_size = Some(body.block_size),
+            par3_rs::PacketBody::FftMatrix(body) => {
+                fft = Some((body.max_recovery_blocks_log2, body.interleave));
+            }
+            _ => {}
+        }
+    }
+    let (capacity_log2, interleave) = fft.expect("an FFT matrix");
+    let mut access = MemorySourceAccess::default();
+    let mut sources = Vec::new();
+    for (index, name) in ["input.bin", "copy.bin"].into_iter().enumerate() {
+        access.insert(SourceId(index as u64), 1, data().into());
+        sources.push(CreationSource {
+            name: name.to_owned(),
+            source: SourceId(index as u64),
+        });
+    }
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &sources,
+        CreationOptions {
+            block_size: block_size.expect("a Start packet"),
+            recovery_count: 1,
+            codec: CreationCodec::Fft {
+                capacity_log2,
+                interleave,
+            },
+            deduplication: Deduplication::Aligned,
+            store_data: true,
+            creator: creator.expect("a Creator packet"),
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    let tree = common::TempTree::new("creation-data-reference");
+    let written = plan
+        .execute(&tree.path().join("data-dedup"), tree.path())
+        .unwrap();
+    let mut written_names: Vec<String> = written
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    written_names.sort();
+    let mut expected: Vec<&str> = names.to_vec();
+    expected.sort();
+    assert_eq!(written_names, expected);
+    for (name, theirs) in names.iter().zip(&reference).take(4) {
+        common::assert_block_eq(&tree.read(name), theirs, name);
+    }
+    // The tail block's Data packet: 3300 bytes leave 228 in block 3.
+    let tail = 3300 % 1024;
+    let ours = common::packets_of(&tree.read(names[4]));
+    let theirs = common::packets_of(&reference[4]);
+    assert_eq!(ours.len(), theirs.len());
+    for (ours, theirs) in ours.iter().zip(&theirs) {
+        match (ours.body(), theirs.body()) {
+            (par3_rs::PacketBody::Data(ours), par3_rs::PacketBody::Data(theirs)) => {
+                assert_eq!(ours.block_index, theirs.block_index);
+                assert_eq!(theirs.data.len(), tail);
+                assert_eq!(&ours.data[..tail], &theirs.data[..]);
+                assert!(ours.data[tail..].iter().all(|&byte| byte == 0));
+            }
+            (ours, theirs) => assert_eq!(ours, theirs),
+        }
+    }
+}

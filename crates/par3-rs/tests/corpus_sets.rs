@@ -833,17 +833,13 @@ fn a_source_read_in_pieces_narrower_than_its_blocks_still_matches_whole() {
 }
 
 /// The streaming engine (`par3_rs::creation`) builds the same set from the
-/// same inputs, for every case inside its reach.
+/// same inputs, for every case without a comment.
 ///
-/// The engine writes no Comment packet, stores files in name order and packs
-/// each chunk tail into the most recent tail block, where the reference (and
-/// `create`) stores the longest tails first and packs each into the first
-/// block with room, and it writes a File packet per input even when two inputs
-/// are identical. Every case with more than one chunk tail, a comment or a
-/// duplicate file differs on those counts and is left to
-/// `every_set_is_created_again_byte_for_byte`. For the cases in reach, the
+/// The engine has no Comment option, so the one case made with `-C` is left to
+/// `every_set_is_created_again_byte_for_byte`. For every other case the
 /// InputSetID and every file written — the index and each volume with its
-/// repeated metadata copies — match the reference's bytes.
+/// repeated metadata copies — match the reference's bytes, whatever order the
+/// inputs are listed in.
 #[test]
 fn the_streaming_engine_creates_every_set_in_reach_byte_for_byte() {
     use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
@@ -853,8 +849,7 @@ fn the_streaming_engine_creates_every_set_in_reach_byte_for_byte() {
     if !hydrated() {
         return;
     }
-    const IN_REACH: &[&str] = &["gf16_by_recovery", "large_stream"];
-    for case in CASES.iter().filter(|case| IN_REACH.contains(&case.name)) {
+    for case in CASES.iter().filter(|case| case.comment.is_none()) {
         let tree = TempTree::new(&format!("corpus-streaming-{}", case.name));
         let base = case.lay_out(&tree);
         let options = CreationOptions {

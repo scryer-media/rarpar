@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::create::{MetadataRepeats, metadata_repeats};
 use crate::fft::{FftCodec, FftGeometry};
 use crate::gf::MulAccBatch;
 use crate::packet::{
@@ -235,10 +236,34 @@ impl CreationPlan {
     /// File, quick-prefix, block, and tail hashes share one source pass; sliding
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
+    ///
+    /// The inputs are stored in the reference's order — longest chunk tail
+    /// first, then largest file, then name — whatever order `sources` lists
+    /// them in. That order is decided from the source sizes alone, before any
+    /// byte is read, so it costs no extra I/O.
     pub fn build(
         access: Arc<dyn SourceAccess>,
         sources: &[CreationSource],
         options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, true)
+    }
+
+    /// Plan the sources in the order given. An embedded carrier lays its body
+    /// out ahead of its footer, so it keeps the order its views were listed in.
+    pub(crate) fn build_in_source_order(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, false)
+    }
+
+    fn build_ordered(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+        reference_order: bool,
     ) -> EngineResult<Self> {
         let _progress = options.execution.stage(crate::runtime::Stage::Create)?;
         if options.block_size == 0 {
@@ -353,10 +378,29 @@ impl CreationPlan {
         let rolling = (options.deduplication == Deduplication::Sliding)
             .then(|| SlidingCrc::new(options.block_size));
         let mut tails = BTreeMap::<(u64, Fingerprint), (u64, u64)>::new();
-        let mut packing: Option<usize> = None;
+        let mut packing = TailSlots::default();
         let mut reused = 0;
         let mut names = BTreeMap::new();
-        for (source, snapshot) in sources.iter().zip(snapshots) {
+        let mut order: Vec<usize> = (0..sources.len()).collect();
+        if reference_order {
+            let block_size = options.block_size;
+            order.sort_by(|&left, &right| {
+                let (one, other) = (snapshots[left].len, snapshots[right].len);
+                (other % block_size)
+                    .cmp(&(one % block_size))
+                    .then_with(|| other.cmp(&one))
+                    .then_with(|| {
+                        sources[left]
+                            .name
+                            .as_bytes()
+                            .cmp(sources[right].name.as_bytes())
+                    })
+            });
+        }
+        for (source, snapshot) in order
+            .into_iter()
+            .map(|index| (&sources[index], snapshots[index]))
+        {
             if names.insert(source.name.clone(), ()).is_some() {
                 return Err(EngineError::InvalidState("duplicate creation path"));
             }
@@ -456,21 +500,18 @@ impl CreationPlan {
                     let (index, offset) = if let Some(alias) = alias {
                         alias
                     } else {
-                        let index = packing
-                            .filter(|index| options.block_size - blocks[*index].used >= length)
-                            .unwrap_or_else(|| {
-                                let index = blocks.len();
-                                blocks.push(Block {
-                                    pieces: Vec::new(),
-                                    used: 0,
-                                    checksum: None,
-                                });
-                                packing = Some(index);
-                                index
+                        let index = packing.take(length).unwrap_or_else(|| {
+                            blocks.push(Block {
+                                pieces: Vec::new(),
+                                used: 0,
+                                checksum: None,
                             });
+                            blocks.len() - 1
+                        });
                         let offset = blocks[index].used;
                         blocks[index].pieces.push(Piece { offset, ..piece });
                         blocks[index].used += length;
+                        packing.place(index, options.block_size - blocks[index].used);
                         tails.insert((length, hash), (index as u64, offset));
                         (index as u64, offset)
                     };
@@ -507,7 +548,6 @@ impl CreationPlan {
                 },
             });
         }
-        files.sort_by(|left, right| left.name.cmp(&right.name));
         for file in &files {
             let mut ancestor = parent(&file.name);
             while !ancestor.is_empty() {
@@ -568,13 +608,22 @@ impl CreationPlan {
                         "requested recovery exceeds FFT capacity",
                     ));
                 }
-                GaloisField {
-                    size: geometry.field_bytes() as u8,
-                    generator: if geometry.field_bytes() == 1 {
-                        0x1d
-                    } else {
-                        0x2d
-                    },
+                if geometry.capacity() == 1 && cohorts == 1 {
+                    // One recovery row at most is the XOR of the inputs, which
+                    // the reference marks with no field at all.
+                    GaloisField {
+                        size: 0,
+                        generator: 0,
+                    }
+                } else {
+                    GaloisField {
+                        size: geometry.field_bytes() as u8,
+                        generator: if geometry.field_bytes() == 1 {
+                            0x1d
+                        } else {
+                            0x2d
+                        },
+                    }
                 }
             }
         };
@@ -1006,17 +1055,7 @@ impl CreationPlan {
         // Creator packet as the reference spreads it: after each of its
         // `units` rows or blocks, cycling through the packets.
         let common = self.metadata.get(1..).unwrap_or_default();
-        let repeats = |units: u64| MetadataRepeats {
-            common,
-            total: if self.repeat_metadata {
-                metadata_repeats(units) * common.len() as u64
-            } else {
-                0
-            },
-            units,
-            emitted: 0,
-            cursor: 0,
-        };
+        let repeats = |units: u64| MetadataRepeats::new(common, units, self.repeat_metadata);
         // A payload held whole is read once, then hashed and written from
         // the same bytes; without room for one it streams twice, as it
         // always did. Resident recovery rows are already whole.
@@ -1582,15 +1621,8 @@ impl CreationPlan {
         // ordered the way the reference lists them: a directory after the
         // directories beneath it. The Directory packets go out in this order
         // too.
-        let mut ancestors = std::collections::BTreeSet::new();
-        for file in &self.files {
-            let mut ancestor = parent(&file.name);
-            while !ancestor.is_empty() && ancestors.insert(ancestor) {
-                ancestor = parent_of(ancestor);
-            }
-        }
-        let mut directories: Vec<String> = ancestors.into_iter().map(str::to_owned).collect();
-        directories.sort_by(|left, right| crate::create::compare_directory_names(left, right));
+        let directories =
+            crate::create::directory_names(self.files.iter().map(|file| file.name.as_str()), &[]);
         self.id = crate::create::input_set_id(
             self.files.iter().map(|file| crate::create::SetIdFile {
                 name: &file.name,
@@ -1639,6 +1671,10 @@ impl CreationPlan {
             packets.push(packet);
         }
         let mut children: BTreeMap<String, Vec<Fingerprint>> = BTreeMap::new();
+        // Two inputs can describe themselves identically — empty files of one
+        // name in different directories — and then share one packet, as the
+        // reference does: each parent lists the hash, the packet goes out once.
+        let mut written = std::collections::BTreeSet::new();
         for file in &self.files {
             let packet = Packet::new(self.id, PacketBody::File(file.packet.clone()));
             let parent = parent(&file.name);
@@ -1646,11 +1682,8 @@ impl CreationPlan {
                 .entry(parent.to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
-            let mut ancestor = parent;
-            while !ancestor.is_empty() {
-                children.entry(ancestor.to_owned()).or_default();
-                ancestor = parent_of(ancestor);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
             }
         }
         for directory in directories {
@@ -1666,7 +1699,9 @@ impl CreationPlan {
                 .entry(parent(&directory).to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
+            }
         }
         let root = Packet::new(
             self.id,
@@ -1835,48 +1870,77 @@ impl CreationPlan {
     }
 }
 
+/// The packed-tail slots, in the order the tails were placed.
+///
+/// A tail goes behind the first earlier tail, in placement order, that is
+/// still the last one in its block and leaves room for it, and only into a new
+/// block when none does — the reference's rule. A block only grows at its end,
+/// so a tail with another placed behind it closes for good.
+///
+/// The slots sit under a max tree of their spare room, so the first one that
+/// fits is found in logarithmic time rather than by scanning every earlier
+/// tail; a closed slot has no room.
+#[derive(Default)]
+struct TailSlots {
+    /// Leaves from `tree.len() / 2`, one per placed tail; each inner node holds
+    /// the larger of its children.
+    tree: Vec<u64>,
+    blocks: Vec<usize>,
+}
+
+impl TailSlots {
+    /// The block of the first open slot with at least `length` bytes spare,
+    /// closing that slot: the tail about to go there becomes its block's last.
+    fn take(&mut self, length: u64) -> Option<usize> {
+        if self.tree.get(1).is_none_or(|&room| room < length) {
+            return None;
+        }
+        let mut node = 1;
+        while node < self.tree.len() / 2 {
+            node = if self.tree[2 * node] >= length {
+                2 * node
+            } else {
+                2 * node + 1
+            };
+        }
+        let slot = node - self.tree.len() / 2;
+        self.set(slot, 0);
+        Some(self.blocks[slot])
+    }
+
+    /// Record a tail just placed in `block`, leaving `room` bytes behind it.
+    fn place(&mut self, block: usize, room: u64) {
+        let slot = self.blocks.len();
+        self.blocks.push(block);
+        let leaves = self.tree.len() / 2;
+        if slot >= leaves {
+            let grown = (leaves * 2).max(16);
+            let mut tree = vec![0; 2 * grown];
+            tree[grown..grown + leaves].copy_from_slice(&self.tree[leaves..]);
+            for node in (1..grown).rev() {
+                tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+            }
+            self.tree = tree;
+        }
+        self.set(slot, room);
+    }
+
+    fn set(&mut self, slot: usize, room: u64) {
+        let mut node = slot + self.tree.len() / 2;
+        self.tree[node] = room;
+        while node > 1 {
+            node /= 2;
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+    }
+}
+
 /// A Directory or Root packet's children, in the order the reference writes
-/// them: sorted by their packet hash bytes.
+/// them.
 fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
     let mut children = children.unwrap_or_default();
-    children.sort_unstable();
+    crate::create::sort_children(&mut children);
     children
-}
-
-/// How many further copies of the metadata a carrier of `units` rows or blocks
-/// holds after its first: one per doubling, `floor(log2(units))`, as the
-/// reference writes them.
-fn metadata_repeats(units: u64) -> u64 {
-    units.checked_ilog2().map_or(0, u64::from)
-}
-
-/// The metadata copies a carrier spreads between its payload packets.
-///
-/// The reference writes the packets after the Creator packet `total` times
-/// over in all, one packet at a time, cycling through them: after the `k`th of
-/// `units` rows or blocks, as many as bring the running count to
-/// `total * k / units`. The last unit therefore ends on a whole number of
-/// copies, and where the counts do not divide evenly a copy is split across
-/// the gaps between units.
-struct MetadataRepeats<'a> {
-    common: &'a [Vec<u8>],
-    total: u64,
-    units: u64,
-    emitted: u64,
-    cursor: usize,
-}
-
-impl MetadataRepeats<'_> {
-    /// Write what is due once `done` units have been written.
-    fn after(&mut self, done: u64, out: &mut impl Write) -> std::io::Result<()> {
-        let target = (u128::from(self.total) * u128::from(done) / u128::from(self.units)) as u64;
-        while self.emitted < target {
-            out.write_all(&self.common[self.cursor])?;
-            self.cursor = (self.cursor + 1) % self.common.len();
-            self.emitted += 1;
-        }
-        Ok(())
-    }
 }
 
 /// Refuse a source name the engine would later refuse to repair.
@@ -1905,9 +1969,6 @@ fn suffix(stem: &Path, suffix: &str) -> PathBuf {
 }
 fn parent(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-fn parent_of(name: &str) -> &str {
-    parent(name)
 }
 fn append_full(chunks: &mut Vec<ChunkDescription>, index: u64, size: u64) {
     if let Some(ChunkDescription::Protected {
@@ -2451,6 +2512,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tail_goes_behind_the_first_placed_tail_with_room() {
+        let mut slots = TailSlots::default();
+        // Blocks 0 and 1 each take a tail, leaving 100 and 300 bytes spare.
+        slots.place(0, 100);
+        slots.place(1, 300);
+        // 80 bytes fit behind the first tail placed, though block 1 is newer
+        // and roomier; that tail is now closed behind the new one.
+        assert_eq!(slots.take(80), Some(0));
+        slots.place(0, 20);
+        assert_eq!(slots.take(50), Some(1));
+        slots.place(1, 250);
+        // Only the newest tail in each block is open.
+        assert_eq!(slots.take(260), None);
+        // Block 0's open tail was placed before block 1's, so it is first.
+        assert_eq!(slots.take(20), Some(0));
+        slots.place(0, 0);
+        assert_eq!(slots.take(20), Some(1));
+        slots.place(1, 230);
+        // The tree grows past its first sixteen leaves without losing any.
+        for block in 2..40 {
+            slots.place(block, block as u64);
+        }
+        assert_eq!(slots.take(200), Some(1));
+        // Block 1's new tail is the newest placed, behind blocks 2 to 39.
+        slots.place(1, 30);
+        assert_eq!(slots.take(39), Some(39));
+        assert_eq!(slots.take(5), Some(5));
+        assert_eq!(slots.take(30), Some(30));
+        assert_eq!(slots.take(39), None);
+    }
+
+    #[test]
     fn a_carrier_repeats_its_metadata_once_per_doubling() {
         // Rows in a carrier against the copies the reference writes in all.
         for (units, copies) in [
@@ -2475,13 +2568,7 @@ mod tests {
     fn repeated_packets_cycle_and_spread_between_the_units() {
         let common: Vec<Vec<u8>> = (b'a'..=b'c').map(|byte| vec![byte]).collect();
         let layout = |units: u64| {
-            let mut repeats = MetadataRepeats {
-                common: &common,
-                total: metadata_repeats(units) * common.len() as u64,
-                units,
-                emitted: 0,
-                cursor: 0,
-            };
+            let mut repeats = MetadataRepeats::new(&common, units, true);
             let mut out = Vec::new();
             for done in 1..=units {
                 out.push(b'|');

@@ -368,6 +368,23 @@ reference. The deviations affecting interpretation are:
   metadata packet up front and, as the reference writes it, `floor(log2(n))`
   further copies of all but the Creator packet spread between its `n`
   recovery rows; the index file carries one copy.
+- **Storage order:** both creation APIs store the inputs as the reference
+  does: longest chunk tail first, then largest file, then by name. File
+  packets follow the same order.
+- **Tail packing:** a chunk tail goes behind the first earlier tail, in
+  placement order, that is still the last in its block and has room, and only
+  into a new block when none does.
+- **Shared packets:** File or Directory packets with identical contents, such
+  as empty files of one name in two directories, are written once and listed
+  by every parent.
+- **Comment:** the reference writes a Comment packet only when given `-C`
+  text. The streaming engine writes none; `create` writes one only when given
+  comment text.
+- **Streaming-engine data volumes:** the reference cuts a packed tail block's
+  Data packet to the bytes in use and, for an interleaved set, splits data
+  volumes and spreads their metadata copies by rows of cohort blocks. The
+  engine stores whole blocks and counts data blocks singly. The index and
+  recovery volumes are unaffected.
 - **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
   chunks concatenated in file order. Unprotected bytes are omitted.
 - **Chunks:** no per-chunk fingerprint from the draft layout.
