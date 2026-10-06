@@ -621,6 +621,17 @@ impl<'k, W: std::io::Write> AuthenticatingWriter<'k, W> {
         &self.inner
     }
 
+    /// The writer underneath, once every packet has been checked.
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// The writer underneath, for bytes outside any packet. They are neither
+    /// authenticated nor counted toward [`Self::finish`].
+    pub(crate) fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
     /// Require exactly `expected` bytes written, every one inside an
     /// authenticated packet.
     pub(crate) fn finish(&self, expected: u64) -> EngineResult<()> {

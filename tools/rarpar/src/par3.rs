@@ -404,6 +404,7 @@ fn load_selected(
 
 pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
     let result = match command {
+        Par3Command::Inside(command) => return crate::par3_inside::run(cli, command),
         Par3Command::Create(args) => create(cli, &args),
         Par3Command::Verify(args) => {
             verify_repair(cli, &args, false).map(|outcome| (outcome.success, outcome.report))
