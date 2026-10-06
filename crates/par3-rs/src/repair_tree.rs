@@ -30,7 +30,7 @@ static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // Makes every clone attempt on this thread fail as one across devices does,
 // so the copy fallback is exercised without a second filesystem.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(test)]
 thread_local! {
     pub(crate) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -127,6 +127,7 @@ pub(crate) struct RepairTree {
     stage_component: OsString,
     stage: Option<BudgetedDir>,
     /// The staging filesystem refused a clone outright; stop asking.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     clones_refused: AtomicBool,
 }
 

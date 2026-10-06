@@ -388,6 +388,7 @@ impl ExecutionDiagnostics {
     pub fn file_clones(&self) -> u64 {
         self.0.clones.load(Ordering::Relaxed)
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn note_clone(&self) {
         add(&self.0.clones, 1);
     }
