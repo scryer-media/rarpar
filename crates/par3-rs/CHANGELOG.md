@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- **Experimental:** `inside::rar5` adds PAR-inside for RAR5 archives and RAR5
+  volume sets made by RARLAB rar. The region layout is not part of the PAR3
+  specification yet; it may change before it is stable, and regions written
+  by this version may not verify with a later one.
+  - `inspect` walks a RAR5 archive's block headers (no member is
+    decompressed), refuses RAR4, non-RAR input and unknown trailing data, and
+    finds an existing region.
+  - `prepare_hosts`, `placement_counts` and `insert_set` write one input set
+    across every volume, with a region per volume in the `Trailing`, `Service`
+    or `Block` layout and recovery packets placed by `Spread`, `Last` or
+    `Independent`. Each File's chunks are the bytes before the region, one
+    unprotected chunk for the region, and the bytes after it.
+  - `open` finds a set's volumes by recorded name, recovery indices, volume
+    number or stem change, and returns `Rar5Set`, whose `repair` rebuilds
+    data and regions byte-exactly and whose `remove` writes the originals
+    back, checked against the File hash.
+- **Breaking:** `carrier::CarrierRestoration` gains `Derived`, for a carrier
+  rebuilt from a derived packet order with regenerated recovery packets.
+
 ## 0.4.5
 
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)

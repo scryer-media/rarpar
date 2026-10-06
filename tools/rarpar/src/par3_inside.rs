@@ -13,13 +13,22 @@ use serde_json::{Value, json};
 
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 
+/// Printed on stderr by every `par3 inside` run unless `--quiet`.
+const EXPERIMENTAL_NOTICE: &str = "rarpar: par3 inside is EXPERIMENTAL: the on-disk layout may change before it is stable, and output from this version may not verify with a later one";
+
 pub fn run(cli: &Cli, command: Par3InsideCommand) -> Result<u8, RarparError> {
-    let (success, report) = match command {
+    if !cli.quiet {
+        eprintln!("{EXPERIMENTAL_NOTICE}");
+    }
+    let (success, mut report) = match command {
         Par3InsideCommand::Insert(args) => insert(cli, &args)?,
         Par3InsideCommand::Verify(args) => verify(cli, &args)?,
         Par3InsideCommand::Repair(args) => repair(cli, &args)?,
         Par3InsideCommand::Remove(args) => remove(cli, &args)?,
     };
+    if let Some(fields) = report.as_object_mut() {
+        fields.insert("experimental".to_owned(), Value::Bool(true));
+    }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if !cli.quiet {

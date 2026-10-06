@@ -3,6 +3,84 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.8.0
+
+### CLI Changes
+
+- **Experimental:** `rarpar par3 inside insert|verify|repair|remove` embeds
+  PAR3 recovery inside existing RAR5 archives and RAR5 volume sets made by
+  RARLAB rar, verifies and repairs them from it, and takes it out again. The
+  region layout is not part of the PAR3 specification yet: it may change
+  before it is stable, and output from this version may not verify with a
+  later one. Every run says so on stderr (silenced by `--quiet`), `--json`
+  reports carry `"experimental": true`, and the help text starts with
+  "EXPERIMENTAL:". No flag is needed to run it. The par3cmdline, unrar and
+  7-Zip front ends do not read these regions.
+- One PAR3 set covers a whole volume set, with one File packet per volume.
+  Each File's chunks are the archive's bytes before the region, one
+  unprotected chunk holding the region, and the bytes after it, so the File's
+  hash is the hash of the original archive. Archive bytes are never changed,
+  and no RAR archive is created or recompressed.
+- `--layout trailing` (the default) appends the region after the
+  end-of-archive header and any volume padding. It works on every RAR5
+  archive, including ones with encrypted headers (`-hp`) and locked ones.
+  `--layout service` instead places a stored `PAR3` service header with the
+  skip-if-unknown flag before the end-of-archive header; it is refused for
+  `-hp` and locked archives. `--layout block` uses an unassigned header type
+  with the skip flag and is kept for comparison only.
+- Reader behaviour after insertion, across 15 RARLAB-made fixtures (stored,
+  compressed, solid, recovery record, quick open, comment, encrypted files,
+  encrypted headers, locked, service headers, many files, SFX, and stored,
+  recovery-record and solid volume sets) and one 4.6 GB archive, each listed,
+  tested and extracted by RARLAB unrar 7.23, 7-Zip 7zz and unrar-rs and
+  compared with the archive before insertion: trailing gives the same result
+  in unrar and unrar-rs, and 7-Zip warns "data after end of archive"; service
+  gives the same result in all three; block makes 7-Zip refuse the archive and
+  unrar-rs warn about an unknown header.
+- `--placement spread` (the default) gives every volume the set's metadata
+  and an even share of the recovery packets, so any one volume, the first and
+  last included, can be rebuilt. `last` puts all recovery in the last volume
+  and cannot rebuild that volume; `independent` writes one set per volume and
+  cannot rebuild any lost volume. Rebuilding a lost volume needs about one
+  volume's worth of recovery: on a 1 GiB set of ten volumes it failed at 2%
+  and 5% and succeeded at 11%, 12% and 15%.
+- `insert` takes `-s`, `-c` and `-r` (5% by default) as `par3 create` does;
+  the default block size is the smallest power of two from 4096 that keeps
+  at most 2048 blocks. Output goes to `-d DIR` or, with `--in-place`, over the
+  input. Insertion is deterministic: the same archive and options give the
+  same bytes. RAR4 archives, unknown trailing data and archives that already
+  hold PAR3 packets are refused.
+- `verify` finds the other volumes of a set by the names recorded in the set
+  and by `.partN.rar` numbering, follows renamed sets, and reports each
+  volume's data and region separately. A missing volume that no set covers
+  is reported and fails the run.
+- `repair` rebuilds damaged and missing volumes in place, keeping numbered
+  backups (`--no-backup` to drop them), or into `-d DIR`. It rebuilds the
+  region as well as the data: the layout and packet count are solved from the
+  region's checked length, and lost recovery packets are recomputed from the
+  rebuilt data, so the output matches the protected file byte for byte.
+- `remove` writes the archives without their regions, checked against the
+  hash recorded in the set; the result is byte-identical to the original.
+- On 1 GiB (one archive, stored random data) inserting took 0.72, 0.88 and
+  1.5 s wall at 2%, 5% and 15%, for regions of 22, 55 and 162 MB, and
+  repairing burst or scattered damage took 1.6 to 2.6 s. RARLAB `rar` adds a
+  recovery record of about the same size in 1.0 to 1.7 s and repairs a burst
+  in 4.4 to 8.8 s; at 2% it could not repair the scattered damage PAR3
+  repaired. Neither recovers an archive whose end, with the region, is cut
+  off.
+- RARLAB `rar r` on an archive holding a region: with the archive intact, or
+  with only the region damaged, it reports nothing to repair and writes
+  nothing. With damaged data and a recovery record it writes `fixed.NAME`,
+  repaired and byte-identical to the original archive, without the region,
+  for all three layouts; inserting again under the original name reproduces
+  the protected file byte for byte. Without a recovery record it writes
+  `rebuilt.NAME`, also without the region, with the damaged data still
+  damaged; `par3 inside repair` restores that archive exactly.
+
+### Library versions
+
+- par3-rs `=0.5.0`; par2-rs and unrar-rs are unchanged.
+
 ## rarpar 0.7.0
 
 ### CLI Changes

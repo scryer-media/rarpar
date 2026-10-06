@@ -45,6 +45,41 @@ fn originals(root: &Path) -> Option<Vec<PathBuf>> {
     Some(copies)
 }
 
+/// Every run warns on stderr that the feature is experimental, unless `--quiet`.
+fn assert_experimental_notice(root: &Path, archive: &str) {
+    let stderr = |quiet: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rarpar"));
+        command.current_dir(root);
+        if quiet {
+            command.arg("--quiet");
+        }
+        let output = command
+            .args(["par3", "inside", "verify", archive])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        String::from_utf8(output.stderr).unwrap()
+    };
+    assert!(stderr(false).contains("par3 inside is EXPERIMENTAL"));
+    assert!(!stderr(true).contains("EXPERIMENTAL"));
+}
+
+#[test]
+fn inside_help_is_marked_experimental() {
+    for args in [
+        &["par3", "inside", "--help"][..],
+        &["par3", "inside", "insert", "--help"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.starts_with("EXPERIMENTAL:"), "{args:?}: {help}");
+    }
+}
+
 fn name(part: usize) -> String {
     format!("{STEM}.part{part}.rar")
 }
@@ -77,6 +112,7 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
         0,
     );
     assert_eq!(inserted["outputs"].as_array().unwrap().len(), 7);
+    assert_eq!(inserted["experimental"], true);
     let protected = root.join("protected");
     let pristine: Vec<Vec<u8>> = (1..=7)
         .map(|part| std::fs::read(protected.join(name(part))).unwrap())
@@ -84,6 +120,7 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
     let entry = protected.join(name(1));
     let entry = entry.to_str().unwrap();
     run(root, &["par3", "inside", "verify", entry], 0);
+    assert_experimental_notice(root, entry);
 
     std::fs::remove_file(protected.join(name(1))).unwrap();
     let damaged = protected.join(name(4));

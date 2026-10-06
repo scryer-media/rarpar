@@ -464,6 +464,7 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | Column-tiled FFT execution, budget-sized FFT stripes, contiguous aligned banks | PAR3 FFT | Building | |
 | Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
 | par3cmdline-compatible command-line facade | rarpar CLI | Building | |
+| PAR3 inside RAR5 volume sets (experimental `par3 inside`): trailing region by default, `PAR3` service header as the alternative; trailing reads clean in unrar and unrar-rs with a 7-Zip "data after end" warning, the service header reads clean in all three; 1 GiB inserts in 0.7 to 1.5 s at 2 to 15% and repairs in 1.6 to 2.6 s | PAR3, rarpar CLI | Building | layout agreed with the PAR3 maintainers |
 | SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Exploring | bench-first spike on Apple M4-class silicon |
 | AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
 | AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over |

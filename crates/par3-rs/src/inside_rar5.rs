@@ -1,5 +1,9 @@
 //! PAR-inside for RAR5 archives and RAR5 volume sets.
 //!
+//! **Experimental.** The region layout is not part of the PAR3 specification
+//! yet; it may change before it is stable, and regions written by this version
+//! may not verify with a later one.
+//!
 //! RAR5 framing is read from block headers only: signature, header CRC32,
 //! header size, type, flags and data size. Members are never decompressed and
 //! no RAR structure is rewritten. Every host file keeps its original bytes in

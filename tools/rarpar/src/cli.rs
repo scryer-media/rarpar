@@ -172,10 +172,13 @@ back. By default the set is written beside the archive as OUTPUT.par3 and
 recovery volumes; --inside appends it after the archive's end header instead,
 where 7z readers ignore it and PAR3 tools find it.")]
     Archive(Par3ArchiveArgs),
-    /// PAR-inside for RAR5 archives and volume sets made by RARLAB rar.
+    /// EXPERIMENTAL: PAR-inside for RAR5 archives and volume sets made by RARLAB rar.
     #[command(
         subcommand,
         long_about = "\
+EXPERIMENTAL: the on-disk layout of the embedded PAR3 region may change before
+it is stable, and output from this version may not verify with a later one.
+
 Embed PAR3 recovery inside existing RAR5 archives, verify and repair them from
 that embedded recovery, and remove it again. The archive's own bytes are never
 changed: insertion writes a new copy with a PAR3 region added, and removal
@@ -187,13 +190,13 @@ recompressed."
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Par3InsideCommand {
-    /// Add a PAR3 region to a RAR5 archive or every volume of a RAR5 set.
+    /// EXPERIMENTAL: add a PAR3 region to a RAR5 archive or every volume of a RAR5 set.
     Insert(Par3InsideInsertArgs),
-    /// Verify archive data and embedded regions.
+    /// EXPERIMENTAL: verify archive data and embedded regions.
     Verify(Par3InsideArgs),
-    /// Rebuild damaged or missing volumes and regions from embedded recovery.
+    /// EXPERIMENTAL: rebuild damaged or missing volumes and regions from embedded recovery.
     Repair(Par3InsideRepairArgs),
-    /// Write the archives without their PAR3 regions, byte-identical to the originals.
+    /// EXPERIMENTAL: write the archives without their PAR3 regions, byte-identical to the originals.
     Remove(Par3InsideRemoveArgs),
 }
 

@@ -77,6 +77,11 @@
 //!   checksum for their shared block.
 //! - Recovery-carrier reconstruction and staged Cauchy PAR-inside insertion or
 //!   self-repair for supported ZIP, ZIP64, and 7z layouts ([`carrier`], [`inside`]).
+//! - Experimental PAR-inside for RAR5 archives and RAR5 volume sets made by
+//!   RARLAB rar: one set across every volume, a region per volume, insertion,
+//!   verification, byte-exact self-repair of lost volumes and regions, and
+//!   byte-exact removal ([`inside::rar5`]). The region layout is not yet
+//!   specified by PAR3 and may change in a later release.
 //!
 //! # What is not
 //!
