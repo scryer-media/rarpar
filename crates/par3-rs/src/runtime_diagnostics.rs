@@ -250,6 +250,13 @@ pub struct AmplificationSnapshot {
 /// would cost more than the arithmetic it measures. `skipped` is what a
 /// pruning plan decided not to compute, so `butterflies + skipped` is what the
 /// same decode would have cost without the plan.
+///
+/// An FFT decode that walks its domain in slabs runs the inverse transform
+/// as one call, then the forward transform as one call per class and two
+/// per block holding a lost row, each against that block's half of the
+/// derivative. `butterflies` is the work it performed and `skipped` what it
+/// saved against both transforms in full; where most blocks hold a lost
+/// row it performs more than that, and `skipped` is zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecSnapshot {
     /// Additive-transform invocations, including the ones a plan split.

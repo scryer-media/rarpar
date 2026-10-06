@@ -1104,6 +1104,16 @@ fn reconstruct_fft(
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
     let writers = StageWriters::new(tree, session, proof);
+    // The proof's frontiers are reserved by the first decode, once its
+    // stripe is known and before it reads anything: the first stripe pass
+    // opens one for every extent the stripes split and only the last closes
+    // them, so taken as they open they found only what the bank left, and
+    // where that was too little every staged output read back. They are
+    // counted over every extent still unproven, the later cohorts' too.
+    let frontiers = ProofFrontiers {
+        proof,
+        reserved: std::cell::Cell::new(false),
+    };
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
     for block in 0..layout.block_count {
@@ -1174,7 +1184,7 @@ fn reconstruct_fft(
                 }
                 FftInput::Recovery(_) => Ok(()),
             };
-            codec.decode_with(
+            codec.decode_held(
                 layout.block_size,
                 &lost,
                 &indices,
@@ -1215,6 +1225,7 @@ fn reconstruct_fft(
                         bytes,
                     )
                 },
+                Some(&frontiers),
             )
         };
         if held {
@@ -1224,6 +1235,28 @@ fn reconstruct_fft(
         writers.settle()?;
     }
     Ok(())
+}
+
+/// The staged proof's frontiers as an FFT decode holds them; reserved once.
+struct ProofFrontiers<'a, 'b> {
+    proof: &'a StagedProof<'b>,
+    reserved: std::cell::Cell<bool>,
+}
+
+impl crate::fft::StripeHold for ProofFrontiers<'_, '_> {
+    fn bytes(&self, stripe: usize) -> Option<usize> {
+        if self.reserved.get() {
+            return Some(0);
+        }
+        self.proof.frontier_bytes(stripe as u64)
+    }
+
+    fn reserve(&self, stripe: usize) -> bool {
+        if !self.reserved.get() && self.proof.reserve_frontiers(stripe as u64) {
+            self.reserved.set(true);
+        }
+        self.reserved.get()
+    }
 }
 
 fn open_staged(
