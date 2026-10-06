@@ -2041,6 +2041,13 @@ fn ahead_segments(
     })
 }
 
+/// Whether the walk reads the chunk of `length` as an inline tail rather
+/// than hashing it as a block: a tail shorter than [`TAIL_HASH_LEN`]. A full
+/// block shorter than that is still a block.
+fn inline_tail(length: u64, block_size: u64) -> bool {
+    length < TAIL_HASH_LEN as u64 && length != block_size
+}
+
 /// Read whole serial-walk reads from `*read` into `buffer` while they fit:
 /// a chunk is read a stripe at a time from its start, and an inline tail in
 /// one read, exactly as [`PlanningReader::hash_chunk`] and the walk do.
@@ -2305,7 +2312,7 @@ impl PlanningReader<'_> {
                     .chunk_crc
                     .update(&data[range.start..range.start + take]);
                 if start + range.end as u64 == chunk + length {
-                    if length < TAIL_HASH_LEN as u64 {
+                    if inline_tail(length, block_size) {
                         ahead.inline = Some((chunk, data[range].to_vec()));
                     }
                     finished.push((chunk, length, ahead.chunk_crc.finalize()));
@@ -2315,7 +2322,7 @@ impl PlanningReader<'_> {
         });
         ahead.chunk_hash = chunk_hash;
         for ((chunk, length, rolling), fingerprint) in finished.into_iter().zip(fingerprints) {
-            if length >= TAIL_HASH_LEN as u64 {
+            if !inline_tail(length, block_size) {
                 ahead.ready.push_back((chunk, fingerprint, rolling));
             }
         }

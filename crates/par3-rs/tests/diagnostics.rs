@@ -581,6 +581,10 @@ fn a_repair_squeezed_onto_one_thread_banks_one_output_row() {
 /// being admitted and asserts the outcome is monotone. The two liveness
 /// assertions at the end keep it honest: the window has to straddle the
 /// admission threshold, or it proves nothing.
+///
+/// The window reaches past the point where the pool's narrowed stripe first
+/// fits, up to where its bank also leaves the staged proof its frontiers:
+/// below that the pool gives way to the serial bank.
 #[test]
 fn a_larger_budget_never_refuses_a_repair_a_smaller_one_completed() {
     if std::thread::available_parallelism().is_ok_and(|threads| threads.get() < 2) {
@@ -591,7 +595,7 @@ fn a_larger_budget_never_refuses_a_repair_a_smaller_one_completed() {
     let seed = b"PAR3 serial retry";
     let mut first_ok = None;
     let mut widths = Vec::new();
-    for budget in ((732 << 10)..=(742 << 10)).step_by(128) {
+    for budget in ((732 << 10)..=(752 << 10)).step_by(128) {
         match try_repair_cauchy(64, 1024, 8, &damage, 8, 4096, budget, seed) {
             Ok(options) => {
                 let admission = options.diagnostics.admission();
@@ -795,6 +799,126 @@ fn reading_ahead_changes_scratch_and_nothing_else() {
         ahead.diagnostics.file_io(),
         alternating.diagnostics.file_io(),
         "reading ahead changed the staged file I/O"
+    );
+}
+
+/// Wave-2 review, finding F1. The syndrome group and the read-ahead set take
+/// what the stripe bank leaves, down to the slack. With stripes narrower than
+/// a block, the staged proof holds a hash frontier open for every extent
+/// written in pieces; when those grabs took the bytes the frontiers needed,
+/// the proof gave up and the staged output was read back, at budgets where a
+/// smaller one read nothing back. Read-back must never grow with the budget,
+/// and with the frontiers reserved ahead of the bank's narrowing and of both
+/// grabs, no budget the repair completes in reads back at all.
+#[test]
+fn w2review_read_ahead_starves_proof_frontiers_into_read_back() {
+    let (blocks, block_size, recovery) = (24usize, 64u64 << 10, 8u64);
+    let block = block_size as usize;
+    let stripe = 16usize << 10;
+    let tree = common::TempTree::new("proof-frontiers");
+    let set = common::cauchy_block_set(
+        blocks,
+        block_size,
+        recovery,
+        b"PAR3 w2review frontier",
+        &tree,
+    );
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for lost in 0..recovery as usize {
+        damaged[(lost * 3 + 1) * block + 11] ^= 0x80;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+    let repair = |budget: usize| -> Option<ExecutionOptions> {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 4;
+        options.stripe_bytes = stripe;
+        options.memory = MemoryBudget::new(budget);
+        let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).ok()?;
+        session.bind_file(&name, SourceId(1)).ok()?;
+        for packet in &carriers {
+            session.merge(packet.clone()).ok()?;
+        }
+        if session.assess().ok()?.status != RepairStatus::Ready {
+            return None;
+        }
+        let output = common::TempTree::new("proof-frontiers-out");
+        let report = session.repair(output.path(), false).ok()?;
+        assert_eq!(report.reconstructed_blocks, recovery);
+        assert!(
+            std::fs::read(output.path().join(&name)).unwrap() == bytes,
+            "{budget}: the repair did not reproduce the input"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "the session leaked");
+        Some(options)
+    };
+    let scratch = |options: &ExecutionOptions| {
+        options
+            .diagnostics
+            .memory()
+            .unwrap()
+            .category(MemoryCategory::CodecScratch)
+            .peak
+    };
+    let roomy = repair(64 << 20).expect("the roomy repair");
+    assert_eq!(
+        roomy.diagnostics.file_io().read_bytes,
+        0,
+        "the roomy repair read back"
+    );
+    let peak = roomy.memory.peak();
+    let mut rows = Vec::new();
+    let mut budget = peak.saturating_sub(1900 << 10);
+    while budget <= peak + (64 << 10) {
+        if let Some(run) = repair(budget) {
+            rows.push((
+                budget,
+                run.diagnostics.file_io().read_bytes,
+                scratch(&run),
+                run.diagnostics.admission().stripe_bytes,
+            ));
+        }
+        budget += 8 << 10;
+    }
+    // The sweep must straddle both grabs: from budgets that leave no room for
+    // a second stripe to budgets with the whole read-ahead set.
+    // It must also reach budgets whose bank narrows the stripe.
+    let widest = scratch(&roomy);
+    let narrowest = rows
+        .iter()
+        .filter(|row| row.3 == stripe as u64)
+        .map(|row| row.2)
+        .min()
+        .unwrap_or(widest);
+    assert!(
+        widest - narrowest >= 16 * stripe as u64,
+        "the sweep did not straddle the group and the read-ahead: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.3 < stripe as u64),
+        "the sweep never narrowed the stripe: {rows:?}"
+    );
+    for pair in rows.windows(2) {
+        assert!(
+            pair[1].1 <= pair[0].1,
+            "budget {} read back {} bytes, budget {} read back {}: {rows:?}",
+            pair[0].0,
+            pair[0].1,
+            pair[1].0,
+            pair[1].1
+        );
+    }
+    assert!(
+        rows.iter().all(|row| row.1 == 0),
+        "a completed repair read back: {rows:?}"
     );
 }
 
@@ -1212,6 +1336,58 @@ fn a_planning_pool_changes_scratch_and_nothing_else() {
     .unwrap();
     let ledger = execution.diagnostics.memory().unwrap();
     assert_eq!(ledger.category(MemoryCategory::WorkerStacks).peak, 0);
+}
+
+/// Wave-2 review, finding F2. With blocks shorter than the 40-byte inline
+/// tail threshold, every full block is shorter than it too. The serial walk
+/// hashes such a block as a block; the pooled read-ahead took it for an inline
+/// tail, never queued it, and failed the plan. One worker and four must agree.
+#[test]
+fn w2review_pooled_planning_blocks_under_tail_len() {
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, Deduplication};
+    for block_size in [40u64, 42, 38, 32] {
+        let bytes: Vec<u8> = (0..(8usize << 20) + 5)
+            .map(|i| ((i % block_size as usize) * 7 + 1) as u8)
+            .collect();
+        let build = |workers: usize| {
+            let mut inner = MemorySourceAccess::default();
+            inner.insert(SourceId(1), 1, bytes.clone().into());
+            let mut options = CreationOptions {
+                block_size,
+                recovery_count: 1,
+                deduplication: Deduplication::Aligned,
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            options.execution.retained_bytes = 2 << 30;
+            options.execution.memory = MemoryBudget::new(4 << 30);
+            let execution = options.execution.clone();
+            let plan = CreationPlan::build(
+                Arc::new(inner),
+                &[CreationSource {
+                    name: "a.bin".into(),
+                    source: SourceId(1),
+                }],
+                options,
+            )
+            .map_err(|error| error.to_string());
+            let reads = execution.diagnostics.source_io();
+            let tree = common::TempTree::new(&format!("tiny-blocks-{block_size}-{workers}"));
+            let carriers = plan.map(|plan| {
+                plan.execute(&tree.path().join("set"), tree.path())
+                    .unwrap()
+                    .iter()
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect::<Vec<_>>()
+            });
+            (carriers, reads)
+        };
+        let (serial, serial_io) = build(1);
+        let (pooled, pooled_io) = build(4);
+        assert!(serial.is_ok(), "block {block_size}: {:?}", serial.err());
+        assert!(serial == pooled, "block {block_size}: {:?}", pooled.err());
+        assert_eq!(serial_io, pooled_io, "block {block_size}");
+    }
 }
 
 // --- Clone staging -----------------------------------------------------------

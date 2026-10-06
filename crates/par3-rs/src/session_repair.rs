@@ -631,39 +631,95 @@ where
     // is refused, the pool's own stacks are the likeliest thing standing in the
     // way, so give them back and try once more at the serial width. A repair
     // that fits on one thread must not be refused because a pool was admitted
-    // in front of it.
-    let admit = |tile: usize| -> EngineResult<(usize, usize, crate::runtime::Reservation)> {
-        let buffer_count = n
-            .checked_add(tile)
-            .and_then(|count| count.checked_add(3))
-            .ok_or(EngineError::resource_limit("repair stripes"))?;
-        let bank_headers = n
-            .checked_add(tile)
-            .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
-            .ok_or(EngineError::resource_limit("repair stripes"))?;
-        let (stripe, buffers) = session.options.memory.reserve_stripes_with_overhead(
-            MemoryCategory::CodecScratch,
-            target,
-            buffer_count,
-            F::SYMBOL_BYTES,
-            bank_headers,
-        )?;
-        Ok((stripe, buffer_count, buffers))
-    };
+    // in front of it. `spare` bytes are held back from the stripes on top of
+    // the bank's own overhead and handed back once the stripe is sized.
+    let admit =
+        |tile: usize, spare: usize| -> EngineResult<(usize, usize, crate::runtime::Reservation)> {
+            let buffer_count = n
+                .checked_add(tile)
+                .and_then(|count| count.checked_add(3))
+                .ok_or(EngineError::resource_limit("repair stripes"))?;
+            let bank_headers = n
+                .checked_add(tile)
+                .and_then(|rows| rows.checked_mul(size_of::<Vec<u8>>()))
+                .ok_or(EngineError::resource_limit("repair stripes"))?;
+            let overhead = bank_headers
+                .checked_add(spare)
+                .ok_or(EngineError::resource_limit("repair stripes"))?;
+            let (stripe, mut buffers) = session.options.memory.reserve_stripes_with_overhead(
+                MemoryCategory::CodecScratch,
+                target,
+                buffer_count,
+                F::SYMBOL_BYTES,
+                overhead,
+            )?;
+            buffers.shrink_to(buffers.bytes() - spare);
+            Ok((stripe, buffer_count, buffers))
+        };
     let mut tile = pool
         .as_ref()
         .map_or(1, crate::runtime::WorkerPool::current_num_threads)
         .min(n);
-    let admitted = match admit(tile) {
+    let mut admitted = match admit(tile, 0) {
         Ok(admitted) => admitted,
         Err(EngineError::ResourceLimit(_)) if pool.is_some() => {
             pool = None;
             tile = 1;
             session.options.diagnostics.note_workers(1, n);
-            admit(tile)?
+            admit(tile, 0)?
         }
         Err(error) => return Err(error),
     };
+    // The staged proof's frontiers are reserved next, before anything that
+    // only saves time takes spare budget: without them every staged output
+    // reads back. A pool whose wider bank left too little for them gives way
+    // to the serial bank, as it does to a repair that fits only serially, but
+    // only when the serial bank at the full stripe would leave room for them.
+    // Otherwise the bank is sized again with room held back for them; a
+    // narrower stripe splits no extent the symbol width does not, so the
+    // frontiers at that width bound what any stripe needs.
+    let mut reserved = proof.reserve_frontiers(admitted.0 as u64);
+    if !reserved
+        && let Some(stacks) = pool
+            .as_ref()
+            .map(crate::runtime::WorkerPool::reserved_bytes)
+    {
+        let full = target / F::SYMBOL_BYTES * F::SYMBOL_BYTES;
+        // What `admit(1)` charges at the full stripe.
+        let serial = serial_rows
+            .checked_add(3)
+            .and_then(|buffers| buffers.checked_mul(full))
+            .and_then(|bytes| bytes.checked_add(serial_rows.checked_mul(size_of::<Vec<u8>>())?));
+        let room = session
+            .options
+            .memory
+            .available()
+            .saturating_add(stacks)
+            .saturating_add(admitted.2.bytes());
+        let fits = serial
+            .zip(proof.frontier_bytes(full as u64))
+            .and_then(|(serial, frontiers)| serial.checked_add(frontiers))
+            .is_some_and(|need| need <= room);
+        if fits {
+            drop(admitted);
+            pool = None;
+            tile = 1;
+            session.options.diagnostics.note_workers(1, n);
+            admitted = admit(tile, 0)?;
+            reserved = proof.reserve_frontiers(admitted.0 as u64);
+        }
+    }
+    if !reserved && let Some(spare) = proof.frontier_bytes(F::SYMBOL_BYTES as u64) {
+        // A bank that cannot leave the room keeps the stripe it had, and the
+        // outputs read back as before.
+        drop(admitted);
+        admitted = match admit(tile, spare) {
+            Ok(narrower) => narrower,
+            Err(EngineError::ResourceLimit(_)) => admit(tile, 0)?,
+            Err(error) => return Err(error),
+        };
+        proof.reserve_frontiers(admitted.0 as u64);
+    }
     let (stripe, buffer_count, _buffers) = admitted;
     session
         .options
@@ -1445,6 +1501,8 @@ struct OutputProof {
     proven: Vec<u64>,
     /// Extents written in more than one piece, hashed up to `next`.
     partial: HashMap<usize, PartialProof>,
+    /// Frontiers reserved ahead of the walk and not yet opened.
+    prepaid: usize,
 }
 
 struct PartialProof {
@@ -1497,6 +1555,7 @@ impl<'a> StagedProof<'a> {
                     unproven,
                     proven,
                     partial: HashMap::new(),
+                    prepaid: 0,
                 }
             })
             .collect();
@@ -1529,6 +1588,81 @@ impl<'a> StagedProof<'a> {
         }
     }
 
+    /// Frontiers a walk in stripes of `stripe` bytes opens in each output: one
+    /// for every extent it writes in more than one piece, with their bytes,
+    /// or `None` when those overflow.
+    fn frontiers(&self, outputs: &[OutputProof], stripe: u64) -> Option<(Vec<usize>, usize)> {
+        // An extent lies within one block, so a stripe as wide as a block
+        // writes every extent whole.
+        if stripe == 0 || stripe >= self.layout.block_size {
+            return Some((vec![0; outputs.len()], 0));
+        }
+        let counts: Vec<usize> = outputs
+            .iter()
+            .map(|output| {
+                if output.doubt {
+                    return 0;
+                }
+                let extents = &self.layout.files[output.index].extents;
+                (0..extents.len())
+                    .filter(|&index| output.proven[index / 64] & (1u64 << (index % 64)) == 0)
+                    .filter(|&index| {
+                        let (Some(range), Some((_, at))) =
+                            (extents.range(index), extents.block_at(index))
+                        else {
+                            return false;
+                        };
+                        let len = range.end - range.start;
+                        len != 0 && at / stripe != (at + len - 1) / stripe
+                    })
+                    .count()
+            })
+            .collect();
+        let bytes = counts.iter().try_fold(0usize, |sum, &count| {
+            sum.checked_add(count.checked_mul(PARTIAL_PROOF_BYTES)?)
+        })?;
+        Some((counts, bytes))
+    }
+
+    /// Bytes [`Self::reserve_frontiers`] would take for `stripe`.
+    fn frontier_bytes(&self, stripe: u64) -> Option<usize> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.reservation.as_ref()?;
+        self.frontiers(&state.outputs, stripe)
+            .map(|(_, bytes)| bytes)
+    }
+
+    /// Reserve now a frontier for every extent a walk in stripes of `stripe`
+    /// bytes writes in more than one piece. The first pass opens them all and
+    /// only the last closes them, so a walk that takes spare budget for
+    /// itself must not take these bytes, or the proof gives up and every
+    /// output reads back. Returns `false` when they do not fit; frontiers are
+    /// then reserved as they open, as before.
+    fn reserve_frontiers(&self, stripe: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.reservation.is_none() {
+            return true;
+        }
+        let Some((counts, bytes)) = self.frontiers(&state.outputs, stripe) else {
+            return false;
+        };
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        if bytes != 0
+            && reservation
+                .as_mut()
+                .is_none_or(|reservation| reservation.grow_by(bytes).is_err())
+        {
+            return false;
+        }
+        for (output, count) in outputs.iter_mut().zip(counts) {
+            output.prepaid += count;
+        }
+        true
+    }
+
     /// Read the output in `slot` back whatever its writes prove.
     fn doubt(&self, slot: usize) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1556,11 +1690,12 @@ impl OutputProof {
     /// frontiers go.
     fn give_up(&mut self, reservation: &mut Option<crate::runtime::Reservation>) {
         if let Some(reservation) = reservation.as_mut() {
-            let held = self.partial.len() * PARTIAL_PROOF_BYTES;
+            let held = (self.partial.len() + self.prepaid) * PARTIAL_PROOF_BYTES;
             reservation.shrink_to(reservation.bytes() - held);
         }
         self.doubt = true;
         self.partial = HashMap::new();
+        self.prepaid = 0;
     }
 
     /// Fold one write into the proof, or say it cannot be proven.
@@ -1603,11 +1738,15 @@ impl OutputProof {
             None if relative != 0 => return false,
             None if bytes.len() as u64 == len => crate::fingerprint(bytes),
             None => {
-                let Some(reservation) = reservation.as_mut() else {
-                    return false;
-                };
-                if reservation.grow_by(PARTIAL_PROOF_BYTES).is_err() {
-                    return false;
+                if self.prepaid != 0 {
+                    self.prepaid -= 1;
+                } else {
+                    let Some(reservation) = reservation.as_mut() else {
+                        return false;
+                    };
+                    if reservation.grow_by(PARTIAL_PROOF_BYTES).is_err() {
+                        return false;
+                    }
                 }
                 let mut hasher = crate::FingerprintHasher::new();
                 hasher.update(bytes);

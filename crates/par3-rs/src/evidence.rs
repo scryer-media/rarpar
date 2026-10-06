@@ -280,6 +280,9 @@ pub struct StreamingVerifier {
     parallel_hash: bool,
     whole_next: u64,
     whole_ordered: bool,
+    /// The end of the bytes [`Self::feed_whole`] has already reported as
+    /// Verify progress, so that rereading them does not report them again.
+    reported: u64,
     dropped: u64,
     reservation: Reservation,
 }
@@ -329,6 +332,7 @@ impl StreamingVerifier {
             parallel_hash: false,
             whole_next: 0,
             whole_ordered: true,
+            reported: 0,
             dropped: 0,
             reservation,
         })
@@ -398,7 +402,7 @@ impl StreamingVerifier {
         if self.whole_ordered {
             self.whole_next = end;
         }
-        progress.advance(bytes.len() as u64);
+        progress.advance(end.saturating_sub(offset.max(self.reported)));
         self.options.cancel.check()
     }
 
@@ -411,8 +415,8 @@ impl StreamingVerifier {
 
     /// [`Self::feed`] for the whole-file hash alone: no extent is hashed and
     /// no verdict changes. Returns whether the hash can still decide the file;
-    /// once protected bytes arrive out of order it cannot, and the caller
-    /// should stop reading for it.
+    /// once protected bytes arrive out of order it cannot, the bytes are not
+    /// taken, and the caller should feed them and the rest to [`Self::feed`].
     fn feed_whole(&mut self, offset: u64, bytes: &[u8]) -> EngineResult<bool> {
         let mut progress = self.options.stage(crate::runtime::Stage::Verify)?;
         let end = offset
@@ -459,6 +463,7 @@ impl StreamingVerifier {
             self.hash_run(&closed, offset, bytes);
         }
         self.whole_next = end;
+        self.reported = end;
         progress.advance(bytes.len() as u64);
         self.options.cancel.check()?;
         Ok(true)
@@ -705,7 +710,11 @@ fn verification_buffer(
 ///
 /// The whole-file hash is computed first, and a file it proves intact is read
 /// once, with every protected extent intact. A file it does not prove is read a second
-/// time to hash its extents.
+/// time to hash its extents. A source with protected bytes missing cannot be
+/// proved by the whole-file hash: when its first available range already
+/// shows the gap, its extents are hashed in a single pass; when the gap shows
+/// only later, hashing switches to extents there and only the prefix before
+/// the gap is read again.
 ///
 /// A source of at least [`crate::hash::PARALLEL_SOURCE_BYTES`] may start a
 /// private worker pool solely to hash it; a smaller one never does, because the
@@ -767,38 +776,80 @@ pub(crate) fn verify_source_in_pool(
     let _reservation = reservation;
     let mut buffer = vec![0; size];
     let description = &verifier.layout.files[verifier.file];
+    // The first pass begins from here, so that what it asks the provider is
+    // asked once.
+    let mut start = match access.open_sequential(source)? {
+        Some(reader) => Start::Reader(reader),
+        None if snapshot.len == 0 => Start::Range(None),
+        None => Start::Range(access.next_available(source, 0)?),
+    };
+    let mut end = snapshot.len;
     let mut whole = None;
     if description.fingerprint == [0; 16] {
         // Nothing can promote extents without a whole-file hash, so skip
         // computing one; `finish` would seal `None` either way.
         verifier.whole_ordered = false;
-    } else if unprotected_between(description, snapshot.len, description.len) {
+    } else if unprotected_between(description, snapshot.len, description.len)
+        && match &start {
+            // A first available range that leaves protected bytes out means
+            // the whole-file hash can never settle the file. The extent pass
+            // below hashes it beside the extents, as it always did.
+            Start::Range(Some(range)) => {
+                unprotected_between(description, 0, range.start)
+                    && unprotected_between(description, range.end, description.len)
+            }
+            Start::Range(None) => false,
+            Start::Reader(_) | Start::Probe => true,
+        }
+    {
         // The whole-file hash alone settles an intact file, and hashing every
         // extent beside it would double the work of the common case. Only a
         // file it does not settle pays a second read, for its extents.
+        let mut gap = None;
         read_source(
             access,
             source,
             snapshot,
+            end,
             options,
             &mut buffer,
-            &mut |offset, bytes| verifier.feed_whole(offset, bytes),
+            std::mem::replace(&mut start, Start::Probe),
+            &mut |offset, bytes| {
+                if gap.is_none() {
+                    if verifier.feed_whole(offset, bytes)? {
+                        return Ok(());
+                    }
+                    // Protected bytes before `offset` are missing, so the
+                    // whole-file hash cannot decide. Hash extents from here
+                    // on; only the prefix needs reading again.
+                    gap = Some(offset);
+                }
+                verifier.feed(offset, bytes)
+            },
         )?;
-        whole = verifier.whole_result();
-        if whole == Some(true) {
-            ensure_snapshot(access, source, snapshot)?;
-            return Ok(verifier.finish());
+        match gap {
+            Some(gap) => end = gap,
+            None => {
+                whole = verifier.whole_result();
+                if whole == Some(true) {
+                    ensure_snapshot(access, source, snapshot)?;
+                    return Ok(verifier.finish());
+                }
+                // The verdict is known; the extent pass need not hash the
+                // file again.
+                verifier.whole_ordered = false;
+            }
         }
-        // The verdict is known; the extent pass need not hash the file again.
-        verifier.whole_ordered = false;
     }
     read_source(
         access,
         source,
         snapshot,
+        end,
         options,
         &mut buffer,
-        &mut |offset, bytes| verifier.feed(offset, bytes).map(|()| true),
+        start,
+        &mut |offset, bytes| verifier.feed(offset, bytes),
     )?;
     ensure_snapshot(access, source, snapshot)?;
     let mut evidence = verifier.finish();
@@ -808,22 +859,39 @@ pub(crate) fn verify_source_in_pool(
     Ok(evidence)
 }
 
-/// Read a source generation in order, through its forward reader when it
-/// offers one and through `next_available` past that prefix, handing each
-/// filled buffer to `feed` until it returns `false`.
+/// Where [`read_source`] begins: what a first pass already asked the provider
+/// for, or nothing, so that it asks itself.
+enum Start {
+    Probe,
+    Reader(Box<dyn std::io::Read + Send>),
+    /// The answer to `next_available(source, 0)`.
+    Range(Option<Range<u64>>),
+}
+
+/// Read a source generation in order up to `end`, through its forward reader
+/// when it offers one and through `next_available` past that prefix, handing
+/// each filled buffer to `feed`.
+#[allow(clippy::too_many_arguments)]
 fn read_source(
     access: &dyn SourceAccess,
     source: SourceId,
     snapshot: SourceSnapshot,
+    end: u64,
     options: &ExecutionOptions,
     buffer: &mut [u8],
-    feed: &mut dyn FnMut(u64, &[u8]) -> EngineResult<bool>,
+    start: Start,
+    feed: &mut dyn FnMut(u64, &[u8]) -> EngineResult<()>,
 ) -> EngineResult<()> {
     let mut offset = 0;
-    if let Some(mut reader) = access.open_sequential(source)? {
-        while offset < snapshot.len {
+    let (reader, mut first) = match start {
+        Start::Probe => (access.open_sequential(source)?, None),
+        Start::Reader(reader) => (Some(reader), None),
+        Start::Range(range) => (None, Some(range)),
+    };
+    if let Some(mut reader) = reader {
+        while offset < end {
             options.cancel.check()?;
-            let take = (snapshot.len - offset).min(buffer.len() as u64) as usize;
+            let take = (end - offset).min(buffer.len() as u64) as usize;
             // Fill the buffer before hashing it. A provider is free to return
             // short reads, and a megabyte buffer fed 17 bytes at a time would
             // never reach the parallel gate.
@@ -844,50 +912,52 @@ fn read_source(
             if read == 0 {
                 break;
             }
-            if !feed(offset, &buffer[..read])? {
-                return Ok(());
-            }
+            feed(offset, &buffer[..read])?;
             offset += read as u64;
         }
     }
-    if offset < snapshot.len {
-        while let Some(range) = access.next_available(source, offset)? {
-            if range.start < offset || range.end <= range.start || range.end > snapshot.len {
-                return Err(EngineError::InvalidState(
-                    "invalid source availability range",
-                ));
-            }
-            offset = range.start;
-            while offset < range.end {
+    while offset < end {
+        let range = match first.take() {
+            Some(range) => range,
+            None => access.next_available(source, offset)?,
+        };
+        let Some(range) = range else {
+            break;
+        };
+        if range.start < offset || range.end <= range.start || range.end > snapshot.len {
+            return Err(EngineError::InvalidState(
+                "invalid source availability range",
+            ));
+        }
+        offset = range.start;
+        let stop = range.end.min(end);
+        while offset < stop {
+            options.cancel.check()?;
+            let take = (stop - offset).min(buffer.len() as u64) as usize;
+            let mut read = 0;
+            while read < take {
                 options.cancel.check()?;
-                let take = (range.end - offset).min(buffer.len() as u64) as usize;
-                let mut read = 0;
-                while read < take {
-                    options.cancel.check()?;
-                    let count = options.diagnostics.read_at(
-                        access,
-                        source,
-                        offset + read as u64,
-                        &mut buffer[read..take],
-                    )?;
-                    if count == 0 {
-                        break;
-                    }
-                    if count > take - read {
-                        return Err(EngineError::InvalidState("invalid source read length"));
-                    }
-                    read += count;
-                }
-                if read == 0 {
+                let count = options.diagnostics.read_at(
+                    access,
+                    source,
+                    offset + read as u64,
+                    &mut buffer[read..take],
+                )?;
+                if count == 0 {
                     break;
                 }
-                if !feed(offset, &buffer[..read])? {
-                    return Ok(());
+                if count > take - read {
+                    return Err(EngineError::InvalidState("invalid source read length"));
                 }
-                offset += read as u64;
+                read += count;
             }
-            offset = range.end;
+            if read == 0 {
+                break;
+            }
+            feed(offset, &buffer[..read])?;
+            offset += read as u64;
         }
+        offset = range.end;
     }
     Ok(())
 }
@@ -1071,7 +1141,8 @@ mod order_tests {
                     2 * bytes.len() as u64,
                     "{case}: not exactly one reread"
                 );
-                assert_eq!(hashed, 2 * bytes.len() as u64, "{case}");
+                // The reread reports no progress the first pass reported.
+                assert_eq!(hashed, bytes.len() as u64, "{case}");
             }
         }
         let (evidence, _, _) = verified(&many, 0, &cases[0].3, false);
@@ -1126,6 +1197,250 @@ mod order_tests {
                 assert_eq!(read, bytes.len() as u64, "{case}: one pass, not two");
                 assert_eq!(hashed, bytes.len() as u64, "{case}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod w2review_verify_tests {
+    //! Adversarial probes for W2.1 (whole-file-first disk verification).
+    use super::*;
+    use crate::runtime::Stage;
+    use crate::source::MemorySourceAccess;
+    use crate::test_reference::{TempTree, cauchy_block_set};
+
+    /// Provider that reports `hole` as unavailable. With `forward`, it also
+    /// offers a forward reader that stops at the hole, as a partially
+    /// downloaded source does.
+    struct Holey {
+        inner: MemorySourceAccess,
+        hole: Option<Range<u64>>,
+        forward: bool,
+    }
+
+    impl SourceAccess for Holey {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<Range<u64>>> {
+            let Some(range) = self.inner.next_available(source, offset)? else {
+                return Ok(None);
+            };
+            Ok(match &self.hole {
+                Some(hole) if range.start < hole.start => {
+                    Some(range.start..hole.start.min(range.end))
+                }
+                Some(hole) if range.start < hole.end => {
+                    (hole.end < range.end).then_some(hole.end..range.end)
+                }
+                _ => Some(range),
+            })
+        }
+        fn open_sequential(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+            if !self.forward {
+                return Ok(None);
+            }
+            let Some(reader) = self.inner.open_sequential(source)? else {
+                return Ok(None);
+            };
+            let prefix = self.hole.as_ref().map_or(u64::MAX, |hole| hole.start);
+            Ok(Some(Box::new(std::io::Read::take(reader, prefix))))
+        }
+    }
+
+    /// The pre-W2.1 verifier: one streaming pass hashing extents and the whole
+    /// file side by side.
+    fn single_pass(
+        layout: &Arc<BlockLayout>,
+        file: usize,
+        bytes: &[u8],
+        hole: Option<Range<u64>>,
+    ) -> FileEvidence {
+        let snapshot = SourceSnapshot {
+            len: bytes.len() as u64,
+            generation: 1,
+        };
+        let mut verifier = StreamingVerifier::new(
+            Arc::clone(layout),
+            file,
+            SourceId(1),
+            snapshot,
+            ExecutionOptions::default(),
+        )
+        .unwrap();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let mut end = (at + 4096).min(bytes.len());
+            if let Some(hole) = &hole {
+                if (at as u64) >= hole.start && (at as u64) < hole.end {
+                    at = hole.end as usize;
+                    continue;
+                }
+                if (at as u64) < hole.start && (end as u64) > hole.start {
+                    end = hole.start as usize;
+                }
+            }
+            verifier.feed(at as u64, &bytes[at..end]).unwrap();
+            at = end;
+        }
+        verifier.finish()
+    }
+
+    fn run(
+        layout: &Arc<BlockLayout>,
+        file: usize,
+        bytes: &[u8],
+        hole: Option<Range<u64>>,
+        forward: bool,
+    ) -> (FileEvidence, u64, u64, u64) {
+        let options = ExecutionOptions {
+            stripe_bytes: 1000,
+            ..ExecutionOptions::default()
+        };
+        let mut memory = MemorySourceAccess::default();
+        memory.insert(SourceId(1), 1, bytes.to_vec().into());
+        let access = Holey {
+            inner: memory,
+            hole,
+            forward,
+        };
+        let evidence =
+            verify_source(Arc::clone(layout), file, &access, SourceId(1), &options).unwrap();
+        (
+            evidence,
+            options.diagnostics.source_io().read_bytes,
+            options.diagnostics.source_io().read_calls,
+            options.diagnostics.stage(Stage::Verify).completed,
+        )
+    }
+
+    fn many_layout(tree: &TempTree) -> (Arc<BlockLayout>, Vec<u8>) {
+        let built = cauchy_block_set(64, 1024, 4, b"PAR3 w2 review", tree);
+        let mut packets = Vec::new();
+        for path in &built.paths {
+            packets.extend(
+                crate::scan::scan_packets_from_path(path)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, packet)| packet),
+            );
+        }
+        let set = crate::set::Par3Set::from_packets_for(packets, built.id).unwrap();
+        let layout = Arc::new(BlockLayout::new(&set, &ExecutionOptions::default()).unwrap());
+        (layout, built.contents[0].1.clone())
+    }
+
+    /// Truncated / appended files, with and without damage, on a 64-block
+    /// file. Classification must match the single pass, and a length that
+    /// cannot match must cost exactly one pass.
+    #[test]
+    fn w2review_truncated_and_appended_match_single_pass() {
+        let tree = TempTree::new("w2review-lengths");
+        let (layout, bytes) = many_layout(&tree);
+        let mut damaged = bytes.clone();
+        damaged[5 * 1024 + 3] ^= 0x40;
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![
+            ("short half block", bytes[..bytes.len() - 512].to_vec()),
+            ("short one block", bytes[..bytes.len() - 1024].to_vec()),
+            ("short to one byte", bytes[..1].to_vec()),
+            ("empty", Vec::new()),
+            ("short + damaged", damaged[..damaged.len() - 512].to_vec()),
+        ];
+        let mut long = bytes.clone();
+        long.extend_from_slice(&[0xAA; 3000]);
+        cases.push(("appended", long));
+        let mut long_damaged = damaged.clone();
+        long_damaged.extend_from_slice(b"x");
+        cases.push(("appended + damaged", long_damaged));
+        for (case, data) in &cases {
+            let expected = single_pass(&layout, 0, data, None);
+            for forward in [false, true] {
+                let (found, read, _, hashed) = run(&layout, 0, data, None, forward);
+                assert_eq!(found.verdicts(), expected.verdicts(), "{case}");
+                assert_eq!(found.whole_matches(), expected.whole_matches(), "{case}");
+                assert_eq!(found.whole_matches(), None, "{case}");
+                assert_eq!(read, data.len() as u64, "{case}: more than one pass");
+                assert_eq!(hashed, data.len() as u64, "{case}");
+            }
+        }
+    }
+
+    /// A positioned source with a hole over protected bytes can never be
+    /// settled by the whole-file hash. Its first available range already
+    /// shows the hole, so it is read once, extents and whole hash side by
+    /// side, as the single pass read it.
+    #[test]
+    fn w2review_hole_rereads_prefix() {
+        let tree = TempTree::new("w2review-hole");
+        let (layout, bytes) = many_layout(&tree);
+        let len = bytes.len() as u64;
+        let hole = (len - 3 * 1024)..(len - 2 * 1024);
+        let expected = single_pass(&layout, 0, &bytes, Some(hole.clone()));
+        let (found, read, calls, hashed) = run(&layout, 0, &bytes, Some(hole.clone()), false);
+        assert_eq!(found.verdicts(), expected.verdicts());
+        assert_eq!(found.whole_matches(), expected.whole_matches());
+        let available = len - (hole.end - hole.start);
+        eprintln!(
+            "W2REVIEW hole: file {len} available {available} read {read} calls {calls} hashed {hashed}"
+        );
+        assert_eq!(
+            read, available,
+            "hole case read {read} bytes for {available} available"
+        );
+        assert_eq!(hashed, available);
+    }
+
+    /// The same hole behind a forward reader that stops at it: nothing shows
+    /// the hole before the reader runs out, so the prefix is hashed whole
+    /// first. Past the hole the extents are hashed as they arrive, and only
+    /// the prefix is read again.
+    #[test]
+    fn w2review_hole_behind_a_forward_reader_rereads_only_the_prefix() {
+        let tree = TempTree::new("w2review-hole-forward");
+        let (layout, bytes) = many_layout(&tree);
+        let len = bytes.len() as u64;
+        for hole in [
+            (len - 3 * 1024)..(len - 2 * 1024),
+            (5 * 1024 + 100)..(9 * 1024),
+        ] {
+            let expected = single_pass(&layout, 0, &bytes, Some(hole.clone()));
+            let (found, read, calls, hashed) = run(&layout, 0, &bytes, Some(hole.clone()), true);
+            assert_eq!(found.verdicts(), expected.verdicts(), "{hole:?}");
+            assert_eq!(found.whole_matches(), expected.whole_matches(), "{hole:?}");
+            let available = len - (hole.end - hole.start);
+            eprintln!(
+                "W2REVIEW forward hole {hole:?}: available {available} read {read} calls {calls} hashed {hashed}"
+            );
+            assert_eq!(read, available + hole.start, "{hole:?}");
+            assert_eq!(hashed, available, "{hole:?}");
+        }
+    }
+
+    /// Progress: a damaged file reports its length once as completed Verify
+    /// work, though it is read twice.
+    #[test]
+    fn w2review_damaged_progress_double_counts() {
+        let tree = TempTree::new("w2review-progress");
+        let (layout, mut bytes) = many_layout(&tree);
+        bytes[100] ^= 1;
+        for forward in [false, true] {
+            let (_, read, _, hashed) = run(&layout, 0, &bytes, None, forward);
+            eprintln!(
+                "W2REVIEW progress: len {} read {read} verify-completed {hashed}",
+                bytes.len()
+            );
+            assert_eq!(read, 2 * bytes.len() as u64, "operator decision D2");
+            assert_eq!(hashed, bytes.len() as u64, "progress overshoot");
         }
     }
 }

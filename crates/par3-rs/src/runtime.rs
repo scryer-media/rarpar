@@ -853,6 +853,11 @@ impl WorkerPool {
     pub(crate) fn current_num_threads(&self) -> usize {
         self.pool().current_num_threads()
     }
+
+    /// Bytes this pool's stacks hold of the budget.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self._memory.bytes()
+    }
 }
 
 impl Drop for WorkerPool {
