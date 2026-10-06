@@ -995,26 +995,27 @@ mod charge_tests {
         }
     }
 
-    /// A budget too small for full-width stripes narrows them to whole 16 KiB
-    /// granules, in the decode workspace and in the repair adapter's source
-    /// buffers alike, so every stripe offset in a page-aligned block stays on a
-    /// page boundary.
+    /// A budget too small for full-width stripes narrows them to whole
+    /// granules of the target's page, in the decode workspace and in the
+    /// repair adapter's source buffers alike, so every stripe offset in a
+    /// page-aligned block stays on a page boundary.
     #[test]
     fn budget_narrowed_fft_stripes_are_whole_granules() {
+        let granule = crate::runtime::STRIPE_GRANULES[0];
         // 400 inputs and capacity 64 pad to a 512-row GF(2^16) domain.
         let geometry = FftGeometry::new(400, 6).unwrap();
         assert_eq!((geometry.domain, geometry.field_bytes()), (512, 2));
         let codec = FftCodec::new(geometry, options(24 << 20)).unwrap();
         let (stripe, buffers) = codec.buffers(1 << 20, geometry.domain).unwrap();
         assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
-        assert!(stripe.is_multiple_of(16 << 10), "unaligned stripe {stripe}");
+        assert!(stripe.is_multiple_of(granule), "unaligned stripe {stripe}");
         drop(buffers);
         drop(codec);
 
         let mut codec = FftCodec::new(geometry, options(768 << 10)).unwrap();
         let (stripe, _buffers) = codec.reserve_source_stripes(1 << 20, 4).unwrap();
         assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
-        assert!(stripe.is_multiple_of(16 << 10), "unaligned stripe {stripe}");
+        assert!(stripe.is_multiple_of(granule), "unaligned stripe {stripe}");
     }
 
     /// The repair adapter keeps two byte buffers for the whole reconstruction

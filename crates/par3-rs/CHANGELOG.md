@@ -54,10 +54,13 @@
   before and after every read. A file changed mid-operation still ends in
   `SourceChanged` with nothing installed; the change surfaces at the next
   write or pass end rather than the next read.
-- Budget-narrowed stripes round down to a multiple of 16 KiB (4 KiB below
-  that), so stripe reads and writes stay page-aligned. Budget-constrained FFT
-  repair wall time roughly halves; the 64 KiB default and user-chosen stripe
-  sizes are unchanged.
+- Budget-narrowed stripes round down to a whole multiple of the compilation
+  target's page: 16 KiB on Apple targets (4 KiB when 16 KiB does not fit),
+  4 KiB everywhere else, so stripe reads and writes stay page-aligned without
+  issuing more, smaller transfers on 4 KiB-page hosts. Budget-constrained FFT
+  repair wall time roughly halves on Apple hosts and improves by about a
+  quarter on x86 Linux; the 64 KiB default and user-chosen stripe sizes are
+  unchanged.
 - Cauchy creation encodes recovery rows on the worker pool when the rows per
   pass carry at least 1 MiB of work per worker. Output is byte-identical for
   every worker count and no read is added.

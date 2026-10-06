@@ -430,10 +430,17 @@ struct BudgetState {
 /// Stripes are read and written at whole multiples of their width from a
 /// block's start, so a width that is a multiple of the page keeps those
 /// transfers off partial pages, which the page cache would otherwise read back
-/// before modifying. 16 KiB is a multiple of both common page sizes (4 KiB and
-/// 16 KiB); 4 KiB is the fallback when the room cannot hold 16 KiB. Both are
-/// multiples of every field unit, and fixed: no page-size probing.
-pub(crate) const STRIPE_GRANULES: [usize; 2] = [16 << 10, 4 << 10];
+/// before modifying. The granule is chosen per compilation target, never
+/// probed: Apple targets page at 16 KiB, so a stripe cut to 4 KiB there stays
+/// on partial pages and the 16 KiB cut halved a budget-narrowed repair's wall
+/// time, with 4 KiB as the fallback when the room cannot hold 16 KiB. Every
+/// other target pages at 4 KiB, where 16 KiB only rounds further down and
+/// issues up to 1.75× more, smaller transfers for the same alignment. Every
+/// granule is a multiple of every field unit.
+#[cfg(target_vendor = "apple")]
+pub(crate) const STRIPE_GRANULES: &[usize] = &[16 << 10, 4 << 10];
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) const STRIPE_GRANULES: &[usize] = &[4 << 10];
 
 /// The stripe width `room` bytes per buffer can hold when the budget, not the
 /// configured target, decides it. Rounding down never charges more than the
@@ -441,7 +448,8 @@ pub(crate) const STRIPE_GRANULES: [usize; 2] = [16 << 10, 4 << 10];
 /// `alignment`-multiple, so a tight budget still runs rather than refuses.
 pub(crate) fn budget_stripe(room: usize, alignment: usize) -> usize {
     let granule = STRIPE_GRANULES
-        .into_iter()
+        .iter()
+        .copied()
         .find(|granule| room >= *granule && granule.is_multiple_of(alignment))
         .unwrap_or(alignment);
     room / granule * granule
@@ -923,15 +931,22 @@ mod stripe_tests {
         assert_eq!(options.memory.used(), 0);
     }
 
-    /// A stripe the budget narrows is cut to whole 16 KiB granules, or 4 KiB
-    /// ones when 16 KiB does not fit, so the reads and writes at multiples of
-    /// it stay page-aligned; a budget that cannot hold 4 KiB, and a target the
-    /// budget does not narrow, keep the field-unit rounding they had.
+    /// A stripe the budget narrows is cut to whole granules of the target's
+    /// page (16 KiB on Apple targets, falling back to 4 KiB; 4 KiB elsewhere),
+    /// so the reads and writes at multiples of it stay page-aligned; a budget
+    /// that cannot hold one granule, and a target the budget does not narrow,
+    /// keep the field-unit rounding they had.
     #[test]
     fn budget_narrowed_stripes_round_down_to_whole_granules() {
+        // 49_152 is a whole number of both 16 KiB and 4 KiB granules.
         assert_eq!(budget_stripe(50_316, 2), 49_152);
         assert_eq!(budget_stripe(50_317, 1), 49_152);
-        assert_eq!(budget_stripe(30_000, 2), 16_384);
+        let narrow = if cfg!(target_vendor = "apple") {
+            16_384
+        } else {
+            28_672
+        };
+        assert_eq!(budget_stripe(30_000, 2), narrow);
         assert_eq!(budget_stripe(16_384, 2), 16_384);
         assert_eq!(budget_stripe(16_383, 2), 12_288);
         assert_eq!(budget_stripe(4096, 2), 4096);
