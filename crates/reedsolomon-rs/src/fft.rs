@@ -226,6 +226,33 @@ impl TransformField {
         Ok(())
     }
 
+    /// The bytes of `row`'s 16-bit symbols on a little-endian target, where
+    /// each symbol's little-endian pair is its own representation, so the
+    /// on-disk layout can be read into and written from the row itself;
+    /// `None` on other targets.
+    #[must_use]
+    pub fn le_image(row: &[u16]) -> Option<&[u8]> {
+        if !cfg!(target_endian = "little") {
+            return None;
+        }
+        // SAFETY: `u8` has alignment 1 and every bit pattern is a `u8`; the
+        // view covers exactly the row's `2 * len` initialized bytes and
+        // borrows the row for as long as it lives.
+        Some(unsafe { std::slice::from_raw_parts(row.as_ptr().cast(), row.len() * 2) })
+    }
+
+    /// [`Self::le_image`], writable: every byte pattern is a symbol, so
+    /// writing the view writes the row.
+    #[must_use]
+    pub fn le_image_mut(row: &mut [u16]) -> Option<&mut [u8]> {
+        if !cfg!(target_endian = "little") {
+            return None;
+        }
+        // SAFETY: as `le_image`; the exclusive borrow of the row is held by
+        // the view for as long as it lives.
+        Some(unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast(), row.len() * 2) })
+    }
+
     /// Byte rows hold 8-bit symbols only.
     fn byte_lane(&self) -> Result<(), TransformError> {
         if self.bits == 8 {
@@ -338,6 +365,7 @@ impl TransformField {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         self.validate_transform(rows, zero, origin, cancelled)?;
+        let n = rows.len();
         let width = rows.first().map_or(0, Vec::len);
         let schedule = Schedule {
             origin,
@@ -345,7 +373,107 @@ impl TransformField {
             backend,
             radix4: Self::fused(width, backend),
         };
-        self.run_sweeps(rows, &schedule, zero, cancelled)
+        // Whole rows, sweep by sweep: alone, the kernels are bound by their
+        // own work, not by the memory the rows stream through, so gathering
+        // them as the pooled transforms do would only add the copies. Each
+        // unit is made as its group comes and the flags are carried sweep to
+        // sweep; a slab walk keeps every sweep's units and flags, as it runs
+        // them all over each slab.
+        let mut known = zero.map(<[bool]>::to_vec);
+        for sweep in sweeps(n.trailing_zeros(), inverse, schedule.radix4) {
+            let units = FreshUnits {
+                field: self,
+                schedule: &schedule,
+                sweep,
+                width,
+            };
+            let flags = known.as_ref().map(std::slice::from_ref);
+            self.run_sweeps(
+                rows,
+                std::slice::from_ref(&units),
+                flags,
+                Place::WHOLE,
+                cancelled,
+            )?;
+            if let Some(known) = &mut known {
+                advance(known, sweep, origin, inverse, &mut |_| {});
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes beyond the scratch that [`Self::transform_in_pool`] of `n`
+    /// rows `width` wide of `size`-byte symbols, `inverse` or forward with
+    /// `backend`, keeps on a pool of `threads` workers while it walks the
+    /// bank in slabs: the butterflies of every sweep, prepared once for all
+    /// the slabs, and the known-zero flags before each. None when it does
+    /// not walk; see [`walks`].
+    pub fn walk_units_bytes(
+        &self,
+        n: usize,
+        width: usize,
+        size: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        threads: usize,
+    ) -> usize {
+        if !walks(n, width, size, inverse, backend, threads) {
+            return 0;
+        }
+        let schedule = Schedule {
+            origin: 0,
+            inverse,
+            backend,
+            radix4: Self::fused(width, backend),
+        };
+        match size {
+            1 => self.units_bytes::<u8>(n, &schedule),
+            _ => self.units_bytes::<u16>(n, &schedule),
+        }
+    }
+
+    /// Bytes [`Self::units`] of `schedule` over `n` rows take, with the
+    /// flags of [`sweep_flags`]: one unit is made to measure.
+    fn units_bytes<S: Lane>(&self, n: usize, schedule: &Schedule) -> usize {
+        let pair = size_of_val(&self.pair::<S>(schedule, 0, 0, 64)) + size_of::<Box<PairUnit<S>>>();
+        let quad = size_of_val(&self.quad::<S>(schedule, 0, 0)) + size_of::<Box<QuadUnit<S>>>();
+        let sweeps: Vec<Sweep> =
+            sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4).collect();
+        let units: usize = sweeps
+            .iter()
+            .map(|sweep| match *sweep {
+                Sweep::Radix2(level) => (n >> (level + 1)) * pair,
+                Sweep::Radix4(low) => (n >> (low + 2)) * quad,
+            })
+            .sum();
+        units + (sweeps.len() + 1) * n
+    }
+
+    /// The butterflies of every sweep of `schedule` over `n` rows `width`
+    /// wide, prepared once and kept: their maps are what a sweep costs
+    /// beyond its rows, and a slab transform runs the same ones over every
+    /// slab.
+    fn units<S: Lane>(&self, n: usize, width: usize, schedule: &Schedule) -> Vec<KeptUnits<'_, S>> {
+        sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4)
+            .map(|sweep| match sweep {
+                Sweep::Radix2(level) => KeptUnits::Radix2(
+                    level,
+                    (0..n)
+                        .step_by(2 << level)
+                        .map(|base| {
+                            Box::new(self.pair(schedule, level, base, width)) as Box<PairUnit<S>>
+                        })
+                        .collect(),
+                ),
+                Sweep::Radix4(low) => KeptUnits::Radix4(
+                    low,
+                    (0..n)
+                        .step_by(4 << low)
+                        .map(|base| Box::new(self.quad(schedule, base, low)) as Box<QuadUnit<S>>)
+                        .collect(),
+                ),
+            })
+            .collect()
     }
 
     /// Whether the transform runs fused radix-4 sweeps: whenever the vector
@@ -355,69 +483,119 @@ impl TransformField {
         backend != crate::gf_simd::LinearBackend::Scalar && width >= 64
     }
 
-    fn run_sweeps<S: Lane>(
+    /// The sweeps `units` over `rows`: the whole rows, or windows of the
+    /// group of them `place` names, each sweep's units those of its groups
+    /// of rows there. `flags` are the known-zero flags of all the rows
+    /// before each of these sweeps, from [`sweep_flags`], or none.
+    fn run_sweeps<S: Lane, R: AsMut<[S]>, U: Units<S>>(
         &self,
-        rows: &mut [Vec<S>],
-        schedule: &Schedule,
-        zero: Option<&[bool]>,
+        rows: &mut [R],
+        units: &[U],
+        flags: Option<&[Vec<bool>]>,
+        place: Place,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         let n = rows.len();
-        let width = rows.first().map_or(0, Vec::len);
-        let mut known = zero.map(<[bool]>::to_vec);
-        for sweep in sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4) {
+        for (index, units) in units.iter().enumerate() {
             // The zero flags as this sweep finds them; it reads, never writes them.
-            let before = known.clone();
-            let zero = |row: usize| before.as_ref().is_some_and(|known| known[row]);
-            match sweep {
+            let before = flags.map(|flags| flags[index].as_slice());
+            let zero = |row: usize| before.is_some_and(|known| known[place.row(row)]);
+            match units.sweep() {
                 Sweep::Radix2(level) => {
-                    let half = 1 << level;
-                    for base in (0..n).step_by(half * 2) {
+                    let half = (1 << level) / place.stride;
+                    let first = place.first >> (level + 1);
+                    for (group, base) in (0..n).step_by(half * 2).enumerate() {
                         if cancelled() {
                             return Err(TransformError::Cancelled);
                         }
+                        let pair = units.pair(first + group);
                         let (left, right) = rows[base..base + half * 2].split_at_mut(half);
-                        let pair = self.pair(schedule, level, base, width);
                         for (at, (left, right)) in left.iter_mut().zip(right).enumerate() {
                             if cancelled() {
                                 return Err(TransformError::Cancelled);
                             }
-                            pair(left, right, [zero(base + at), zero(base + half + at)]);
+                            pair(
+                                left.as_mut(),
+                                right.as_mut(),
+                                [zero(base + at), zero(base + half + at)],
+                            );
                         }
                     }
                 }
                 Sweep::Radix4(low) => {
-                    let quarter = 1 << low;
-                    for base in (0..n).step_by(quarter * 4) {
+                    let quarter = (1 << low) / place.stride;
+                    let first = place.first >> (low + 2);
+                    for (group, base) in (0..n).step_by(quarter * 4).enumerate() {
                         if cancelled() {
                             return Err(TransformError::Cancelled);
                         }
-                        let quad = self.quad(schedule, base, low);
+                        let quad = units.quad(first + group);
                         let [a, b, c, d] = quarters(&mut rows[base..base + quarter * 4]);
                         let units = a.iter_mut().zip(b).zip(c).zip(d).enumerate();
                         for (at, (((a, b), c), d)) in units {
                             if cancelled() {
                                 return Err(TransformError::Cancelled);
                             }
-                            let flags = match &before {
+                            let flags = match before {
                                 None => [false; 4],
                                 Some(_) => std::array::from_fn(|k| zero(base + k * quarter + at)),
                             };
-                            quad([a, b, c, d].map(Vec::as_mut_slice), flags);
+                            quad([a, b, c, d].map(AsMut::as_mut), flags);
                         }
                     }
                 }
             }
-            if let Some(known) = &mut known {
-                advance(known, sweep, schedule.origin, schedule.inverse, &mut |_| {});
-            }
+        }
+        Ok(())
+    }
+
+    /// A pooled transform of a bank beyond the scratch: the workers share
+    /// the tasks of each pass of `walk`, every worker gathering its tasks'
+    /// rows into its own contiguous scratch; see [`Walk`] and
+    /// [`pass_tasks`]. A pass ends on every worker before the next begins.
+    fn transform_walk<S: Lane>(
+        &self,
+        rows: &mut [Vec<S>],
+        schedule: &Schedule,
+        flags: Option<&[Vec<bool>]>,
+        walk: &Walk,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        let units = self.units(rows.len(), walk.window, schedule);
+        let shared = SharedRows::of(rows);
+        for (sweeps, pass) in &walk.passes {
+            let flags = pass_flags(flags, sweeps);
+            let work = |rows: &mut [S], _: &mut [S], place| {
+                let mut windows: Vec<&mut [S]> = rows.chunks_exact_mut(walk.window).collect();
+                self.run_sweeps(
+                    &mut windows,
+                    &units[sweeps.clone()],
+                    flags.0,
+                    place,
+                    cancelled,
+                )
+            };
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            pool.broadcast(|_| {
+                pass_tasks(&shared, &next, *pass, flags.1, flags.2, 0, work, cancelled)
+            })
+            .into_iter()
+            .collect::<Result<(), TransformError>>()?;
         }
         Ok(())
     }
 
     /// Run transform stages inside a caller-owned, bounded worker pool. No
     /// global pool is used. Small stripes execute synchronously to avoid task
-    /// overhead; cancellation is checked before each butterfly pair.
+    /// overhead; cancellation is checked before each butterfly pair. A bank
+    /// beyond [`TRANSFORM_SCRATCH_BYTES`] is walked in slabs on a target
+    /// that gathers (see [`walks`]), each worker taking at most that much
+    /// scratch and all of them together at most the bank's worth, rounded
+    /// up to whole 64-symbol runs; a cancelled walk leaves the rows with
+    /// some slabs put back and some
+    /// not, so they hold no transform of anything, as a cancelled sweep
+    /// over whole rows leaves them with some butterflies done.
     pub fn transform_in_pool(
         &self,
         rows: &mut [Vec<u16>],
@@ -507,6 +685,10 @@ impl TransformField {
             backend,
             radix4: Self::fused(width, backend),
         };
+        if let Some(walk) = Walk::engaged(n, width, size_of::<S>(), &schedule, pool) {
+            let flags = sweep_flags(n, zero, &schedule);
+            return self.transform_walk(rows, &schedule, flags.as_deref(), &walk, pool, cancelled);
+        }
         let mut known = zero.map(<[bool]>::to_vec);
         pool.install(|| {
             for sweep in sweeps(n.trailing_zeros(), inverse, schedule.radix4) {
@@ -735,7 +917,10 @@ impl TransformField {
     /// columns are split between tasks, each running the sequential
     /// derivative on its own columns of every row, so the rows come out
     /// exactly as [`Self::derivative`] leaves them. Small stripes execute
-    /// synchronously, as in [`Self::transform_in_pool`].
+    /// synchronously, as in [`Self::transform_in_pool`]. On a target that
+    /// gathers, a bank beyond half [`TRANSFORM_SCRATCH_BYTES`] is gathered
+    /// a window of every row at a time, each worker taking at most that
+    /// scratch and all of them together at most twice the bank.
     pub fn derivative_in_pool(
         &self,
         rows: &mut [Vec<u16>],
@@ -776,8 +961,18 @@ impl TransformField {
             return self.derivative_lane(rows, cancelled);
         }
         self.validate_derivative(rows)?;
+        // Gathered where the transforms would gather, for the same reason:
+        // every row is read once per set bit of its index, and from scratch
+        // of the worker's own those reads hit the cache; see
+        // `Self::derivative_pass`.
+        if let Some(pass) = POOL_GATHERS
+            .then(|| Self::derivative_pass::<S>(n, width, threads))
+            .flatten()
+        {
+            return Self::derivative_gathered(rows, pass, pool, cancelled);
+        }
         // One pointer per row, the same size as the row handles themselves.
-        let shared = SharedRows(rows.iter_mut().map(|row| row.as_mut_ptr()).collect(), width);
+        let shared = SharedRows::of(rows);
         pool.install(|| {
             (0..width.div_ceil(share))
                 .into_par_iter()
@@ -823,26 +1018,63 @@ impl TransformField {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         self.validate_derivative(rows)?;
+        // Whole rows, for the reason the sequential transform sweeps them.
+        derivative_rows(rows, cancelled)
+    }
+
+    /// The pass a derivative of a bank beyond the scratch gathers in on
+    /// `threads` workers: every row at once, at a window narrow enough for
+    /// the rows and a second copy of them to share the scratch, and for the
+    /// workers' gathers together to stay within twice the bank; none when
+    /// the scratch-sized windows, or whole cache lines, would leave a
+    /// worker idle, and the pool shares the columns instead. See
+    /// [`derivative_blocks`].
+    fn derivative_pass<S: Lane>(n: usize, width: usize, threads: usize) -> Option<Pass> {
+        Pass::narrow::<S>(n, width, TRANSFORM_SCRATCH_BYTES / 2, threads)
+    }
+
+    /// A pooled derivative of validated `rows`, gathered in `pass`: the
+    /// workers share its tasks, each gathering a window of every row into
+    /// its own scratch, differentiating there and putting the rows back;
+    /// see [`pass_tasks`].
+    fn derivative_gathered<S: Lane>(
+        rows: &mut [Vec<S>],
+        pass: Pass,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
         let n = rows.len();
-        // Coefficient `index` becomes the XOR of the coefficients one set bit
-        // above it, all of which lie later in the rows, so ascending order
-        // reads each before it is overwritten. Each target is stored once,
-        // its sources folded two at a time, rather than cleared and then
-        // rewritten once per source.
-        for index in 0..n {
-            if cancelled() {
-                return Err(TransformError::Cancelled);
-            }
-            let (done, remaining) = rows.split_at_mut(index + 1);
-            let mut sources = [&[] as &[S]; 16];
-            let mut count = 0;
-            for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
-                sources[count] = &remaining[(index | (1 << bit)) - index - 1];
-                count += 1;
-            }
-            xor_sum(&mut done[index], &sources[..count]);
+        // One pointer per row, the same size as the row handles themselves.
+        let shared = SharedRows::of(rows);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = Self::derivative_work::<S>(pass, cancelled);
+        pool.broadcast(|_| {
+            pass_tasks(
+                &shared,
+                &next,
+                pass,
+                None,
+                None,
+                n * pass.window,
+                &work,
+                cancelled,
+            )
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// The work of a gathered derivative: the rows differentiated into the
+    /// spare scratch, then copied back for the pass to put them back.
+    fn derivative_work<S: Lane>(
+        pass: Pass,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> impl Fn(&mut [S], &mut [S], Place) -> Result<(), TransformError> + Sync {
+        move |rows, spare, _| {
+            derivative_blocks(rows, spare, pass.rows, pass.window, cancelled)?;
+            rows.copy_from_slice(spare);
+            Ok(())
         }
-        Ok(())
     }
 
     /// Evaluate an erasure locator at received positions and its derivative at
@@ -1059,6 +1291,523 @@ fn advance(
     }
 }
 
+/// Differentiate whole `rows` in place; see [`TransformField::derivative`].
+fn derivative_rows<S: Lane>(
+    rows: &mut [Vec<S>],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), TransformError> {
+    let n = rows.len();
+    // Coefficient `index` becomes the XOR of the coefficients one set bit
+    // above it, all of which lie later in the rows, so ascending order
+    // reads each before it is overwritten. Each target is stored once,
+    // its sources folded two at a time, rather than cleared and then
+    // rewritten once per source.
+    for index in 0..n {
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let (done, remaining) = rows.split_at_mut(index + 1);
+        let mut sources = [&[] as &[S]; 16];
+        let mut count = 0;
+        for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
+            sources[count] = remaining[(index | (1 << bit)) - index - 1].as_slice();
+            count += 1;
+        }
+        xor_sum(&mut done[index], &sources[..count]);
+    }
+    Ok(())
+}
+
+/// Differentiate `rows` rows of `window` symbols, contiguous in `from`, into
+/// `into`, as long; see [`TransformField::derivative`]. Bit by bit: the
+/// coefficients one set bit above a block of rows with that bit clear lie
+/// `1 << bit` rows on, contiguous, so each bit is one pass of XORs of whole
+/// blocks, and no row is handled on its own.
+fn derivative_blocks<S: Lane>(
+    from: &[S],
+    into: &mut [S],
+    rows: usize,
+    window: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), TransformError> {
+    debug_assert!(from.len() == rows * window && into.len() == from.len());
+    into.fill(S::default());
+    for bit in 0..rows.trailing_zeros() {
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let block = window << bit;
+        let pairs = into
+            .chunks_exact_mut(block * 2)
+            .zip(from.chunks_exact(block * 2));
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            for (into, from) in pairs {
+                // SAFETY: AVX2 was detected.
+                unsafe { xor_into_avx2(&mut into[..block], &from[block..]) };
+            }
+            continue;
+        }
+        for (into, from) in pairs {
+            xor_into(&mut into[..block], &from[block..]);
+        }
+    }
+    Ok(())
+}
+
+/// XOR `from` into `into`, as long.
+#[inline(always)]
+fn xor_into<S: Lane>(into: &mut [S], from: &[S]) {
+    for (into, &from) in into.iter_mut().zip(from) {
+        *into ^= from;
+    }
+}
+
+/// [`xor_into`] compiled for AVX2, which the vectorizer then uses.
+///
+/// # Safety
+/// AVX2 must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_into_avx2<S: Lane>(into: &mut [S], from: &[S]) {
+    xor_into(into, from)
+}
+
+/// Scratch each worker of a pooled transform or derivative may take for
+/// the rows it gathers, at most; see [`TransformField::transform_in_pool`].
+/// None is taken on a target that does not gather; see [`POOL_GATHERS`].
+pub const TRANSFORM_SCRATCH_BYTES: usize = 512 << 10;
+
+/// Whether the pooled transforms and derivatives of this target gather a
+/// bank beyond the scratch into slabs. Apple silicon streams the whole-row
+/// sweeps faster than the gathers and scatters cost: on an M-series, the
+/// slab walk of 4096 rows of 32768 16-bit symbols ran half as long again
+/// as the whole-row sweeps, and the gathered derivative twice as long. So
+/// there the pool sweeps whole rows, as every pool does for a bank within
+/// the scratch, and takes no scratch.
+pub const POOL_GATHERS: bool = !cfg!(target_vendor = "apple");
+
+/// Whether [`TransformField::transform_in_pool`] of `n` rows `width` wide
+/// of `size`-byte symbols (one for the 8-bit field's byte rows, two for
+/// 16-bit words), `inverse` or forward with `backend`, on a pool of
+/// `threads` workers, walks the bank in slabs: a bank beyond
+/// [`TRANSFORM_SCRATCH_BYTES`] over three levels or more, on a target
+/// that gathers, when every pass of the walk has tasks enough for the
+/// workers. Otherwise the pool sweeps the whole rows, a level at a time
+/// across the workers.
+pub fn walks(
+    n: usize,
+    width: usize,
+    size: usize,
+    inverse: bool,
+    backend: crate::gf_simd::LinearBackend,
+    threads: usize,
+) -> bool {
+    let schedule = Schedule {
+        origin: 0,
+        inverse,
+        backend,
+        radix4: TransformField::fused(width, backend),
+    };
+    threads > 1 && POOL_GATHERS && Walk::of(n, width, size, &schedule, threads).is_some()
+}
+
+/// Where the rows of a gathered group come from: local row `k` is row
+/// `first + k * stride` of the bank.
+#[derive(Clone, Copy)]
+struct Place {
+    first: usize,
+    stride: usize,
+}
+
+impl Place {
+    /// The rows as they are: whole rows, in order.
+    const WHOLE: Place = Place {
+        first: 0,
+        stride: 1,
+    };
+
+    /// The bank's row behind local row `k`.
+    fn row(self, k: usize) -> usize {
+        self.first + k * self.stride
+    }
+}
+
+/// One pass of a walk over the bank: each task gathers a group of `rows`
+/// rows, consecutive or `stride` apart, at a window of `window` columns.
+#[derive(Clone, Copy)]
+struct Pass {
+    window: usize,
+    rows: usize,
+    stride: usize,
+}
+
+impl Pass {
+    /// One pass over every row of `n` rows `width` wide at once, with the
+    /// widest window of whole cache lines whose scratch over every row
+    /// fits `budget` bytes: none when the rows are no wider than that
+    /// window, the domain is so tall that even one line a row overflows
+    /// the budget, or the windows, or whole lines, would leave some of
+    /// `threads` workers without one. The window is then no wider than the
+    /// rows split across the workers, so their scratch together never
+    /// exceeds the bank's worth.
+    fn narrow<S: Lane>(n: usize, width: usize, budget: usize, threads: usize) -> Option<Pass> {
+        let line = 64 / size_of::<S>();
+        let window = (budget / (n * size_of::<S>()) / line * line).max(line);
+        let share = width / line / threads.max(1);
+        if window * n * size_of::<S>() > budget
+            || width <= window
+            || width.div_ceil(window) < threads
+            || share == 0
+        {
+            return None;
+        }
+        Some(Pass {
+            window: window.min(share * line),
+            rows: n,
+            stride: 1,
+        })
+    }
+
+    /// The bank's row where local row 0 of group `group` lies.
+    fn place(self, group: usize) -> Place {
+        Place {
+            first: if self.stride == 1 {
+                group * self.rows
+            } else {
+                group
+            },
+            stride: self.stride,
+        }
+    }
+
+    /// The tasks of this pass over `n` rows `width` wide.
+    fn tasks(self, n: usize, width: usize) -> usize {
+        (n / self.rows) * width.div_ceil(self.window)
+    }
+}
+
+/// How a transform of a bank beyond the scratch walks it: each pass gathers
+/// groups of rows at a window of columns into contiguous scratch, where they
+/// stay cache resident through a range of the sweeps, and puts them back.
+/// The bank is thus read and written once per pass instead of once per
+/// sweep, the rows' own addresses never meet in a cache set, and the
+/// kernels run over whole windows. One pass over every row when the domain
+/// is short enough for that window to be wide; otherwise two, split at a
+/// level `h`: the sweeps below `h` touch only rows within one block of
+/// `2^h` consecutive rows, and those at `h` and above only rows `2^h`
+/// apart, so each pass gathers those groups, in the order the sweeps run.
+struct Walk {
+    /// The window of every pass, in symbols; the units are built this wide.
+    window: usize,
+    /// The sweeps of each pass, in order, and the pass.
+    passes: Vec<(std::ops::Range<usize>, Pass)>,
+}
+
+impl Walk {
+    /// Rows at least this wide, in bytes, are gathered in one pass.
+    const WIDE_ROW_BYTES: usize = 2048;
+
+    /// The walk a pooled transform of `schedule` over `n` rows `width` wide
+    /// of `size`-byte symbols takes on `pool`: [`Self::of`] on a target that
+    /// gathers, when every pass of it has tasks enough to keep the pool
+    /// busy; otherwise none, and the pool sweeps whole rows.
+    fn engaged(
+        n: usize,
+        width: usize,
+        size: usize,
+        schedule: &Schedule,
+        pool: &rayon::ThreadPool,
+    ) -> Option<Walk> {
+        POOL_GATHERS
+            .then(|| Self::of(n, width, size, schedule, pool.current_num_threads()))
+            .flatten()
+    }
+
+    /// The walk of `schedule` over `n` rows `width` wide of `size`-byte
+    /// symbols on `threads` workers: [`Self::planned`], when every pass of
+    /// it has a slab per worker, with each window then no wider than the
+    /// runs split across the workers a pass's groups leave without one, so
+    /// the workers' slabs together never outreach the bank's rows rounded
+    /// up to whole runs, whatever the scratch would let each gather. None
+    /// when there is no walk or its slabs would leave workers idle.
+    fn of(
+        n: usize,
+        width: usize,
+        size: usize,
+        schedule: &Schedule,
+        threads: usize,
+    ) -> Option<Walk> {
+        let mut walk = Self::planned(n, width, size, schedule)?;
+        if walk.tasks(n, width) < threads {
+            return None;
+        }
+        let share = |rows: usize| {
+            let groups = n / rows;
+            (width.div_ceil(64) / threads.max(1).div_ceil(groups)).max(1) * 64
+        };
+        let window = walk
+            .passes
+            .iter()
+            .map(|(_, pass)| share(pass.rows))
+            .fold(walk.window, usize::min);
+        walk.window = window;
+        for (_, pass) in &mut walk.passes {
+            pass.window = window;
+        }
+        Some(walk)
+    }
+
+    /// The walk of `schedule` over `n` rows `width` wide of `size`-byte
+    /// symbols with the widest slabs the scratch holds, or none when the
+    /// bank fits the scratch or the domain has fewer than three levels, so
+    /// gathering would cost as much as the sweeps it saves.
+    fn planned(n: usize, width: usize, size: usize, schedule: &Schedule) -> Option<Walk> {
+        let levels = n.trailing_zeros();
+        if levels < 3 || n * width * size <= TRANSFORM_SCRATCH_BYTES {
+            return None;
+        }
+        let sweeps: Vec<Sweep> = sweeps(levels, schedule.inverse, schedule.radix4).collect();
+        // The widest window of whole 64-symbol runs whose scratch over
+        // `rows` rows fits; a pass never has rows enough for one run to
+        // overflow it (at most twice the square root of the domain's, or a
+        // whole domain short enough for wide rows).
+        let window =
+            |rows: usize| width.min((TRANSFORM_SCRATCH_BYTES / (rows * size) / 64 * 64).max(64));
+        let one = window(n);
+        if one * size >= Self::WIDE_ROW_BYTES {
+            let pass = Pass {
+                window: one,
+                rows: n,
+                stride: 1,
+            };
+            return Some(Walk {
+                window: one,
+                passes: vec![(0..sweeps.len(), pass)],
+            });
+        }
+        // The levels each sweep touches, and the level the sweeps `..s`
+        // and `s..` are split at: the sweeps run from the top down forward
+        // and from the bottom up inverse, so the split is wherever two
+        // sweeps meet, and the one nearest the middle keeps both groups
+        // short. A boundary always exists past the first sweep.
+        let span = |sweep: &Sweep| match *sweep {
+            Sweep::Radix2(level) => (level, level),
+            Sweep::Radix4(low) => (low, low + 1),
+        };
+        let (s, h) = (1..sweeps.len())
+            .map(|s| {
+                let h = if schedule.inverse {
+                    span(&sweeps[s]).0
+                } else {
+                    span(&sweeps[s]).1 + 1
+                };
+                (s, h)
+            })
+            .min_by_key(|&(_, h)| (2 * h).abs_diff(levels))
+            .expect("a walk has at least two sweeps");
+        let low = Pass {
+            window: 0,
+            rows: 1 << h,
+            stride: 1,
+        };
+        let high = Pass {
+            window: 0,
+            rows: n >> h,
+            stride: 1 << h,
+        };
+        let window = window(low.rows.max(high.rows));
+        let widen = |pass: Pass| Pass { window, ..pass };
+        let passes = if schedule.inverse {
+            vec![(0..s, widen(low)), (s..sweeps.len(), widen(high))]
+        } else {
+            vec![(0..s, widen(high)), (s..sweeps.len(), widen(low))]
+        };
+        Some(Walk { window, passes })
+    }
+
+    /// The fewest tasks any pass has over `n` rows `width` wide.
+    fn tasks(&self, n: usize, width: usize) -> usize {
+        self.passes
+            .iter()
+            .map(|(_, pass)| pass.tasks(n, width))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// The known-zero flags of a pass over the sweeps `sweeps`, from those of
+/// every sweep: the flags before each of its sweeps, then the flags before
+/// its first and after its last, which rows need not be gathered or put
+/// back; all none when there are none.
+#[allow(clippy::type_complexity)]
+fn pass_flags<'a>(
+    flags: Option<&'a [Vec<bool>]>,
+    sweeps: &std::ops::Range<usize>,
+) -> (
+    Option<&'a [Vec<bool>]>,
+    Option<&'a [bool]>,
+    Option<&'a [bool]>,
+) {
+    (
+        flags.map(|flags| &flags[sweeps.clone()]),
+        flags.map(|flags| flags[sweeps.start].as_slice()),
+        flags.map(|flags| flags[sweeps.end].as_slice()),
+    )
+}
+
+/// One worker's share of `pass` over `shared`: tasks taken from `next` until
+/// none remain, each a group of rows at a window of columns gathered into
+/// scratch of this worker's own, `pass.rows` rows of `pass.window` symbols
+/// contiguous, given to `work` with `spare` more symbols of scratch and
+/// where the group lies, and put back. Rows flagged in `before` are known
+/// zero on the way in and are cleared rather than gathered; rows flagged in
+/// `after` are known zero on the way out and are not put back. A short last
+/// window keeps whatever its padding columns held: `work` treats every
+/// column on its own, so they touch nothing that is put back. One worker
+/// alone walks every task in order; several share them, and no two tasks
+/// of one pass share a symbol.
+#[allow(clippy::too_many_arguments)]
+fn pass_tasks<S: Lane>(
+    shared: &SharedRows<S>,
+    next: &std::sync::atomic::AtomicUsize,
+    pass: Pass,
+    before: Option<&[bool]>,
+    after: Option<&[bool]>,
+    spare: usize,
+    work: impl Fn(&mut [S], &mut [S], Place) -> Result<(), TransformError>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), TransformError> {
+    use std::sync::atomic::Ordering;
+    let (n, width) = (shared.0.len(), shared.1);
+    let windows = width.div_ceil(pass.window);
+    let tasks = pass.tasks(n, width);
+    let mut scratch = vec![S::default(); pass.rows * pass.window + spare];
+    let (rows, spare) = scratch.split_at_mut(pass.rows * pass.window);
+    loop {
+        let task = next.fetch_add(1, Ordering::Relaxed);
+        if task >= tasks {
+            return Ok(());
+        }
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let place = pass.place(task / windows);
+        let at = task % windows;
+        let columns = at * pass.window..width.min((at + 1) * pass.window);
+        let w = columns.len();
+        for (k, window) in rows.chunks_exact_mut(pass.window).enumerate() {
+            let row = place.row(k);
+            if before.is_some_and(|known| known[row]) {
+                window[..w].fill(S::default());
+            } else {
+                // SAFETY: this task alone touches these columns of these
+                // rows; see `SharedRows::columns`.
+                window[..w].copy_from_slice(unsafe { shared.columns(row, &columns) });
+            }
+        }
+        work(rows, spare, place)?;
+        for (k, window) in rows.chunks_exact(pass.window).enumerate() {
+            let row = place.row(k);
+            if after.is_some_and(|known| known[row]) {
+                continue;
+            }
+            // SAFETY: as above, and the window is this task's own.
+            unsafe { shared.columns_mut(row, &columns) }.copy_from_slice(&window[..w]);
+        }
+    }
+}
+
+/// The known-zero flags `schedule` finds before each of its sweeps over `n`
+/// rows, and after the last, from the flags `zero` the caller gave; none
+/// when the caller gave none.
+fn sweep_flags(n: usize, zero: Option<&[bool]>, schedule: &Schedule) -> Option<Vec<Vec<bool>>> {
+    let mut known = zero?.to_vec();
+    let mut flags = Vec::new();
+    for sweep in sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4) {
+        flags.push(known.clone());
+        advance(
+            &mut known,
+            sweep,
+            schedule.origin,
+            schedule.inverse,
+            &mut |_| {},
+        );
+    }
+    flags.push(known);
+    Some(flags)
+}
+
+/// One radix-2 butterfly, prepared for its group: see [`TransformField::pair`].
+type PairUnit<'a, S> = dyn Fn(&mut [S], &mut [S], [bool; 2]) + Sync + 'a;
+/// One radix-4 unit, prepared for its group: see [`TransformField::quad`].
+type QuadUnit<'a, S> = dyn Fn([&mut [S]; 4], [bool; 4]) + Sync + 'a;
+
+/// The butterflies of one sweep, as [`TransformField::run_sweeps`] takes
+/// them: the unit of each group of rows, numbered over the whole domain.
+/// A sweep asks for a pair or a quad as its kind says.
+trait Units<S: Lane> {
+    fn sweep(&self) -> Sweep;
+    fn pair(&self, group: usize) -> impl Fn(&mut [S], &mut [S], [bool; 2]) + '_;
+    fn quad(&self, group: usize) -> impl Fn([&mut [S]; 4], [bool; 4]) + '_;
+}
+
+/// The units of one sweep prepared for every group and kept, for the slab
+/// walk to run over every slab.
+enum KeptUnits<'a, S> {
+    Radix2(u32, Vec<Box<PairUnit<'a, S>>>),
+    Radix4(u32, Vec<Box<QuadUnit<'a, S>>>),
+}
+
+impl<S: Lane> Units<S> for KeptUnits<'_, S> {
+    fn sweep(&self) -> Sweep {
+        match self {
+            Self::Radix2(level, _) => Sweep::Radix2(*level),
+            Self::Radix4(low, _) => Sweep::Radix4(*low),
+        }
+    }
+    fn pair(&self, group: usize) -> impl Fn(&mut [S], &mut [S], [bool; 2]) + '_ {
+        match self {
+            Self::Radix2(_, pairs) => &*pairs[group],
+            Self::Radix4(..) => unreachable!("a radix-4 sweep runs quads"),
+        }
+    }
+    fn quad(&self, group: usize) -> impl Fn([&mut [S]; 4], [bool; 4]) + '_ {
+        match self {
+            Self::Radix4(_, quads) => &*quads[group],
+            Self::Radix2(..) => unreachable!("a radix-2 sweep runs pairs"),
+        }
+    }
+}
+
+/// The units of one sweep made as each group comes, for a sequential
+/// transform over whole rows, which runs each once and keeps nothing.
+struct FreshUnits<'a> {
+    field: &'a TransformField,
+    schedule: &'a Schedule,
+    sweep: Sweep,
+    width: usize,
+}
+
+impl<S: Lane> Units<S> for FreshUnits<'_> {
+    fn sweep(&self) -> Sweep {
+        self.sweep
+    }
+    fn pair(&self, group: usize) -> impl Fn(&mut [S], &mut [S], [bool; 2]) + '_ {
+        let Sweep::Radix2(level) = self.sweep else {
+            unreachable!("a radix-4 sweep runs quads")
+        };
+        self.field
+            .pair(self.schedule, level, group << (level + 1), self.width)
+    }
+    fn quad(&self, group: usize) -> impl Fn([&mut [S]; 4], [bool; 4]) + '_ {
+        let Sweep::Radix4(low) = self.sweep else {
+            unreachable!("a radix-2 sweep runs pairs")
+        };
+        self.field.quad(self.schedule, group << (low + 2), low)
+    }
+}
+
 /// One sweep over every row: a radix-2 stage at a level, or the stages
 /// `low + 1` and `low` fused into one radix-4 sweep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1090,8 +1839,8 @@ fn sweeps(levels: u32, inverse: bool, radix4: bool) -> impl Iterator<Item = Swee
     })
 }
 
-/// Equally wide rows, taken mutably for the duration of a pooled derivative
-/// whose tasks each touch only their own range of columns.
+/// Equally wide rows, taken mutably for the duration of a slab walk or a
+/// pooled derivative whose tasks each touch only their own range of columns.
 struct SharedRows<S>(Vec<*mut S>, usize);
 
 // SAFETY: the pointers come from an exclusive borrow of the rows held for as
@@ -1100,13 +1849,20 @@ struct SharedRows<S>(Vec<*mut S>, usize);
 unsafe impl<S: Send + Sync> Sync for SharedRows<S> {}
 
 impl<S> SharedRows<S> {
+    /// The rows, which the caller leaves alone while this lives: one pointer
+    /// per row, the same size as the row handles themselves.
+    fn of(rows: &mut [Vec<S>]) -> Self {
+        let width = rows.first().map_or(0, Vec::len);
+        Self(rows.iter_mut().map(|row| row.as_mut_ptr()).collect(), width)
+    }
+
     /// Columns `columns` of row `row`.
     ///
     /// # Safety
     /// `row` must be in bounds and `columns` within the width, and no mutable
-    /// slice may overlap the result while it lives. A pooled derivative gives
-    /// each task its own columns, and within them reads only rows past the
-    /// one it writes.
+    /// slice may overlap the result while it lives. A slab walk gives each
+    /// task its own columns; a pooled derivative does too, and within them
+    /// reads only rows past the one it writes.
     unsafe fn columns(&self, row: usize, columns: &std::ops::Range<usize>) -> &[S] {
         debug_assert!(columns.end <= self.1);
         // SAFETY: as documented above.
@@ -1657,8 +2413,9 @@ mod tests {
                             let run = |backend, radix4| {
                                 let mut rows = original.clone();
                                 let schedule = schedule(origin, inverse, backend, radix4);
+                                let units = field.units(count, width, &schedule);
                                 field
-                                    .run_sweeps(&mut rows, &schedule, None, &never)
+                                    .run_sweeps(&mut rows, &units, None, Place::WHOLE, &never)
                                     .unwrap();
                                 rows
                             };
@@ -1671,8 +2428,9 @@ mod tests {
                                     .map(|row| row.iter().map(|&v| v as u8).collect())
                                     .collect();
                                 let schedule = schedule(origin, inverse, LinearBackend::Auto, true);
+                                let units = field.units(count, width, &schedule);
                                 field
-                                    .run_sweeps(&mut bytes, &schedule, None, &never)
+                                    .run_sweeps(&mut bytes, &units, None, Place::WHOLE, &never)
                                     .unwrap();
                                 assert_eq!(widen(&bytes), oracle, "byte radix-4, {what}");
                             }
@@ -1720,7 +2478,14 @@ mod tests {
                 (32, 100),
                 (64, 65),
                 (256, 300),
+                // Wide enough for the pool to transform them slab by slab in
+                // both lanes, with a short last slab.
+                (256, 6200),
+                (1024, 1100),
             ] {
+                if count > field.order() {
+                    continue;
+                }
                 let noise = random_bytes(count, count as u64);
                 let patterns: [Vec<bool>; 6] = [
                     vec![false; count],
@@ -1816,6 +2581,252 @@ mod tests {
                 ),
             Err(TransformError::Geometry)
         );
+    }
+
+    /// A pooled transform or derivative of a bank beyond the scratch gathers
+    /// its rows, in one pass or two, and must come out exactly as the
+    /// sequential one, which sweeps the whole rows, does. The walk and the
+    /// gathered derivative are driven directly as well as through the
+    /// pooled entry points, which take them only on a target that gathers.
+    #[test]
+    fn pooled_walks_match_whole_row_sweeps() {
+        use crate::gf_simd::LinearBackend;
+        let never = || false;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        for bits in [8u32, 16] {
+            let field = TransformField::new(bits).unwrap();
+            let mask = (field.order() - 1) as u16;
+            // One pass with word windows of 1024, 4096 and 16384 symbols
+            // and byte windows of 2048 and 8192, each shape ending in a
+            // short window; one pass over a bank the scratch would gather
+            // in three word windows, narrowed to share the rows across the
+            // three workers (and in two byte windows, so no byte walk); then
+            // two passes, over a domain of 10 levels, split evenly, and of
+            // 9, split unevenly, forward and inverse; and two passes over
+            // rows of 65 words of a 12-level domain, which hold fewer
+            // whole lines than workers, so the derivative is not gathered.
+            for (count, width, passes) in [
+                (256usize, 6200usize, 1usize),
+                (64, 20000, 1),
+                (16, 70000, 1),
+                (8, 70000, 1),
+                (1024, 1100, 2),
+                (512, 3000, 2),
+                (4096, 65, 2),
+            ] {
+                if count > field.order() {
+                    continue;
+                }
+                let threads = pool.current_num_threads();
+                for inverse in [false, true] {
+                    let schedule = Schedule {
+                        origin: 0,
+                        inverse,
+                        backend: LinearBackend::Auto,
+                        radix4: true,
+                    };
+                    let walk = Walk::of(count, width, 2, &schedule, threads).unwrap();
+                    assert_eq!(
+                        walk.passes.len(),
+                        passes,
+                        "{count}x{width} inverse {inverse}"
+                    );
+                    if passes == 2 {
+                        let (low, high) = if inverse { (0, 1) } else { (1, 0) };
+                        let low = walk.passes[low].1;
+                        let high = walk.passes[high].1;
+                        assert_eq!(low.stride, 1);
+                        assert_eq!(high.stride, low.rows);
+                        assert_eq!(low.rows * high.rows, count);
+                    }
+                    // Every pass has a task per worker, and the workers'
+                    // slabs together never outreach the bank.
+                    for (_, pass) in &walk.passes {
+                        assert!(pass.tasks(count, width) >= threads, "{count}x{width}");
+                        assert!(
+                            threads * pass.rows * pass.window <= count * width.div_ceil(64) * 64,
+                            "{count}x{width}: {threads} slabs of {}x{}",
+                            pass.rows,
+                            pass.window
+                        );
+                    }
+                }
+                let pass = TransformField::derivative_pass::<u16>(count, width, threads);
+                assert_eq!(pass.is_some(), width / 32 >= threads, "{count}x{width}");
+                if let Some(pass) = pass {
+                    assert!(pass.tasks(count, width) >= threads, "{count}x{width}");
+                    assert!(
+                        threads * count * pass.window <= count * width,
+                        "{count}x{width}: {threads} derivative windows of {}",
+                        pass.window
+                    );
+                }
+                let zero: Vec<bool> = (0..count).map(|row| row % 3 == 1).collect();
+                let original: Vec<Vec<u16>> = (0..count)
+                    .map(|row| {
+                        random_bytes(width * 2, (row * 7 + width) as u64)
+                            .chunks_exact(2)
+                            .map(|pair| {
+                                let value = u16::from_le_bytes([pair[0], pair[1]]) & mask;
+                                if zero[row] { 0 } else { value }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let bytes: Vec<Vec<u8>> = original
+                    .iter()
+                    .map(|row| row.iter().map(|&v| v as u8).collect())
+                    .collect();
+                for origin in [0, field.order() - count] {
+                    for inverse in [false, true] {
+                        for backend in [LinearBackend::Scalar, LinearBackend::Auto] {
+                            let what = format!(
+                                "GF(2^{bits}) {count}x{width}, origin {origin}, inverse \
+                                 {inverse}, {backend:?}"
+                            );
+                            let mut expected = original.clone();
+                            field
+                                .transform_with_backend(
+                                    &mut expected,
+                                    origin,
+                                    inverse,
+                                    backend,
+                                    &never,
+                                )
+                                .unwrap();
+                            let mut rows = original.clone();
+                            field
+                                .transform_in_pool(
+                                    &mut rows, origin, inverse, backend, &pool, &never,
+                                )
+                                .unwrap();
+                            assert_eq!(rows, expected, "pooled, {what}");
+                            let mut rows = original.clone();
+                            field
+                                .transform_known_zero_in_pool(
+                                    &mut rows, &zero, origin, inverse, backend, &pool, &never,
+                                )
+                                .unwrap();
+                            assert_eq!(rows, expected, "pooled known zero, {what}");
+                            let schedule = Schedule {
+                                origin,
+                                inverse,
+                                backend,
+                                radix4: TransformField::fused(width, backend),
+                            };
+                            for zero in [None, Some(zero.as_slice())] {
+                                let flags = sweep_flags(count, zero, &schedule);
+                                let walk = Walk::of(count, width, 2, &schedule, threads).unwrap();
+                                let mut rows = original.clone();
+                                field
+                                    .transform_walk(
+                                        &mut rows,
+                                        &schedule,
+                                        flags.as_deref(),
+                                        &walk,
+                                        &pool,
+                                        &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rows, expected, "walk, zero {}, {what}", zero.is_some());
+                                // Byte rows take windows twice as wide, which
+                                // at the shortest shape leave a worker idle,
+                                // so there is no byte walk of it.
+                                let byte_walk = (bits == 8)
+                                    .then(|| Walk::of(count, width, 1, &schedule, threads))
+                                    .flatten();
+                                if bits == 8 {
+                                    assert_eq!(byte_walk.is_some(), count != 8, "{what}");
+                                }
+                                if let Some(walk) = byte_walk {
+                                    let mut rows = bytes.clone();
+                                    field
+                                        .transform_walk(
+                                            &mut rows,
+                                            &schedule,
+                                            flags.as_deref(),
+                                            &walk,
+                                            &pool,
+                                            &never,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(
+                                        widen(&rows),
+                                        expected,
+                                        "byte walk, zero {}, {what}",
+                                        zero.is_some()
+                                    );
+                                }
+                            }
+                            if bits == 8 {
+                                let mut rows = bytes.clone();
+                                field
+                                    .transform_u8_in_pool(
+                                        &mut rows, origin, inverse, backend, &pool, &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(widen(&rows), expected, "pooled bytes, {what}");
+                                let mut rows = bytes.clone();
+                                field
+                                    .transform_u8_known_zero_in_pool(
+                                        &mut rows, &zero, origin, inverse, backend, &pool, &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    widen(&rows),
+                                    expected,
+                                    "pooled bytes known zero, {what}"
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut expected = original.clone();
+                field.derivative(&mut expected, &never).unwrap();
+                let mut rows = original.clone();
+                field.derivative_in_pool(&mut rows, &pool, &never).unwrap();
+                assert_eq!(
+                    rows, expected,
+                    "pooled derivative, GF(2^{bits}) {count}x{width}"
+                );
+                if let Some(pass) = TransformField::derivative_pass::<u16>(count, width, threads) {
+                    let mut rows = original.clone();
+                    TransformField::derivative_gathered(&mut rows, pass, &pool, &never).unwrap();
+                    assert_eq!(
+                        rows, expected,
+                        "gathered derivative, GF(2^{bits}) {count}x{width}"
+                    );
+                }
+                if bits == 8 {
+                    let mut rows = bytes.clone();
+                    field
+                        .derivative_u8_in_pool(&mut rows, &pool, &never)
+                        .unwrap();
+                    assert_eq!(
+                        widen(&rows),
+                        expected,
+                        "pooled byte derivative, {count}x{width}"
+                    );
+                    let pass =
+                        TransformField::derivative_pass::<u8>(count, width, threads).unwrap();
+                    assert!(
+                        threads * count * pass.window <= count * width,
+                        "{count}x{width}: {threads} byte derivative windows of {}",
+                        pass.window
+                    );
+                    let mut rows = bytes.clone();
+                    TransformField::derivative_gathered(&mut rows, pass, &pool, &never).unwrap();
+                    assert_eq!(
+                        widen(&rows),
+                        expected,
+                        "gathered byte derivative, {count}x{width}"
+                    );
+                }
+            }
+        }
     }
 
     /// The butterflies known zeros remove from the PAR3 encoder's last-chunk
@@ -2096,7 +3107,16 @@ mod tests {
         };
         let shapes = (0..=9)
             .flat_map(|levels| WIDTHS.map(|width| (1usize << levels, width)))
-            .chain([(256, 300), (128, 1031), (64, 4096), (512, 129)]);
+            // The last two are wide enough for the pool to take them slab by
+            // slab, in both lanes, with a short last slab.
+            .chain([
+                (256, 300),
+                (128, 1031),
+                (64, 4096),
+                (512, 129),
+                (256, 6200),
+                (1024, 1100),
+            ]);
         for (count, width) in shapes {
             let bytes: Vec<Vec<u8>> = (0..count)
                 .map(|row| random_bytes(width, (row * 29 + width + count) as u64))

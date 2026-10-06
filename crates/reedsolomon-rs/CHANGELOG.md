@@ -76,6 +76,41 @@
   (`WEAVER_GF8_PF=0` pins the plain loop): create encode at one worker,
   1 GiB, 100 rows, 8 MiB blocks, Sapphire Rapids 2.07 → 1.87 s and Zen 4
   2.10 → 2.03 s on top of the grouping. Output is bit-identical.
+- Pooled transforms and derivatives walk the bank in slabs. When a bank of
+  three levels or more outgrows `fft::TRANSFORM_SCRATCH_BYTES` (512 KiB)
+  and every pass of the walk has at least one slab per thread, each worker
+  gathers the rows of a slab into its own contiguous scratch, runs every
+  sweep of a pass over that slab and scatters the result back, in one pass
+  when a window of the scratch holds 2 KiB rows and otherwise in two passes
+  split at the middle level — the low levels over blocks of consecutive
+  rows, the high levels over rows a block apart — so each sweep reads its
+  rows from cache instead of streaming the whole bank per level. A slab's
+  window is no wider than the rows split across the workers, so their
+  slabs together never hold more than the bank, rounded up to whole
+  64-symbol runs. Rows flagged zero before a
+  pass are not gathered and rows still zero after it are not put back. A
+  walked transform keeps the butterflies of every sweep while it runs,
+  prepared once for all the slabs: `walk_units_bytes` says how much that
+  is and `walks` whether a transform walks at all; a bank the pool would
+  not walk is still swept a level at a time across the workers, which on
+  the Alder Lake cores beats transforming banks of a mebibyte side by side
+  on sibling threads. The derivative gathers a window of every row the
+  same way and differentiates bit-major into a second copy, so each worker
+  takes at most the scratch and all of them together at most twice the
+  bank. The sequential
+  `transform` and `derivative` sweep whole rows as before: alone, the
+  kernels are bound by their own work and the copies would be pure cost.
+  `fft::POOL_GATHERS` is false on Apple silicon, whose memory system
+  streams the whole-row sweeps faster than the copies cost (walk 1.5 times
+  and derivative twice as long as the row-parallel sweeps on an M-series),
+  so there the pooled paths stay as they were and take no scratch. Output
+  is bit-identical. Decode of 2048 data rows of 1 MiB over GF(2^16), 50
+  lost, eight workers on four Alder Lake P-cores: 1.67 → 1.34 s, CPU
+  11.3 → 8.3 s; one worker unchanged.
+- `TransformField::le_image` and `le_image_mut` view a `u16` row as its
+  bytes on a little-endian target, where a symbol's little-endian pair is
+  its own representation, so a caller can read the on-disk layout into and
+  write it from the row itself; `None` elsewhere.
 
 ## 0.4.7
 
