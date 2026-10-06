@@ -237,8 +237,8 @@ impl CreationPlan {
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
     ///
-    /// The inputs are stored in the reference's order — longest chunk tail
-    /// first, then largest file, then name — whatever order `sources` lists
+    /// The inputs are stored in the reference's order — longest file tail
+    /// (size modulo block size) first, then largest file, then name — whatever order `sources` lists
     /// them in. That order is decided from the source sizes alone, before any
     /// byte is read, so it costs no extra I/O.
     pub fn build(
@@ -378,7 +378,11 @@ impl CreationPlan {
         let rolling = (options.deduplication == Deduplication::Sliding)
             .then(|| SlidingCrc::new(options.block_size));
         let mut tails = BTreeMap::<(u64, Fingerprint), (u64, u64)>::new();
-        let mut packing = TailSlots::default();
+        let mut packing = if options.deduplication == Deduplication::None {
+            TailSlots::default()
+        } else {
+            TailSlots::by_block()
+        };
         let mut reused = 0;
         let mut names = BTreeMap::new();
         let mut order: Vec<usize> = (0..sources.len()).collect();
@@ -616,12 +620,15 @@ impl CreationPlan {
                         "creation block is not field aligned",
                     ));
                 }
-                if last == 1 || (geometry.capacity() == 1 && cohorts == 1) {
+                if last == 1 {
                     // The reference records no field when the set carries a
-                    // single recovery block or the matrix reserves only one.
-                    // The block is still the first transform parity of the
-                    // reserved capacity: the XOR of the inputs only when that
-                    // capacity is one.
+                    // single recovery block, whatever capacity the matrix
+                    // reserves. (Its other case, a requested capacity of one
+                    // with no recovery blocks, is not expressible here: a set
+                    // without recovery records the geometry's field.) The block
+                    // is still the first transform parity of the reserved
+                    // capacity: the XOR of the inputs only when that capacity
+                    // is one.
                     GaloisField {
                         size: 0,
                         generator: 0,
@@ -1881,27 +1888,43 @@ impl CreationPlan {
     }
 }
 
-/// The packed-tail slots, in the order the tails were placed.
+/// Where packed tails may go, in the order the reference searches them.
 ///
-/// A tail goes behind the first earlier tail, in placement order, that is
-/// still the last one in its block and leaves room for it, and only into a new
-/// block when none does — the reference's rule. A block only grows at its end,
-/// so a tail with another placed behind it closes for good.
+/// Without deduplication (`-d0`) the reference puts a tail behind the first
+/// earlier tail, in placement order, that is still the last one in its block
+/// and leaves room for it. A block only grows at its end, so a tail with
+/// another placed behind it closes for good. With deduplication (`-d1` and
+/// `-d2`) it instead takes the first block, by block index, with room for the
+/// tail. Either way a tail opens a new block only when nothing fits.
 ///
-/// The slots sit under a max tree of their spare room, so the first one that
-/// fits is found in logarithmic time rather than by scanning every earlier
-/// tail; a closed slot has no room.
+/// The slots — one per placed tail, or one per block — sit under a max tree
+/// of their spare room, so the first one that fits is found in logarithmic
+/// time rather than by scanning; a closed slot or a full block has no room.
+/// The tree and the slot list stay under 48 bytes per placed tail or block,
+/// inside the 1024 bytes per block the plan reserves before it starts.
 #[derive(Default)]
 struct TailSlots {
-    /// Leaves from `tree.len() / 2`, one per placed tail; each inner node holds
-    /// the larger of its children.
+    /// Leaves from `tree.len() / 2`, one per slot; each inner node holds the
+    /// larger of its children.
     tree: Vec<u64>,
+    /// Each placement-order slot's block; unused when slots are blocks.
     blocks: Vec<usize>,
+    /// Slots are blocks, searched by block index (`-d1` and `-d2`).
+    by_block: bool,
 }
 
 impl TailSlots {
-    /// The block of the first open slot with at least `length` bytes spare,
-    /// closing that slot: the tail about to go there becomes its block's last.
+    /// Slots searched by block index, as the reference's deduplicating modes do.
+    fn by_block() -> Self {
+        Self {
+            by_block: true,
+            ..Self::default()
+        }
+    }
+
+    /// The block of the first slot with at least `length` bytes spare. In
+    /// placement order that slot closes: the tail about to go there becomes its
+    /// block's last.
     fn take(&mut self, length: u64) -> Option<usize> {
         if self.tree.get(1).is_none_or(|&room| room < length) {
             return None;
@@ -1915,17 +1938,24 @@ impl TailSlots {
             };
         }
         let slot = node - self.tree.len() / 2;
+        if self.by_block {
+            return Some(slot);
+        }
         self.set(slot, 0);
         Some(self.blocks[slot])
     }
 
     /// Record a tail just placed in `block`, leaving `room` bytes behind it.
     fn place(&mut self, block: usize, room: u64) {
-        let slot = self.blocks.len();
-        self.blocks.push(block);
+        let slot = if self.by_block {
+            block
+        } else {
+            self.blocks.push(block);
+            self.blocks.len() - 1
+        };
         let leaves = self.tree.len() / 2;
         if slot >= leaves {
-            let grown = (leaves * 2).max(16);
+            let grown = (slot + 1).next_power_of_two().max(16);
             let mut tree = vec![0; 2 * grown];
             tree[grown..grown + leaves].copy_from_slice(&self.tree[leaves..]);
             for node in (1..grown).rev() {
@@ -2552,6 +2582,28 @@ mod tests {
         assert_eq!(slots.take(5), Some(5));
         assert_eq!(slots.take(30), Some(30));
         assert_eq!(slots.take(39), None);
+    }
+
+    #[test]
+    fn a_deduplicating_tail_goes_into_the_first_block_by_index_with_room() {
+        let mut slots = TailSlots::by_block();
+        // Block 1 took a tail first, then block 0's room was set later; the
+        // lower index still wins, and a block stays open after taking a tail.
+        slots.place(1, 500);
+        slots.place(0, 100);
+        assert_eq!(slots.take(90), Some(0));
+        slots.place(0, 10);
+        assert_eq!(slots.take(90), Some(1));
+        slots.place(1, 410);
+        assert_eq!(slots.take(10), Some(0));
+        assert_eq!(slots.take(411), None);
+        // Blocks never given room, such as whole-data blocks, have none, and
+        // the tree grows to a far block index without losing any.
+        slots.place(100, 700);
+        assert_eq!(slots.take(600), Some(100));
+        assert_eq!(slots.take(400), Some(1));
+        slots.place(1, 0);
+        assert_eq!(slots.take(400), Some(100));
     }
 
     #[test]

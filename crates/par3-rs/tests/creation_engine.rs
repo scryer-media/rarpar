@@ -8,6 +8,7 @@ use par3_rs::creation::{
 use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::runtime::EngineError;
 use par3_rs::source::{DiskSourceAccess, MemorySourceAccess, SourceId};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn data() -> Vec<u8> {
@@ -1603,6 +1604,34 @@ fn a_single_recovery_block_under_a_wider_fft_capacity_records_no_field_and_repai
         let carriers: Vec<Vec<u8>> = set.into_iter().map(|(_, bytes)| bytes).collect();
         verify_and_repair_one_block(&format!("capacity-{capacity_log2}"), &carriers);
     }
+    // Without recovery blocks the reference (`par3 c -e8 -c0`) records the
+    // geometry's field, even at a capacity of one.
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(0), 1, fft_input().into());
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".to_owned(),
+            source: SourceId(0),
+        }],
+        CreationOptions {
+            block_size: 1024,
+            recovery_count: 0,
+            codec: CreationCodec::Fft {
+                capacity_log2: 0,
+                interleave: 0,
+            },
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        plan.requirements().field,
+        par3_rs::packet::GaloisField {
+            size: 1,
+            generator: 0x1d
+        }
+    );
 }
 
 /// A set the reference made with `par3 c -s1024 -e8 -c1 -cm4` over the FFT
@@ -1632,5 +1661,265 @@ fn a_reference_single_recovery_set_under_a_wider_capacity_is_accepted() {
     for ((name, ours), (expected, theirs)) in ours.iter().zip(names.iter().zip(&reference)) {
         assert_eq!(name, expected);
         common::assert_block_eq(ours, theirs, name);
+    }
+}
+
+/// Four inputs of 600, 500, 300 and 90 bytes under 1000-byte blocks, distinct
+/// so that nothing deduplicates.
+fn packing_inputs() -> Vec<(String, Vec<u8>)> {
+    [(600, 3), (500, 5), (300, 7), (90, 11)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (size, seed))| {
+            let number = index + 1;
+            (
+                format!("t{number}.bin"),
+                (0..size)
+                    .map(|i| ((i * seed + number * 31 + i / 13) % 256) as u8)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Write the packing inputs as the reference's `par3 c -s1000 -c1 -d<mode>`
+/// does and return each carrier by name.
+fn packing_set(deduplication: Deduplication, creator: &str) -> Vec<(String, Vec<u8>)> {
+    let mut access = MemorySourceAccess::default();
+    let mut sources = Vec::new();
+    for (index, (name, bytes)) in packing_inputs().into_iter().enumerate() {
+        access.insert(SourceId(index as u64), 1, bytes.into());
+        sources.push(CreationSource {
+            name,
+            source: SourceId(index as u64),
+        });
+    }
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &sources,
+        CreationOptions {
+            block_size: 1000,
+            recovery_count: 1,
+            deduplication,
+            creator: creator.to_owned(),
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    let tree = common::TempTree::new(&format!("packing-{deduplication:?}"));
+    plan.execute(&tree.path().join("pack"), tree.path())
+        .unwrap()
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Without deduplication the reference packs a tail behind the first open
+/// tail in placement order; with it, into the first block by index with room.
+/// Stored longest tail first, the 90-byte tail meets block 1 (500 bytes used,
+/// its tail placed second) and block 0 (600 + 300 used, its open tail placed
+/// third): `-d0` picks block 1, `-d1` and `-d2` pick block 0.
+#[test]
+fn deduplicating_modes_pack_a_tail_into_the_first_block_by_index_with_room() {
+    for (deduplication, expected) in [
+        (Deduplication::None, (1, 500)),
+        (Deduplication::Aligned, (0, 900)),
+        (Deduplication::Sliding, (0, 900)),
+    ] {
+        let set = packing_set(deduplication, "par3-rs test");
+        let placed = common::packets_of(&set[0].1)
+            .into_iter()
+            .find_map(|packet| match packet.body() {
+                par3_rs::PacketBody::File(file) if file.name == "t4.bin" => {
+                    match &file.chunks[..] {
+                        [
+                            par3_rs::packet::ChunkDescription::Protected {
+                                tail:
+                                    par3_rs::packet::ChunkTail::Described {
+                                        block_index,
+                                        offset,
+                                        ..
+                                    },
+                                ..
+                            },
+                        ] => Some((*block_index, *offset)),
+                        chunks => panic!("unexpected chunks {chunks:?}"),
+                    }
+                }
+                _ => None,
+            })
+            .expect("t4.bin");
+        assert_eq!(placed, expected, "{deduplication:?}");
+    }
+}
+
+/// The reference's `par3 c -s1000 -c1 -d<n>` sets over the packing inputs are
+/// recreated byte for byte at every deduplication mode. The run names a
+/// directory holding `d0/`, `d1/` and `d2/`, each with `pack.par3` and
+/// `pack.vol0+1.par3`.
+#[test]
+#[ignore = "reads reference carriers from an explicitly configured pinned-reference run"]
+fn reference_packing_sets_are_recreated_at_every_deduplication_mode() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("PAR3_REFERENCE_PACKING_DIR").expect("explicit reference directory"),
+    );
+    for (mode, deduplication) in [
+        ("d0", Deduplication::None),
+        ("d1", Deduplication::Aligned),
+        ("d2", Deduplication::Sliding),
+    ] {
+        let names = ["pack.par3", "pack.vol0+1.par3"];
+        let reference: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| std::fs::read(directory.join(mode).join(name)).unwrap())
+            .collect();
+        let creator = common::packets_of(&reference[0])
+            .into_iter()
+            .find_map(|packet| match packet.body() {
+                par3_rs::PacketBody::Creator(body) => Some(body.text().into_owned()),
+                _ => None,
+            })
+            .expect("a Creator packet");
+        let ours = packing_set(deduplication, &creator);
+        assert_eq!(ours.len(), names.len(), "{mode}");
+        for ((name, ours), (expected, theirs)) in ours.iter().zip(names.iter().zip(&reference)) {
+            assert_eq!(name, expected, "{mode}");
+            common::assert_block_eq(ours, theirs, &format!("{mode}/{name}"));
+        }
+    }
+}
+
+/// Create the reference's `par3 c -s1024 -e8 -i1 -c2 -D` set over the FFT
+/// input with the streaming engine and return each carrier by name.
+fn interleaved_data_set(creator: &str, capacity_log2: i8) -> Vec<(String, Vec<u8>)> {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(0), 1, fft_input().into());
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".to_owned(),
+            source: SourceId(0),
+        }],
+        CreationOptions {
+            block_size: 1024,
+            recovery_count: 2,
+            codec: CreationCodec::Fft {
+                capacity_log2,
+                interleave: 1,
+            },
+            store_data: true,
+            creator: creator.to_owned(),
+            ..CreationOptions::default()
+        },
+    )
+    .unwrap();
+    let tree = common::TempTree::new("interleaved-data");
+    plan.execute(&tree.path().join("ileave"), tree.path())
+        .unwrap()
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The reference's interleaved data volumes (`par3 c -s1024 -e8 -i1 -c2 -D`
+/// over the FFT input) differ from the engine's exactly as recorded: the index
+/// and recovery volume are byte for byte the same, the reference counts data
+/// volumes in rows of cohort blocks where the engine counts blocks singly, and
+/// it cuts the tail block's Data packet to the bytes in use. The run names the
+/// directory holding the reference's `ileave*.par3` carriers.
+#[test]
+#[ignore = "reads reference carriers from an explicitly configured pinned-reference run"]
+fn reference_interleaved_data_volumes_differ_only_as_recorded() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("PAR3_REFERENCE_INTERLEAVED_DATA_DIR")
+            .expect("explicit reference directory"),
+    );
+    let read = |name: &str| std::fs::read(directory.join(name)).unwrap();
+    let index = read("ileave.par3");
+    let (mut creator, mut fft) = (None, None);
+    for packet in common::packets_of(&index) {
+        match packet.body() {
+            par3_rs::PacketBody::Creator(body) => creator = Some(body.text().into_owned()),
+            par3_rs::PacketBody::FftMatrix(body) => {
+                assert_eq!(body.interleave, 1);
+                fft = Some(body.max_recovery_blocks_log2);
+            }
+            _ => {}
+        }
+    }
+    let ours = interleaved_data_set(&creator.expect("a Creator packet"), fft.expect("FFT"));
+    let ours: BTreeMap<&str, &[u8]> = ours
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    for name in ["ileave.par3", "ileave.vol0+1.par3"] {
+        common::assert_block_eq(ours[name], &read(name), name);
+    }
+    // Data blocks per volume: the reference's `partF+N` counts rows of two
+    // blocks, the engine's counts blocks.
+    let data = |bytes: &[u8]| -> Vec<(u64, Vec<u8>)> {
+        common::packets_of(bytes)
+            .into_iter()
+            .filter_map(|packet| match packet.body() {
+                par3_rs::PacketBody::Data(body) => Some((body.block_index, body.data.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let theirs_layout = [
+        ("ileave.part0+1.par3", 0..2),
+        ("ileave.part1+2.par3", 2..6),
+        ("ileave.part3+4.par3", 6..14),
+    ];
+    let ours_layout = [
+        ("ileave.part0+1.par3", 0..1),
+        ("ileave.part1+2.par3", 1..3),
+        ("ileave.part3+4.par3", 3..7),
+        ("ileave.part7+7.par3", 7..14),
+    ];
+    assert_eq!(ours.len(), 2 + ours_layout.len());
+    let mut theirs_blocks = Vec::new();
+    for (name, blocks) in theirs_layout {
+        let packets = data(&read(name));
+        assert_eq!(
+            packets.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            blocks.collect::<Vec<_>>(),
+            "{name}"
+        );
+        theirs_blocks.extend(packets);
+    }
+    assert!(!directory.join("ileave.part7+7.par3").exists());
+    let mut ours_blocks = Vec::new();
+    for (name, blocks) in ours_layout {
+        let packets = data(ours[name]);
+        assert_eq!(
+            packets.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            blocks.collect::<Vec<_>>(),
+            "{name}"
+        );
+        ours_blocks.extend(packets);
+    }
+    // The same bytes, but the tail block: 14000 bytes leave 688 in block 13,
+    // which the reference stores cut and the engine stores whole.
+    let tail = 14000 % 1024;
+    assert_eq!(ours_blocks.len(), theirs_blocks.len());
+    for ((index, ours), (_, theirs)) in ours_blocks.iter().zip(&theirs_blocks) {
+        if *index == 13 {
+            assert_eq!(theirs.len(), tail);
+            assert_eq!(&ours[..tail], &theirs[..]);
+            assert!(ours[tail..].iter().all(|&byte| byte == 0));
+        } else {
+            assert_eq!(ours, theirs, "block {index}");
+        }
     }
 }
