@@ -455,6 +455,28 @@ pub(crate) fn budget_stripe(room: usize, alignment: usize) -> usize {
     room / granule * granule
 }
 
+/// The stripe [`MemoryBudget::reserve_stripes_with_overhead`] admits for
+/// `count` buffers beside `overhead` bytes when `available` bytes are free:
+/// the configured `target` when it fits, else the budget's
+/// [`budget_stripe`], and 0 when not one `alignment` fits.
+pub(crate) fn stripe_within(
+    available: usize,
+    target: usize,
+    count: usize,
+    alignment: usize,
+    overhead: usize,
+) -> usize {
+    if count == 0 || alignment == 0 {
+        return 0;
+    }
+    let room = available.saturating_sub(overhead) / count;
+    if room < target {
+        budget_stripe(room, alignment)
+    } else {
+        target / alignment * alignment
+    }
+}
+
 /// A caller-owned allocation budget that may be shared across sessions.
 ///
 /// Reservations precede allocation and include conservative bookkeeping costs.
@@ -547,12 +569,7 @@ impl MemoryBudget {
             return Err(EngineError::InvalidState("invalid repair stripe layout"));
         }
         for attempt in 0..2 {
-            let room = self.available().saturating_sub(overhead) / count;
-            let stripe = if room < target {
-                budget_stripe(room, alignment)
-            } else {
-                target / alignment * alignment
-            };
+            let stripe = stripe_within(self.available(), target, count, alignment, overhead);
             if stripe == 0 {
                 break;
             }
@@ -718,6 +735,15 @@ pub struct ExecutionOptions {
     /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
     /// This does not change the independent Cauchy dispatch.
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
+    /// Whether an FFT decode whose bank outgrows the transform scratch runs
+    /// its inverse transform, derivative and forward transform fused
+    /// (`reedsolomon_rs`'s `TransformField::derivative_at`). `None`, the
+    /// default, fuses where `reedsolomon_rs::fft::POOL_GATHERS` holds, which
+    /// is every target but Apple silicon, at every worker count. A forced
+    /// value exists so every target's tests run both decodes; output is
+    /// identical either way.
+    #[doc(hidden)]
+    pub fft_fused_decode: Option<bool>,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
     /// Shared handle ceiling across cloned options and cooperating providers.
@@ -744,6 +770,7 @@ impl Default for ExecutionOptions {
             retained_bytes: 64 << 20,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
+            fft_fused_decode: None,
             open_handles: 32,
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,

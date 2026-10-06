@@ -1673,9 +1673,53 @@ pub fn cauchy_files_set(
     seed: &[u8],
     tree: &TempTree,
 ) -> ManyBlockSet {
-    use par3_rs::creation::{
-        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
-    };
+    files_set(
+        files,
+        bytes_per_file,
+        block_size,
+        recovery,
+        par3_rs::creation::CreationCodec::Cauchy,
+        seed,
+        tree,
+    )
+}
+
+/// An FFT-coded set of one file of `blocks` blocks of `block_size` bytes, one
+/// cohort, room for exactly `recovery` (a power of two) recovery blocks, one
+/// per carrier. Unlike [`many_block_set`], the blocks can be wide enough for
+/// a repair's stripes to split them.
+pub fn fft_block_set(
+    blocks: usize,
+    block_size: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    assert!(recovery.is_power_of_two(), "FFT capacity is a power of two");
+    files_set(
+        1,
+        blocks * block_size as usize,
+        block_size,
+        recovery,
+        par3_rs::creation::CreationCodec::Fft {
+            capacity_log2: recovery.trailing_zeros() as i8,
+            interleave: 0,
+        },
+        seed,
+        tree,
+    )
+}
+
+fn files_set(
+    files: usize,
+    bytes_per_file: usize,
+    block_size: u64,
+    recovery: u64,
+    codec: par3_rs::creation::CreationCodec,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, VolumeLayout};
     let mut access = MemorySourceAccess::default();
     let mut contents = Vec::new();
     let mut sources = Vec::new();
@@ -1703,7 +1747,7 @@ pub fn cauchy_files_set(
         block_size,
         recovery_count: recovery,
         volumes: VolumeLayout::Uniform(1),
-        codec: CreationCodec::Cauchy,
+        codec,
         ..CreationOptions::default()
     };
     options.execution.workers = 1;

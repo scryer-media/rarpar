@@ -235,6 +235,42 @@
   silicon, where the pool does not gather, nothing changes and nothing is
   charged. Same decode, eight workers: 1.66–1.68 → 1.33–1.35 s and CPU
   11.3 → 8.3 s; one worker, which never walks, unchanged at 2.05 s.
+- FFT decode runs its inverse transform, formal derivative and forward
+  transform as one step, `reedsolomon-rs` 0.4.8's
+  `TransformField::derivative_at`: three slab passes over the bank instead
+  of the walked inverse, a separate derivative pass that streamed the whole
+  bank once per set bit of a row index, and the pruned forward plan. The
+  codec admits the domain's rows plus one per lost block for what the step
+  returns, the index of each lost row, and the step's sweeps, bookkeeping
+  and slab scratch beside them. The fused rows charge more than the
+  separate steps, so a binding budget narrows their stripe further; they
+  are taken only where their stripe walks each block in no more passes
+  than the separate steps' stripe from the same budget, so they never read
+  an input more often or more bytes of it. Where the bank fits the
+  transform scratch, where the budget refuses those rows or would take more
+  passes, and on Apple silicon, whose pools do not gather (forced on, an
+  Apple M5 Max decode took 1.81 → 2.61 s at one worker), the previous path
+  runs. `ExecutionOptions::fft_fused_decode` (hidden) forces either path,
+  for tests. The direct lane reads up to 256 rows ahead of its workers, a
+  quarter of the domain and at least 16, instead of two per worker: the
+  short batches left the pool spinning between them.
+- An FFT repair reserves its staged outputs' proof frontiers as soon as the
+  decode's stripe is known, and narrows the stripe to leave room for them
+  when they would not fit, as the Cauchy repair does. A repair walking
+  stripes narrower than a block holds a frontier for every block it decodes,
+  and these were taken as they opened out of whatever the decode's bank
+  left: where that came up short, on either decode path, the proof gave up
+  and every staged output was read back in full (1.61 GB more on the run
+  below with the fused decode).
+- FFT repair of 1.5 GiB of 32 KiB blocks over GF(2^16), 2000 lost, 2 GiB
+  budget, medians of three, repaired bytes and file reads (5.08 GB)
+  identical, peak RSS 1959 → 1750 MiB. Intel Core i5-1240P (Alder Lake),
+  Decode stage (process CPU): eight workers on four P-cores 3.86 → 2.54 s
+  (22.2 → 12.4 s), four on one thread per P-core 3.58 → 2.55 s (12.3 →
+  8.3 s), two 4.40 → 3.23 s (9.6 → 7.3 s), one 5.93 → 5.08 s (7.2 →
+  6.4 s). Apple M5 Max, separate steps with the batch change: eight
+  workers 0.76 → 0.65 s (6.4 → 5.0 s), eighteen 0.88 → 0.60 s (11.2 →
+  7.3 s), one unchanged. Create and Cauchy repair unchanged.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident

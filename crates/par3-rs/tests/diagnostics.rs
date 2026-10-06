@@ -917,6 +917,132 @@ fn read_ahead_never_starves_the_proof_frontiers_into_read_back() {
     );
 }
 
+/// The FFT counterpart of the test above. An FFT repair walking stripes
+/// narrower than a block writes every block it decodes in pieces, and the
+/// first stripe pass opens a hash frontier for every one of them that only
+/// the last pass closes. Those frontiers used to be taken as they opened, out
+/// of whatever the decode's bank left: where that rounded down to less than
+/// the frontiers need the proof gave up and every staged output was read
+/// back, and the fused decode, whose bank also holds a row per lost block,
+/// left less of it. With the frontiers reserved once the decode's stripe is
+/// known, and the bank narrowed to leave room for them when they would not
+/// fit, no budget the repair completes in reads anything back, and every one
+/// reads the sources exactly once.
+#[test]
+fn fft_decode_never_starves_the_proof_frontiers_into_read_back() {
+    let (blocks, block_size, recovery) = (64usize, 64u64 << 10, 16u64);
+    let block = block_size as usize;
+    let stripe = 16usize << 10;
+    let tree = common::TempTree::new("fft-proof-frontiers");
+    let set = common::fft_block_set(
+        blocks,
+        block_size,
+        recovery,
+        b"PAR3 FFT proof frontiers",
+        &tree,
+    );
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for lost in 0..recovery as usize {
+        damaged[(lost * 4 + 1) * block + 29] ^= 0x40;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+    let repair = |budget: usize, fused: bool| -> Option<ExecutionOptions> {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 4;
+        options.stripe_bytes = stripe;
+        options.memory = MemoryBudget::new(budget);
+        options.fft_fused_decode = Some(fused);
+        let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).ok()?;
+        session.bind_file(&name, SourceId(1)).ok()?;
+        for packet in &carriers {
+            session.merge(packet.clone()).ok()?;
+        }
+        if session.assess().ok()?.status != RepairStatus::Ready {
+            return None;
+        }
+        let output = common::TempTree::new("fft-proof-frontiers-out");
+        let report = session.repair(output.path(), false).ok()?;
+        assert_eq!(report.reconstructed_blocks, recovery);
+        assert!(
+            std::fs::read(output.path().join(&name)).unwrap() == bytes,
+            "{budget}: the repair did not reproduce the input"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "the session leaked");
+        assert!(options.memory.peak() <= budget, "{budget}: over the budget");
+        Some(options)
+    };
+    // Both decodes, on every target: the separate steps, and the fused one,
+    // which charges a row per lost block of the 128-row domain more.
+    let mut peaks = [0usize; 2];
+    let mut reads = [0u64; 2];
+    for fused in [false, true] {
+        let roomy = repair(256 << 20, fused).expect("the roomy repair");
+        let diagnostics = &roomy.diagnostics;
+        assert_eq!(
+            diagnostics.file_io().read_bytes,
+            0,
+            "the roomy repair read back"
+        );
+        assert_eq!(diagnostics.admission().stripe_bytes, stripe as u64);
+        assert_eq!(
+            diagnostics.admission().stripe_buffers,
+            if fused { 128 + recovery + 1 } else { 128 + 1 },
+            "the roomy repair did not take the expected decode"
+        );
+        peaks[usize::from(fused)] = roomy.memory.peak();
+        reads[usize::from(fused)] = diagnostics.source_io().read_bytes;
+    }
+    assert_eq!(reads[0], reads[1]);
+    // Every budget from well below where the separate steps narrow to just
+    // above what the fused decode takes in full, through both decodes.
+    let mut rows = Vec::new();
+    let mut budget = peaks[0].saturating_sub(2 << 20);
+    while budget <= peaks[1] + (64 << 10) {
+        let run = |fused| {
+            repair(budget, fused).map(|run| {
+                let admission = run.diagnostics.admission();
+                (
+                    run.diagnostics.file_io().read_bytes,
+                    admission.stripe_bytes,
+                    admission.stripe_buffers,
+                    run.diagnostics.source_io().read_bytes,
+                )
+            })
+        };
+        rows.push((budget, run(false), run(true)));
+        budget += 256 << 10;
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row.1.is_some_and(|plain| plain.1 < stripe as u64)),
+        "the sweep never narrowed the stripe: {rows:?}"
+    );
+    for (budget, plain, either) in &rows {
+        let Some(plain) = plain else { continue };
+        // The fused decode, where it may run, is taken only where its stripe
+        // walks a block in no more passes; the separate steps run otherwise.
+        let either = either.expect("a decode that may fuse fits where the plain one does");
+        let passes = |stripe: u64| block_size.div_ceil(stripe);
+        assert!(
+            passes(either.1) <= passes(plain.1),
+            "{budget}: {either:?} against {plain:?}"
+        );
+        for run in [*plain, either] {
+            assert_eq!(run.0, 0, "{budget}: a completed repair read back: {rows:?}");
+            assert_eq!(run.3, reads[0], "{budget}: the reads changed: {rows:?}");
+        }
+    }
+}
+
 /// PR #73 finding 10. Successive stripe passes walk disjoint slices of every
 /// block, so a repair that cannot hold a whole block reads each source byte
 /// exactly once. `reread_bytes` is what a host uses to see I/O amplification,

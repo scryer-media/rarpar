@@ -7,6 +7,13 @@
 //! every decode here must return the original bytes, and the diagnostics must
 //! show the plan removed work rather than merely rearranging it.
 //!
+//! A decode of a bank beyond the transform scratch can instead run its three
+//! steps as one through `TransformField::derivative_at`, which splits the
+//! levels in half and keeps the low half of the forward transform only for
+//! the blocks holding a lost row. Targets whose pools gather take it by
+//! default; every test here forces it on and off, so both paths and their
+//! counts are checked on every target.
+//!
 //! Nothing here assembles or edits a PAR3 packet. Recovery rows come from this
 //! crate's own encoder and the data from a deterministic byte stream.
 mod common;
@@ -33,17 +40,23 @@ fn blocks(inputs: usize, block_size: u64) -> Vec<Vec<u8>> {
     out
 }
 
-fn options(stripe: usize, workers: usize) -> ExecutionOptions {
+/// Both ways a decode can run: the separate steps under the plan, then the
+/// split steps of `derivative_at`.
+const PATHS: [bool; 2] = [false, true];
+
+fn options(stripe: usize, workers: usize, fused: bool) -> ExecutionOptions {
     let mut options = ExecutionOptions::default();
     options.stripe_bytes = stripe;
     options.workers = workers;
     options.memory = MemoryBudget::new(256 << 20);
+    options.fft_fused_decode = Some(fused);
     options
 }
 
 /// Encode every compatible recovery row, then decode `lost` from `recovery`
 /// and require the original bytes back. Returns what the codec counters said
 /// about the decode alone.
+#[allow(clippy::too_many_arguments)]
 fn round_trip(
     inputs: usize,
     capacity_log2: i8,
@@ -52,12 +65,13 @@ fn round_trip(
     lost: &[usize],
     recovery: &[usize],
     workers: usize,
+    fused: bool,
 ) -> (par3_rs::runtime::CodecSnapshot, usize, u64) {
     let geometry = FftGeometry::new(inputs as u64, capacity_log2).unwrap();
     let data = blocks(inputs, block_size);
     let capacity = geometry.capacity();
 
-    let encode_options = options(stripe, workers);
+    let encode_options = options(stripe, workers, fused);
     let codec = FftCodec::new(geometry, encode_options.clone()).unwrap();
     let mut parity = vec![vec![0u8; block_size as usize]; capacity];
     codec
@@ -78,7 +92,7 @@ fn round_trip(
         .unwrap();
     drop(codec);
 
-    let decode_options = options(stripe, workers);
+    let decode_options = options(stripe, workers, fused);
     let codec = FftCodec::new(geometry, decode_options.clone()).unwrap();
     let mut recovered = vec![vec![0u8; block_size as usize]; lost.len()];
     codec
@@ -106,7 +120,7 @@ fn round_trip(
         assert_eq!(
             recovered[slot], data[*index],
             "inputs {inputs} capacity 2^{capacity_log2} block {block_size} stripe {stripe} \
-             lost {lost:?} recovery {recovery:?}"
+             lost {lost:?} recovery {recovery:?} fused {fused}"
         );
     }
     drop(codec);
@@ -157,15 +171,18 @@ fn a_pruned_decode_returns_the_original_bytes_in_both_fields() {
     ];
     for (inputs, capacity_log2, block_size, stripe, lost, recovery) in cases {
         for workers in [1, 4] {
-            round_trip(
-                *inputs,
-                *capacity_log2,
-                *block_size,
-                *stripe,
-                lost,
-                recovery,
-                workers,
-            );
+            for fused in PATHS {
+                round_trip(
+                    *inputs,
+                    *capacity_log2,
+                    *block_size,
+                    *stripe,
+                    lost,
+                    recovery,
+                    workers,
+                    fused,
+                );
+            }
         }
     }
 }
@@ -177,18 +194,29 @@ fn a_pruned_decode_returns_the_original_bytes_in_both_fields() {
 /// 128-row block: 1024x4 wide plus 448 narrow, 4544 instead of 11,264. The
 /// decode's other transform — the input inverse — is unplanned and runs in
 /// full, so the two together are 15,808 a stripe.
+///
+/// Through `derivative_at` the split is at five levels: the six wide stages
+/// over the whole domain (1024x6), then the five narrow ones twice over the
+/// one 32-row block holding the loss (2x80), 6304 against the full 11,264.
 #[test]
 fn the_plan_skips_what_one_lost_row_does_not_need() {
-    let (light, domain, stripe) = round_trip(900, 7, 8192, 4096, &[5], &[0], 1);
-    assert_eq!((domain, stripe), (2048, 4096));
-    let stripes = 8192 / stripe;
-    assert_eq!(light.butterflies, stripes * (11_264 + 4_544), "{light:?}");
-    assert_eq!(light.butterflies_skipped, stripes * 6_720, "{light:?}");
-    assert_eq!(
-        light.butterflies + light.butterflies_skipped,
-        stripes * 2 * 11_264,
-        "what ran plus what was skipped is two full transforms a stripe"
-    );
+    for fused in PATHS {
+        let (light, domain, stripe) = round_trip(900, 7, 8192, 4096, &[5], &[0], 1, fused);
+        assert_eq!((domain, stripe), (2048, 4096));
+        let stripes = 8192 / stripe;
+        let forward = if fused { 6_304 } else { 4_544 };
+        assert_eq!(light.butterflies, stripes * (11_264 + forward), "{light:?}");
+        assert_eq!(
+            light.butterflies_skipped,
+            stripes * (11_264 - forward),
+            "{light:?}"
+        );
+        assert_eq!(
+            light.butterflies + light.butterflies_skipped,
+            stripes * 2 * 11_264,
+            "what ran plus what was skipped is two full transforms a stripe"
+        );
+    }
 }
 
 /// The other end of the cost model. Thirty-two losses spread 62 rows apart in
@@ -198,21 +226,32 @@ fn the_plan_skips_what_one_lost_row_does_not_need() {
 /// 11,264. That is a real saving but a small one, and far less than the 7168 a
 /// single loss removes — the plan tracks the damage rather than claiming a
 /// fixed discount.
+///
+/// Through `derivative_at` every loss lies in a 32-row block of its own, so
+/// all 32 blocks run the five narrow stages twice: 1024x6 + 32x160, the full
+/// 11,264, and nothing is skipped.
 #[test]
 fn spread_damage_prunes_far_less_than_a_single_loss() {
     let spread: Vec<usize> = (0..32).map(|index| index * 62).collect();
     let recovery: Vec<usize> = (0..32).collect();
-    let (heavy, domain, stripe) = round_trip(2000, 5, 8192, 4096, &spread, &recovery, 1);
-    assert_eq!((domain, stripe), (2048, 4096));
-    let stripes = 8192 / stripe;
-    assert_eq!(heavy.butterflies, stripes * (11_264 + 8_192), "{heavy:?}");
-    assert_eq!(heavy.butterflies_skipped, stripes * 3_072, "{heavy:?}");
+    for fused in PATHS {
+        let (heavy, domain, stripe) = round_trip(2000, 5, 8192, 4096, &spread, &recovery, 1, fused);
+        assert_eq!((domain, stripe), (2048, 4096));
+        let stripes = 8192 / stripe;
+        let forward = if fused { 11_264 } else { 8_192 };
+        assert_eq!(heavy.butterflies, stripes * (11_264 + forward), "{heavy:?}");
+        assert_eq!(
+            heavy.butterflies_skipped,
+            stripes * (11_264 - forward),
+            "{heavy:?}"
+        );
 
-    let (light, _, _) = round_trip(2000, 5, 8192, 4096, &[5], &[0], 1);
-    assert!(
-        light.butterflies_skipped > heavy.butterflies_skipped * 2,
-        "one loss should prune far more than 32 spread ones: {light:?} {heavy:?}"
-    );
+        let (light, _, _) = round_trip(2000, 5, 8192, 4096, &[5], &[0], 1, fused);
+        assert!(
+            light.butterflies_skipped > heavy.butterflies_skipped * 2,
+            "one loss should prune far more than 32 spread ones: {light:?} {heavy:?}"
+        );
+    }
 }
 
 #[test]
@@ -229,19 +268,144 @@ fn the_plan_does_not_depend_on_the_order_the_caller_names_its_losses() {
     let shuffled = [200usize, 3, 613, 41, 40];
     let recovery = [0usize, 1, 2, 3, 4];
 
-    let (sorted, domain, stripe) = round_trip(900, 7, 8192, 4096, &ascending, &recovery, 1);
-    assert_eq!((domain, stripe), (2048, 4096));
-    assert!(
-        sorted.butterflies_skipped > 0,
-        "the case must select a pruned plan to be worth ordering: {sorted:?}"
-    );
-
-    for lost in [&descending[..], &shuffled[..]] {
-        let (measured, _, _) = round_trip(900, 7, 8192, 4096, lost, &recovery, 1);
-        assert_eq!(
-            (measured.butterflies, measured.butterflies_skipped),
-            (sorted.butterflies, sorted.butterflies_skipped),
-            "{lost:?} must cost exactly what {ascending:?} costs"
+    for fused in PATHS {
+        let (sorted, domain, stripe) =
+            round_trip(900, 7, 8192, 4096, &ascending, &recovery, 1, fused);
+        assert_eq!((domain, stripe), (2048, 4096));
+        assert!(
+            sorted.butterflies_skipped > 0,
+            "the case must select a pruned plan to be worth ordering: {sorted:?}"
         );
+
+        for lost in [&descending[..], &shuffled[..]] {
+            let (measured, _, _) = round_trip(900, 7, 8192, 4096, lost, &recovery, 1, fused);
+            assert_eq!(
+                (measured.butterflies, measured.butterflies_skipped),
+                (sorted.butterflies, sorted.butterflies_skipped),
+                "{lost:?} must cost exactly what {ascending:?} costs"
+            );
+        }
+    }
+}
+
+/// One decode of `lost` from `recovery` through `options`: the stripe it
+/// read at, the reads it made, and the bytes per stripe byte it admitted;
+/// none where the budget holds no decode at all.
+fn decode_reads(
+    geometry: FftGeometry,
+    data: &[Vec<u8>],
+    parity: &[Vec<u8>],
+    block_size: u64,
+    lost: &[usize],
+    recovery: &[usize],
+    options: &ExecutionOptions,
+) -> Option<(usize, usize, u64)> {
+    let codec = FftCodec::new(geometry, options.clone()).ok()?;
+    let reads = std::cell::Cell::new(0usize);
+    let widest = std::cell::Cell::new(0usize);
+    let mut recovered = vec![vec![0u8; block_size as usize]; lost.len()];
+    let decoded = codec.decode(
+        block_size,
+        lost,
+        recovery,
+        |row, offset, out| {
+            reads.set(reads.get() + 1);
+            widest.set(widest.get().max(out.len()));
+            let from = match row {
+                FftInput::Original(index) => &data[index],
+                FftInput::Recovery(index) => &parity[index],
+            };
+            out.copy_from_slice(&from[offset as usize..offset as usize + out.len()]);
+            Ok(())
+        },
+        |index, offset, bytes| {
+            let slot = lost.iter().position(|at| *at == index).expect("a lost row");
+            recovered[slot][offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        },
+    );
+    drop(codec);
+    assert_eq!(options.memory.used(), 0);
+    match decoded {
+        Err(par3_rs::runtime::EngineError::ResourceLimit(_)) => return None,
+        other => other.unwrap(),
+    }
+    for (slot, index) in lost.iter().enumerate() {
+        assert_eq!(recovered[slot], data[*index]);
+    }
+    Some((
+        widest.get(),
+        reads.get(),
+        options.diagnostics.admission().stripe_buffers,
+    ))
+}
+
+/// The split steps keep more beside the rows than the separate steps do, so
+/// a budget that binds narrows their stripe further, and every stripe pass
+/// over a block reads every input once more. They are taken only where
+/// their stripe walks a block in no more passes: at no budget may a decode
+/// that may take them make more reads, or read more, than one that may not.
+/// Where the budget cannot hold them at all, the decode falls back to the
+/// separate steps and still succeeds.
+#[test]
+fn the_split_steps_never_take_more_stripe_passes_than_the_separate_ones() {
+    let (inputs, block_size) = (900usize, 8192u64);
+    let geometry = FftGeometry::new(inputs as u64, 7).unwrap();
+    let data = blocks(inputs, block_size);
+    let capacity = geometry.capacity();
+    let mut parity = vec![vec![0u8; block_size as usize]; capacity];
+    FftCodec::new(geometry, options(block_size as usize, 1, false))
+        .unwrap()
+        .encode(
+            block_size,
+            0,
+            capacity,
+            |index, offset, out| {
+                out.copy_from_slice(&data[index][offset as usize..offset as usize + out.len()]);
+                Ok(())
+            },
+            |index, offset, bytes| {
+                parity[index][offset as usize..offset as usize + bytes.len()]
+                    .copy_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let (lost, recovery) = ([5usize, 300], [0usize, 1]);
+    let run = |budget: usize, workers: usize, fused: bool| {
+        let mut options = options(block_size as usize, workers, fused);
+        options.memory = MemoryBudget::new(budget);
+        decode_reads(
+            geometry, &data, &parity, block_size, &lost, &recovery, &options,
+        )
+    };
+    for workers in [1, 8] {
+        // What each path charges a stripe byte, where the budget is no bound.
+        let split = run(256 << 20, workers, true).unwrap().2;
+        let separate = run(256 << 20, workers, false).unwrap().2;
+        assert_ne!(split, separate, "the roomy decode takes the split steps");
+        let (mut narrowed, mut declined) = (false, false);
+        for budget in (1usize..=40).map(|half| half << 19) {
+            let (either, plain) = (run(budget, workers, true), run(budget, workers, false));
+            println!("w{workers} budget {budget}: either {either:?} plain {plain:?}");
+            let Some(plain) = plain else { continue };
+            let either = either.expect("the split steps never refuse what the separate ones hold");
+            let passes = |stripe: usize| (block_size as usize).div_ceil(stripe);
+            assert!(
+                passes(either.0) <= passes(plain.0) && either.1 <= plain.1,
+                "workers {workers} budget {budget}: {either:?} against {plain:?}"
+            );
+            if either.2 == split && either.0 < block_size as usize {
+                narrowed = true;
+            }
+            if either.2 != split {
+                declined = true;
+            }
+        }
+        assert!(
+            narrowed,
+            "workers {workers}: some budget binds the split steps"
+        );
+        assert!(declined, "workers {workers}: some budget declines them");
     }
 }
