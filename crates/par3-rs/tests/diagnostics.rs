@@ -1098,6 +1098,73 @@ fn stripe_passes_over_a_block_are_passes_and_not_rereads() {
     );
 }
 
+/// W4.10. Repair used to reauthenticate every recovery payload, reading and
+/// hashing the whole packet, before the codec read the same payload again to
+/// use it. Where one stripe covers the block, the codec's own read of a payload
+/// is now what gets hashed, and its bytes are used only once the hash matched:
+/// each payload is fetched once. A stripe narrower than the block still
+/// authenticates each payload in a pass of its own before its first stripe.
+#[test]
+fn a_payload_read_whole_is_authenticated_by_the_read_that_uses_it() {
+    let (blocks, block_size, damage) = (32usize, 4096u64, [2usize, 9]);
+    let tree = common::TempTree::new("payload-read-once");
+    let set = common::cauchy_block_set(blocks, block_size, 4, b"PAR3 payload read once", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in damage {
+        damaged[block * block_size as usize + 11] ^= 0x80;
+    }
+    let repair = |workers: usize, stripe_bytes: usize| {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = workers;
+        options.stripe_bytes = stripe_bytes;
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file(&name, SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let before = options.diagnostics.source_io();
+        let output = common::TempTree::new("payload-read-once-out");
+        let report = session.repair(output.path(), false).unwrap();
+        let after = options.diagnostics.source_io();
+        assert_eq!(report.reconstructed_blocks, damage.len() as u64);
+        assert!(std::fs::read(output.path().join(&name)).unwrap() == bytes);
+        assert_eq!(session.failed_hash_bytes(), 0);
+        (
+            after.read_bytes - before.read_bytes,
+            after.read_calls - before.read_calls,
+        )
+    };
+    let lost = damage.len() as u64;
+    // Every surviving block and every selected recovery row, once each.
+    let once = blocks as u64 * block_size;
+    for workers in [1, 4] {
+        assert_eq!(
+            repair(workers, block_size as usize),
+            (once, blocks as u64),
+            "{workers} workers: a whole-block stripe read a payload twice"
+        );
+        // A quarter-block stripe walks four passes and authenticates each row
+        // first: its packet from the length field on, header and identity
+        // fields included, in stripe-sized reads.
+        let packet = block_size + 64;
+        assert_eq!(
+            repair(workers, block_size as usize / 4),
+            (
+                once + lost * packet,
+                4 * blocks as u64 + lost * packet.div_ceil(block_size / 4)
+            ),
+            "{workers} workers: a narrow stripe changed what it authenticates"
+        );
+    }
+}
+
 /// PR #73 round 5, finding D again, at the second site. Round 5 fixed the pass
 /// counter in the reconstruction loop and left the copy loop — the one a repair
 /// with nothing lost takes, where every block is available from an alias — still

@@ -715,6 +715,19 @@ impl RepairTree {
         Ok(())
     }
 
+    /// Remove staged outputs a refused repair leaves no host a reason to keep,
+    /// through the staging capability. A path that cannot be removed stays in
+    /// `outputs`, so the host is still told about it.
+    pub(crate) fn discard_temporary_outputs(&self, outputs: &mut Vec<PathBuf>) {
+        outputs.retain(|path| {
+            path.file_name()
+                .is_none_or(|name| match self.stage().remove_file(name) {
+                    Ok(()) => false,
+                    Err(error) => error.kind() != io::ErrorKind::NotFound,
+                })
+        });
+    }
+
     fn stage(&self) -> &BudgetedDir {
         self.stage.as_ref().expect("staging directory is open")
     }

@@ -155,15 +155,33 @@ impl PayloadRef {
         &self,
         options: &ExecutionOptions,
     ) -> Result<(), (EngineError, bool)> {
-        let spent = |error: EngineError| (error, false);
-        options.validate().map_err(spent)?;
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        options.validate().map_err(|error| (error, false))?;
         let size = options.stripe_bytes.min(64 << 10);
         let _buffer_reservation = options
             .memory
             .reserve_as(MemoryCategory::CarrierPackets, size)
-            .map_err(spent)?;
-        let mut buffer = vec![0; size];
+            .map_err(|error| (error, false))?;
+        self.reauthenticate_in(options, &mut vec![0; size])
+    }
+
+    /// [`Self::reauthenticate`] through a buffer the caller already holds, so
+    /// a codec whose stripes took the budget can still authenticate a payload
+    /// before it uses it. The packet is read in `buffer`-sized pieces, and
+    /// `buffer` holds nothing useful afterwards.
+    pub(crate) fn reauthenticate_in(
+        &self,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        if buffer.is_empty() {
+            return Err(spent(EngineError::InvalidState(
+                "empty reauthentication buffer",
+            )));
+        }
+        let size = buffer.len();
         let mut hash = FingerprintHasher::new();
         let mut offset = 24;
         while offset < self.header.length {
@@ -183,6 +201,74 @@ impl PayloadRef {
         // Everything from here on has cost a full pass over the packet.
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
             .map_err(|error| (error, true))?;
+        if hash.finalize() != self.header.hash {
+            return Err((
+                Par3Error::PacketHashMismatch {
+                    offset: self.packet_offset,
+                }
+                .into(),
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the whole payload into the front of `out`, zero the rest, and
+    /// authenticate the packet over the bytes just read: one read in place of
+    /// [`Self::reauthenticate`] followed by [`Self::read_at`].
+    ///
+    /// The packet's header and the identity fields ahead of its payload were
+    /// authenticated when it was admitted and are held here; only the payload
+    /// is read again, and the hash over the two is the packet's own. The bytes
+    /// in `out` are the ones the hash vouched for, so a caller that consumes
+    /// them only after this returns `Ok` never uses an unverified byte. `out`
+    /// must be at least [`Self::len`] bytes; what it holds after an error is
+    /// unspecified. The error carries whether a whole pass was spent, as
+    /// [`Self::reauthenticate`]'s does.
+    pub(crate) fn read_authenticated(
+        &self,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        let len = usize::try_from(self.len())
+            .ok()
+            .filter(|len| *len <= out.len())
+            .ok_or_else(|| spent(EngineError::InvalidState("payload wider than its buffer")))?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        out[len..].fill(0);
+        if len != 0 {
+            read_exact_at(
+                &options.diagnostics,
+                self.access.as_ref(),
+                self.source,
+                self.data_offset,
+                &mut out[..len],
+            )
+            .map_err(spent)?;
+        }
+        // From here on the payload has been read, as a reauthentication would
+        // have read it.
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
+            .map_err(|error| (error, true))?;
+        let mut hash = FingerprintHasher::new();
+        hash.update(&self.header.length.to_le_bytes());
+        hash.update(self.header.input_set_id.as_bytes());
+        hash.update(&self.header.packet_type.signature());
+        match self.kind {
+            PayloadKind::Data { index } => hash.update(&index.to_le_bytes()),
+            PayloadKind::Recovery {
+                root,
+                matrix,
+                index,
+            } => {
+                hash.update(&root);
+                hash.update(&matrix);
+                hash.update(&index.to_le_bytes());
+            }
+        }
+        hash.update(&out[..len]);
         if hash.finalize() != self.header.hash {
             return Err((
                 Par3Error::PacketHashMismatch {
@@ -1419,7 +1505,38 @@ impl IncrementalSet {
         payload: &PayloadRef,
         options: &ExecutionOptions,
     ) -> EngineResult<()> {
-        match payload.reauthenticate(options) {
+        self.charge(payload, payload.reauthenticate(options))
+    }
+
+    /// [`Self::validate_payload`] through a buffer the caller already holds:
+    /// see [`PayloadRef::reauthenticate_in`].
+    pub(crate) fn validate_payload_in(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.reauthenticate_in(options, buffer))
+    }
+
+    /// [`Self::validate_payload`] fused with the read that consumes the
+    /// payload: see [`PayloadRef::read_authenticated`]. A failure is charged
+    /// exactly as a failed reauthentication is.
+    pub(crate) fn read_payload(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.read_authenticated(options, out))
+    }
+
+    fn charge(
+        &self,
+        payload: &PayloadRef,
+        checked: Result<(), (EngineError, bool)>,
+    ) -> EngineResult<()> {
+        match checked {
             Ok(()) => Ok(()),
             Err((error, spent)) => {
                 // A pass was spent whenever the packet was read and hashed
