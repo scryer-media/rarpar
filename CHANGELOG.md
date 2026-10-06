@@ -24,6 +24,35 @@ documented in each crate's own changelog so those notes ship with the crate.
   covered falls back to one read of the finished archive, reported as
   `read_back` in `--json` output. Every non-Creator packet is byte-identical
   to par3cmdline 0.0.1's over the same archive.
+- `rarpar par3 archive --format zip OUTPUT.zip INPUTS...` writes a ZIP
+  instead, through the zip crate: each file stored (`--level 0`) or deflated
+  on its own through flate2's zlib-rs backend at `--level 1..9`, with no
+  encryption. Deflate runs as one stream per member, on one thread. The
+  writer streams, with data descriptors, so no byte is rewritten; members
+  larger than 4 GiB less 16 MiB get ZIP64 sizes from the start, and the archive gets the
+  ZIP64 end records when it passes 4 GiB or 65,535 entries. Directories are
+  stored with a trailing slash, and every entry keeps its modification time
+  (local time, 1980 to 2107) and, on Unix, its permission bits. `--filter`
+  and `--no-solid` are 7z only and refused with `--format zip`. The sibling
+  set is laid out as for 7z. With `--inside` the set follows par3cmdline's
+  ZIP layout: the end records (22 bytes, or 98 with the ZIP64 records) form
+  their own protected chunk after the data chunk, the packets follow as an
+  unprotected chunk, and a copy of the end records ends the file as a fourth
+  chunk, protected by the same blocks as the original. Every non-Creator
+  packet is byte-identical to par3cmdline 0.0.1's `i -r<percent>` over the
+  same ZIP, and with the same Creator text so is the whole file. `--json` output now names the `format`.
+- Where `--format zip --inside` differs from the request it was built to:
+  - The copy of the end records after the packets is protected, as
+    par3cmdline protects it, rather than only the original archive's bytes.
+  - The central directory stays where the writer put it and only the end
+    records are copied after the packets, as par3cmdline lays it out. The
+    zip crate and par3cmdline read such a file, and 7-Zip reads it with a
+    "data after the end of archive" warning and exit code 0; Info-ZIP `unzip` extracts it with a
+    warning and exit code 2, and Python's `zipfile` refuses it.
+  - A layout where par3cmdline's size estimate and the packets it writes
+    would disagree (a data tail under 40 bytes ahead of whole footer
+    blocks, which only a block size of 98 bytes or less can produce) is refused
+    rather than written.
 - The par3cmdline front end now runs `vs` and `rs` on ZIP and 7z files that
   carry their PAR3 packets inside them, where 0.6.0 refused them:
   - `vs` judges such a file by its protected chunks alone, as par3cmdline
@@ -94,8 +123,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
-- sevenz-turbo 0.26.1 and blake3 for the `sevenz` feature; crc-fast,
-  filetime and libc are now also used by rarpar itself. par3-rs stays
+- sevenz-turbo 0.26.1, zip 8.6 (with flate2's zlib-rs backend) and blake3
+  for the `sevenz` feature; crc-fast, filetime and libc are now also used by
+  rarpar itself. par3-rs stays
   `=0.4.5`; par2-rs and unrar-rs are unchanged.
 
 ## rarpar 0.6.0
