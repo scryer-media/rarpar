@@ -449,7 +449,7 @@ Engine-side kernel and platform work for the PAR2, PAR3 and RAR crates. Weaver's
 
 Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept when it materially moves wall clock or CPU time where it engages without adding significant risk or code, and regresses nothing else by more than 1%; there is no minimum percentage; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
 
-Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence.
+Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence; **Dropped** was measured and abandoned, kept on the radar so the attempt is not repeated.
 
 | Item | Serves | Status | Needs |
 |---|---|---|---|
@@ -465,7 +465,8 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
 | par3cmdline-compatible command-line facade | rarpar CLI | Building | |
 | SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Watch | spike measured: slower than NEON at the 12–16 source groups the engines issue and at 8–18 workers (SME unit shared per cluster); wins 2–3x only at 64 or more sources per product; kept as an opt-in `kernel_ceiling` lane |
-| Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Watch | pays only on outer-product units (SME2 today, AVX512BMM if it has the same shape); changes the memory planner and read pattern; a wash for lookup kernels |
+| Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Dropped | breakpoint spike measured on Apple silicon at 8 workers: repair of 1–10 lost blocks never crosses on realistic sets (N 256–51,200 blocks, 64 KiB stripe: SME2 saves 8–14 ms of compute per pass against at least 130 ms of streamed read, and holding K stripes resident forfeits NEON's read-ahead overlap, a net loss cold); PAR2 shows no crossover up to N=32,000 for 1–4 lost blocks or 5–10% recovery; full-recovery create is 1.2–1.5x on the kernel but per-pass plan rebuilds erase it and cached plans cost 32·R·N bytes (1.6 GB at N=32,000); the apparent 1.9x on one lost block was the PAR3 repair nest running row-parallel on one thread, fixed by a column split instead (see PAR3 repair row); revisit only if large-set create with page-cached sources and a 256 KiB or larger stripe becomes a hot path |
+| PAR3 repair nest column split when fewer blocks are lost than there are workers | PAR3 | Building | the wide-K spike showed the row-parallel nest leaves 1–4 lost blocks on 1–4 threads (CPU ratio about 0.3 against SME2); PAR2's nest already splits the stripe by column; needs interleaved A/B at 1 and 8 workers for lost 1, 4 and 10 at a 64 KiB and a 1 MiB stripe |
 | AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
 | AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over |
 | AVX-512 FFT linear map tier | PAR3 FFT | Watch | depends on the GF(2^8) AVX-512 result |
