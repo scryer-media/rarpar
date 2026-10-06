@@ -224,9 +224,12 @@ buffered row is named `rarpar-wN-buffered`. Both carry ratios against the
 single reference row, whose durability column reads `none (never syncs)`.
 Verify rows write nothing and run once. `--durability durable` drops the
 buffered rows; durable is always required. The suite probes
-`rarpar par3 <op> --help` for `--buffered`, and when the CLI lacks it, which is
-the case for `par3 repair` today, it skips that op's buffered row and says so in
-the report notes. `par3 matrix --profile full` prints the rows per op.
+`rarpar par3 <op> --help` for `--buffered` as a whole token. When the help
+prints but lacks it, which is the case for `par3 repair` today, the suite skips
+that op's buffered row and says so in the report notes. When the help itself
+fails (a timeout, a non-zero exit, a start failure, or a quarantine), the run
+stops with that error rather than guessing. `par3 matrix --profile full` prints
+the rows per op.
 
 Each variant gets the warmups, then the measured repeats, and the variant order
 alternates on every repeat. Each table cell is the median with the range,
@@ -260,16 +263,36 @@ have no RSS.
 
 ### Timeouts and reference DNF
 
-Every run has a per-run timeout, `--timeout`, 20 minutes by default.
-`--reference-timeout` sets a different limit for the reference only. A
-reference run that exits non-zero, writes no recovery files or fewer recovery
-blocks than asked for, or exceeds its timeout is recorded as `DNF` with the
-exit code (or the timeout) and the last line it printed. The suite carries on:
-the rest of that reference row is skipped, every `rarpar` row still runs, and
-the run never fails because of it. Ratios against a DNF reference show `-`.
+Every run has a per-run timeout, `--timeout`, now 20 minutes by default (it
+was longer before). The limit applies to `rarpar` rows too, so on a slow host
+raise it, or a large set's `rarpar` rows fail as `timeout`. A `rarpar` row that
+times out stays failed and is not retried on its remaining warmups and
+repeats. `--reference-timeout` sets a different limit for the reference only.
+
+A reference run is **DNF** for exactly these failure classes, recorded with
+the exit code (or the timeout) and the last line it printed:
+
+- `timeout`: it exceeded its timeout and was killed, with its whole process
+  group;
+- `signal`: it was killed by a signal;
+- `exit-N`: it exited non-zero;
+- `no-carriers`, `truncated-carriers`, `unreadable-carriers`: a create exited 0
+  but wrote no recovery files, fewer recovery blocks than asked for, or files
+  that do not parse.
+
+The suite carries on: the rest of that reference row is skipped, every
+`rarpar` row still runs, and the run never fails because of it. Ratios against
+a DNF reference show `-`.
+
+Every other reference failure fails the run: `start-failed` (the binary would
+not start), `reference-nondeterministic` (its create did not reproduce its own
+canonical set byte for byte, which would make every identity verdict
+meaningless), `repair-mismatch` (its repair did not restore the original
+bytes) and `harness-missing-rss`.
 
 Verify and repair need a canonical recovery set, normally written by an untimed
-reference create. If that create DNFs, `rarpar` (durable, most workers) writes
+reference create. If that create is DNF (one of the classes above; any other
+failure stops the set), `rarpar` (durable, most workers) writes
 the canonical set instead, the reference still verifies and repairs it, the
 identity verdicts are skipped, and the report says where the set came from.
 
@@ -322,10 +345,14 @@ The harness never adds exclusions and never retries around it. Restore the
 binary, or ask the host owner to allow it, then rerun.
 
 Known false positive: Defender flags the `par3-rs` `engine_perf.exe` example
-as `Trojan:Win64/AsyncRAT.C!MTB` and quarantines it. The operator-approved
-handling is a path-scoped Defender exclusion on the bench work directory, added
-by hand by the host owner. No automation in this repository touches Defender
-settings, and none may.
+as `Trojan:Win64/AsyncRAT.C!MTB` and quarantines it. `engine_perf.exe` is only
+used by a manual `par3 run --engine-perf PATH`; the fleet neither ships nor
+runs it. The operator-approved handling is a path-scoped Defender exclusion,
+added by hand by the host owner, on the bench work directory that holds
+`engine_perf.exe`: the directory you build it into (cargo's
+`target\release\examples`) or copy it into before passing it as `PATH`. Do not
+widen it beyond that directory. No automation in this repository touches
+Defender settings, and none may.
 
 ### Output
 

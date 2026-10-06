@@ -475,3 +475,65 @@ func TestPeakRSSIsARequiredRowField(t *testing.T) {
 		t.Fatalf("report lacks the RSS column or ratio:\n%s", report)
 	}
 }
+
+func TestOnlyUnfinishedReferenceRunsAreDNF(t *testing.T) {
+	cases := []struct {
+		tool, failure string
+		status        string
+		finished      bool
+	}{
+		{ToolReference, "timeout", StatusDNF, true},
+		{ToolReference, "signal", StatusDNF, true},
+		{ToolReference, "exit-6", StatusDNF, true},
+		{ToolReference, "no-carriers", StatusDNF, true},
+		{ToolReference, "truncated-carriers", StatusDNF, true},
+		{ToolReference, "unreadable-carriers", StatusDNF, true},
+		// A reference that ran but contradicted itself or the harness fails
+		// the run: every identity verdict would be meaningless.
+		{ToolReference, "reference-nondeterministic", StatusFailed, false},
+		{ToolReference, "repair-mismatch", StatusFailed, false},
+		{ToolReference, "start-failed", StatusFailed, false},
+		{ToolReference, FailureMissingRSS, StatusFailed, false},
+		// A timed-out rarpar row stays failed but is not retried.
+		{ToolCandidate, "timeout", StatusFailed, true},
+		{ToolCandidate, "exit-6", StatusFailed, false},
+		{ToolCandidate, "repair-mismatch", StatusFailed, false},
+	}
+	for _, c := range cases {
+		record := RunRecord{Tool: c.tool, Status: StatusFailed, Failure: c.failure}
+		finished := settleRow(&record)
+		if record.Status != c.status || finished != c.finished {
+			t.Errorf("%s %s: status %s finished %t, want %s %t", c.tool, c.failure, record.Status, finished, c.status, c.finished)
+		}
+	}
+	if ok := (RunRecord{Tool: ToolReference, Status: StatusOK}); settleRow(&ok) || ok.Status != StatusOK {
+		t.Error("an ok run must not end its row")
+	}
+}
+
+func TestHelpListsFlagMatchesWholeTokens(t *testing.T) {
+	for help, want := range map[string]bool{
+		"      --buffered       skip the per-output fsync":  true,
+		"usage: rarpar par3 create [--buffered] FILES":      true,
+		"      --buffered-io    something else":             false,
+		"      --no-buffered    always sync":                false,
+		"no flag mentioned; see docs for --buffered-output": false,
+	} {
+		if got := helpListsFlag(help, "--buffered"); got != want {
+			t.Errorf("%q: got %t, want %t", help, got, want)
+		}
+	}
+}
+
+func TestReferenceRowWithOnlyFailedRunsHasNoSelfRatio(t *testing.T) {
+	results := &Results{Schema: ResultsSchema, Ops: []string{OpVerify}, Repeats: 1, Variants: Variants([]int{1}, nil, nil),
+		Configs: []ConfigSummary{{Config: Config{ID: "u", BlockSize: MiB, Recovery: 3, Codec: "cauchy"}}},
+		Runs: []RunRecord{
+			{Config: "u", Op: OpVerify, Variant: "reference", Tool: ToolReference, Status: StatusFailed, Failure: "start-failed"},
+			{Config: "u", Op: OpVerify, Variant: "rarpar-w1", Tool: ToolCandidate, Status: StatusOK, Measurement: Measurement{WallSeconds: 1, MaxRSSBytes: 1 << 20}},
+		}}
+	report := RenderReport(results)
+	if !strings.Contains(report, "| reference | - | - | - | - | - | - |") {
+		t.Fatalf("a reference row whose runs all failed must not print 1.000 ratios:\n%s", report)
+	}
+}

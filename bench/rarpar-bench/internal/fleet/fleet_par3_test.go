@@ -243,3 +243,14 @@ func TestBundleRequiresExeNamesOnWindows(t *testing.T) {
 		t.Fatalf("a missing rarpar.exe must be refused, got %v", err)
 	}
 }
+
+func TestPAR3ReferenceTimeoutReachesTheHost(t *testing.T) {
+	machine := Machine{PAR3: PAR3Plan{Profile: "smoke", Workers: []int{1}, Repeats: 1, TimeoutMinutes: 20}}
+	if strings.Contains(strings.Join(par3Args(machine), " "), "--reference-timeout") {
+		t.Fatal("no reference timeout is passed when reference_timeout_minutes is unset")
+	}
+	machine.PAR3.ReferenceTimeoutMinutes = 45
+	if args := strings.Join(par3Args(machine), " "); !strings.Contains(args, "--timeout 20m --reference-timeout 45m") {
+		t.Fatalf("par3 args = %s", args)
+	}
+}

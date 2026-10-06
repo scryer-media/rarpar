@@ -271,7 +271,10 @@ type RunRecord struct {
 	Position  int    `json:"position"`
 	Command   string `json:"command"`
 	Measurement
-	// Status is "ok", "failed" (rarpar only) or "dnf" (reference only).
+	// Status is "ok", "failed" or "dnf" (reference only). A reference run is
+	// "failed" when it ran but contradicted itself or the harness
+	// (reference-nondeterministic, repair-mismatch, start-failed,
+	// harness-missing-rss); those fail the run.
 	Status     string `json:"status"`
 	Failure    string `json:"failure,omitempty"`
 	Error      string `json:"error,omitempty"`
@@ -441,7 +444,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
-	r.probeBuffered(ctx)
+	if err := r.probeBuffered(ctx); err != nil {
+		return nil, err
+	}
 
 	for _, config := range options.Profile.Configs {
 		if err := ctx.Err(); err != nil {
@@ -554,16 +559,25 @@ func validateOptions(options *Options) error {
 // writing op, from its own --help. An op whose help lists no --buffered flag
 // gets no buffered row: running the durable command twice under a buffered
 // label would be a lie.
-func (r *runner) probeBuffered(ctx context.Context) {
+func (r *runner) probeBuffered(ctx context.Context) error {
 	if !contains(r.options.Durabilities, DurabilityBuffered) {
-		return
+		return nil
 	}
 	for _, op := range []string{OpCreate, OpRepair} {
 		if !contains(r.options.Ops, op) {
 			continue
 		}
 		result := Run(ctx, Command{Path: r.options.Candidate, Args: []string{"par3", op, "--help"}, Timeout: 30 * time.Second})
-		if strings.Contains(result.Stdout+result.Stderr, "--buffered") {
+		if result.Failure == "binary-quarantined" {
+			return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
+		}
+		if result.Failure != "" || result.ExitCode != 0 {
+			// A help screen that did not print says nothing about the flag;
+			// guessing "unsupported" would silently drop the buffered rows.
+			return fmt.Errorf("probing `%s par3 %s --help` for --buffered failed (%s, exit %d): %s",
+				r.options.Candidate, op, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
+		}
+		if helpListsFlag(result.Stdout+result.Stderr, "--buffered") {
 			r.results.BufferedArgs[op] = []string{"--buffered"}
 			continue
 		}
@@ -575,6 +589,29 @@ func (r *runner) probeBuffered(ctx context.Context) {
 		r.results.Notes = append(r.results.Notes, note)
 		r.logf("%s", note)
 	}
+	return nil
+}
+
+// helpListsFlag matches flag as a whole token of a help screen, so
+// "--buffered-io" or "--no-buffered" does not count as "--buffered".
+func helpListsFlag(help, flag string) bool {
+	for _, token := range strings.FieldsFunc(help, func(c rune) bool {
+		return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '[' || c == ']' || c == '=' || c == '|' || c == '<' || c == '(' || c == ')'
+	}) {
+		if token == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // runsOp reports whether variant has a row for op on this candidate.
@@ -760,10 +797,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 					record.Repeat = run - r.options.Warmups
 				}
 				record.Position = position
-				if record.Tool == ToolReference && record.Status != StatusOK && record.Failure != FailureMissingRSS {
-					// The reference did not finish: record it once and stop
-					// running this row. Nothing about it fails the run.
-					record.Status = StatusDNF
+				if settleRow(&record) {
 					r.finished[key] = true
 				}
 				r.record(record)
@@ -818,6 +852,9 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 	if err := ctx.Err(); err != nil {
 		return CarrierSet{}, "", err
 	}
+	if !IsDNFFailure(failure) {
+		return CarrierSet{}, "", fmt.Errorf("%s: the reference's canonical create failed (%s): %s %s", config.ID, failure, detail, lastLine(seed))
+	}
 	record := RunRecord{
 		Config: config.ID, Op: OpCreate, Variant: reference.Name, Tool: ToolReference, Canonical: true, Warmup: true,
 		Command: command.Describe(), Measurement: seed.Measurement, Status: StatusDNF, Failure: failure, Error: detail,
@@ -858,6 +895,35 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 	}
 	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: the reference did not finish the canonical create, so rarpar (durable, %d workers) wrote the carriers every verify and repair read; create identity verdicts are unavailable for this set", config.ID, workers))
 	return set, ToolCandidate, nil
+}
+
+// settleRow applies the row rules to one finished run and reports whether
+// its row is over. A reference that did not finish (IsDNFFailure) becomes
+// DNF: recorded once, the row stops, and nothing about it fails the run. A
+// rarpar run past its timeout stays failed and its row stops too, since every
+// remaining run would only time out again.
+func settleRow(record *RunRecord) bool {
+	if record.Status == StatusOK {
+		return false
+	}
+	if record.Tool == ToolReference && IsDNFFailure(record.Failure) {
+		record.Status = StatusDNF
+		return true
+	}
+	return record.Tool == ToolCandidate && record.Failure == "timeout"
+}
+
+// IsDNFFailure reports whether a reference failure class means "did not
+// finish": it timed out, was killed, exited non-zero, or left missing, short
+// or unreadable carriers. Every other class (start-failed,
+// reference-nondeterministic, repair-mismatch, harness-missing-rss) means the
+// reference or the harness misbehaved, and that fails the run.
+func IsDNFFailure(failure string) bool {
+	switch failure {
+	case "timeout", "signal", "no-carriers", "truncated-carriers", "unreadable-carriers":
+		return true
+	}
+	return strings.HasPrefix(failure, "exit-")
 }
 
 // referenceCreateProblem classifies a reference create that did not finish:
@@ -1088,14 +1154,6 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 	result := Run(ctx, command)
 	record.Measurement = result.Measurement
 	record.Status = StatusOK
-	if result.Failure == "" && result.MaxRSSBytes <= 0 {
-		// Peak RSS is a required field of every row. A process that ran to
-		// exit without one means the harness failed to measure it.
-		record.Status = StatusFailed
-		record.Failure = FailureMissingRSS
-		record.Error = "the process exited but the harness recorded no peak RSS (" + rssSource() + ")"
-		return record, nil
-	}
 	if result.Failure != "" {
 		record.Status = StatusFailed
 		record.Failure = result.Failure
@@ -1123,6 +1181,14 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		record.Failure = fmt.Sprintf("exit-%d", result.ExitCode)
 		record.StderrTail = result.Stderr
 		record.StderrLine = lastLine(result)
+		return record, nil
+	}
+	if result.MaxRSSBytes <= 0 {
+		// Peak RSS is a required field of every row. A process that ran to
+		// exit without one means the harness failed to measure it.
+		record.Status = StatusFailed
+		record.Failure = FailureMissingRSS
+		record.Error = "the process exited but the harness recorded no peak RSS (" + rssSource() + ")"
 		return record, nil
 	}
 	switch op {

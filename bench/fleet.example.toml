@@ -222,7 +222,8 @@ work = "/home/bench/p3"
 # Only meaningful once the candidate honours the variable.
 # kernel_variants = ["name:VAR=value"]
 # durability = ["durable", "buffered"]   # default; rarpar create/repair rows, durable first
-timeout_minutes = 20                     # per run; a reference run past it is DNF
+timeout_minutes = 20                     # per run, rarpar rows too; a reference run past it is DNF
+# reference_timeout_minutes = 60         # default 0: the reference uses timeout_minutes
 
 # ------------------------------------- machine: appliance NAS, askpass auth ----
 # A DSM-class appliance: password auth through an askpass helper, no perf, no

@@ -211,17 +211,27 @@ warmups = 1
 repeats = 5
 pin_cpus = "0-7"
 work = "/home/bench/p3"           # keep it short, see below
-timeout_minutes = 20              # per run; a reference over it is DNF
+timeout_minutes = 20              # per run, rarpar rows too; a reference over it is DNF
+# reference_timeout_minutes = 60  # default 0: the reference uses timeout_minutes
 # durability = ["durable"]        # default: durable and buffered rows
 ```
 
 - **Durability rows.** Every `rarpar` create and repair runs durable (the
   default) and buffered; the reference gets one row. `durability` narrows that
-  and must include `durable`. The plan's macro-par3 step lists the
-  durabilities, the per-run timeout and the rows per op.
-- **Reference failures** (non-zero exit, missing or short recovery files, or a
-  timeout) are recorded as DNF with the exit code and stderr line. The PAR3
-  section carries on and does not fail because of them.
+  and must include `durable`. Verify writes nothing, so it has no buffered
+  row and runs once per worker count. In the text plan, the macro-par3 step
+  lists the durabilities and the per-run timeout, and the machine's `par3`
+  block lists the variants and the rows each op produces; `--json` carries
+  the same rows under `par3.rows`.
+- **Timeouts.** `timeout_minutes` (default 20, lower than before) applies to
+  `rarpar` rows too; raise it on slow hosts. `reference_timeout_minutes`
+  gives the reference its own limit (0 = the same).
+- **Reference failures** that mean "did not finish" (timeout, signal, non-zero
+  exit, missing, short or unreadable recovery files) are recorded as DNF with
+  the exit code and stderr line, and the PAR3 section carries on. A reference
+  that would not start, did not reproduce its own canonical set, or repaired
+  wrongly fails the section; see
+  [benchmarking.md](benchmarking.md#timeouts-and-reference-dnf).
 
 - **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
   `par3 build-reference` against the shipped `toolchains.json`, so the
@@ -239,9 +249,9 @@ timeout_minutes = 20              # per run; a reference over it is DNF
   costs DNF rows. The run deletes the work directory afterwards.
 - **Defender.** A quarantined or blocked binary stops the PAR3 section as
   `binary-quarantined`. The harness reports it and does not work around it.
-  Defender misflags `engine_perf.exe` as `Trojan:Win64/AsyncRAT.C!MTB`; the
-  approved handling is a path-scoped exclusion on the bench work directory,
-  added by hand. No automation here touches Defender.
+  Defender misflags the `par3-rs` `engine_perf.exe` example as
+  `Trojan:Win64/AsyncRAT.C!MTB`. The fleet neither ships nor runs it; it only
+  matters for a manual `par3 run --engine-perf`. See the Windows section below.
 
 ```sh
 rarpar-bench fleet plan --config bench/fleet.toml --suite macro-par3
@@ -337,7 +347,12 @@ The generated PowerShell is pinned by golden files in
 transport is unchanged.
 
 **Defender.** Defender flags the `par3-rs` `engine_perf.exe` example as
-`Trojan:Win64/AsyncRAT.C!MTB`, a false positive. The operator-approved
-handling is a path-scoped Defender exclusion on the bench work directory,
-added by hand by the host owner. Nothing in the fleet tooling touches Defender
-settings, and nothing may; a quarantine still surfaces as `binary-quarantined`.
+`Trojan:Win64/AsyncRAT.C!MTB`, a false positive. The fleet neither ships nor
+runs `engine_perf.exe`; it is used only by a manual
+`rarpar-bench par3 run --engine-perf PATH` on the host. The operator-approved
+handling is a path-scoped Defender exclusion, added by hand by the host owner,
+on the bench work directory that holds `engine_perf.exe` (cargo's
+`target\release\examples` where it was built, or the directory it was copied
+into for `--engine-perf`), and no wider. Nothing in the fleet tooling touches
+Defender settings, and nothing may; a quarantine still surfaces as
+`binary-quarantined`.

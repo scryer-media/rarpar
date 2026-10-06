@@ -244,6 +244,12 @@ func TestConfigValidation(t *testing.T) {
 			want: "unknown suite",
 		},
 		{
+			name: "windows host-path oracle with a cmd metacharacter is refused",
+			old:  "path = \"C:\\\\bench\\\\oracles\\\\UnRAR.exe\"",
+			new:  "path = \"C:\\\\bench\\\\100%\\\\UnRAR.exe\"",
+			want: "oracles.rar.path must not contain a double quote",
+		},
+		{
 			name: "windows host with perf is refused",
 			old:  "perf = \"none\"                            # enforced: Windows has no perf collector",
 			new:  "perf = \"linux-perf\"",

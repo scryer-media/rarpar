@@ -22,6 +22,7 @@ var (
 const (
 	processQueryInformation = 0x0400
 	processSetInformation   = 0x0200
+	processVMRead           = 0x0010
 	// ERROR_VIRUS_INFECTED and ERROR_VIRUS_DELETED: Defender (or another AV
 	// filter) refused to start the image.
 	errorVirusInfected = syscall.Errno(225)
@@ -69,12 +70,19 @@ func attachProbe(cmd *exec.Cmd, pin string) probe {
 	if cmd.Process == nil {
 		return probe{}
 	}
-	handle, err := syscall.OpenProcess(processQueryInformation|processSetInformation, false, uint32(cmd.Process.Pid))
+	// K32GetProcessMemoryInfo needs QUERY_INFORMATION|VM_READ; the affinity
+	// call needs SET_INFORMATION, requested only when pinning.
+	access := uint32(processQueryInformation | processVMRead)
+	mask, pinning := affinityMask(pin)
+	if pinning {
+		access |= processSetInformation
+	}
+	handle, err := syscall.OpenProcess(access, false, uint32(cmd.Process.Pid))
 	if err != nil {
 		return probe{}
 	}
 	p := probe{handle: handle}
-	if mask, ok := affinityMask(pin); ok {
+	if pinning {
 		// The child is already running when the mask lands: process start-up
 		// takes a few milliseconds before any benchmark work, and Go exposes no
 		// suspended-start handle to close that window entirely.
@@ -106,6 +114,11 @@ func (p probe) finish(measurement *Measurement) {
 }
 
 func fillRusage(*Measurement, *os.ProcessState) {}
+
+// configureKill leaves the default kill of the direct child; WaitDelay (set by
+// Run) closes the pipes so a surviving grandchild cannot hold Wait open. The
+// tools measured here do not spawn children on Windows.
+func configureKill(*exec.Cmd) {}
 
 // affinityMask turns "0-7" (or "3") into a processor mask.
 func affinityMask(pin string) (uintptr, bool) {

@@ -274,9 +274,13 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		if oracle, ok := machine.Oracles["par3"]; ok && oracle.Recipe == RecipePAR3CmdlineHost {
 			steps = append(steps, "on host: build the par3cmdline reference from the toolchains.json pin (cmake, Release)")
 		}
-		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s, warmups=%d repeats=%d, %dm per-run timeout (reference failures are DNF), work %s",
+		timeout := fmt.Sprintf("%dm per-run timeout", machine.PAR3.TimeoutMinutes)
+		if machine.PAR3.ReferenceTimeoutMinutes > 0 {
+			timeout += fmt.Sprintf(" (reference %dm)", machine.PAR3.ReferenceTimeoutMinutes)
+		}
+		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s (verify runs once), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, strings.Join(par3Durabilities(machine), "+"), machine.PAR3.Warmups, machine.PAR3.Repeats,
-			machine.PAR3.TimeoutMinutes, PAR3Work(machine, layout)))
+			timeout, PAR3Work(machine, layout)))
 	}
 	switch machine.Capabilities.Perf {
 	case PerfLinux:
@@ -415,6 +419,11 @@ func WritePlanText(writer io.Writer, plan FleetPlan) {
 		if machine.PAR3 != nil {
 			fmt.Fprintf(writer, "  par3       %s\n", strings.Join(machine.PAR3.Configs, ","))
 			fmt.Fprintf(writer, "             variants=%s work=%s\n", strings.Join(machine.PAR3.Variants, ","), machine.PAR3.Work)
+			for _, op := range par3bench.KnownOps {
+				if rows, ok := machine.PAR3.Rows[op]; ok {
+					fmt.Fprintf(writer, "             %-14s %s\n", op+":", strings.Join(rows, ","))
+				}
+			}
 		}
 		fmt.Fprintf(writer, "  remote     %s\n", machine.Remote.Base)
 		if machine.Cloud != nil {

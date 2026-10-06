@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -740,6 +741,9 @@ func readJSONFile(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	// Windows PowerShell 5.1 writes UTF-8 with a BOM, which encoding/json
+	// rejects; host evidence may carry one.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	return json.Unmarshal(data, value)
 }
 

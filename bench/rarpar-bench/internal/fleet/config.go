@@ -191,6 +191,9 @@ type PAR3Plan struct {
 	// TimeoutMinutes bounds every timed process (default 20); a reference run
 	// past it is DNF.
 	TimeoutMinutes int `json:"timeout_minutes"`
+	// ReferenceTimeoutMinutes overrides TimeoutMinutes for the reference only;
+	// 0 means the same limit.
+	ReferenceTimeoutMinutes int `json:"reference_timeout_minutes,omitempty"`
 }
 
 type Connection struct {
@@ -524,18 +527,19 @@ func decodeMachine(item *section, settings Settings) Machine {
 
 	par3 := item.child("par3")
 	machine.PAR3 = PAR3Plan{
-		Profile:        par3.str("profile", "full"),
-		Sets:           par3.strings("sets", nil),
-		Ops:            par3.strings("ops", nil),
-		Workers:        par3.integers("workers", []int{1, 8}),
-		Warmups:        par3.integer("warmups", 1),
-		Repeats:        par3.integer("repeats", 5),
-		PinCPUs:        par3.str("pin_cpus", ""),
-		IOCount:        par3.boolean("iocount", false),
-		Work:           par3.str("work", ""),
-		KernelVariants: par3.strings("kernel_variants", nil),
-		Durability:     par3.strings("durability", nil),
-		TimeoutMinutes: par3.integer("timeout_minutes", 20),
+		Profile:                 par3.str("profile", "full"),
+		Sets:                    par3.strings("sets", nil),
+		Ops:                     par3.strings("ops", nil),
+		Workers:                 par3.integers("workers", []int{1, 8}),
+		Warmups:                 par3.integer("warmups", 1),
+		Repeats:                 par3.integer("repeats", 5),
+		PinCPUs:                 par3.str("pin_cpus", ""),
+		IOCount:                 par3.boolean("iocount", false),
+		Work:                    par3.str("work", ""),
+		KernelVariants:          par3.strings("kernel_variants", nil),
+		Durability:              par3.strings("durability", nil),
+		TimeoutMinutes:          par3.integer("timeout_minutes", 20),
+		ReferenceTimeoutMinutes: par3.integer("reference_timeout_minutes", 0),
 	}
 	par3.finish()
 
@@ -874,6 +878,8 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 		case OracleHostPath:
 			if oracle.Path == "" {
 				state.fail("%s: oracles.%s.path is required for policy %q", prefix, role, OracleHostPath)
+			} else {
+				validateHostPath(state, prefix, "oracles."+role+".path", oracle.Path, machine.isWindows())
 			}
 		case OracleOfficialBinary:
 			if oracle.URL == "" || oracle.SHA256 == "" {
@@ -949,6 +955,9 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	}
 	if plan.TimeoutMinutes < 1 {
 		state.fail("%s: par3.timeout_minutes must be positive", prefix)
+	}
+	if plan.ReferenceTimeoutMinutes < 0 {
+		state.fail("%s: par3.reference_timeout_minutes must not be negative (0 = timeout_minutes)", prefix)
 	}
 	for _, variant := range plan.KernelVariants {
 		if _, err := par3bench.ParseKernelVariant(variant); err != nil {

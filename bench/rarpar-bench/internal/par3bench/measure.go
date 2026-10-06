@@ -71,6 +71,10 @@ type Result struct {
 
 const outputTail = 4096
 
+// killWaitDelay bounds how long Wait lingers for the output pipes after the
+// child exits or is killed.
+const killWaitDelay = 5 * time.Second
+
 func tail(buffer *bytes.Buffer) string {
 	data := buffer.Bytes()
 	if len(data) > outputTail {
@@ -90,6 +94,11 @@ func Run(ctx context.Context, command Command) Result {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Dir = command.Dir
 	cmd.Env = append(os.Environ(), command.Env...)
+	// A timeout must end the whole tree, not only the direct child: the
+	// platform hook kills the process group (POSIX) and WaitDelay closes the
+	// pipes so a surviving grandchild cannot hold Wait open.
+	configureKill(cmd)
+	cmd.WaitDelay = killWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -125,6 +134,11 @@ func Run(ctx context.Context, command Command) Result {
 		result.Failure = "timeout"
 		result.Err = ctx.Err()
 		return result
+	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		// The process itself exited; only an orphaned descendant still held
+		// the output pipes, which WaitDelay then closed.
+		waitErr = nil
 	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError

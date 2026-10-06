@@ -395,6 +395,9 @@ func par3Args(machine Machine) []string {
 	args := []string{"--profile", plan.Profile, "--workers", strings.Join(workers, ","),
 		"--warmups", fmt.Sprint(plan.Warmups), "--repeats", fmt.Sprint(plan.Repeats),
 		"--timeout", fmt.Sprintf("%dm", plan.TimeoutMinutes)}
+	if plan.ReferenceTimeoutMinutes > 0 {
+		args = append(args, "--reference-timeout", fmt.Sprintf("%dm", plan.ReferenceTimeoutMinutes))
+	}
 	if len(plan.Ops) > 0 {
 		args = append(args, "--ops", strings.Join(plan.Ops, ","))
 	}

@@ -179,7 +179,7 @@ func RenderReport(results *Results) string {
 	}
 	fmt.Fprintln(&b)
 	if results.TimeoutSeconds > 0 {
-		fmt.Fprintf(&b, "- Per-run timeout %s (reference %s); a reference run that exits non-zero, times out, or writes no or truncated carriers is **DNF** and the rest of the matrix still runs\n",
+		fmt.Fprintf(&b, "- Per-run timeout %s (reference %s); a reference run that exits non-zero, is killed, times out, or writes missing, unreadable or truncated carriers is **DNF** and the rest of the matrix still runs\n",
 			formatTimeout(results.TimeoutSeconds), formatTimeout(results.ReferenceTimeoutSeconds))
 	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
@@ -257,7 +257,12 @@ func RenderReport(results *Results) string {
 		case row.DNF != "":
 			line += " DNF | - | - | - | - | - |"
 		case row.Tool == ToolReference:
-			line += fmt.Sprintf(" %s | %s | %s | 1.000 | 1.000 | 1.000 |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
+			self := "1.000"
+			if row.Wall.N == 0 {
+				// Every reference run failed: there is nothing to be 1.000 of.
+				self = "-"
+			}
+			line += fmt.Sprintf(" %s | %s | %s | %s | %s | %s |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS), self, self, self)
 		case reference.DNF != "":
 			line += fmt.Sprintf(" %s | %s | %s | - | - | - |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
 		default:

@@ -142,6 +142,67 @@ func TestWindowsPathsRefuseCmdMetacharacters(t *testing.T) {
 	if len(state.errors) != 0 {
 		t.Fatalf("a single quote is escaped, not refused: %v", state.errors)
 	}
+
+	// ...and it is escaped everywhere it lands: the run script and every
+	// control script quote it as O''Brien and never leave it bare.
+	config, machine := windowsExample(t)
+	machine.Name = "win-$(evil)'x"
+	machine.PlatformLabel = "label'$env:X"
+	machine.Paths.Staging = `C:\bench\O'Brien`
+	machine.Paths.Scratch = `C:\bench\O'Brien\work`
+	machine.Paths.Corpus = `C:\bench\O'Brien\corpus`
+	machine.PAR3.Work = `C:\p3\O'Brien`
+	layout := windowsLayout(machine, "fleet-testrun")
+	oracle := `C:\bench\O'Brien\oracles\par3.exe`
+	scripts := map[string]string{
+		"run":     WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"rar": oracle, "par2": oracle, "par3": oracle}),
+		"mkdir":   psMkdirScript(layout.Bin),
+		"exists":  psExistsScript(layout.Done),
+		"read":    psReadOptionalScript(layout.Done, readMissingMarker),
+		"expand":  psExpandArchiveScript(layout.Bin+`\fleet-upload.zip`, layout.Bin),
+		"cleanup": psRemoveAllScript(layout.Base, layout.Scratch),
+		"oracle":  psOracleCheckScript(oracle),
+		"start":   psStartDetachedScript(layout.Script, layout.Log, layout.Base),
+	}
+	for name, script := range scripts {
+		if !strings.Contains(script, "O''Brien") {
+			t.Fatalf("%s script does not carry the quoted path:\n%s", name, script)
+		}
+		if strings.Contains(strings.ReplaceAll(script, "O''Brien", ""), "O'Brien") {
+			t.Fatalf("%s script leaves a single quote unescaped:\n%s", name, script)
+		}
+	}
+	run := scripts["run"]
+	if !strings.Contains(run, `$MachineName = 'win-$(evil)''x'`) || !strings.Contains(run, `$Machine = 'label''$env:X'`) {
+		t.Fatalf("machine name and label must be single-quoted literals:\n%s", run)
+	}
+	if strings.Contains(run, `"machine=`) {
+		t.Fatal("the machine name must not sit inside an expandable double-quoted string")
+	}
+	for _, line := range strings.Split(run, "\r\n") {
+		for _, cmdlet := range []string{"Remove-Item ", "Get-ChildItem ", "Copy-Item ", "Move-Item ", "Get-FileHash ", "Test-Path ", "Get-Item ", "Out-File "} {
+			index := strings.Index(line, cmdlet)
+			if index >= 0 && !strings.HasPrefix(line[index+len(cmdlet):], "-LiteralPath") && !strings.HasPrefix(line[index+len(cmdlet):], "-Algorithm SHA256 -LiteralPath") {
+				t.Fatalf("%s must take -LiteralPath: %s", strings.TrimSpace(cmdlet), line)
+			}
+		}
+	}
+}
+
+// Windows PowerShell 5.1 writes UTF-8 with a BOM; the collected manifest must
+// still parse.
+func TestReadJSONFileStripsAUTF8BOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "MANIFEST.json")
+	if err := os.WriteFile(path, append([]byte{0xEF, 0xBB, 0xBF}, `{"run_id":"r1","status":"ok"}`...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &HostManifest{}
+	if err := readJSONFile(path, manifest); err != nil {
+		t.Fatalf("a BOM-prefixed manifest must parse: %v", err)
+	}
+	if manifest.RunID != "r1" || manifest.Status != "ok" {
+		t.Fatalf("manifest = %+v", manifest)
+	}
 }
 
 func TestExtractZipNormalisesAndContains(t *testing.T) {

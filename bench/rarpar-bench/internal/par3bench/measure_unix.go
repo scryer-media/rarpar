@@ -52,6 +52,22 @@ func fillRusage(measurement *Measurement, state *os.ProcessState) {
 
 func isQuarantineError(error) bool { return false }
 
+// configureKill puts the child in its own process group and makes the context
+// cancel kill that whole group, so a timed-out run takes its descendants with
+// it.
+func configureKill(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+}
+
 func rssSource() string {
 	if runtime.GOOS == "darwin" {
 		return "rusage ru_maxrss, bytes"
