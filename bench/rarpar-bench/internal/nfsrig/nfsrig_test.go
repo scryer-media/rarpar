@@ -95,6 +95,22 @@ func TestClientConfigSwitches(t *testing.T) {
 	}
 }
 
+func TestClientConfigExt4Size(t *testing.T) {
+	config, err := ClientConfigFromEnv(env(map[string]string{"RIG_EXT4": "8G"}))
+	if err != nil || config.Ext4 != "8G" {
+		t.Fatalf("config = %+v, err = %v", config, err)
+	}
+	for _, bad := range []string{"G", "8GB", "-8G", "8 G", "eight"} {
+		if _, err := ClientConfigFromEnv(env(map[string]string{"RIG_EXT4": bad})); err == nil {
+			t.Errorf("accepted RIG_EXT4=%q", bad)
+		}
+	}
+	args := strings.Join(Ext4TargetArgs(), " ")
+	if !strings.Contains(args, "local-ext4="+LocalExt4) || !strings.Contains(args, "backing_fs=ext4") {
+		t.Errorf("ext4 target args = %s", args)
+	}
+}
+
 func TestTargetArgsPutLocalFirstAndRecordTheServer(t *testing.T) {
 	markers := map[string]ServerMarker{}
 	for _, export := range Exports() {

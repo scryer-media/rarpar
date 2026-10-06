@@ -410,7 +410,7 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"file_in_place\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
@@ -418,6 +418,7 @@ fn main() -> Result<()> {
         options.diagnostics.file_opens(),
         sync.completed,
         options.diagnostics.file_clones(),
+        options.diagnostics.file_in_place_repairs(),
         SNAPSHOTS.load(Ordering::Relaxed),
         options.scan_work.used(),
         options.memory.limit(),

@@ -22,7 +22,7 @@ CMD ["nfs", "server"]
 # test from the read-only source mount, and CMake for the reference.
 FROM rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS client
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nfs-common netbase kmod cmake make g++ clang pkg-config perl patch strace iproute2 procps ca-certificates \
+ && apt-get install -y --no-install-recommends nfs-common netbase kmod cmake make g++ clang pkg-config perl patch strace iproute2 procps e2fsprogs ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=harness /out/rarpar-bench /usr/local/bin/rarpar-bench
 ENTRYPOINT ["rarpar-bench"]
