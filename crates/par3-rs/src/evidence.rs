@@ -189,6 +189,17 @@ impl FileEvidence {
                 .all(|state| matches!(state, ExtentVerdict::Intact | ExtentVerdict::Unprotected))
     }
 
+    /// Every protected extent matches its own fingerprint at the right length,
+    /// yet the whole-file fingerprint does not: metadata that contradicts itself.
+    pub(crate) fn contradicts_itself(&self) -> bool {
+        self.whole_matches == Some(false)
+            && self.snapshot.len == self.expected_len
+            && self
+                .verdicts
+                .iter()
+                .all(|state| matches!(state, ExtentVerdict::Intact | ExtentVerdict::Unprotected))
+    }
+
     /// Largest verified prefix, stopping at unknown, damaged or unprotected data.
     pub fn verified_prefix(&self, layout: &BlockLayout) -> EngineResult<u64> {
         self.check_layout(layout)?;

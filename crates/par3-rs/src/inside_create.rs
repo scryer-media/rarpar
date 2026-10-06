@@ -266,12 +266,24 @@ impl InsertionPlan {
                 crate::session_repair::clone_stage_path(destination, &*original.0)?
         {
             let temporary = staging.insert(temporary);
-            let mut output = OpenOptions::new()
+            match OpenOptions::new()
                 .write(true)
-                .open_budgeted(temporary, options)?;
-            io::Seek::seek(&mut output, io::SeekFrom::Start(self.layout.snapshot().len))?;
-            options.diagnostics.note_clone();
-            return Ok((output, true));
+                .open_budgeted(temporary, options)
+            {
+                Ok(mut output) => {
+                    io::Seek::seek(&mut output, io::SeekFrom::Start(self.layout.snapshot().len))?;
+                    options.diagnostics.note_clone();
+                    return Ok((output, true));
+                }
+                // A clone that kept something denying its owner writes is
+                // removed, and the output is staged by copying.
+                Err(EngineError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    tracing::debug!(%error, "PAR3 staging copies an unwritable clone");
+                    std::fs::remove_file(&*temporary)?;
+                    *staging = None;
+                }
+                Err(error) => return Err(error),
+            }
         }
         let temporary = staging.insert(crate::session_repair::stage_path(destination, options)?);
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -638,6 +650,84 @@ mod tests {
                 0
             );
         }
+    }
+
+    /// REVIEW: a Finder-locked (`uchg`) source archive is only read by
+    /// insertion. The copy path inserts into it; a clone inherits the flag,
+    /// so the staged output can be neither written nor removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn review_a_locked_source_archive_still_inserts_and_leaves_no_temporary() {
+        let (fixture, name, block_size) = CASES[0];
+        let original = advanced_fixture(fixture);
+        let expected = assembled(&original, name, block_size);
+        let tree = TempTree::new("inside-locked");
+        let options = options(block_size);
+        let chflags = |flag: &str, path: &Path| {
+            assert!(
+                std::process::Command::new("chflags")
+                    .arg(flag)
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let mut access = DiskSourceAccess::with_options(options.execution.clone());
+        let source = tree.write(&format!("source/{name}"), &original);
+        // Locked before planning: the flag change is a metadata change.
+        chflags("uchg", &source);
+        access.insert(SourceId(7), source.clone());
+        let plan = plan(Arc::new(access), name, options);
+        tree.mkdir("scratch");
+        tree.mkdir("output");
+        let output = tree.path().join("output").join(name);
+        let result = plan.execute(&output, &tree.path().join("scratch"));
+        let left: Vec<_> = std::fs::read_dir(tree.path().join("output"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        // Unlock everything so the temporary tree can be removed.
+        chflags("nouchg", &source);
+        for path in &left {
+            chflags("nouchg", path);
+        }
+        assert!(result.is_ok(), "{result:?}, left behind: {left:?}");
+        assert_eq!(left, vec![output.clone()], "a temporary was left behind");
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+    }
+
+    /// A source archive whose ACL denies its owner writes is only read by
+    /// insertion. Whether or not the clone carries that ACL, the output is
+    /// staged, written and installed, and no temporary is left.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_source_archive_denying_writes_by_acl_still_inserts() {
+        let (fixture, name, block_size) = CASES[0];
+        let original = advanced_fixture(fixture);
+        let expected = assembled(&original, name, block_size);
+        let tree = TempTree::new("inside-acl");
+        let options = options(block_size);
+        let mut access = DiskSourceAccess::with_options(options.execution.clone());
+        let source = tree.write(&format!("source/{name}"), &original);
+        crate::test_reference::deny_owner_writes(&source, true);
+        access.insert(SourceId(7), source.clone());
+        let plan = plan(Arc::new(access), name, options);
+        tree.mkdir("scratch");
+        tree.mkdir("output");
+        let output = tree.path().join("output").join(name);
+        let result = plan.execute(&output, &tree.path().join("scratch"));
+        let left: Vec<_> = std::fs::read_dir(tree.path().join("output"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        crate::test_reference::deny_owner_writes(&source, false);
+        for path in &left {
+            crate::test_reference::deny_owner_writes(path, false);
+        }
+        assert!(result.is_ok(), "{result:?}, left behind: {left:?}");
+        assert_eq!(left, vec![output.clone()], "a temporary was left behind");
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
     }
 
     /// A source that keeps its generation while its bytes change: the copy

@@ -560,17 +560,24 @@ impl SourceAccess for DiskSourceAccess {
     }
 
     /// The cached read handle when there is one, so the file is not opened
-    /// again; otherwise a fresh read-only handle.
+    /// again; otherwise a fresh read-only handle, cached as a positioned read
+    /// would cache it, so the reads that follow do not open the file again.
     fn open_file(&self, source: SourceId) -> io::Result<Option<SourceFile>> {
         let path = self.path(source)?;
-        if self.cached_handles() != 0 {
-            self.options.validate().map_err(EngineError::into_io)?;
-            if let Ok(file) = self.handles.lookup(source) {
-                return Ok(Some(SourceFile(file)));
-            }
+        let capacity = self.cached_handles();
+        if capacity == 0 {
+            let file = File::open(path, &self.options).map_err(EngineError::into_io)?;
+            return Ok(Some(SourceFile(Arc::new(file))));
         }
-        let file = File::open(path, &self.options).map_err(EngineError::into_io)?;
-        Ok(Some(SourceFile(Arc::new(file))))
+        self.options.validate().map_err(EngineError::into_io)?;
+        let epoch = match self.handles.lookup(source) {
+            Ok(file) => return Ok(Some(SourceFile(file))),
+            Err(epoch) => epoch,
+        };
+        let file = Arc::new(File::open(path, &self.options).map_err(EngineError::into_io)?);
+        self.handles
+            .offer(source, epoch, &file, capacity, &self.options.handles);
+        Ok(Some(SourceFile(file)))
     }
 }
 

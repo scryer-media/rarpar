@@ -33,7 +33,9 @@ pub struct InstalledFile {
 /// in [`EngineError::RepairInterrupted`].
 #[derive(Clone, Debug, Default)]
 pub struct SessionRepairReport {
-    /// Independently verified, installed files.
+    /// Installed files, each proven against the authenticated layout from the
+    /// bytes the repair wrote (and, for a staged clone, its source's snapshot),
+    /// or read back where that proof did not apply.
     pub installed: Vec<InstalledFile>,
     /// Logical lost blocks reconstructed once, regardless of aliases.
     pub reconstructed_blocks: u64,
@@ -94,14 +96,15 @@ fn held(
         )
 }
 
-/// The evidence output `index` may be staged from by cloning the file at its
-/// destination, on the targets that clone. It must be this file's evidence for
-/// this layout and hold at least one extent the clone would spare writing, and
-/// the file must have no unprotected range: a fresh stage leaves those zero,
-/// where a clone would keep whatever the original had there.
+/// The evidence output `index` may be staged from by cloning the source that
+/// evidence verified, on the targets that clone. It must be this file's
+/// evidence for this layout and hold at least one extent the clone would spare
+/// writing, and the file must have no unprotected range: a fresh stage leaves
+/// those zero, where a clone would keep whatever the original had there.
 ///
-/// Whether the destination is the file this evidence verified is settled by
-/// [`RepairTree::create_stage_from`] from the destination's own handle.
+/// Whether the source's registry hands over the very file this evidence
+/// verified is settled by [`RepairTree::create_stage_from`] from that
+/// registry's own handle.
 fn clone_source<'a>(
     session: &'a Par3RepairSession,
     layout: &BlockLayout,
@@ -274,7 +277,7 @@ fn repair_inner(
         let mut staged = Vec::with_capacity(destinations.len());
         for (index, destination) in destinations {
             session.options.cancel.check()?;
-            // An output whose destination still holds the file its evidence
+            // An output whose registry hands over the local file its evidence
             // verified is staged as a clone of that file where the filesystem
             // allows, and the repair writes only what the clone lacks.
             let source = clone_source(session, layout, index);
@@ -283,7 +286,13 @@ fn repair_inner(
                 layout.files[index].len,
                 &session.options,
                 temporary_outputs,
-                source.map(|evidence| (&destination, evidence.snapshot)),
+                source.map(|evidence| {
+                    (
+                        session.access.as_ref() as &dyn SourceAccess,
+                        evidence.source,
+                        evidence.snapshot,
+                    )
+                }),
             )?;
             let cloned = match source {
                 Some(evidence) if cloned => {
@@ -307,6 +316,16 @@ fn repair_inner(
             });
         }
         let proof = StagedProof::new(layout, &staged, &session.options);
+        // A whole-file fingerprint the proof cannot check already disagrees
+        // with intact extents: only the read-back can refuse that output.
+        for (slot, target) in staged.iter().enumerate() {
+            let path = &layout.files[target.index].path;
+            if session.evidence.get(path).is_some_and(|evidence| {
+                evidence.file == target.index && evidence.contradicts_itself()
+            }) {
+                proof.doubt(slot);
+            }
+        }
         if assessment.lost_blocks.is_empty() {
             copy_available(session, layout, Some(&tree), &staged, &proof)?;
         } else if let Some(PacketBody::FftMatrix(matrix)) =
@@ -1106,7 +1125,9 @@ fn open_staged(
 /// briefly hold bytes from a source that has since changed, but such a file
 /// only ever ends in [`EngineError::SourceChanged`] with nothing installed.
 ///
-/// Every successful write is also recorded in the [`StagedProof`].
+/// Every successful write is also recorded in the [`StagedProof`]. The inline
+/// tails [`finish_staged`] writes bypass these writers and record themselves
+/// there directly.
 struct StageWriters<'a> {
     tree: Option<&'a RepairTree>,
     options: &'a ExecutionOptions,
@@ -1333,11 +1354,14 @@ fn verify_staged(
 /// file built from wrong bytes is refused exactly as before.
 ///
 /// A staged clone is the other way an extent is proven. Such an output was
-/// staged as a clone of the file at its destination, taken from a handle whose
-/// metadata matched the snapshot of the source its evidence verified, and that
-/// source was checked against the same snapshot right after the clone and is
-/// checked again before installation. A Unix snapshot is the file's identity
-/// and change time, so the clone holds the bytes the evidence verified. Every
+/// staged as a clone of the local file its source's registry handed over,
+/// taken from that handle once its metadata matched the snapshot of the source
+/// the evidence verified, and that source was checked against the same
+/// snapshot right after the clone and is checked again before installation. A
+/// Unix snapshot is the file's identity and change time, so, provided the
+/// change time moves with every write, which [`crate::source::SourceSnapshot`]
+/// already assumes, the clone holds the bytes the evidence verified. Nothing
+/// re-reads a cloned extent: it is proven by that metadata alone. Every
 /// extent that evidence holds intact against the extent's own fingerprint is
 /// therefore proven without being written, sits inside both the source and
 /// the final length, so the resize to that length leaves it alone, and is never
@@ -1345,12 +1369,15 @@ fn verify_staged(
 /// the source's end, inline, or without its own fingerprint — is written and
 /// proven as above, or the output reads back.
 ///
-/// The one difference is metadata that contradicts itself: per-extent
-/// fingerprints every proven byte matches, under a whole-file fingerprint those
-/// same bytes do not. The read-back refused such a set; the proof installs the
-/// bytes every extent's fingerprint vouches for, the rule
+/// The proof never checks the whole-file fingerprint, so metadata that
+/// contradicts itself — per-extent fingerprints every byte matches, under a
+/// whole-file fingerprint those same bytes do not — is routed to the read-back
+/// whenever the evidence already shows it, and the read-back refuses it as
+/// before. Where damage hid the contradiction from the evidence, the proof
+/// installs the bytes every extent's fingerprint vouches for, the rule
 /// [`crate::evidence::StreamingVerifier`] already applies to a file whose bytes
-/// it saw out of order.
+/// it saw out of order; the next repair of that file then fails instead of
+/// installing it again.
 fn finish_staged(
     session: &Par3RepairSession,
     layout: &BlockLayout,
@@ -1491,13 +1518,19 @@ impl<'a> StagedProof<'a> {
         }
         let extents = &self.layout.files[output.index].extents;
         if !output.prove(extents, extent, relative, bytes, reservation) {
-            // Nothing more is learnt from this output; its frontiers go.
-            if let Some(reservation) = reservation.as_mut() {
-                let held = output.partial.len() * PARTIAL_PROOF_BYTES;
-                reservation.shrink_to(reservation.bytes() - held);
-            }
-            output.doubt = true;
-            output.partial = HashMap::new();
+            output.give_up(reservation);
+        }
+    }
+
+    /// Read the output in `slot` back whatever its writes prove.
+    fn doubt(&self, slot: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        if let Some(output) = outputs.get_mut(slot) {
+            output.give_up(reservation);
         }
     }
 
@@ -1512,6 +1545,17 @@ impl<'a> StagedProof<'a> {
 }
 
 impl OutputProof {
+    /// Nothing more is learnt from this output: it reads back, and its
+    /// frontiers go.
+    fn give_up(&mut self, reservation: &mut Option<crate::runtime::Reservation>) {
+        if let Some(reservation) = reservation.as_mut() {
+            let held = self.partial.len() * PARTIAL_PROOF_BYTES;
+            reservation.shrink_to(reservation.bytes() - held);
+        }
+        self.doubt = true;
+        self.partial = HashMap::new();
+    }
+
     /// Fold one write into the proof, or say it cannot be proven.
     fn prove(
         &mut self,
@@ -2529,5 +2573,237 @@ mod clone_tests {
         } else {
             assert_eq!(written, len);
         }
+    }
+
+    /// A disk registry that serves its files but hands over none of them.
+    struct NoFile(DiskSourceAccess);
+
+    impl SourceAccess for NoFile {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            self.0.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.0.next_available(source, offset)
+        }
+        fn open_sequential(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+            self.0.open_sequential(source)
+        }
+    }
+
+    /// Repair a damaged `input.bin` in place through a registry that hands
+    /// over its file or not: (files opened by the repair, clones).
+    fn repair_opens(hand_over: bool, refuse: bool) -> (u64, u64) {
+        let block = 64u64 << 10;
+        let tree = TempTree::new("clone-opens");
+        let set = cauchy_block_set(16, block, 2, b"PAR3 clone opens", &tree);
+        let mut damaged = set.contents[0].1.clone();
+        damaged[5 * block as usize + 9] ^= 0x40;
+        let inputs = TempTree::new("clone-opens-inputs");
+        let options = ExecutionOptions {
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let mut disk = DiskSourceAccess::with_options(options.clone());
+        disk.insert(SourceId(1), inputs.write("input.bin", &damaged));
+        let access: Arc<dyn SourceAccess> = if hand_over {
+            Arc::new(disk)
+        } else {
+            Arc::new(NoFile(disk))
+        };
+        let mut session = Par3RepairSession::new(set.id, access, options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let opens = options.diagnostics.file_opens();
+        REFUSE_CLONES.with(|refused| refused.set(refuse));
+        let report = session.repair(inputs.path(), false);
+        REFUSE_CLONES.with(|refused| refused.set(false));
+        assert_eq!(report.unwrap().installed.len(), 1);
+        assert_eq!(
+            &std::fs::read(inputs.path().join("input.bin")).unwrap(),
+            &set.contents[0].1
+        );
+        (
+            options.diagnostics.file_opens() - opens,
+            options.diagnostics.file_clones(),
+        )
+    }
+
+    /// A clone is tried from the registry's cached handle, so one the
+    /// filesystem refuses costs no open: such a repair opens exactly what one
+    /// that never tries a clone does.
+    #[test]
+    fn a_refused_clone_opens_no_more_files_than_the_copy_it_falls_back_to() {
+        let refused = repair_opens(true, true);
+        let never_tried = repair_opens(false, false);
+        assert_eq!(refused, never_tried);
+        assert_eq!(refused.1, 0);
+    }
+
+    /// A reflink filesystem can refuse one file with `EINVAL` (an inline
+    /// extent, say) and clone the next, so that refusal does not turn clones
+    /// off for the rest of the repair.
+    #[test]
+    fn a_file_refused_with_einval_leaves_clones_on_for_the_next_output() {
+        use crate::repair_tree::REFUSE_NEXT_CLONE;
+        use crate::test_reference::many_block_set;
+        let tree = TempTree::new("clone-einval");
+        let set = many_block_set(2, 16, 0, 4, b"PAR3 einval clone", &tree);
+        let inputs = TempTree::new("clone-einval-inputs");
+        let options = ExecutionOptions {
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        for (index, (name, bytes)) in set.contents.iter().enumerate() {
+            let mut damaged = bytes.clone();
+            damaged[70] ^= 0x80;
+            access.insert(SourceId(index as u64 + 1), inputs.write(name, &damaged));
+        }
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        for (index, (name, _)) in set.contents.iter().enumerate() {
+            session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+        }
+        for path in &set.paths {
+            for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        REFUSE_NEXT_CLONE.with(|refused| refused.set(Some(libc::EINVAL)));
+        let report = session.repair(inputs.path(), false);
+        REFUSE_NEXT_CLONE.with(|refused| refused.set(None));
+        assert_eq!(report.unwrap().installed.len(), 2);
+        for (name, bytes) in &set.contents {
+            assert_eq!(&std::fs::read(inputs.path().join(name)).unwrap(), bytes);
+        }
+        let clones = options.diagnostics.file_clones();
+        if cfg!(target_os = "macos") || clones != 0 {
+            assert_eq!(clones, 1, "the second output was not cloned");
+        }
+    }
+
+    /// A source whose ACL denies its owner writes is repaired in place, from
+    /// a clone or a copy, and leaves no temporary behind.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_source_denying_writes_by_acl_is_still_repaired_in_place() {
+        let block = 64u64 << 10;
+        let tree = TempTree::new("clone-acl");
+        let set = cauchy_block_set(16, block, 2, b"PAR3 acl clone", &tree);
+        let bytes = &set.contents[0].1;
+        let mut damaged = bytes.clone();
+        damaged[5 * block as usize + 9] ^= 0x40;
+        let inputs = TempTree::new("clone-acl-inputs");
+        let source = inputs.write("input.bin", &damaged);
+        crate::test_reference::deny_owner_writes(&source, true);
+        let options = ExecutionOptions {
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), source.clone());
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let report = session.repair(inputs.path(), false);
+        let left: Vec<_> = std::fs::read_dir(inputs.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for path in &left {
+            crate::test_reference::deny_owner_writes(path, false);
+        }
+        assert_eq!(report.unwrap().installed.len(), 1);
+        assert_eq!(left, vec![source.clone()], "a temporary was left behind");
+        assert_eq!(&std::fs::read(&source).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+mod contradiction_tests {
+    //! Metadata that contradicts itself is refused by the read-back.
+    use super::*;
+    use crate::repair_tree::REFUSE_CLONES;
+    use crate::source::{DiskSourceAccess, SourceId};
+    use crate::test_reference::{TempTree, cauchy_block_set, scanned_packets};
+
+    /// An output whose evidence says every protected extent is intact while
+    /// the whole-file fingerprint is not (made so here in memory, after an
+    /// honest verification of a regenerated set, since no packet may be
+    /// edited) is read back before installation instead of being proven from
+    /// its writes. A real contradiction then fails that read-back, so repair
+    /// errors instead of installing the file and reporting it ready again.
+    #[test]
+    fn an_output_whose_evidence_contradicts_itself_is_read_back() {
+        let block = 64u64 << 10;
+        let tree = TempTree::new("contradiction");
+        let set = cauchy_block_set(16, block, 2, b"PAR3 contradiction", &tree);
+        let bytes = &set.contents[0].1;
+        let len = bytes.len() as u64;
+        let inputs = TempTree::new("contradiction-inputs");
+        let output = TempTree::new("contradiction-output");
+        let options = ExecutionOptions {
+            workers: 1,
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), inputs.write("input.bin", bytes));
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Complete);
+        let evidence = session.evidence.get_mut("input.bin").unwrap();
+        assert_eq!(evidence.whole_matches, Some(true));
+        evidence.whole_matches = Some(false);
+        assert!(evidence.contradicts_itself());
+        session.assessment = None;
+        let assessment = session.assess().unwrap();
+        assert_eq!(assessment.status, RepairStatus::Ready);
+        assert!(assessment.lost_blocks.is_empty());
+        let before = options.diagnostics.file_io().read_bytes;
+        REFUSE_CLONES.with(|refused| refused.set(true));
+        let report = session.repair(output.path(), false);
+        REFUSE_CLONES.with(|refused| refused.set(false));
+        assert_eq!(report.unwrap().installed.len(), 1);
+        assert_eq!(
+            &std::fs::read(output.path().join("input.bin")).unwrap(),
+            bytes
+        );
+        // The copy reads the source once; the read-back reads the output.
+        assert_eq!(
+            options.diagnostics.file_io().read_bytes - before,
+            2 * len,
+            "the output was not read back"
+        );
     }
 }

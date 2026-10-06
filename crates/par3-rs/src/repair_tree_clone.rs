@@ -21,25 +21,29 @@ pub(crate) fn unsupported(error: &io::Error) -> bool {
 }
 
 /// Whether a refused clone says the staging filesystem has no clones at all,
-/// so no later output of the same repair asks again.
+/// so no later output of the same repair asks again. `EINVAL` is not one: a
+/// reflink filesystem can refuse a single file (an inline extent, say) and
+/// still clone the next.
 pub(super) fn never(error: &io::Error) -> bool {
     error.raw_os_error().is_some_and(|code| {
-        code == libc::EOPNOTSUPP
-            || code == libc::ENOTSUP
-            || code == libc::EINVAL
-            || code == libc::ENOTTY
+        code == libc::EOPNOTSUPP || code == libc::ENOTSUP || code == libc::ENOTTY
     })
 }
 
 /// Whether the open file with `metadata` is the regular file `source`
 /// snapshots, so that a clone of it holds the bytes that snapshot describes.
-/// A macOS clone also keeps the original's mode, and the staged file must be
-/// writable.
+/// A macOS clone also keeps the original's mode and file flags, and the staged
+/// file must be writable and removable.
 pub(crate) fn is_source(metadata: &std::fs::Metadata, source: SourceSnapshot) -> bool {
     #[cfg(target_os = "macos")]
     let writable = {
+        use std::os::macos::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o200 != 0
+        // An immutable or append-only clone could be neither written nor
+        // removed.
+        const LOCKED: u32 =
+            libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+        metadata.permissions().mode() & 0o200 != 0 && metadata.st_flags() & LOCKED == 0
     };
     #[cfg(target_os = "linux")]
     let writable = true;

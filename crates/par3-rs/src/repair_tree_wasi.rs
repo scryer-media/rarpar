@@ -13,6 +13,12 @@ use crate::session_repair::RepairDurability;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// WASI has no clones; the hook exists so the shared copy-path tests build.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) struct Destination {
     pub(crate) relative: PathBuf,
     pub(crate) display: PathBuf,
@@ -135,7 +141,11 @@ impl RepairTree {
         len: u64,
         options: &ExecutionOptions,
         outputs: &mut Vec<PathBuf>,
-        _clone_from: Option<(&Destination, crate::source::SourceSnapshot)>,
+        _clone_from: Option<(
+            &dyn crate::source::SourceAccess,
+            crate::source::SourceId,
+            crate::source::SourceSnapshot,
+        )>,
     ) -> EngineResult<(OsString, PathBuf, bool)> {
         let (name, display) = self.create_stage_registered(index, len, options, outputs)?;
         Ok((name, display, false))

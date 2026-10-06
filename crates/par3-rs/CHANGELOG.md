@@ -22,12 +22,12 @@
   pair, including directories with different case-folding behavior.
 - Native directory capabilities now count against the shared open-handle budget.
   Ordinary repair preflight requires at least five handles; a cross-filesystem
-  install can require a sixth for its destination-local verified copy.
+  install can require a sixth for its destination-local copy.
 - Failed staging-file sizing removes the file or retains its cleanup path if
   removal fails. Native interruption checks the staging identity and cleans
   through its held capability instead of returning a replaced ambient path.
-- Cross-filesystem native installs use a private destination-local copy, verify
-  its bytes, and rename it atomically. Failed installation rolls back its backup.
+- Cross-filesystem native installs use a private destination-local copy and
+  rename it atomically. Failed installation rolls back its backup.
 - Unix staging directories are created with mode `0700`; Windows creates them
   with a protected owner-only ACL. Windows native calls are isolated in one
   module with safe interfaces; targets other than Windows, macOS and Linux
@@ -106,8 +106,7 @@
 - Recovery rows that fit the memory budget alongside the codec stay resident
   and are hashed and written straight to carriers; no spool file is created or
   synced. Spooled rows, and source blocks copied into data carriers, are read
-  once instead of twice. Every other fsync and the carrier read-back are
-  unchanged.
+  once instead of twice.
 - **Behaviour change:** staged outputs are no longer read back before
   installation. Carriers are authenticated packet by packet as their bytes
   reach the file, with the checks the scanner made; staged repair outputs are
@@ -117,7 +116,13 @@
   checksum, a budget refusal). What is proven is what the engine wrote; a
   storage layer that keeps different bytes is the synchronization barrier's
   contract and a later verification's question. A 1 GiB repair reads 1 GiB
-  less; creation no longer re-reads its carriers.
+  less; creation no longer re-reads its carriers. One verdict changes: a File
+  packet whose whole-file fingerprint disagrees with block checksums that
+  every rebuilt byte matches is installed where the read-back refused it,
+  when damage hid the disagreement from verification. An output whose
+  evidence already shows it is still read back and refused, so a second
+  repair of such a file fails instead of installing it again while `assess`
+  keeps reporting it incomplete.
 - The recovery spool is never synchronized; it is scratch consumed by the same
   process. `CreationDurability::SyncFiles` covers staged carriers only.
 - New `RepairDurability { SyncFiles, Buffered }` and
@@ -140,30 +145,42 @@
   pool's stacks beside its stripe. Output bytes and every I/O count are
   unchanged. 1 GiB: planning 4× faster with 1 MiB blocks and 3.7× faster with
   64 KiB blocks at four or more workers, for about 0.1–0.3 s more CPU.
-- Repair in place stages a damaged file as a clone of itself where the
+- Repair stages a damaged file as a clone of its source where the
   filesystem shares extents: `fclonefileat` on APFS (macOS), the `FICLONE`
   ioctl on Linux reflink filesystems (Btrfs, XFS with reflink, bcachefs).
-  It applies when the file at the destination is the very file the evidence
-  verified, identified from its own open handle, and the file has no
-  unprotected range. The clone is cut or extended to the protected length,
+  It applies when the source's registry hands over the very file the
+  evidence verified through `SourceAccess::open_file`, identified from that
+  handle, and the file has no unprotected range; a registry that does not
+  hand over its file is never cloned behind its back. Repair in place, a
+  source found under another name and a separate output directory on the
+  same volume all clone. The clone is cut or extended to the protected length,
   and the repair writes only what it lacks: the lost blocks and any inline
   tail. Intact blocks are no longer copied into the stage. When blocks are
   lost they are still read once to compute the syndromes; a file whose blocks
   are all intact but which carries trailing bytes is cut back with no source
-  read and no write. What the clone holds is proven by
-  the evidence for the file it cloned, which is re-checked right after the
-  clone and again before installation, so nothing is read back.
-  A 1 GiB file with one lost 1 MiB block writes 1 MiB instead of 1 GiB.
-  The clone keeps the original's mode and extended attributes.
+  read and no write. What the clone holds is proven by the evidence for the
+  file it cloned, through that file's snapshot alone, which is re-checked
+  right after the clone and again before installation, so nothing is read
+  back. That trusts the change time to move with every write, as
+  `SourceSnapshot` already does; a filesystem that hides or coarsens it
+  (attribute-cached network mounts, an unflushed memory-mapped writer) can
+  hide a change from it. A 1 GiB file with one lost 1 MiB block writes
+  1 MiB instead of 1 GiB. On macOS the clone keeps the original's mode and
+  extended attributes; on Linux the staged file is created fresh, as a copy
+  would be.
   `ExecutionDiagnostics::file_clones()` counts clones.
 - Where a clone is refused because the filesystem cannot share extents, or
-  the destination is on another device (`EOPNOTSUPP`, `EXDEV`, `EINVAL`,
-  `ENOTTY`, `EPERM`), staging falls back silently to the full copy it made
-  before. The same happens when the destination is a different file, or the
-  source was found under another name. After a refusal that means the
-  filesystem has no clones, later outputs of the same repair do not try
-  again. Windows, WASI and other targets are unchanged. A clone attempt costs
-  one read-only open of the original. Repair also no longer reads surviving
+  the stage is on another device (`EOPNOTSUPP`, `EXDEV`, `EINVAL`, `ENOTTY`,
+  `EPERM`), staging falls back silently to the full copy it made before. The
+  same happens when the registry hands over no file, the file is no longer
+  the one its snapshot describes, or, on macOS, the file is not
+  owner-writable or carries an immutable or append-only flag, which a clone
+  would inherit. After a refusal that means the filesystem has no clones
+  (`EOPNOTSUPP`, `ENOTTY`), later outputs of the same repair do not try
+  again; an `EINVAL`, which a reflink filesystem can return for one file,
+  does not stop the next. Windows, WASI and other targets are unchanged. A
+  clone attempt uses `DiskSourceAccess`'s cached read handle, so it costs no
+  open while handles are cached. Repair also no longer reads surviving
   blocks that no reconstruction and no staged output needs.
 - macOS and Linux builds take `libc` as a regular dependency, and permit
   `unsafe` only in the two file-clone calls. Every other non-Windows target
@@ -187,7 +204,8 @@
   `InsertionPlan::execute_with_durability`. The output bytes are unchanged.
   For a 1 GiB stored zip with 100 × 1 MiB recovery blocks, insertion
   reads 1 GiB instead of 3.2 GiB, writes 100 MiB instead of 1.2 GiB, and
-  makes 1 fsync instead of 3. A cloned output keeps the source's mode and extended attributes.
+  makes 1 fsync instead of 3. On macOS a cloned output keeps the source's
+  mode and extended attributes.
   `InsertionRequirements::scratch_bytes` no longer counts the carrier, which
   is no longer written to scratch.
 - `SourceAccess::open_file` (default `None`) lets a source registry hand the

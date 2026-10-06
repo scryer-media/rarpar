@@ -1411,6 +1411,25 @@ impl Drop for TempTree {
     }
 }
 
+/// Give `path` an ACL entry denying the current user writes, or, with `deny`
+/// false, remove every ACL entry it has.
+#[cfg(target_os = "macos")]
+pub fn deny_owner_writes(path: &std::path::Path, deny: bool) {
+    use std::process::Command;
+    let status = if deny {
+        let user = Command::new("id").arg("-un").output().expect("id -un");
+        let user = String::from_utf8(user.stdout).expect("a user name");
+        Command::new("chmod")
+            .arg("+a")
+            .arg(format!("{} deny write", user.trim()))
+            .arg(path)
+            .status()
+    } else {
+        Command::new("chmod").arg("-N").arg(path).status()
+    };
+    assert!(status.expect("chmod").success(), "chmod {path:?}");
+}
+
 /// Write the GF(2^8) oracle's three input files into a scratch directory.
 pub fn write_gf8_inputs(tree: &TempTree) {
     tree.write("a.bin", &a_bin());

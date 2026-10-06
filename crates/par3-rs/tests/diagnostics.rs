@@ -1397,15 +1397,17 @@ fn an_fft_repair_in_place_writes_only_the_lost_block() {
     }
 }
 
-/// Only the file the evidence verified is ever cloned. A source found under
-/// another name leaves nothing at the destination, and a destination holding a
-/// different file with the same bytes is not that file: both are copied.
+/// Only the file the evidence verified is ever cloned, from its registry's own
+/// handle, wherever the output goes. A source found under another name, and a
+/// separate output directory whose destination holds a different file with the
+/// same bytes, both clone that source, and the source itself is never changed.
 #[test]
-fn a_moved_source_or_another_file_at_the_destination_is_copied_not_cloned() {
+fn a_moved_source_or_another_file_at_the_destination_clones_the_verified_source() {
     let block = 64u64 << 10;
     let tree = common::TempTree::new("clone-moved");
     let set = common::cauchy_block_set(16, block, 2, b"PAR3 clone moved", &tree);
     let bytes = &set.contents[0].1;
+    let len = bytes.len() as u64;
     let mut damaged = bytes.clone();
     damaged[3 * block as usize] ^= 0x80;
 
@@ -1419,9 +1421,9 @@ fn a_moved_source_or_another_file_at_the_destination_is_copied_not_cloned() {
         inputs.path(),
         false,
     );
-    assert_eq!(run.clones, 0, "a moved source");
-    assert_eq!(run.write_bytes, bytes.len() as u64);
-    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    let written = if expect_clone(&run) { block } else { len };
+    assert_eq!(run.write_bytes, written, "a moved source");
+    assert_eq!(run.read_bytes, len - block, "no read-back");
     assert_eq!(
         std::fs::read(inputs.path().join("moved.bin")).unwrap(),
         damaged
@@ -1439,11 +1441,202 @@ fn a_moved_source_or_another_file_at_the_destination_is_copied_not_cloned() {
         output.path(),
         false,
     );
-    assert_eq!(run.clones, 0, "another file at the destination");
-    assert_eq!(run.write_bytes, bytes.len() as u64);
-    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    let written = if expect_clone(&run) { block } else { len };
+    assert_eq!(run.write_bytes, written, "another file at the destination");
+    assert_eq!(run.read_bytes, len - block, "no read-back");
     assert_eq!(
         std::fs::read(inputs.path().join("input.bin")).unwrap(),
         damaged
+    );
+}
+
+/// REVIEW: a registry that wraps the disk one and serves bytes the file does
+/// not hold yet (here: one block still in its write-back cache), forwarding
+/// the disk snapshot but not `open_file`. `SourceAccess::open_file` says the
+/// engine stages from a local file only through that hook; repair must
+/// install the bytes the registry served and the evidence verified.
+#[test]
+fn review_repair_never_clones_a_file_its_registry_did_not_hand_over() {
+    use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceSnapshot};
+    struct Overlay {
+        inner: DiskSourceAccess,
+        at: u64,
+        bytes: Vec<u8>,
+    }
+    impl SourceAccess for Overlay {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read_at(source, offset, out)?;
+            if source == SourceId(1) {
+                let end = offset + read as u64;
+                let (start, stop) = (
+                    offset.max(self.at),
+                    end.min(self.at + self.bytes.len() as u64),
+                );
+                if start < stop {
+                    out[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
+                        &self.bytes[(start - self.at) as usize..(stop - self.at) as usize],
+                    );
+                }
+            }
+            Ok(read)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("review-overlay");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 review overlay", &tree);
+    let (name, bytes) = &set.contents[0];
+    // Block 3 is damaged everywhere; block 9 is only stale on disk.
+    let mut on_disk = bytes.clone();
+    on_disk[3 * block as usize] ^= 0x80;
+    let cached = 9 * block as usize..10 * block as usize;
+    on_disk[cached.clone()].fill(0);
+    let inputs = common::TempTree::new("review-overlay-inputs");
+    let path = inputs.write(name, &on_disk);
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    let mut inner = DiskSourceAccess::with_options(options.clone());
+    inner.insert(SourceId(1), path.clone());
+    let access = Overlay {
+        inner,
+        at: cached.start as u64,
+        bytes: bytes[cached].to_vec(),
+    };
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+    session.bind_file(name, SourceId(1)).unwrap();
+    for carrier in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(carrier).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.status, RepairStatus::Ready);
+    assert_eq!(assessment.lost_blocks, vec![3]);
+    let report = session.repair(inputs.path(), false);
+    let clones = options.diagnostics.file_clones();
+    let installed = std::fs::read(&path).unwrap();
+    assert!(report.is_ok(), "{report:?}");
+    assert!(
+        installed == *bytes,
+        "the installed file is not the one the evidence verified (clones {clones}, block 9 zero: {})",
+        installed[9 * block as usize..10 * block as usize]
+            .iter()
+            .all(|&b| b == 0)
+    );
+    assert_eq!(
+        clones, 0,
+        "a file the registry never handed over was cloned"
+    );
+}
+
+/// REVIEW (invariant 8): the destination is rewritten in place after its
+/// clone was taken, while repair is reading it for the syndromes. The clone
+/// holds the old bytes; the repair must end in `SourceChanged`, install
+/// nothing and leave no temporary.
+#[cfg(unix)]
+#[test]
+fn review_a_destination_rewritten_after_its_clone_ends_in_source_changed() {
+    use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceFile, SourceSnapshot};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Rewriter {
+        inner: DiskSourceAccess,
+        path: std::path::PathBuf,
+        armed: AtomicBool,
+    }
+    impl SourceAccess for Rewriter {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                use std::os::unix::fs::FileExt;
+                let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+                // A held block (12), not the lost one (3).
+                file.write_all_at(&[0x5a], 12 * (64 << 10) + 5)?;
+            }
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+        fn open_file(&self, source: SourceId) -> std::io::Result<Option<SourceFile>> {
+            self.inner.open_file(source)
+        }
+    }
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("review-rewrite");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 review rewrite", &tree);
+    let (name, bytes) = &set.contents[0];
+    let mut on_disk = bytes.clone();
+    on_disk[3 * block as usize] ^= 0x80;
+    let inputs = common::TempTree::new("review-rewrite-inputs");
+    let path = inputs.write(name, &on_disk);
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    let mut inner = DiskSourceAccess::with_options(options.clone());
+    inner.insert(SourceId(1), path.clone());
+    let access = Arc::new(Rewriter {
+        inner,
+        path: path.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let mut session = Par3RepairSession::new(set.id, access.clone(), options.clone()).unwrap();
+    session.bind_file(name, SourceId(1)).unwrap();
+    for carrier in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(carrier).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    let assessment = session.assess().unwrap();
+    assert_eq!(assessment.lost_blocks, vec![3]);
+    access.armed.store(true, Ordering::SeqCst);
+    let report = session.repair(inputs.path(), false);
+    let clones = options.diagnostics.file_clones();
+    assert!(!access.armed.load(Ordering::SeqCst), "repair read nothing");
+    let Err(EngineError::RepairInterrupted {
+        installed,
+        temporary,
+        cause,
+    }) = report
+    else {
+        panic!("{report:?} (clones {clones})");
+    };
+    assert!(
+        matches!(*cause, EngineError::SourceChanged(SourceId(1))),
+        "{cause:?}"
+    );
+    assert!(installed.is_empty());
+    let mut rewritten = on_disk.clone();
+    rewritten[12 * block as usize + 5] = 0x5a;
+    assert!(
+        std::fs::read(&path).unwrap() == rewritten,
+        "something was installed"
+    );
+    // Only the reported temporaries (and their private staging directory).
+    for path in &temporary {
+        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+    let left: Vec<_> = std::fs::read_dir(inputs.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        left,
+        vec![std::ffi::OsString::from(name)],
+        "clones {clones}"
     );
 }

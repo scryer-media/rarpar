@@ -1284,8 +1284,9 @@ impl Par3RepairSession {
     }
 
     /// Reconstruct damaged files into an explicitly selected output directory.
-    /// Sources remain read-only; verified temporary outputs are installed only
-    /// after their complete protected-data hashes match. Each staged output is
+    /// Sources remain read-only; a staged output is installed only after every
+    /// protected extent matches its authenticated checksum (and, when it is
+    /// read back, the whole-file fingerprint too). Each staged output is
     /// synchronized before installation; see [`Self::repair_with_durability`].
     pub fn repair(
         &mut self,
