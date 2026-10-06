@@ -94,8 +94,11 @@ pub trait SourceAccess: Send + Sync {
 /// dropping the registry closes them all. Windows opens them, like sequential
 /// readers, sharing reads, writes and deletion: a cached handle admits writers,
 /// renames and deletes, which the next snapshot sees, and refuses only an
-/// opener that denies reads, as any open read handle does. Elsewhere every
-/// positioned read opens the file.
+/// opener that denies reads, as any open read handle does. Windows caches
+/// them only on volumes with POSIX unlink and rename (NTFS on Windows 10 1809
+/// and later); on FAT, exFAT and SMB a held handle would leave a deleted file
+/// pending deletion and refuse renames over it. Elsewhere every positioned
+/// read opens the file.
 ///
 /// Unix generations include device, inode and change time. Windows generations
 /// include the volume serial number, the 128-bit file id and the change time,
@@ -199,7 +202,7 @@ fn handle_identity(file: &File) -> Option<FileIdentity> {
 /// What a snapshot learns about the file a path names.
 struct DiskStat {
     metadata: std::fs::Metadata,
-    /// Identity and change time, `None` where the filesystem reports neither.
+    /// Identity and change time, `None` where the filesystem lacks either.
     #[cfg(windows)]
     stamp: Option<crate::repair_tree::windows::FileStamp>,
 }
@@ -329,6 +332,13 @@ impl ReadHandles {
         capacity: usize,
         budget: &crate::runtime::HandleBudget,
     ) {
+        // Held open on a volume without POSIX unlink and rename, a handle would
+        // leave a deleted source pending deletion (its next snapshot refused as
+        // PermissionDenied) and refuse renames over it, installs included.
+        #[cfg(windows)]
+        if !crate::repair_tree::windows::posix_unlink_rename(file.as_std()) {
+            return;
+        }
         let Some(identity) = handle_identity(file) else {
             return;
         };
@@ -1057,7 +1067,14 @@ mod tests {
         // Still the same file, so the cached handle stays and reads the new bytes.
         assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
         assert_eq!(&out, b"rewrite!");
-        assert_eq!(options.diagnostics.file_opens(), 1);
+        // A volume without POSIX unlink and rename caches no handle, so there
+        // each read opens the file.
+        #[cfg(windows)]
+        let cached =
+            crate::repair_tree::windows::posix_unlink_rename(&std::fs::File::open(&path).unwrap());
+        #[cfg(unix)]
+        let cached = true;
+        assert_eq!(options.diagnostics.file_opens(), if cached { 1 } else { 2 });
         assert_eq!(options.diagnostics.file_io().read_bytes, 16);
         assert_eq!(options.scan_work.used(), 0);
         // Nor does it keep the file from being deleted.

@@ -104,10 +104,15 @@ fn sequential_readers_share_a_ceiling_and_release_on_drop() {
 }
 
 // Read handles are cached on Unix and Windows, where a file identity tells a
-// cached handle on a replaced file from one on the file the path names.
+// cached handle on a replaced file from one on the file the path names. On a
+// Windows volume without POSIX unlink and rename none is cached, so the tests
+// counting cached opens skip there.
 #[cfg(any(unix, windows))]
 #[test]
 fn disk_reads_open_each_source_once_and_close_with_the_registry() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
     let tree = common::TempTree::new("cached-reads");
     let files = [common::a_bin(), common::c_bin()];
     let options = ExecutionOptions::default();
@@ -136,6 +141,9 @@ fn disk_reads_open_each_source_once_and_close_with_the_registry() {
 #[cfg(any(unix, windows))]
 #[test]
 fn idle_cached_reads_yield_their_leases_to_other_openers() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
     let tree = common::TempTree::new("reclaimed-reads");
     let path = tree.path().join("source");
     std::fs::write(&path, common::a_bin()).unwrap();
@@ -488,13 +496,17 @@ fn creation_rejects_a_source_changed_within_or_between_stripe_passes() {
     // truncated one fails at block 16, the first read past its new end. The
     // read counts show neither waits for the check before installation. The
     // replacement is a copy, which keeps its bytes and, on Windows, its mtime;
-    // only the file identity tells it apart.
+    // only the file identity tells it apart. Without POSIX rename the held
+    // reader refuses the replacement itself, so only truncation is tried.
     for (at, truncate, reads) in [
         (5, false, 32),
         (5, true, 17),
         (32, false, 64),
         (32, true, 49),
     ] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
         let run = create_watched(32, Some((at, truncate)), false);
         assert!(
             matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
@@ -521,8 +533,12 @@ fn creation_planning_checks_each_source_once_and_rejects_a_changed_file() {
     // last chunk; execution adds the six counted above. Checking before and
     // after every block's hash added 64.
     assert_eq!(run.snapshots, 2 + 6);
-    // Read 5 is early in planning's first block.
+    // Read 5 is early in planning's first block. Without POSIX rename the
+    // forward reader refuses a replacement, so only truncation is tried.
     for truncate in [false, true] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
         let run = create_watched(32, Some((5, truncate)), true);
         assert!(
             matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
@@ -546,13 +562,18 @@ fn repair_rejects_a_source_changed_within_or_between_stripe_passes() {
     // replaced file still reads through the old handle and is caught when
     // that pass settles, after its thirtieth read; a truncated one fails at
     // block 16, the fifteenth read of the pass, the first past its new end.
-    // Either way the staged temporary is never installed.
+    // Either way the staged temporary is never installed. Without POSIX
+    // rename a held handle refuses the replacement, so only truncation is
+    // tried.
     for (at, truncate, reads) in [
         (5, false, 30),
         (5, true, 15),
         (30, false, 60),
         (30, true, 45),
     ] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
         let run = repair_watched(
             &set,
             &[(0, 4096 + 5), (0, 9 * 4096 + 7)],
@@ -595,6 +616,9 @@ fn repair_checks_sources_it_does_not_write_once_per_pass() {
 #[cfg(any(unix, windows))]
 #[test]
 fn disk_repair_opens_do_not_grow_with_the_number_of_reads() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
     let mut opens = Vec::new();
     for blocks in [32, 256] {
         let tree = common::TempTree::new("disk-repair-opens");
@@ -695,5 +719,130 @@ fn resolved_metadata_has_an_independent_budget_and_failed_admission_releases_it(
         assert!(options.memory.peak() <= options.memory.limit());
         drop(session);
         assert_eq!(options.memory.used(), 0);
+    }
+}
+
+/// Disk sources on Windows volumes with and without POSIX unlink and rename.
+/// The sources under test live under `std::env::temp_dir()`, so pointing `TMP`
+/// at an exFAT, FAT32 or SMB path runs these against that volume.
+#[cfg(windows)]
+mod windows_volumes {
+    use super::*;
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+
+    /// A disk registry mapping `SourceId(1)` to `path`.
+    fn registry(path: &std::path::Path, options: &ExecutionOptions) -> DiskSourceAccess {
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), path.to_path_buf());
+        access
+    }
+
+    /// A scratch directory on the build volume, for the carriers and repair
+    /// output that are not under test, so only the source sits on `TMP`'s
+    /// volume.
+    fn build_tree(label: &str) -> common::TempTree {
+        common::TempTree::under(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")), label)
+    }
+
+    #[test]
+    fn rw_snapshot_of_a_source_deleted_under_a_cached_handle_is_absent() {
+        let tree = common::TempTree::new("deleted-after-read");
+        let path = tree.write("source", b"original");
+        let options = ExecutionOptions::default();
+        let access = registry(&path, &options);
+        access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(access.read_at(SourceId(1), 0, &mut [0; 8]).unwrap(), 8);
+        // A handle kept open would leave the file pending deletion, refusing
+        // the snapshot's open, on a volume without POSIX unlink.
+        std::fs::remove_file(&path).unwrap();
+        let snapshot = access.snapshot(SourceId(1));
+        assert!(
+            matches!(snapshot, Ok(None)),
+            "a deleted source must read as absent, not {snapshot:?}"
+        );
+    }
+
+    /// A registry that deletes the source just before read `at`.
+    struct Deleting {
+        disk: DiskSourceAccess,
+        path: std::path::PathBuf,
+        reads: AtomicUsize,
+        at: AtomicUsize,
+    }
+
+    impl SourceAccess for Deleting {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.disk.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.reads.fetch_add(1, Ordering::Relaxed) == self.at.load(Ordering::Relaxed) {
+                std::fs::remove_file(&self.path).unwrap();
+            }
+            self.disk.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.disk.next_available(source, offset)
+        }
+    }
+
+    #[test]
+    fn rw_repair_of_a_source_deleted_mid_pass_ends_in_source_changed() {
+        let tree = build_tree("deleted-mid-repair-set");
+        let set = common::cauchy_block_set(32, 4096, 4, b"deleted-mid-repair", &tree);
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = 1024;
+        let inputs = common::TempTree::new("deleted-mid-repair-input");
+        let mut damaged = set.contents[0].1.clone();
+        damaged[4096 + 5] ^= 0x80;
+        let path = inputs.write("input.bin", &damaged);
+        let access = Arc::new(Deleting {
+            disk: registry(&path, &options),
+            path: path.clone(),
+            reads: AtomicUsize::new(0),
+            at: AtomicUsize::new(usize::MAX),
+        });
+        let mut session = Par3RepairSession::new(set.id, access.clone(), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for carrier in &set.paths {
+            for packet in common::scanned_packets(std::fs::read(carrier).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let output = build_tree("deleted-mid-repair-output");
+        // Delete inside the repair's first stripe pass.
+        access.reads.store(0, Ordering::Relaxed);
+        access.at.store(5, Ordering::Relaxed);
+        let result = session.repair(output.path(), false);
+        match &result {
+            Err(EngineError::RepairInterrupted {
+                installed, cause, ..
+            }) if installed.is_empty()
+                && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+            other => panic!("a deleted source must end in SourceChanged: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rw_rename_over_a_source_the_registry_read() {
+        let tree = common::TempTree::new("rename-over-read");
+        let path = tree.write("source", b"original");
+        let options = ExecutionOptions::default();
+        let access = registry(&path, &options);
+        let before = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(access.read_at(SourceId(1), 0, &mut [0; 8]).unwrap(), 8);
+        // The engine's own installs rename over sources the same way.
+        let replacement = tree.write("replacement", b"replaced");
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_ne!(before, after);
+        let mut out = [0; 8];
+        assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
+        assert_eq!(&out, b"replaced");
     }
 }

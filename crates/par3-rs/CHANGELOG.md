@@ -53,13 +53,19 @@
   128-bit file ID (`FILE_ID_INFO`, with the 64-bit index as the fallback) and
   the NTFS change time stand in for the Unix device/inode pair and ctime. A
   source snapshot on Windows is now a zero-byte metadata query instead of a
-  re-hash of the file, the read-handle cache applies on Windows too, and the
-  identity, handle-budget and snapshot tests that were Unix-only run on
-  Windows. A 1 GiB repair that previously rescanned the source on every
-  snapshot and gave up after minutes completes in seconds with identical
-  output; create and verify run about twice as fast. Filesystems without a
-  change time (FAT, some SMB shares) fall back to the previous content
-  snapshot.
+  re-hash of the file, and the identity, handle-budget and snapshot tests that
+  were Unix-only run on Windows. The read-handle cache applies on volumes with
+  POSIX unlink/rename (NTFS on Windows 10 1809 and later); FAT, exFAT and SMB
+  keep their snapshots without the cache, since a handle held open there
+  would leave a deleted source pending deletion and refuse renames over it. A
+  1 GiB repair that previously rescanned the source on every snapshot and gave
+  up after minutes completes in seconds with identical output; create runs
+  3.2× and verify 6.2× faster (Windows NTFS, release, median of 3).
+  Filesystems without a change time (FAT, some SMB shares) fall back to the
+  previous content snapshot.
+- Refusals for source generation hashing now name
+  `"cumulative scanning work (source generation hashes)"` instead of
+  `"cumulative scanning work"`; scanner refusals keep the old name.
 - Sources are snapshot-checked once per read-ahead refill in the scanner and
   once per stripe pass in creation, carrier regeneration and repair, always
   after the last read a write depends on and before that write, instead of

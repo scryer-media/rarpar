@@ -302,8 +302,10 @@ Windows scanning pins a read-only carrier handle. Retained packets keep that
 handle alive; drop them before replacing or deleting carriers. Disk source
 generations come from the file's identity and change time — device, inode and
 ctime on Unix; volume serial number, 128-bit file id and ChangeTime on Windows —
-so a snapshot reads no file bytes. Where a filesystem reports neither, and on
-WASI, generations hash the file instead, consuming scan-work budget. Use `Par3RepairSession::validate_repair()` to check
+so a snapshot reads no file bytes. A writer holding FILE_WRITE_ATTRIBUTES can
+set a Windows ChangeTime back and so hide a same-length rewrite; Unix ctime
+cannot be set back. Where a filesystem lacks either, and on WASI, generations
+hash the file instead, consuming scan-work budget. Use `Par3RepairSession::validate_repair()` to check
 dry-run readiness, configured codec limits, and layouts requiring explicit
 self-repair before staging output.
 

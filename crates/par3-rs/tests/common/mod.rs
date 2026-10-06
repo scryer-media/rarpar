@@ -1363,12 +1363,16 @@ pub struct TempTree {
 impl TempTree {
     /// Make a fresh directory named after the test using it.
     pub fn new(label: &str) -> Self {
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    /// Make a fresh directory named after the test using it under `root`.
+    pub fn under(root: &std::path::Path, label: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("par3-rs-{label}-{}-{unique}", std::process::id()));
+        let path = root.join(format!("par3-rs-{label}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&path).expect("a scratch directory");
         let keep = std::env::var_os("PAR3_KEEP_OUTPUT").is_some();
         if keep {
@@ -1428,6 +1432,73 @@ pub fn deny_owner_writes(path: &std::path::Path, deny: bool) {
         Command::new("chmod").arg("-N").arg(path).status()
     };
     assert!(status.expect("chmod").success(), "chmod {path:?}");
+}
+
+/// Whether the volume under the system temp directory deletes and renames
+/// over open files at once, as Unix filesystems and NTFS on Windows 10 1809
+/// and later do. Where it does not (FAT, exFAT, SMB) the disk registry keeps
+/// no read handles open between reads, and a file held open refuses a rename
+/// over it, so tests counting cached opens or replacing a file mid-read skip.
+pub fn temp_volume_has_posix_unlink_rename() -> bool {
+    #[cfg(windows)]
+    {
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| {
+            let tree = TempTree::new("volume-flags");
+            let file = std::fs::File::open(tree.write("probe", b"")).expect("a probe file");
+            let flag = windows_volume::posix_unlink_rename(&file);
+            if !flag {
+                println!("temp volume lacks POSIX unlink/rename; cache-dependent cases skip");
+            }
+            flag
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// The volume-flag query the disk registry gates its read-handle cache on.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_volume {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumeInformationByHandleW(
+            handle: *mut core::ffi::c_void,
+            name: *mut u16,
+            name_len: u32,
+            serial: *mut u32,
+            max_component: *mut u32,
+            flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
+        ) -> i32;
+    }
+
+    pub fn posix_unlink_rename(file: &std::fs::File) -> bool {
+        const FILE_SUPPORTS_POSIX_UNLINK_RENAME: u32 = 0x400;
+        use std::ptr::null_mut;
+        let mut flags = 0;
+        // SAFETY: null buffers with zero lengths are permitted for every
+        // output but `flags`; the borrowed handle stays open for the call.
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(
+                file.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                &mut flags,
+                null_mut(),
+                0,
+            )
+        };
+        ok != 0 && flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0
+    }
 }
 
 /// Write the GF(2^8) oracle's three input files into a scratch directory.

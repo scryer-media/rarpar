@@ -201,6 +201,40 @@ unsafe extern "system" {
         handle: *mut c_void,
         information: *mut ByHandleFileInformation,
     ) -> i32;
+    fn GetVolumeInformationByHandleW(
+        handle: *mut c_void,
+        name: *mut u16,
+        name_len: u32,
+        serial: *mut u32,
+        max_component: *mut u32,
+        flags: *mut u32,
+        fs_name: *mut u16,
+        fs_name_len: u32,
+    ) -> i32;
+}
+
+/// Whether the volume `file` lives on deletes and renames over open files at
+/// once (FILE_SUPPORTS_POSIX_UNLINK_RENAME). Without it (FAT, exFAT, SMB,
+/// NTFS before Windows 10 1809) a handle held open leaves a deleted file
+/// pending deletion, refusing opens, and refuses a rename over the file.
+pub(crate) fn posix_unlink_rename(file: &std::fs::File) -> bool {
+    const FILE_SUPPORTS_POSIX_UNLINK_RENAME: u32 = 0x400;
+    let mut flags = 0;
+    // SAFETY: null buffers with zero lengths are permitted for every output
+    // but `flags`, a live u32; the borrowed handle stays open for the call.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            &mut flags,
+            null_mut(),
+            0,
+        )
+    };
+    ok != 0 && flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0
 }
 
 /// Query one fixed-size information class of a live handle.
@@ -240,7 +274,9 @@ pub(crate) struct FileStamp {
     /// File id within the volume. ReFS uses all 128 bits; NTFS the low 64.
     pub(crate) id: [u8; 16],
     /// FILE_BASIC_INFO's ChangeTime, which every data or metadata write
-    /// moves; unlike the last write time, ordinary APIs do not set it back.
+    /// moves. A writer holding FILE_WRITE_ATTRIBUTES can set it back through
+    /// SetFileInformationByHandle, hiding a same-length rewrite; Unix ctime
+    /// cannot be set back this way.
     pub(crate) change: i64,
 }
 
