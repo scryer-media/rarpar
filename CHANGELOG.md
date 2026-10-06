@@ -3,6 +3,101 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.7.0
+
+### CLI Changes
+
+- New `sevenz` feature, on by default, brings in sevenz-turbo (7z reading
+  and writing) and blake3. Builds without it behave as 0.6.0 did.
+- `rarpar par3 archive OUTPUT.7z INPUTS...` writes a 7z archive and computes
+  its PAR3 recovery data from the bytes as they reach the disk, in one pass,
+  without reading the archive back. By default the set is written beside the
+  archive as `OUTPUT.par3` and recovery volumes, laid out as
+  `par3 c -s<size> -c<count>|-r<percent>` lays them out over the finished
+  archive; with `--inside` it is appended after the 7z end header, laid out
+  as `par3 i -r<percent>` appends it. 7z readers stop at the end header and
+  ignore it. Options: `--base-path`, `--level 0..9` (0 stores), `--filter`
+  (x86, arm, arm-thumb, arm64, ia64, sparc, ppc, riscv), `--no-solid`,
+  `-s`/`-c`/`-r` for the sibling set, and `--inside` with `-r 0..250`.
+  Archives that fit in half of `--par3-memory-mib` are held and coded at the
+  end; larger ones are coded as they stream. A final layout no streaming lane
+  covered falls back to one read of the finished archive, reported as
+  `read_back` in `--json` output. Every non-Creator packet is byte-identical
+  to par3cmdline 0.0.1's over the same archive.
+- The par3cmdline front end now runs `vs` and `rs` on ZIP and 7z files that
+  carry their PAR3 packets inside them, where 0.6.0 refused them:
+  - `vs` judges such a file by its protected chunks alone, as par3cmdline
+    does: "protected data is complete" when every protected chunk verifies,
+    otherwise "damaged" with par3cmdline's count of available bytes. It
+    never reports on the appended packets themselves.
+  - `rs` restores the protected bytes, then refills the packet region as
+    par3cmdline's `copy_inside_data` does: every complete packet still found
+    in the damaged file, in file order, then zeros. The damaged file is kept
+    as `<name>.1`.
+  - `i`, `ti` and `d` are still refused: they write recovery data, which is
+    left to `rarpar par3 archive --inside`.
+- Three par3cmdline front-end lines that `v` and `r` share with `vs` and
+  `rs` now match par3cmdline:
+  - without a Root packet, the Creator, Comment and Start header lines are
+    printed;
+  - with a Root packet but no File packet, the message is "File Packet or
+    Directory Packet is missing.";
+  - the recovery block count is printed only when both a Matrix packet and a
+    Recovery Data packet are held, and a 16-bit Cauchy repair prints
+    "Computing Reed Solomon matrix:".
+- rarpar accepts 7-Zip's extract, test and list command lines. Started under
+  the name `7z`, `7za`, `7zz` or `7zr` (a link or copy of the binary), or as
+  `rarpar 7z ...`, it runs `x`, `e`, `t` and `l` on 7z archives (single
+  files, `.001` split sets, solid and non-solid, encrypted data and
+  encrypted headers, with trailing data such as an inside PAR3 set). It
+  decodes LZMA, LZMA2, PPMd, BZip2, Deflate and Copy, with the BCJ, BCJ2 and
+  ARM64 filters and AES-256. It parses 7-Zip's whole switch table, so an
+  unknown or malformed switch gets 7-Zip's "Command Line Error" and exit
+  code 7. Of the switches, it acts on `-o`, `-p`, `-y`, `-ao[a|s|t|u]`,
+  `-i`, `-x`, `-r`, `-an`, `-ai`, `-t`, `-so`, `-bso`, `-bse`, `-bb`, `-ba`,
+  `-slt`, `-scrc`, `-sdel`, `-ssc`, `-spd`, `-spm` and `-mmt`, with list
+  files (`@file`) and wildcards in archive and member names. It prints
+  7-Zip 26.01's lines on standard output and standard error, including the archive information block, `l` and `l -slt`
+  listings, overwrite and password prompts on standard input, per-item
+  errors ("CRC Failed", "Data Error", "Wrong password?", "Unexpected end of
+  data", "Unsupported Method"), the closing summary and `-scrc` sums, and
+  exits with 7-Zip's codes (0, 1, 2, 7, 8, 255). Extracted files are
+  byte-identical to 7-Zip's, with the same names, modes and times. The
+  command lines SABnzbd and NZBGet run work unchanged.
+- Where the 7-Zip front end differs from 7-Zip:
+  - Only 7z archives (and `.001` split sets of them) are read. `-t` with any
+    other type fails to open the archive, as 7-Zip does for a 7z file opened
+    as that type. ZIP, RAR and the other formats 7-Zip reads are not
+    supported.
+  - The commands `a`, `u`, `d`, `rn`, `h`, `b` and `i` fail with "Unsupported
+    command" and exit code 7, the error 7-Zip gives for an unknown command.
+    Creating archives is left to `rarpar par3 archive`.
+  - The banner is one line, "rarpar VERSION (7-Zip compatible decoder) :
+    Copyright (c) the rarpar authors", and the help text lists only the
+    supported commands and switches.
+  - No progress output is printed.
+  - `-si` (archive from standard input) is a command-line error.
+  - `-scrc` computes CRC32 only; other hash types are a command-line error.
+  - The other switches are accepted and ignored. Names are always read and
+    printed as UTF-8 whatever `-scc` and `-scs` say, `-spf` paths are
+    sanitised as without it, `-ax` excludes no archive, and `-t#` and
+    `-tsplit` open the archive as 7z.
+  - A member whose data fails to decode keeps the bytes decoded before the
+    fault, as in 7-Zip, but how many depends on the decoder's buffering. A
+    damaged member may keep fewer bytes than 7-Zip keeps, or, when its block
+    fails within its first 4 KiB or, for LZMA2, within the failing chunk,
+    may not be created at all.
+  - On Windows, symbolic links are written as regular files holding the link
+    target, and times are shown in UTC.
+  - When writing an output file fails, the per-item error and the closing
+    "System ERROR" text approximate 7-Zip's.
+
+### Library versions
+
+- sevenz-turbo 0.26.1 and blake3 for the `sevenz` feature; crc-fast,
+  filetime and libc are now also used by rarpar itself. par3-rs stays
+  `=0.4.5`; par2-rs and unrar-rs are unchanged.
+
 ## rarpar 0.6.0
 
 ### CLI Changes
