@@ -272,14 +272,11 @@ fn last_component(name: &str) -> &str {
     name.rsplit_once('/').map_or(name, |(_, last)| last)
 }
 
-/// Derive the set's InputSetID.
+/// Derive the set's InputSetID for this module's planned files.
 ///
-/// The reference implementation calls this a globally unique random number, and
-/// it is not derivable from anything a reader can see, so nothing validates it.
-/// It is built the same way here anyway — a digest of the names, sizes, hashes
-/// and block layout of the input set, then a second digest of that and the Start
-/// packet body — so that two runs over identical inputs agree and two runs over
-/// different ones do not.
+/// The chunk descriptions fed to the digest are the ones the File packets will
+/// carry, so this and the streaming engine in [`crate::creation`] share one
+/// derivation through [`input_set_id`].
 fn generate_set_id(
     files: &[PlannedFile],
     directories: &[String],
@@ -288,27 +285,92 @@ fn generate_set_id(
     block_size: u64,
     start_body: &[u8],
 ) -> InputSetId {
+    let packets: Vec<FilePacket> = (0..files.len())
+        .map(|index| file_packet(&files[index], map, outcome, index))
+        .collect();
+    input_set_id(
+        files.iter().zip(&packets).map(|(file, packet)| SetIdFile {
+            name: &file.name,
+            size: file.size,
+            fingerprint: &packet.fingerprint,
+            chunks: &packet.chunks,
+        }),
+        directories.iter().map(String::as_str),
+        block_size,
+        start_body,
+    )
+}
+
+/// One file as the InputSetID digest sees it.
+pub(crate) struct SetIdFile<'a> {
+    /// Relative `/`-separated name, as given for the whole path rather than
+    /// the last component a File packet stores.
+    pub name: &'a str,
+    /// File size in bytes.
+    pub size: u64,
+    /// The 16-byte hash of the file's protected chunks.
+    pub fingerprint: &'a Fingerprint,
+    /// The chunk descriptions its File packet carries.
+    pub chunks: &'a [ChunkDescription],
+}
+
+/// Derive an InputSetID the reference implementation's way.
+///
+/// The reference calls this a globally unique random number, and it is not
+/// derivable from anything a reader can see, so nothing validates it. It is
+/// built the same way here anyway — a digest over every file of its name with a
+/// zero terminator, its size, its hash and its chunk layout, then every
+/// directory name with a zero terminator; then a second digest of the first
+/// eight bytes of that and the Start packet body — so that output matches the
+/// reference byte for byte, two runs over identical inputs agree, and two runs
+/// over different ones do not.
+///
+/// Each chunk contributes its length; for a chunk of at least one block (or an
+/// unprotected chunk, which the reference stores as length zero with the real
+/// length in the block field) the first block index; and for a tail of at least
+/// 40 bytes the block and offset holding it. Modification times and
+/// permissions feed the digest only when the matching option packets are
+/// written, and this crate writes none.
+pub(crate) fn input_set_id<'a>(
+    files: impl IntoIterator<Item = SetIdFile<'a>>,
+    directories: impl IntoIterator<Item = &'a str>,
+    block_size: u64,
+    start_body: &[u8],
+) -> InputSetId {
     let mut hasher = FingerprintHasher::new();
-    for (index, file) in files.iter().enumerate() {
+    for file in files {
         hasher.update(file.name.as_bytes());
         hasher.update(&[0]);
         hasher.update(&file.size.to_le_bytes());
-        hasher.update(&outcome.files[index].fingerprint);
-        // Modification times and permissions feed this digest only when the
-        // matching option packets are being written, and this crate writes none.
-        if let Some(chunk) = map.chunks[index] {
-            hasher.update(&chunk.length.to_le_bytes());
-            if chunk.length >= block_size {
-                hasher.update(&chunk.block_hint.to_le_bytes());
-            }
-            if let PlannedTail::Described {
-                block_index,
-                offset,
-                ..
-            } = chunk.tail
-            {
-                hasher.update(&block_index.to_le_bytes());
-                hasher.update(&offset.to_le_bytes());
+        hasher.update(file.fingerprint);
+        if file.size == 0 {
+            continue;
+        }
+        for chunk in file.chunks {
+            match chunk {
+                ChunkDescription::Unprotected { length } => {
+                    hasher.update(&0u64.to_le_bytes());
+                    hasher.update(&length.to_le_bytes());
+                }
+                ChunkDescription::Protected {
+                    length,
+                    first_block_index,
+                    tail,
+                } => {
+                    hasher.update(&length.to_le_bytes());
+                    if *length >= block_size {
+                        hasher.update(&first_block_index.unwrap_or(0).to_le_bytes());
+                    }
+                    if let ChunkTail::Described {
+                        block_index,
+                        offset,
+                        ..
+                    } = tail
+                    {
+                        hasher.update(&block_index.to_le_bytes());
+                        hasher.update(&offset.to_le_bytes());
+                    }
+                }
             }
         }
     }

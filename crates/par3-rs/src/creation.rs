@@ -1540,32 +1540,48 @@ impl CreationPlan {
     }
 
     fn build_metadata(&mut self) -> EngineResult<()> {
-        let mut identity = FingerprintHasher::new();
-        identity.update(&self.options.block_size.to_le_bytes());
-        identity.update(&[self.requirements.field.size]);
-        identity.update(&self.requirements.field.generator.to_le_bytes());
+        let start = StartPacket {
+            parent_input_set_id: InputSetId::ZERO,
+            parent_root_hash: [0; 16],
+            block_size: self.options.block_size,
+            galois_field: self.requirements.field,
+            legacy_random: None,
+        };
+        // Every directory the set describes is an ancestor of a file name,
+        // ordered the way the reference lists them: a directory after the
+        // directories beneath it. The Directory packets go out in this order
+        // too.
+        let mut ancestors = std::collections::BTreeSet::new();
         for file in &self.files {
-            identity.update(file.name.as_bytes());
-            identity.update(
-                &Packet::new(InputSetId::ZERO, PacketBody::File(file.packet.clone())).to_bytes(),
-            );
+            let mut ancestor = parent(&file.name);
+            while !ancestor.is_empty() && ancestors.insert(ancestor) {
+                ancestor = parent_of(ancestor);
+            }
         }
-        self.id = InputSetId(identity.finalize()[..8].try_into().expect("eight bytes"));
+        let mut directories: Vec<String> = ancestors.into_iter().map(str::to_owned).collect();
+        directories.sort_by(|left, right| crate::create::compare_directory_names(left, right));
+        self.id = crate::create::input_set_id(
+            self.files.iter().map(|file| crate::create::SetIdFile {
+                name: &file.name,
+                size: file
+                    .packet
+                    .chunks
+                    .iter()
+                    .map(ChunkDescription::length)
+                    .sum(),
+                fingerprint: &file.packet.fingerprint,
+                chunks: &file.packet.chunks,
+            }),
+            directories.iter().map(String::as_str),
+            self.options.block_size,
+            &start.to_body_bytes(),
+        );
         let mut packets = vec![
             Packet::new(
                 self.id,
                 PacketBody::Creator(CreatorPacket::new(&self.options.creator)),
             ),
-            Packet::new(
-                self.id,
-                PacketBody::Start(StartPacket {
-                    parent_input_set_id: InputSetId::ZERO,
-                    parent_root_hash: [0; 16],
-                    block_size: self.options.block_size,
-                    galois_field: self.requirements.field,
-                    legacy_random: None,
-                }),
-            ),
+            Packet::new(self.id, PacketBody::Start(start)),
         ];
         if self.options.recovery_count != 0 {
             let body = match self.options.codec {
@@ -1606,19 +1622,13 @@ impl CreationPlan {
                 ancestor = parent_of(ancestor);
             }
         }
-        let mut directories: Vec<String> = children
-            .keys()
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .collect();
-        directories.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
         for directory in directories {
             let packet = Packet::new(
                 self.id,
                 PacketBody::Directory(DirectoryPacket {
                     name: directory.rsplit('/').next().expect("directory").to_owned(),
                     option_hashes: Vec::new(),
-                    children: children.remove(&directory).unwrap_or_default(),
+                    children: sorted_children(children.remove(&directory)),
                 }),
             );
             children
@@ -1633,7 +1643,7 @@ impl CreationPlan {
                 lowest_unused_block_index: self.blocks.len() as u64,
                 attributes: 0,
                 option_hashes: Vec::new(),
-                children: children.remove("").unwrap_or_default(),
+                children: sorted_children(children.remove("")),
             }),
         );
         self.root = root.hash();
@@ -1767,6 +1777,14 @@ impl CreationPlan {
         }
         Ok(())
     }
+}
+
+/// A Directory or Root packet's children, in the order the reference writes
+/// them: sorted by their packet hash bytes.
+fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
+    let mut children = children.unwrap_or_default();
+    children.sort_unstable();
+    children
 }
 
 /// Refuse a source name the engine would later refuse to repair.
