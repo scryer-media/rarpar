@@ -1374,7 +1374,7 @@ mod charge_tests {
         let geometry = FftGeometry::new(400, 6).unwrap();
         assert_eq!((geometry.domain, geometry.field_bytes()), (512, 2));
         let codec = FftCodec::new(geometry, options(24 << 20)).unwrap();
-        let (stripe, buffers) = codec.buffers(1 << 20, geometry.domain).unwrap();
+        let (stripe, buffers) = codec.buffers::<u16>(1 << 20, geometry.domain).unwrap();
         assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
         assert!(stripe.is_multiple_of(granule), "unaligned stripe {stripe}");
         drop(buffers);
@@ -1843,9 +1843,12 @@ mod lane_tests {
     }
 
     /// Byte rows are charged at one byte per stripe byte, so a budget that
-    /// narrows the zero-extended rows admits the byte lane a wider stripe.
+    /// narrows the zero-extended rows admits the byte lane a wider stripe:
+    /// twice the word lane's before each is rounded down to a whole page
+    /// granule, which takes less than one granule from either.
     #[test]
     fn a_gf8_cohort_gets_twice_the_stripe_under_the_same_budget() {
+        let granule = crate::runtime::STRIPE_GRANULES[0];
         let geometry = FftGeometry::new(150, 6).unwrap();
         let options = ExecutionOptions {
             memory: MemoryBudget::new(8 << 20),
@@ -1859,7 +1862,7 @@ mod lane_tests {
         let (words, _held) = codec.buffers::<u16>(1 << 20, geometry.domain()).unwrap();
         assert!(words < 1 << 20, "the budget should narrow the stripe");
         assert!(
-            bytes >= 2 * words - 64,
+            bytes >= words && bytes + granule > 2 * words - 64,
             "byte lane admitted {bytes}, word lane {words}"
         );
     }
