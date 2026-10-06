@@ -791,6 +791,29 @@ impl SourceAccess for MemorySourceAccess {
     }
 }
 
+/// Largest single read the engine issues when it walks a source from front
+/// to back, to verify it or to scan it for packets: a mebibyte, the most a
+/// network mount commonly moves in one request.
+///
+/// A mount's client reads ahead far less than a local disk does, so a small
+/// read becomes a small request on the wire however sequential it is. The
+/// size does not follow the set's block size, which can be a few kibibytes.
+pub(crate) const SEQUENTIAL_READ_BYTES: usize = 1 << 20;
+
+/// The read size for a front-to-back walk of a `len`-byte source: never
+/// more than the source itself. A caller that narrowed
+/// [`ExecutionOptions::stripe_bytes`] below its default asked for small I/O
+/// and reads at that stripe instead.
+pub(crate) fn sequential_read_bytes(options: &ExecutionOptions, len: u64) -> usize {
+    // 64 KiB is the default stripe.
+    let cap = if options.stripe_bytes < 64 << 10 {
+        options.stripe_bytes
+    } else {
+        SEQUENTIAL_READ_BYTES
+    };
+    usize::try_from(len).map_or(cap, |len| len.min(cap))
+}
+
 pub(crate) fn read_exact_at(
     diagnostics: &crate::runtime::ExecutionDiagnostics,
     access: &dyn SourceAccess,

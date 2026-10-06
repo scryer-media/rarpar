@@ -536,6 +536,9 @@ pub enum ScanEvent {
 
 struct ScanReadAhead {
     bytes: Vec<u8>,
+    /// The scanner's stripe: the least scanning work one fill is charged,
+    /// and the most a fill asks for once the work budget cannot cover more.
+    unit: usize,
     offset: u64,
     len: usize,
     /// Bytes have been read from the source since its generation was last
@@ -556,10 +559,18 @@ impl ScanReadAhead {
         if offset < self.offset || offset - self.offset >= self.len as u64 {
             self.len = 0;
             self.unchecked = true;
-            let take = source_len
+            let mut take = source_len
                 .saturating_sub(offset)
                 .min(self.bytes.len() as u64) as usize;
-            options.scan_work.charge(take)?;
+            // A fill is charged what it asks for, and handed back what a
+            // short read did not return beyond one stripe: a whole scan
+            // costs its bytes and an empty poll a stripe, whatever the
+            // read-ahead's size. A budget too low for a full fill still
+            // admits a stripe, as a stripe-sized read-ahead would.
+            if take <= self.unit || options.scan_work.charge(take).is_err() {
+                take = take.min(self.unit);
+                options.scan_work.charge(take)?;
+            }
             let read =
                 options
                     .diagnostics
@@ -567,6 +578,9 @@ impl ScanReadAhead {
             if read > take {
                 return Err(EngineError::InvalidState("invalid source read length"));
             }
+            options
+                .scan_work
+                .refund(take - read.max(self.unit).min(take));
             self.offset = offset;
             self.len = read;
         }
@@ -895,12 +909,13 @@ impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<'_, W> {
 /// arrivals. A hole returns `NeedData`; use `seek` to scan a later available
 /// range and a separate scanner to revisit the hole later. Neither operation
 /// assumes that holes contain zero bytes.
-/// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
+/// A budgeted read-ahead reuses bytes across packet boundaries. Seeking
 /// discards it. The source generation is checked before any packet, end or
 /// missing-byte boundary is returned, unless no byte has been read since the
 /// last check, so packets parsed from bytes already confirmed cost no further
-/// check. The scanner
-/// reserves two stripes of at most 64 KiB each. A provider may also pin a
+/// check. The scanner reserves a stripe of at most 64 KiB and a read-ahead of
+/// at most a mebibyte, no larger than the source; a budget without room for
+/// that read-ahead gets a stripe-sized one. A provider may also pin a
 /// budgeted handle for the scanner and its authenticated packets' lifetime.
 pub struct PacketScanner {
     access: Arc<dyn SourceAccess>,
@@ -937,9 +952,30 @@ impl PacketScanner {
             offset: 0,
         })?;
         let size = options.stripe_bytes.clamp(HEADER_SIZE, 64 << 10);
-        let reservation = options
+        // The read-ahead is the scan's read size, sized for the source
+        // rather than the stripe, so that a carrier on a network mount is
+        // not fetched in small requests. A budget without room for it scans
+        // with a stripe-sized one instead.
+        let ahead = crate::source::sequential_read_bytes(&options, snapshot.len).max(size);
+        let wide = match options
             .memory
-            .reserve_as(MemoryCategory::CarrierPackets, size * 2)?;
+            .reserve_as(MemoryCategory::CarrierPackets, size + ahead)
+        {
+            Ok(reservation) if ahead == size || options.memory.available() >= 128 << 10 => {
+                Some(reservation)
+            }
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let (reservation, ahead) = match wide {
+            Some(reservation) => (reservation, ahead),
+            None => (
+                options
+                    .memory
+                    .reserve_as(MemoryCategory::CarrierPackets, size * 2)?,
+                size,
+            ),
+        };
         Ok(Self {
             access,
             source,
@@ -954,7 +990,8 @@ impl PacketScanner {
             packets: 0,
             buffer: vec![0; size],
             read_ahead: ScanReadAhead {
-                bytes: vec![0; size],
+                bytes: vec![0; ahead],
+                unit: size,
                 offset: 0,
                 len: 0,
                 unchecked: false,

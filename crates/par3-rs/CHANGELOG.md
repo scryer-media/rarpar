@@ -8,6 +8,22 @@
   the default (`None`) is unchanged. The `engine_perf` example exposes it as
   `PAR3_BENCH_WHOLE_FILE_FIRST=0` so the cost of the second read pass can be
   measured on remote mounts.
+- Source verification (`evidence::verify_source`, and through it session
+  verification and repair assessment, on both the whole-file and the extent
+  pass) and the packet scanner (`ingest::PacketScanner`) now read a source
+  front to back in reads of up to a mebibyte, never more than the source,
+  instead of 64 KiB. The read size no longer depends on the block size or on
+  whether the hash runs in parallel; a file verified beside others in a batch
+  was read 64 KiB at a time. On a network mount, whose client reads ahead far
+  less than a local disk, each small read became a small request on the wire
+  (a Linux NFS client fetched such a walk 128 KiB at a time). The larger
+  buffers are charged to the memory budget as before (a mebibyte per file
+  verified at once, and per scanner); a budget without room for them falls
+  back to the old 64 KiB, and a caller that narrows `stripe_bytes` below
+  64 KiB still reads at that stripe. A scanner fill is charged to
+  `scan_work` for what it asks and refunded what a short read did not
+  return beyond one stripe, so a whole scan still costs its bytes and a poll
+  that finds nothing one stripe. Evidence is unchanged.
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
   `create::create` already did, through the same code — from each file's full
