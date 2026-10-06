@@ -1126,8 +1126,79 @@ impl<S> SharedRows<S> {
 }
 
 /// Store the XOR of `sources` (zero when there are none) in `out`, which is
-/// written once, folding two sources per pass.
+/// written once. With AVX2 every source (the derivative hands at most one per
+/// bit of a row index, so 16) is folded into each 64-byte block in one pass;
+/// the portable fold, which also finishes the AVX2 remainder and takes any
+/// longer list, folds two sources per pass. Sources must be as long as `out`.
 fn xor_sum<S: Lane>(out: &mut [S], sources: &[&[S]]) {
+    #[cfg(target_arch = "x86_64")]
+    if (2..=16).contains(&sources.len()) && is_x86_feature_detected!("avx2") {
+        assert!(sources.iter().all(|source| source.len() == out.len()));
+        let bytes = |values: &[S]| {
+            // SAFETY: `Lane` is implemented only for `u8` and `u16`, plain
+            // integers without padding; their bytes are initialized.
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
+        };
+        let mut views = [&[] as &[u8]; 16];
+        for (view, source) in views.iter_mut().zip(sources) {
+            *view = bytes(source);
+        }
+        let length = size_of_val(out);
+        // SAFETY: AVX2 was detected; `out` is exclusively borrowed, so its
+        // byte view aliases nothing, and every byte pattern is a value of
+        // either lane type. All views are `length` bytes long.
+        let done = unsafe {
+            xor_sum_avx2(
+                std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), length),
+                &views[..sources.len()],
+            )
+        } / size_of::<S>();
+        let mut tails = [&[] as &[S]; 16];
+        for (tail, source) in tails.iter_mut().zip(sources) {
+            *tail = &source[done..];
+        }
+        return xor_sum_portable(&mut out[done..], &tails[..sources.len()]);
+    }
+    xor_sum_portable(out, sources)
+}
+
+/// Store the XOR of at least two equally long `sources` in `out`, each
+/// 64-byte block loaded from every source and stored once; returns the bytes
+/// done, a multiple of 64.
+///
+/// # Safety
+/// AVX2 must be available and every source must be as long as `out`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_sum_avx2(out: &mut [u8], sources: &[&[u8]]) -> usize {
+    use std::arch::x86_64::*;
+    let [first, rest @ ..] = sources else {
+        return 0;
+    };
+    let mut at = 0;
+    while out.len() - at >= 64 {
+        // SAFETY: `out` and, by the caller's contract, every source hold 64
+        // bytes from `at`.
+        unsafe {
+            let mut low = _mm256_loadu_si256(first.as_ptr().add(at).cast());
+            let mut high = _mm256_loadu_si256(first.as_ptr().add(at + 32).cast());
+            for source in rest {
+                low = _mm256_xor_si256(low, _mm256_loadu_si256(source.as_ptr().add(at).cast()));
+                high = _mm256_xor_si256(
+                    high,
+                    _mm256_loadu_si256(source.as_ptr().add(at + 32).cast()),
+                );
+            }
+            _mm256_storeu_si256(out.as_mut_ptr().add(at).cast(), low);
+            _mm256_storeu_si256(out.as_mut_ptr().add(at + 32).cast(), high);
+        }
+        at += 64;
+    }
+    at
+}
+
+/// [`xor_sum`] on the portable path, folding two sources per pass.
+fn xor_sum_portable<S: Lane>(out: &mut [S], sources: &[&[S]]) {
     match sources {
         [] => out.fill(S::default()),
         [only] => out.copy_from_slice(only),
@@ -2076,6 +2147,37 @@ mod tests {
             field.derivative_u8_in_pool(&mut rows, &pool, &|| true),
             Err(TransformError::Cancelled)
         );
+    }
+
+    /// The dispatched source fold against the portable one for every source
+    /// count a derivative can hand it and two past it, at lengths either side of the 64-byte
+    /// block and an unaligned start, in both lanes.
+    #[test]
+    fn xor_sums_match_the_portable_fold() {
+        fn check<S: Lane + std::fmt::Debug>(pool: &[S]) {
+            for count in 0..=18usize {
+                for length in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000] {
+                    for offset in [0usize, 1] {
+                        let sources: Vec<&[S]> = (0..count)
+                            .map(|at| &pool[offset + at * 1031..offset + at * 1031 + length])
+                            .collect();
+                        let mut actual = pool[pool.len() - length..].to_vec();
+                        let mut expected = actual.clone();
+                        xor_sum(&mut actual, &sources);
+                        xor_sum_portable(&mut expected, &sources);
+                        assert_eq!(actual, expected, "{count} sources, length {length}");
+                        let direct = (0..length).map(|at| {
+                            sources
+                                .iter()
+                                .fold(S::default(), |sum, source| sum ^ source[at])
+                        });
+                        assert!(actual.iter().copied().eq(direct), "{count} sources");
+                    }
+                }
+            }
+        }
+        check(&random_bytes(20000, 5));
+        check(&words(20000, 6, 0xffff));
     }
 
     #[test]

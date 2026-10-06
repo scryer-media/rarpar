@@ -1,6 +1,8 @@
 //! Native comparisons of Cantor transforms with equal input buffers: one
 //! worker, except the `cantor_pool` group.
 //! These arithmetic measurements do not establish end-to-end PAR3 parity.
+//! On a GFNI host the `Auto` maps take their affine form; run once more with
+//! `WEAVER_LINEAR_GFNI=0` to measure the AVX2 shuffle form on the same rows.
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     use criterion::{BenchmarkId, Criterion, Throughput};
@@ -8,6 +10,11 @@ fn main() {
     use reedsolomon_rs::gf_simd::LinearBackend;
     use std::hint::black_box;
 
+    eprintln!(
+        "linear map kernel: {:?}, GFNI affine form: {}",
+        LinearBackend::Auto.kernel(),
+        reedsolomon_rs::gf_simd::linear_uses_gfni()
+    );
     let mut criterion = Criterion::default().configure_from_args();
     let mut group = criterion.benchmark_group("cantor_transform_pair");
     for (bits, count) in [(8, 128), (16, 1024)] {

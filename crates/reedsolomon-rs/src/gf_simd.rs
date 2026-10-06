@@ -50,8 +50,29 @@ pub enum LinearKernel {
     Neon,
     /// x86 SSSE3 byte shuffles.
     Ssse3,
-    /// x86 AVX2 byte shuffles.
+    /// x86 AVX2 byte shuffles, or GFNI affine transforms where
+    /// [`linear_uses_gfni`] holds.
     Avx2,
+}
+
+/// Whether the AVX2 kernels of [`LinearMap8`] and [`LinearMap16`] take their
+/// GFNI form: one `gf2p8affineqb` per 8×8 bit block of the map replaces the
+/// nibble split, the byte shuffles and the XORs that merge them. Setting
+/// `WEAVER_LINEAR_GFNI=0` pins the shuffle form so a GFNI host can A/B the two
+/// without a rebuild. The variable is read once and cached; it never enables
+/// a kernel whose features are absent.
+pub fn linear_uses_gfni() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("WEAVER_LINEAR_GFNI").is_some_and(|v| v == "0")
+                && is_x86_feature_detected!("gfni")
+                && is_x86_feature_detected!("avx2")
+        });
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 impl LinearBackend {
@@ -82,6 +103,10 @@ impl LinearBackend {
 pub struct LinearMap16 {
     tables: MulTables,
     kernel: LinearKernel,
+    /// `[m_ll, m_lh, m_hl, m_hh]` as in [`AffineMulMatrices`], present when
+    /// the AVX2 kernel takes its GFNI form.
+    #[cfg(target_arch = "x86_64")]
+    affine: Option<[u64; 4]>,
 }
 
 impl LinearMap16 {
@@ -98,9 +123,13 @@ impl LinearMap16 {
                 *high = (product >> 8) as u8;
             }
         }
+        let kernel = backend.kernel();
         Self {
             tables: MulTables { tables, factor: 0 },
-            kernel: backend.kernel(),
+            kernel,
+            #[cfg(target_arch = "x86_64")]
+            affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni())
+                .then(|| affine_matrices_from_images(&basis)),
         }
     }
 
@@ -141,7 +170,12 @@ impl LinearMap16 {
                     std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), bytes);
                 match self.kernel {
                     #[cfg(target_arch = "x86_64")]
-                    LinearKernel::Avx2 => mul_acc_region_avx2(&self.tables, source, destination),
+                    LinearKernel::Avx2 => match &self.affine {
+                        Some(affine) => {
+                            fused16_x86::accumulate_gfni(affine, &self.tables, source, destination)
+                        }
+                        None => mul_acc_region_avx2(&self.tables, source, destination),
+                    },
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => mul_acc_region_ssse3(&self.tables, source, destination),
                     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -160,10 +194,15 @@ impl LinearMap16 {
 /// bits. Any such map is two 16-entry nibble tables, so this runs the GF(2^8)
 /// region kernels of [`crate::gf8`] with tables built from the caller's basis
 /// images instead of the 0x11d product. The kernel set matches
-/// [`LinearMap16`], selected by the same [`LinearBackend`].
+/// [`LinearMap16`], selected by the same [`LinearBackend`]; on a GFNI host the
+/// AVX2 kernels apply the map as one 8×8 bit matrix instead of two tables.
 pub struct LinearMap8 {
     plan: crate::gf8::MulPlan,
     kernel: LinearKernel,
+    /// The plan's `gf2p8affineqb` matrix, present when the AVX2 kernel takes
+    /// its GFNI form.
+    #[cfg(target_arch = "x86_64")]
+    affine: Option<u64>,
 }
 
 impl LinearMap8 {
@@ -176,9 +215,13 @@ impl LinearMap8 {
                     .fold(0, |sum, bit| sum ^ basis[nibble * 4 + bit])
             })
         };
+        let plan = crate::gf8::MulPlan::from_tables(table(0), table(1));
+        let kernel = backend.kernel();
         Self {
-            plan: crate::gf8::MulPlan::from_tables(table(0), table(1)),
-            kernel: backend.kernel(),
+            #[cfg(target_arch = "x86_64")]
+            affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni()).then(|| plan.affine()),
+            plan,
+            kernel,
         }
     }
 
@@ -188,12 +231,16 @@ impl LinearMap8 {
         assert_eq!(source.len(), destination.len());
         match self.kernel {
             // SAFETY (all three): `LinearBackend::kernel` reports a vector
-            // kernel only after detecting its ISA, and each kernel bounds
-            // every load and store by the equal slice lengths asserted above.
+            // kernel only after detecting its ISA, an affine matrix is present
+            // only after detecting GFNI, and each kernel bounds every load and
+            // store by the equal slice lengths asserted above.
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => unsafe { self.plan.avx2(source, destination) },
+            LinearKernel::Avx2 => match self.affine {
+                Some(affine) => unsafe { self.plan.accumulate_gfni(affine, source, destination) },
+                None => unsafe { self.plan.avx2(source, destination) },
+            },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.ssse3(source, destination) },
             _ => self.plan.scalar(source, destination),
@@ -218,7 +265,10 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
+            LinearKernel::Avx2 => match self.affine {
+                Some(affine) => unsafe { self.plan.butterfly_gfni::<INVERSE>(affine, left, right) },
+                None => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
+            },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.butterfly_ssse3::<INVERSE>(left, right) },
             _ => 0,
@@ -252,11 +302,20 @@ impl LinearMap8 {
                 )
             },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => unsafe {
-                crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
-                    plans,
-                    [&mut *a, &mut *b, &mut *c, &mut *d],
-                )
+            LinearKernel::Avx2 => match [outer.affine, inner[0].affine, inner[1].affine] {
+                [Some(o), Some(x), Some(y)] => unsafe {
+                    crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
+                        plans,
+                        [o, x, y],
+                        [&mut *a, &mut *b, &mut *c, &mut *d],
+                    )
+                },
+                _ => unsafe {
+                    crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
+                        plans,
+                        [&mut *a, &mut *b, &mut *c, &mut *d],
+                    )
+                },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe {
@@ -286,7 +345,10 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => unsafe { self.plan.map_avx2(row) },
+            LinearKernel::Avx2 => match self.affine {
+                Some(affine) => unsafe { self.plan.map_gfni(affine, row) },
+                None => unsafe { self.plan.map_avx2(row) },
+            },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.map_ssse3(row) },
             _ => 0,
@@ -378,9 +440,12 @@ impl LinearMap16 {
                 let r = std::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), bytes);
                 match self.kernel {
                     #[cfg(target_arch = "x86_64")]
-                    LinearKernel::Avx2 => {
-                        fused16_x86::butterfly_avx2::<INVERSE>(&self.tables, l, r)
-                    }
+                    LinearKernel::Avx2 => match &self.affine {
+                        Some(affine) => {
+                            fused16_x86::butterfly_gfni::<INVERSE>(affine, &self.tables, l, r)
+                        }
+                        None => fused16_x86::butterfly_avx2::<INVERSE>(&self.tables, l, r),
+                    },
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => {
                         fused16_x86::butterfly_ssse3::<INVERSE>(&self.tables, l, r)
@@ -434,7 +499,12 @@ impl LinearMap16 {
                 let rows = [view(a), view(b), view(c), view(d)];
                 match outer.kernel {
                     #[cfg(target_arch = "x86_64")]
-                    LinearKernel::Avx2 => fused16_x86::radix4_avx2::<INVERSE>(tables, rows),
+                    LinearKernel::Avx2 => match [&outer.affine, &inner_a.affine, &inner_b.affine] {
+                        [Some(o), Some(a), Some(b)] => {
+                            fused16_x86::radix4_gfni::<INVERSE>([o, a, b], tables, rows)
+                        }
+                        _ => fused16_x86::radix4_avx2::<INVERSE>(tables, rows),
+                    },
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => fused16_x86::radix4_ssse3::<INVERSE>(tables, rows),
                     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -510,9 +580,18 @@ impl LinearMap16 {
             return unsafe {
                 match self.kernel {
                     #[cfg(target_arch = "x86_64")]
-                    LinearKernel::Avx2 => {
-                        fused16_x86::map_region_avx2(&self.tables, source, destination, bytes)
-                    }
+                    LinearKernel::Avx2 => match &self.affine {
+                        Some(affine) => fused16_x86::map_region_gfni(
+                            affine,
+                            &self.tables,
+                            source,
+                            destination,
+                            bytes,
+                        ),
+                        None => {
+                            fused16_x86::map_region_avx2(&self.tables, source, destination, bytes)
+                        }
+                    },
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => {
                         fused16_x86::map_region_ssse3(&self.tables, source, destination, bytes)
@@ -1015,6 +1094,175 @@ mod fused16_x86 {
         }
         at
     }
+
+    /// `[m_ll, m_lh, m_hl, m_hh]`, each in every qword lane.
+    #[target_feature(enable = "gfni,avx2")]
+    #[inline]
+    fn matrices256(affine: &[u64; 4]) -> [__m256i; 4] {
+        affine.map(|matrix| _mm256_set1_epi64x(matrix as i64))
+    }
+
+    /// The map on byte planes with four affine transforms: low = ll·lo ⊕
+    /// lh·hi, high = hl·lo ⊕ hh·hi, in place of eight shuffles.
+    #[target_feature(enable = "gfni,avx2")]
+    #[inline]
+    fn affine256(m: &[__m256i; 4], (lo, hi): Planes256) -> Planes256 {
+        (
+            _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo, m[0]),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi, m[1]),
+            ),
+            _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo, m[2]),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi, m[3]),
+            ),
+        )
+    }
+
+    /// [`butterfly_avx2`] with the map's affine matrices; `tables` finish
+    /// the remainder on SSSE3.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available and both rows must have equal lengths.
+    #[target_feature(enable = "gfni,avx2")]
+    pub(super) unsafe fn butterfly_gfni<const INVERSE: bool>(
+        affine: &[u64; 4],
+        tables: &MulTables,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        let m = matrices256(affine);
+        let mut at = 0;
+        while left.len() - at >= 64 {
+            // SAFETY: both rows hold 64 bytes from `at`.
+            unsafe {
+                let mut l = load256(left.as_ptr().add(at));
+                let mut r = load256(right.as_ptr().add(at));
+                crate::gf_simd::fused_butterfly!(INVERSE, l, r, &m, xor256, affine256);
+                store256(left.as_mut_ptr().add(at), l);
+                store256(right.as_mut_ptr().add(at), r);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe { butterfly_ssse3::<INVERSE>(tables, &mut left[at..], &mut right[at..]) }
+    }
+
+    /// [`radix4_avx2`] with the three maps' affine matrices, in the order
+    /// of `tables`.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available and all four rows must have equal
+    /// lengths.
+    #[target_feature(enable = "gfni,avx2")]
+    pub(super) unsafe fn radix4_gfni<const INVERSE: bool>(
+        affine: [&[u64; 4]; 3],
+        tables: [&MulTables; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let [outer, inner_a, inner_b] = [
+            matrices256(affine[0]),
+            matrices256(affine[1]),
+            matrices256(affine[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 64 {
+            // SAFETY: all four rows hold 64 bytes from `at`.
+            unsafe {
+                let mut a = load256(ra.as_ptr().add(at));
+                let mut b = load256(rb.as_ptr().add(at));
+                let mut c = load256(rc.as_ptr().add(at));
+                let mut d = load256(rd.as_ptr().add(at));
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    xor256,
+                    affine256
+                );
+                store256(ra.as_mut_ptr().add(at), a);
+                store256(rb.as_mut_ptr().add(at), b);
+                store256(rc.as_mut_ptr().add(at), c);
+                store256(rd.as_mut_ptr().add(at), d);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe {
+            radix4_ssse3::<INVERSE>(
+                tables,
+                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
+            )
+        }
+    }
+
+    /// [`map_region_avx2`] with the map's affine matrices.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available; pointers as for [`map_region_avx2`].
+    #[target_feature(enable = "gfni,avx2")]
+    pub(super) unsafe fn map_region_gfni(
+        affine: &[u64; 4],
+        tables: &MulTables,
+        source: *const u8,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> usize {
+        let m = matrices256(affine);
+        let mut at = 0;
+        while bytes - at >= 64 {
+            // SAFETY: as in `map_region_avx2`, for 64 bytes from `at`.
+            unsafe {
+                let value = load256(source.add(at));
+                store256(destination.add(at), affine256(&m, value));
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders keep the caller's bounds.
+        at + unsafe { map_region_ssse3(tables, source.add(at), destination.add(at), bytes - at) }
+    }
+
+    /// XOR the image of each symbol of `source` into `destination`, 64 bytes
+    /// per affine pass and the 32-byte remainder on the SSSE3 tables.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available, the slices must have equal lengths,
+    /// and those must be a multiple of 32.
+    #[target_feature(enable = "gfni,avx2")]
+    pub(super) unsafe fn accumulate_gfni(
+        affine: &[u64; 4],
+        tables: &MulTables,
+        source: &[u8],
+        destination: &mut [u8],
+    ) {
+        let m = matrices256(affine);
+        let mut at = 0;
+        while source.len() - at >= 64 {
+            // SAFETY: both slices hold 64 bytes from `at`.
+            unsafe {
+                let to = destination.as_mut_ptr().add(at);
+                let (lo, hi) = affine256(&m, load256(source.as_ptr().add(at)));
+                // The interleave of `store256`, XORed into the symbols there.
+                _mm256_storeu_si256(
+                    to.cast(),
+                    _mm256_xor_si256(_mm256_loadu_si256(to.cast()), _mm256_unpacklo_epi8(lo, hi)),
+                );
+                _mm256_storeu_si256(
+                    to.add(32).cast(),
+                    _mm256_xor_si256(
+                        _mm256_loadu_si256(to.add(32).cast()),
+                        _mm256_unpackhi_epi8(lo, hi),
+                    ),
+                );
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainder is a whole 32-byte block.
+        unsafe { super::mul_acc_region_ssse3(tables, &source[at..], &mut destination[at..]) };
+    }
 }
 
 #[cfg(test)]
@@ -1033,24 +1281,173 @@ mod fused_tests {
             .collect()
     }
 
-    /// Every kernel this host can run, scalar included. The vector tiers are
-    /// forced one at a time, so SSSE3 is covered on an AVX2 host too.
-    fn kernels() -> Vec<LinearKernel> {
-        let mut kernels = vec![LinearKernel::Scalar];
+    /// Every kernel this host can run, scalar included, each with whether it
+    /// takes its GFNI form. The vector tiers are forced one at a time, so
+    /// SSSE3 is covered on an AVX2 host and the AVX2 shuffles on a GFNI host.
+    fn kernels() -> Vec<(LinearKernel, bool)> {
+        let mut kernels = vec![(LinearKernel::Scalar, false)];
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if std::arch::is_aarch64_feature_detected!("neon") {
-            kernels.push(LinearKernel::Neon);
+            kernels.push((LinearKernel::Neon, false));
         }
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("ssse3") {
-                kernels.push(LinearKernel::Ssse3);
+                kernels.push((LinearKernel::Ssse3, false));
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-                kernels.push(LinearKernel::Avx2);
+                kernels.push((LinearKernel::Avx2, false));
+                if is_x86_feature_detected!("gfni") {
+                    kernels.push((LinearKernel::Avx2, true));
+                }
             }
         }
         kernels
+    }
+
+    /// A 16-bit map forced onto one entry of [`kernels`].
+    fn map16(basis: [u16; 16], (kernel, gfni): (LinearKernel, bool)) -> LinearMap16 {
+        let _ = gfni;
+        LinearMap16 {
+            kernel,
+            #[cfg(target_arch = "x86_64")]
+            affine: gfni.then(|| affine_matrices_from_images(&basis)),
+            ..LinearMap16::new(basis, LinearBackend::Scalar)
+        }
+    }
+
+    /// An 8-bit map forced onto one entry of [`kernels`].
+    fn map8(basis: [u8; 8], (kernel, gfni): (LinearKernel, bool)) -> LinearMap8 {
+        let _ = gfni;
+        let map = LinearMap8::new(basis, LinearBackend::Scalar);
+        LinearMap8 {
+            kernel,
+            #[cfg(target_arch = "x86_64")]
+            affine: gfni.then(|| map.plan.affine()),
+            ..map
+        }
+    }
+
+    /// `gf2p8affineqb` on one byte, as Intel defines it: output bit `row` is
+    /// the parity of the input masked by byte `7 - row` of the matrix.
+    fn affine_scalar(matrix: u64, value: u8) -> u8 {
+        (0..8).fold(0, |out, row| {
+            let mask = (matrix >> ((7 - row) * 8)) as u8;
+            out | ((((mask & value).count_ones() & 1) as u8) << row)
+        })
+    }
+
+    /// The affine matrices built from basis images reproduce the table maps
+    /// of the Cantor fields: every factor on every byte for the 8-bit field,
+    /// and every symbol under a spread of factors for the 16-bit one.
+    #[test]
+    fn affine_matrices_reproduce_the_cantor_maps() {
+        let field = crate::fft::TransformField::new(8).unwrap();
+        for factor in 0..=255u16 {
+            let basis = std::array::from_fn(|bit| field.mul(1 << bit, factor) as u8);
+            let map = LinearMap8::new(basis, LinearBackend::Scalar);
+            let matrix = map.plan.affine();
+            for value in 0..=255u8 {
+                assert_eq!(
+                    affine_scalar(matrix, value),
+                    field.mul(value.into(), factor) as u8,
+                    "8-bit factor {factor}, value {value}"
+                );
+            }
+        }
+        let field = crate::fft::TransformField::new(16).unwrap();
+        for factor in [0u16, 1, 2, 0x53, 0x1234, 0x8000, 0xabcd, 0xffff] {
+            let basis = std::array::from_fn(|bit| field.mul(1 << bit, factor));
+            let map = LinearMap16::new(basis, LinearBackend::Scalar);
+            let [ll, lh, hl, hh] = affine_matrices_from_images(&basis);
+            for value in 0..=u16::MAX {
+                let [lo, hi] = value.to_le_bytes();
+                let product = u16::from_le_bytes([
+                    affine_scalar(ll, lo) ^ affine_scalar(lh, hi),
+                    affine_scalar(hl, lo) ^ affine_scalar(hh, hi),
+                ]);
+                assert_eq!(product, map.apply(value), "16-bit factor {factor:#x}");
+                assert_eq!(
+                    product,
+                    field.mul(value, factor),
+                    "16-bit factor {factor:#x}"
+                );
+            }
+        }
+    }
+
+    /// Accumulate, in-place and unpacking maps on every tier against the
+    /// scalar tier, for every 8-bit Cantor factor and a spread of 16-bit
+    /// ones, at lengths either side of each vector width and an unaligned
+    /// start. The fused test below compares tiers only with themselves.
+    #[test]
+    fn map_kernels_match_the_scalar_tier_on_every_tier() {
+        let lengths = [
+            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 129, 600,
+        ];
+        let source = bytes(1400, 77);
+        let seed = bytes(1400, 78);
+        let field8 = crate::fft::TransformField::new(8).unwrap();
+        let field16 = crate::fft::TransformField::new(16).unwrap();
+        for tier in kernels() {
+            for factor in 0..=255u16 {
+                let basis = std::array::from_fn(|bit| field8.mul(1 << bit, factor) as u8);
+                let (map, oracle) = (
+                    map8(basis, tier),
+                    LinearMap8::new(basis, LinearBackend::Scalar),
+                );
+                for &length in &lengths {
+                    for offset in [0usize, 1] {
+                        let what =
+                            format!("{tier:?} factor {factor} length {length} offset {offset}");
+                        let input = &source[offset..offset + length];
+                        let (mut actual, mut expected) =
+                            (seed[..length].to_vec(), seed[..length].to_vec());
+                        map.accumulate(input, &mut actual);
+                        oracle.accumulate(input, &mut expected);
+                        assert_eq!(actual, expected, "8-bit accumulate, {what}");
+                        let (mut actual, mut expected) = (input.to_vec(), input.to_vec());
+                        map.map_in_place(&mut actual);
+                        oracle.map_in_place(&mut expected);
+                        assert_eq!(actual, expected, "8-bit map, {what}");
+                    }
+                }
+            }
+            for factor in [2u16, 0x53, 0x1234, 0x8001, 0xabcd, 0xffff] {
+                let basis = std::array::from_fn(|bit| field16.mul(1 << bit, factor));
+                let (map, oracle) = (
+                    map16(basis, tier),
+                    LinearMap16::new(basis, LinearBackend::Scalar),
+                );
+                for &length in &lengths {
+                    for offset in [0usize, 1] {
+                        let what =
+                            format!("{tier:?} factor {factor:#x} length {length} offset {offset}");
+                        let pairs = &source[offset * 2..(offset + length) * 2];
+                        let words: Vec<u16> = pairs
+                            .chunks_exact(2)
+                            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                            .collect();
+                        let start: Vec<u16> = seed[..length * 2]
+                            .chunks_exact(2)
+                            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                            .collect();
+                        let (mut actual, mut expected) = (start.clone(), start.clone());
+                        map.accumulate(&words, &mut actual);
+                        oracle.accumulate(&words, &mut expected);
+                        assert_eq!(actual, expected, "16-bit accumulate, {what}");
+                        let (mut actual, mut expected) = (words.clone(), words.clone());
+                        map.map_in_place(&mut actual);
+                        oracle.map_in_place(&mut expected);
+                        assert_eq!(actual, expected, "16-bit map, {what}");
+                        let (mut actual, mut expected) = (start.clone(), start);
+                        map.map_le_bytes(pairs, &mut actual);
+                        oracle.map_le_bytes(pairs, &mut expected);
+                        assert_eq!(actual, expected, "16-bit unpacking map, {what}");
+                    }
+                }
+            }
+        }
     }
 
     /// The unfused butterfly: one multiply-accumulate pass and one XOR pass.
@@ -1085,14 +1482,8 @@ mod fused_tests {
         let basis8: [[u8; 8]; 3] =
             std::array::from_fn(|map| bytes(8, map as u64 + 9).try_into().unwrap());
         for kernel in kernels() {
-            let maps16 = basis16.map(|basis| LinearMap16 {
-                kernel,
-                ..LinearMap16::new(basis, LinearBackend::Scalar)
-            });
-            let maps8 = basis8.map(|basis| LinearMap8 {
-                kernel,
-                ..LinearMap8::new(basis, LinearBackend::Scalar)
-            });
+            let maps16 = basis16.map(|basis| map16(basis, kernel));
+            let maps8 = basis8.map(|basis| map8(basis, kernel));
             for &length in &lengths {
                 for offset in [0usize, 1] {
                     for inverse in [false, true] {
@@ -1416,7 +1807,12 @@ fn affine_matrices_from_field(factor: u16) -> [u64; 4] {
     for bit in 0..16u32 {
         cols[bit as usize] = gf::mul(factor, 1 << bit);
     }
+    affine_matrices_from_images(&cols)
+}
 
+/// Build `[m_ll, m_lh, m_hl, m_hh]` for any 16-bit binary linear map, from
+/// the images `cols` of its sixteen input bits.
+fn affine_matrices_from_images(cols: &[u16; 16]) -> [u64; 4] {
     // Extract four 8×8 sub-matrices and pack into GFNI format.
     //
     // GFNI gf2p8affineqb computes: result_bit[i] = popcount(row_i AND input) mod 2
@@ -1425,19 +1821,9 @@ fn affine_matrices_from_field(factor: u16) -> [u64; 4] {
     // of input. In our le byte representation, bit 0 = LSB = GF bit 0.
     // So matrix column for GF input bit `col` maps to bit `col` in the row byte.
     let pack = |input_shift: usize, output_shift: usize| -> u64 {
-        let mut matrix: u64 = 0;
-        for row in 0..8u32 {
-            let output_bit = output_shift as u32 + row;
-            let mut row_byte: u8 = 0;
-            for col in 0..8u32 {
-                let input_bit = input_shift as u32 + col;
-                if (cols[input_bit as usize] >> output_bit) & 1 == 1 {
-                    row_byte |= 1 << col;
-                }
-            }
-            matrix |= (row_byte as u64) << ((7 - row) * 8);
-        }
-        matrix
+        crate::gf8::affine_from_images(std::array::from_fn(|col| {
+            (cols[input_shift + col] >> output_shift) as u8
+        }))
     };
 
     [pack(0, 0), pack(8, 0), pack(0, 8), pack(8, 8)]
