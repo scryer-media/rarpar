@@ -1720,6 +1720,23 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         })
         .collect::<BTreeSet<_>>()
         .len() as u64;
+    // The same blocks with their payloads, for rebuilding a file whose
+    // layout par3-rs's self-repair does not take.
+    let mut recovery = BTreeMap::new();
+    for packet in &packets {
+        if let Some(payload) = packet.payload()
+            && let PayloadKind::Recovery { matrix, index, .. } = payload.kind()
+        {
+            recovery
+                .entry((matrix, index))
+                .or_insert_with(|| inside::Recovery {
+                    matrix,
+                    index,
+                    payload: payload.clone(),
+                });
+        }
+    }
+    let recovery: Vec<inside::Recovery> = recovery.into_values().collect();
     let session_failure = |error: EngineError| engine_failure(error, trailer);
     let mut session =
         Par3RepairSession::new(id, access.clone(), execution.clone()).map_err(session_failure)?;
@@ -1764,6 +1781,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         .map(|file| (file.path.clone(), (file.complete, file.unresolved.clone())))
         .collect();
     let lost_blocks = assessment.lost_blocks.len() as u64;
+    let lost_list = assessment.lost_blocks.clone();
     let requirements: Vec<(u64, u64)> = assessment
         .requirements
         .iter()
@@ -1978,15 +1996,38 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 .first()
                 .map(par3_rs::Packet::hash)
                 .ok_or_else(|| Failure::new(RET_LOGIC_ERROR, "There is no Matrix Packet."))?;
-            let installed = inside::self_repair(
-                &mut session,
-                base,
-                &destinations[&name],
-                id,
-                matrix,
-                &layout,
-                &embedded[&name],
-            )
+            let chunks = set.files()[0].chunks();
+            let installed = if inside::par3cmdline_layout(chunks) {
+                inside::self_repair(
+                    &mut session,
+                    base,
+                    &destinations[&name],
+                    id,
+                    matrix,
+                    &layout,
+                    &embedded[&name],
+                )
+            } else {
+                let field = set.galois_field();
+                let mut lost = lost_list.clone();
+                lost.sort_unstable();
+                inside::rebuild(
+                    &inside::Rebuild {
+                        block_size: set.block_size(),
+                        block_count: set.block_count(),
+                        field: &field,
+                        matrix,
+                        recovery: &recovery,
+                        lost: &lost,
+                        options: &execution,
+                    },
+                    base,
+                    &destinations[&name],
+                    id,
+                    &layout,
+                    &embedded[&name],
+                )
+            }
             .map_err(session_failure)?;
             if noise >= 0 && lost_blocks > 0 {
                 print_matrix_solve(&set, started);

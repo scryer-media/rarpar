@@ -896,6 +896,10 @@ pub(crate) struct InsideParams {
     pub redundancy: u64,
     /// `-lp`, or 0.
     pub repetition_limit: u64,
+    /// The strict ZIP layout: the packets go between the archive's data and
+    /// its central directory (`footer` bytes), which is protected once and
+    /// not copied. Sized exactly, where par3cmdline's sizing is an estimate.
+    pub strict: bool,
 }
 
 pub(crate) fn inside_size(params: &InsideParams, block_size: u64) -> InsideShape {
@@ -931,6 +935,16 @@ pub(crate) fn inside_size(params: &InsideParams, block_size: u64) -> InsideShape
     if footer_blocks > 0 {
         ext += 48 + 8 + 24 * footer_blocks;
     }
+    if params.strict {
+        // One External Data packet per run of full blocks: the directory's
+        // run continues the data's unless the data's tail block parts them.
+        let runs = match (data_blocks > 0, footer_blocks > 0) {
+            (true, true) if data_tail >= 40 => 2,
+            (false, false) => 0,
+            _ => 1,
+        };
+        ext = (48 + 8) * runs + 24 * (data_blocks + footer_blocks);
+    }
     common += ext;
     common += 48 + 24;
     let recovery_packet = 48 + 40 + block_size;
@@ -951,7 +965,7 @@ pub(crate) fn inside_size(params: &InsideParams, block_size: u64) -> InsideShape
         footer_desc(&mut file);
     }
     file += 16;
-    if footer > 0 {
+    if footer > 0 && !params.strict {
         footer_desc(&mut file);
     }
     common += file;
@@ -1205,6 +1219,68 @@ mod tests {
         assert_eq!(suggest_block_size(1 << 20), 8192);
     }
 
+    /// The strict ZIP layout's packet run is sized exactly: for data and
+    /// directory lengths around every block boundary and tail rule, the run
+    /// written is the run reserved.
+    #[test]
+    fn the_strict_layout_reserves_exactly_the_packets_it_writes() {
+        let creator = "strict sizing";
+        let block_size = 64u64;
+        let lengths = [1u64, 39, 40, 41, 63, 64, 65, 103, 104, 127, 128, 129, 200];
+        for &data in &lengths {
+            for &directory in &[22u64, 39, 40, 64, 98, 130, 300] {
+                for redundancy in [0u64, 30] {
+                    let params = InsideParams {
+                        file_size: data + directory,
+                        footer: directory,
+                        name_len: "strict.zip".len() as u64,
+                        creator_packet_size: 48
+                            + CreatorPacket::new(creator).to_body_bytes().len() as u64,
+                        redundancy,
+                        repetition_limit: 0,
+                        strict: true,
+                    };
+                    let shape = inside_size(&params, block_size);
+                    let galois = reference_field(shape.blocks, 0, shape.recovery, shape.recovery);
+                    let mut lane = Lane::new(block_size, false, true);
+                    lane.add_coding(Coding::new(galois, 0, shape.recovery, block_size).unwrap());
+                    let bytes: Vec<u8> = (0..data + directory).map(|i| (i * 7 + 3) as u8).collect();
+                    lane.begin_chunk();
+                    lane.feed(&bytes[..data as usize]).unwrap();
+                    lane.end_chunk().unwrap();
+                    lane.unprotected(shape.total_packet_size);
+                    lane.begin_chunk();
+                    lane.feed(&bytes[data as usize..]).unwrap();
+                    lane.end_chunk().unwrap();
+                    lane.finish().unwrap();
+                    let case = format!("data {data} directory {directory} -r{redundancy}");
+                    assert_eq!(lane.block_count(), shape.blocks, "{case}");
+                    let runs = lane.checksum_runs();
+                    let spec = SetSpec {
+                        id_name: "strict.zip",
+                        name: "strict.zip",
+                        file_size: data + directory,
+                        block_size,
+                        galois,
+                        matrix_hint: Some(shape.recovery),
+                        quick_hash: 0,
+                        fingerprint: Fingerprint::default(),
+                        chunks: lane.chunks(),
+                        runs: &runs,
+                        block_count: lane.block_count(),
+                        creator,
+                    };
+                    let set = build_set(&spec);
+                    let mut out = Vec::new();
+                    let written =
+                        write_inside(&mut out, &set, lane.codings()[0].rows(), 0, shape.repeat)
+                            .unwrap();
+                    assert_eq!(written, shape.total_packet_size, "{case}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_inside_search_matches_a_reference_run() {
         // par3cmdline `i` over a 300205-byte 7z named demo_i.7z chose 2048-byte
@@ -1215,6 +1291,7 @@ mod tests {
         let params = InsideParams {
             file_size: 300_205,
             footer: 0,
+            strict: false,
             name_len: "demo_i.7z".len() as u64,
             creator_packet_size: 48 + creator.to_body_bytes().len() as u64,
             redundancy: 0,

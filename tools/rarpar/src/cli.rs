@@ -119,6 +119,33 @@ pub struct Cli {
     pub paths: Vec<PathBuf>,
 }
 
+impl Cli {
+    /// Rules that depend on an argument's value, which clap's derive cannot
+    /// state, reported as clap reports its own.
+    pub fn validate(&self) -> Result<(), clap::Error> {
+        #[cfg(feature = "sevenz")]
+        if let Some(Command::Par3 {
+            command: Par3Command::Archive(args),
+        }) = &self.command
+            && args.strict_zip
+            && args.format != ArchiveFormat::Zip
+        {
+            use clap::CommandFactory;
+            let mut root = Cli::command();
+            root.build();
+            let archive = root
+                .find_subcommand_mut("par3")
+                .and_then(|par3| par3.find_subcommand_mut("archive"))
+                .expect("par3 archive is a subcommand");
+            return Err(archive.error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--strict-zip' cannot be used with '--format 7z'",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Discover, repair, restore, and extract what is safe to process.
@@ -162,14 +189,15 @@ pub enum Par3Command {
     Verify(Par3Args),
     /// Rebuild damaged files in the working directory, keeping numbered backups.
     Repair(Par3Args),
-    /// Write a 7z archive and protect it with PAR3 in the same pass.
+    /// Write a 7z or ZIP archive and protect it with PAR3 in the same pass.
     #[cfg(feature = "sevenz")]
     #[command(long_about = "\
-Write a 7z archive of the given files and directories and compute its PAR3
-recovery data from the bytes as they are written, without reading the archive
-back. By default the set is written beside the archive as OUTPUT.par3 and
-recovery volumes; --inside appends it after the archive's end header instead,
-where 7z readers ignore it and PAR3 tools find it.")]
+Write a 7z or ZIP archive of the given files and directories and compute its
+PAR3 recovery data from the bytes as they are written, without reading the
+archive back. By default the set is written beside the archive as OUTPUT.par3
+and recovery volumes; --inside appends it after the archive's end header
+instead, where archive readers ignore it and PAR3 tools find it. With --format
+zip --inside --strict-zip it goes before the ZIP's central directory instead.")]
     Archive(Par3ArchiveArgs),
 }
 
@@ -261,6 +289,9 @@ pub struct Par3ArchiveArgs {
     /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
     #[arg(long, conflicts_with_all = ["block_size", "recovery_count"])]
     pub inside: bool,
+    /// With --format zip --inside, put the set before the central directory so the archive ends with its own end records: strict ZIP readers accept the file, but par3cmdline's own vs and rs may not.
+    #[arg(long, requires = "inside")]
+    pub strict_zip: bool,
     /// Logical block size in bytes for the sibling set; odd sizes are rounded up.
     #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
     pub block_size: u64,

@@ -309,6 +309,41 @@ fn many_small_files_take_zip64_end_records_and_repair() {
     );
     assert!(stdout.contains("protected data was repaired"), "{stdout}");
     assert_eq!(std::fs::read(&archive).unwrap(), original);
+
+    // The strict layout moves the ZIP64 record's offset and the locator's too.
+    let report = self::archive(
+        root,
+        &["--max-files", "70000"],
+        &[
+            "strict/crowd.zip",
+            "crowd",
+            "--inside",
+            "--strict-zip",
+            "-r",
+            "5",
+        ],
+    );
+    let archive = root.join("strict/crowd.zip");
+    let original = std::fs::read(&archive).unwrap();
+    let (data, start) = strict_shape(&archive, &report);
+    assert_eq!(
+        original[original.len() - 98..][..4],
+        [0x50, 0x4b, 0x06, 0x06]
+    );
+    let reader = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+    assert_eq!(reader.len(), 66_067);
+    drop(reader);
+    strict_readers(&archive);
+    damage(&archive, data / 3, 5000);
+    damage(&archive, start + 1000, 200);
+    damage(&archive, original.len() - 50, 50);
+    let stdout = run_ok(
+        Command::new(&par3)
+            .current_dir(root.join("strict"))
+            .args(["rs", "crowd.zip"]),
+    );
+    assert!(stdout.contains("protected data was repaired"), "{stdout}");
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
 }
 
 /// A member over 4 GiB gets ZIP64 sizes and the archive ZIP64 end records.
@@ -356,6 +391,275 @@ fn a_member_over_four_gib_takes_zip64() {
             .args(["vs", "vast.zip"]),
     );
     assert!(stdout.contains("protected data is complete"), "{stdout}");
+    std::fs::remove_file(&archive).unwrap();
+
+    // The strict layout puts the directory past 4 GiB: its offset lives in
+    // the ZIP64 record, which moves with it.
+    let report = self::archive(
+        root,
+        &[],
+        &[
+            "out/vast.zip",
+            "vast.bin",
+            "after.txt",
+            "--level",
+            "0",
+            "--inside",
+            "--strict-zip",
+        ],
+    );
+    let (data, start) = strict_shape(&archive, &report);
+    assert!(data as u64 > size && start > data);
+    let mut reader = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+    assert_eq!(reader.by_name("vast.bin").unwrap().size(), size);
+    drop(reader);
+    strict_readers(&archive);
+    let stdout = run_ok(
+        Command::new(&par3)
+            .current_dir(root.join("out"))
+            .args(["vs", "vast.zip"]),
+    );
+    assert!(stdout.contains("protected data is complete"), "{stdout}");
+}
+
+/// Where a strict archive's parts sit: the end of its members' data, where
+/// the packets start, and the start of its central directory, which its end
+/// records place. Checks that nothing trails the end records. Reads only the
+/// archive's last bytes and the packets' first.
+#[track_caller]
+fn strict_shape(path: &Path, report: &Value) -> (usize, usize) {
+    use std::io::{Seek, SeekFrom};
+    assert_eq!(report["zip_layout"], "strict");
+    let mut file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    // The end records: the plain one, after the ZIP64 record and locator.
+    let mut tail = [0u8; 98];
+    let base = len - tail.len() as u64;
+    file.seek(SeekFrom::Start(base)).unwrap();
+    file.read_exact(&mut tail).unwrap();
+    let u32_at = |at: usize| u64::from(u32::from_le_bytes(tail[at..at + 4].try_into().unwrap()));
+    let u64_at = |at: usize| u64::from_le_bytes(tail[at..at + 8].try_into().unwrap());
+    assert_eq!(u32_at(76), 0x0605_4b50);
+    let (size, start, first) = if u32_at(56) == 0x0706_4b50 {
+        assert_eq!(u64_at(64), base);
+        assert_eq!(u32_at(0), 0x0606_4b50);
+        (u64_at(40), u64_at(48), base)
+    } else {
+        (u32_at(88), u32_at(92), len - 22)
+    };
+    assert_eq!(start + size, first, "the directory ends at its end records");
+    let protected = report["protected_bytes"].as_u64().unwrap();
+    let data = protected - (len - start);
+    let mut magic = [0u8; 8];
+    file.seek(SeekFrom::Start(data)).unwrap();
+    file.read_exact(&mut magic).unwrap();
+    assert_eq!(magic, *b"PAR3\0PKT");
+    (data as usize, start as usize)
+}
+
+/// Run every strict ZIP reader installed here over `archive`: Python's
+/// zipfile, Info-ZIP's unzip, and 7-Zip (`SEVENZ_REFERENCE_BIN` or `7zz`).
+/// Each must accept it without a word about bytes outside the archive.
+#[track_caller]
+fn strict_readers(archive: &Path) {
+    let sevenzip = std::env::var_os("SEVENZ_REFERENCE_BIN").unwrap_or_else(|| "7zz".into());
+    let python = "import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    sys.exit(1 if z.testzip() else 0)";
+    let readers: [(&str, std::ffi::OsString, Vec<std::ffi::OsString>); 3] = [
+        (
+            "python3 zipfile",
+            "python3".into(),
+            vec!["-c".into(), python.into(), archive.into()],
+        ),
+        (
+            "unzip -t",
+            "unzip".into(),
+            vec!["-t".into(), archive.into()],
+        ),
+        ("7-Zip t", sevenzip, vec!["t".into(), archive.into()]),
+    ];
+    for (name, program, args) in readers {
+        let output = match Command::new(&program).args(&args).output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("{name}: not installed, skipped");
+                continue;
+            }
+            Err(error) => panic!("{name}: {error}"),
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(0), "{name}: {text}");
+        for complaint in ["extra bytes", "Warning", "data after the end"] {
+            assert!(!text.contains(complaint), "{name}: {text}");
+        }
+    }
+}
+
+/// `--strict-zip`: the packets go before the central directory, so the file
+/// ends with the archive's own end records and strict readers take it; the
+/// set still protects the archive's bytes and repairs them.
+#[test]
+fn a_strict_zip_ends_with_its_own_directory_and_repairs() {
+    let dir = fixture(150_000);
+    let root = dir.path();
+    let report = archive(
+        root,
+        &[],
+        &with_args(
+            &["out/tidy.zip"],
+            &with_args(&MEMBERS, &["--inside", "--strict-zip", "-r", "10"]),
+        ),
+    );
+    assert_eq!(report["outputs"].as_array().unwrap().len(), 1);
+    let archive = root.join("out/tidy.zip");
+    let original = std::fs::read(&archive).unwrap();
+    let (data, start) = strict_shape(&archive, &report);
+    assert_extracts(root, "out/tidy.zip");
+    strict_readers(&archive);
+
+    let par3 = par3_facade(root);
+    let verify = || {
+        run_ok(
+            Command::new(&par3)
+                .current_dir(root.join("out"))
+                .args(["vs", "tidy.zip"]),
+        )
+    };
+    let repair = || {
+        run_ok(
+            Command::new(&par3)
+                .current_dir(root.join("out"))
+                .args(["rs", "tidy.zip"]),
+        )
+    };
+    let stdout = verify();
+    assert!(stdout.contains("protected data is complete"), "{stdout}");
+    // The packets themselves are not protected data.
+    damage(&archive, data + 100, 50);
+    let stdout = verify();
+    assert!(stdout.contains("protected data is complete"), "{stdout}");
+    std::fs::write(&archive, &original).unwrap();
+
+    // A local header, the central directory, and the end record.
+    damage(&archive, 10, 3000);
+    damage(&archive, start + 10, 30);
+    damage(&archive, original.len() - 12, 12);
+    let stdout = verify();
+    assert!(stdout.contains("damaged"), "{stdout}");
+    let stdout = repair();
+    assert!(stdout.contains("protected data was repaired"), "{stdout}");
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
+    assert!(root.join("out/tidy.zip.1").exists());
+    assert_extracts(root, "out/tidy.zip");
+    strict_readers(&archive);
+
+    // Damage that reaches the packets too: the protected bytes come back,
+    // and the packet run is refilled from the complete packets found.
+    damage(&archive, data - 20, 200);
+    damage(&archive, start + 5, 5);
+    let stdout = repair();
+    assert!(stdout.contains("protected data was repaired"), "{stdout}");
+    let repaired = std::fs::read(&archive).unwrap();
+    assert_eq!(repaired.len(), original.len());
+    assert!(repaired[..data] == original[..data]);
+    assert!(repaired[start..] == original[start..]);
+    let stdout = verify();
+    assert!(stdout.contains("protected data is complete"), "{stdout}");
+    assert_extracts(root, "out/tidy.zip");
+}
+
+/// The default `--inside` ZIP layout is the one written before `--strict-zip`
+/// existed, byte for byte. Pinned modes, pre-1980 times (stored as the DOS
+/// epoch in every time zone) and a fixed Creator text make the archives
+/// reproducible; the fingerprints were taken from the release before.
+#[cfg(unix)]
+#[test]
+fn the_default_inside_zip_layout_is_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn pin(path: &Path) {
+        let directory = path.is_dir();
+        if directory {
+            for entry in std::fs::read_dir(path).unwrap() {
+                pin(&entry.unwrap().path());
+            }
+        }
+        let mode = if directory { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+    }
+    let cases: [(usize, &str, &[&str], &str); 3] = [
+        (150_000, "256", &["--inside", "-r", "10"], GOLDEN_SMALL),
+        (3_000_000, "4", &["--inside", "--level", "0"], GOLDEN_LANES),
+        (3_000_000, "4", &["--inside", "-r", "3"], GOLDEN_DEFLATE),
+    ];
+    for (noise, memory, mode, golden) in cases {
+        let dir = fixture(noise);
+        let root = dir.path();
+        pin(&root.join("in"));
+        let mut args = vec!["--json", "--par3-memory-mib", memory, "par3", "archive"];
+        args.extend(["--format", "zip", "--base-path", "in", "out/same.zip"]);
+        args.extend(MEMBERS);
+        args.extend(mode);
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(root)
+            .env("RARPAR_PAR3_CREATOR_TEXT", "fixed creator")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{mode:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["zip_layout"], "par3cmdline");
+        let bytes = std::fs::read(root.join("out/same.zip")).unwrap();
+        let print: String = par3_rs::fingerprint(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            format!("{} {print}", bytes.len()),
+            golden,
+            "{noise} {mode:?}"
+        );
+    }
+}
+
+const GOLDEN_SMALL: &str = "176593 93c787afe50996a06b0ec36b4eda4efd";
+const GOLDEN_LANES: &str = "3095639 5d20afec50bfa775fa717cc8434be155";
+const GOLDEN_DEFLATE: &str = "3110497 5aae339997cf9e749afd41af1fe678e7";
+
+#[test]
+fn strict_zip_needs_an_inside_zip() {
+    let dir = fixture(1000);
+    let root = dir.path();
+    for (bad, complaint) in [
+        (
+            &["--format", "zip", "--strict-zip"][..],
+            "required arguments were not provided",
+        ),
+        (
+            &["--inside", "--strict-zip"][..],
+            "'--strict-zip' cannot be used with '--format 7z'",
+        ),
+        (
+            &["--format", "7z", "--inside", "--strict-zip"][..],
+            "'--strict-zip' cannot be used with '--format 7z'",
+        ),
+    ] {
+        let mut args = vec!["par3", "archive", "--base-path", "in", "x.zip"];
+        args.extend(MEMBERS);
+        args.extend(bad);
+        let output = rarpar(root, &args);
+        assert_eq!(output.status.code(), Some(2), "{bad:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(complaint), "{bad:?}: {stderr}");
+        assert!(!root.join("x.zip").exists());
+    }
 }
 
 #[test]
@@ -510,6 +814,57 @@ fn zip_sets_match_par3cmdline_both_ways() {
     assert!(stdout.contains("protected data was repaired"), "{stdout}");
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert_extracts(root, "theirs/set.zip");
+
+    // The strict layout, verified and repaired by par3cmdline, which follows
+    // the File packet's chunks wherever the gap is; with the packets damaged
+    // too, its rebuilt file is the one rarpar's rebuild writes.
+    let _ = std::fs::remove_dir_all(root.join("strict"));
+    let report = archive(
+        root,
+        &[],
+        &with_args(
+            &["strict/set.zip"],
+            &with_args(&MEMBERS, &["--inside", "--strict-zip", "-r", "10"]),
+        ),
+    );
+    let path = root.join("strict/set.zip");
+    let original = std::fs::read(&path).unwrap();
+    let (data, start) = strict_shape(&path, &report);
+    let stdout = run_ok(
+        Command::new(&reference)
+            .current_dir(root.join("strict"))
+            .args(["vs", "set.zip"]),
+    );
+    assert!(stdout.contains("protected data is complete"), "{stdout}");
+    damage(&path, 500, 4000);
+    damage(&path, original.len() - 10, 10);
+    run_ok(
+        Command::new(&reference)
+            .current_dir(root.join("strict"))
+            .args(["rs", "set.zip"]),
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let mut rebuilt = Vec::new();
+    for tool in [&reference, &par3] {
+        std::fs::write(&path, &original).unwrap();
+        damage(&path, 500, 4000);
+        damage(&path, data + 3000, 100);
+        damage(&path, start + 20, 20);
+        let _ = std::fs::remove_file(root.join("strict/set.zip.1"));
+        let stdout = run_ok(
+            Command::new(tool)
+                .current_dir(root.join("strict"))
+                .args(["rs", "set.zip"]),
+        );
+        assert!(stdout.contains("protected data was repaired"), "{stdout}");
+        rebuilt.push(std::fs::read(&path).unwrap());
+    }
+    assert!(
+        rebuilt[0] == rebuilt[1],
+        "par3cmdline and rarpar rebuild differently"
+    );
+    assert!(rebuilt[0][..data] == original[..data]);
+    assert!(rebuilt[0][start..] == original[start..]);
 
     // ZIP64 end records: a 98-byte footer, copied whole.
     let dir = crowd();

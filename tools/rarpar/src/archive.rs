@@ -25,7 +25,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use par3_rs::hash::QUICK_HASH_LEN;
@@ -54,7 +54,7 @@ const ZIP_SEARCH: usize = 1024;
 
 /// The end records the zip crate writes without a comment: the end of central
 /// directory record, or that with the ZIP64 record and locator before it.
-const ZIP_FOOTERS: &[u64] = &[22, 98];
+const ZIP_FOOTERS: [u64; 2] = [22, 98];
 
 /// How the set is laid out.
 #[derive(Clone, Copy)]
@@ -64,12 +64,14 @@ enum Plan {
         block_size: u64,
         choice: RecoveryChoice,
     },
-    /// After the end header, as `par3 i -r<n>` lays it out. `footers` are
-    /// the footer lengths the finished archive may end with, until
+    /// After the end header, as `par3 i -r<n>` lays it out, or before a
+    /// ZIP's central directory in the strict layout. `footers` are the footer
+    /// lengths the finished archive may end with (for the strict layout, the
+    /// least and most its central directory and end records may take), until
     /// `params.footer` is set to the one it does.
     Inside {
         params: InsideParams,
-        footers: &'static [u64],
+        footers: [u64; 2],
     },
 }
 
@@ -148,9 +150,31 @@ impl Plan {
             }
             Plan::Inside { params, footers } => {
                 let mut merged: Vec<Candidate> = Vec::new();
-                for &footer in footers {
+                let footers = if params.strict {
+                    // The directory's length moves the block size the search
+                    // picks, so sample its whole range, geometrically.
+                    let [least, most] = footers;
+                    let ratio = (most.max(least) as f64 / least.max(1) as f64).powf(1.0 / 16.0);
+                    let mut at = least.max(1) as f64;
+                    let mut sampled = Vec::with_capacity(18);
+                    for _ in 0..=16 {
+                        sampled.push((at as u64).clamp(least, most.max(least)));
+                        at *= ratio;
+                    }
+                    sampled.push(most.max(least));
+                    sampled.dedup();
+                    sampled
+                } else {
+                    footers.to_vec()
+                };
+                for footer in footers {
                     let params = InsideParams { footer, ..params };
-                    for candidate in Self::inside_candidates(&params, low, high) {
+                    for mut candidate in Self::inside_candidates(&params, low, high) {
+                        if params.strict {
+                            // A directory length between the two can pack
+                            // its tail differently from both: one more block.
+                            candidate.rows += 1;
+                        }
                         match merged
                             .iter_mut()
                             .find(|known| known.block_size == candidate.block_size)
@@ -282,8 +306,13 @@ struct Protect {
     lanes: Vec<Lane>,
     /// How many of the latest bytes the lanes trail by.
     hold: usize,
-    /// The bytes the lanes have not been fed yet, at most `hold`.
+    /// The bytes the lanes have not been fed yet: at most `hold`, or once
+    /// `directory` is set, every byte from then on.
     held: Vec<u8>,
+    /// Set by the strict ZIP layout as the writer starts on its central
+    /// directory: the bytes after it are neither fed nor digested until the
+    /// directory's start is known and its offsets are moved.
+    directory: Arc<AtomicBool>,
     digest: FileDigest,
     len: u64,
     next_prune: u64,
@@ -303,6 +332,11 @@ impl Protect {
     }
 
     fn feed(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.directory.load(Ordering::Relaxed) {
+            self.held.extend_from_slice(data);
+            self.len += data.len() as u64;
+            return Ok(());
+        }
         self.digest.update(data, true);
         self.len += data.len() as u64;
         if self.buffering {
@@ -698,8 +732,15 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
                 creator_packet_size: 48 + CreatorPacket::new(&creator).to_body_bytes().len() as u64,
                 redundancy: u64::from(redundancy),
                 repetition_limit: 0,
+                strict: args.strict_zip,
             },
-            footers: if zip { ZIP_FOOTERS } else { &[0] },
+            footers: if args.strict_zip {
+                [22, 0]
+            } else if zip {
+                ZIP_FOOTERS
+            } else {
+                [0, 0]
+            },
         }
     } else {
         Plan::Sibling {
@@ -761,7 +802,15 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             / 100
             + 4096
     };
+    let plan = match plan {
+        Plan::Inside { params, footers } if params.strict => Plan::Inside {
+            params,
+            footers: [footers[0], header.max(footers[0])],
+        },
+        plan => plan,
+    };
     let consumed = Arc::new(AtomicU64::new(0));
+    let at_directory = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(Mutex::new(None));
     let budget = (cli.par3_memory_mib as u64).saturating_mul(MIB);
     let protect = Protect {
@@ -778,8 +827,13 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         head_cap: budget / 2,
         buffering: true,
         lanes: Vec::new(),
-        hold: if zip && args.inside { ZIP_SEARCH } else { 0 },
+        hold: if zip && args.inside && !args.strict_zip {
+            ZIP_SEARCH
+        } else {
+            0
+        },
         held: Vec::new(),
+        directory: at_directory.clone(),
         digest: FileDigest::new(),
         len: 0,
         next_prune: 0,
@@ -801,7 +855,8 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         protect,
     };
     let written = if zip {
-        write_zip(tee, &members, args.level, &consumed)
+        let mark = args.strict_zip.then_some(&at_directory);
+        write_zip(tee, &members, args.level, &consumed, mark)
     } else {
         write_archive(tee, &members, methods, args.no_solid, &consumed)
     };
@@ -823,9 +878,31 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     } = tee;
     let mut file = file.into_inner().map_err(|error| error.into_error())?;
 
-    // The footer of a ZIP that takes the set inside, found as par3cmdline
-    // finds it, among the bytes the lanes have not been fed.
-    let (footer, plan) = if zip && args.inside {
+    // The strict layout's central directory and end records, held back
+    // from the point the writer started on them; the data before the
+    // directory's start joins what the lanes and the digest were fed.
+    let strict = zip && args.strict_zip;
+    let (footer, plan) = if strict {
+        let before = protect.len - protect.held.len() as u64;
+        let start = zip_directory_start(&protect.held, size)
+            .filter(|&start| start >= before)
+            .ok_or_else(|| {
+                RarparError::Data(
+                    "the ZIP writer's central directory was not where its end records place it"
+                        .into(),
+                )
+            })?;
+        let directory = protect.held.split_off((start - before) as usize);
+        protect.digest.update(&protect.held, true);
+        if protect.buffering {
+            let rest = std::mem::take(&mut protect.held);
+            protect.head.extend_from_slice(&rest);
+        }
+        let length = directory.len() as u64;
+        (directory, plan.with_footer(length))
+    } else if zip && args.inside {
+        // The footer of a ZIP that takes the set inside, found as
+        // par3cmdline finds it, among the bytes the lanes have not been fed.
         let tail: &[u8] = if protect.buffering {
             &protect.head
         } else {
@@ -860,7 +937,9 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         })?
     } else if let Some(mut lane) = protect.take_lane(&geometry) {
         protect.lanes.clear();
-        let held = &protect.held[..protect.held.len() - footer.len()];
+        // The default layout's footer is still among the held bytes.
+        let trailing = if strict { 0 } else { footer.len() };
+        let held = &protect.held[..protect.held.len() - trailing];
         lane.feed(held).map_err(RarparError::Data)?;
         lane
     } else {
@@ -887,6 +966,19 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     protect.head = Vec::new();
     protect.held = Vec::new();
     lane.end_chunk().map_err(RarparError::Data)?;
+    // What follows the packets: the default layout's footer copy, or the
+    // strict layout's central directory with its offsets moved past them.
+    let mut trailer = footer;
+    if strict {
+        let shape = geometry.inside.expect("the strict layout is inside");
+        trailer = move_directory(&trailer, data_end, shape.total_packet_size)?;
+        lane.unprotected(shape.total_packet_size);
+        lane.begin_chunk();
+        lane.feed(&trailer).map_err(RarparError::Data)?;
+        lane.end_chunk().map_err(RarparError::Data)?;
+        protect.digest.update(&trailer, false);
+    }
+    let footer = if strict { Vec::new() } else { trailer.clone() };
     let footer_chunk = if footer.is_empty() {
         None
     } else {
@@ -894,7 +986,9 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         lane.feed(&footer).map_err(RarparError::Data)?;
         Some(lane.end_chunk().map_err(RarparError::Data)?)
     };
-    if let Some(shape) = geometry.inside {
+    if let Some(shape) = geometry.inside
+        && !strict
+    {
         lane.unprotected(shape.total_packet_size);
     }
     if let Some(chunk) = &footer_chunk {
@@ -916,8 +1010,11 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         ));
     }
     let runs = lane.checksum_runs();
+    // par3cmdline leaves an inside set's quick hash out for a file shorter
+    // than the hash covers; the strict layout's first bytes are the data.
+    let hashed = if strict { data_end } else { size };
     let quick_hash = match geometry.inside {
-        Some(_) if size < QUICK_HASH_LEN as u64 => 0,
+        Some(_) if hashed < QUICK_HASH_LEN as u64 => 0,
         _ => protect.digest.quick_hash(),
     };
     let spec = SetSpec {
@@ -943,7 +1040,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
 
     let mut written = vec![output.clone()];
     if let Some(shape) = geometry.inside {
-        file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(if strict { data_end } else { size }))?;
         let mut out = BufWriter::new(&mut file);
         let packets = write_inside(&mut out, &set, rows, 0, shape.repeat)?;
         if packets != shape.total_packet_size {
@@ -954,7 +1051,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
                 shape.total_packet_size
             )));
         }
-        out.write_all(&footer)?;
+        out.write_all(&trailer)?;
         out.flush()?;
         drop(out);
     }
@@ -972,6 +1069,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         json!({"operation":"par3_archive","success":true,"dry_run":false,
             "archive":output,"format":format_name(args.format),
             "mode":if args.inside {"inside"} else {"sibling"},
+            "zip_layout":(zip && args.inside).then_some(if strict {"strict"} else {"par3cmdline"}),
             "outputs":written,"members":members.len(),"input_bytes":input_bytes,
             "archive_bytes":archive_bytes,"protected_bytes":size,
             "set_id":set.set_id.to_string(),"block_size":geometry.block_size,
@@ -1031,6 +1129,104 @@ fn zip_footer(tail: &[u8], size: u64) -> Option<u64> {
         offset -= 1;
     }
     None
+}
+
+const EOCD: u32 = 0x0605_4b50;
+const ZIP64_EOCD: u32 = 0x0606_4b50;
+const ZIP64_LOCATOR: u32 = 0x0706_4b50;
+/// End of central directory record, without a comment.
+const EOCD_LEN: usize = 22;
+const LOCATOR_LEN: usize = 20;
+
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Where the ZIP64 end of central directory record sits in `tail`, the last
+/// bytes of a `size`-byte ZIP that ends with a locator and an end record.
+fn zip64_record(tail: &[u8], size: u64) -> Option<usize> {
+    let locator = tail.len().checked_sub(EOCD_LEN + LOCATOR_LEN)?;
+    if le_u32(tail, locator)? != ZIP64_LOCATOR {
+        return None;
+    }
+    let record = le_u64(tail, locator + 8)?;
+    let at = usize::try_from(record.checked_sub(size - tail.len() as u64)?).ok()?;
+    (le_u32(tail, at)? == ZIP64_EOCD).then_some(at)
+}
+
+/// The start of the central directory of a `size`-byte ZIP whose last bytes
+/// are `tail`, which hold the directory and its end records, as the end
+/// records give it. The zip crate writes no archive comment, so the end of
+/// central directory record is the file's last 22 bytes.
+fn zip_directory_start(tail: &[u8], size: u64) -> Option<u64> {
+    let end = tail.len().checked_sub(EOCD_LEN)?;
+    if le_u32(tail, end)? != EOCD || tail[end + 20..] != [0, 0] {
+        return None;
+    }
+    let (directory, start) = match zip64_record(tail, size) {
+        Some(record) => (le_u64(tail, record + 40)?, le_u64(tail, record + 48)?),
+        None => (
+            u64::from(le_u32(tail, end + 12)?),
+            u64::from(le_u32(tail, end + 16)?),
+        ),
+    };
+    // The directory runs up to the first end record.
+    let first = zip64_record(tail, size).unwrap_or(end);
+    (start.checked_add(directory)? == size - tail.len() as u64 + first as u64).then_some(start)
+}
+
+/// The strict layout's central directory and end records, `records`, with
+/// the directory moved from `start` to `start + shift`, past the packets put
+/// before it. The members' own offsets do not change.
+fn move_directory(records: &[u8], start: u64, shift: u64) -> Result<Vec<u8>, RarparError> {
+    let malformed = || RarparError::Data("the ZIP writer's end records are malformed".into());
+    let mut out = records.to_vec();
+    let size = start + records.len() as u64;
+    let end = out.len().checked_sub(EOCD_LEN).ok_or_else(malformed)?;
+    let moved = start + shift;
+    let put32 = |out: &mut [u8], at: usize, value: u32| {
+        out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    let put64 = |out: &mut [u8], at: usize, value: u64| {
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    let short = le_u32(&out, end + 16).ok_or_else(malformed)?;
+    match zip64_record(&out, size) {
+        Some(record) => {
+            if le_u64(&out, record + 48) != Some(start) {
+                return Err(malformed());
+            }
+            put64(&mut out, record + 48, moved);
+            let locator = end - LOCATOR_LEN;
+            let at = le_u64(&out, locator + 8).ok_or_else(malformed)?;
+            put64(&mut out, locator + 8, at + shift);
+            if short != u32::MAX {
+                // The short field holds the offset while it fits.
+                put32(&mut out, end + 16, u32::try_from(moved).unwrap_or(u32::MAX));
+            }
+        }
+        None => {
+            if u64::from(short) != start {
+                return Err(malformed());
+            }
+            let moved = u32::try_from(moved)
+                .ok()
+                .filter(|&moved| moved != u32::MAX)
+                .ok_or_else(|| {
+                    RarparError::Resource(
+                        "with the set before it, this ZIP's central directory would start past \
+                         4 GiB, which its end records cannot say without ZIP64; drop --strict-zip"
+                            .into(),
+                    )
+                })?;
+            put32(&mut out, end + 16, moved);
+        }
+    }
+    Ok(out)
 }
 
 /// A lane for exactly `geometry`, fed by `feed`.
@@ -1114,11 +1310,17 @@ fn write_zip(
     members: &[Member],
     level: u32,
     consumed: &Arc<AtomicU64>,
+    directory: Option<&Arc<AtomicBool>>,
 ) -> Result<Tee, RarparError> {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
-    let mut writer = ZipWriter::new_stream(tee);
+    let large = Arc::new(AtomicBool::new(false));
+    let mut writer = ZipWriter::new_stream(LocalHeaders {
+        inner: tee,
+        large: large.clone(),
+        held: Vec::new(),
+    });
     let mut buffer = vec![0u8; 256 << 10];
     for member in members {
         let meta = std::fs::metadata(&member.path)?;
@@ -1143,6 +1345,7 @@ fn write_zip(
                 .map_err(zip_error)?;
             continue;
         }
+        large.store(member.size >= ZIP64_MEMBER, Ordering::Relaxed);
         writer
             .start_file(member.name.as_str(), options)
             .map_err(zip_error)?;
@@ -1160,9 +1363,71 @@ fn write_zip(
             writer.write_all(&buffer[..read])?;
         }
     }
-    let mut tee = writer.finish().map_err(zip_error)?.into_inner();
+    if let Some(directory) = directory {
+        // Everything written from here on, the last member's end, its
+        // descriptor and the central directory, is held back whole.
+        directory.store(true, Ordering::Relaxed);
+    }
+    let mut tee = writer.finish().map_err(zip_error)?.into_inner().inner;
     tee.flush()?;
     Ok(tee)
+}
+
+/// Passes the zip crate's output through, fixing one field on the way. A
+/// streamed ZIP64 member's local header carries its sizes in a data
+/// descriptor, with zero in the header's own size fields, but the zip crate
+/// fills the header's ZIP64 sizes with all-ones placeholders it never goes
+/// back to. APPNOTE 4.5.3 wants zeros there, and 7-Zip warns on the
+/// mismatch. While `large` is set, the next local header is held until
+/// complete and its placeholders are zeroed before anything sees them.
+struct LocalHeaders<W> {
+    inner: W,
+    large: Arc<AtomicBool>,
+    held: Vec<u8>,
+}
+
+impl<W: Write> Write for LocalHeaders<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.large.load(Ordering::Relaxed) {
+            return self.inner.write(buf);
+        }
+        self.held.extend_from_slice(buf);
+        let header = &mut self.held;
+        if header.len() >= 4 && header[..4] != *b"PK\x03\x04" {
+            self.large.store(false, Ordering::Relaxed);
+        } else if header.len() >= 30 {
+            let name = usize::from(u16::from_le_bytes([header[26], header[27]]));
+            let extra = usize::from(u16::from_le_bytes([header[28], header[29]]));
+            if header.len() < 30 + name + extra {
+                return Ok(buf.len());
+            }
+            self.large.store(false, Ordering::Relaxed);
+            let descriptor = header[6] & 8 != 0 && header[18..26] == [0; 8];
+            let mut at = 30 + name;
+            while descriptor && at + 4 <= 30 + name + extra {
+                let id = u16::from_le_bytes([header[at], header[at + 1]]);
+                let len = usize::from(u16::from_le_bytes([header[at + 2], header[at + 3]]));
+                let fields = at + 4..at + 4 + len;
+                if fields.end > 30 + name + extra {
+                    break;
+                }
+                if id == 1 && len == 16 && header[fields.clone()].iter().all(|&b| b == 0xFF) {
+                    header[fields].fill(0);
+                    break;
+                }
+                at += 4 + len;
+            }
+        } else {
+            return Ok(buf.len());
+        }
+        let held = std::mem::take(&mut self.held);
+        self.inner.write_all(&held)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A file's modification time as a ZIP stores it: local time, clamped to the
@@ -1207,7 +1472,41 @@ fn archive_error(error: sevenz_turbo::Error) -> RarparError {
 mod tests {
     use super::*;
 
-    fn inside(redundancy: u64, footers: &'static [u64]) -> Plan {
+    #[test]
+    fn a_streamed_zip64_local_header_gets_zero_sizes() {
+        let mut header = b"PK\x03\x04\x2d\x00\x08\x00".to_vec();
+        header.extend_from_slice(&[0; 18]);
+        header.extend_from_slice(&[4, 0, 20, 0]);
+        header.extend_from_slice(b"vast");
+        header.extend_from_slice(&[1, 0, 16, 0]);
+        header.extend_from_slice(&[0xFF; 16]);
+        let large = Arc::new(AtomicBool::new(true));
+        let mut writer = LocalHeaders {
+            inner: Vec::new(),
+            large: large.clone(),
+            held: Vec::new(),
+        };
+        for piece in header.chunks(7) {
+            writer.write_all(piece).unwrap();
+        }
+        writer.write_all(&[0xFF; 3]).unwrap();
+        let mut expected = header.clone();
+        expected[38..54].fill(0);
+        expected.extend_from_slice(&[0xFF; 3]);
+        assert_eq!(writer.inner, expected);
+        assert!(!large.load(Ordering::Relaxed));
+
+        // Unarmed, the same bytes pass through untouched.
+        let mut writer = LocalHeaders {
+            inner: Vec::new(),
+            large,
+            held: Vec::new(),
+        };
+        writer.write_all(&header).unwrap();
+        assert_eq!(writer.inner, header);
+    }
+
+    fn inside(redundancy: u64, footers: [u64; 2], strict: bool) -> Plan {
         Plan::Inside {
             params: InsideParams {
                 file_size: 0,
@@ -1216,6 +1515,7 @@ mod tests {
                 creator_packet_size: 120,
                 redundancy,
                 repetition_limit: 0,
+                strict,
             },
             footers,
         }
@@ -1226,18 +1526,27 @@ mod tests {
     #[test]
     fn candidates_cover_every_length_in_their_window() {
         let plans = [0, 1, 10, 40, 250]
-            .map(|redundancy| (redundancy, &[0u64][..]))
+            .map(|redundancy| (redundancy, [0u64, 0], false))
             .into_iter()
-            .chain([0, 10, 250].map(|redundancy| (redundancy, ZIP_FOOTERS)));
-        for (redundancy, footers) in plans {
-            let plan = inside(redundancy, footers);
+            .chain([0, 10, 250].map(|redundancy| (redundancy, ZIP_FOOTERS, false)))
+            .chain([0, 10, 250].map(|redundancy| (redundancy, [22, 70_000], true)));
+        for (redundancy, footers, strict) in plans {
+            let plan = inside(redundancy, footers, strict);
+            // The strict layout's directory may take any length in its range.
+            let lengths: Vec<u64> = if strict {
+                vec![
+                    22, 23, 63, 64, 65, 1000, 4097, 33_333, 65_536, 69_999, 70_000,
+                ]
+            } else {
+                footers.to_vec()
+            };
             let mut low = 1u64 << 12;
             while low < 1 << 34 {
                 for spread in [0u64, 1, 37, 4096, low / 100, low / 3, low] {
                     let high = low + spread;
                     let candidates = plan.candidates(low, high);
                     for size in [low, low + spread / 3, low + spread / 2, high] {
-                        for &footer in footers {
+                        for &footer in &lengths {
                             let geometry = plan.with_footer(footer).geometry(size);
                             let candidate = candidates
                                 .iter()
@@ -1296,6 +1605,7 @@ mod tests {
             lanes: Vec::new(),
             hold: 0,
             held: Vec::new(),
+            directory: Arc::new(AtomicBool::new(false)),
             digest: FileDigest::new(),
             len: 0,
             next_prune: 0,
@@ -1309,5 +1619,70 @@ mod tests {
         }
         let geometry = plan.geometry(protect.len);
         assert!(protect.take_lane(&geometry).is_none());
+    }
+
+    /// A central directory of one entry, then its end records: the plain end
+    /// record, or the ZIP64 record, locator and plain record.
+    fn records(start: u64, zip64: bool) -> Vec<u8> {
+        let mut out = b"PK\x01\x02".to_vec();
+        out.resize(46 + 4, b'n');
+        let directory = out.len() as u64;
+        if zip64 {
+            out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+            out.extend_from_slice(&44u64.to_le_bytes());
+            out.extend_from_slice(&[0; 28]);
+            out.extend_from_slice(&directory.to_le_bytes());
+            out.extend_from_slice(&start.to_le_bytes());
+            out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(start + directory).to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+        }
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&(directory as u32).to_le_bytes());
+        let short = if zip64 && start >= u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            start as u32
+        };
+        out.extend_from_slice(&short.to_le_bytes());
+        out.extend_from_slice(&[0; 2]);
+        out
+    }
+
+    #[test]
+    fn the_strict_layout_moves_the_directory_past_the_packets() {
+        // Plain end record: the directory's offset moves by the packets.
+        let plain = records(1000, false);
+        let size = 1000 + plain.len() as u64;
+        assert_eq!(zip_directory_start(&plain, size), Some(1000));
+        let moved = move_directory(&plain, 1000, 777).unwrap();
+        assert_eq!(zip_directory_start(&moved, size + 777), Some(1777));
+        assert_eq!(moved[..50], plain[..50]);
+
+        // ZIP64: the record's offset and the locator's move; the short field
+        // takes the sentinel once the offset no longer fits it.
+        let zip64 = records(5000, true);
+        let size = 5000 + zip64.len() as u64;
+        assert_eq!(zip_directory_start(&zip64, size), Some(5000));
+        let moved = move_directory(&zip64, 5000, 300).unwrap();
+        assert_eq!(zip_directory_start(&moved, size + 300), Some(5300));
+        assert_eq!(le_u32(&moved, moved.len() - 6), Some(5300));
+        let far = u64::from(u32::MAX) - 100;
+        let moved = move_directory(&zip64, 5000, far).unwrap();
+        assert_eq!(zip_directory_start(&moved, size + far), Some(5000 + far));
+        assert_eq!(le_u32(&moved, moved.len() - 6), Some(u32::MAX));
+
+        // Without ZIP64 records, an offset past 4 GiB is refused.
+        assert!(matches!(
+            move_directory(&plain, 1000, u64::from(u32::MAX) - 1000),
+            Err(RarparError::Resource(_))
+        ));
+        assert!(move_directory(&plain, 1000, u64::from(u32::MAX) - 1001).is_ok());
+
+        // End records that do not account for the directory are not taken.
+        assert_eq!(zip_directory_start(&plain, size + 1), None);
+        assert!(move_directory(&plain, 999, 10).is_err());
     }
 }

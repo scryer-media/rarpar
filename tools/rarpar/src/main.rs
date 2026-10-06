@@ -46,6 +46,9 @@ fn main() -> ExitCode {
 
     let parse_args = std::iter::once(program).chain(args).collect::<Vec<_>>();
     let cli = Cli::parse_from(parse_args);
+    if let Err(error) = cli.validate() {
+        error.exit();
+    }
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {

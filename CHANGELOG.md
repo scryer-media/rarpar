@@ -30,7 +30,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   encryption. Deflate runs as one stream per member, on one thread. The
   writer streams, with data descriptors, so no byte is rewritten; members
   larger than 4 GiB less 16 MiB get ZIP64 sizes from the start, and the archive gets the
-  ZIP64 end records when it passes 4 GiB or 65,535 entries. Directories are
+  ZIP64 end records when it passes 4 GiB or 65,535 entries. Such a member's
+  local header carries zeros in its ZIP64 sizes, as APPNOTE 4.5.3 asks of a
+  member with a data descriptor; the zip crate's streaming writer leaves
+  all-ones placeholders there, which 7-Zip reports as a headers warning, so
+  rarpar zeroes them as the header passes. Directories are
   stored with a trailing slash, and every entry keeps its modification time
   (local time, 1980 to 2107) and, on Unix, its permission bits. `--filter`
   and `--no-solid` are 7z only and refused with `--format zip`. The sibling
@@ -53,6 +57,21 @@ documented in each crate's own changelog so those notes ship with the crate.
     would disagree (a data tail under 40 bytes ahead of whole footer
     blocks, which only a block size of 98 bytes or less can produce) is refused
     rather than written.
+- `--strict-zip`, with `--format zip --inside` only (otherwise a usage
+  error, exit code 2), lays the set out as the PAR3 specification's
+  PAR-inside section sketches instead: the members' data, then the packets
+  as an unprotected chunk, then the central directory and end records as
+  the last protected chunk, with the directory's offset (and, with ZIP64,
+  the ZIP64 record's and locator's) moved past the packets. The file ends
+  with a single valid central directory and end records and nothing after
+  them: the zip crate, Python's `zipfile`, Info-ZIP `unzip -t` (exit code 0)
+  and 7-Zip (`t`, exit code 0, no warning) all read it, and so do
+  par3cmdline's `vs` and `rs`, which follow the File packet's chunks. The
+  set protects the archive's bytes as a strict reader sees them; the
+  directory it protects is the moved one, so it is not copied. Without the
+  ZIP64 end records, a directory that the packets would push past 4 GiB is
+  refused. `--json` output names the layout as `zip_layout`, `par3cmdline`
+  or `strict`. The default `--inside` layout is unchanged, byte for byte.
 - The par3cmdline front end now runs `vs` and `rs` on ZIP and 7z files that
   carry their PAR3 packets inside them, where 0.6.0 refused them:
   - `vs` judges such a file by its protected chunks alone, as par3cmdline
@@ -63,6 +82,13 @@ documented in each crate's own changelog so those notes ship with the crate.
     par3cmdline's `copy_inside_data` does: every complete packet still found
     in the damaged file, in file order, then zeros. The damaged file is kept
     as `<name>.1`.
+  - The layout comes from the File packet's chunks, never from bytes that
+    may be damaged: a single unprotected chunk that ends the file, or is
+    followed only by a copy of the chunk before it, is par3cmdline's
+    layout and is restored through par3-rs's self-repair; any other single
+    gap, such as `--strict-zip`'s, is rebuilt by rarpar from the recovery
+    blocks, checked against the File packet's fingerprint, and gets the
+    same packet refill. par3cmdline's `rs` writes the same file.
   - `i`, `ti` and `d` are still refused: they write recovery data, which is
     left to `rarpar par3 archive --inside`.
 - Three par3cmdline front-end lines that `v` and `r` share with `vs` and
