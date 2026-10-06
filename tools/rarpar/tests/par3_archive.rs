@@ -256,6 +256,30 @@ fn filters_and_non_solid_archives_extract() {
 }
 
 #[test]
+fn the_text_report_names_the_archive_and_its_set() {
+    let dir = fixture(30_000);
+    let root = dir.path();
+    let output = rarpar(
+        root,
+        &with_args(
+            &["par3", "archive", "--base-path", "in", "set.7z"],
+            &MEMBERS,
+        ),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let size = std::fs::metadata(root.join("set.7z")).unwrap().len();
+    assert_eq!(
+        text,
+        format!(
+            "par3_archive: created\n  set.7z: 8 member(s), {size} bytes, {size} protected\n  \
+             1 block(s) of 1048576 bytes, 1 recovery block(s), PAR3 set sibling\n  \
+             set.7z\n  set.par3\n  set.vol0+1.par3\n"
+        )
+    );
+}
+
+#[test]
 fn existing_outputs_and_bad_switches_are_refused() {
     let dir = fixture(1000);
     let root = dir.path();

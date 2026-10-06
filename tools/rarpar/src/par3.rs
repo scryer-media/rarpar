@@ -474,7 +474,27 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                 ""
             }
         );
-        if let Some(outputs) = report["outputs"].as_array() {
+        if report["operation"] == "par3_archive" {
+            if report["dry_run"] != true {
+                println!(
+                    "  {}: {} member(s), {} bytes, {} protected",
+                    report["archive"].as_str().unwrap_or_default(),
+                    report["members"],
+                    report["archive_bytes"],
+                    report["protected_bytes"]
+                );
+                println!(
+                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    report["blocks"],
+                    report["block_size"],
+                    report["recovery_blocks"],
+                    report["mode"].as_str().unwrap_or_default()
+                );
+            }
+            for path in report["outputs"].as_array().into_iter().flatten() {
+                println!("  {}", path.as_str().unwrap_or_default());
+            }
+        } else if let Some(outputs) = report["outputs"].as_array() {
             println!(
                 "  {} block(s), {} cohort(s), {} scratch bytes",
                 report["blocks"], report["cohorts"], report["scratch_bytes"]
