@@ -19,6 +19,24 @@ pub fn mul(mut left: u8, mut right: u8) -> u8 {
     result
 }
 
+/// The 8×8 bit matrix `gf2p8affineqb` applies for the byte map that sends
+/// input bit `col` to `images[col]`: byte `7 - row` of the qword is output
+/// bit `row`, and its bit `col` is bit `row` of `images[col]`. Read with byte
+/// `col` as row `col`, the images are that matrix transposed and in reverse
+/// byte order, so three delta swaps and a byte swap build it.
+pub(crate) fn affine_from_images(images: [u8; 8]) -> u64 {
+    let mut bits = u64::from_le_bytes(images);
+    for (shift, mask) in [
+        (7, 0x00aa_00aa_00aa_00aa_u64),
+        (14, 0x0000_cccc_0000_cccc),
+        (28, 0x0000_0000_f0f0_f0f0),
+    ] {
+        let swap = (bits ^ (bits >> shift)) & mask;
+        bits ^= swap ^ (swap << shift);
+    }
+    bits.swap_bytes()
+}
+
 impl MulPlan {
     /// Precompute the two 16-entry tables for a coefficient.
     #[must_use]
@@ -189,6 +207,15 @@ impl MulPlan {
         self.low[(value & 15) as usize] ^ self.high[(value >> 4) as usize]
     }
 
+    /// This plan's map as the 8×8 bit matrix `gf2p8affineqb` applies (see
+    /// [`affine_from_images`]), built from the table entries of the eight unit
+    /// bits. Like the tables, it never consults the polynomial.
+    #[cfg(any(target_arch = "x86_64", test))]
+    pub(crate) fn affine(&self) -> u64 {
+        let [l, h] = [&self.low, &self.high];
+        affine_from_images([l[1], l[2], l[4], l[8], h[1], h[2], h[4], h[8]])
+    }
+
     /// One additive-FFT butterfly per byte on the portable table walk: forward
     /// `left ^= map(right); right ^= left`, inverse `right ^= left;
     /// left ^= map(right)`. Rows must have equal lengths.
@@ -336,6 +363,45 @@ impl MulPlan {
         at + unsafe { self.butterfly_ssse3::<INVERSE>(&mut left[at..], &mut right[at..]) }
     }
 
+    /// [`Self::butterfly_scalar`] on GFNI, one affine transform per 32 bytes
+    /// with `affine`, this plan's [`Self::affine`] matrix; returns the bytes
+    /// processed.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available and the rows must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "gfni,avx2")]
+    pub(crate) unsafe fn butterfly_gfni<const INVERSE: bool>(
+        &self,
+        affine: u64,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let m = fused_x86::matrix256(affine);
+        let mut at = 0;
+        while left.len() - at >= 32 {
+            // SAFETY: both rows hold 32 bytes from `at`.
+            unsafe {
+                let mut l = _mm256_loadu_si256(left.as_ptr().add(at).cast());
+                let mut r = _mm256_loadu_si256(right.as_ptr().add(at).cast());
+                crate::gf_simd::fused_butterfly!(
+                    INVERSE,
+                    l,
+                    r,
+                    &m,
+                    _mm256_xor_si256,
+                    fused_x86::affine256
+                );
+                _mm256_storeu_si256(left.as_mut_ptr().add(at).cast(), l);
+                _mm256_storeu_si256(right.as_mut_ptr().add(at).cast(), r);
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe { self.butterfly_ssse3::<INVERSE>(&mut left[at..], &mut right[at..]) }
+    }
+
     /// [`Self::butterfly_scalar`] on SSSE3; returns the bytes processed.
     ///
     /// # Safety
@@ -404,6 +470,59 @@ impl MulPlan {
                     &inner_b,
                     _mm256_xor_si256,
                     fused_x86::map256
+                );
+                _mm256_storeu_si256(ra.as_mut_ptr().add(at).cast(), a);
+                _mm256_storeu_si256(rb.as_mut_ptr().add(at).cast(), b);
+                _mm256_storeu_si256(rc.as_mut_ptr().add(at).cast(), c);
+                _mm256_storeu_si256(rd.as_mut_ptr().add(at).cast(), d);
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe {
+            Self::radix4_ssse3::<INVERSE>(
+                plans,
+                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
+            )
+        }
+    }
+
+    /// [`Self::radix4_scalar`] on GFNI; `affine` holds the [`Self::affine`]
+    /// matrices of `plans`, in the same order. Returns the bytes processed.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available and all four rows must have equal
+    /// lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "gfni,avx2")]
+    pub(crate) unsafe fn radix4_gfni<const INVERSE: bool>(
+        plans: [&Self; 3],
+        affine: [u64; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let [outer, inner_a, inner_b] = [
+            fused_x86::matrix256(affine[0]),
+            fused_x86::matrix256(affine[1]),
+            fused_x86::matrix256(affine[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 32 {
+            // SAFETY: all four rows hold 32 bytes from `at`.
+            unsafe {
+                let mut a = _mm256_loadu_si256(ra.as_ptr().add(at).cast());
+                let mut b = _mm256_loadu_si256(rb.as_ptr().add(at).cast());
+                let mut c = _mm256_loadu_si256(rc.as_ptr().add(at).cast());
+                let mut d = _mm256_loadu_si256(rd.as_ptr().add(at).cast());
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    _mm256_xor_si256,
+                    fused_x86::affine256
                 );
                 _mm256_storeu_si256(ra.as_mut_ptr().add(at).cast(), a);
                 _mm256_storeu_si256(rb.as_mut_ptr().add(at).cast(), b);
@@ -517,6 +636,64 @@ impl MulPlan {
         }
         // SAFETY: AVX2 implies SSSE3.
         at + unsafe { self.map_ssse3(&mut row[at..]) }
+    }
+
+    /// [`Self::map_scalar`] on GFNI with `affine`, this plan's
+    /// [`Self::affine`] matrix; returns the bytes processed.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "gfni,avx2")]
+    pub(crate) unsafe fn map_gfni(&self, affine: u64, row: &mut [u8]) -> usize {
+        use std::arch::x86_64::*;
+        let m = fused_x86::matrix256(affine);
+        let mut at = 0;
+        while row.len() - at >= 32 {
+            // SAFETY: the row holds 32 bytes from `at`.
+            unsafe {
+                let value = _mm256_loadu_si256(row.as_ptr().add(at).cast());
+                _mm256_storeu_si256(
+                    row.as_mut_ptr().add(at).cast(),
+                    fused_x86::affine256(&m, value),
+                );
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3.
+        at + unsafe { self.map_ssse3(&mut row[at..]) }
+    }
+
+    /// [`Self::scalar`] on GFNI with `affine`, this plan's [`Self::affine`]
+    /// matrix: one affine transform per 32 bytes, the remainder on SSSE3.
+    ///
+    /// # Safety
+    /// GFNI and AVX2 must be available and the slices must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "gfni,avx2")]
+    pub(crate) unsafe fn accumulate_gfni(
+        &self,
+        affine: u64,
+        source: &[u8],
+        destination: &mut [u8],
+    ) {
+        use std::arch::x86_64::*;
+        let m = fused_x86::matrix256(affine);
+        let mut at = 0;
+        while source.len() - at >= 32 {
+            // SAFETY: both slices hold 32 bytes from `at`.
+            unsafe {
+                let value = _mm256_loadu_si256(source.as_ptr().add(at).cast());
+                let previous = _mm256_loadu_si256(destination.as_ptr().add(at).cast());
+                _mm256_storeu_si256(
+                    destination.as_mut_ptr().add(at).cast(),
+                    _mm256_xor_si256(previous, fused_x86::affine256(&m, value)),
+                );
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        unsafe { self.ssse3(&source[at..], &mut destination[at..]) };
     }
 
     /// [`Self::map_scalar`] on SSSE3; returns the bytes processed.
@@ -662,6 +839,21 @@ mod fused_x86 {
         )
     }
 
+    /// A [`MulPlan::affine`] matrix in every qword lane.
+    #[target_feature(enable = "gfni,avx2")]
+    #[inline]
+    pub(super) fn matrix256(affine: u64) -> __m256i {
+        _mm256_set1_epi64x(affine as i64)
+    }
+
+    /// The map of the fused GFNI kernels: one affine transform replaces the
+    /// nibble split, both shuffles and their XOR.
+    #[target_feature(enable = "gfni,avx2")]
+    #[inline]
+    pub(super) fn affine256(matrix: &__m256i, value: __m256i) -> __m256i {
+        _mm256_gf2p8affine_epi64_epi8::<0>(value, *matrix)
+    }
+
     #[target_feature(enable = "ssse3")]
     #[inline]
     pub(super) fn tables128(plan: &MulPlan) -> (__m128i, __m128i) {
@@ -707,6 +899,69 @@ mod tests {
                     .collect();
                 plan.accumulate(&source[1..1 + length], &mut actual);
                 assert_eq!(actual, expected, "factor {factor}, length {length}");
+            }
+        }
+    }
+
+    /// `gf2p8affineqb` on one byte, as Intel defines it: output bit `row` is
+    /// the parity of the input masked by byte `7 - row` of the matrix.
+    fn affine_scalar(matrix: u64, value: u8) -> u8 {
+        (0..8).fold(0, |out, row| {
+            let mask = (matrix >> ((7 - row) * 8)) as u8;
+            out | ((((mask & value).count_ones() & 1) as u8) << row)
+        })
+    }
+
+    #[test]
+    fn affine_matrices_reproduce_every_plan_on_every_byte() {
+        for factor in 0..=255u8 {
+            let plan = MulPlan::new(factor);
+            let matrix = plan.affine();
+            for value in 0..=255u8 {
+                assert_eq!(
+                    affine_scalar(matrix, value),
+                    mul(value, factor),
+                    "factor {factor}, value {value}"
+                );
+            }
+        }
+    }
+
+    /// The GFNI kernels against the scalar tier for every factor, on rows
+    /// that hold every byte value, at lengths either side of each vector
+    /// width and an unaligned start.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gfni_kernels_match_the_scalar_tier_for_every_factor() {
+        if !(std::arch::is_x86_feature_detected!("gfni")
+            && std::arch::is_x86_feature_detected!("avx2"))
+        {
+            return;
+        }
+        let source: Vec<u8> = (0..1100u32).map(|i| (i * 167 + i / 256) as u8).collect();
+        let seed: Vec<u8> = (0..1100u32).map(|i| (i * 89 + 5) as u8).collect();
+        for factor in 0..=255u8 {
+            let plan = MulPlan::new(factor);
+            let affine = plan.affine();
+            for offset in [0usize, 1] {
+                for length in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256, 1025] {
+                    let what = format!("factor {factor}, offset {offset}, length {length}");
+                    let input = &source[offset..offset + length];
+                    let mut actual = seed[offset..offset + length].to_vec();
+                    let mut expected = actual.clone();
+                    // SAFETY: GFNI and AVX2 were detected; equal lengths.
+                    unsafe { plan.accumulate_gfni(affine, input, &mut actual) };
+                    plan.scalar(input, &mut expected);
+                    assert_eq!(actual, expected, "accumulate, {what}");
+
+                    let mut actual = input.to_vec();
+                    let mut expected = actual.clone();
+                    // SAFETY: as above.
+                    let done = unsafe { plan.map_gfni(affine, &mut actual) };
+                    plan.map_scalar(&mut actual[done..]);
+                    plan.map_scalar(&mut expected);
+                    assert_eq!(actual, expected, "map, {what}");
+                }
             }
         }
     }

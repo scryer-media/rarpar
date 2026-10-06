@@ -208,6 +208,9 @@
   rows. The formal derivative stores each row once and splits its columns
   across the worker pool. Decode codec time falls 8–22% at one to eight
   workers on both fields; carriers and repaired bytes are identical.
+- On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
+  transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
+  0.4.8); carriers and repaired bytes are identical.
 
 ## 0.4.3
 

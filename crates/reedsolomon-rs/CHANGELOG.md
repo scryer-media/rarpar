@@ -25,9 +25,22 @@
   copy or product instead of a butterfly. `derivative_in_pool` and
   `derivative_u8_in_pool` store each row once and split columns across the
   pool; the sequential derivative also stores each row once.
+- On x86_64 hosts with GFNI and AVX2, the AVX2 tier of `LinearMap8` and
+  `LinearMap16` (multiply-accumulate, map, fused butterfly and radix-4) runs
+  as `vgf2p8affineqb` affine transforms. Each byte map is one 8x8 bit matrix
+  built from the images of the eight unit bits, so an 8-bit map is one
+  instruction per 32 bytes instead of two shuffles and the nibble masking, and
+  a 16-bit map is four instead of eight shuffles. `LinearKernel` still reports
+  `Avx2`; the new `gf_simd::linear_uses_gfni` says whether the affine form is
+  in use, and `WEAVER_LINEAR_GFNI=0` pins the shuffle form. Output is
+  bit-identical.
+- The formal derivative's column XOR runs as one AVX2 pass on x86_64: every
+  source folds into a register pair per 64 bytes and the row stores once, on
+  the sequential and pooled paths. aarch64 is unchanged.
 - Benches: `kernel_ceiling` reports single-thread GiB/s for the GF(2^8) and
   GF(2^16) multiply-accumulate kernels, the fused batch kernels and memory
-  baselines; `fft_transform` gains the u8-vs-u16, pooled and known-zero groups.
+  baselines; `fft_transform` gains the u8-vs-u16, pooled and known-zero groups
+  and prints which linear kernel runs.
 
 ## 0.4.7
 
