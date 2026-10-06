@@ -95,6 +95,11 @@ pub enum FftInput {
     Recovery(usize),
 }
 
+/// A consumer of decoded input stripes, as [`FftCodec::decode_with`] hands
+/// them out: the row, the stripe's byte offset within the block, and the
+/// bytes the input callback filled.
+pub type FftConsumer<'a> = dyn Fn(FftInput, u64, &[u8]) -> EngineResult<()> + Sync + 'a;
+
 /// Butterflies one full additive transform over `rows` rows performs.
 fn butterflies(rows: usize) -> u64 {
     (rows as u64 / 2) * u64::from(rows.trailing_zeros())
@@ -257,15 +262,18 @@ impl ForwardPlan {
 /// Symbol storage for a cohort's transform rows.
 ///
 /// GF(2^8) rows are `u8`: a row is the stripe's own bytes, read into and
-/// written from directly. GF(2^16) rows are `u16` and convert from and to the
-/// little-endian pairs on disk through one byte buffer. The `u16` lane also
-/// accepts 8-bit symbols, zero-extended, which is how GF(2^8) used to run; the
-/// tests keep it as the reference the byte lane must match.
+/// written from directly. GF(2^16) rows are `u16`, whose little-endian pairs
+/// on disk are the rows' own bytes on a little-endian target, and convert
+/// through one byte buffer elsewhere. The `u16` lane also accepts 8-bit
+/// symbols, zero-extended, which is how GF(2^8) used to run; the tests keep
+/// it as the reference the byte lane must match.
 trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
-    /// Rows are the stripe's byte image; no conversion buffer is needed.
-    const DIRECT: bool;
-    fn direct(row: &mut [Self]) -> Option<&mut [u8]>;
-    fn direct_ref(row: &[Self]) -> Option<&[u8]>;
+    /// Rows of `unit`-byte symbols are the stripe's byte image; no
+    /// conversion buffer is needed.
+    fn is_direct(unit: usize) -> bool;
+    /// The row's byte image when [`Self::is_direct`].
+    fn direct(unit: usize, row: &mut [Self]) -> Option<&mut [u8]>;
+    fn direct_ref(unit: usize, row: &[Self]) -> Option<&[u8]>;
     fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]);
     fn pack(unit: usize, row: &[Self], bytes: &mut [u8]);
     /// `zero` flags rows the layout leaves all zero; see
@@ -322,12 +330,22 @@ trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
 }
 
 impl Lane for u16 {
-    const DIRECT: bool = false;
-    fn direct(_: &mut [Self]) -> Option<&mut [u8]> {
-        None
+    fn is_direct(unit: usize) -> bool {
+        unit == 2 && cfg!(target_endian = "little")
     }
-    fn direct_ref(_: &[Self]) -> Option<&[u8]> {
-        None
+    fn direct(unit: usize, row: &mut [Self]) -> Option<&mut [u8]> {
+        if unit == 2 {
+            TransformField::le_image_mut(row)
+        } else {
+            None
+        }
+    }
+    fn direct_ref(unit: usize, row: &[Self]) -> Option<&[u8]> {
+        if unit == 2 {
+            TransformField::le_image(row)
+        } else {
+            None
+        }
     }
     fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]) {
         unpack(unit, bytes, row);
@@ -410,11 +428,13 @@ impl Lane for u16 {
 }
 
 impl Lane for u8 {
-    const DIRECT: bool = true;
-    fn direct(row: &mut [Self]) -> Option<&mut [u8]> {
+    fn is_direct(_: usize) -> bool {
+        true
+    }
+    fn direct(_: usize, row: &mut [Self]) -> Option<&mut [u8]> {
         Some(row)
     }
-    fn direct_ref(row: &[Self]) -> Option<&[u8]> {
+    fn direct_ref(_: usize, row: &[Self]) -> Option<&[u8]> {
         Some(row)
     }
     fn unpack(_: usize, _: &[u8], _: &mut [Self]) {
@@ -498,7 +518,7 @@ impl Lane for u8 {
 /// when the lane needs one, and one stripe of slack.
 fn workspace_per_byte<L: Lane>(rows: usize, unit: usize) -> Option<usize> {
     rows.checked_mul(size_of::<L>() / unit)?
-        .checked_add(usize::from(!L::DIRECT) + 1)
+        .checked_add(usize::from(!L::is_direct(unit)) + 1)
 }
 
 /// Move row handles so that a `rows`-by-`columns` row-major arrangement becomes
@@ -717,7 +737,41 @@ impl FftCodec {
         let span = rows.len() >> plan.block_log2;
         let symbols = rows.first().map_or(0, Vec::len);
         let blocks = &plan.blocks;
+        // With workers that gather, each class and block beyond the pool's
+        // scratch is one pooled transform, run one after another: the pool
+        // walks it in slabs, or where it has too few for that, sweeps it a
+        // level at a time across the workers, and either way the rows of
+        // one class at a time stream through the workers' caches, which
+        // classes transformed side by side, each sweeping its whole rows
+        // through one worker's, would not. Smaller ones run side by side,
+        // as all do on a target whose pools do not gather, where the
+        // sweeps of one small class at a time cost far more than they save.
+        let run = |rows: &mut [Vec<L>], origin: usize| {
+            match &self.workers {
+                Some(workers) => L::transform_in_pool(
+                    field,
+                    rows,
+                    None,
+                    origin,
+                    false,
+                    backend,
+                    workers.pool(),
+                    &cancelled,
+                ),
+                None => L::transform(field, rows, None, origin, false, backend, &cancelled),
+            }
+            .map_err(transform_error)
+        };
+        let pooled = |rows: usize| {
+            self.workers.is_some()
+                && reedsolomon_rs::fft::POOL_GATHERS
+                && rows.saturating_mul(symbols).saturating_mul(size_of::<L>())
+                    > reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES
+        };
         let wide = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+            if pooled(span) {
+                return rows.chunks_mut(span).try_for_each(|class| run(class, 0));
+            }
             let run = |class: &mut [Vec<L>]| {
                 L::transform(field, class, None, 0, false, backend, &cancelled)
                     .map_err(transform_error)
@@ -730,8 +784,16 @@ impl FftCodec {
             }
         };
         let narrow = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+            let kept = |block: &usize| blocks.binary_search(block).is_ok();
+            if pooled(width) {
+                return rows
+                    .chunks_mut(width)
+                    .enumerate()
+                    .filter(|(block, _)| kept(block))
+                    .try_for_each(|(block, at)| run(at, block * width));
+            }
             let run = |(block, at): (usize, &mut [Vec<L>])| {
-                if blocks.binary_search(&block).is_err() {
+                if !kept(&block) {
                     return Ok(());
                 }
                 L::transform(field, at, None, block * width, false, backend, &cancelled)
@@ -812,7 +874,14 @@ impl FftCodec {
         let symbols = stripe / g.field_bytes();
         let mut work = vec![vec![L::default(); symbols]; g.capacity];
         let mut sum = vec![vec![L::default(); symbols]; g.capacity];
-        let mut bytes = vec![0; if L::DIRECT { 0 } else { stripe }];
+        let mut bytes = vec![
+            0;
+            if L::is_direct(g.field_bytes()) {
+                0
+            } else {
+                stripe
+            }
+        ];
         // The last chunk's rows past the final input are zero.
         let tail = g.inputs % g.capacity;
         let tail: Vec<bool> = (0..g.capacity).map(|at| tail != 0 && at >= tail).collect();
@@ -834,7 +903,7 @@ impl FftCodec {
                         row.fill(L::default());
                         continue;
                     }
-                    if let Some(row) = L::direct(row) {
+                    if let Some(row) = L::direct(unit, row) {
                         read(base + at, offset, &mut row[..take])?;
                     } else {
                         read(base + at, offset, &mut bytes[..take])?;
@@ -856,7 +925,7 @@ impl FftCodec {
             }
             self.transform(&mut sum, None, 0, false)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
-                let out = match L::direct_ref(row) {
+                let out = match L::direct_ref(unit, row) {
                     Some(row) => row,
                     None => {
                         L::pack(g.field_bytes(), row, &mut bytes);
@@ -880,6 +949,28 @@ impl FftCodec {
         lost: &[usize],
         recovery: &[usize],
         read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        self.decode_with(block_size, lost, recovery, read, None, write)
+    }
+
+    /// [`Self::decode`], handing every input stripe's bytes, as `read`
+    /// filled them, to `consume` as well: each stripe of each surviving
+    /// input and supplied recovery row exactly once, the stripes of a row
+    /// in offset order. With workers the stripes of a batch of rows are
+    /// consumed in parallel, in no particular order among themselves, while
+    /// `read`, still on the calling thread and in row order, fills the next
+    /// batch. Without workers, or when no room is left for the batch, each
+    /// stripe is consumed right after it is read. A failing `consume` or
+    /// `read` ends the decode with its error; when both fail in one batch
+    /// the consumer's is returned.
+    pub fn decode_with(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
+        mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        consume: Option<&FftConsumer<'_>>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
         let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
@@ -897,12 +988,23 @@ impl FftCodec {
             return Err(EngineError::InvalidState("insufficient FFT recovery"));
         }
         if g.is_trivial() {
-            return self.decode_trivial(block_size, lost, recovery, read, write);
+            let none = |_: FftInput, _: u64, _: &[u8]| Ok(());
+            let consume: &FftConsumer<'_> = consume.unwrap_or(&none);
+            return self.decode_trivial(
+                block_size,
+                lost,
+                recovery,
+                |row, offset, out| {
+                    read(row, offset, out)?;
+                    consume(row, offset, out)
+                },
+                write,
+            );
         }
         if g.bits == 8 {
-            self.decode_rows::<u8>(block_size, lost, recovery, read, write)
+            self.decode_rows::<u8>(block_size, lost, recovery, read, consume, write)
         } else {
-            self.decode_rows::<u16>(block_size, lost, recovery, read, write)
+            self.decode_rows::<u16>(block_size, lost, recovery, read, consume, write)
         }
     }
 
@@ -912,8 +1014,10 @@ impl FftCodec {
         lost: &[usize],
         recovery: &[usize],
         mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        consume: Option<&FftConsumer<'_>>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
+        use rayon::prelude::*;
         let g = self.geometry;
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let _plan = self.options.memory.reserve_as(
@@ -946,13 +1050,57 @@ impl FftCodec {
         let symbols = stripe / g.field_bytes();
         let mut plan = ForwardPlan::new(g, lost, symbols, &self.options)?;
         let mut rows = vec![vec![L::default(); symbols]; g.domain];
-        let mut bytes = vec![0; if L::DIRECT { 0 } else { stripe }];
+        let mut bytes = vec![
+            0;
+            if L::is_direct(g.field_bytes()) {
+                0
+            } else {
+                stripe
+            }
+        ];
         // Erased and padding rows are never read, so they stay zero.
         let zero: Vec<bool> = (0..g.domain)
             .map(|index| erased[index] || index >= g.capacity + g.inputs)
             .collect();
         let unit = g.field_bytes();
         let backend = self.options.fft_backend;
+        let input = |index: usize| {
+            if index < g.capacity {
+                FftInput::Recovery(index)
+            } else {
+                FftInput::Original(index - g.capacity)
+            }
+        };
+        // With workers and a consumer, the stripes of a batch of rows are read
+        // ahead, straight into their rows where the lane is the byte image and
+        // otherwise into a ring, then consumed and scaled on the pool while
+        // the next batch is read; the ring holds two batches for that. It
+        // comes only out of what the bank left, beyond a stripe of slack;
+        // without room for two batches of two stripes, as without workers,
+        // each stripe is consumed and scaled as it is read.
+        let mut ring: Vec<Vec<u8>> = Vec::new();
+        let mut _ring_memory = None;
+        let mut batch = 0;
+        if let (Some(workers), Some(_)) = (&self.workers, consume) {
+            let wanted = (workers.pool().current_num_threads() * 2).clamp(2, 32);
+            if L::is_direct(unit) {
+                batch = wanted;
+            } else {
+                let room = self.options.memory.available().saturating_sub(stripe) / stripe;
+                let fit = (wanted * 2).min(room) / 2;
+                if fit >= 2
+                    && let Ok(reservation) = self
+                        .options
+                        .memory
+                        .reserve_as(MemoryCategory::CodecScratch, 2 * fit * stripe)
+                {
+                    _ring_memory = Some(reservation);
+                    ring = vec![vec![0; stripe]; 2 * fit];
+                    batch = fit;
+                }
+            }
+        }
+        tracing::debug!(batch, "PAR3 FFT decode consumer batch admitted");
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
@@ -961,37 +1109,139 @@ impl FftCodec {
             // only the symbols past them are cleared, and each symbol is
             // scaled as it is loaded.
             let used = take.div_ceil(unit);
-            for (index, row) in rows.iter_mut().enumerate() {
-                self.options.cancel.check()?;
-                if zero[index] {
-                    row.fill(L::default());
-                    continue;
+            if batch == 0 {
+                for (index, row) in rows.iter_mut().enumerate() {
+                    self.options.cancel.check()?;
+                    if zero[index] {
+                        row.fill(L::default());
+                        continue;
+                    }
+                    let source = input(index);
+                    let factor = factors[index];
+                    if let Some(direct) = L::direct(unit, row) {
+                        read(source, offset, &mut direct[..take])?;
+                        if let Some(consume) = consume {
+                            consume(source, offset, &direct[..take])?;
+                        }
+                        L::scale(field, &mut row[..used], factor, backend, &cancelled)
+                    } else {
+                        read(source, offset, &mut bytes[..take])?;
+                        if let Some(consume) = consume {
+                            consume(source, offset, &bytes[..take])?;
+                        }
+                        bytes[take..used * unit].fill(0);
+                        let packed = &bytes[..used * unit];
+                        L::unpack_scaled(
+                            field,
+                            unit,
+                            packed,
+                            &mut row[..used],
+                            factor,
+                            backend,
+                            &cancelled,
+                        )
+                    }
+                    .map_err(transform_error)?;
+                    row[used..].fill(L::default());
                 }
-                let source = if index < g.capacity {
-                    FftInput::Recovery(index)
-                } else {
-                    FftInput::Original(index - g.capacity)
-                };
-                let factor = factors[index];
-                if let Some(direct) = L::direct(row) {
-                    read(source, offset, &mut direct[..take])?;
-                    L::scale(field, &mut row[..used], factor, backend, &cancelled)
-                } else {
-                    read(source, offset, &mut bytes[..take])?;
-                    bytes[take..used * unit].fill(0);
-                    let packed = &bytes[..used * unit];
-                    L::unpack_scaled(
-                        field,
-                        unit,
-                        packed,
-                        &mut row[..used],
-                        factor,
-                        backend,
-                        &cancelled,
-                    )
+            } else {
+                // Batch by batch: each is read on this thread while the pool
+                // consumes and scales the one before, out of the other half
+                // of the ring, and the last is consumed alone.
+                let consume = consume.expect("batched reads have a consumer");
+                let pool = self
+                    .workers
+                    .as_ref()
+                    .expect("batched reads have workers")
+                    .pool();
+                let (zero, factors) = (&zero, &factors);
+                let mut read_batch =
+                    |rows: &mut [Vec<L>], first: usize, ring: &mut [Vec<u8>]| -> EngineResult<()> {
+                        for (at, row) in rows.iter_mut().enumerate() {
+                            self.options.cancel.check()?;
+                            if zero[first + at] {
+                                continue;
+                            }
+                            if let Some(direct) = L::direct(unit, row) {
+                                read(input(first + at), offset, &mut direct[..take])?;
+                            } else {
+                                let slot = &mut ring[at];
+                                read(input(first + at), offset, &mut slot[..take])?;
+                                slot[take..used * unit].fill(0);
+                            }
+                        }
+                        Ok(())
+                    };
+                let consume_batch =
+                    |rows: &mut [Vec<L>], first: usize, ring: &[Vec<u8>]| -> EngineResult<()> {
+                        rows.par_iter_mut().enumerate().try_for_each(
+                            |(at, row)| -> EngineResult<()> {
+                                let index = first + at;
+                                if zero[index] {
+                                    row.fill(L::default());
+                                    return Ok(());
+                                }
+                                let source = input(index);
+                                let factor = factors[index];
+                                if L::is_direct(unit) {
+                                    let direct = L::direct(unit, row).expect("byte image");
+                                    consume(source, offset, &direct[..take])?;
+                                    L::scale(field, &mut row[..used], factor, backend, &cancelled)
+                                } else {
+                                    let packed = &ring[at];
+                                    consume(source, offset, &packed[..take])?;
+                                    L::unpack_scaled(
+                                        field,
+                                        unit,
+                                        &packed[..used * unit],
+                                        &mut row[..used],
+                                        factor,
+                                        backend,
+                                        &cancelled,
+                                    )
+                                }
+                                .map_err(transform_error)?;
+                                row[used..].fill(L::default());
+                                Ok(())
+                            },
+                        )
+                    };
+                let mut start = 0;
+                let mut pending: Option<std::ops::Range<usize>> = None;
+                let mut parity = false;
+                loop {
+                    let next = (start < rows.len()).then(|| start..(start + batch).min(rows.len()));
+                    if pending.is_none() && next.is_none() {
+                        break;
+                    }
+                    // The pending batch ends where the next begins.
+                    let (done, rest) = rows.split_at_mut(start);
+                    let half = ring.len() / 2;
+                    let (front, back) = ring.split_at_mut(half);
+                    let (ring_pending, ring_next) =
+                        if parity { (back, front) } else { (front, back) };
+                    let mut consumed = Ok(());
+                    let mut read_ahead = Ok(());
+                    pool.in_place_scope(|scope| {
+                        if let Some(pending) = &pending {
+                            let first = pending.start;
+                            let batch = &mut done[first..];
+                            let ring = &*ring_pending;
+                            let consumed = &mut consumed;
+                            scope.spawn(move |_| *consumed = consume_batch(batch, first, ring));
+                        }
+                        if let Some(next) = &next {
+                            read_ahead = read_batch(&mut rest[..next.len()], next.start, ring_next);
+                        }
+                    });
+                    consumed?;
+                    read_ahead?;
+                    if let Some(next) = &next {
+                        start = next.end;
+                    }
+                    pending = next;
+                    parity = !parity;
                 }
-                .map_err(transform_error)?;
-                row[used..].fill(L::default());
             }
             self.transform(&mut rows, Some(&zero), 0, true)?;
             match &self.workers {
@@ -1009,7 +1259,7 @@ impl FftCodec {
                 let row = &mut rows[g.capacity + index];
                 L::scale(field, row, factor, self.options.fft_backend, &cancelled)
                     .map_err(transform_error)?;
-                let out = match L::direct_ref(row) {
+                let out = match L::direct_ref(unit, row) {
                     Some(row) => row,
                     None => {
                         L::pack(g.field_bytes(), row, &mut bytes);
@@ -1131,9 +1381,63 @@ impl FftCodec {
             workspace_per_byte::<u16>(rows, unit)
         }
         .unwrap_or(usize::MAX);
+        let lane = if self.geometry.bits == 8 { 1 } else { 2 };
         (target / unit * unit)
             .saturating_mul(per_byte)
             .saturating_add(rows.saturating_mul(32))
+            .saturating_add(self.walk_units_bytes(rows, target, lane))
+            .saturating_add(self.walk_scratch_bytes(rows, target, lane))
+    }
+
+    /// Scratch the workers may take beside `rows` rows of `lane`-byte symbols
+    /// over a `stripe`-byte stripe: each gathers at most
+    /// [`reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES`] when a pooled
+    /// transform or derivative walks the rows in slabs, and all of them
+    /// together never more than twice the bank they walk. Nothing without
+    /// workers, or on a target whose pools do not gather.
+    fn walk_scratch_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
+        let Some(workers) = &self.workers else {
+            return 0;
+        };
+        if !reedsolomon_rs::fft::POOL_GATHERS {
+            return 0;
+        }
+        let unit = self.geometry.field_bytes();
+        let bank = rows
+            .saturating_mul(stripe / unit)
+            .saturating_mul(lane)
+            .saturating_mul(2);
+        workers
+            .pool()
+            .current_num_threads()
+            .saturating_mul(reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES)
+            .min(bank)
+    }
+
+    /// What a walked transform of `rows` rows of `lane`-byte symbols over a
+    /// `stripe`-byte stripe, or any narrower one the budget admits, keeps
+    /// beside the scratch: the units of its sweeps, most for the inverse
+    /// over every row. A narrower stripe never needs more of them under the
+    /// same sweeps, but rows under 64 symbols take radix-2 sweeps, which
+    /// keep different units and may walk where the wider rows would not, so
+    /// the wider of the two is charged. Nothing when the pool would walk
+    /// neither.
+    fn walk_units_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
+        let (Some(workers), Some(field)) = (&self.workers, &self.field) else {
+            return 0;
+        };
+        let unit = self.geometry.field_bytes();
+        let units = |stripe: usize| {
+            field.walk_units_bytes(
+                rows,
+                stripe / unit,
+                lane,
+                true,
+                self.options.fft_backend,
+                workers.pool().current_num_threads(),
+            )
+        };
+        units(stripe).max(units(stripe.min(63 * unit)))
     }
 
     fn byte_buffers(&self, block_size: u64) -> EngineResult<(usize, Reservation)> {
@@ -1165,25 +1469,62 @@ impl FftCodec {
         if block_size == 0 || !block_size.is_multiple_of(unit as u64) {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
-        let overhead = rows
-            .checked_mul(32)
-            .ok_or(EngineError::resource_limit("FFT rows"))?;
         let per_byte = workspace_per_byte::<L>(rows, unit)
             .ok_or(EngineError::resource_limit("FFT stripes"))?;
         let target = self
             .options
             .stripe_bytes
             .min(usize::try_from(block_size).unwrap_or(usize::MAX));
-        let buffers = self.options.memory.reserve_stripes_with_overhead(
-            MemoryCategory::CodecScratch,
-            target,
-            per_byte,
-            unit,
-            overhead,
-        )?;
-        self.options
-            .diagnostics
-            .note_stripe(buffers.0, per_byte, target);
+        // The row handles and the units a walked transform keeps are what
+        // the rows cost whatever the stripe. The slab scratch the workers may
+        // take beside them is charged either as what the configured stripe
+        // would let them gather, a fixed amount, or as twice the bank the
+        // admitted stripe holds, per stripe byte, which bounds it however
+        // narrow the stripe becomes: whichever leaves the wider stripe
+        // first, the other when that one does not fit at all.
+        let kept = rows
+            .checked_mul(32)
+            .and_then(|handles| {
+                handles.checked_add(self.walk_units_bytes(rows, target, size_of::<L>()))
+            })
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
+        let walk = self.walk_scratch_bytes(rows, target, size_of::<L>());
+        let overhead = kept
+            .checked_add(walk)
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
+        let twice = rows
+            .checked_mul(2 * size_of::<L>() / unit)
+            .and_then(|bank| per_byte.checked_add(bank))
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+        let mut attempts = [(per_byte, overhead), (twice, kept)];
+        let available = self.options.memory.available();
+        let stripe = |(per_byte, overhead): &(usize, usize)| {
+            (available.saturating_sub(*overhead) / per_byte).min(target)
+        };
+        if stripe(&attempts[1]) > stripe(&attempts[0]) {
+            attempts.swap(0, 1);
+        }
+        let mut buffers = Err(EngineError::resource_limit("FFT stripes"));
+        for (per_byte, overhead) in attempts.into_iter().take(if walk == 0 { 1 } else { 2 }) {
+            buffers = self.options.memory.reserve_stripes_with_overhead(
+                MemoryCategory::CodecScratch,
+                target,
+                per_byte,
+                unit,
+                overhead,
+            );
+            match &buffers {
+                Err(EngineError::ResourceLimit(_)) => continue,
+                Err(_) => break,
+                Ok(buffers) => {
+                    self.options
+                        .diagnostics
+                        .note_stripe(buffers.0, per_byte, target);
+                    break;
+                }
+            }
+        }
+        let buffers = buffers?;
         tracing::debug!(stripe_bytes = buffers.0, rows, "PAR3 FFT stripes admitted");
         Ok(buffers)
     }
@@ -1339,7 +1680,7 @@ mod charge_tests {
             // Exactly what `decode` allocates once the charge is granted.
             let symbols = stripe / unit;
             let rows = vec![vec![L::default(); symbols]; geometry.domain];
-            let bytes = vec![0u8; if L::DIRECT { 0 } else { stripe }];
+            let bytes = vec![0u8; if L::is_direct(unit) { 0 } else { stripe }];
             let measured = rows.capacity() * size_of::<Vec<L>>()
                 + rows
                     .iter()
@@ -1755,9 +2096,44 @@ mod lane_tests {
             Ok(())
         };
         if reference {
+            // The word lane over bytes is not the stripe's own image, so with
+            // workers its consumer takes the batched ring path; every stripe
+            // read must reach it once, as read, and nothing else.
+            let consumed = std::sync::Mutex::new(vec![0u64; data.len() + recovery_rows.len()]);
+            let consume = |source: FftInput, offset: u64, bytes: &[u8]| {
+                let (slot, row) = match source {
+                    FftInput::Original(index) => (index, &data[index]),
+                    FftInput::Recovery(index) => (data.len() + index, &recovery_rows[index]),
+                };
+                let offset = offset as usize;
+                assert_eq!(
+                    bytes,
+                    &row[offset..offset + bytes.len()],
+                    "consumed {source:?}"
+                );
+                consumed.lock().unwrap()[slot] += bytes.len() as u64;
+                Ok(())
+            };
             codec
-                .decode_rows::<u16>(block as u64, lost, recovery, read, write)
+                .decode_rows::<u16>(block as u64, lost, recovery, read, Some(&consume), write)
                 .unwrap();
+            let consumed = consumed.into_inner().unwrap();
+            for (index, count) in consumed[..data.len()].iter().enumerate() {
+                let expected = if lost.contains(&index) {
+                    0
+                } else {
+                    block as u64
+                };
+                assert_eq!(*count, expected, "original {index} consumed {count} bytes");
+            }
+            for (index, count) in consumed[data.len()..].iter().enumerate() {
+                let expected = if recovery.contains(&index) {
+                    block as u64
+                } else {
+                    0
+                };
+                assert_eq!(*count, expected, "recovery {index} consumed {count} bytes");
+            }
         } else {
             codec
                 .decode(block as u64, lost, recovery, read, write)
@@ -1883,11 +2259,14 @@ mod lane_tests {
     /// by the layout `buffers` charges, on both fields.
     #[test]
     fn encode_stripe_bytes_matches_the_encode_reservation() {
-        for (inputs, capacity_log2) in [(100u64, 7i8), (150, 6), (300, 8), (40, 4)] {
+        for ((inputs, capacity_log2), workers) in [(100u64, 7i8), (150, 6), (300, 8), (40, 4)]
+            .into_iter()
+            .flat_map(|shape| [(shape, 1), (shape, 3)])
+        {
             let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
             let options = ExecutionOptions {
                 memory: MemoryBudget::new(1 << 30),
-                workers: 1,
+                workers,
                 stripe_bytes: 1 << 16,
                 ..ExecutionOptions::default()
             };
@@ -1904,7 +2283,7 @@ mod lane_tests {
             assert_eq!(
                 codec.encode_stripe_bytes(1 << 20),
                 reserved,
-                "GF(2^{}) inputs {inputs} capacity 2^{capacity_log2}",
+                "GF(2^{}) inputs {inputs} capacity 2^{capacity_log2}, {workers} workers",
                 geometry.bits
             );
         }

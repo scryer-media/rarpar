@@ -690,6 +690,19 @@ fn a_walk_whose_workers_write_opens_nothing_on_a_worker() {
     workers_open_nothing(&set, block);
 }
 
+/// The FFT walk hands the writes of the blocks it reads to its workers the
+/// same way, in both field widths: a cohort of six files of eight blocks
+/// decodes over GF(2^8), one of six files of forty-eight blocks over GF(2^16),
+/// where the workers unpack the stripes they are handed from a ring.
+#[test]
+fn an_fft_walk_whose_workers_write_opens_nothing_on_a_worker() {
+    for (blocks, seed) in [(8, "fft-worker-writes-8"), (48, "fft-worker-writes-16")] {
+        let tree = common::TempTree::new(seed);
+        let set = common::many_block_set(6, blocks, 0, 12, seed.as_bytes(), &tree);
+        workers_open_nothing(&set, 64);
+    }
+}
+
 /// Repair `set` with two blocks of four of its files damaged, on one thread
 /// and on eight, across handle budgets that admit and refuse holding the
 /// outputs, and require the same opens either way.

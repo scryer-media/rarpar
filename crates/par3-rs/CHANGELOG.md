@@ -149,6 +149,39 @@
   50 lost 1 MiB blocks, Alder Lake: one worker 2.64–2.68 → 2.31–2.40 s,
   eight 0.94–1.00 → 0.80–0.86 s, CPU time down 0.35 and 0.7 s; reads,
   checks and bytes unchanged.
+- The FFT repair walk hands the writing and hashing of the surviving blocks
+  it reads to its workers too, under the same hold on the output handles:
+  `FftCodec::decode_with` takes a consumer of each input stripe, and with
+  workers the calling thread reads a batch of rows ahead, straight into the
+  bank, and the workers write, hash and scale that batch in parallel while
+  the calling thread reads the next one. Without workers or a consumer each
+  stripe is consumed as it is read, as before. FFT repair Decode on ext4,
+  2 GiB of 1 MiB blocks over GF(2^16), 50 lost, eight workers on four Alder
+  Lake P-cores: 1.77–1.83 → 1.63–1.68 s for the parallel consume and
+  1.36–1.37 → 1.27–1.29 s for the overlap; one worker unchanged.
+- GF(2^16) transform rows are the stripe's own bytes on little-endian
+  targets, as GF(2^8) rows already were: the walk reads each stripe into
+  its row and writes each repaired row from itself, with no conversion
+  buffer, no unpacking pass and no ring, and scales in place. Elsewhere the
+  rows still convert through one byte buffer. One worker 2.00 → 1.98 s,
+  eight unchanged, 2 MiB less resident.
+- Pooled FFT transforms and derivatives walk the bank in slabs
+  (`reedsolomon-rs` 0.4.8): each worker gathers a slab of rows into at most
+  512 KiB of its own scratch, runs the sweeps of a pass over it from cache
+  and scatters it back; the forward transform's pruned width classes and
+  kept blocks beyond that scratch go to the pool one after another, walked
+  in slabs or swept a level at a time, so one class streams through the
+  workers' caches at a time (classes of a mebibyte transformed side by
+  side on sibling threads cost 2% of the decode and 5% of its CPU), and
+  smaller ones run side by side as before. The codec
+  charges that scratch beside the rows — at the configured stripe as what
+  the workers may gather together, never more than twice the bank, or as
+  twice the admitted bank per stripe byte, whichever leaves the wider
+  stripe, the other when that does not fit at all — and the butterflies
+  the walked inverse transform keeps. On Apple
+  silicon, where the pool does not gather, nothing changes and nothing is
+  charged. Same decode, eight workers: 1.66–1.68 → 1.33–1.35 s and CPU
+  11.3 → 8.3 s; one worker, which never walks, unchanged at 2.05 s.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident

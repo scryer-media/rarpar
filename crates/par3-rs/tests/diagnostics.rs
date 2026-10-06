@@ -802,7 +802,7 @@ fn reading_ahead_changes_scratch_and_nothing_else() {
     );
 }
 
-/// Wave-2 review, finding F1. The syndrome group and the read-ahead set take
+/// The syndrome group and the read-ahead set take
 /// what the stripe bank leaves, down to the slack. With stripes narrower than
 /// a block, the staged proof holds a hash frontier open for every extent
 /// written in pieces; when those grabs took the bytes the frontiers needed,
@@ -811,18 +811,13 @@ fn reading_ahead_changes_scratch_and_nothing_else() {
 /// and with the frontiers reserved ahead of the bank's narrowing and of both
 /// grabs, no budget the repair completes in reads back at all.
 #[test]
-fn w2review_read_ahead_starves_proof_frontiers_into_read_back() {
+fn read_ahead_never_starves_the_proof_frontiers_into_read_back() {
     let (blocks, block_size, recovery) = (24usize, 64u64 << 10, 8u64);
     let block = block_size as usize;
     let stripe = 16usize << 10;
     let tree = common::TempTree::new("proof-frontiers");
-    let set = common::cauchy_block_set(
-        blocks,
-        block_size,
-        recovery,
-        b"PAR3 w2review frontier",
-        &tree,
-    );
+    let set =
+        common::cauchy_block_set(blocks, block_size, recovery, b"PAR3 proof frontiers", &tree);
     let (name, bytes) = set.contents[0].clone();
     let mut damaged = bytes.clone();
     for lost in 0..recovery as usize {
@@ -1346,12 +1341,12 @@ fn a_planning_pool_changes_scratch_and_nothing_else() {
     assert_eq!(ledger.category(MemoryCategory::WorkerStacks).peak, 0);
 }
 
-/// Wave-2 review, finding F2. With blocks shorter than the 40-byte inline
+/// With blocks shorter than the 40-byte inline
 /// tail threshold, every full block is shorter than it too. The serial walk
 /// hashes such a block as a block; the pooled read-ahead took it for an inline
 /// tail, never queued it, and failed the plan. One worker and four must agree.
 #[test]
-fn w2review_pooled_planning_blocks_under_tail_len() {
+fn pooled_planning_hashes_blocks_shorter_than_an_inline_tail() {
     use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, Deduplication};
     for block_size in [40u64, 42, 38, 32] {
         let bytes: Vec<u8> = (0..(8usize << 20) + 5)

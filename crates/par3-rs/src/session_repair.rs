@@ -1156,45 +1156,71 @@ fn reconstruct_fft(
             })
             .collect();
         let indices: Vec<usize> = recovery.keys().copied().collect();
-        codec.decode(
-            layout.block_size,
-            &lost,
-            &indices,
-            |row, offset, out| {
-                match row {
-                    FftInput::Original(local) => {
-                        let block = first + local as u64 * cohorts;
-                        if block >= coverage.end {
-                            out.fill(0);
-                        } else {
-                            session.read_block(
-                                block,
-                                offset,
-                                out,
-                                &mut covered[..out.len()],
-                                Some(writers.owed()),
-                            )?;
-                            scatter(&writers, layout, outputs, block, offset, out)?;
-                        }
-                    }
-                    FftInput::Recovery(index) => {
-                        out.fill(0);
-                        recovery[&index].read_at(offset, out)?;
+        // Every surviving block the decoder reads is also written to the
+        // staged outputs. With workers, and every output held open ahead,
+        // the decoder hands those writes and the proof's hashing of them to
+        // its workers, a batch of rows at a time, so the calling thread only
+        // reads; otherwise each block is written as it is read, as before.
+        let held = codec.worker_count() > 1 && writers.hold(outputs)?;
+        let decoded = {
+            let consume = |row, offset, bytes: &[u8]| match row {
+                FftInput::Original(local) => {
+                    let block = first + local as u64 * cohorts;
+                    if block >= coverage.end {
+                        Ok(())
+                    } else {
+                        scatter(&writers, layout, outputs, block, offset, bytes)
                     }
                 }
-                Ok(())
-            },
-            |local, offset, bytes| {
-                scatter(
-                    &writers,
-                    layout,
-                    outputs,
-                    first + local as u64 * cohorts,
-                    offset,
-                    bytes,
-                )
-            },
-        )?;
+                FftInput::Recovery(_) => Ok(()),
+            };
+            codec.decode_with(
+                layout.block_size,
+                &lost,
+                &indices,
+                |row, offset, out| {
+                    match row {
+                        FftInput::Original(local) => {
+                            let block = first + local as u64 * cohorts;
+                            if block >= coverage.end {
+                                out.fill(0);
+                            } else {
+                                session.read_block(
+                                    block,
+                                    offset,
+                                    out,
+                                    &mut covered[..out.len()],
+                                    Some(writers.owed()),
+                                )?;
+                                if !held {
+                                    consume(row, offset, out)?;
+                                }
+                            }
+                        }
+                        FftInput::Recovery(index) => {
+                            out.fill(0);
+                            recovery[&index].read_at(offset, out)?;
+                        }
+                    }
+                    Ok(())
+                },
+                held.then_some(&consume),
+                |local, offset, bytes| {
+                    scatter(
+                        &writers,
+                        layout,
+                        outputs,
+                        first + local as u64 * cohorts,
+                        offset,
+                        bytes,
+                    )
+                },
+            )
+        };
+        if held {
+            writers.release();
+        }
+        decoded?;
         writers.settle()?;
     }
     Ok(())
@@ -1356,6 +1382,12 @@ impl<'a> StageWriters<'a> {
         }
         self.open.held.store(true, Ordering::Release);
         Ok(true)
+    }
+
+    /// End a hold: the walk's workers write no more, and what the slots
+    /// keep open is the usual cache again, which a budget may close.
+    fn release(&self) {
+        self.open.held.store(false, Ordering::Release);
     }
 
     /// The slot holding `target` open, opened if it is not; the write
