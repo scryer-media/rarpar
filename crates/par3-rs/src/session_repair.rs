@@ -399,6 +399,16 @@ fn copy_available(
     Ok(())
 }
 
+/// Arithmetic owed on one set of staged stripes in a Cauchy repair pass.
+#[derive(Clone, Copy)]
+enum StagedWork {
+    /// The set holds this many surviving blocks to fold into every syndrome.
+    Fold(usize),
+    /// The set holds recovery rows `first..first + count`, each added to its
+    /// own syndrome.
+    Recovery { first: usize, count: usize },
+}
+
 /// Bytes building the Cauchy inverse costs at its peak.
 ///
 /// [`crate::cauchy::inverse_coefficients`] returns the `n` by `n` inverse and,
@@ -579,12 +589,35 @@ where
         group = 1;
         None
     };
-    tracing::debug!(group, "PAR3 Cauchy syndrome group admitted");
+    // With a pool, a second set of `group` stripes lets the calling thread read
+    // and scatter the next group while the workers fold the last one. It comes
+    // out of what is left after the first set, beyond the same slack; without
+    // room for it, or without workers to overlap with, the walk alternates
+    // between reading and folding as before.
+    let _read_ahead = if pool.is_some()
+        && session
+            .options
+            .memory
+            .available()
+            .saturating_sub(crate::runtime::SOURCE_GROUP_SLACK)
+            / stripe
+            >= group
+    {
+        session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, group * stripe)
+            .ok()
+    } else {
+        None
+    };
+    let sets = 1 + usize::from(_read_ahead.is_some());
+    tracing::debug!(group, sets, "PAR3 Cauchy syndrome group admitted");
     let mut syndromes = vec![vec![0u8; stripe]; n];
     let mut recovered = vec![vec![0u8; stripe]; tile];
-    let mut inputs = vec![vec![0u8; stripe]; group];
-    let mut members = [0u64; crate::gf::BATCH_SOURCES];
+    let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
+    let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
     let writers = StageWriters::new(tree, session);
     let mut offset = 0;
     while offset < layout.block_size {
@@ -601,83 +634,147 @@ where
         for syndrome in &mut syndromes {
             syndrome[..take].fill(0);
         }
-        // Fold the held surviving stripes, block `members[k]` in `held[k]`,
-        // into every syndrome row.
-        let fold = |syndromes: &mut [Vec<u8>], members: &[u64], held: &[Vec<u8>]| {
-            let mut sources: [&[u8]; crate::gf::BATCH_SOURCES] = [&[]; crate::gf::BATCH_SOURCES];
-            for (source, bytes) in sources.iter_mut().zip(held) {
-                *source = &bytes[..take];
-            }
-            let sources = &sources[..held.len()];
-            let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
-                session.options.cancel.check()?;
-                let mut factors = [F::Symbol::default(); crate::gf::BATCH_SOURCES];
-                for (factor, block) in factors.iter_mut().zip(members) {
-                    *factor = crate::cauchy::element(&field, *block, *row)?;
+        // The arithmetic for one staged set, which reads and writes nothing:
+        // fold surviving block `members[k]`, held in `held[k]`, into every
+        // syndrome row, or add recovery row `first + k` to its own syndrome.
+        let work = |syndromes: &mut [Vec<u8>],
+                    job: StagedWork,
+                    members: &[u64],
+                    held: &[Vec<u8>]|
+         -> EngineResult<()> {
+            match job {
+                StagedWork::Fold(count) => {
+                    let members = &members[..count];
+                    let mut sources: [&[u8]; crate::gf::BATCH_SOURCES] =
+                        [&[]; crate::gf::BATCH_SOURCES];
+                    for (source, bytes) in sources.iter_mut().zip(&held[..count]) {
+                        *source = &bytes[..take];
+                    }
+                    let sources = &sources[..count];
+                    let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
+                        session.options.cancel.check()?;
+                        let mut factors = [F::Symbol::default(); crate::gf::BATCH_SOURCES];
+                        for (factor, block) in factors.iter_mut().zip(members) {
+                            *factor = crate::cauchy::element(&field, *block, *row)?;
+                        }
+                        field.mul_acc_batch(&mut syndrome[..take], sources, &factors[..count]);
+                        Ok(())
+                    };
+                    match parallel {
+                        Some(pool) => pool.install(|| {
+                            syndromes
+                                .par_iter_mut()
+                                .zip(rows.par_iter())
+                                .try_for_each(apply)
+                        }),
+                        None => syndromes.iter_mut().zip(rows.iter()).try_for_each(apply),
+                    }
                 }
-                field.mul_acc_batch(&mut syndrome[..take], sources, &factors[..members.len()]);
-                Ok(())
-            };
-            if let Some(pool) = &pool {
-                pool.pool().install(|| {
-                    syndromes
-                        .par_iter_mut()
-                        .zip(rows.par_iter())
-                        .try_for_each(apply)
-                })
-            } else {
-                syndromes.iter_mut().zip(rows.iter()).try_for_each(apply)
+                StagedWork::Recovery { first, count } => {
+                    let add = |(syndrome, payload): (&mut Vec<u8>, &Vec<u8>)| {
+                        for (to, from) in syndrome[..take].iter_mut().zip(&payload[..take]) {
+                            *to ^= from;
+                        }
+                    };
+                    let rows = &mut syndromes[first..first + count];
+                    match parallel {
+                        Some(pool) => pool.install(|| {
+                            rows.par_iter_mut()
+                                .zip(held[..count].par_iter())
+                                .for_each(add)
+                        }),
+                        None => rows.iter_mut().zip(&held[..count]).for_each(add),
+                    }
+                    Ok(())
+                }
             }
         };
-        // Reads and the scatters that follow them keep their order; only the
-        // arithmetic waits for the group to fill.
-        let mut held = 0;
-        for block in 0..layout.block_count {
-            session.options.cancel.check()?;
-            if lost.binary_search(&block).is_ok() {
-                continue;
-            }
-            session.read_block(
-                block,
-                offset,
-                &mut inputs[held][..take],
-                &mut covered[..take],
-                Some(writers.owed()),
-            )?;
-            scatter(
-                &writers,
-                layout,
-                outputs,
-                block,
-                offset,
-                &inputs[held][..take],
-            )?;
-            if coverage.contains(&block) {
-                // One code-matrix element per surviving block per recovery row,
-                // recomputed on every stripe pass. Counted here so the report
-                // can say what that costs before anything caches it.
-                session
-                    .options
-                    .diagnostics
-                    .note_factors(rows.len() as u64, 0);
-                members[held] = block;
-                held += 1;
-                if held == group {
-                    fold(&mut syndromes, &members[..held], &inputs[..held])?;
-                    held = 0;
+        // Read and scatter the next set: surviving blocks in order until a
+        // group is held, then the recovery rows a set at a time. Every read and
+        // every write of the pass happens here, on the calling thread, in the
+        // order the walk has always had; only the arithmetic waits for a set.
+        let (mut next_block, mut next_row) = (0u64, 0usize);
+        let mut fill = |set: &mut [Vec<u8>],
+                        members: &mut [u64; crate::gf::BATCH_SOURCES]|
+         -> EngineResult<Option<StagedWork>> {
+            let mut held = 0;
+            while next_block < layout.block_count {
+                session.options.cancel.check()?;
+                let block = next_block;
+                next_block += 1;
+                if lost.binary_search(&block).is_ok() {
+                    continue;
+                }
+                session.read_block(
+                    block,
+                    offset,
+                    &mut set[held][..take],
+                    &mut covered[..take],
+                    Some(writers.owed()),
+                )?;
+                scatter(&writers, layout, outputs, block, offset, &set[held][..take])?;
+                if coverage.contains(&block) {
+                    // One code-matrix element per surviving block per recovery
+                    // row, recomputed on every stripe pass. Counted here so the
+                    // report can say what that costs before anything caches it.
+                    session
+                        .options
+                        .diagnostics
+                        .note_factors(rows.len() as u64, 0);
+                    members[held] = block;
+                    held += 1;
+                    if held == set.len() {
+                        return Ok(Some(StagedWork::Fold(held)));
+                    }
                 }
             }
-        }
-        if held != 0 {
-            fold(&mut syndromes, &members[..held], &inputs[..held])?;
-        }
-        let input = &mut inputs[0];
-        for (row, payload) in assessment.recovery.iter().enumerate() {
-            input[..take].fill(0);
-            payload.read_at(offset, &mut input[..take])?;
-            for (to, from) in syndromes[row][..take].iter_mut().zip(&input[..take]) {
-                *to ^= from;
+            if held != 0 {
+                return Ok(Some(StagedWork::Fold(held)));
             }
+            let first = next_row;
+            for input in set.iter_mut() {
+                let Some(payload) = assessment.recovery.get(next_row) else {
+                    break;
+                };
+                input[..take].fill(0);
+                payload.read_at(offset, &mut input[..take])?;
+                next_row += 1;
+            }
+            Ok((next_row != first).then_some(StagedWork::Recovery {
+                first,
+                count: next_row - first,
+            }))
+        };
+        let (mut staged, mut spare) = inputs.split_at_mut(group);
+        let mut staged_members = [0u64; crate::gf::BATCH_SOURCES];
+        let mut spare_members = staged_members;
+        let mut job = fill(staged, &mut staged_members)?;
+        while let Some(current) = job {
+            job = match parallel {
+                // The workers take this set while the calling thread fills the
+                // other; the two meet before the sets trade places. A failed
+                // fold still lets the read in flight finish, and is reported
+                // ahead of anything that read ran into.
+                Some(pool) if !spare.is_empty() => {
+                    let mut done = Ok(());
+                    let next = {
+                        let (held, members, syndromes, done) =
+                            (&*staged, &staged_members, &mut syndromes[..], &mut done);
+                        pool.in_place_scope(|scope| {
+                            scope.spawn(move |_| *done = work(syndromes, current, members, held));
+                            fill(spare, &mut spare_members)
+                        })
+                    };
+                    done?;
+                    std::mem::swap(&mut staged, &mut spare);
+                    std::mem::swap(&mut staged_members, &mut spare_members);
+                    next?
+                }
+                _ => {
+                    work(&mut syndromes, current, &staged_members, staged)?;
+                    fill(staged, &mut staged_members)?
+                }
+            };
         }
         // Solve and scatter the lost columns a tile at a time. Columns are
         // still visited in order and each is written exactly once, so the
