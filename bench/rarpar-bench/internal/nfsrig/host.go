@@ -179,6 +179,13 @@ func HostDown(ctx context.Context, options HostOptions, volumes bool) error {
 	if options.Docker == "" {
 		options.Docker = "docker"
 	}
+	// down mounts nothing, but compose still interpolates the client's
+	// required bind sources; any path satisfies it.
+	for _, path := range []*string{&options.Source, &options.Results} {
+		if *path == "" {
+			*path = os.TempDir()
+		}
+	}
 	return options.docker(ctx, options.DownArgs(volumes))
 }
 
