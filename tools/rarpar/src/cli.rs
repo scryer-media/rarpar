@@ -233,7 +233,7 @@ pub struct Par3InsideInsertArgs {
     /// Replace each archive with its protected copy.
     #[arg(long, conflicts_with = "output_dir")]
     pub in_place: bool,
-    /// Logical block size in bytes; defaults to a power of two keeping at most 32768 blocks.
+    /// Logical block size in bytes; defaults to the smallest power of two from 4096 keeping at most 2048 blocks.
     #[arg(short = 's', long, value_parser = clap::value_parser!(u64).range(1..))]
     pub block_size: Option<u64>,
     /// Number of recovery packets in the set (per volume with --placement independent).

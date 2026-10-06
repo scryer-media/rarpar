@@ -71,6 +71,16 @@ fn print_human(report: &Value) {
             println!("    {} more recovery block(s) needed", set["additional"]);
         }
     }
+    for name in report["unprotected_missing_volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "  {} is missing and no embedded set covers it",
+            name.as_str().unwrap_or("")
+        );
+    }
     for output in report["outputs"].as_array().into_iter().flatten() {
         if let Some(path) = output.as_str() {
             println!("  wrote {path}");
@@ -169,7 +179,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
     let total: u64 = hosts.iter().map(|host| host.archive.length).sum();
     let block_size = args.block_size.unwrap_or_else(|| {
         let mut size = 4096u64;
-        while total.div_ceil(size) > 32768 {
+        while total.div_ceil(size) > 2048 {
             size *= 2;
         }
         size
@@ -320,15 +330,91 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
             return Err(RarparError::MissingInput(path.clone()));
         }
     }
-    Ok(rar5::open(&args.archives, &execution)?)
+    // Every present volume of a given `.partN.rar` set, so sets embedded per
+    // volume are all opened.
+    let mut paths = args.archives.clone();
+    for path in &args.archives {
+        let Some((stem, _)) = part_number(path) else {
+            continue;
+        };
+        let directory = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(directory)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|candidate| part_number(candidate).is_some_and(|(found, _)| found == stem))
+            .filter(|candidate| !paths.contains(candidate))
+            .collect();
+        siblings.sort();
+        paths.extend(siblings);
+    }
+    Ok(rar5::open(&paths, &execution)?)
+}
+
+/// Volumes of the given archives' `.partN.rar` sets that are absent and that
+/// no opened set records: a numbering gap, or a missing successor of the
+/// highest volume present when its end header says another follows.
+fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<String> {
+    let covered: Vec<String> = sets.iter().flat_map(Rar5Set::current_names).collect();
+    let mut missing = Vec::new();
+    for path in &args.archives {
+        let Some((stem, _)) = part_number(path) else {
+            continue;
+        };
+        let directory = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        let mut present: Vec<(u64, PathBuf, usize)> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter_map(|candidate| {
+                let (candidate_stem, number) = part_number(&candidate)?;
+                let width = candidate.file_name()?.to_str()?.len() - stem.len() - ".part.rar".len();
+                (candidate_stem == stem).then_some((number, candidate, width))
+            })
+            .collect();
+        present.sort();
+        let Some((highest, last, width)) = present.last().cloned() else {
+            continue;
+        };
+        let more = crate::par3::execution_options(
+            cli.par3_memory_mib,
+            cli.par3_workers,
+            cli.par3_max_lost_blocks,
+        )
+        .ok()
+        .and_then(|options| {
+            let mut disk = par3_rs::source::DiskSourceAccess::with_options(options.clone());
+            disk.insert(par3_rs::source::SourceId(0), last.clone());
+            rar5::inspect(&disk, par3_rs::source::SourceId(0), &options).ok()
+        })
+        .is_some_and(|archive| archive.more_volumes);
+        let end = highest + u64::from(more);
+        for number in 1..=end {
+            if present.iter().any(|(found, _, _)| *found == number) {
+                continue;
+            }
+            let name = format!("{stem}.part{number:0width$}.rar");
+            if !covered.contains(&name) && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+    }
+    missing
 }
 
 fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError> {
     let sets = open(cli, args)?;
-    let healthy = sets.iter().all(|set| set.needs_repair().is_empty());
-    let repairable = sets
-        .iter()
-        .all(|set| matches!(set.status, RepairStatus::Complete | RepairStatus::Ready));
+    let uncovered = uncovered_volumes(cli, args, &sets);
+    let healthy = uncovered.is_empty() && sets.iter().all(|set| set.needs_repair().is_empty());
+    let repairable = uncovered.is_empty()
+        && sets
+            .iter()
+            .all(|set| matches!(set.status, RepairStatus::Complete | RepairStatus::Ready));
     let status = if healthy {
         "all data and regions intact"
     } else if repairable {
@@ -338,7 +424,7 @@ fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError
     };
     Ok((
         healthy,
-        json!({"operation":"par3_inside_verify","status":status,"repairable":repairable,"sets":sets.iter().map(set_report).collect::<Vec<_>>()}),
+        json!({"operation":"par3_inside_verify","status":status,"repairable":repairable,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>()}),
     ))
 }
 
@@ -350,7 +436,8 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
         .unwrap_or(Path::new("."))
         .to_owned();
     let mut outputs = Vec::new();
-    let mut success = true;
+    let uncovered = uncovered_volumes(cli, &args.inputs, &sets);
+    let mut success = uncovered.is_empty();
     for set in &mut sets {
         let needed = set.needs_repair();
         if needed.is_empty() {
@@ -410,7 +497,7 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
     };
     Ok((
         success,
-        json!({"operation":"par3_inside_repair","status":status,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs}),
+        json!({"operation":"par3_inside_repair","status":status,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs}),
     ))
 }
 
